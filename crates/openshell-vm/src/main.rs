@@ -93,16 +93,7 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         "tsi" => openshell_vm::NetBackend::Tsi,
         "none" => openshell_vm::NetBackend::None,
         "gvproxy" => openshell_vm::NetBackend::Gvproxy {
-            binary: PathBuf::from(
-                [
-                    "/opt/podman/bin/gvproxy",
-                    "/opt/homebrew/bin/gvproxy",
-                    "/usr/local/bin/gvproxy",
-                ]
-                .iter()
-                .find(|p| std::path::Path::new(p).exists())
-                .unwrap_or(&"/opt/podman/bin/gvproxy"),
-            ),
+            binary: openshell_vm::default_runtime_gvproxy_path(),
         },
         other => {
             return Err(
@@ -126,6 +117,7 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
             env: cli.env,
             workdir: cli.workdir,
             port_map: cli.port,
+            vsock_ports: vec![],
             log_level: cli.krun_log_level,
             console_output: None,
             net: net_backend.clone(),

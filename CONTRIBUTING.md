@@ -140,6 +140,28 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run docs`    | Build and serve documentation locally                   |
 | `mise run clean`   | Clean build artifacts                                   |
 
+### MicroVM runtime
+
+To build and run the standalone `gateway` microVM from `crates/openshell-vm`:
+
+```bash
+mise run vm
+```
+
+That task builds `openshell-vm`, stages `gateway.runtime/`, builds the default rootfs under `$XDG_DATA_HOME/openshell/gateway/rootfs`, codesigns `target/debug/gateway` on macOS, and then launches the VM.
+
+If you only want to stage the sidecar runtime bundle without launching the VM:
+
+```bash
+mise run vm:bundle-runtime
+```
+
+To create a local tarball that contains both `gateway` and `gateway.runtime/`:
+
+```bash
+mise run vm:package:gateway
+```
+
 ## Project Structure
 
 | Path            | Purpose                                       |

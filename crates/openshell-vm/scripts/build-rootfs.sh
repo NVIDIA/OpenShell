@@ -4,7 +4,7 @@
 
 # Build an aarch64 Ubuntu rootfs for the gateway microVM.
 #
-# Produces a rootfs with k3s pre-installed, the NemoClaw helm chart and
+# Produces a rootfs with k3s pre-installed, the OpenShell helm chart and
 # manifests baked in, container images pre-loaded, AND a fully initialized
 # k3s cluster state (database, TLS, images imported, all services deployed).
 #
@@ -12,14 +12,14 @@
 # cold-starting, achieving ~3-5s startup times.
 #
 # Usage:
-#   ./crates/navigator-vm/scripts/build-rootfs.sh [output_dir]
+#   ./crates/openshell-vm/scripts/build-rootfs.sh [output_dir]
 #
 # Requires: Docker (or compatible container runtime), curl, helm, zstd
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_ROOTFS="${XDG_DATA_HOME:-${HOME}/.local/share}/nemoclaw/gateway/rootfs"
+DEFAULT_ROOTFS="${XDG_DATA_HOME:-${HOME}/.local/share}/openshell/gateway/rootfs"
 ROOTFS_DIR="${1:-${DEFAULT_ROOTFS}}"
 CONTAINER_NAME="krun-rootfs-builder"
 INIT_CONTAINER_NAME="krun-k3s-init"
@@ -30,7 +30,7 @@ BASE_IMAGE_TAG="krun-rootfs:gateway"
 K3S_VERSION="${K3S_VERSION:-v1.35.2+k3s1}"
 K3S_VERSION="${K3S_VERSION//-k3s/+k3s}"
 
-# Project root (two levels up from crates/navigator-vm/scripts/)
+# Project root (two levels up from crates/openshell-vm/scripts/)
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 # Container images to pre-load into k3s (arm64).
@@ -117,7 +117,7 @@ chmod +x "${ROOTFS_DIR}/srv/hello-server.py"
 
 # ── Package and inject helm chart ────────────────────────────────────
 
-HELM_CHART_DIR="${PROJECT_ROOT}/deploy/helm/navigator"
+HELM_CHART_DIR="${PROJECT_ROOT}/deploy/helm/openshell"
 CHART_DEST="${ROOTFS_DIR}/var/lib/rancher/k3s/server/static/charts"
 
 if [ -d "${HELM_CHART_DIR}" ]; then
@@ -140,7 +140,7 @@ MANIFEST_DEST="${ROOTFS_DIR}/opt/navigator/manifests"
 echo "==> Injecting Kubernetes manifests..."
 mkdir -p "${MANIFEST_DEST}"
 
-for manifest in navigator-helmchart.yaml agent-sandbox.yaml; do
+for manifest in openshell-helmchart.yaml agent-sandbox.yaml; do
     if [ -f "${MANIFEST_SRC}/${manifest}" ]; then
         cp "${MANIFEST_SRC}/${manifest}" "${MANIFEST_DEST}/"
         echo "    ${manifest}"
@@ -197,8 +197,8 @@ pull_and_save() {
     cp "${output}" "${cache}"
 }
 
-pull_and_save "${SERVER_IMAGE}" "${IMAGES_DIR}/navigator-server.tar.zst"
-pull_and_save "${SANDBOX_IMAGE}" "${IMAGES_DIR}/navigator-sandbox.tar.zst"
+pull_and_save "${SERVER_IMAGE}" "${IMAGES_DIR}/openshell-server.tar.zst"
+pull_and_save "${SANDBOX_IMAGE}" "${IMAGES_DIR}/openshell-sandbox.tar.zst"
 pull_and_save "${AGENT_SANDBOX_IMAGE}" "${IMAGES_DIR}/agent-sandbox-controller.tar.zst"
 
 # ── Pre-initialize k3s cluster state ─────────────────────────────────
@@ -226,18 +226,19 @@ for manifest in "${MANIFEST_DEST}"/*.yaml; do
 done
 
 # Patch HelmChart for local images and VM settings.
-HELMCHART="${INIT_MANIFESTS}/navigator-helmchart.yaml"
+HELMCHART="${INIT_MANIFESTS}/openshell-helmchart.yaml"
 if [ -f "$HELMCHART" ]; then
     # Use local images — explicitly imported into containerd.
     sed -i '' 's|pullPolicy: Always|pullPolicy: IfNotPresent|' "$HELMCHART" 2>/dev/null \
         || sed -i 's|pullPolicy: Always|pullPolicy: IfNotPresent|' "$HELMCHART"
-    # Fill image placeholders.
-    sed -i '' "s|__IMAGE_REPO_BASE__/server|${SERVER_IMAGE%:*}|g" "$HELMCHART" 2>/dev/null \
-        || sed -i "s|__IMAGE_REPO_BASE__/server|${SERVER_IMAGE%:*}|g" "$HELMCHART"
-    sed -i '' "s|__IMAGE_REPO_BASE__/sandbox:__IMAGE_TAG__|${SANDBOX_IMAGE}|g" "$HELMCHART" 2>/dev/null \
-        || sed -i "s|__IMAGE_REPO_BASE__/sandbox:__IMAGE_TAG__|${SANDBOX_IMAGE}|g" "$HELMCHART"
-    sed -i '' "s|__IMAGE_TAG__|${IMAGE_TAG}|g" "$HELMCHART" 2>/dev/null \
-        || sed -i "s|__IMAGE_TAG__|${IMAGE_TAG}|g" "$HELMCHART"
+    # Use the locally imported image references.
+    sed -i '' -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${SERVER_IMAGE%:*}|" "$HELMCHART" 2>/dev/null \
+        || sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${SERVER_IMAGE%:*}|" "$HELMCHART"
+    sed -i '' -E "s|tag:[[:space:]]*\"?[^\"[:space:]]+\"?|tag: \"${IMAGE_TAG}\"|" "$HELMCHART" 2>/dev/null \
+        || sed -i -E "s|tag:[[:space:]]*\"?[^\"[:space:]]+\"?|tag: \"${IMAGE_TAG}\"|" "$HELMCHART"
+    sed -i '' "s|server:[[:space:]]*sandboxImage: ghcr.io/nvidia/openshell-community/sandboxes/base:latest|server:\n      sandboxImage: ${SANDBOX_IMAGE}|g" "$HELMCHART" 2>/dev/null || true
+    sed -i '' "s|sandboxImage: ghcr.io/nvidia/openshell-community/sandboxes/base:latest|sandboxImage: ${SANDBOX_IMAGE}|g" "$HELMCHART" 2>/dev/null \
+        || sed -i "s|sandboxImage: ghcr.io/nvidia/openshell-community/sandboxes/base:latest|sandboxImage: ${SANDBOX_IMAGE}|g" "$HELMCHART"
     # Enable hostNetwork for VM (no kube-proxy / iptables).
     sed -i '' 's|__HOST_NETWORK__|true|g' "$HELMCHART" 2>/dev/null \
         || sed -i 's|__HOST_NETWORK__|true|g' "$HELMCHART"
@@ -255,13 +256,24 @@ if [ -f "$HELMCHART" ]; then
     # are unreliable on virtiofs.
     sed -i '' 's|__PERSISTENCE_ENABLED__|false|g' "$HELMCHART" 2>/dev/null \
         || sed -i 's|__PERSISTENCE_ENABLED__|false|g' "$HELMCHART"
-    sed -i '' 's|__DB_URL__|"sqlite:/tmp/navigator.db"|g' "$HELMCHART" 2>/dev/null \
-        || sed -i 's|__DB_URL__|"sqlite:/tmp/navigator.db"|g' "$HELMCHART"
+    sed -i '' 's|__DB_URL__|"sqlite:/tmp/openshell.db"|g' "$HELMCHART" 2>/dev/null \
+        || sed -i 's|__DB_URL__|"sqlite:/tmp/openshell.db"|g' "$HELMCHART"
     # Clear SSH gateway placeholders.
     sed -i '' 's|sshGatewayHost: __SSH_GATEWAY_HOST__|sshGatewayHost: ""|g' "$HELMCHART" 2>/dev/null \
         || sed -i 's|sshGatewayHost: __SSH_GATEWAY_HOST__|sshGatewayHost: ""|g' "$HELMCHART"
     sed -i '' 's|sshGatewayPort: __SSH_GATEWAY_PORT__|sshGatewayPort: 0|g' "$HELMCHART" 2>/dev/null \
         || sed -i 's|sshGatewayPort: __SSH_GATEWAY_PORT__|sshGatewayPort: 0|g' "$HELMCHART"
+    SSH_HANDSHAKE_SECRET="$(head -c 32 /dev/urandom | od -A n -t x1 | tr -d ' \n')"
+    sed -i '' "s|__SSH_HANDSHAKE_SECRET__|${SSH_HANDSHAKE_SECRET}|g" "$HELMCHART" 2>/dev/null \
+        || sed -i "s|__SSH_HANDSHAKE_SECRET__|${SSH_HANDSHAKE_SECRET}|g" "$HELMCHART"
+    sed -i '' 's|__DISABLE_GATEWAY_AUTH__|false|g' "$HELMCHART" 2>/dev/null \
+        || sed -i 's|__DISABLE_GATEWAY_AUTH__|false|g' "$HELMCHART"
+    sed -i '' 's|__DISABLE_TLS__|false|g' "$HELMCHART" 2>/dev/null \
+        || sed -i 's|__DISABLE_TLS__|false|g' "$HELMCHART"
+    sed -i '' 's|hostGatewayIP: __HOST_GATEWAY_IP__|hostGatewayIP: ""|g' "$HELMCHART" 2>/dev/null \
+        || sed -i 's|hostGatewayIP: __HOST_GATEWAY_IP__|hostGatewayIP: ""|g' "$HELMCHART"
+    sed -i '' '/__CHART_CHECKSUM__/d' "$HELMCHART" 2>/dev/null \
+        || sed -i '/__CHART_CHECKSUM__/d' "$HELMCHART"
 fi
 
 # Boot k3s in a privileged container. We use a Docker volume for the
@@ -406,16 +418,16 @@ docker exec "${INIT_CONTAINER_NAME}" sh -c '
     /usr/local/bin/k3s ctr images list -q | grep -v "^sha256:" | sort
 ' 2>&1 | sed 's/^/    /'
 
-# Wait for the navigator namespace (Helm controller creates it).
-echo "    Waiting for navigator namespace..."
+# Wait for the openshell namespace (Helm controller creates it).
+echo "    Waiting for openshell namespace..."
 for i in $(seq 1 120); do
     if docker exec "${INIT_CONTAINER_NAME}" \
-        /usr/local/bin/k3s kubectl get namespace navigator -o name 2>/dev/null | grep -q navigator; then
+        /usr/local/bin/k3s kubectl get namespace openshell -o name 2>/dev/null | grep -q openshell; then
         echo "    Namespace ready (${i}s)"
         break
     fi
     if [ "$i" -eq 120 ]; then
-        echo "ERROR: navigator namespace did not appear in 120s"
+        echo "ERROR: openshell namespace did not appear in 120s"
         docker logs "${INIT_CONTAINER_NAME}" --tail 50
         docker rm -f "${INIT_CONTAINER_NAME}" 2>/dev/null || true
         docker volume rm krun-k3s-init-data 2>/dev/null || true
@@ -429,7 +441,7 @@ echo "    Generating TLS certificates and creating secrets..."
 
 # We generate certs outside the container, then apply them via kubectl.
 # Use openssl for cert generation at build time (simpler than pulling in
-# the Rust PKI library). The navigator-bootstrap Rust code will detect
+# the Rust PKI library). The bootstrap Rust code will detect
 # these pre-baked secrets at runtime and skip its own generation.
 
 PKI_DIR=$(mktemp -d)
@@ -438,7 +450,7 @@ trap 'rm -rf "${PKI_DIR}"' EXIT
 # Generate CA
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -keyout "${PKI_DIR}/ca.key" -out "${PKI_DIR}/ca.crt" \
-    -days 3650 -nodes -subj "/O=navigator/CN=navigator-ca" 2>/dev/null
+    -days 3650 -nodes -subj "/O=openshell/CN=openshell-ca" 2>/dev/null
 
 # Generate server cert with SANs
 cat > "${PKI_DIR}/server.cnf" <<EOF
@@ -448,15 +460,15 @@ distinguished_name = req_dn
 prompt = no
 
 [req_dn]
-CN = navigator-server
+CN = openshell-server
 
 [v3_req]
 subjectAltName = @alt_names
 
 [alt_names]
-DNS.1 = navigator
-DNS.2 = navigator.navigator.svc
-DNS.3 = navigator.navigator.svc.cluster.local
+DNS.1 = openshell
+DNS.2 = openshell.openshell.svc
+DNS.3 = openshell.openshell.svc.cluster.local
 DNS.4 = localhost
 DNS.5 = host.docker.internal
 IP.1 = 127.0.0.1
@@ -473,7 +485,7 @@ openssl x509 -req -in "${PKI_DIR}/server.csr" \
 # Generate client cert
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -keyout "${PKI_DIR}/client.key" -out "${PKI_DIR}/client.csr" \
-    -nodes -subj "/CN=navigator-client" 2>/dev/null
+    -nodes -subj "/CN=openshell-client" 2>/dev/null
 openssl x509 -req -in "${PKI_DIR}/client.csr" \
     -CA "${PKI_DIR}/ca.crt" -CAkey "${PKI_DIR}/ca.key" -CAcreateserial \
     -out "${PKI_DIR}/client.crt" -days 3650 2>/dev/null
@@ -494,35 +506,35 @@ SERVER_KEY_B64=$(base64 < "${PKI_DIR}/server.key" | tr -d '\n')
 CLIENT_CRT_B64=$(base64 < "${PKI_DIR}/client.crt" | tr -d '\n')
 CLIENT_KEY_B64=$(base64 < "${PKI_DIR}/client.key" | tr -d '\n')
 
-apply_secret "navigator-server-tls" "$(cat <<EOSECRET
-{"apiVersion":"v1","kind":"Secret","metadata":{"name":"navigator-server-tls","namespace":"navigator"},"type":"kubernetes.io/tls","data":{"tls.crt":"${SERVER_CRT_B64}","tls.key":"${SERVER_KEY_B64}"}}
+apply_secret "openshell-server-tls" "$(cat <<EOSECRET
+{"apiVersion":"v1","kind":"Secret","metadata":{"name":"openshell-server-tls","namespace":"openshell"},"type":"kubernetes.io/tls","data":{"tls.crt":"${SERVER_CRT_B64}","tls.key":"${SERVER_KEY_B64}"}}
 EOSECRET
 )"
 
-apply_secret "navigator-server-client-ca" "$(cat <<EOSECRET
-{"apiVersion":"v1","kind":"Secret","metadata":{"name":"navigator-server-client-ca","namespace":"navigator"},"type":"Opaque","data":{"ca.crt":"${CA_CRT_B64}"}}
+apply_secret "openshell-server-client-ca" "$(cat <<EOSECRET
+{"apiVersion":"v1","kind":"Secret","metadata":{"name":"openshell-server-client-ca","namespace":"openshell"},"type":"Opaque","data":{"ca.crt":"${CA_CRT_B64}"}}
 EOSECRET
 )"
 
-apply_secret "navigator-client-tls" "$(cat <<EOSECRET
-{"apiVersion":"v1","kind":"Secret","metadata":{"name":"navigator-client-tls","namespace":"navigator"},"type":"Opaque","data":{"tls.crt":"${CLIENT_CRT_B64}","tls.key":"${CLIENT_KEY_B64}","ca.crt":"${CA_CRT_B64}"}}
+apply_secret "openshell-client-tls" "$(cat <<EOSECRET
+{"apiVersion":"v1","kind":"Secret","metadata":{"name":"openshell-client-tls","namespace":"openshell"},"type":"Opaque","data":{"tls.crt":"${CLIENT_CRT_B64}","tls.key":"${CLIENT_KEY_B64}","ca.crt":"${CA_CRT_B64}"}}
 EOSECRET
 )"
 
-# Wait for the navigator StatefulSet to have a ready replica.
-echo "    Waiting for navigator pod to be ready..."
+# Wait for the openshell StatefulSet to have a ready replica.
+echo "    Waiting for openshell pod to be ready..."
 for i in $(seq 1 120); do
     ready=$(docker exec "${INIT_CONTAINER_NAME}" \
-        /usr/local/bin/k3s kubectl -n navigator get statefulset navigator \
+        /usr/local/bin/k3s kubectl -n openshell get statefulset openshell \
         -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
     if [ "$ready" = "1" ]; then
-        echo "    Navigator pod ready (${i}s)"
+        echo "    OpenShell pod ready (${i}s)"
         break
     fi
     if [ "$i" -eq 120 ]; then
-        echo "WARNING: navigator pod not ready after 120s, continuing anyway"
+        echo "WARNING: openshell pod not ready after 120s, continuing anyway"
         docker exec "${INIT_CONTAINER_NAME}" \
-            /usr/local/bin/k3s kubectl -n navigator get pods 2>/dev/null | sed 's/^/    /' || true
+            /usr/local/bin/k3s kubectl -n openshell get pods 2>/dev/null | sed 's/^/    /' || true
         break
     fi
     sleep 1

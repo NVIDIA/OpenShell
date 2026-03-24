@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# openshell-vm development helpers
+
+[vm]
+description = "Build and run the standalone gateway microVM"
+depends = ["vm:build", "vm:bundle-runtime", "vm:rootfs", "vm:codesign"]
+run = "target/debug/gateway"
+hide = false
+
+["vm:build"]
+description = "Build the standalone gateway binary"
+run = "cargo build -p openshell-vm"
+hide = true
+
+["vm:build:release"]
+description = "Build the standalone gateway binary in release mode"
+run = "cargo build -p openshell-vm --release"
+hide = true
+
+["vm:rootfs"]
+description = "Build the default gateway rootfs if needed"
+run = "crates/openshell-vm/scripts/build-rootfs.sh"
+hide = true
+
+["vm:codesign"]
+description = "Codesign the gateway binary for Hypervisor.framework access on macOS"
+run = "tasks/scripts/codesign-gateway.sh"
+hide = true
+
+["vm:bundle-runtime"]
+description = "Stage the gateway sidecar runtime bundle next to local build outputs"
+run = "tasks/scripts/bundle-vm-runtime.sh"
+hide = false
+
+["vm:package:gateway"]
+description = "Package the gateway binary with its sidecar runtime bundle"
+run = "tasks/scripts/package-gateway-runtime.sh"
+depends = ["vm:build:release", "vm:bundle-runtime"]
+hide = false

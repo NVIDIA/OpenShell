@@ -44,27 +44,16 @@ fn codesign_if_needed() {
     }
 }
 
-/// Build environment variables so libkrun can find libkrunfw at runtime.
-fn libkrun_env() -> Vec<(&'static str, String)> {
-    if cfg!(target_os = "macos") {
-        let homebrew_lib = Command::new("brew")
-            .args(["--prefix"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| format!("{}/lib", s.trim()))
-            .unwrap_or_else(|| "/opt/homebrew/lib".to_string());
-
-        let existing = std::env::var("DYLD_FALLBACK_LIBRARY_PATH").unwrap_or_default();
-        let val = if existing.is_empty() {
-            homebrew_lib
-        } else {
-            format!("{homebrew_lib}:{existing}")
-        };
-        vec![("DYLD_FALLBACK_LIBRARY_PATH", val)]
-    } else {
-        vec![]
-    }
+fn assert_runtime_bundle_staged() {
+    let bundle_dir = std::path::Path::new(GATEWAY)
+        .parent()
+        .expect("gateway binary has no parent")
+        .join("gateway.runtime");
+    assert!(
+        bundle_dir.is_dir(),
+        "gateway.runtime is missing next to the test binary: {}. Run `mise run vm:bundle-runtime` first.",
+        bundle_dir.display()
+    );
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -75,12 +64,10 @@ fn libkrun_env() -> Vec<(&'static str, String)> {
 #[ignore] // requires libkrun + rootfs
 fn gateway_boots_and_service_becomes_reachable() {
     codesign_if_needed();
+    assert_runtime_bundle_staged();
 
     let mut cmd = Command::new(GATEWAY);
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    for (k, v) in libkrun_env() {
-        cmd.env(k, v);
-    }
 
     let mut child = cmd.spawn().expect("failed to start gateway");
 
@@ -114,12 +101,10 @@ fn gateway_boots_and_service_becomes_reachable() {
 #[ignore] // requires libkrun + rootfs
 fn gateway_exec_runs_guest_command() {
     codesign_if_needed();
+    assert_runtime_bundle_staged();
 
     let mut cmd = Command::new(GATEWAY);
     cmd.args(["--exec", "/bin/true"]);
-    for (k, v) in libkrun_env() {
-        cmd.env(k, v);
-    }
 
     let output = cmd.output().expect("failed to run gateway --exec");
 

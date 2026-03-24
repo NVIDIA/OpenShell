@@ -17,7 +17,6 @@
 mod ffi;
 
 use std::ffi::CString;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::time::Instant;
@@ -48,6 +47,10 @@ pub enum VmError {
     /// A required host binary was not found.
     #[error("required binary not found: {path}\n{hint}")]
     BinaryNotFound { path: String, hint: String },
+
+    /// Host-side VM setup failed before boot.
+    #[error("host setup failed: {0}")]
+    HostSetup(String),
 
     /// `fork()` failed.
     #[error("fork() failed: {0}")]
@@ -88,6 +91,14 @@ pub enum NetBackend {
     },
 }
 
+/// Host Unix socket bridged into the guest as a vsock port.
+#[derive(Debug, Clone)]
+pub struct VsockPort {
+    pub port: u32,
+    pub socket_path: PathBuf,
+    pub listen: bool,
+}
+
 /// Configuration for a libkrun microVM.
 pub struct VmConfig {
     /// Path to the extracted rootfs directory (aarch64 Linux).
@@ -115,6 +126,9 @@ pub struct VmConfig {
     /// TCP port mappings in `"host_port:guest_port"` form.
     /// Only used with TSI networking.
     pub port_map: Vec<String>,
+
+    /// Optional host Unix sockets exposed to the guest over vsock.
+    pub vsock_ports: Vec<VsockPort>,
 
     /// libkrun log level (0=Off .. 5=Trace).
     pub log_level: u32,
@@ -159,10 +173,11 @@ impl VmConfig {
                 // port stays the same for CLI clients.
                 "30051:8080".to_string(),
             ],
+            vsock_ports: vec![],
             log_level: 3, // Info — for debugging
             console_output: None,
             net: NetBackend::Gvproxy {
-                binary: find_gvproxy().unwrap_or_else(|| PathBuf::from("/opt/podman/bin/gvproxy")),
+                binary: default_runtime_gvproxy_path(),
             },
         }
     }
@@ -183,86 +198,303 @@ fn c_string_array(strings: &[&str]) -> Result<(Vec<CString>, Vec<*const libc::c_
     Ok((owned, ptrs))
 }
 
-/// Discover the Homebrew lib directory.
-fn homebrew_lib_dir() -> String {
-    std::process::Command::new("brew")
-        .args(["--prefix"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout)
-                    .ok()
-                    .map(|s| format!("{}/lib", s.trim()))
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "/opt/homebrew/lib".to_string())
+const VM_RUNTIME_DIR_NAME: &str = "gateway.runtime";
+const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
+
+pub(crate) fn configured_runtime_dir() -> Result<PathBuf, VmError> {
+    if let Some(path) = std::env::var_os(VM_RUNTIME_DIR_ENV) {
+        return Ok(PathBuf::from(path));
+    }
+
+    let exe = std::env::current_exe().map_err(|e| VmError::HostSetup(e.to_string()))?;
+    let exe_dir = exe.parent().ok_or_else(|| {
+        VmError::HostSetup(format!(
+            "executable has no parent directory: {}",
+            exe.display()
+        ))
+    })?;
+    Ok(exe_dir.join(VM_RUNTIME_DIR_NAME))
 }
 
-/// Ensure `DYLD_FALLBACK_LIBRARY_PATH` includes the Homebrew lib directory.
-///
-/// libkrun loads `libkrunfw.5.dylib` at runtime via `dlopen`. On macOS, dyld
-/// only reads `DYLD_FALLBACK_LIBRARY_PATH` at process startup — setting it
-/// programmatically after launch has no effect. If the variable isn't already
-/// set, we re-exec the current process with it configured so dyld picks it up.
-///
-/// Returns `Ok(())` if the path is already set, or does not return (re-execs).
-fn ensure_krunfw_path() -> Result<(), VmError> {
-    let key = "DYLD_FALLBACK_LIBRARY_PATH";
-    let homebrew_lib = homebrew_lib_dir();
-
-    if let Ok(existing) = std::env::var(key)
-        && existing.contains(&homebrew_lib)
+fn required_runtime_lib_name() -> &'static str {
+    #[cfg(target_os = "macos")]
     {
-        return Ok(()); // Already set — nothing to do.
+        "libkrun.dylib"
     }
-
-    // Re-exec ourselves with the library path set. dyld will process it
-    // at startup, making libkrunfw discoverable for libkrun's dlopen.
-    let exe = std::env::current_exe().map_err(|e| VmError::Fork(e.to_string()))?;
-    let args: Vec<String> = std::env::args().collect();
-
-    let new_val = match std::env::var(key) {
-        Ok(existing) => format!("{homebrew_lib}:{existing}"),
-        Err(_) => homebrew_lib,
-    };
-
-    eprintln!("re-exec: setting {key} for libkrunfw discovery");
-    // SAFETY: single-threaded at this point (before fork).
-    unsafe {
-        std::env::set_var(key, &new_val);
+    #[cfg(not(target_os = "macos"))]
+    {
+        "libkrun.so"
     }
-
-    // exec replaces the process — if it returns, something went wrong.
-    let err = std::process::Command::new(exe).args(&args[1..]).exec();
-    Err(VmError::Fork(format!("re-exec failed: {err}")))
 }
 
-/// Try to find gvproxy in common locations.
-fn find_gvproxy() -> Option<PathBuf> {
-    // Check PATH first
-    if let Ok(output) = std::process::Command::new("which").arg("gvproxy").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(PathBuf::from(path));
-            }
+fn validate_runtime_dir(dir: &Path) -> Result<PathBuf, VmError> {
+    if !dir.is_dir() {
+        return Err(VmError::BinaryNotFound {
+            path: dir.display().to_string(),
+            hint: format!(
+                "stage the VM runtime bundle with `mise run vm:bundle-runtime` or set {VM_RUNTIME_DIR_ENV}"
+            ),
+        });
+    }
+
+    let libkrun = dir.join(required_runtime_lib_name());
+    if !libkrun.is_file() {
+        return Err(VmError::BinaryNotFound {
+            path: libkrun.display().to_string(),
+            hint: "runtime bundle is incomplete: missing libkrun".to_string(),
+        });
+    }
+
+    let has_krunfw = std::fs::read_dir(dir)
+        .map_err(|e| VmError::HostSetup(format!("read {}: {e}", dir.display())))?
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("libkrunfw.")
+        });
+    if !has_krunfw {
+        return Err(VmError::BinaryNotFound {
+            path: dir.display().to_string(),
+            hint: "runtime bundle is incomplete: missing libkrunfw".to_string(),
+        });
+    }
+
+    let gvproxy = dir.join("gvproxy");
+    if !gvproxy.is_file() {
+        return Err(VmError::BinaryNotFound {
+            path: gvproxy.display().to_string(),
+            hint: "runtime bundle is incomplete: missing gvproxy".to_string(),
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = std::fs::metadata(&gvproxy)
+            .map_err(|e| VmError::HostSetup(format!("stat {}: {e}", gvproxy.display())))?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            return Err(VmError::HostSetup(format!(
+                "gvproxy is not executable: {}",
+                gvproxy.display()
+            )));
         }
     }
-    // Common Podman installation paths
-    for p in &[
-        "/opt/podman/bin/gvproxy",
-        "/opt/homebrew/bin/gvproxy",
-        "/usr/local/bin/gvproxy",
-    ] {
-        let path = PathBuf::from(p);
-        if path.exists() {
-            return Some(path);
+
+    Ok(gvproxy)
+}
+
+fn resolve_runtime_bundle() -> Result<PathBuf, VmError> {
+    let runtime_dir = configured_runtime_dir()?;
+    validate_runtime_dir(&runtime_dir)
+}
+
+pub fn default_runtime_gvproxy_path() -> PathBuf {
+    configured_runtime_dir()
+        .unwrap_or_else(|_| PathBuf::from(VM_RUNTIME_DIR_NAME))
+        .join("gvproxy")
+}
+
+fn raise_nofile_limit() {
+    #[cfg(unix)]
+    unsafe {
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rlim) == 0 {
+            rlim.rlim_cur = rlim.rlim_max;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
         }
     }
-    None
+}
+
+fn clamp_log_level(level: u32) -> u32 {
+    match level {
+        0 => ffi::KRUN_LOG_LEVEL_OFF,
+        1 => ffi::KRUN_LOG_LEVEL_ERROR,
+        2 => ffi::KRUN_LOG_LEVEL_WARN,
+        3 => ffi::KRUN_LOG_LEVEL_INFO,
+        4 => ffi::KRUN_LOG_LEVEL_DEBUG,
+        _ => ffi::KRUN_LOG_LEVEL_TRACE,
+    }
+}
+
+struct VmContext {
+    krun: &'static ffi::LibKrun,
+    ctx_id: u32,
+}
+
+impl VmContext {
+    fn create(log_level: u32) -> Result<Self, VmError> {
+        let krun = ffi::libkrun()?;
+        unsafe {
+            check(
+                (krun.krun_init_log)(
+                    ffi::KRUN_LOG_TARGET_DEFAULT,
+                    clamp_log_level(log_level),
+                    ffi::KRUN_LOG_STYLE_AUTO,
+                    ffi::KRUN_LOG_OPTION_NO_ENV,
+                ),
+                "krun_init_log",
+            )?;
+        }
+
+        let ctx_id = unsafe { (krun.krun_create_ctx)() };
+        if ctx_id < 0 {
+            return Err(VmError::Krun {
+                func: "krun_create_ctx",
+                code: ctx_id,
+            });
+        }
+
+        Ok(Self {
+            krun,
+            ctx_id: ctx_id as u32,
+        })
+    }
+
+    fn set_vm_config(&self, vcpus: u8, mem_mib: u32) -> Result<(), VmError> {
+        unsafe {
+            check(
+                (self.krun.krun_set_vm_config)(self.ctx_id, vcpus, mem_mib),
+                "krun_set_vm_config",
+            )
+        }
+    }
+
+    fn set_root(&self, rootfs: &Path) -> Result<(), VmError> {
+        let rootfs_c = path_to_cstring(rootfs)?;
+        unsafe {
+            check(
+                (self.krun.krun_set_root)(self.ctx_id, rootfs_c.as_ptr()),
+                "krun_set_root",
+            )
+        }
+    }
+
+    fn set_workdir(&self, workdir: &str) -> Result<(), VmError> {
+        let workdir_c = CString::new(workdir)?;
+        unsafe {
+            check(
+                (self.krun.krun_set_workdir)(self.ctx_id, workdir_c.as_ptr()),
+                "krun_set_workdir",
+            )
+        }
+    }
+
+    fn disable_implicit_vsock(&self) -> Result<(), VmError> {
+        unsafe {
+            check(
+                (self.krun.krun_disable_implicit_vsock)(self.ctx_id),
+                "krun_disable_implicit_vsock",
+            )
+        }
+    }
+
+    fn add_vsock(&self, tsi_features: u32) -> Result<(), VmError> {
+        unsafe {
+            check(
+                (self.krun.krun_add_vsock)(self.ctx_id, tsi_features),
+                "krun_add_vsock",
+            )
+        }
+    }
+
+    fn add_net_unixgram(
+        &self,
+        socket_path: &Path,
+        mac: &[u8; 6],
+        features: u32,
+        flags: u32,
+    ) -> Result<(), VmError> {
+        let sock_c = path_to_cstring(socket_path)?;
+        unsafe {
+            check(
+                (self.krun.krun_add_net_unixgram)(
+                    self.ctx_id,
+                    sock_c.as_ptr(),
+                    -1,
+                    mac.as_ptr(),
+                    features,
+                    flags,
+                ),
+                "krun_add_net_unixgram",
+            )
+        }
+    }
+
+    fn set_port_map(&self, port_map: &[String]) -> Result<(), VmError> {
+        let port_strs: Vec<&str> = port_map.iter().map(String::as_str).collect();
+        let (_port_owners, port_ptrs) = c_string_array(&port_strs)?;
+        unsafe {
+            check(
+                (self.krun.krun_set_port_map)(self.ctx_id, port_ptrs.as_ptr()),
+                "krun_set_port_map",
+            )
+        }
+    }
+
+    fn add_vsock_port(&self, port: &VsockPort) -> Result<(), VmError> {
+        let socket_c = path_to_cstring(&port.socket_path)?;
+        unsafe {
+            check(
+                (self.krun.krun_add_vsock_port2)(
+                    self.ctx_id,
+                    port.port,
+                    socket_c.as_ptr(),
+                    port.listen,
+                ),
+                "krun_add_vsock_port2",
+            )
+        }
+    }
+
+    fn set_console_output(&self, path: &Path) -> Result<(), VmError> {
+        let console_c = path_to_cstring(path)?;
+        unsafe {
+            check(
+                (self.krun.krun_set_console_output)(self.ctx_id, console_c.as_ptr()),
+                "krun_set_console_output",
+            )
+        }
+    }
+
+    fn set_exec(&self, exec_path: &str, args: &[String], env: &[String]) -> Result<(), VmError> {
+        let exec_c = CString::new(exec_path)?;
+        let argv_strs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (_argv_owners, argv_ptrs) = c_string_array(&argv_strs)?;
+        let env_strs: Vec<&str> = env.iter().map(String::as_str).collect();
+        let (_env_owners, env_ptrs) = c_string_array(&env_strs)?;
+
+        unsafe {
+            check(
+                (self.krun.krun_set_exec)(
+                    self.ctx_id,
+                    exec_c.as_ptr(),
+                    argv_ptrs.as_ptr(),
+                    env_ptrs.as_ptr(),
+                ),
+                "krun_set_exec",
+            )
+        }
+    }
+
+    fn start_enter(&self) -> i32 {
+        unsafe { (self.krun.krun_start_enter)(self.ctx_id) }
+    }
+}
+
+impl Drop for VmContext {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = (self.krun.krun_free_ctx)(self.ctx_id);
+        }
+    }
 }
 
 /// Issue a gvproxy expose call via its HTTP API (unix socket).
@@ -361,54 +593,17 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
     eprintln!("rootfs: {}", config.rootfs.display());
     eprintln!("vm: {} vCPU(s), {} MiB RAM", config.vcpus, config.mem_mib);
 
-    // Ensure libkrunfw is discoverable. On macOS, dyld only reads
-    // DYLD_FALLBACK_LIBRARY_PATH at startup, so if it's not set we
-    // re-exec ourselves with it configured (this call won't return).
-    ensure_krunfw_path()?;
+    // The runtime must already be staged as a sidecar bundle next to the
+    // binary (or explicitly pointed to via OPENSHELL_VM_RUNTIME_DIR).
+    resolve_runtime_bundle()?;
+    raise_nofile_limit();
 
     // ── Configure the microVM ──────────────────────────────────────
 
-    unsafe {
-        check(
-            ffi::krun_set_log_level(config.log_level),
-            "krun_set_log_level",
-        )?;
-    }
-
-    let ctx_id = unsafe { ffi::krun_create_ctx() };
-    if ctx_id < 0 {
-        return Err(VmError::Krun {
-            func: "krun_create_ctx",
-            code: ctx_id,
-        });
-    }
-    #[allow(clippy::cast_sign_loss)]
-    let ctx_id = ctx_id as u32;
-
-    unsafe {
-        check(
-            ffi::krun_set_vm_config(ctx_id, config.vcpus, config.mem_mib),
-            "krun_set_vm_config",
-        )?;
-    }
-
-    // Root filesystem (virtio-fs)
-    let rootfs_c = path_to_cstring(&config.rootfs)?;
-    unsafe {
-        check(
-            ffi::krun_set_root(ctx_id, rootfs_c.as_ptr()),
-            "krun_set_root",
-        )?;
-    }
-
-    // Working directory
-    let workdir_c = CString::new(config.workdir.as_str())?;
-    unsafe {
-        check(
-            ffi::krun_set_workdir(ctx_id, workdir_c.as_ptr()),
-            "krun_set_workdir",
-        )?;
-    }
+    let vm = VmContext::create(config.log_level)?;
+    vm.set_vm_config(config.vcpus, config.mem_mib)?;
+    vm.set_root(&config.rootfs)?;
+    vm.set_workdir(&config.workdir)?;
 
     // Networking setup
     let mut gvproxy_child: Option<std::process::Child> = None;
@@ -419,13 +614,8 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
             // Default TSI — no special setup needed.
         }
         NetBackend::None => {
-            unsafe {
-                check(
-                    ffi::krun_disable_implicit_vsock(ctx_id),
-                    "krun_disable_implicit_vsock",
-                )?;
-                check(ffi::krun_add_vsock(ctx_id, 0), "krun_add_vsock")?;
-            }
+            vm.disable_implicit_vsock()?;
+            vm.add_vsock(0)?;
             eprintln!("Networking: disabled (no TSI, no virtio-net)");
         }
         NetBackend::Gvproxy { binary } => {
@@ -494,15 +684,8 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
             }
 
             // Disable implicit TSI and add virtio-net via gvproxy
-            unsafe {
-                check(
-                    ffi::krun_disable_implicit_vsock(ctx_id),
-                    "krun_disable_implicit_vsock",
-                )?;
-                check(ffi::krun_add_vsock(ctx_id, 0), "krun_add_vsock")?;
-            }
-
-            let sock_c = path_to_cstring(&vfkit_sock)?;
+            vm.disable_implicit_vsock()?;
+            vm.add_vsock(0)?;
             // This MAC matches gvproxy's default static DHCP lease for
             // 192.168.127.2. Using a different MAC can cause the gVisor
             // network stack to misroute or drop packets.
@@ -523,19 +706,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                 | NET_FEATURE_HOST_UFO;
             const NET_FLAG_VFKIT: u32 = 1 << 0;
 
-            unsafe {
-                check(
-                    ffi::krun_add_net_unixgram(
-                        ctx_id,
-                        sock_c.as_ptr(),
-                        -1,
-                        mac.as_ptr(),
-                        COMPAT_NET_FEATURES,
-                        NET_FLAG_VFKIT,
-                    ),
-                    "krun_add_net_unixgram",
-                )?;
-            }
+            vm.add_net_unixgram(&vfkit_sock, &mac, COMPAT_NET_FEATURES, NET_FLAG_VFKIT)?;
 
             eprintln!(
                 "Networking: gvproxy (virtio-net) [{:.1}s]",
@@ -548,14 +719,11 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
 
     // Port mapping (TSI only)
     if !config.port_map.is_empty() && matches!(config.net, NetBackend::Tsi) {
-        let port_strs: Vec<&str> = config.port_map.iter().map(String::as_str).collect();
-        let (_port_owners, port_ptrs) = c_string_array(&port_strs)?;
-        unsafe {
-            check(
-                ffi::krun_set_port_map(ctx_id, port_ptrs.as_ptr()),
-                "krun_set_port_map",
-            )?;
-        }
+        vm.set_port_map(&config.port_map)?;
+    }
+
+    for vsock_port in &config.vsock_ports {
+        vm.add_vsock_port(vsock_port)?;
     }
 
     // Console output
@@ -566,45 +734,22 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
             .unwrap_or(&config.rootfs)
             .join("console.log")
     });
-    let console_c = path_to_cstring(&console_log)?;
-    unsafe {
-        check(
-            ffi::krun_set_console_output(ctx_id, console_c.as_ptr()),
-            "krun_set_console_output",
-        )?;
-    }
-
-    // Executable, argv, envp
-    let exec_c = CString::new(config.exec_path.as_str())?;
-
-    // argv: libkrun's init sets argv[0] from exec_path internally,
-    // so we only pass the actual arguments here.
-    let argv_strs: Vec<&str> = config.args.iter().map(String::as_str).collect();
-    let (_argv_owners, argv_ptrs) = c_string_array(&argv_strs)?;
+    vm.set_console_output(&console_log)?;
 
     // envp: use provided env or minimal defaults
-    let env_strs: Vec<&str> = if config.env.is_empty() {
+    let env: Vec<String> = if config.env.is_empty() {
         vec![
             "HOME=/root",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "TERM=xterm",
         ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect()
     } else {
-        config.env.iter().map(String::as_str).collect()
+        config.env.clone()
     };
-    let (_env_owners, env_ptrs) = c_string_array(&env_strs)?;
-
-    unsafe {
-        check(
-            ffi::krun_set_exec(
-                ctx_id,
-                exec_c.as_ptr(),
-                argv_ptrs.as_ptr(),
-                env_ptrs.as_ptr(),
-            ),
-            "krun_set_exec",
-        )?;
-    }
+    vm.set_exec(&config.exec_path, &config.args, &env)?;
 
     // ── Fork and enter the VM ──────────────────────────────────────
     //
@@ -619,7 +764,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
         -1 => Err(VmError::Fork(std::io::Error::last_os_error().to_string())),
         0 => {
             // Child process: enter the VM (never returns on success)
-            let ret = unsafe { ffi::krun_start_enter(ctx_id) };
+            let ret = vm.start_enter();
             eprintln!("krun_start_enter failed: {ret}");
             std::process::exit(1);
         }
@@ -1189,7 +1334,7 @@ fn host_tcp_probe() -> bool {
     }
 }
 
-/// Poll kubectl until the `navigator` namespace exists.
+/// Poll kubectl until the `openshell` namespace exists.
 ///
 /// Uses exponential backoff (500ms → 3s) to minimize latency when the
 /// namespace appears quickly while avoiding kubectl spam.
@@ -1202,21 +1347,21 @@ fn wait_for_namespace(kubeconfig: &str) -> Result<(), VmError> {
     loop {
         let output = std::process::Command::new("kubectl")
             .args(["--kubeconfig", kubeconfig])
-            .args(["get", "namespace", "navigator", "-o", "name"])
+            .args(["get", "namespace", "openshell", "-o", "name"])
             .output();
 
         if let Ok(output) = output
             && output.status.success()
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.contains("navigator") {
+            if stdout.contains("openshell") {
                 return Ok(());
             }
         }
 
         if start.elapsed() >= timeout {
             return Err(VmError::Bootstrap(
-                "timed out waiting for navigator namespace (180s). \
+                "timed out waiting for openshell namespace (180s). \
                  Check console.log for k3s errors."
                     .to_string(),
             ));
@@ -1225,7 +1370,7 @@ fn wait_for_namespace(kubeconfig: &str) -> Result<(), VmError> {
         attempts += 1;
         if attempts.is_multiple_of(10) {
             eprintln!(
-                "  still waiting for navigator namespace ({:.0}s elapsed)",
+                "  still waiting for openshell namespace ({:.0}s elapsed)",
                 start.elapsed().as_secs_f64()
             );
         }
@@ -1252,7 +1397,7 @@ fn apply_tls_secrets(
             "kind": "Secret",
             "metadata": {
                 "name": openshell_bootstrap::constants::SERVER_TLS_SECRET_NAME,
-                "namespace": "navigator"
+                "namespace": "openshell"
             },
             "type": "kubernetes.io/tls",
             "data": {
@@ -1266,7 +1411,7 @@ fn apply_tls_secrets(
             "kind": "Secret",
             "metadata": {
                 "name": openshell_bootstrap::constants::SERVER_CLIENT_CA_SECRET_NAME,
-                "namespace": "navigator"
+                "namespace": "openshell"
             },
             "type": "Opaque",
             "data": {
@@ -1279,7 +1424,7 @@ fn apply_tls_secrets(
             "kind": "Secret",
             "metadata": {
                 "name": openshell_bootstrap::constants::CLIENT_TLS_SECRET_NAME,
-                "namespace": "navigator"
+                "namespace": "openshell"
             },
             "type": "Opaque",
             "data": {
@@ -1339,5 +1484,70 @@ extern "C" fn forward_signal(_sig: libc::c_int) {
         unsafe {
             libc::kill(pid, libc::SIGTERM);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_runtime_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "openshell-vm-runtime-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn write_runtime_file(path: &Path) {
+        fs::write(path, b"test").expect("failed to write runtime file");
+    }
+
+    #[test]
+    fn validate_runtime_dir_accepts_minimal_bundle() {
+        let dir = temp_runtime_dir();
+        fs::create_dir_all(&dir).expect("failed to create runtime dir");
+
+        write_runtime_file(&dir.join(required_runtime_lib_name()));
+        write_runtime_file(&dir.join("libkrunfw.test"));
+        let gvproxy = dir.join("gvproxy");
+        write_runtime_file(&gvproxy);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mut perms = fs::metadata(&gvproxy).expect("stat gvproxy").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&gvproxy, perms).expect("chmod gvproxy");
+        }
+
+        let resolved_gvproxy = validate_runtime_dir(&dir).expect("runtime bundle should validate");
+        assert_eq!(resolved_gvproxy, gvproxy);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_runtime_dir_requires_gvproxy() {
+        let dir = temp_runtime_dir();
+        fs::create_dir_all(&dir).expect("failed to create runtime dir");
+
+        write_runtime_file(&dir.join(required_runtime_lib_name()));
+        write_runtime_file(&dir.join("libkrunfw.test"));
+
+        let err = validate_runtime_dir(&dir).expect_err("missing gvproxy should fail");
+        match err {
+            VmError::BinaryNotFound { hint, .. } => {
+                assert!(hint.contains("missing gvproxy"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
