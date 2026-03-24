@@ -171,16 +171,25 @@ network_action := "allow" if {
 
 default allow_request = false
 
-# L7 request allowed if: L4 policy matches AND the specific endpoint's rules allow the request.
+# Per-policy helper: true when this single policy has at least one endpoint
+# matching the L4 request whose L7 rules also permit the specific request.
+# Isolating the endpoint iteration inside a function avoids the regorus
+# "duplicated definition of local variable" error that occurs when the
+# outer `some name` iterates over multiple policies that share a host:port.
+_policy_allows_l7(policy) if {
+	some ep
+	ep := policy.endpoints[_]
+	endpoint_matches_request(ep, input.network)
+	request_allowed_for_endpoint(input.request, ep)
+}
+
+# L7 request allowed if any matching L4 policy also allows the L7 request.
 allow_request if {
 	some name
 	policy := data.network_policies[name]
 	endpoint_allowed(policy, input.network)
 	binary_allowed(policy, input.exec)
-	some ep
-	ep := policy.endpoints[_]
-	endpoint_matches_request(ep, input.network)
-	request_allowed_for_endpoint(input.request, ep)
+	_policy_allows_l7(policy)
 }
 
 # --- L7 deny reason ---
@@ -239,17 +248,22 @@ command_matches(actual, expected) if {
 # Used by Rust to extract L7 config (protocol, tls, enforcement) and/or
 # allowed_ips for SSRF allowlist validation.
 
-# Collect all matching endpoint configs into an array to avoid complete-rule
-# conflicts when multiple policies cover the same endpoint.  Return the first.
-_matching_endpoint_configs := [ep |
-	some name
-	policy := data.network_policies[name]
-	endpoint_allowed(policy, input.network)
-	binary_allowed(policy, input.exec)
+# Per-policy helper: returns matching endpoint configs for a single policy.
+_policy_endpoint_configs(policy) := [ep |
 	some ep
 	ep := policy.endpoints[_]
 	endpoint_matches_request(ep, input.network)
 	endpoint_has_extended_config(ep)
+]
+
+# Collect matching endpoint configs across all policies.  Iterates over
+# _matching_policy_names (a set, safe from regorus variable collisions)
+# then collects per-policy configs via the helper function.
+_matching_endpoint_configs := [cfg |
+	some pname
+	_matching_policy_names[pname]
+	cfgs := _policy_endpoint_configs(data.network_policies[pname])
+	cfg := cfgs[_]
 ]
 
 matched_endpoint_config := _matching_endpoint_configs[0] if {

@@ -2522,22 +2522,60 @@ async fn merge_chunk_into_policy(
 
         let base_version = latest.as_ref().map_or(0, |r| r.version);
 
-        // Merge: if a rule for this endpoint already exists, add the binary
-        // to its binaries list. Otherwise insert the whole proposed rule.
-        if let Some(existing) = policy.network_policies.get_mut(&chunk.rule_name) {
-            // Add the chunk's binary if not already present.
+        // Merge: find an existing rule that covers the same (host, port),
+        // regardless of its map key / rule name.  This prevents duplicate
+        // entries when the mechanistic mapper generates a name like
+        // "allow_192_168_86_157_8567" and the user's original rule uses a
+        // different name (e.g. "test_server").
+        //
+        // Search order:
+        // 1. Exact rule_name match (fast path — covers auto-generated chunks
+        //    being re-approved and user rules whose names happen to match).
+        // 2. Scan all entries for a host:port endpoint match.
+        // 3. Fall through to insertion if neither matches.
+        let chunk_host_lc = chunk.host.to_lowercase();
+        let chunk_port = chunk.port as u32;
+
+        let merge_key = if policy.network_policies.contains_key(&chunk.rule_name) {
+            Some(chunk.rule_name.clone())
+        } else {
+            policy.network_policies.iter().find_map(|(key, existing_rule)| {
+                let has_match = existing_rule.endpoints.iter().any(|ep| {
+                    let host_match = ep.host.to_lowercase() == chunk_host_lc;
+                    let port_match = if ep.ports.is_empty() {
+                        ep.port == chunk_port
+                    } else {
+                        ep.ports.contains(&chunk_port)
+                    };
+                    host_match && port_match
+                });
+                has_match.then(|| key.clone())
+            })
+        };
+
+        if let Some(key) = merge_key {
+            let existing = policy.network_policies.get_mut(&key).unwrap();
+            // Add the chunk's binaries if not already present.
             for b in &rule.binaries {
                 if !existing.binaries.iter().any(|eb| eb.path == b.path) {
                     existing.binaries.push(b.clone());
                 }
             }
-            // Also merge endpoints and L7 rules in case they differ.
+            // Merge endpoints: for matching host:port, merge fields like
+            // allowed_ips into the existing endpoint rather than duplicating.
             for ep in &rule.endpoints {
-                if !existing
-                    .endpoints
-                    .iter()
-                    .any(|e| e.host == ep.host && e.port == ep.port)
-                {
+                if let Some(existing_ep) = existing.endpoints.iter_mut().find(|e| {
+                    e.host.to_lowercase() == ep.host.to_lowercase()
+                        && (e.port == ep.port
+                            || (!e.ports.is_empty() && e.ports.contains(&ep.port)))
+                }) {
+                    // Merge allowed_ips into the existing endpoint.
+                    for ip in &ep.allowed_ips {
+                        if !existing_ep.allowed_ips.contains(ip) {
+                            existing_ep.allowed_ips.push(ip.clone());
+                        }
+                    }
+                } else {
                     existing.endpoints.push(ep.clone());
                 }
             }
@@ -5354,6 +5392,210 @@ mod tests {
         assert_eq!(stored_rule.endpoints[0].host, "google.com");
         assert_eq!(stored_rule.endpoints[0].port, 443);
         assert_eq!(stored_rule.binaries[0].path, "/usr/bin/curl");
+    }
+
+    #[tokio::test]
+    async fn merge_chunk_merges_into_existing_rule_by_host_port() {
+        // When a user's policy has a rule named "test_server" covering
+        // 192.168.1.100:8567, and the mechanistic mapper generates a chunk
+        // named "allow_192_168_1_100_8567" for the same host:port, the merge
+        // should add allowed_ips into the existing "test_server" entry rather
+        // than creating a duplicate.
+        use openshell_core::proto::{
+            NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
+        };
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let sandbox_id = "sb-merge";
+
+        // Seed an initial policy with a user-named rule.
+        let initial_policy = SandboxPolicy {
+            network_policies: [(
+                "test_server".to_string(),
+                NetworkPolicyRule {
+                    name: "test_server".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "192.168.1.100".to_string(),
+                        port: 8567,
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/curl".to_string(),
+                        ..Default::default()
+                    }],
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        store
+            .put_policy_revision(
+                "p-seed",
+                sandbox_id,
+                1,
+                &initial_policy.encode_to_vec(),
+                "seed-hash",
+            )
+            .await
+            .unwrap();
+
+        // Build a chunk with a different rule_name but same host:port.
+        let proposed = NetworkPolicyRule {
+            name: "allow_192_168_1_100_8567".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "192.168.1.100".to_string(),
+                port: 8567,
+                allowed_ips: vec!["192.168.1.100".to_string()],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let chunk = DraftChunkRecord {
+            id: "chunk-merge".to_string(),
+            sandbox_id: sandbox_id.to_string(),
+            draft_version: 1,
+            status: "pending".to_string(),
+            rule_name: "allow_192_168_1_100_8567".to_string(),
+            proposed_rule: proposed.encode_to_vec(),
+            rationale: String::new(),
+            security_notes: String::new(),
+            confidence: 0.3,
+            created_at_ms: 0,
+            decided_at_ms: None,
+            host: "192.168.1.100".to_string(),
+            port: 8567,
+            binary: "/usr/bin/curl".to_string(),
+            hit_count: 1,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+        };
+
+        let (version, _) = merge_chunk_into_policy(&store, sandbox_id, &chunk)
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
+
+        let latest = store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .expect("policy revision should be persisted");
+        let policy = SandboxPolicy::decode(latest.policy_payload.as_slice()).unwrap();
+
+        // Should have exactly one network_policies entry (no duplicate).
+        assert_eq!(
+            policy.network_policies.len(),
+            1,
+            "expected 1 rule, got {}: {:?}",
+            policy.network_policies.len(),
+            policy.network_policies.keys().collect::<Vec<_>>()
+        );
+        // The entry should keep the user's original key name.
+        let rule = policy
+            .network_policies
+            .get("test_server")
+            .expect("original rule name 'test_server' should be preserved");
+        assert_eq!(rule.endpoints[0].host, "192.168.1.100");
+        // allowed_ips should have been merged in.
+        assert_eq!(rule.endpoints[0].allowed_ips, vec!["192.168.1.100"]);
+    }
+
+    #[tokio::test]
+    async fn merge_chunk_new_host_port_inserts_new_entry() {
+        // When a chunk's host:port doesn't match any existing rule, it should
+        // be inserted as a new entry (existing behavior preserved).
+        use openshell_core::proto::{
+            NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
+        };
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let sandbox_id = "sb-new";
+
+        let initial_policy = SandboxPolicy {
+            network_policies: [(
+                "existing_rule".to_string(),
+                NetworkPolicyRule {
+                    name: "existing_rule".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/curl".to_string(),
+                        ..Default::default()
+                    }],
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        store
+            .put_policy_revision(
+                "p-seed",
+                sandbox_id,
+                1,
+                &initial_policy.encode_to_vec(),
+                "seed-hash",
+            )
+            .await
+            .unwrap();
+
+        // Chunk for a different host:port.
+        let proposed = NetworkPolicyRule {
+            name: "allow_10_0_0_5_8080".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "10.0.0.5".to_string(),
+                port: 8080,
+                allowed_ips: vec!["10.0.0.5".to_string()],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let chunk = DraftChunkRecord {
+            id: "chunk-new".to_string(),
+            sandbox_id: sandbox_id.to_string(),
+            draft_version: 1,
+            status: "pending".to_string(),
+            rule_name: "allow_10_0_0_5_8080".to_string(),
+            proposed_rule: proposed.encode_to_vec(),
+            rationale: String::new(),
+            security_notes: String::new(),
+            confidence: 0.3,
+            created_at_ms: 0,
+            decided_at_ms: None,
+            host: "10.0.0.5".to_string(),
+            port: 8080,
+            binary: "/usr/bin/curl".to_string(),
+            hit_count: 1,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+        };
+
+        let (version, _) = merge_chunk_into_policy(&store, sandbox_id, &chunk)
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
+
+        let latest = store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let policy = SandboxPolicy::decode(latest.policy_payload.as_slice()).unwrap();
+
+        // Should have two entries now.
+        assert_eq!(policy.network_policies.len(), 2);
+        assert!(policy.network_policies.contains_key("existing_rule"));
+        assert!(policy.network_policies.contains_key("allow_10_0_0_5_8080"));
     }
 
     // ── petname default name generation ───────────────────────────────

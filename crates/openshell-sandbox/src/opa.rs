@@ -921,12 +921,10 @@ mod tests {
         let config = engine.query_sandbox_config().unwrap();
         assert!(config.filesystem.include_workdir);
         assert!(config.filesystem.read_only.contains(&PathBuf::from("/usr")));
-        assert!(
-            config
-                .filesystem
-                .read_write
-                .contains(&PathBuf::from("/tmp"))
-        );
+        assert!(config
+            .filesystem
+            .read_write
+            .contains(&PathBuf::from("/tmp")));
     }
 
     #[test]
@@ -1285,12 +1283,10 @@ network_policies:
         let config = engine.query_sandbox_config().unwrap();
         assert!(config.filesystem.include_workdir);
         assert!(config.filesystem.read_only.contains(&PathBuf::from("/usr")));
-        assert!(
-            config
-                .filesystem
-                .read_write
-                .contains(&PathBuf::from("/tmp"))
-        );
+        assert!(config
+            .filesystem
+            .read_write
+            .contains(&PathBuf::from("/tmp")));
         assert_eq!(config.process.run_as_user.as_deref(), Some("sandbox"));
         assert_eq!(config.process.run_as_group.as_deref(), Some("sandbox"));
     }
@@ -1566,6 +1562,92 @@ process:
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
         assert_eq!(val, regorus::Value::from(true));
+    }
+
+    // ========================================================================
+    // Overlapping policies (duplicate host:port) — regression tests
+    // ========================================================================
+
+    /// Two network_policies entries covering the same host:port with L7 rules.
+    /// Before the fix, this caused regorus to fail with
+    /// "duplicated definition of local variable ep" in allow_request.
+    const OVERLAPPING_L7_TEST_DATA: &str = r#"
+network_policies:
+  test_server:
+    name: test_server
+    endpoints:
+      - host: 192.168.1.100
+        port: 8567
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "**"
+    binaries:
+      - { path: /usr/bin/curl }
+  allow_192_168_1_100_8567:
+    name: allow_192_168_1_100_8567
+    endpoints:
+      - host: 192.168.1.100
+        port: 8567
+        protocol: rest
+        enforcement: enforce
+        allowed_ips:
+          - 192.168.1.100
+        rules:
+          - allow:
+              method: GET
+              path: "**"
+    binaries:
+      - { path: /usr/bin/curl }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+
+    #[test]
+    fn l7_overlapping_policies_allow_request_does_not_crash() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, OVERLAPPING_L7_TEST_DATA)
+            .expect("engine should load overlapping data");
+        let input = l7_input("192.168.1.100", 8567, "GET", "/test");
+        // Should not panic or error — must evaluate to true.
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_overlapping_policies_deny_request_does_not_crash() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, OVERLAPPING_L7_TEST_DATA)
+            .expect("engine should load overlapping data");
+        let input = l7_input("192.168.1.100", 8567, "DELETE", "/test");
+        // DELETE is not in the rules, so should deny — but must not crash.
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn overlapping_policies_endpoint_config_returns_result() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, OVERLAPPING_L7_TEST_DATA)
+            .expect("engine should load overlapping data");
+        let input = NetworkInput {
+            host: "192.168.1.100".into(),
+            port: 8567,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        // Should return config from one of the entries without error.
+        let config = engine.query_endpoint_config(&input).unwrap();
+        assert!(
+            config.is_some(),
+            "Expected endpoint config for overlapping policies"
+        );
     }
 
     // ========================================================================
