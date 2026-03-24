@@ -3997,11 +3997,14 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
 // Provider CRUD
 // ---------------------------------------------------------------------------
 
-/// Strip credential values from a provider before returning it in a gRPC
-/// response.  Internal server paths (inference routing, sandbox env injection)
-/// read credentials from the store directly and are unaffected.
+/// Redact credential values from a provider before returning it in a gRPC
+/// response.  Key names are preserved so callers can display credential counts
+/// and key listings.  Internal server paths (inference routing, sandbox env
+/// injection) read credentials from the store directly and are unaffected.
 fn redact_provider_credentials(mut provider: Provider) -> Provider {
-    provider.credentials.clear();
+    for value in provider.credentials.values_mut() {
+        *value = "REDACTED".to_string();
+    }
     provider
 }
 
@@ -4472,10 +4475,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(updated.id, provider_id);
-        // Credentials are redacted in responses.
-        assert!(
-            updated.credentials.is_empty(),
-            "credentials must be redacted in gRPC responses"
+        // Credential keys are preserved but values are redacted in responses.
+        assert_eq!(updated.credentials.len(), 2);
+        assert_eq!(
+            updated.credentials.get("API_TOKEN"),
+            Some(&"REDACTED".to_string()),
+            "credential values must be redacted in gRPC responses"
+        );
+        assert_eq!(
+            updated.credentials.get("SECONDARY"),
+            Some(&"REDACTED".to_string()),
         );
         // Verify the store still has full credentials.
         let stored: Provider = store
@@ -4581,8 +4590,12 @@ mod tests {
 
         assert_eq!(updated.id, persisted.id);
         assert_eq!(updated.r#type, "nvidia");
-        // Credentials are redacted in responses.
-        assert!(updated.credentials.is_empty());
+        // Credential keys are preserved but values are redacted in responses.
+        assert_eq!(updated.credentials.len(), 2);
+        assert_eq!(
+            updated.credentials.get("API_TOKEN"),
+            Some(&"REDACTED".to_string())
+        );
         assert_eq!(updated.config.len(), 2);
         assert_eq!(
             updated.config.get("endpoint"),
@@ -4621,8 +4634,13 @@ mod tests {
         .await
         .unwrap();
 
-        // Credentials are redacted in responses.
-        assert!(updated.credentials.is_empty());
+        // Credential keys are preserved but values are redacted; SECONDARY was deleted.
+        assert_eq!(updated.credentials.len(), 1);
+        assert_eq!(
+            updated.credentials.get("API_TOKEN"),
+            Some(&"REDACTED".to_string())
+        );
+        assert!(updated.credentials.get("SECONDARY").is_none());
         assert_eq!(updated.config.len(), 1);
         assert_eq!(
             updated.config.get("endpoint"),
