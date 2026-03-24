@@ -59,19 +59,9 @@ RUN case "$TARGETARCH" in \
     && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${gh_arch}.tar.gz" \
     | tar xz --strip-components=2 -C /usr/local/bin "gh_${GH_VERSION}_linux_${gh_arch}/bin/gh"
 
-# Install AWS CLI v2 used for ECR publishing
-RUN case "$TARGETARCH" in \
-      amd64) aws_arch=x86_64 ;; \
-      arm64) aws_arch=aarch64 ;; \
-      *) echo "Unsupported TARGETARCH: $TARGETARCH"; exit 1 ;; \
-    esac \
-    && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip" -o /tmp/awscliv2.zip \
-    && unzip -q /tmp/awscliv2.zip -d /tmp \
-    && /tmp/aws/install \
-    && rm -rf /tmp/aws /tmp/awscliv2.zip
-
 # Install mise
-RUN curl https://mise.run | sh
+ARG MISE_VERSION=v2026.3.13
+RUN curl https://mise.run | MISE_VERSION=$MISE_VERSION sh
 
 # Copy mise.toml and task includes, then install all tools via mise
 COPY mise.toml /opt/mise/mise.toml
@@ -81,7 +71,8 @@ RUN --mount=type=secret,id=MISE_GITHUB_TOKEN \
     export MISE_GITHUB_TOKEN="$(cat /run/secrets/MISE_GITHUB_TOKEN 2>/dev/null || true)" && \
     mise trust /opt/mise/mise.toml && \
     env -u RUSTC_WRAPPER mise install && \
-    /root/.cargo/bin/rustup component remove rust-docs || true && \
+    mise reshim && \
+    (/root/.cargo/bin/rustup component remove rust-docs || true) && \
     rm -rf /root/.rustup/toolchains/*/share/doc /root/.rustup/toolchains/*/share/man
 
 # Set working directory for CI jobs
