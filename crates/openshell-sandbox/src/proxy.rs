@@ -418,7 +418,12 @@ async fn handle_tcp_connection(
     // Query allowed_ips from the matched endpoint config (if any).
     // When present, the SSRF check validates resolved IPs against this
     // allowlist instead of blanket-blocking all private IPs.
-    let raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
+    // When the policy host is already a literal IP address, treat it as
+    // implicitly allowed — the user explicitly declared the destination.
+    let mut raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
+    if raw_allowed_ips.is_empty() {
+        raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
+    }
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
     let mut upstream = if !raw_allowed_ips.is_empty() {
@@ -1236,6 +1241,19 @@ fn is_internal_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// When the policy endpoint host is a literal IP address, the user has
+/// explicitly declared intent to allow that destination.  Synthesize an
+/// `allowed_ips` entry so the existing allowlist-validation path is used
+/// instead of the blanket internal-IP rejection.  Loopback and link-local
+/// addresses are still blocked by `resolve_and_check_allowed_ips`.
+fn implicit_allowed_ips_for_ip_host(host: &str) -> Vec<String> {
+    if host.parse::<IpAddr>().is_ok() {
+        vec![host.to_string()]
+    } else {
+        vec![]
+    }
+}
+
 /// Resolve DNS for a host:port and reject if any resolved address is internal.
 ///
 /// Returns the resolved `SocketAddr` list on success. Returns an error string
@@ -1806,7 +1824,12 @@ async fn handle_forward_proxy(
     //    - If allowed_ips is set: validate resolved IPs against the allowlist
     //      (this is the SSRF override for private IP destinations).
     //    - If allowed_ips is empty: reject internal IPs, allow public IPs through.
-    let raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
+    //    When the policy host is already a literal IP address, treat it as
+    //    implicitly allowed — the user explicitly declared the destination.
+    let mut raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
+    if raw_allowed_ips.is_empty() {
+        raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
+    }
 
     let addrs = if !raw_allowed_ips.is_empty() {
         // allowed_ips mode: validate resolved IPs against CIDR allowlist.
@@ -2742,5 +2765,31 @@ mod tests {
             err.contains("always-blocked"),
             "expected 'always-blocked' in error: {err}"
         );
+    }
+
+    // -- implicit_allowed_ips_for_ip_host --
+
+    #[test]
+    fn test_implicit_allowed_ips_returns_ip_for_ipv4_literal() {
+        let result = implicit_allowed_ips_for_ip_host("192.168.1.100");
+        assert_eq!(result, vec!["192.168.1.100"]);
+    }
+
+    #[test]
+    fn test_implicit_allowed_ips_returns_ip_for_ipv6_literal() {
+        let result = implicit_allowed_ips_for_ip_host("::1");
+        assert_eq!(result, vec!["::1"]);
+    }
+
+    #[test]
+    fn test_implicit_allowed_ips_returns_empty_for_hostname() {
+        let result = implicit_allowed_ips_for_ip_host("api.github.com");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_implicit_allowed_ips_returns_empty_for_wildcard() {
+        let result = implicit_allowed_ips_for_ip_host("*.example.com");
+        assert!(result.is_empty());
     }
 }
