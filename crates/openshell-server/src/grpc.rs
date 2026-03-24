@@ -2539,18 +2539,21 @@ async fn merge_chunk_into_policy(
         let merge_key = if policy.network_policies.contains_key(&chunk.rule_name) {
             Some(chunk.rule_name.clone())
         } else {
-            policy.network_policies.iter().find_map(|(key, existing_rule)| {
-                let has_match = existing_rule.endpoints.iter().any(|ep| {
-                    let host_match = ep.host.to_lowercase() == chunk_host_lc;
-                    let port_match = if ep.ports.is_empty() {
-                        ep.port == chunk_port
-                    } else {
-                        ep.ports.contains(&chunk_port)
-                    };
-                    host_match && port_match
-                });
-                has_match.then(|| key.clone())
-            })
+            policy
+                .network_policies
+                .iter()
+                .find_map(|(key, existing_rule)| {
+                    let has_match = existing_rule.endpoints.iter().any(|ep| {
+                        let host_match = ep.host.to_lowercase() == chunk_host_lc;
+                        let port_match = if ep.ports.is_empty() {
+                            ep.port == chunk_port
+                        } else {
+                            ep.ports.contains(&chunk_port)
+                        };
+                        host_match && port_match
+                    });
+                    has_match.then(|| key.clone())
+                })
         };
 
         if let Some(key) = merge_key {
@@ -5585,11 +5588,7 @@ mod tests {
             .unwrap();
         assert_eq!(version, 2);
 
-        let latest = store
-            .get_latest_policy(sandbox_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let latest = store.get_latest_policy(sandbox_id).await.unwrap().unwrap();
         let policy = SandboxPolicy::decode(latest.policy_payload.as_slice()).unwrap();
 
         // Should have two entries now.
