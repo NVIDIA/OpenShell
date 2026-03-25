@@ -275,16 +275,14 @@ where
             "HTTP_REQUEST",
         );
 
-        // Forward request with credential rewriting.
-        let keep_alive =
+        // Forward request with credential rewriting and relay the response.
+        // relay_http_request_with_resolver handles both directions: it sends
+        // the request upstream and reads the response back to the client.
+        let reusable =
             crate::l7::rest::relay_http_request_with_resolver(&req, client, upstream, resolver)
                 .await?;
 
-        // Relay response back to client.
-        let reusable =
-            crate::l7::rest::relay_response_to_client(upstream, client, &req.action).await?;
-
-        if !keep_alive || !reusable {
+        if !reusable {
             break;
         }
     }
