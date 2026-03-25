@@ -158,6 +158,9 @@ pub struct VmConfig {
     /// Wipe all runtime state (containerd tasks/sandboxes, kubelet pods)
     /// before booting. Recovers from corrupted state after a crash.
     pub reset: bool,
+
+    /// Gateway metadata name used for host-side config and mTLS material.
+    pub gateway_name: String,
 }
 
 impl VmConfig {
@@ -198,8 +201,124 @@ impl VmConfig {
                 binary: default_runtime_gvproxy_path(),
             },
             reset: false,
+            gateway_name: DEFAULT_GATEWAY_NAME.to_string(),
         }
     }
+}
+
+/// Default gateway metadata name used by the legacy single-instance layout.
+pub const DEFAULT_GATEWAY_NAME: &str = "openshell-vm";
+
+/// Resolve the gateway metadata name for an optional instance name.
+pub fn gateway_name(instance_name: Option<&str>) -> Result<String, VmError> {
+    match instance_name {
+        Some(name) => Ok(format!(
+            "{DEFAULT_GATEWAY_NAME}-{}",
+            sanitize_instance_name(name)?
+        )),
+        None => Ok(DEFAULT_GATEWAY_NAME.to_string()),
+    }
+}
+
+/// Resolve the rootfs path for a named instance.
+pub fn named_rootfs_dir(instance_name: &str) -> Result<PathBuf, VmError> {
+    let name = sanitize_instance_name(instance_name)?;
+    let base = openshell_bootstrap::paths::default_rootfs_dir()
+        .map_err(|e| VmError::RuntimeState(format!("resolve default VM rootfs: {e}")))?;
+    let parent = base.parent().ok_or_else(|| {
+        VmError::RuntimeState(format!("default rootfs has no parent: {}", base.display()))
+    })?;
+    Ok(parent.join("instances").join(name).join("rootfs"))
+}
+
+/// Ensure a named instance rootfs exists, cloning from the default rootfs
+/// on first use.
+pub fn ensure_named_rootfs(instance_name: &str) -> Result<PathBuf, VmError> {
+    let instance_rootfs = named_rootfs_dir(instance_name)?;
+    if instance_rootfs.is_dir() {
+        return Ok(instance_rootfs);
+    }
+
+    let default_rootfs = openshell_bootstrap::paths::default_rootfs_dir()
+        .map_err(|e| VmError::RuntimeState(format!("resolve default VM rootfs: {e}")))?;
+    if !default_rootfs.is_dir() {
+        return Err(VmError::RootfsNotFound {
+            path: default_rootfs.display().to_string(),
+        });
+    }
+
+    clone_rootfs(&default_rootfs, &instance_rootfs)?;
+    Ok(instance_rootfs)
+}
+
+fn sanitize_instance_name(name: &str) -> Result<String, VmError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(VmError::RuntimeState(
+            "instance name cannot be empty".to_string(),
+        ));
+    }
+
+    let mut out = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            return Err(VmError::RuntimeState(format!(
+                "invalid instance name '{trimmed}': only [A-Za-z0-9_-] are allowed"
+            )));
+        }
+    }
+
+    Ok(out)
+}
+
+fn clone_rootfs(source: &Path, dest: &Path) -> Result<(), VmError> {
+    let parent = dest.parent().ok_or_else(|| {
+        VmError::RuntimeState(format!("instance rootfs has no parent: {}", dest.display()))
+    })?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        VmError::RuntimeState(format!(
+            "create instance parent dir {}: {e}",
+            parent.display()
+        ))
+    })?;
+
+    let status = if cfg!(target_os = "macos") {
+        let clone_status = std::process::Command::new("cp")
+            .args(["-c", "-R"])
+            .arg(source)
+            .arg(dest)
+            .status()
+            .map_err(|e| VmError::RuntimeState(format!("clone rootfs with cp failed: {e}")))?;
+        if clone_status.success() {
+            clone_status
+        } else {
+            std::process::Command::new("cp")
+                .args(["-R"])
+                .arg(source)
+                .arg(dest)
+                .status()
+                .map_err(|e| VmError::RuntimeState(format!("copy rootfs with cp failed: {e}")))?
+        }
+    } else {
+        std::process::Command::new("cp")
+            .args(["-a", "--reflink=auto"])
+            .arg(source)
+            .arg(dest)
+            .status()
+            .map_err(|e| VmError::RuntimeState(format!("clone rootfs with cp failed: {e}")))?
+    };
+
+    if !status.success() {
+        return Err(VmError::RuntimeState(format!(
+            "failed to clone rootfs {} -> {}",
+            source.display(),
+            dest.display()
+        )));
+    }
+
+    Ok(())
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -676,6 +795,70 @@ fn kill_stale_gvproxy(rootfs: &Path) {
     }
 }
 
+fn vm_rootfs_key(rootfs: &Path) -> String {
+    let name = rootfs
+        .file_name()
+        .and_then(|part| part.to_str())
+        .unwrap_or("openshell-vm");
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "openshell-vm".to_string()
+    } else {
+        out
+    }
+}
+
+fn hash_path_id(path: &Path) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{:012x}", hash & 0x0000_ffff_ffff_ffff)
+}
+
+fn gvproxy_socket_dir(rootfs: &Path) -> Result<PathBuf, VmError> {
+    let mut base = PathBuf::from("/tmp");
+    if !base.is_dir() {
+        base = std::env::temp_dir();
+    }
+    let dir = base.join("ovm-gv");
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        VmError::HostSetup(format!("create gvproxy socket dir {}: {e}", dir.display()))
+    })?;
+
+    // macOS unix socket path limit is tight (~104 bytes). Keep paths very short.
+    let id = hash_path_id(rootfs);
+    Ok(dir.join(id))
+}
+
+fn gateway_host_port(config: &VmConfig) -> u16 {
+    config
+        .port_map
+        .first()
+        .and_then(|pm| pm.split(':').next())
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_GATEWAY_PORT)
+}
+
+fn pick_gvproxy_ssh_port() -> Result<u16, VmError> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| VmError::HostSetup(format!("allocate gvproxy ssh port on localhost: {e}")))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| VmError::HostSetup(format!("read gvproxy ssh port: {e}")))?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
 fn path_to_cstring(path: &Path) -> Result<CString, VmError> {
     let s = path
         .to_str()
@@ -718,7 +901,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
     // This must happen after the lock (to confirm no other VM is using
     // the rootfs) but before booting (so the new VM starts clean).
     if config.reset {
-        reset_runtime_state(&config.rootfs)?;
+        reset_runtime_state(&config.rootfs, &config.gateway_name)?;
     }
 
     let launch_start = Instant::now();
@@ -777,8 +960,10 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                 .parent()
                 .unwrap_or(&config.rootfs)
                 .to_path_buf();
-            let vfkit_sock = run_dir.join("gvproxy-vfkit.sock");
-            let api_sock = run_dir.join("gvproxy-api.sock");
+            let rootfs_key = vm_rootfs_key(&config.rootfs);
+            let sock_base = gvproxy_socket_dir(&config.rootfs)?;
+            let vfkit_sock = sock_base.with_extension("v");
+            let api_sock = sock_base.with_extension("a");
 
             // Kill any stale gvproxy process from a previous run.
             // If gvproxy is still holding port 2222, the new instance
@@ -789,12 +974,13 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
             // libkrun creates as its datagram endpoint).
             let _ = std::fs::remove_file(&vfkit_sock);
             let _ = std::fs::remove_file(&api_sock);
-            let krun_sock = run_dir.join("gvproxy-vfkit.sock-krun.sock");
+            let krun_sock = sock_base.with_extension("v-krun.sock");
             let _ = std::fs::remove_file(&krun_sock);
 
             // Start gvproxy
             eprintln!("Starting gvproxy: {}", binary.display());
-            let gvproxy_log = run_dir.join("gvproxy.log");
+            let ssh_port = pick_gvproxy_ssh_port()?;
+            let gvproxy_log = run_dir.join(format!("{rootfs_key}-gvproxy.log"));
             let gvproxy_log_file = std::fs::File::create(&gvproxy_log)
                 .map_err(|e| VmError::Fork(format!("failed to create gvproxy log: {e}")))?;
             let child = std::process::Command::new(binary)
@@ -802,14 +988,17 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                 .arg(format!("unixgram://{}", vfkit_sock.display()))
                 .arg("-listen")
                 .arg(format!("unix://{}", api_sock.display()))
+                .arg("-ssh-port")
+                .arg(ssh_port.to_string())
                 .stdout(std::process::Stdio::null())
                 .stderr(gvproxy_log_file)
                 .spawn()
                 .map_err(|e| VmError::Fork(format!("failed to start gvproxy: {e}")))?;
 
             eprintln!(
-                "gvproxy started (pid {}) [{:.1}s]",
+                "gvproxy started (pid {}, ssh port {}) [{:.1}s]",
                 child.id(),
+                ssh_port,
                 launch_start.elapsed().as_secs_f64()
             );
 
@@ -868,6 +1057,11 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
     }
 
     for vsock_port in &config.vsock_ports {
+        if let Some(parent) = vsock_port.socket_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                VmError::RuntimeState(format!("create vsock socket dir {}: {e}", parent.display()))
+            })?;
+        }
         vm.add_vsock_port(vsock_port)?;
     }
 
@@ -877,7 +1071,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
             .rootfs
             .parent()
             .unwrap_or(&config.rootfs)
-            .join("console.log")
+            .join(format!("{}-console.log", vm_rootfs_key(&config.rootfs)))
     });
     vm.set_console_output(&console_log)?;
 
@@ -1007,7 +1201,10 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                 // from virtio-fs — no kubectl or port forwarding needed.
                 // Cold boot (Path 2) writes secret manifests into the
                 // k3s auto-deploy directory via virtio-fs.
-                if let Err(e) = bootstrap_gateway(&config.rootfs) {
+                let gateway_port = gateway_host_port(config);
+                if let Err(e) =
+                    bootstrap_gateway(&config.rootfs, &config.gateway_name, gateway_port)
+                {
                     eprintln!("Bootstrap failed: {e}");
                     eprintln!("  The VM is running but OpenShell may not be fully operational.");
                 }
@@ -1015,7 +1212,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                 // Wait for the gRPC service to be reachable via TCP
                 // probe on host:30051. This confirms the full path
                 // (gvproxy → kube-proxy nftables → pod:8080) is working.
-                wait_for_gateway_service();
+                wait_for_gateway_service(gateway_port);
             }
 
             eprintln!("Ready [{:.1}s total]", boot_start.elapsed().as_secs_f64());
@@ -1066,11 +1263,8 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
 
 // ── Post-boot bootstrap ────────────────────────────────────────────────
 
-/// Cluster name used for metadata and mTLS storage.
-const GATEWAY_CLUSTER_NAME: &str = "openshell-vm";
-
-/// Gateway port: the host port mapped to the OpenShell `NodePort` (30051).
-const GATEWAY_PORT: u16 = 30051;
+/// Default gateway port: host port mapped to the OpenShell `NodePort` (30051).
+const DEFAULT_GATEWAY_PORT: u16 = 30051;
 
 /// Bootstrap the OpenShell control plane after k3s is ready.
 ///
@@ -1095,14 +1289,14 @@ const GATEWAY_PORT: u16 = 30051;
 /// 1. **Warm boot**: host already has certs at `~/.config/.../mtls/` — skip.
 /// 2. **First boot / post-reset**: polls the rootfs for `/opt/openshell/pki/ca.crt`
 ///    (written by the VM init script), then copies client certs to the host.
-fn bootstrap_gateway(rootfs: &Path) -> Result<(), VmError> {
+fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Result<(), VmError> {
     let bootstrap_start = Instant::now();
 
     let metadata = openshell_bootstrap::GatewayMetadata {
-        name: GATEWAY_CLUSTER_NAME.to_string(),
-        gateway_endpoint: format!("https://127.0.0.1:{GATEWAY_PORT}"),
+        name: gateway_name.to_string(),
+        gateway_endpoint: format!("https://127.0.0.1:{gateway_port}"),
         is_remote: false,
-        gateway_port: GATEWAY_PORT,
+        gateway_port,
         remote_host: None,
         resolved_host: None,
         auth_mode: None,
@@ -1111,11 +1305,11 @@ fn bootstrap_gateway(rootfs: &Path) -> Result<(), VmError> {
     };
 
     // ── Warm boot: host already has certs ──────────────────────────
-    if is_warm_boot() {
+    if is_warm_boot(gateway_name) {
         // Always (re-)store metadata so port/endpoint changes are picked up.
-        openshell_bootstrap::store_gateway_metadata(GATEWAY_CLUSTER_NAME, &metadata)
+        openshell_bootstrap::store_gateway_metadata(gateway_name, &metadata)
             .map_err(|e| VmError::Bootstrap(format!("failed to store metadata: {e}")))?;
-        openshell_bootstrap::save_active_gateway(GATEWAY_CLUSTER_NAME)
+        openshell_bootstrap::save_active_gateway(gateway_name)
             .map_err(|e| VmError::Bootstrap(format!("failed to set active cluster: {e}")))?;
 
         // Verify host certs match the rootfs PKI. If they diverge (e.g.
@@ -1123,7 +1317,7 @@ fn bootstrap_gateway(rootfs: &Path) -> Result<(), VmError> {
         // re-sync the host certs from the authoritative rootfs copy.
         let pki_dir = rootfs.join("opt/openshell/pki");
         if pki_dir.join("ca.crt").is_file() {
-            if let Err(e) = sync_host_certs_if_stale(&pki_dir) {
+            if let Err(e) = sync_host_certs_if_stale(&pki_dir, gateway_name) {
                 eprintln!("Warning: cert sync check failed: {e}");
             }
         }
@@ -1132,9 +1326,9 @@ fn bootstrap_gateway(rootfs: &Path) -> Result<(), VmError> {
             "Warm boot [{:.1}s]",
             bootstrap_start.elapsed().as_secs_f64()
         );
-        eprintln!("  Cluster:  {GATEWAY_CLUSTER_NAME}");
-        eprintln!("  Gateway:  https://127.0.0.1:{GATEWAY_PORT}");
-        eprintln!("  mTLS:     ~/.config/openshell/gateways/{GATEWAY_CLUSTER_NAME}/mtls/");
+        eprintln!("  Cluster:  {gateway_name}");
+        eprintln!("  Gateway:  https://127.0.0.1:{gateway_port}");
+        eprintln!("  mTLS:     ~/.config/openshell/gateways/{gateway_name}/mtls/");
         return Ok(());
     }
 
@@ -1182,22 +1376,22 @@ fn bootstrap_gateway(rootfs: &Path) -> Result<(), VmError> {
         client_key_pem: read("client.key")?,
     };
 
-    openshell_bootstrap::store_gateway_metadata(GATEWAY_CLUSTER_NAME, &metadata)
+    openshell_bootstrap::store_gateway_metadata(gateway_name, &metadata)
         .map_err(|e| VmError::Bootstrap(format!("failed to store metadata: {e}")))?;
 
-    openshell_bootstrap::mtls::store_pki_bundle(GATEWAY_CLUSTER_NAME, &pki_bundle)
+    openshell_bootstrap::mtls::store_pki_bundle(gateway_name, &pki_bundle)
         .map_err(|e| VmError::Bootstrap(format!("failed to store mTLS creds: {e}")))?;
 
-    openshell_bootstrap::save_active_gateway(GATEWAY_CLUSTER_NAME)
+    openshell_bootstrap::save_active_gateway(gateway_name)
         .map_err(|e| VmError::Bootstrap(format!("failed to set active cluster: {e}")))?;
 
     eprintln!(
         "Bootstrap complete [{:.1}s]",
         bootstrap_start.elapsed().as_secs_f64()
     );
-    eprintln!("  Cluster:  {GATEWAY_CLUSTER_NAME}");
-    eprintln!("  Gateway:  https://127.0.0.1:{GATEWAY_PORT}");
-    eprintln!("  mTLS:     ~/.config/openshell/gateways/{GATEWAY_CLUSTER_NAME}/mtls/");
+    eprintln!("  Cluster:  {gateway_name}");
+    eprintln!("  Gateway:  https://127.0.0.1:{gateway_port}");
+    eprintln!("  mTLS:     ~/.config/openshell/gateways/{gateway_name}/mtls/");
 
     Ok(())
 }
@@ -1212,7 +1406,7 @@ fn bootstrap_gateway(rootfs: &Path) -> Result<(), VmError> {
 /// metadata storage) can be skipped because the virtio-fs rootfs persists k3s
 /// state (TLS certs, kine/sqlite, containerd images, helm releases) across VM
 /// restarts.
-fn is_warm_boot() -> bool {
+fn is_warm_boot(gateway_name: &str) -> bool {
     let Ok(home) = std::env::var("HOME") else {
         return false;
     };
@@ -1225,13 +1419,13 @@ fn is_warm_boot() -> bool {
         .join("gateways");
 
     // Check metadata file.
-    let metadata_path = config_dir.join(GATEWAY_CLUSTER_NAME).join("metadata.json");
+    let metadata_path = config_dir.join(gateway_name).join("metadata.json");
     if !metadata_path.is_file() {
         return false;
     }
 
     // Check mTLS cert files.
-    let mtls_dir = config_dir.join(GATEWAY_CLUSTER_NAME).join("mtls");
+    let mtls_dir = config_dir.join(gateway_name).join("mtls");
     for name in &["ca.crt", "tls.crt", "tls.key"] {
         let path = mtls_dir.join(name);
         match std::fs::metadata(&path) {
@@ -1248,7 +1442,7 @@ fn is_warm_boot() -> bool {
 ///
 /// This catches cases where PKI was regenerated (e.g. rootfs rebuilt,
 /// manual reset) but host-side certs survived from a previous boot cycle.
-fn sync_host_certs_if_stale(pki_dir: &Path) -> Result<(), VmError> {
+fn sync_host_certs_if_stale(pki_dir: &Path, gateway_name: &str) -> Result<(), VmError> {
     let Ok(home) = std::env::var("HOME") else {
         return Ok(());
     };
@@ -1256,7 +1450,7 @@ fn sync_host_certs_if_stale(pki_dir: &Path) -> Result<(), VmError> {
         std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
     let host_ca = PathBuf::from(&config_base)
         .join("openshell/gateways")
-        .join(GATEWAY_CLUSTER_NAME)
+        .join(gateway_name)
         .join("mtls/ca.crt");
 
     let rootfs_ca = std::fs::read_to_string(pki_dir.join("ca.crt"))
@@ -1285,7 +1479,7 @@ fn sync_host_certs_if_stale(pki_dir: &Path) -> Result<(), VmError> {
         client_key_pem: read("client.key")?,
     };
 
-    openshell_bootstrap::mtls::store_pki_bundle(GATEWAY_CLUSTER_NAME, &pki_bundle)
+    openshell_bootstrap::mtls::store_pki_bundle(gateway_name, &pki_bundle)
         .map_err(|e| VmError::Bootstrap(format!("failed to store mTLS creds: {e}")))?;
 
     eprintln!("  mTLS certs re-synced from rootfs");
@@ -1307,7 +1501,7 @@ fn sync_host_certs_if_stale(pki_dir: &Path) -> Result<(), VmError> {
 /// nftables → pod:8080. A successful probe means the pod is running,
 /// the NodePort service is routing, and the server is accepting
 /// connections. No kubectl or API server access required.
-fn wait_for_gateway_service() {
+fn wait_for_gateway_service(gateway_port: u16) {
     let start = Instant::now();
     let timeout = std::time::Duration::from_secs(90);
     let poll_interval = std::time::Duration::from_secs(1);
@@ -1315,7 +1509,7 @@ fn wait_for_gateway_service() {
     eprintln!("Waiting for gateway service...");
 
     loop {
-        if host_tcp_probe() {
+        if host_tcp_probe(gateway_port) {
             eprintln!("Service healthy [{:.1}s]", start.elapsed().as_secs_f64());
             return;
         }
@@ -1341,12 +1535,12 @@ fn wait_for_gateway_service() {
 /// ClientHello). We exploit this: connect, then try a short read. If
 /// the read **times out** the server is alive; if it returns an error
 /// (reset/EOF) the server is down.
-fn host_tcp_probe() -> bool {
+fn host_tcp_probe(gateway_port: u16) -> bool {
     use std::io::Read;
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
 
-    let addr: SocketAddr = ([127, 0, 0, 1], GATEWAY_PORT).into();
+    let addr: SocketAddr = ([127, 0, 0, 1], gateway_port).into();
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
         return false;
     };

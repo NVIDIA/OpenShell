@@ -36,6 +36,15 @@ struct Cli {
     #[arg(long, value_hint = ValueHint::DirPath)]
     rootfs: Option<PathBuf>,
 
+    /// Named VM instance.
+    ///
+    /// When set, the rootfs resolves to
+    /// `~/.local/share/openshell/openshell-vm/instances/<name>/rootfs`.
+    /// For launch mode, the instance rootfs is cloned from the default
+    /// rootfs on first use.
+    #[arg(long, conflicts_with = "rootfs")]
+    name: Option<String>,
+
     /// Executable path inside the VM. When set, runs this instead of
     /// the default k3s server.
     #[arg(long)]
@@ -133,7 +142,11 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         }
         return Ok(openshell_vm::exec_running_vm(
             openshell_vm::VmExecOptions {
-                rootfs: cli.rootfs,
+                rootfs: match (cli.rootfs, cli.name.as_deref()) {
+                    (Some(path), _) => Some(path),
+                    (None, Some(name)) => Some(openshell_vm::named_rootfs_dir(name)?),
+                    (None, None) => None,
+                },
                 command,
                 workdir,
                 env,
@@ -155,10 +168,13 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         }
     };
 
-    let rootfs = match cli.rootfs {
-        Some(p) => p,
-        None => openshell_bootstrap::paths::default_rootfs_dir()?,
+    let rootfs = match (cli.rootfs, cli.name.as_deref()) {
+        (Some(path), _) => path,
+        (None, Some(name)) => openshell_vm::ensure_named_rootfs(name)?,
+        (None, None) => openshell_bootstrap::paths::default_rootfs_dir()?,
     };
+
+    let gateway_name = openshell_vm::gateway_name(cli.name.as_deref())?;
 
     let mut config = if let Some(exec_path) = cli.exec {
         openshell_vm::VmConfig {
@@ -175,6 +191,7 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
             console_output: None,
             net: net_backend.clone(),
             reset: cli.reset,
+            gateway_name,
         }
     } else {
         let mut c = openshell_vm::VmConfig::gateway(rootfs);
@@ -189,6 +206,7 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         }
         c.net = net_backend;
         c.reset = cli.reset;
+        c.gateway_name = gateway_name;
         c
     };
     config.log_level = cli.krun_log_level;

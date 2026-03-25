@@ -15,7 +15,6 @@ use crate::VmError;
 
 pub const VM_EXEC_VSOCK_PORT: u32 = 10_777;
 
-const VM_EXEC_SOCKET_NAME: &str = "openshell-vm-exec.sock";
 const VM_STATE_NAME: &str = "vm-state.json";
 const VM_LOCK_NAME: &str = "vm.lock";
 const KUBECONFIG_ENV: &str = "KUBECONFIG=/etc/rancher/k3s/k3s.yaml";
@@ -67,7 +66,22 @@ enum ServerFrame {
 }
 
 pub fn vm_exec_socket_path(rootfs: &Path) -> PathBuf {
-    vm_run_dir(rootfs).join(format!("{}-{}", rootfs_key(rootfs), VM_EXEC_SOCKET_NAME))
+    let mut base = PathBuf::from("/tmp");
+    if !base.is_dir() {
+        base = std::env::temp_dir();
+    }
+    let dir = base.join("ovm-exec");
+    let id = hash_path_id(rootfs);
+    dir.join(format!("{id}.sock"))
+}
+
+fn hash_path_id(path: &Path) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{:012x}", hash & 0x0000_ffff_ffff_ffff)
 }
 
 pub fn write_vm_runtime_state(
@@ -121,7 +135,7 @@ pub fn clear_vm_runtime_state(rootfs: &Path) {
 /// - containerd snapshots (no re-extract needed)
 /// - containerd metadata database (meta.db — image/snapshot tracking)
 /// - k3s server state (kine/sqlite, TLS certs, manifests)
-pub fn reset_runtime_state(rootfs: &Path) -> Result<(), VmError> {
+pub fn reset_runtime_state(rootfs: &Path, gateway_name: &str) -> Result<(), VmError> {
     // Full reset: wipe all k3s state so the VM cold-starts from scratch.
     // The init script will re-import airgap images, deploy manifests,
     // and generate fresh cluster state. This is slower (~30-60s) but
@@ -179,7 +193,7 @@ pub fn reset_runtime_state(rootfs: &Path) -> Result<(), VmError> {
             std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
         let mtls_dir = PathBuf::from(&config_base)
             .join("openshell/gateways")
-            .join(super::GATEWAY_CLUSTER_NAME)
+            .join(gateway_name)
             .join("mtls");
         if mtls_dir.is_dir() {
             fs::remove_dir_all(&mtls_dir).ok();
@@ -187,7 +201,7 @@ pub fn reset_runtime_state(rootfs: &Path) -> Result<(), VmError> {
         // Also remove metadata so is_warm_boot() returns false.
         let metadata = PathBuf::from(&config_base)
             .join("openshell/gateways")
-            .join(super::GATEWAY_CLUSTER_NAME)
+            .join(gateway_name)
             .join("metadata.json");
         if metadata.is_file() {
             fs::remove_file(&metadata).ok();
