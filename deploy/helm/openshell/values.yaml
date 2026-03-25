@@ -19,12 +19,6 @@ serviceAccount:
   annotations: {}
   name: ""
 
-# Whether to auto-mount the ServiceAccount token into the pod. Disabled
-# in microVM gateway mode because the projected volume mount at
-# /var/run/secrets/kubernetes.io/serviceaccount hits a containerd
-# native-snapshotter + virtiofs incompatibility on sandbox re-creation.
-automountServiceAccountToken: true
-
 podAnnotations: {}
 podLabels: {}
 
@@ -65,19 +59,6 @@ probes:
     failureThreshold: 3
 
 resources: {}
-
-# Persistent storage for the OpenShell database. When disabled, an
-# emptyDir volume is used instead of a PVC. This is useful in microVM
-# environments where overlayfs-on-virtiofs doesn't support PVC mounts
-# reliably.
-persistence:
-  enabled: true
-
-# Run the pod directly on the host network. Useful in microVM
-# environments where kube-proxy is unavailable (no iptables).
-# When true, the pod binds to the VM's eth0 and NodePort is
-# unnecessary — gvproxy forwards host ports to the pod directly.
-hostNetwork: false
 
 nodeSelector: {}
 
