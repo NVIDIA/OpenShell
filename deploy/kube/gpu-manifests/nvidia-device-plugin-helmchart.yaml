@@ -31,6 +31,9 @@ spec:
   targetNamespace: nvidia-device-plugin
   createNamespace: true
   valuesContent: |-
+    image:
+      repository: ghcr.io/nvidia/k8s-device-plugin
+      tag: "2ab68c16"
     runtimeClassName: nvidia
     deviceListStrategy: cdi-cri
     deviceIDStrategy: index
