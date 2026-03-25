@@ -429,7 +429,7 @@ fn build_backend_url(endpoint: &str, path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_backend_url, verify_backend_endpoint, ValidationFailureKind};
+    use super::{ValidationFailureKind, build_backend_url, verify_backend_endpoint};
     use crate::config::ResolvedRoute;
     use openshell_core::inference::AuthHeader;
     use wiremock::matchers::{body_partial_json, header, method, path};
@@ -609,6 +609,9 @@ mod tests {
         let result = verify_backend_endpoint(&client, &route).await;
 
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind, ValidationFailureKind::RequestShape);
+        assert_eq!(
+            result.unwrap_err().kind,
+            ValidationFailureKind::RequestShape
+        );
     }
 }
