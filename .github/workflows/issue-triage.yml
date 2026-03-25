@@ -23,7 +23,7 @@ jobs:
             // The template placeholder starts with "Example:" — if that's still
             // there or the section is empty, the reporter didn't fill it in.
             const diagnosticMatch = body.match(
-              /## Agent Diagnostic\s*\n([\s\S]*?)(?=\n## |\n$)/
+              /### Agent Diagnostic\s*\n([\s\S]*?)(?=\n### |\n$)/
             );
 
             const hasSubstantiveDiagnostic = diagnosticMatch
