@@ -27,11 +27,18 @@ spec:
     image:
       repository: ghcr.io/nvidia/openshell/gateway
       tag: latest
-      pullPolicy: Always
+      pullPolicy: __IMAGE_PULL_POLICY__
+    hostNetwork: __HOST_NETWORK__
+    automountServiceAccountToken: __AUTOMOUNT_SA_TOKEN__
+    persistence:
+      enabled: __PERSISTENCE_ENABLED__
     server:
       sandboxImage: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+      sandboxImagePullPolicy: __SANDBOX_IMAGE_PULL_POLICY__
       sshGatewayHost: __SSH_GATEWAY_HOST__
       sshGatewayPort: __SSH_GATEWAY_PORT__
+      sshHandshakeSecret: __SSH_HANDSHAKE_SECRET__
+      dbUrl: __DB_URL__ da57ba3a (feat(vm): add openshell-vm crate with libkrun microVM gateway)
       grpcEndpoint: "https://openshell.openshell.svc.cluster.local:8080"
       hostGatewayIP: __HOST_GATEWAY_IP__
       disableGatewayAuth: __DISABLE_GATEWAY_AUTH__

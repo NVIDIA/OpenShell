@@ -17,7 +17,7 @@ depends = ["e2e:python:gpu"]
 
 ["test:rust"]
 description = "Run Rust tests"
-run = "cargo test --workspace"
+run = "cargo test --workspace --exclude openshell-vm"
 hide = true
 
 ["test:python"]
@@ -47,3 +47,9 @@ description = "Run Python GPU e2e tests"
 depends = ["python:proto", "CLUSTER_GPU=1 cluster"]
 env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
 run = "uv run pytest -o python_files='test_*.py' -m gpu -n ${E2E_PARALLEL:-1} e2e/python"
+
+["e2e:vm"]
+description = "Run e2e tests against a gateway VM (macOS ARM64)"
+depends = ["python:proto"]
+env = { UV_NO_SYNC = "1", PYTHONPATH = "python", OPENSHELL_GATEWAY = "gateway" }
+run = "uv run pytest -o python_files='test_*.py' e2e/python"

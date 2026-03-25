@@ -49,6 +49,7 @@ All gateway lifecycle commands live under `openshell gateway`:
 | `openshell status` | Show gateway health via gRPC/HTTP |
 | `openshell doctor logs [--name NAME] [--remote user@host] [--tail N]` | Fetch gateway container logs |
 | `openshell doctor exec [--name NAME] [--remote user@host] -- <command>` | Run a command inside the gateway container |
+| `gateway exec [--workdir DIR] [--env KEY=VALUE] -- <command>` | Run a command inside the standalone gateway microVM |
 | `openshell gateway select <name>` | Set the active gateway |
 | `openshell gateway select` | Open an interactive chooser on a TTY, or list all gateways in non-interactive mode |
 

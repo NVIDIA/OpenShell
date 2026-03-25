@@ -181,6 +181,9 @@ kubeconfig
 # Documentation build output
 _build/
 
+# Gateway microVM rootfs build artifacts
+rootfs/
+
 # Docker build artifacts (image tarballs, packaged helm charts)
 deploy/docker/.build/
 

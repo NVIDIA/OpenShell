@@ -6,12 +6,12 @@ pub mod edge_token;
 pub mod errors;
 pub mod image;
 
-mod constants;
+pub mod constants;
 mod docker;
 mod metadata;
-mod mtls;
-mod paths;
-mod pki;
+pub mod mtls;
+pub mod paths;
+pub mod pki;
 pub(crate) mod push;
 mod runtime;
 

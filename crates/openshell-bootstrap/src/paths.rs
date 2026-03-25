@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use miette::Result;
-use openshell_core::paths::xdg_config_dir;
+use openshell_core::paths::{xdg_config_dir, xdg_data_dir};
 use std::path::PathBuf;
 
 /// Path to the file that stores the active gateway name.
@@ -24,6 +24,16 @@ pub fn gateways_dir() -> Result<PathBuf> {
 /// Location: `$XDG_CONFIG_HOME/openshell/gateways/<gateway>/last_sandbox`
 pub fn last_sandbox_path(gateway: &str) -> Result<PathBuf> {
     Ok(gateways_dir()?.join(gateway).join("last_sandbox"))
+}
+
+/// Default rootfs directory for gateway microVMs.
+///
+/// Location: `$XDG_DATA_HOME/openshell/openshell-vm/rootfs`
+pub fn default_rootfs_dir() -> Result<PathBuf> {
+    Ok(xdg_data_dir()?
+        .join("openshell")
+        .join("openshell-vm")
+        .join("rootfs"))
 }
 
 #[cfg(test)]

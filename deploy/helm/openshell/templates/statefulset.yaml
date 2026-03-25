@@ -26,11 +26,16 @@ spec:
         {{- end }}
     spec:
       terminationGracePeriodSeconds: {{ .Values.podLifecycle.terminationGracePeriodSeconds }}
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "openshell.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
       {{- if .Values.server.hostGatewayIP }}
       hostAliases:
         - ip: {{ .Values.server.hostGatewayIP | quote }}
@@ -99,8 +104,10 @@ spec:
             {{- end }}
             {{- end }}
           volumeMounts:
+            {{- if .Values.persistence.enabled }}
             - name: openshell-data
               mountPath: /var/openshell
+            {{- end }}
             {{- if not .Values.server.disableTls }}
             - name: tls-cert
               mountPath: /etc/openshell-tls/server
@@ -143,6 +150,10 @@ spec:
         - name: tls-client-ca
           secret:
             secretName: {{ .Values.server.tls.clientCaSecretName }}
+        {{- if not .Values.persistence.enabled }}
+        - name: openshell-data
+          emptyDir: {}
+        {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
@@ -156,6 +167,7 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+  {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:
         name: openshell-data
@@ -164,3 +176,4 @@ spec:
         resources:
           requests:
             storage: 1Gi
+  {{- end }}
