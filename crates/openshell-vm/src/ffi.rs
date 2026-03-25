@@ -218,7 +218,7 @@ fn preload_runtime_support_libraries(runtime_dir: &Path) -> Result<Vec<PathBuf>,
     Ok(support_libs)
 }
 
-fn required_runtime_lib_name() -> &'static str {
+pub fn required_runtime_lib_name() -> &'static str {
     #[cfg(target_os = "macos")]
     {
         "libkrun.dylib"
@@ -230,67 +230,49 @@ fn required_runtime_lib_name() -> &'static str {
 }
 
 /// Compute SHA-256 hash of a file, returning hex string.
+///
+/// Streams the file contents directly to `shasum -a 256` via a pipe,
+/// avoiding buffering the entire file in memory.
 fn compute_sha256(path: &Path) -> Result<String, std::io::Error> {
-    use std::io::Read;
-    let mut file = fs::File::open(path)?;
-    let mut hasher = sha2_hasher();
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher_update(&mut hasher, &buf[..n]);
-    }
-    Ok(hasher_finalize(hasher))
-}
-
-// Minimal SHA-256 using the sha2 crate if available, otherwise shell out.
-// We attempt a runtime `shasum` call to avoid adding a crate dependency.
-fn sha2_hasher() -> Sha256State {
-    Sha256State {
-        data: Vec::with_capacity(1024 * 1024),
-    }
-}
-
-struct Sha256State {
-    data: Vec<u8>,
-}
-
-fn hasher_update(state: &mut Sha256State, bytes: &[u8]) {
-    state.data.extend_from_slice(bytes);
-}
-
-fn hasher_finalize(state: Sha256State) -> String {
-    // Use shasum via process for simplicity — avoids adding a crypto dependency.
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::process::{Command, Stdio};
 
-    let mut child = match Command::new("shasum")
+    let mut file = fs::File::open(path)?;
+
+    let mut child = Command::new("shasum")
         .args(["-a", "256"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return "unknown".to_string(),
-    };
+        .spawn()?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(&state.data);
+    // Stream file contents directly to shasum's stdin in 8KB chunks.
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("failed to open shasum stdin"))?;
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            stdin.write_all(&buf[..n])?;
+        }
+        // stdin is dropped here, closing the pipe so shasum can finish.
     }
 
-    match child.wait_with_output() {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout
-                .split_whitespace()
-                .next()
-                .unwrap_or("unknown")
-                .to_string()
-        }
-        _ => "unknown".to_string(),
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout
+            .split_whitespace()
+            .next()
+            .unwrap_or("unknown")
+            .to_string())
+    } else {
+        Ok("unknown".to_string())
     }
 }
 

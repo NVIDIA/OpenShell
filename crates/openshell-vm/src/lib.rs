@@ -23,9 +23,9 @@ use std::ptr;
 use std::time::Instant;
 
 pub use exec::{
-    VM_EXEC_VSOCK_PORT, VmExecOptions, VmRuntimeState, acquire_rootfs_lock, clear_vm_runtime_state,
-    ensure_vm_not_running, exec_running_vm, reset_runtime_state, vm_exec_socket_path,
-    write_vm_runtime_state,
+    acquire_rootfs_lock, clear_vm_runtime_state, ensure_vm_not_running, exec_running_vm,
+    reset_runtime_state, vm_exec_socket_path, vm_state_path, write_vm_runtime_state, VmExecOptions,
+    VmRuntimeState, VM_EXEC_VSOCK_PORT,
 };
 
 // ── Error type ─────────────────────────────────────────────────────────
@@ -235,17 +235,6 @@ pub(crate) fn configured_runtime_dir() -> Result<PathBuf, VmError> {
     Ok(exe_dir.join(VM_RUNTIME_DIR_NAME))
 }
 
-fn required_runtime_lib_name() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "libkrun.dylib"
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        "libkrun.so"
-    }
-}
-
 fn validate_runtime_dir(dir: &Path) -> Result<PathBuf, VmError> {
     if !dir.is_dir() {
         return Err(VmError::BinaryNotFound {
@@ -256,7 +245,7 @@ fn validate_runtime_dir(dir: &Path) -> Result<PathBuf, VmError> {
         });
     }
 
-    let libkrun = dir.join(required_runtime_lib_name());
+    let libkrun = dir.join(ffi::required_runtime_lib_name());
     if !libkrun.is_file() {
         return Err(VmError::BinaryNotFound {
             path: libkrun.display().to_string(),
@@ -404,7 +393,7 @@ fn log_runtime_provenance(runtime_dir: &Path) {
             eprintln!("  type: custom (OpenShell-built)");
             // Parse provenance.json for additional details.
             if let Some(ref json) = prov.provenance_json {
-                // Extract key fields without pulling in serde_json for this.
+                // Extract key fields from provenance metadata.
                 for key in &["libkrunfw_commit", "kernel_version", "build_timestamp"] {
                     if let Some(val) = extract_json_string(json, key) {
                         eprintln!("  {}: {}", key.replace('_', "-"), val);
@@ -417,22 +406,10 @@ fn log_runtime_provenance(runtime_dir: &Path) {
     }
 }
 
-/// Simple JSON string value extractor (avoids serde_json dependency
-/// for this single use case).
+/// Extract a string value from a JSON object by key.
 fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\"", key);
-    let idx = json.find(&pattern)?;
-    let after_key = &json[idx + pattern.len()..];
-    // Skip whitespace and colon
-    let after_colon = after_key.trim_start().strip_prefix(':')?;
-    let after_ws = after_colon.trim_start();
-    if after_ws.starts_with('"') {
-        let value_start = &after_ws[1..];
-        let end = value_start.find('"')?;
-        Some(value_start[..end].to_string())
-    } else {
-        None
-    }
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json).ok()?;
+    map.get(key)?.as_str().map(ToOwned::to_owned)
 }
 
 fn clamp_log_level(level: u32) -> u32 {
@@ -669,18 +646,30 @@ fn gvproxy_expose(api_sock: &Path, body: &str) -> Result<(), String> {
     }
 }
 
-/// Kill any stale gvproxy process from a previous openshell-vm run.
+/// Kill a stale gvproxy process from a previous openshell-vm run.
 ///
 /// If the CLI crashes or is killed before cleanup, gvproxy keeps running
 /// and holds port 2222. A new gvproxy instance then fails with
 /// "bind: address already in use".
-fn kill_stale_gvproxy() {
-    let output = std::process::Command::new("pkill")
-        .args(["-x", "gvproxy"])
-        .output();
-    if let Ok(o) = output {
-        if o.status.success() {
-            eprintln!("Killed stale gvproxy process");
+///
+/// We only kill the specific gvproxy PID recorded in the VM runtime state
+/// to avoid disrupting unrelated gvproxy instances (e.g. Podman Desktop).
+fn kill_stale_gvproxy(rootfs: &Path) {
+    let state_path = vm_state_path(rootfs);
+    let pid = std::fs::read(&state_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<VmRuntimeState>(&bytes).ok())
+        .and_then(|state| state.gvproxy_pid);
+
+    if let Some(gvproxy_pid) = pid {
+        // Verify the process is still alive before killing it.
+        let pid_i32 = gvproxy_pid as libc::pid_t;
+        let is_alive = unsafe { libc::kill(pid_i32, 0) } == 0;
+        if is_alive {
+            unsafe {
+                libc::kill(pid_i32, libc::SIGTERM);
+            }
+            eprintln!("Killed stale gvproxy process (pid {gvproxy_pid})");
             // Brief pause for the port to be released.
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
@@ -794,7 +783,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
             // Kill any stale gvproxy process from a previous run.
             // If gvproxy is still holding port 2222, the new instance
             // will fail with "bind: address already in use".
-            kill_stale_gvproxy();
+            kill_stale_gvproxy(&config.rootfs);
 
             // Clean stale sockets (including the -krun.sock file that
             // libkrun creates as its datagram endpoint).
@@ -927,7 +916,10 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
         _ => {
             // Parent: wait for child
             if config.exec_path == "/srv/openshell-vm-init.sh" {
-                if let Err(err) = write_vm_runtime_state(&config.rootfs, pid, &console_log) {
+                let gvproxy_pid = gvproxy_child.as_ref().map(std::process::Child::id);
+                if let Err(err) =
+                    write_vm_runtime_state(&config.rootfs, pid, &console_log, gvproxy_pid)
+                {
                     unsafe {
                         libc::kill(pid, libc::SIGTERM);
                     }
@@ -1414,7 +1406,7 @@ mod tests {
         let dir = temp_runtime_dir();
         fs::create_dir_all(&dir).expect("failed to create runtime dir");
 
-        write_runtime_file(&dir.join(required_runtime_lib_name()));
+        write_runtime_file(&dir.join(ffi::required_runtime_lib_name()));
         write_runtime_file(&dir.join("libkrunfw.test"));
         let gvproxy = dir.join("gvproxy");
         write_runtime_file(&gvproxy);
@@ -1438,7 +1430,7 @@ mod tests {
         let dir = temp_runtime_dir();
         fs::create_dir_all(&dir).expect("failed to create runtime dir");
 
-        write_runtime_file(&dir.join(required_runtime_lib_name()));
+        write_runtime_file(&dir.join(ffi::required_runtime_lib_name()));
         write_runtime_file(&dir.join("libkrunfw.test"));
 
         let err = validate_runtime_dir(&dir).expect_err("missing gvproxy should fail");

@@ -655,6 +655,8 @@ ts "starting k3s server (bridge CNI + nftables kube-proxy)"
 # readable from the host at rootfs/opt/openshell/diag.txt.
 # The subshell runs detached with its own session (setsid) so it survives
 # the exec that replaces this shell with k3s as PID 1.
+# Only runs when OPENSHELL_VM_DIAG=1 is set.
+if [ "${OPENSHELL_VM_DIAG:-0}" = "1" ]; then
 DIAG_FILE="/opt/openshell/diag.txt"
 setsid sh -c '
     sleep 60
@@ -688,5 +690,6 @@ setsid sh -c '
         echo "=== [DIAG] done ==="
     } > "$DIAG" 2>&1
 ' &
+fi
 
 exec /usr/local/bin/k3s server "${K3S_ARGS[@]}"

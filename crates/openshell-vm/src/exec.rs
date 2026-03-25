@@ -37,6 +37,9 @@ pub struct VmRuntimeState {
     pub rootfs: PathBuf,
     pub console_log: PathBuf,
     pub started_at_ms: u128,
+    /// PID of the gvproxy process (if networking uses gvproxy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gvproxy_pid: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,7 +70,12 @@ pub fn vm_exec_socket_path(rootfs: &Path) -> PathBuf {
     vm_run_dir(rootfs).join(format!("{}-{}", rootfs_key(rootfs), VM_EXEC_SOCKET_NAME))
 }
 
-pub fn write_vm_runtime_state(rootfs: &Path, pid: i32, console_log: &Path) -> Result<(), VmError> {
+pub fn write_vm_runtime_state(
+    rootfs: &Path,
+    pid: i32,
+    console_log: &Path,
+    gvproxy_pid: Option<u32>,
+) -> Result<(), VmError> {
     let state = VmRuntimeState {
         pid,
         exec_vsock_port: VM_EXEC_VSOCK_PORT,
@@ -75,6 +83,7 @@ pub fn write_vm_runtime_state(rootfs: &Path, pid: i32, console_log: &Path) -> Re
         rootfs: rootfs.to_path_buf(),
         console_log: console_log.to_path_buf(),
         started_at_ms: now_ms()?,
+        gvproxy_pid,
     };
     let path = vm_state_path(rootfs);
     let bytes = serde_json::to_vec_pretty(&state)
@@ -396,7 +405,7 @@ fn vm_run_dir(rootfs: &Path) -> PathBuf {
     rootfs.parent().unwrap_or(rootfs).to_path_buf()
 }
 
-fn vm_state_path(rootfs: &Path) -> PathBuf {
+pub fn vm_state_path(rootfs: &Path) -> PathBuf {
     vm_run_dir(rootfs).join(format!("{}-{}", rootfs_key(rootfs), VM_STATE_NAME))
 }
 
@@ -471,7 +480,7 @@ fn validate_env_vars(items: &[String]) -> Result<(), VmError> {
         })?;
         if key.is_empty()
             || !key.chars().enumerate().all(|(idx, ch)| {
-                ch == '_' || ch.is_ascii_alphanumeric() && (idx > 0 || !ch.is_ascii_digit())
+                ch == '_' || (ch.is_ascii_alphanumeric() && (idx > 0 || !ch.is_ascii_digit()))
             })
         {
             return Err(VmError::Exec(format!(
