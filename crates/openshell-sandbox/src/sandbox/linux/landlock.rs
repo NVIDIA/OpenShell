@@ -29,7 +29,7 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    let abi = ABI::V5;
+    let abi = ABI::V2;
     info!(
         abi = ?abi,
         compatibility = ?policy.landlock.compatibility,
