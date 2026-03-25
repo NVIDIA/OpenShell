@@ -10,24 +10,7 @@ use miette::{IntoDiagnostic, Result};
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
-
-fn perf_log(msg: &str) {
-    use std::io::Write;
-    for path in &["/var/log/openshell-perf.log", "/tmp/openshell-perf.log"] {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-            let _ = writeln!(f, "[{:.3}] {}", now.as_secs_f64(), msg);
-            return;
-        }
-    }
-    eprintln!("PERF_LOG_FALLBACK: {msg}");
-}
+use tracing::debug;
 
 /// Read the binary path of a process via `/proc/{pid}/exe` symlink.
 ///
@@ -70,29 +53,29 @@ pub fn resolve_tcp_peer_identity(entrypoint_pid: u32, peer_port: u16) -> Result<
 
     let phase = std::time::Instant::now();
     let inode = parse_proc_net_tcp(entrypoint_pid, peer_port)?;
-    perf_log(&format!(
+    debug!(
         "    parse_proc_net_tcp: {}ms inode={}",
         phase.elapsed().as_millis(), inode
-    ));
+    );
 
     let phase = std::time::Instant::now();
     let pid = find_pid_by_socket_inode(inode, entrypoint_pid)?;
-    perf_log(&format!(
+    debug!(
         "    find_pid_by_socket_inode: {}ms pid={}",
         phase.elapsed().as_millis(), pid
-    ));
+    );
 
     let phase = std::time::Instant::now();
     let path = binary_path(pid.cast_signed())?;
-    perf_log(&format!(
+    debug!(
         "    binary_path: {}ms path={}",
         phase.elapsed().as_millis(), path.display()
-    ));
+    );
 
-    perf_log(&format!(
+    debug!(
         "    resolve_tcp_peer_identity TOTAL: {}ms",
         start.elapsed().as_millis()
-    ));
+    );
     Ok((path, pid))
 }
 
@@ -274,25 +257,25 @@ fn find_pid_by_socket_inode(inode: u64, entrypoint_pid: u32) -> Result<u32> {
 
     let phase = std::time::Instant::now();
     let descendants = collect_descendant_pids(entrypoint_pid);
-    perf_log(&format!(
+    debug!(
         "      collect_descendant_pids: {}ms count={}",
         phase.elapsed().as_millis(), descendants.len()
-    ));
+    );
 
     let phase = std::time::Instant::now();
     for &pid in &descendants {
         if let Some(found) = check_pid_fds(pid, &target) {
-            perf_log(&format!(
+            debug!(
                 "      find_pid_by_socket_inode: {}ms found_pid={} scan=descendants",
                 start.elapsed().as_millis(), found
-            ));
+            );
             return Ok(found);
         }
     }
-    perf_log(&format!(
+    debug!(
         "      descendant_fd_scan (not found): {}ms",
         phase.elapsed().as_millis()
-    ));
+    );
 
     let phase = std::time::Instant::now();
     if let Ok(proc_dir) = std::fs::read_dir("/proc") {
@@ -306,18 +289,18 @@ fn find_pid_by_socket_inode(inode: u64, entrypoint_pid: u32) -> Result<u32> {
                 continue;
             }
             if let Some(found) = check_pid_fds(pid, &target) {
-                perf_log(&format!(
+                debug!(
                     "      find_pid_by_socket_inode: {}ms found_pid={} scan=full_proc",
                     start.elapsed().as_millis(), found
-                ));
+                );
                 return Ok(found);
             }
         }
     }
-    perf_log(&format!(
+    debug!(
         "      full_proc_scan (not found): {}ms",
         phase.elapsed().as_millis()
-    ));
+    );
 
     Err(miette::miette!(
         "No process found owning socket inode {} \
@@ -399,10 +382,10 @@ pub fn file_sha256(path: &Path) -> Result<String> {
     }
 
     let hash = hasher.finalize();
-    perf_log(&format!(
+    debug!(
         "        file_sha256: {}ms size={} path={}",
         start.elapsed().as_millis(), total_read, path.display()
-    ));
+    );
     Ok(hex::encode(hash))
 }
 

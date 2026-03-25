@@ -20,24 +20,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-fn perf_log(msg: &str) {
-    use std::io::Write;
-    for path in &["/var/log/openshell-perf.log", "/tmp/openshell-perf.log"] {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-            let _ = writeln!(f, "[{:.3}] {}", now.as_secs_f64(), msg);
-            return;
-        }
-    }
-    eprintln!("PERF_LOG_FALLBACK: {msg}");
-}
-
 const MAX_HEADER_BYTES: usize = 8192;
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
 
@@ -355,7 +337,7 @@ async fn handle_tcp_connection(
     let local_addr = client.local_addr().into_diagnostic()?;
 
     let connect_start = std::time::Instant::now();
-    perf_log(&format!("handle_tcp_connection START host={host_lc} port={port}"));
+    debug!("handle_tcp_connection START host={host_lc} port={port}");
 
     // Evaluate OPA policy with process-identity binding.
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
@@ -376,10 +358,10 @@ async fn handle_tcp_connection(
     })
     .await
     .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
-    perf_log(&format!(
+    debug!(
         "handle_tcp_connection evaluate_opa_tcp: {}ms",
         connect_start.elapsed().as_millis()
-    ));
+    );
 
     // Extract action string and matched policy for logging
     let (matched_policy, deny_reason) = match &decision.action {
@@ -533,10 +515,10 @@ async fn handle_tcp_connection(
         }
     };
 
-    perf_log(&format!(
+    debug!(
         "handle_tcp_connection dns_resolve_and_tcp_connect: {}ms host={host_lc}",
         dns_connect_start.elapsed().as_millis()
-    ));
+    );
 
     respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
@@ -744,7 +726,7 @@ fn evaluate_opa_tcp(
 
     let total_start = std::time::Instant::now();
     let peer_port = peer_addr.port();
-    perf_log(&format!("evaluate_opa_tcp START host={host} port={port}"));
+    debug!("evaluate_opa_tcp START host={host} port={port}");
 
     let phase_start = std::time::Instant::now();
     let (bin_path, binary_pid) = match crate::procfs::resolve_tcp_peer_identity(pid, peer_port) {
@@ -759,12 +741,12 @@ fn evaluate_opa_tcp(
             );
         }
     };
-    perf_log(&format!(
+    debug!(
         "  resolve_tcp_peer_identity: {}ms binary={} pid={}",
         phase_start.elapsed().as_millis(),
         bin_path.display(),
         binary_pid
-    ));
+    );
 
     let phase_start = std::time::Instant::now();
     let bin_hash = match identity_cache.verify_or_cache(&bin_path) {
@@ -779,19 +761,19 @@ fn evaluate_opa_tcp(
             );
         }
     };
-    perf_log(&format!(
+    debug!(
         "  tofu_verify_binary: {}ms binary={}",
         phase_start.elapsed().as_millis(),
         bin_path.display()
-    ));
+    );
 
     let phase_start = std::time::Instant::now();
     let ancestors = crate::procfs::collect_ancestor_binaries(binary_pid, pid);
-    perf_log(&format!(
+    debug!(
         "  collect_ancestor_binaries: {}ms count={}",
         phase_start.elapsed().as_millis(),
         ancestors.len()
-    ));
+    );
 
     let phase_start = std::time::Instant::now();
     for ancestor in &ancestors {
@@ -808,25 +790,25 @@ fn evaluate_opa_tcp(
                 vec![],
             );
         }
-        perf_log(&format!(
+        debug!(
             "    tofu_verify_ancestor: {}ms ancestor={}",
             ancestor_start.elapsed().as_millis(),
             ancestor.display()
-        ));
+        );
     }
-    perf_log(&format!(
+    debug!(
         "  tofu_verify_all_ancestors: {}ms",
         phase_start.elapsed().as_millis()
-    ));
+    );
 
     let phase_start = std::time::Instant::now();
     let mut exclude = ancestors.clone();
     exclude.push(bin_path.clone());
     let cmdline_paths = crate::procfs::collect_cmdline_paths(binary_pid, pid, &exclude);
-    perf_log(&format!(
+    debug!(
         "  collect_cmdline_paths: {}ms",
         phase_start.elapsed().as_millis()
-    ));
+    );
 
     let phase_start = std::time::Instant::now();
     let input = NetworkInput {
@@ -854,14 +836,14 @@ fn evaluate_opa_tcp(
             cmdline_paths,
         ),
     };
-    perf_log(&format!(
+    debug!(
         "  opa_evaluate_network_action: {}ms",
         phase_start.elapsed().as_millis()
-    ));
-    perf_log(&format!(
+    );
+    debug!(
         "evaluate_opa_tcp TOTAL: {}ms host={host} port={port}",
         total_start.elapsed().as_millis()
-    ));
+    );
     result
 }
 
