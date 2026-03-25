@@ -26,8 +26,8 @@ use openshell_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
     ExecSandboxRequest, GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, InferenceModelEntry,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider,
     RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
     SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
     UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
@@ -3632,6 +3632,7 @@ pub async fn gateway_inference_set(
             verify: false,
             no_verify,
             timeout_secs,
+            models: vec![],
         })
         .await;
 
@@ -3663,7 +3664,96 @@ pub async fn gateway_inference_set(
     Ok(())
 }
 
-pub async fn gateway_inference_update(
+pub async fn gateway_inference_set_multi(
+    server: &str,
+    model_aliases: &[String],
+    route_name: &str,
+    no_verify: bool,
+    timeout_secs: u64,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut models = Vec::with_capacity(model_aliases.len());
+    for entry in model_aliases {
+        let (alias, rest) = entry.split_once('=').ok_or_else(|| {
+            miette!("invalid --model-alias format: {entry:?}. Expected ALIAS=PROVIDER/MODEL")
+        })?;
+        let (provider, model) = rest.split_once('/').ok_or_else(|| {
+            miette!("invalid --model-alias value after '=': {rest:?}. Expected PROVIDER/MODEL")
+        })?;
+        if alias.trim().is_empty() {
+            return Err(miette!("empty alias in --model-alias {entry:?}"));
+        }
+        if provider.trim().is_empty() {
+            return Err(miette!("empty provider in --model-alias {entry:?}"));
+        }
+        if model.trim().is_empty() {
+            return Err(miette!("empty model in --model-alias {entry:?}"));
+        }
+        models.push(InferenceModelEntry {
+            alias: alias.to_string(),
+            provider_name: provider.to_string(),
+            model_id: model.to_string(),
+        });
+    }
+
+    let progress = if std::io::stdout().is_terminal() {
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg} ({elapsed})")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        spinner.set_message("Configuring multi-model inference...");
+        spinner.enable_steady_tick(Duration::from_millis(120));
+        Some(spinner)
+    } else {
+        None
+    };
+
+    let mut client = grpc_inference_client(server, tls).await?;
+    let response = client
+        .set_cluster_inference(SetClusterInferenceRequest {
+            provider_name: String::new(),
+            model_id: String::new(),
+            route_name: route_name.to_string(),
+            verify: false,
+            no_verify,
+            timeout_secs,
+            models,
+        })
+        .await;
+
+    if let Some(progress) = &progress {
+        progress.finish_and_clear();
+    }
+
+    let response = response.map_err(format_inference_status)?;
+    let configured = response.into_inner();
+    let label = if configured.route_name == "sandbox-system" {
+        "System multi-model inference configured:"
+    } else {
+        "Gateway multi-model inference configured:"
+    };
+    println!("{}", label.cyan().bold());
+    println!();
+    println!("  {} {}", "Route:".dimmed(), configured.route_name);
+    println!("  {} {}", "Version:".dimmed(), configured.version);
+    if configured.models.is_empty() {
+        println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
+        println!("  {} {}", "Model:".dimmed(), configured.model_id);
+    } else {
+        println!("  {}", "Models:".dimmed());
+        for m in &configured.models {
+            println!(
+                "    {} {} {}/{}",
+                "-".dimmed(),
+                m.alias.bold(),
+                m.provider_name,
+                m.model_id
+            );
+        }
+    }
+    print_timeout(configured.timeout_secs);
+    if configured.validation_performed {
     server: &str,
     provider_name: Option<&str>,
     model_id: Option<&str>,
@@ -3714,6 +3804,7 @@ pub async fn gateway_inference_update(
             verify: false,
             no_verify,
             timeout_secs: timeout,
+            models: vec![],
         })
         .await;
 
@@ -3769,9 +3860,23 @@ pub async fn gateway_inference_get(
         };
         println!("{}", label.cyan().bold());
         println!();
-        println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
-        println!("  {} {}", "Model:".dimmed(), configured.model_id);
-        println!("  {} {}", "Version:".dimmed(), configured.version);
+        if !configured.models.is_empty() {
+            println!("  {} {}", "Version:".dimmed(), configured.version);
+            println!("  {}", "Models:".dimmed());
+            for m in &configured.models {
+                println!(
+                    "    {} {} {}/{}",
+                    "-".dimmed(),
+                    m.alias.bold(),
+                    m.provider_name,
+                    m.model_id
+                );
+            }
+        } else {
+            println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
+            println!("  {} {}", "Model:".dimmed(), configured.model_id);
+            println!("  {} {}", "Version:".dimmed(), configured.version);
+        }
         print_timeout(configured.timeout_secs);
     } else {
         // Show both routes by default.
@@ -3797,9 +3902,23 @@ async fn print_inference_route(
             let configured = response.into_inner();
             println!("{}", format!("{label}:").cyan().bold());
             println!();
-            println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
-            println!("  {} {}", "Model:".dimmed(), configured.model_id);
-            println!("  {} {}", "Version:".dimmed(), configured.version);
+            if !configured.models.is_empty() {
+                println!("  {} {}", "Version:".dimmed(), configured.version);
+                println!("  {}", "Models:".dimmed());
+                for m in &configured.models {
+                    println!(
+                        "    {} {} {}/{}",
+                        "-".dimmed(),
+                        m.alias.bold(),
+                        m.provider_name,
+                        m.model_id
+                    );
+                }
+            } else {
+                println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
+                println!("  {} {}", "Model:".dimmed(), configured.model_id);
+                println!("  {} {}", "Version:".dimmed(), configured.version);
+            }
             print_timeout(configured.timeout_secs);
         }
         Err(e) if e.code() == Code::NotFound => {

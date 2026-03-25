@@ -39,6 +39,12 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
         },
         InferenceApiPattern {
             method: "POST".to_string(),
+            path_glob: "/v1/codex/*".to_string(),
+            protocol: "openai_responses".to_string(),
+            kind: "codex_responses".to_string(),
+        },
+        InferenceApiPattern {
+            method: "POST".to_string(),
             path_glob: "/v1/messages".to_string(),
             protocol: "anthropic_messages".to_string(),
             kind: "messages".to_string(),

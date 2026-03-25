@@ -21,8 +21,9 @@ sequenceDiagram
     Agent->>Proxy: CONNECT inference.local:443
     Proxy->>Proxy: TLS terminate (MITM)
     Proxy->>Proxy: Parse HTTP, detect pattern
-    Proxy->>Router: proxy_with_candidates()
-    Router->>Router: Select route by protocol
+    Proxy->>Proxy: Extract model hint from body
+    Proxy->>Router: proxy_with_candidates(model_hint)
+    Router->>Router: Select route by alias or protocol
     Router->>Router: Rewrite auth + model
     Router->>Backend: HTTPS request
     Backend->>Router: Response headers + body stream
@@ -41,15 +42,16 @@ File: `crates/openshell-core/src/inference.rs`
 
 `InferenceProviderProfile` is the single source of truth for provider-specific inference knowledge: default endpoint, supported protocols, credential key lookup order, auth header style, and default headers.
 
-Three profiles are defined:
+Four profiles are defined:
 
 | Provider | Default Base URL | Protocols | Auth | Default Headers |
-|----------|-----------------|-----------|------|-----------------|
+|----------|-----------------|-----------|------|------------------|
 | `openai` | `https://api.openai.com/v1` | `openai_chat_completions`, `openai_completions`, `openai_responses`, `model_discovery` | `Authorization: Bearer` | (none) |
 | `anthropic` | `https://api.anthropic.com/v1` | `anthropic_messages`, `model_discovery` | `x-api-key` | `anthropic-version: 2023-06-01` |
 | `nvidia` | `https://integrate.api.nvidia.com/v1` | `openai_chat_completions`, `openai_completions`, `openai_responses`, `model_discovery` | `Authorization: Bearer` | (none) |
+| `ollama` | `http://host.openshell.internal:11434` | `ollama_chat`, `ollama_model_discovery`, `openai_chat_completions`, `openai_completions`, `model_discovery` | `Authorization: Bearer` | (none) |
 
-Each profile also defines `credential_key_names` (e.g. `["OPENAI_API_KEY"]`) and `base_url_config_keys` (e.g. `["OPENAI_BASE_URL"]`) used by the gateway to resolve credentials and endpoint overrides from provider records.
+Each profile also defines `credential_key_names` (e.g. `["OPENAI_API_KEY"]`) and `base_url_config_keys` (e.g. `["OPENAI_BASE_URL"]`) used by the gateway to resolve credentials and endpoint overrides from provider records. The Ollama profile uses `OLLAMA_API_KEY` for credentials and checks both `OLLAMA_BASE_URL` and `OLLAMA_HOST` for endpoint overrides. Its default endpoint uses `host.openshell.internal` so sandboxes can reach an Ollama instance running on the gateway host.
 
 Unknown provider types return `None` from `profile_for()` and default to `Bearer` auth with no default headers via `auth_for_provider_type()`.
 
@@ -70,7 +72,19 @@ The gateway implements the `Inference` gRPC service defined in `proto/inference.
 5. Builds a managed route spec that stores only `provider_name` and `model_id`. The spec intentionally leaves `base_url`, `api_key`, and `protocols` empty -- these are resolved dynamically at bundle time from the provider record.
 6. Upserts the route with name `inference.local`. Version starts at 1 and increments monotonically on each update.
 
-`GetClusterInference` returns `provider_name`, `model_id`, and `version` for the managed route. Returns `NOT_FOUND` if cluster inference is not configured.
+`GetClusterInference` returns `provider_name`, `model_id`, `version`, and any configured `models` entries for the managed route. Returns `NOT_FOUND` if cluster inference is not configured.
+
+### Multi-model routes
+
+`upsert_multi_model_route()` configures multiple provider/model pairs on a single route, each identified by a short alias:
+
+1. Validates that each `InferenceModelEntry` has non-empty `alias`, `provider_name`, and `model_id`.
+2. Checks that aliases are unique (case-insensitive).
+3. Verifies each provider exists and is inference-capable.
+4. Optionally probes each endpoint (skipped with `--no-verify`).
+5. Stores the full `models` vector in the route config. The first entry's provider/model are also written to the legacy single-model fields for backward compatibility.
+
+At bundle time, each `InferenceModelEntry` is resolved into a separate `ResolvedRoute` whose `name` is set to the alias. The router's alias-first selection (see Route Selection) then matches the agent's `model` field against these names.
 
 ### Bundle delivery
 
@@ -92,10 +106,14 @@ File: `proto/inference.proto`
 
 Key messages:
 
-- `SetClusterInferenceRequest` -- `provider_name` + `model_id` + `timeout_secs` + optional `no_verify` override, with verification enabled by default
-- `SetClusterInferenceResponse` -- `provider_name` + `model_id` + `timeout_secs` + `version`
+- `InferenceModelEntry` -- `alias` + `provider_name` + `model_id` (a single alias-to-provider mapping)
+- `SetClusterInferenceRequest` -- `provider_name` + `model_id` + `timeout_secs` + optional `no_verify` override + `repeated InferenceModelEntry models`, with verification enabled by default
+- `SetClusterInferenceResponse` -- `provider_name` + `model_id` + `timeout_secs` + `version` + `repeated InferenceModelEntry models`
+- `GetClusterInferenceResponse` -- `provider_name` + `model_id` + `timeout_secs` + `version` + `repeated InferenceModelEntry models`
 - `GetInferenceBundleResponse` -- `repeated ResolvedRoute routes` + `revision` + `generated_at_ms`
 - `ResolvedRoute` -- `name`, `base_url`, `protocols`, `api_key`, `model_id`, `provider_type`, `timeout_secs`
+
+When `models` is non-empty in a set request, the gateway uses `upsert_multi_model_route()` and ignores the legacy `provider_name`/`model_id` fields. When `models` is empty, the legacy single-model path is used.
 
 ## Data Plane (Sandbox)
 
@@ -117,7 +135,7 @@ When a `CONNECT inference.local:443` arrives:
 1. Proxy responds `200 Connection Established`.
 2. `handle_inference_interception()` TLS-terminates the client connection using the sandbox CA (MITM).
 3. Raw HTTP requests are parsed from the TLS tunnel using `try_parse_http_request()` (supports Content-Length and chunked transfer encoding).
-4. Each parsed request is passed to `route_inference_request()`.
+4. Each parsed request is passed to `route_inference_request()`. Before routing, the proxy extracts a `model_hint` from the JSON request body's `model` field (if present). This hint is passed to the router for alias-based route selection.
 5. The tunnel supports HTTP keep-alive: multiple requests can be processed sequentially.
 6. Buffer starts at 64 KiB (`INITIAL_INFERENCE_BUF`) and grows up to 10 MiB (`MAX_INFERENCE_BUF`). Requests exceeding the max get `413 Payload Too Large`.
 
@@ -133,10 +151,16 @@ Supported built-in patterns:
 | `POST` | `/v1/completions` | `openai_completions` | `completion` |
 | `POST` | `/v1/responses` | `openai_responses` | `responses` |
 | `POST` | `/v1/messages` | `anthropic_messages` | `messages` |
+| `POST` | `/v1/codex/*` | `openai_responses` | `codex_responses` |
 | `GET` | `/v1/models` | `model_discovery` | `models_list` |
 | `GET` | `/v1/models/*` | `model_discovery` | `models_get` |
+| `POST` | `/api/chat` | `ollama_chat` | `ollama_chat` |
+| `GET` | `/api/tags` | `ollama_model_discovery` | `ollama_tags` |
+| `POST` | `/api/show` | `ollama_model_discovery` | `ollama_show` |
 
-Query strings are stripped before matching. Path matching is exact for most patterns; `/v1/models/*` matches any sub-path (e.g. `/v1/models/gpt-4.1`). Absolute-form URIs (e.g. `https://inference.local/v1/chat/completions`) are normalized to path-only form by `normalize_inference_path()` before detection.
+Query strings are stripped before matching. Path matching is exact for most patterns; `/v1/models/*` and `/v1/codex/*` match any sub-path (e.g. `/v1/models/gpt-4.1`, `/v1/codex/responses`). Absolute-form URIs (e.g. `https://inference.local/v1/chat/completions`) are normalized to path-only form by `normalize_inference_path()` before detection.
+
+Ollama patterns use `/api/` paths (no `/v1/` prefix), matching Ollama's native API. This allows agents to use the Ollama client library directly against `inference.local`.
 
 If no pattern matches, the proxy returns `403 Forbidden` with `{"error": "connection not allowed by policy"}`.
 
@@ -161,7 +185,16 @@ Files:
 
 ### Route selection
 
-`proxy_with_candidates()` finds the first route whose `protocols` list contains the detected source protocol (normalized to lowercase). If no route matches, returns `RouterError::NoCompatibleRoute`.
+`select_route()` picks the best route from the candidate list using a two-phase strategy:
+
+1. **Alias match (preferred)**: If a `model_hint` is provided (extracted from the request body's `model` field), select the first candidate whose `name` equals the hint AND whose `protocols` list contains the detected source protocol.
+2. **Protocol fallback**: If no alias matches, fall back to the first candidate whose `protocols` list contains the source protocol.
+
+This enables multi-route configurations where the agent selects a backend by setting the `model` field to an alias name (e.g. `"model": "my-gpt"` routes to the aliased provider). If the model field is absent, not a known alias, or parsing fails, routing falls back to protocol-based selection.
+
+If no route matches either phase, returns `RouterError::NoCompatibleRoute`.
+
+`proxy_with_candidates()` and `proxy_with_candidates_streaming()` both accept an optional `model_hint: Option<&str>` parameter, passed through from the sandbox proxy.
 
 ### Request rewriting
 
@@ -171,7 +204,7 @@ Files:
 2. **Header stripping**: Removes `authorization`, `x-api-key`, `host`, and any header names that will be set from route defaults.
 3. **Default headers**: Applies route-level default headers (e.g. `anthropic-version: 2023-06-01`) unless the client already sent them.
 4. **Model rewrite**: Parses the request body as JSON and replaces the `model` field with the route's configured model. Non-JSON bodies are forwarded unchanged.
-5. **URL construction**: `build_backend_url()` appends the request path to the route endpoint. If the endpoint already ends with `/v1` and the request path starts with `/v1/`, the duplicate prefix is deduplicated.
+5. **URL construction**: `build_backend_url()` appends the request path to the route endpoint. If the request path is exactly `/v1` or starts with `/v1/`, the `/v1` prefix is always stripped before appending. This handles both `/v1`-suffixed endpoints (e.g. `api.openai.com/v1`) and non-versioned endpoints (e.g. `chatgpt.com/backend-api` for Codex) uniformly.
 
 ### Header sanitization
 
@@ -299,13 +332,25 @@ The system route is stored as a separate `InferenceRoute` record in the gateway 
 
 Cluster inference commands:
 
-- `openshell inference set --provider <name> --model <id> [--timeout <secs>]` -- configures user-facing cluster inference
+- `openshell inference set --provider <name> --model <id> [--timeout <secs>]` -- configures user-facing cluster inference (single model)
+- `openshell inference set --model-alias ALIAS=PROVIDER/MODEL [--model-alias ...] [--timeout <secs>]` -- configures multi-model cluster inference
 - `openshell inference set --system --provider <name> --model <id> [--timeout <secs>]` -- configures system inference
 - `openshell inference update [--provider <name>] [--model <id>] [--timeout <secs>]` -- updates individual fields without resetting others
 - `openshell inference get` -- displays both user and system inference configuration
 - `openshell inference get --system` -- displays only the system inference configuration
 
-The `--provider` flag references a provider record name (not a provider type). The provider must already exist in the cluster and have a supported inference type (`openai`, `anthropic`, or `nvidia`).
+The `--provider` flag references a provider record name (not a provider type). The provider must already exist in the cluster and have a supported inference type (`openai`, `anthropic`, `nvidia`, or `ollama`).
+
+`--model-alias` can be repeated to configure multiple providers simultaneously. It conflicts with `--provider` and `--model` -- the two modes are mutually exclusive. Example:
+
+```bash
+openshell inference set \
+  --model-alias my-gpt=openai-dev/gpt-4o \
+  --model-alias my-claude=anthropic-dev/claude-sonnet-4-20250514 \
+  --model-alias my-llama=ollama-local/llama3
+```
+
+Agents select a backend by setting the `model` field in their inference request to the alias name (e.g. `"model": "my-gpt"`).
 
 The `--timeout` flag sets the per-request timeout in seconds for upstream inference calls. When omitted or set to `0`, the default of 60 seconds applies. Timeout changes propagate to running sandboxes within the route refresh interval (5 seconds by default).
 

@@ -45,8 +45,10 @@ fn select_route<'a>(
     model_hint: Option<&str>,
 ) -> Option<&'a ResolvedRoute> {
     if let Some(hint) = model_hint {
+        let normalized_hint = hint.trim().to_ascii_lowercase();
         if let Some(r) = candidates.iter().find(|r| {
-            r.name == hint && r.protocols.iter().any(|p| p == protocol)
+            r.name.trim().to_ascii_lowercase() == normalized_hint
+                && r.protocols.iter().any(|p| p == protocol)
         }) {
             return Some(r);
         }
@@ -233,7 +235,10 @@ mod tests {
     fn select_route_alias_match_takes_priority() {
         let routes = vec![
             make_route("ollama-local", vec!["openai_chat_completions"]),
-            make_route("openai-prod", vec!["openai_chat_completions", "openai_responses"]),
+            make_route(
+                "openai-prod",
+                vec!["openai_chat_completions", "openai_responses"],
+            ),
         ];
         // Both support openai_chat_completions, but hint selects the second one.
         let r = select_route(&routes, "openai_chat_completions", Some("openai-prod")).unwrap();
@@ -254,9 +259,17 @@ mod tests {
 
     #[test]
     fn select_route_no_match_returns_none() {
-        let routes = vec![
-            make_route("ollama-local", vec!["openai_chat_completions"]),
-        ];
+        let routes = vec![make_route("ollama-local", vec!["openai_chat_completions"])];
         assert!(select_route(&routes, "anthropic_messages", None).is_none());
+    }
+
+    #[test]
+    fn select_route_alias_match_is_case_insensitive() {
+        let routes = vec![
+            make_route("My-GPT", vec!["openai_chat_completions"]),
+            make_route("anthropic-prod", vec!["anthropic_messages"]),
+        ];
+        let r = select_route(&routes, "openai_chat_completions", Some("my-gpt")).unwrap();
+        assert_eq!(r.name, "My-GPT");
     }
 }

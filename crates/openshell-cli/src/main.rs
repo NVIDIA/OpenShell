@@ -6,7 +6,7 @@
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
-use miette::Result;
+use miette::{Result, miette};
 use owo_colors::OwoColorize;
 use std::io::Write;
 
@@ -290,6 +290,7 @@ const GATEWAY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 
 const INFERENCE_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell inference set --provider openai --model gpt-4
+  $ openshell inference set --model-alias gpt=openai/gpt-4 --model-alias claude=anthropic/claude-sonnet-4-20250514
   $ openshell inference get
   $ openshell inference update --model gpt-4-turbo
 ";
@@ -928,15 +929,26 @@ enum GatewayCommands {
 #[derive(Subcommand, Debug)]
 enum InferenceCommands {
     /// Set gateway-level inference provider and model.
+    ///
+    /// Use --provider/--model for single-model mode, or --model-alias for
+    /// multi-model mode (multiple providers routed by alias).
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Set {
-        /// Provider name.
-        #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
-        provider: String,
+        /// Provider name (single-model mode).
+        #[arg(long, required_unless_present = "model_alias", add = ArgValueCompleter::new(completers::complete_provider_names))]
+        provider: Option<String>,
 
-        /// Model identifier to force for generation calls.
-        #[arg(long)]
-        model: String,
+        /// Model identifier to force for generation calls (single-model mode).
+        #[arg(long, required_unless_present = "model_alias")]
+        model: Option<String>,
+
+        /// Add a model alias in the form ALIAS=PROVIDER/MODEL.
+        /// Can be repeated to configure multiple providers simultaneously.
+        /// Not supported with --system.
+        ///
+        /// Example: --model-alias my-gpt=openai-dev/gpt-4o --model-alias my-claude=anthropic-dev/claude-sonnet-4-20250514
+        #[arg(long, conflicts_with_all = ["provider", "model", "system"])]
+        model_alias: Vec<String>,
 
         /// Configure the system inference route instead of the user-facing
         /// route. System inference is used by platform functions (e.g. the
@@ -2091,15 +2103,34 @@ async fn main() -> Result<()> {
                 InferenceCommands::Set {
                     provider,
                     model,
+                    model_alias,
                     system,
                     no_verify,
                     timeout,
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
-                    run::gateway_inference_set(
-                        endpoint, &provider, &model, route_name, no_verify, timeout, &tls,
-                    )
-                    .await?;
+                    if !model_alias.is_empty() {
+                        run::gateway_inference_set_multi(
+                            endpoint,
+                            &model_alias,
+                            route_name,
+                            no_verify,
+                            timeout,
+                            &tls,
+                        )
+                        .await?;
+                    } else {
+                        let provider = provider.as_deref().ok_or_else(|| {
+                            miette!("--provider is required in single-model mode")
+                        })?;
+                        let model = model
+                            .as_deref()
+                            .ok_or_else(|| miette!("--model is required in single-model mode"))?;
+                        run::gateway_inference_set(
+                            endpoint, provider, model, route_name, no_verify, timeout, &tls,
+                        )
+                        .await?;
+                    }
                 }
                 InferenceCommands::Update {
                     provider,

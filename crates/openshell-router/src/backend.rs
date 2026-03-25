@@ -234,6 +234,7 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
             body: bytes::Bytes::from_static(
                 br#"{"model":"test","messages":[{"role":"user","content":"ping"}],"stream":false}"#,
             ),
+            fallback_body: None,
         });
     }
 
@@ -434,6 +435,9 @@ pub async fn proxy_to_backend_streaming(
 
 fn build_backend_url(endpoint: &str, path: &str) -> String {
     let base = endpoint.trim_end_matches('/');
+    // When the endpoint already contains /v1 (e.g. api.openai.com/v1)
+    // and the proxy path also starts with /v1/, strip the duplicate
+    // prefix so the resulting URL is correct.
     if base.ends_with("/v1") && (path == "/v1" || path.starts_with("/v1/")) {
         return format!("{base}{}", &path[3..]);
     }
@@ -458,10 +462,18 @@ mod tests {
     }
 
     #[test]
-    fn build_backend_url_preserves_non_versioned_base() {
+    fn build_backend_url_preserves_v1_for_plain_endpoint() {
         assert_eq!(
-            build_backend_url("https://api.anthropic.com", "/v1/messages"),
-            "https://api.anthropic.com/v1/messages"
+            build_backend_url("https://my-proxy.example.com", "/v1/chat/completions"),
+            "https://my-proxy.example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn build_backend_url_codex_path() {
+        assert_eq!(
+            build_backend_url("https://api.openai.com/v1", "/v1/codex/responses"),
+            "https://api.openai.com/v1/codex/responses"
         );
     }
 
@@ -489,8 +501,9 @@ mod tests {
     #[tokio::test]
     async fn verify_backend_endpoint_uses_route_auth_and_shape() {
         let mock_server = MockServer::start().await;
+        // Use endpoint with /v1 suffix to match real Anthropic endpoint layout.
         let route = test_route(
-            &mock_server.uri(),
+            &format!("{}/v1", mock_server.uri()),
             &["anthropic_messages"],
             AuthHeader::Custom("x-api-key"),
         );
@@ -520,7 +533,7 @@ mod tests {
     #[tokio::test]
     async fn verify_backend_endpoint_accepts_mock_routes() {
         let route = test_route(
-            "mock://test-backend",
+            "mock://test-backend/v1",
             &["openai_chat_completions"],
             AuthHeader::Bearer,
         );

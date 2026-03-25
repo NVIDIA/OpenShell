@@ -254,6 +254,10 @@ async fn upsert_multi_model_route(
         return Err(Status::invalid_argument("models list is empty"));
     }
 
+    // Names reserved for internal route partitioning (sandbox uses
+    // `name == "sandbox-system"` to split user vs system caches).
+    const RESERVED_ALIASES: &[&str] = &["sandbox-system", "inference.local"];
+
     // Validate aliases are unique.
     let mut seen_aliases = std::collections::HashSet::new();
     for entry in models {
@@ -261,6 +265,13 @@ async fn upsert_multi_model_route(
             return Err(Status::invalid_argument(
                 "each model entry must have a non-empty alias",
             ));
+        }
+        let alias_lower = entry.alias.trim().to_ascii_lowercase();
+        if RESERVED_ALIASES.iter().any(|r| *r == alias_lower) {
+            return Err(Status::invalid_argument(format!(
+                "alias '{}' is reserved and cannot be used",
+                entry.alias,
+            )));
         }
         if entry.provider_name.trim().is_empty() {
             return Err(Status::invalid_argument(format!(
@@ -300,9 +311,8 @@ async fn upsert_multi_model_route(
         let resolved = resolve_provider_route(&provider)?;
 
         if verify {
-            validation.push(
-                verify_provider_endpoint(&provider.name, &entry.model_id, &resolved).await?,
-            );
+            validation
+                .push(verify_provider_endpoint(&provider.name, &entry.model_id, &resolved).await?);
         }
     }
 
@@ -1059,7 +1069,7 @@ mod tests {
             "OPENAI_API_KEY",
             "sk-test",
             "OPENAI_BASE_URL",
-            &mock_server.uri(),
+            &format!("{}/v1", mock_server.uri()),
         );
         store
             .put_message(&provider)
@@ -1101,7 +1111,7 @@ mod tests {
             "OPENAI_API_KEY",
             "sk-test",
             "OPENAI_BASE_URL",
-            &mock_server.uri(),
+            &format!("{}/v1", mock_server.uri()),
         );
         store
             .put_message(&provider)
@@ -1310,18 +1320,16 @@ mod tests {
             model_id: "gpt-4o-mini".to_string(),
         }];
 
-        let result = upsert_multi_model_route(
-            &store,
-            CLUSTER_INFERENCE_ROUTE_NAME,
-            &models,
-            false,
-        )
-        .await
-        .expect("upsert should succeed");
+        let result = upsert_multi_model_route(&store, CLUSTER_INFERENCE_ROUTE_NAME, &models, false)
+            .await
+            .expect("upsert should succeed");
 
         assert_eq!(result.route.version, 1);
         assert_eq!(result.route.config.as_ref().unwrap().models.len(), 1);
-        assert_eq!(result.route.config.as_ref().unwrap().models[0].alias, "fast-gpt");
+        assert_eq!(
+            result.route.config.as_ref().unwrap().models[0].alias,
+            "fast-gpt"
+        );
 
         // Legacy fields should be populated from first entry
         assert_eq!(
@@ -1332,5 +1340,27 @@ mod tests {
             result.route.config.as_ref().unwrap().model_id,
             "gpt-4o-mini"
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_multi_model_route_rejects_reserved_alias() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let openai = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-openai");
+        store.put_message(&openai).await.expect("persist");
+
+        let models = vec![InferenceModelEntry {
+            alias: "sandbox-system".to_string(),
+            provider_name: "openai-dev".to_string(),
+            model_id: "gpt-4o".to_string(),
+        }];
+
+        let err = upsert_multi_model_route(&store, CLUSTER_INFERENCE_ROUTE_NAME, &models, false)
+            .await
+            .expect_err("should reject reserved alias");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("reserved"));
     }
 }
