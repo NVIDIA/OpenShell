@@ -32,8 +32,8 @@ use tracing::{debug, error, info};
 
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router};
-pub use multiplex::{MultiplexService, MultiplexedService};
 pub use multiplex::ALPN_H2;
+pub use multiplex::{MultiplexService, MultiplexedService};
 use persistence::Store;
 use sandbox::{SandboxClient, spawn_sandbox_watcher, spawn_store_reconciler};
 use sandbox_index::SandboxIndex;
@@ -222,11 +222,7 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
                         // `serve()`, which can misidentify h2 connections as
                         // HTTP/1.1 when the first read returns a partial
                         // preface.
-                        let alpn = tls_stream
-                            .get_ref()
-                            .1
-                            .alpn_protocol()
-                            .unwrap_or_default();
+                        let alpn = tls_stream.get_ref().1.alpn_protocol().unwrap_or_default();
                         let result = if alpn == ALPN_H2 {
                             debug!(client = %addr, "ALPN negotiated h2 — serving HTTP/2");
                             service.serve_h2(tls_stream).await
