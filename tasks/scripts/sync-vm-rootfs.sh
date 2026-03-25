@@ -56,7 +56,7 @@ if [ -d "${HELM_CHART_DIR}" ]; then
 fi
 
 # ── Kubernetes manifests ───────────────────────────────────────────────
-MANIFEST_SRC="${ROOT}/deploy/k8s"
+MANIFEST_SRC="${ROOT}/deploy/kube/manifests"
 MANIFEST_DST="${ROOTFS_DIR}/opt/openshell/manifests"
 if [ -d "${MANIFEST_SRC}" ]; then
     mkdir -p "${MANIFEST_DST}"

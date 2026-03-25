@@ -5,12 +5,12 @@
 
 ["rust:check"]
 description = "Check all Rust crates for errors"
-run = "cargo check --workspace --exclude openshell-vm"
+run = "cargo check --workspace"
 hide = true
 
 ["rust:lint"]
 description = "Lint Rust code with Clippy"
-run = "cargo clippy --workspace --all-targets --exclude openshell-vm"
+run = "cargo clippy --workspace --all-targets"
 hide = true
 
 ["rust:format"]
