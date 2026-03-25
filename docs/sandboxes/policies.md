@@ -269,6 +269,32 @@ Endpoints with `protocol: rest` enable HTTP request inspection. The proxy auto-d
 
 :::::
 
+### Query parameter matching
+
+REST rules can also constrain query parameter values:
+
+```yaml
+  download_api:
+    name: download_api
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/api/v1/download"
+              query:
+                slug: "skill-*"
+                version:
+                  any: ["1.*", "2.*"]
+    binaries:
+      - { path: /usr/bin/curl }
+```
+
+`query` matchers are case-sensitive and run on decoded values. If a request has duplicate keys (for example, `tag=a&tag=b`), every value for that key must match the configured glob(s).
+
 ## Next Steps
 
 Explore related topics:

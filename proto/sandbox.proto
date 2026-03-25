@@ -100,6 +100,18 @@ message L7Allow {
   string path = 2;
   // SQL command (SQL): SELECT, INSERT, etc. or "*" for any.
   string command = 3;
+  // Query parameter matcher map (REST).
+  // Key is the decoded query parameter name (case-sensitive).
+  // Value supports either a single glob (`glob`) or a list (`any`).
+  map<string, L7QueryMatcher> query = 4;
+}
+
+// Query value matcher for one query parameter key.
+message L7QueryMatcher {
+  // Single glob pattern.
+  string glob = 1;
+  // Any-of glob patterns.
+  repeated string any = 2;
 }
 
 // A binary identity for network policy matching.

@@ -208,6 +208,7 @@ request_allowed_for_endpoint(request, endpoint) if {
 	rule.allow.method
 	method_matches(request.method, rule.allow.method)
 	path_matches(request.path, rule.allow.path)
+	query_params_match(request, rule)
 }
 
 # --- L7 rule matching: SQL command ---
@@ -233,6 +234,55 @@ path_matches(_, "**") if true
 path_matches(actual, pattern) if {
 	pattern != "**"
 	glob.match(pattern, ["/"], actual)
+}
+
+# Query matching:
+# - If no query rules are configured, allow any query params.
+# - For configured keys, all request values for that key must match.
+# - Matcher shape supports either `glob` or `any`.
+query_params_match(request, rule) if {
+	query_rules := object.get(rule.allow, "query", {})
+	not query_mismatch(request, query_rules)
+}
+
+query_mismatch(request, query_rules) if {
+	some key
+	matcher := query_rules[key]
+	not query_key_matches(request, key, matcher)
+}
+
+query_key_matches(request, key, matcher) if {
+	request_query := object.get(request, "query_params", {})
+	values := object.get(request_query, key, null)
+	values != null
+	count(values) > 0
+	not query_value_mismatch(values, matcher)
+}
+
+query_value_mismatch(values, matcher) if {
+	some i
+	value := values[i]
+	not query_value_matches(value, matcher)
+}
+
+query_value_matches(value, matcher) if {
+	is_string(matcher)
+	glob.match(matcher, [], value)
+}
+
+query_value_matches(value, matcher) if {
+	is_object(matcher)
+	glob_pattern := object.get(matcher, "glob", "")
+	glob_pattern != ""
+	glob.match(glob_pattern, [], value)
+}
+
+query_value_matches(value, matcher) if {
+	is_object(matcher)
+	any_patterns := object.get(matcher, "any", [])
+	count(any_patterns) > 0
+	some i
+	glob.match(any_patterns[i], [], value)
 }
 
 # SQL command matching: "*" matches any; otherwise case-insensitive.

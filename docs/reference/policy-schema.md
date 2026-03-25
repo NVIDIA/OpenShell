@@ -196,6 +196,7 @@ Used when `access` is not set. Each rule explicitly allows a method and path com
 |---|---|---|---|
 | `allow.method` | string | Yes | HTTP method to allow (for example, `GET`, `POST`). |
 | `allow.path` | string | Yes | URL path pattern. Supports `*` and `**` glob syntax. |
+| `allow.query` | map | No | Query parameter matchers keyed by decoded param name. Matcher value can be a glob string (`tag: "foo-*"`) or an object with `any` (`tag: { any: ["foo-*", "bar-*"] }`). |
 
 Example with rules:
 
@@ -204,9 +205,14 @@ rules:
   - allow:
       method: GET
       path: /**/info/refs*
+      query:
+        service: "git-*"
   - allow:
       method: POST
       path: /**/git-upload-pack
+      query:
+        tag:
+          any: ["v1.*", "v2.*"]
 ```
 
 ### Binary Object

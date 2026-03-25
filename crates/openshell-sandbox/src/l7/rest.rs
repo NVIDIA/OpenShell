@@ -10,6 +10,7 @@
 use crate::l7::provider::{BodyLength, L7Provider, L7Request};
 use crate::secrets::rewrite_http_header_block;
 use miette::{IntoDiagnostic, Result, miette};
+use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
@@ -116,7 +117,7 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
         .next()
         .ok_or_else(|| miette!("Missing HTTP method"))?
         .to_string();
-    let path = parts
+    let target = parts
         .next()
         .ok_or_else(|| miette!("Missing HTTP path"))?
         .to_string();
@@ -129,13 +130,81 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
 
     // Determine body framing from headers
     let body_length = parse_body_length(header_str)?;
+    let (path, query_params) = parse_target_query(&target)?;
 
     Ok(Some(L7Request {
         action: method,
         target: path,
+        query_params,
         raw_header: buf, // exact header bytes up to and including \r\n\r\n
         body_length,
     }))
+}
+
+fn parse_target_query(target: &str) -> Result<(String, HashMap<String, Vec<String>>)> {
+    match target.split_once('?') {
+        Some((path, query)) => Ok((path.to_string(), parse_query_params(query)?)),
+        None => Ok((target.to_string(), HashMap::new())),
+    }
+}
+
+fn parse_query_params(query: &str) -> Result<HashMap<String, Vec<String>>> {
+    let mut params: HashMap<String, Vec<String>> = HashMap::new();
+    if query.is_empty() {
+        return Ok(params);
+    }
+
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+
+        let (raw_key, raw_value) = match pair.split_once('=') {
+            Some((key, value)) => (key, value),
+            None => (pair, ""),
+        };
+        let key = decode_query_component(raw_key)?;
+        let value = decode_query_component(raw_value)?;
+        params.entry(key).or_default().push(value);
+    }
+
+    Ok(params)
+}
+
+fn decode_query_component(input: &str) -> Result<String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            decoded.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+
+        if i + 2 >= bytes.len() {
+            return Err(miette!("Invalid percent-encoding in query component"));
+        }
+
+        let hi = decode_hex_nibble(bytes[i + 1])
+            .ok_or_else(|| miette!("Invalid percent-encoding in query component"))?;
+        let lo = decode_hex_nibble(bytes[i + 2])
+            .ok_or_else(|| miette!("Invalid percent-encoding in query component"))?;
+        decoded.push((hi << 4) | lo);
+        i += 3;
+    }
+
+    String::from_utf8(decoded).map_err(|_| miette!("Query component is not valid UTF-8"))
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Forward an allowed HTTP request to upstream and relay the response back.
@@ -689,6 +758,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_target_query_parses_duplicate_values() {
+        let (path, query) = parse_target_query("/download?tag=a&tag=b").expect("parse");
+        assert_eq!(path, "/download");
+        assert_eq!(
+            query.get("tag").cloned(),
+            Some(vec!["a".into(), "b".into()])
+        );
+    }
+
+    #[test]
+    fn parse_target_query_decodes_percent_and_preserves_plus() {
+        let (path, query) = parse_target_query("/download?slug=my%2Fskill&name=Foo+Bar").unwrap();
+        assert_eq!(path, "/download");
+        assert_eq!(
+            query.get("slug").cloned(),
+            Some(vec!["my/skill".to_string()])
+        );
+        assert_eq!(
+            query.get("name").cloned(),
+            Some(vec!["Foo+Bar".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_target_query_rejects_malformed_percent_encoding() {
+        let err = parse_target_query("/download?slug=bad%2").expect_err("expected parse error");
+        assert!(
+            err.to_string().contains("percent-encoding"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// SEC-009: Reject requests with both Content-Length and Transfer-Encoding
     /// to prevent CL/TE request smuggling (RFC 7230 Section 3.3.3).
     #[test]
@@ -807,6 +909,32 @@ mod tests {
         assert!(result.is_err(), "Must reject unsupported HTTP version");
     }
 
+    #[tokio::test]
+    async fn parse_http_request_splits_path_and_query_params() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(
+                    b"GET /download?slug=my%2Fskill&tag=foo&tag=bar HTTP/1.1\r\nHost: x\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let req = parse_http_request(&mut client)
+            .await
+            .expect("request should parse")
+            .expect("request should exist");
+        assert_eq!(req.target, "/download");
+        assert_eq!(
+            req.query_params.get("slug").cloned(),
+            Some(vec!["my/skill".to_string()])
+        );
+        assert_eq!(
+            req.query_params.get("tag").cloned(),
+            Some(vec!["foo".to_string(), "bar".to_string()])
+        );
+    }
+
     /// Regression test: two pipelined requests in a single write must be
     /// parsed independently.  Before the fix, the 1024-byte `read()` buffer
     /// could capture bytes from the second request, which were forwarded
@@ -831,6 +959,7 @@ mod tests {
             .expect("expected first request");
         assert_eq!(first.action, "GET");
         assert_eq!(first.target, "/allowed");
+        assert!(first.query_params.is_empty());
         assert_eq!(
             first.raw_header, b"GET /allowed HTTP/1.1\r\nHost: example.com\r\n\r\n",
             "raw_header must contain only the first request's headers"
@@ -842,6 +971,7 @@ mod tests {
             .expect("expected second request");
         assert_eq!(second.action, "POST");
         assert_eq!(second.target, "/blocked");
+        assert!(second.query_params.is_empty());
     }
 
     #[test]
@@ -1194,7 +1324,7 @@ mod tests {
     /// to the upstream API, causing 401 Unauthorized errors.
     #[tokio::test]
     async fn relay_request_with_resolver_rewrites_credential_placeholders() {
-        let provider_env: std::collections::HashMap<String, String> = [(
+        let provider_env: HashMap<String, String> = [(
             "NVIDIA_API_KEY".to_string(),
             "nvapi-real-secret-key".to_string(),
         )]
@@ -1210,6 +1340,7 @@ mod tests {
         let req = L7Request {
             action: "POST".to_string(),
             target: "/v1/chat/completions".to_string(),
+            query_params: HashMap::new(),
             raw_header: format!(
                 "POST /v1/chat/completions HTTP/1.1\r\n\
                  Host: integrate.api.nvidia.com\r\n\
@@ -1293,6 +1424,7 @@ mod tests {
         let req = L7Request {
             action: "POST".to_string(),
             target: "/v1/chat/completions".to_string(),
+            query_params: HashMap::new(),
             raw_header: format!(
                 "POST /v1/chat/completions HTTP/1.1\r\n\
                  Host: integrate.api.nvidia.com\r\n\

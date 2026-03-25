@@ -76,6 +76,8 @@ pub struct L7RequestInfo {
     pub action: String,
     /// Target: URL path for REST, or empty for SQL.
     pub target: String,
+    /// Decoded query parameter multimap for REST requests.
+    pub query_params: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// Parse an L7 endpoint config from a regorus Value (returned by Rego query).
@@ -279,7 +281,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                     "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "*",
                 ];
                 if let Some(rules) = ep.get("rules").and_then(|v| v.as_array()) {
-                    for rule in rules {
+                    for (rule_idx, rule) in rules.iter().enumerate() {
                         if let Some(method) = rule
                             .get("allow")
                             .and_then(|a| a.get("method"))
@@ -290,6 +292,88 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                             warnings.push(format!(
                                     "{loc}: Unknown HTTP method '{method}'. Standard methods: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS."
                                 ));
+                        }
+
+                        let Some(query) = rule
+                            .get("allow")
+                            .and_then(|a| a.get("query"))
+                            .filter(|v| !v.is_null())
+                        else {
+                            continue;
+                        };
+
+                        let Some(query_obj) = query.as_object() else {
+                            errors.push(format!(
+                                "{loc}.rules[{rule_idx}].allow.query: expected map of query matchers"
+                            ));
+                            continue;
+                        };
+
+                        for (param, matcher) in query_obj {
+                            if matcher.as_str().is_some() {
+                                continue;
+                            }
+
+                            let Some(matcher_obj) = matcher.as_object() else {
+                                errors.push(format!(
+                                    "{loc}.rules[{rule_idx}].allow.query.{param}: expected string glob or object with `any`"
+                                ));
+                                continue;
+                            };
+
+                            let has_any = matcher_obj.get("any").is_some();
+                            let has_glob = matcher_obj.get("glob").is_some();
+                            let has_unknown = matcher_obj.keys().any(|k| k != "any" && k != "glob");
+                            if has_unknown {
+                                errors.push(format!(
+                                    "{loc}.rules[{rule_idx}].allow.query.{param}: unknown matcher keys; only `glob` or `any` are supported"
+                                ));
+                                continue;
+                            }
+
+                            if has_glob && has_any {
+                                errors.push(format!(
+                                    "{loc}.rules[{rule_idx}].allow.query.{param}: matcher cannot specify both `glob` and `any`"
+                                ));
+                                continue;
+                            }
+
+                            if !has_glob && !has_any {
+                                errors.push(format!(
+                                    "{loc}.rules[{rule_idx}].allow.query.{param}: object matcher requires `glob` string or non-empty `any` list"
+                                ));
+                                continue;
+                            }
+
+                            if has_glob {
+                                if matcher_obj.get("glob").and_then(|v| v.as_str()).is_none() {
+                                    errors.push(format!(
+                                        "{loc}.rules[{rule_idx}].allow.query.{param}.glob: expected glob string"
+                                    ));
+                                }
+                                continue;
+                            }
+
+                            let any = matcher_obj.get("any").and_then(|v| v.as_array());
+                            let Some(any) = any else {
+                                errors.push(format!(
+                                    "{loc}.rules[{rule_idx}].allow.query.{param}.any: expected array of glob strings"
+                                ));
+                                continue;
+                            };
+
+                            if any.is_empty() {
+                                errors.push(format!(
+                                    "{loc}.rules[{rule_idx}].allow.query.{param}.any: list must not be empty"
+                                ));
+                                continue;
+                            }
+
+                            if any.iter().any(|v| v.as_str().is_none()) {
+                                errors.push(format!(
+                                    "{loc}.rules[{rule_idx}].allow.query.{param}.any: all values must be strings"
+                                ));
+                            }
                         }
                     }
                 }
@@ -778,6 +862,98 @@ mod tests {
         assert!(
             !warnings.iter().any(|w| w.contains("tls")),
             "should have no tls warnings with auto-detect: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_query_any_requires_non_empty_array() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 8080,
+                        "protocol": "rest",
+                        "rules": [{
+                            "allow": {
+                                "method": "GET",
+                                "path": "/download",
+                                "query": {
+                                    "tag": { "any": [] }
+                                }
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("allow.query.tag.any")),
+            "expected query any validation error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_query_object_rejects_unknown_keys() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 8080,
+                        "protocol": "rest",
+                        "rules": [{
+                            "allow": {
+                                "method": "GET",
+                                "path": "/download",
+                                "query": {
+                                    "tag": { "mode": "foo-*" }
+                                }
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("unknown matcher keys")),
+            "expected unknown query matcher key error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_query_string_and_any_matchers_are_accepted() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 8080,
+                        "protocol": "rest",
+                        "rules": [{
+                            "allow": {
+                                "method": "GET",
+                                "path": "/download",
+                                "query": {
+                                    "slug": "my-*",
+                                    "tag": { "any": ["foo-*", "bar-*"] },
+                                    "owner": { "glob": "org-*" }
+                                }
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "valid query matcher shapes should not error: {errors:?}"
         );
     }
 }

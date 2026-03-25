@@ -968,7 +968,7 @@ flowchart LR
 | `EnforcementMode` | `Audit`, `Enforce` | What to do on L7 deny (log-only vs block) |
 | `L7EndpointConfig` | `{ protocol, tls, enforcement }` | Per-endpoint L7 configuration |
 | `L7Decision` | `{ allowed, reason, matched_rule }` | Result of L7 evaluation |
-| `L7RequestInfo` | `{ action, target }` | HTTP method + path for policy evaluation |
+| `L7RequestInfo` | `{ action, target, query_params }` | HTTP method, path, and decoded query multimap for policy evaluation |
 
 ### Access presets
 
@@ -1047,7 +1047,7 @@ This enables credential injection on all HTTPS endpoints automatically, without 
 
 Implements `L7Provider` for HTTP/1.1:
 
-- **`parse_request()`**: Reads up to 16 KiB of headers, parses the request line (method, path), determines body framing from `Content-Length` or `Transfer-Encoding: chunked` headers. Returns `L7Request` with raw header bytes (may include overflow body bytes).
+- **`parse_request()`**: Reads up to 16 KiB of headers, parses the request line (method, path), decodes query parameters into a multimap, determines body framing from `Content-Length` or `Transfer-Encoding: chunked` headers. Returns `L7Request` with raw header bytes (may include overflow body bytes).
 
 - **`relay()`**: Forwards request headers and body to upstream (handling Content-Length, chunked, and no-body cases), then reads and relays the full response back to the client.
 
@@ -1060,7 +1060,7 @@ Implements `L7Provider` for HTTP/1.1:
 `relay_with_inspection()` in `crates/openshell-sandbox/src/l7/relay.rs` is the main relay loop:
 
 1. Parse one HTTP request from client via the provider
-2. Build L7 input JSON with `request.method`, `request.path`, plus the CONNECT-level context (host, port, binary, ancestors, cmdline)
+2. Build L7 input JSON with `request.method`, `request.path`, `request.query_params`, plus the CONNECT-level context (host, port, binary, ancestors, cmdline)
 3. Evaluate `data.openshell.sandbox.allow_request` and `data.openshell.sandbox.request_deny_reason`
 4. Log the L7 decision (tagged `L7_REQUEST`)
 5. If allowed (or audit mode): relay request to upstream and response back to client, then loop
