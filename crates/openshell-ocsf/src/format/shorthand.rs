@@ -43,7 +43,6 @@ impl OcsfEvent {
     #[must_use]
     pub fn format_shorthand(&self) -> String {
         let base = self.base();
-        let ts = format_ts(base.time);
         let sev = severity_char(base.severity.as_u8());
 
         match self {
@@ -85,7 +84,7 @@ impl OcsfEvent {
                     format!(" {actor_str} -> {dst}")
                 };
 
-                format!("{ts} {sev} NET:{activity} {action}{arrow}{rule_ctx}")
+                format!("{sev} NET:{activity} {action}{arrow}{rule_ctx}")
             }
 
             Self::HttpActivity(e) => {
@@ -116,7 +115,7 @@ impl OcsfEvent {
                     format!(" {actor_str} -> {method} {url_str}")
                 };
 
-                format!("{ts} {sev} HTTP:{method} {action}{arrow}{rule_ctx}")
+                format!("{sev} HTTP:{method} {action}{arrow}{rule_ctx}")
             }
 
             Self::SshActivity(e) => {
@@ -143,7 +142,7 @@ impl OcsfEvent {
                     })
                     .unwrap_or_default();
 
-                format!("{ts} {sev} SSH:{activity} {action} {peer}{auth_ctx}")
+                format!("{sev} SSH:{activity} {action} {peer}{auth_ctx}")
             }
 
             Self::ProcessActivity(e) => {
@@ -160,7 +159,7 @@ impl OcsfEvent {
                     .map(|c| format!(" [cmd:{c}]"))
                     .unwrap_or_default();
 
-                format!("{ts} {sev} PROC:{activity} {proc_str}{exit_ctx}{cmd_ctx}")
+                format!("{sev} PROC:{activity} {proc_str}{exit_ctx}{cmd_ctx}")
             }
 
             Self::DetectionFinding(e) => {
@@ -173,7 +172,7 @@ impl OcsfEvent {
                     .map(|c| format!(" [confidence:{}]", c.label().to_lowercase()))
                     .unwrap_or_default();
 
-                format!("{ts} {sev} FINDING:{disposition} \"{title}\"{confidence_ctx}")
+                format!("{sev} FINDING:{disposition} \"{title}\"{confidence_ctx}")
             }
 
             Self::ApplicationLifecycle(e) => {
@@ -185,7 +184,7 @@ impl OcsfEvent {
                     .map(|s| s.label().to_lowercase())
                     .unwrap_or_default();
 
-                format!("{ts} {sev} LIFECYCLE:{activity} {app} {status}")
+                format!("{sev} LIFECYCLE:{activity} {app} {status}")
             }
 
             Self::DeviceConfigStateChange(e) => {
@@ -214,7 +213,7 @@ impl OcsfEvent {
                     })
                     .unwrap_or_default();
 
-                format!("{ts} {sev} CONFIG:{state} {what}{version_ctx}")
+                format!("{sev} CONFIG:{state} {what}{version_ctx}")
             }
 
             Self::Base(e) => {
@@ -240,7 +239,7 @@ impl OcsfEvent {
                     })
                     .unwrap_or_default();
 
-                format!("{ts} {sev} EVENT {message}{unmapped_ctx}")
+                format!("{sev} EVENT {message}{unmapped_ctx}")
             }
         }
     }
@@ -337,7 +336,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 I NET:OPEN ALLOWED python3(42) -> api.example.com:443 [policy:default-egress engine:mechanistic]"
+            "I NET:OPEN ALLOWED python3(42) -> api.example.com:443 [policy:default-egress engine:mechanistic]"
         );
     }
 
@@ -366,7 +365,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 M NET:REFUSE DENIED node(1234) -> 93.184.216.34:443/tcp [policy:bypass-detect engine:iptables]"
+            "M NET:REFUSE DENIED node(1234) -> 93.184.216.34:443/tcp [policy:bypass-detect engine:iptables]"
         );
     }
 
@@ -395,7 +394,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 I HTTP:GET ALLOWED curl(88) -> GET https://api.example.com/v1/data [policy:default-egress]"
+            "I HTTP:GET ALLOWED curl(88) -> GET https://api.example.com/v1/data [policy:default-egress]"
         );
     }
 
@@ -414,10 +413,7 @@ mod tests {
         });
 
         let shorthand = event.format_shorthand();
-        assert_eq!(
-            shorthand,
-            "14:00:00.000 I SSH:OPEN ALLOWED 10.42.0.1:48201 [auth:NSSH1]"
-        );
+        assert_eq!(shorthand, "I SSH:OPEN ALLOWED 10.42.0.1:48201 [auth:NSSH1]");
     }
 
     #[test]
@@ -435,7 +431,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 I PROC:LAUNCH python3(42) [cmd:python3 /app/main.py]"
+            "I PROC:LAUNCH python3(42) [cmd:python3 /app/main.py]"
         );
     }
 
@@ -459,10 +455,7 @@ mod tests {
         });
 
         let shorthand = event.format_shorthand();
-        assert_eq!(
-            shorthand,
-            "14:00:00.000 I PROC:TERMINATE python3(42) [exit:0]"
-        );
+        assert_eq!(shorthand, "I PROC:TERMINATE python3(42) [exit:0]");
     }
 
     #[test]
@@ -487,7 +480,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 H FINDING:BLOCKED \"NSSH1 Nonce Replay Attack\" [confidence:high]"
+            "H FINDING:BLOCKED \"NSSH1 Nonce Replay Attack\" [confidence:high]"
         );
     }
 
@@ -512,10 +505,7 @@ mod tests {
         });
 
         let shorthand = event.format_shorthand();
-        assert_eq!(
-            shorthand,
-            "14:00:00.000 I LIFECYCLE:START openshell-sandbox success"
-        );
+        assert_eq!(shorthand, "I LIFECYCLE:START openshell-sandbox success");
     }
 
     #[test]
@@ -536,7 +526,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 I CONFIG:LOADED policy reloaded [version:v3 hash:sha256:abc123def456]"
+            "I CONFIG:LOADED policy reloaded [version:v3 hash:sha256:abc123def456]"
         );
     }
 
@@ -551,7 +541,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 I EVENT Network namespace created [ns:openshell-sandbox-abc123]"
+            "I EVENT Network namespace created [ns:openshell-sandbox-abc123]"
         );
     }
 }
