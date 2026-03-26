@@ -132,7 +132,13 @@ pub(crate) fn begin_spawn() {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn end_spawn() {
-    ACTIVE_SPAWNS.fetch_sub(1, Ordering::SeqCst);
+    let result = ACTIVE_SPAWNS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        current.checked_sub(1)
+    });
+    debug_assert!(
+        result.is_ok(),
+        "end_spawn called when no spawns are active (ACTIVE_SPAWNS == 0)"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1879,15 +1885,11 @@ filesystem_policy:
     fn spawn_tracking_toggles_in_progress_state() {
         let _guard = SPAWN_LOCK.lock().unwrap();
 
-        while spawn_in_progress() {
-            end_spawn();
-        }
-
-        assert!(!spawn_in_progress());
+        let initial_in_progress = spawn_in_progress();
         begin_spawn();
         assert!(spawn_in_progress());
         end_spawn();
-        assert!(!spawn_in_progress());
+        assert_eq!(spawn_in_progress(), initial_in_progress);
     }
 
     #[tokio::test]

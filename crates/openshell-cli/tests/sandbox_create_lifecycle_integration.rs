@@ -698,35 +698,54 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
     let _env = test_env(&fake_ssh_dir, &xdg_dir);
     let tls = test_tls(&server);
     install_fake_ssh(&fake_ssh_dir);
-    let forward_port = TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let mut last_err = None;
+    for _ in 0..5 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let forward_port = listener.local_addr().unwrap().port();
+        drop(listener);
 
-    run::sandbox_create(
-        &server.endpoint,
-        Some("persistent-forward"),
-        None,
-        "openshell",
-        None,
-        false,
-        false,
-        None,
-        None,
-        None,
-        &[],
-        None,
-        Some(openshell_core::forward::ForwardSpec::new(forward_port)),
-        &["echo".to_string(), "OK".to_string()],
-        Some(false),
-        Some(false),
-        Some(false),
-        &tls,
-    )
-    .await
-    .expect("sandbox create with forward should succeed");
+        match run::sandbox_create(
+            &server.endpoint,
+            Some("persistent-forward"),
+            None,
+            "openshell",
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            Some(openshell_core::forward::ForwardSpec::new(forward_port)),
+            &["echo".to_string(), "OK".to_string()],
+            Some(false),
+            Some(false),
+            Some(false),
+            &tls,
+        )
+        .await
+        {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(err) => {
+                let err_text = err.to_string();
+                if err_text.contains("Address already in use") {
+                    last_err = Some(err_text);
+                    continue;
+                }
+                panic!("sandbox create with forward should succeed: {err}");
+            }
+        }
+    }
+
+    assert!(
+        last_err.is_none(),
+        "sandbox create with forward hit port allocation race repeatedly: {}",
+        last_err.unwrap()
+    );
 
     assert!(deleted_names(&server).await.is_empty());
 }
