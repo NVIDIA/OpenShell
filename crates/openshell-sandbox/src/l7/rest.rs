@@ -171,12 +171,25 @@ fn parse_query_params(query: &str) -> Result<HashMap<String, Vec<String>>> {
     Ok(params)
 }
 
+/// Decode a single query string component (key or value).
+///
+/// Handles both RFC 3986 percent-encoding (`%20` → space) and the
+/// `application/x-www-form-urlencoded` convention (`+` → space).
+/// Decoding `+` as space matches the behavior of Python's `urllib.parse`,
+/// JavaScript's `URLSearchParams`, Go's `url.ParseQuery`, and most HTTP
+/// frameworks. Callers that need a literal `+` should send `%2B`.
 fn decode_query_component(input: &str) -> Result<String> {
     let bytes = input.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
 
     while i < bytes.len() {
+        if bytes[i] == b'+' {
+            decoded.push(b' ');
+            i += 1;
+            continue;
+        }
+
         if bytes[i] != b'%' {
             decoded.push(bytes[i]);
             i += 1;
@@ -769,16 +782,69 @@ mod tests {
     }
 
     #[test]
-    fn parse_target_query_decodes_percent_and_preserves_plus() {
+    fn parse_target_query_decodes_percent_and_plus() {
         let (path, query) = parse_target_query("/download?slug=my%2Fskill&name=Foo+Bar").unwrap();
         assert_eq!(path, "/download");
         assert_eq!(
             query.get("slug").cloned(),
             Some(vec!["my/skill".to_string()])
         );
+        // `+` is decoded as space per application/x-www-form-urlencoded.
+        // Literal `+` should be sent as `%2B`.
         assert_eq!(
             query.get("name").cloned(),
-            Some(vec!["Foo+Bar".to_string()])
+            Some(vec!["Foo Bar".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_target_query_literal_plus_via_percent_encoding() {
+        let (_path, query) = parse_target_query("/search?q=a%2Bb").unwrap();
+        assert_eq!(
+            query.get("q").cloned(),
+            Some(vec!["a+b".to_string()]),
+            "%2B should decode to literal +"
+        );
+    }
+
+    #[test]
+    fn parse_target_query_empty_value() {
+        let (_path, query) = parse_target_query("/api?tag=").unwrap();
+        assert_eq!(
+            query.get("tag").cloned(),
+            Some(vec!["".to_string()]),
+            "key with empty value should produce empty string"
+        );
+    }
+
+    #[test]
+    fn parse_target_query_key_without_value() {
+        let (_path, query) = parse_target_query("/api?verbose").unwrap();
+        assert_eq!(
+            query.get("verbose").cloned(),
+            Some(vec!["".to_string()]),
+            "key without = should produce empty string value"
+        );
+    }
+
+    #[test]
+    fn parse_target_query_unicode_after_decoding() {
+        // "café" = c a f %C3%A9
+        let (_path, query) = parse_target_query("/search?q=caf%C3%A9").unwrap();
+        assert_eq!(
+            query.get("q").cloned(),
+            Some(vec!["café".to_string()]),
+            "percent-encoded UTF-8 should decode correctly"
+        );
+    }
+
+    #[test]
+    fn parse_target_query_empty_query_string() {
+        let (path, query) = parse_target_query("/api?").unwrap();
+        assert_eq!(path, "/api");
+        assert!(
+            query.is_empty(),
+            "empty query after ? should produce empty map"
         );
     }
 

@@ -146,6 +146,49 @@ fn get_object_str(val: &regorus::Value, key: &str) -> Option<String> {
     }
 }
 
+/// Check a glob pattern for obvious syntax issues.
+///
+/// Returns `Some(warning_message)` if the pattern looks malformed.
+/// OPA's `glob.match` is forgiving, so these are warnings (not errors)
+/// to surface likely typos without blocking policy loading.
+fn check_glob_syntax(pattern: &str) -> Option<String> {
+    let mut bracket_depth: i32 = 0;
+    for c in pattern.chars() {
+        match c {
+            '[' => bracket_depth += 1,
+            ']' => {
+                if bracket_depth == 0 {
+                    return Some(format!("glob pattern '{pattern}' has unmatched ']'"));
+                }
+                bracket_depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    if bracket_depth > 0 {
+        return Some(format!("glob pattern '{pattern}' has unclosed '['"));
+    }
+
+    let mut brace_depth: i32 = 0;
+    for c in pattern.chars() {
+        match c {
+            '{' => brace_depth += 1,
+            '}' => {
+                if brace_depth == 0 {
+                    return Some(format!("glob pattern '{pattern}' has unmatched '}}'"));
+                }
+                brace_depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    if brace_depth > 0 {
+        return Some(format!("glob pattern '{pattern}' has unclosed '{{'"));
+    }
+
+    None
+}
+
 /// Validate L7 policy configuration in the loaded OPA data.
 ///
 /// Returns a list of errors and warnings. Errors should prevent sandbox startup;
@@ -310,7 +353,12 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                         };
 
                         for (param, matcher) in query_obj {
-                            if matcher.as_str().is_some() {
+                            if let Some(glob_str) = matcher.as_str() {
+                                if let Some(warning) = check_glob_syntax(glob_str) {
+                                    warnings.push(format!(
+                                        "{loc}.rules[{rule_idx}].allow.query.{param}: {warning}"
+                                    ));
+                                }
                                 continue;
                             }
 
@@ -346,10 +394,19 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                             }
 
                             if has_glob {
-                                if matcher_obj.get("glob").and_then(|v| v.as_str()).is_none() {
-                                    errors.push(format!(
-                                        "{loc}.rules[{rule_idx}].allow.query.{param}.glob: expected glob string"
-                                    ));
+                                match matcher_obj.get("glob").and_then(|v| v.as_str()) {
+                                    None => {
+                                        errors.push(format!(
+                                            "{loc}.rules[{rule_idx}].allow.query.{param}.glob: expected glob string"
+                                        ));
+                                    }
+                                    Some(g) => {
+                                        if let Some(warning) = check_glob_syntax(g) {
+                                            warnings.push(format!(
+                                                "{loc}.rules[{rule_idx}].allow.query.{param}.glob: {warning}"
+                                            ));
+                                        }
+                                    }
                                 }
                                 continue;
                             }
@@ -373,6 +430,14 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                                 errors.push(format!(
                                     "{loc}.rules[{rule_idx}].allow.query.{param}.any: all values must be strings"
                                 ));
+                            }
+
+                            for item in any.iter().filter_map(|v| v.as_str()) {
+                                if let Some(warning) = check_glob_syntax(item) {
+                                    warnings.push(format!(
+                                        "{loc}.rules[{rule_idx}].allow.query.{param}.any: {warning}"
+                                    ));
+                                }
                             }
                         }
                     }
@@ -922,6 +987,114 @@ mod tests {
         assert!(
             errors.iter().any(|e| e.contains("unknown matcher keys")),
             "expected unknown query matcher key error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_query_glob_warns_on_unclosed_bracket() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 8080,
+                        "protocol": "rest",
+                        "rules": [{
+                            "allow": {
+                                "method": "GET",
+                                "path": "/download",
+                                "query": {
+                                    "tag": "[unclosed"
+                                }
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "malformed glob should warn, not error: {errors:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("unclosed '['") && w.contains("allow.query.tag")),
+            "expected glob syntax warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_query_glob_warns_on_unclosed_brace() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 8080,
+                        "protocol": "rest",
+                        "rules": [{
+                            "allow": {
+                                "method": "GET",
+                                "path": "/download",
+                                "query": {
+                                    "format": { "glob": "{json,xml" }
+                                }
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "malformed glob should warn, not error: {errors:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("unclosed '{'") && w.contains("allow.query.format.glob")),
+            "expected glob syntax warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_query_any_warns_on_malformed_glob_item() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 8080,
+                        "protocol": "rest",
+                        "rules": [{
+                            "allow": {
+                                "method": "GET",
+                                "path": "/download",
+                                "query": {
+                                    "tag": { "any": ["valid-*", "[bad"] }
+                                }
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "malformed glob in any should warn, not error: {errors:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("unclosed '['") && w.contains("allow.query.tag.any")),
+            "expected glob syntax warning for any item, got: {warnings:?}"
         );
     }
 
