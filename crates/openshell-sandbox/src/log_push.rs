@@ -243,6 +243,61 @@ async fn drain_during_backoff(
     }
 }
 
+const REDACTED_LOG_VALUE: &str = "[REDACTED]";
+
+fn sanitize_field_value(field_name: &str, value: &str) -> String {
+    if field_name_looks_sensitive(field_name) || value_looks_sensitive(value) {
+        REDACTED_LOG_VALUE.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn field_name_looks_sensitive(field_name: &str) -> bool {
+    let normalized = field_name.to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "proxy_authorization"
+            | "token"
+            | "secret"
+            | "password"
+            | "passwd"
+            | "api_key"
+            | "apikey"
+    ) || matches!(
+        normalized.as_str(),
+        name if name.ends_with("_token")
+            || name.ends_with("_secret")
+            || name.ends_with("_password")
+            || name.ends_with("_passwd")
+            || name.ends_with("_api_key")
+            || name.ends_with("_apikey")
+    )
+}
+
+fn value_looks_sensitive(value: &str) -> bool {
+    let candidate = strip_wrapping_quotes(value.trim());
+    let lower = candidate.to_ascii_lowercase();
+    lower.starts_with("bearer ")
+        || lower.starts_with("openshell:resolve:")
+        || candidate.starts_with("sk-")
+}
+
+fn strip_wrapping_quotes(mut value: &str) -> &str {
+    loop {
+        let trimmed = value.trim();
+        if trimmed.len() >= 2
+            && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+                || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+        {
+            value = &trimmed[1..trimmed.len() - 1];
+            continue;
+        }
+        return trimmed;
+    }
+}
+
 #[derive(Debug, Default)]
 struct LogVisitor {
     message: Option<String>,
@@ -263,8 +318,10 @@ impl tracing::field::Visit for LogVisitor {
         if field.name() == "message" {
             self.message = Some(value.to_string());
         } else {
-            self.fields
-                .push((field.name().to_string(), value.to_string()));
+            self.fields.push((
+                field.name().to_string(),
+                sanitize_field_value(field.name(), value),
+            ));
         }
     }
 
@@ -272,8 +329,11 @@ impl tracing::field::Visit for LogVisitor {
         if field.name() == "message" {
             self.message = Some(format!("{value:?}"));
         } else {
-            self.fields
-                .push((field.name().to_string(), format!("{value:?}")));
+            let rendered = format!("{value:?}");
+            self.fields.push((
+                field.name().to_string(),
+                sanitize_field_value(field.name(), &rendered),
+            ));
         }
     }
 }
@@ -281,4 +341,71 @@ impl tracing::field::Visit for LogVisitor {
 fn current_time_ms() -> Option<i64> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
     i64::try_from(now.as_millis()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_field_value_redacts_sensitive_field_names() {
+        assert_eq!(
+            sanitize_field_value("authorization", "Basic abc123"),
+            REDACTED_LOG_VALUE
+        );
+        assert_eq!(
+            sanitize_field_value("api_key", "not-a-pattern-match"),
+            REDACTED_LOG_VALUE
+        );
+        assert_eq!(
+            sanitize_field_value("session_token", "opaque"),
+            REDACTED_LOG_VALUE
+        );
+    }
+
+    #[test]
+    fn sanitize_field_value_redacts_known_secret_prefixes() {
+        assert_eq!(
+            sanitize_field_value("dst_host", "Bearer abc123"),
+            REDACTED_LOG_VALUE
+        );
+        assert_eq!(
+            sanitize_field_value("dst_host", "sk-proj-123456"),
+            REDACTED_LOG_VALUE
+        );
+        assert_eq!(
+            sanitize_field_value("dst_host", "openshell:resolve:provider.token"),
+            REDACTED_LOG_VALUE
+        );
+    }
+
+    #[test]
+    fn sanitize_field_value_redacts_debug_quoted_secret_values() {
+        assert_eq!(
+            sanitize_field_value("metadata", "\"Bearer abc123\""),
+            REDACTED_LOG_VALUE
+        );
+        assert_eq!(
+            sanitize_field_value("metadata", "\"sk-secret-value\""),
+            REDACTED_LOG_VALUE
+        );
+    }
+
+    #[test]
+    fn sanitize_field_value_preserves_benign_fields() {
+        assert_eq!(
+            sanitize_field_value("l7_target", "api.openai.com"),
+            "api.openai.com"
+        );
+        assert_eq!(sanitize_field_value("token_count", "42"), "42");
+        assert_eq!(
+            sanitize_field_value("event", "BearerTokenParsingFailed"),
+            "BearerTokenParsingFailed"
+        );
+    }
+
+    #[test]
+    fn current_time_ms_returns_some() {
+        assert!(current_time_ms().is_some());
+    }
 }
