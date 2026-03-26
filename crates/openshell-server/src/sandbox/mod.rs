@@ -880,6 +880,18 @@ fn sandbox_template_to_k8s(
             serde_json::json!(template.runtime_class_name),
         );
     }
+    if !template.image_pull_secrets.is_empty() {
+        spec.insert(
+            "imagePullSecrets".to_string(),
+            serde_json::Value::Array(
+                template
+                    .image_pull_secrets
+                    .iter()
+                    .map(|name| serde_json::json!({ "name": name }))
+                    .collect(),
+            ),
+        );
+    }
 
     let mut container = serde_json::Map::new();
     container.insert("name".to_string(), serde_json::json!("agent"));
@@ -1764,6 +1776,37 @@ mod tests {
             pod_template["spec"]["hostAliases"].is_null(),
             "hostAliases should not be present when host_gateway_ip is empty"
         );
+    }
+
+    #[test]
+    fn image_pull_secrets_are_forwarded_to_pod_spec() {
+        let template = SandboxTemplate {
+            image_pull_secrets: vec!["regcred".to_string(), "backup".to_string()],
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+            "",
+        );
+
+        let pull_secrets = pod_template["spec"]["imagePullSecrets"]
+            .as_array()
+            .expect("imagePullSecrets should exist");
+        assert_eq!(pull_secrets.len(), 2);
+        assert_eq!(pull_secrets[0]["name"], "regcred");
+        assert_eq!(pull_secrets[1]["name"], "backup");
     }
 
     #[test]

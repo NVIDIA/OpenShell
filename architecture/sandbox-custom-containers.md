@@ -83,6 +83,13 @@ openshell sandbox create --from openclaw
 openshell sandbox create --from myimage:latest -- echo "hello from custom container"
 ```
 
+For private registry images, attach one or more pull secrets:
+
+```bash
+openshell sandbox secret create registry regcred --server registry.example.com --username myuser --from-env REGISTRY_PASSWORD
+openshell sandbox create --from registry.example.com/team/private-image:latest --image-pull-secret regcred -- echo "hello from custom container"
+```
+
 When `--from` is set the CLI clears the default `run_as_user`/`run_as_group` policy (which expects a `sandbox` user) so that arbitrary images that lack that user can start without error.
 
 ### Building from a Dockerfile in one step

@@ -44,6 +44,7 @@ message SandboxTemplate {
   map<string, string> annotations = 5;
   map<string, string> environment = 6;
   google.protobuf.Struct resources = 7;
+  repeated string image_pull_secrets = 8;
   google.protobuf.Struct volume_claim_templates = 9;
 }
 

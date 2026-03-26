@@ -67,6 +67,14 @@ $ openshell sandbox create --from ./my-sandbox-dir
 $ openshell sandbox create --from my-registry.example.com/my-image:latest
 ```
 
+For private registry images, create a reusable registry secret and attach it at
+create time:
+
+```console
+$ openshell sandbox secret create registry regcred --server registry.example.com --username myuser --from-env REGISTRY_PASSWORD
+$ openshell sandbox create --from registry.example.com/team/private-image:latest --image-pull-secret regcred -- /bin/bash
+```
+
 The CLI resolves community names against the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog, pulls the bundled Dockerfile and policy, builds the image locally, and creates the sandbox. For the full catalog and how to contribute your own, refer to {doc}`community-sandboxes`.
 
 ## Connect to a Sandbox

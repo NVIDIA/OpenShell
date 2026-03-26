@@ -3194,6 +3194,12 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
         MAX_MAP_VALUE_LEN,
         "template.environment",
     )?;
+    validate_string_list(
+        &tmpl.image_pull_secrets,
+        MAX_TEMPLATE_MAP_ENTRIES,
+        MAX_TEMPLATE_STRING_LEN,
+        "template.image_pull_secrets",
+    )?;
 
     // Struct fields (serialized size).
     if let Some(ref s) = tmpl.resources {
@@ -3237,6 +3243,29 @@ fn validate_string_map(
                 key.len()
             )));
         }
+        if value.len() > max_value_len {
+            return Err(Status::invalid_argument(format!(
+                "{field_name} value exceeds maximum length ({} > {max_value_len})",
+                value.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_string_list(
+    values: &[String],
+    max_entries: usize,
+    max_value_len: usize,
+    field_name: &str,
+) -> Result<(), Status> {
+    if values.len() > max_entries {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} exceeds maximum entries ({} > {max_entries})",
+            values.len()
+        )));
+    }
+    for value in values {
         if value.len() > max_value_len {
             return Err(Status::invalid_argument(format!(
                 "{field_name} value exceeds maximum length ({} > {max_value_len})",
@@ -5769,6 +5798,20 @@ mod tests {
         let err = validate_sandbox_spec("ok", &spec).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("template.labels"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_oversized_image_pull_secret_name() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                image_pull_secrets: vec!["x".repeat(MAX_TEMPLATE_STRING_LEN + 1)],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("template.image_pull_secrets"));
     }
 
     #[test]

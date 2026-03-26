@@ -1128,6 +1128,13 @@ enum SandboxCommands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
 
+        /// Kubernetes image pull secret names to attach to the sandbox pod.
+        ///
+        /// Use this when `--from` points at a private registry image that
+        /// requires registry authentication at pull time.
+        #[arg(long = "image-pull-secret")]
+        image_pull_secrets: Vec<String>,
+
         /// Forward a local port to the sandbox before the initial command or shell starts.
         /// Accepts [bind_address:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
         #[arg(long, conflicts_with = "no_keep")]
@@ -1271,6 +1278,106 @@ enum SandboxCommands {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
+    },
+
+    /// Manage sandbox-scoped secrets such as image registry pull credentials.
+    #[command(help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Secret {
+        #[command(subcommand)]
+        command: Option<SandboxSecretCommands>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SandboxSecretCommands {
+    /// Create a sandbox secret.
+    #[command(help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Create {
+        #[command(subcommand)]
+        command: Option<SandboxSecretCreateCommands>,
+    },
+
+    /// List sandbox secrets managed by `OpenShell`.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Namespace where the secret lives.
+        #[arg(long, default_value = "openshell")]
+        namespace: String,
+
+        /// Override SSH destination for remote gateways.
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Path to SSH private key for remote gateways.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        ssh_key: Option<String>,
+    },
+
+    /// Delete a sandbox secret by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Secret name.
+        name: String,
+
+        /// Namespace where the secret lives.
+        #[arg(long, default_value = "openshell")]
+        namespace: String,
+
+        /// Override SSH destination for remote gateways.
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Path to SSH private key for remote gateways.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        ssh_key: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SandboxSecretCreateCommands {
+    /// Create an image registry pull secret.
+    #[command(
+        help_template = LEAF_HELP_TEMPLATE,
+        next_help_heading = "FLAGS",
+        group = clap::ArgGroup::new("password_source")
+            .required(true)
+            .args(["password", "password_stdin", "from_env"])
+    )]
+    Registry {
+        /// Secret name.
+        name: String,
+
+        /// Registry server (for example `ghcr.io` or `registry.example.com`).
+        #[arg(long)]
+        server: String,
+
+        /// Registry username.
+        #[arg(long)]
+        username: String,
+
+        /// Registry password or token.
+        #[arg(long)]
+        password: Option<String>,
+
+        /// Read the registry password from stdin.
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// Read the registry password from the named environment variable.
+        #[arg(long = "from-env", value_name = "VAR")]
+        from_env: Option<String>,
+
+        /// Namespace where the secret should be created.
+        #[arg(long, default_value = "openshell")]
+        namespace: String,
+
+        /// Override SSH destination for remote gateways.
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Path to SSH private key for remote gateways.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        ssh_key: Option<String>,
     },
 }
 
@@ -2077,6 +2184,7 @@ async fn main() -> Result<()> {
                     ssh_key,
                     providers,
                     policy,
+                    image_pull_secrets,
                     forward,
                     tty,
                     no_tty,
@@ -2159,6 +2267,7 @@ async fn main() -> Result<()> {
                                 ssh_key.as_deref(),
                                 &providers,
                                 policy.as_deref(),
+                                &image_pull_secrets,
                                 forward,
                                 &command,
                                 tty_override,
@@ -2181,6 +2290,7 @@ async fn main() -> Result<()> {
                                 ssh_key.as_deref(),
                                 &providers,
                                 policy.as_deref(),
+                                &image_pull_secrets,
                                 forward,
                                 &command,
                                 tty_override,
@@ -2286,6 +2396,68 @@ async fn main() -> Result<()> {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
                             run::print_ssh_config(&ctx.name, &name);
                         }
+                        SandboxCommands::Secret { command } => match command {
+                            Some(SandboxSecretCommands::Create { command }) => match command {
+                                Some(SandboxSecretCreateCommands::Registry {
+                                    name,
+                                    server,
+                                    username,
+                                    password,
+                                    password_stdin,
+                                    from_env,
+                                    namespace,
+                                    remote,
+                                    ssh_key,
+                                }) => {
+                                    run::sandbox_secret_create_registry(
+                                        &ctx.name,
+                                        &name,
+                                        &server,
+                                        &username,
+                                        password.as_deref(),
+                                        password_stdin,
+                                        from_env.as_deref(),
+                                        &namespace,
+                                        remote.as_deref(),
+                                        ssh_key.as_deref(),
+                                    )?;
+                                }
+                                None => {
+                                    return Err(miette::miette!(
+                                        "missing sandbox secret create subcommand"
+                                    ));
+                                }
+                            },
+                            Some(SandboxSecretCommands::List {
+                                namespace,
+                                remote,
+                                ssh_key,
+                            }) => {
+                                run::sandbox_secret_list(
+                                    &ctx.name,
+                                    &namespace,
+                                    remote.as_deref(),
+                                    ssh_key.as_deref(),
+                                )?;
+                            }
+                            Some(SandboxSecretCommands::Delete {
+                                name,
+                                namespace,
+                                remote,
+                                ssh_key,
+                            }) => {
+                                run::sandbox_secret_delete(
+                                    &ctx.name,
+                                    &name,
+                                    &namespace,
+                                    remote.as_deref(),
+                                    ssh_key.as_deref(),
+                                )?;
+                            }
+                            None => {
+                                return Err(miette::miette!("missing sandbox secret subcommand"));
+                            }
+                        },
                     }
                 }
             }
@@ -2870,6 +3042,74 @@ mod tests {
 
         assert_eq!(from.get_value_hint(), ValueHint::AnyPath);
         assert_eq!(dest.get_value_hint(), ValueHint::AnyPath);
+    }
+
+    #[test]
+    fn sandbox_create_accepts_image_pull_secret_flags() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--from",
+            "registry.example.com/team/private:latest",
+            "--image-pull-secret",
+            "regcred",
+            "--image-pull-secret",
+            "backup",
+            "--",
+            "echo",
+            "ok",
+        ])
+        .expect("sandbox create should parse image pull secrets");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create {
+                    image_pull_secrets,
+                    ..
+                })
+            }) if image_pull_secrets == vec!["regcred".to_string(), "backup".to_string()]
+        ));
+    }
+
+    #[test]
+    fn sandbox_secret_create_registry_parses() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "secret",
+            "create",
+            "registry",
+            "regcred",
+            "--server",
+            "registry.example.com",
+            "--username",
+            "myuser",
+            "--from-env",
+            "REGISTRY_PASSWORD",
+        ])
+        .expect("sandbox secret registry command should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Secret {
+                    command: Some(SandboxSecretCommands::Create {
+                        command: Some(SandboxSecretCreateCommands::Registry {
+                            name,
+                            server,
+                            username,
+                            from_env,
+                            ..
+                        })
+                    })
+                })
+            }) if name == "regcred"
+                && server == "registry.example.com"
+                && username == "myuser"
+                && from_env.as_deref() == Some("REGISTRY_PASSWORD")
+        ));
     }
 
     #[test]

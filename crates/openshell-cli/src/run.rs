@@ -38,9 +38,9 @@ use openshell_providers::{
 };
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 use tonic::{Code, Status};
 
@@ -1730,6 +1730,51 @@ pub fn doctor_exec(
     Ok(())
 }
 
+fn gateway_exec_output(
+    name: &str,
+    remote: Option<&str>,
+    ssh_key: Option<&str>,
+    inner_cmd: &str,
+) -> Result<Output> {
+    validate_gateway_name(name)?;
+    let container = container_name(name);
+
+    let remote_host = if let Some(dest) = remote {
+        Some(dest.to_string())
+    } else if let Some(metadata) = get_gateway_metadata(name)
+        && metadata.is_remote
+    {
+        metadata.remote_host.clone()
+    } else {
+        None
+    };
+
+    let mut cmd = if let Some(ref host) = remote_host {
+        validate_ssh_host(host)?;
+        let ssh_escaped_cmd = shell_escape(inner_cmd);
+        let mut c = Command::new("ssh");
+        if let Some(key) = ssh_key {
+            c.args(["-i", key]);
+        }
+        c.arg(host);
+        c.arg("docker");
+        c.arg("exec");
+        c.arg("-i");
+        c.args([&container, "sh", "-lc", &ssh_escaped_cmd]);
+        c
+    } else {
+        let mut c = Command::new("docker");
+        c.arg("exec");
+        c.arg("-i");
+        c.args([&container, "sh", "-lc", inner_cmd]);
+        c
+    };
+
+    cmd.output()
+        .into_diagnostic()
+        .wrap_err("failed to execute command inside the gateway container")
+}
+
 /// Print the LLM diagnostic prompt to stdout.
 ///
 /// Outputs a system prompt that a coding agent can use to autonomously
@@ -1835,6 +1880,141 @@ fn validate_ssh_host(host: &str) -> Result<()> {
     Ok(())
 }
 
+fn resolve_secret_value(
+    password: Option<&str>,
+    password_stdin: bool,
+    from_env: Option<&str>,
+) -> Result<String> {
+    if let Some(password) = password {
+        if password.is_empty() {
+            return Err(miette!("--password cannot be empty"));
+        }
+        return Ok(password.to_string());
+    }
+
+    if let Some(env_key) = from_env {
+        let value = std::env::var(env_key)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("environment variable '{env_key}' is not set"))?;
+        if value.is_empty() {
+            return Err(miette!(
+                "environment variable '{env_key}' must be set to a non-empty value"
+            ));
+        }
+        return Ok(value);
+    }
+
+    if password_stdin {
+        let mut value = String::new();
+        std::io::stdin()
+            .read_to_string(&mut value)
+            .into_diagnostic()
+            .wrap_err("failed to read password from stdin")?;
+        let value = value.trim_end_matches(['\r', '\n']).to_string();
+        if value.is_empty() {
+            return Err(miette!("stdin did not provide a non-empty password"));
+        }
+        return Ok(value);
+    }
+
+    Err(miette!(
+        "one of --password, --password-stdin, or --from-env must be provided"
+    ))
+}
+
+pub fn sandbox_secret_create_registry(
+    gateway_name: &str,
+    name: &str,
+    server: &str,
+    username: &str,
+    password: Option<&str>,
+    password_stdin: bool,
+    from_env: Option<&str>,
+    namespace: &str,
+    remote: Option<&str>,
+    ssh_key: Option<&str>,
+) -> Result<()> {
+    let password = resolve_secret_value(password, password_stdin, from_env)?;
+    let command = format!(
+        "KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n {} create secret docker-registry {} \
+--docker-server={} --docker-username={} --docker-password={} --dry-run=client -o yaml \
+| KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl label --local -f - \
+openshell.ai/managed-by=openshell openshell.ai/secret-kind=registry -o yaml \
+| KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -f -",
+        shell_escape(namespace),
+        shell_escape(name),
+        shell_escape(server),
+        shell_escape(username),
+        shell_escape(&password),
+    );
+    let output = gateway_exec_output(gateway_name, remote, ssh_key, &command)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim()
+        } else {
+            stdout.trim()
+        };
+        return Err(miette!("failed to create registry secret: {detail}"));
+    }
+
+    println!(
+        "{} Created registry secret '{}' in namespace '{}'",
+        "✓".green().bold(),
+        name,
+        namespace
+    );
+    Ok(())
+}
+
+pub fn sandbox_secret_list(
+    gateway_name: &str,
+    namespace: &str,
+    remote: Option<&str>,
+    ssh_key: Option<&str>,
+) -> Result<()> {
+    let command = format!(
+        "KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n {} get secret \
+-l openshell.ai/managed-by=openshell,openshell.ai/secret-kind=registry",
+        shell_escape(namespace)
+    );
+    let output = gateway_exec_output(gateway_name, remote, ssh_key, &command)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(miette!(
+            "failed to list registry secrets: {}",
+            stderr.trim()
+        ));
+    }
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    Ok(())
+}
+
+pub fn sandbox_secret_delete(
+    gateway_name: &str,
+    name: &str,
+    namespace: &str,
+    remote: Option<&str>,
+    ssh_key: Option<&str>,
+) -> Result<()> {
+    let command = format!(
+        "KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n {} delete secret {}",
+        shell_escape(namespace),
+        shell_escape(name)
+    );
+    let output = gateway_exec_output(gateway_name, remote, ssh_key, &command)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(miette!(
+            "failed to delete registry secret: {}",
+            stderr.trim()
+        ));
+    }
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    Ok(())
+}
+
 /// Create a sandbox when no gateway is configured.
 ///
 /// Bootstraps a new gateway first, then delegates to [`sandbox_create`].
@@ -1850,6 +2030,7 @@ pub async fn sandbox_create_with_bootstrap(
     ssh_key: Option<&str>,
     providers: &[String],
     policy: Option<&str>,
+    image_pull_secrets: &[String],
     forward: Option<openshell_core::forward::ForwardSpec>,
     command: &[String],
     tty_override: Option<bool>,
@@ -1881,6 +2062,7 @@ pub async fn sandbox_create_with_bootstrap(
         ssh_key,
         providers,
         policy,
+        image_pull_secrets,
         forward,
         command,
         tty_override,
@@ -1936,6 +2118,7 @@ pub async fn sandbox_create(
     ssh_key: Option<&str>,
     providers: &[String],
     policy: Option<&str>,
+    image_pull_secrets: &[String],
     forward: Option<openshell_core::forward::ForwardSpec>,
     command: &[String],
     tty_override: Option<bool>,
@@ -2029,10 +2212,15 @@ pub async fn sandbox_create(
 
     let policy = load_sandbox_policy(policy)?;
 
-    let template = image.map(|img| SandboxTemplate {
-        image: img,
-        ..SandboxTemplate::default()
-    });
+    let template = if image.is_some() || !image_pull_secrets.is_empty() {
+        Some(SandboxTemplate {
+            image: image.unwrap_or_default(),
+            image_pull_secrets: image_pull_secrets.to_vec(),
+            ..SandboxTemplate::default()
+        })
+    } else {
+        None
+    };
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
@@ -4991,8 +5179,9 @@ mod tests {
         format_gateway_select_items, gateway_auth_label, gateway_select_with, gateway_type_label,
         git_sync_files, http_health_check, image_requests_gpu, inferred_provider_type,
         parse_cli_setting_value, parse_credential_pairs, provisioning_timeout_message,
-        ready_false_condition_message, resolve_gateway_control_target_from, sandbox_should_persist,
-        shell_escape, source_requests_gpu, validate_gateway_name, validate_ssh_host,
+        ready_false_condition_message, resolve_gateway_control_target_from, resolve_secret_value,
+        sandbox_should_persist, shell_escape, source_requests_gpu, validate_gateway_name,
+        validate_ssh_host,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -5110,6 +5299,29 @@ mod tests {
         assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+    }
+
+    #[test]
+    fn resolve_secret_value_prefers_direct_password() {
+        let value = resolve_secret_value(Some("secret"), false, None).expect("resolve");
+        assert_eq!(value, "secret");
+    }
+
+    #[test]
+    fn resolve_secret_value_reads_from_environment() {
+        let _guard = EnvVarGuard::set("OPENSHELL_TEST_SECRET", "from-env");
+        let value = resolve_secret_value(None, false, Some("OPENSHELL_TEST_SECRET"))
+            .expect("resolve from env");
+        assert_eq!(value, "from-env");
+    }
+
+    #[test]
+    fn resolve_secret_value_rejects_missing_source() {
+        let err = resolve_secret_value(None, false, None).expect_err("missing source should fail");
+        assert!(
+            err.to_string()
+                .contains("one of --password, --password-stdin, or --from-env")
+        );
     }
 
     #[cfg(feature = "dev-settings")]
