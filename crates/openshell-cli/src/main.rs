@@ -1109,6 +1109,21 @@ enum SandboxCommands {
         #[arg(long)]
         gpu: bool,
 
+        /// Request an additional sandbox resource limit.
+        ///
+        /// Accepts `<NAME>=<COUNT>` and may be repeated. This is primarily
+        /// useful for device-plugin resources such as `nvidia.com/gpu=2` or
+        /// `vendor.com/vf=1`.
+        #[arg(long = "resource", value_name = "NAME=COUNT")]
+        resources: Vec<String>,
+
+        /// Override the sandbox pod runtime class.
+        ///
+        /// This is forwarded to `template.runtime_class_name` and is useful
+        /// for device runtimes that require an explicit runtime class.
+        #[arg(long = "runtime-class")]
+        runtime_class: Option<String>,
+
         /// SSH destination for remote bootstrap (e.g., user@hostname).
         /// Only used when no cluster exists yet; ignored if a cluster is
         /// already active.
@@ -2073,6 +2088,8 @@ async fn main() -> Result<()> {
                     no_keep,
                     editor,
                     gpu,
+                    resources,
+                    runtime_class,
                     remote,
                     ssh_key,
                     providers,
@@ -2154,6 +2171,8 @@ async fn main() -> Result<()> {
                                 upload_spec.as_ref(),
                                 keep,
                                 gpu,
+                                &resources,
+                                runtime_class.as_deref(),
                                 editor,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
@@ -2176,6 +2195,8 @@ async fn main() -> Result<()> {
                                 upload_spec.as_ref(),
                                 keep,
                                 gpu,
+                                &resources,
+                                runtime_class.as_deref(),
                                 editor,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
@@ -2870,6 +2891,34 @@ mod tests {
 
         assert_eq!(from.get_value_hint(), ValueHint::AnyPath);
         assert_eq!(dest.get_value_hint(), ValueHint::AnyPath);
+    }
+
+    #[test]
+    fn sandbox_create_accepts_resource_and_runtime_class_flags() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--resource",
+            "nvidia.com/gpu=2",
+            "--resource",
+            "vendor.com/vf=1",
+            "--runtime-class",
+            "nvidia",
+        ])
+        .expect("sandbox create should parse generic resource flags");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create {
+                    resources,
+                    runtime_class,
+                    ..
+                })
+            }) if resources == vec!["nvidia.com/gpu=2".to_string(), "vendor.com/vf=1".to_string()]
+                && runtime_class.as_deref() == Some("nvidia")
+        ));
     }
 
     #[test]

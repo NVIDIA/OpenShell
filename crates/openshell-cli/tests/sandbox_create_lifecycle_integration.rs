@@ -541,6 +541,8 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         None,
         true,
         false,
+        &[],
+        None,
         None,
         None,
         None,
@@ -581,6 +583,8 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         None,
         false,
         false,
+        &[],
+        None,
         None,
         None,
         None,
@@ -624,6 +628,8 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         None,
         false,
         false,
+        &[],
+        None,
         None,
         None,
         None,
@@ -667,6 +673,8 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         None,
         true,
         false,
+        &[],
+        None,
         None,
         None,
         None,
@@ -698,6 +706,11 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
     let _env = test_env(&fake_ssh_dir, &xdg_dir);
     let tls = test_tls(&server);
     install_fake_ssh(&fake_ssh_dir);
+    let forward_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
 
     run::sandbox_create(
         &server.endpoint,
@@ -707,12 +720,14 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         None,
         false,
         false,
+        &[],
+        None,
         None,
         None,
         None,
         &[],
         None,
-        Some(openshell_core::forward::ForwardSpec::new(8080)),
+        Some(openshell_core::forward::ForwardSpec::new(forward_port)),
         &["echo".to_string(), "OK".to_string()],
         Some(false),
         Some(false),

@@ -381,7 +381,7 @@ When `openshell sandbox create` cannot connect to a gateway (connection refused,
 1. `should_attempt_bootstrap()` in `crates/openshell-cli/src/bootstrap.rs` checks the error type. It returns `true` for connectivity errors and missing default TLS materials, but `false` for TLS handshake/auth errors.
 2. If running in a terminal, the user is prompted to confirm.
 3. `run_bootstrap()` deploys a gateway named `"openshell"`, sets it as active, and returns fresh `TlsOptions` pointing to the newly-written mTLS certs.
-4. When `sandbox create` requests GPU explicitly (`--gpu`) or infers it from an image whose final name component contains `gpu` (such as `nvidia-gpu`), the bootstrap path enables gateway GPU support before retrying sandbox creation.
+4. When `sandbox create` requests GPU explicitly (`--gpu`), requests `nvidia.com/gpu` through `--resource`, or infers GPU intent from an image whose final name component contains `gpu` (such as `nvidia-gpu`), the bootstrap path enables gateway GPU support before retrying sandbox creation.
 
 ## Container Environment Variables
 

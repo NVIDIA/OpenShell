@@ -57,6 +57,19 @@ To request GPU resources, add `--gpu`:
 $ openshell sandbox create --gpu -- claude
 ```
 
+For device-plugin resources beyond the one-GPU shorthand, use `--resource` and
+optionally `--runtime-class`:
+
+```console
+$ openshell sandbox create --resource nvidia.com/gpu=2 --runtime-class nvidia -- claude
+$ openshell sandbox create --resource vendor.com/vf=1 --runtime-class kata -- my-tool
+```
+
+`--resource` accepts `<NAME>=<COUNT>` and may be repeated. This is useful for
+device-style resources exposed through Kubernetes, such as GPUs, VFs, or other
+vendor accelerators. Keep using `--gpu` when you only need the existing
+single-GPU shorthand.
+
 ### Custom Containers
 
 Use `--from` to create a sandbox from a pre-built community package, a local directory, or a container image:
