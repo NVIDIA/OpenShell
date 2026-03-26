@@ -27,6 +27,8 @@ use miette::{IntoDiagnostic, Result};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::{LazyLock, Mutex};
@@ -108,6 +110,9 @@ static MANAGED_CHILDREN: LazyLock<Mutex<HashSet<i32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[cfg(target_os = "linux")]
+static ACTIVE_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(target_os = "linux")]
 pub(crate) fn register_managed_child(pid: u32) {
     let Ok(pid) = i32::try_from(pid) else {
         return;
@@ -118,6 +123,21 @@ pub(crate) fn register_managed_child(pid: u32) {
     if let Ok(mut children) = MANAGED_CHILDREN.lock() {
         children.insert(pid);
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn begin_spawn() {
+    ACTIVE_SPAWNS.fetch_add(1, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn end_spawn() {
+    ACTIVE_SPAWNS.fetch_sub(1, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_in_progress() -> bool {
+    ACTIVE_SPAWNS.load(Ordering::SeqCst) > 0
 }
 
 #[cfg(target_os = "linux")]
@@ -455,6 +475,14 @@ pub async fn run_sandbox(
                         break;
                     }
                 };
+
+                if spawn_in_progress() {
+                    // A child launched via Command::spawn/pre_exec can fail and exit
+                    // before it is registered in MANAGED_CHILDREN. Back off here so
+                    // std/tokio can observe that child normally instead of us reaping
+                    // it underneath the spawning thread.
+                    break;
+                }
 
                 let Some(pid) = status.pid() else {
                     break;
@@ -1467,6 +1495,9 @@ mod tests {
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    #[cfg(target_os = "linux")]
+    static SPAWN_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[test]
     fn bundle_to_resolved_routes_converts_all_fields() {
@@ -1841,6 +1872,22 @@ filesystem_policy:
                 );
             },
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_tracking_toggles_in_progress_state() {
+        let _guard = SPAWN_LOCK.lock().unwrap();
+
+        while spawn_in_progress() {
+            end_spawn();
+        }
+
+        assert!(!spawn_in_progress());
+        begin_spawn();
+        assert!(spawn_in_progress());
+        end_spawn();
+        assert!(!spawn_in_progress());
     }
 
     #[tokio::test]

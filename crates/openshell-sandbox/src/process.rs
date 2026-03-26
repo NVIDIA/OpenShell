@@ -9,7 +9,7 @@ use crate::sandbox;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
 #[cfg(target_os = "linux")]
-use crate::{register_managed_child, unregister_managed_child};
+use crate::{begin_spawn, end_spawn, register_managed_child, unregister_managed_child};
 use miette::{IntoDiagnostic, Result};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{Group, Pid, User};
@@ -23,6 +23,24 @@ use tokio::process::{Child, Command};
 use tracing::{debug, warn};
 
 const SSH_HANDSHAKE_SECRET_ENV: &str = "OPENSHELL_SSH_HANDSHAKE_SECRET";
+
+#[cfg(target_os = "linux")]
+struct SpawnGuard;
+
+#[cfg(target_os = "linux")]
+impl SpawnGuard {
+    fn new() -> Self {
+        begin_spawn();
+        Self
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        end_spawn();
+    }
+}
 
 fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>) {
     for (key, value) in provider_env {
@@ -192,6 +210,7 @@ impl ProcessHandle {
             }
         }
 
+        let _spawn_guard = SpawnGuard::new();
         let child = cmd.spawn().into_diagnostic()?;
         let pid = child.id().unwrap_or(0);
         register_managed_child(pid);

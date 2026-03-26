@@ -8,7 +8,7 @@ use crate::policy::SandboxPolicy;
 use crate::process::drop_privileges;
 use crate::sandbox;
 #[cfg(target_os = "linux")]
-use crate::{register_managed_child, unregister_managed_child};
+use crate::{begin_spawn, end_spawn, register_managed_child, unregister_managed_child};
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
@@ -31,6 +31,28 @@ use tracing::{info, warn};
 const PREFACE_MAGIC: &str = "NSSH1";
 #[cfg(test)]
 const SSH_HANDSHAKE_SECRET_ENV: &str = "OPENSHELL_SSH_HANDSHAKE_SECRET";
+
+struct SpawnGuard;
+
+impl SpawnGuard {
+    #[cfg(target_os = "linux")]
+    fn new() -> Self {
+        begin_spawn();
+        Self
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        end_spawn();
+    }
+}
 
 /// A time-bounded set of nonces used to detect replayed NSSH1 handshakes.
 /// Each entry records the `Instant` it was inserted; a background reaper task
@@ -771,6 +793,7 @@ fn spawn_pty_shell(
         );
     }
 
+    let _spawn_guard = SpawnGuard::new();
     let mut child = cmd.spawn()?;
     #[cfg(target_os = "linux")]
     let child_pid = child.id();
@@ -901,6 +924,7 @@ fn spawn_pipe_exec(
         unsafe_pty::install_pre_exec_no_pty(&mut cmd, policy.clone(), workdir.clone(), netns_fd);
     }
 
+    let _spawn_guard = SpawnGuard::new();
     let mut child = cmd.spawn()?;
     #[cfg(target_os = "linux")]
     let child_pid = child.id();
