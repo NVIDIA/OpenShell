@@ -3,10 +3,15 @@
 
 //! OpenShell Sandbox - process sandbox and monitor.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use clap::Parser;
 use miette::Result;
+use openshell_ocsf::{OcsfJsonlLayer, OcsfShorthandLayer};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 use openshell_sandbox::run_sandbox;
@@ -130,37 +135,60 @@ async fn main() -> Result<()> {
     let push_layer = log_push_state.as_ref().map(|(layer, _)| layer.clone());
     let _log_push_handle = log_push_state.map(|(_, handle)| handle);
 
-    // Keep the file guard alive for the entire process. When the guard is
-    // dropped the non-blocking writer flushes remaining logs.
-    let _file_guard = if let Some((file_writer, file_guard)) = file_logging {
+    // Shared flag: the sandbox poll loop toggles this when the
+    // `ocsf_logging_enabled` setting changes. The JSONL layer checks it
+    // on each event and short-circuits when false.
+    let ocsf_enabled = Arc::new(AtomicBool::new(false));
+
+    // Keep guards alive for the entire process. When a guard is dropped the
+    // non-blocking writer flushes remaining logs.
+    let (_file_guard, _jsonl_guard) = if let Some((file_writer, file_guard)) = file_logging {
         let file_filter = EnvFilter::new("info");
+
+        // OCSF JSONL file: append-only, created eagerly but gated by the
+        // enabled flag. The file exists on disk even when OCSF is off (0 bytes).
+        let jsonl_logging = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/var/log/openshell-ocsf.log")
+            .ok()
+            .map(|f| {
+                let (writer, guard) = tracing_appender::non_blocking(f);
+                let layer = OcsfJsonlLayer::new(writer).with_enabled_flag(ocsf_enabled.clone());
+                (layer, guard)
+            });
+        let (jsonl_layer, jsonl_guard) = match jsonl_logging {
+            Some((layer, guard)) => (Some(layer), Some(guard)),
+            None => (None, None),
+        };
+
         tracing_subscriber::registry()
             .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(std::io::stdout)
+                OcsfShorthandLayer::new(std::io::stdout())
+                    .with_non_ocsf(true)
                     .with_filter(stdout_filter),
             )
             .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(file_writer)
-                    .with_ansi(false)
+                OcsfShorthandLayer::new(file_writer)
+                    .with_non_ocsf(true)
                     .with_filter(file_filter),
             )
+            .with(jsonl_layer.with_filter(LevelFilter::INFO))
             .with(push_layer.clone())
             .init();
-        Some(file_guard)
+        (Some(file_guard), jsonl_guard)
     } else {
         tracing_subscriber::registry()
             .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(std::io::stdout)
+                OcsfShorthandLayer::new(std::io::stdout())
+                    .with_non_ocsf(true)
                     .with_filter(stdout_filter),
             )
             .with(push_layer)
             .init();
         // Log the warning after the subscriber is initialized
         warn!("Could not open /var/log for log rotation; using stdout-only logging");
-        None
+        (None, None)
     };
 
     // Get command - either from CLI args, environment variable, or default to /bin/bash
@@ -174,6 +202,9 @@ async fn main() -> Result<()> {
     };
 
     info!(command = ?command, "Starting sandbox");
+    // Note: "Starting sandbox" stays as plain info!() since the OCSF context
+    // is not yet initialized at this point (run_sandbox hasn't been called).
+    // The shorthand layer will render it in fallback format.
 
     let exit_code = run_sandbox(
         command,
@@ -191,6 +222,7 @@ async fn main() -> Result<()> {
         args.health_check,
         args.health_port,
         args.inference_routes,
+        ocsf_enabled,
     )
     .await?;
 

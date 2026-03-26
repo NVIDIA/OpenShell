@@ -449,13 +449,27 @@ async fn resolve_allowed_ips_if_private(host: &str, port: u32) -> Vec<String> {
     let addrs = match tokio::net::lookup_host(&addr).await {
         Ok(addrs) => addrs.collect::<Vec<_>>(),
         Err(e) => {
-            tracing::warn!(host, port, error = %e, "DNS resolution failed for allowed_ips check");
+            let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(openshell_ocsf::ActivityId::Fail)
+                .severity(openshell_ocsf::SeverityId::Low)
+                .dst_endpoint(openshell_ocsf::Endpoint::from_domain(host, port as u16))
+                .message(format!("DNS resolution failed for allowed_ips check: {e}"))
+                .build();
+            openshell_ocsf::ocsf_emit!(event);
             return Vec::new();
         }
     };
 
     if addrs.is_empty() {
-        tracing::warn!(host, port, "DNS resolution returned no addresses");
+        let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
+            .activity(openshell_ocsf::ActivityId::Fail)
+            .severity(openshell_ocsf::SeverityId::Low)
+            .dst_endpoint(openshell_ocsf::Endpoint::from_domain(host, port as u16))
+            .message(format!(
+                "DNS resolution returned no addresses for {host}:{port}"
+            ))
+            .build();
+        openshell_ocsf::ocsf_emit!(event);
         return Vec::new();
     }
 

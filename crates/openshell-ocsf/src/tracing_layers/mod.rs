@@ -11,6 +11,6 @@ pub(crate) mod event_bridge;
 mod jsonl_layer;
 mod shorthand_layer;
 
-pub use event_bridge::emit_ocsf_event;
+pub use event_bridge::{OCSF_TARGET, clone_current_event, emit_ocsf_event};
 pub use jsonl_layer::OcsfJsonlLayer;
 pub use shorthand_layer::OcsfShorthandLayer;

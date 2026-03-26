@@ -121,7 +121,15 @@ impl OpaEngine {
         // Validate BEFORE expanding presets
         let (errors, warnings) = crate::l7::validate_l7_policies(&data);
         for w in &warnings {
-            tracing::warn!(warning = %w, "L7 policy validation warning");
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Medium)
+                    .status(openshell_ocsf::StatusId::Success)
+                    .state(openshell_ocsf::StateId::Enabled, "validated")
+                    .unmapped("warning", serde_json::json!(w.to_string()))
+                    .message(format!("L7 policy validation warning: {w}"))
+                    .build()
+            );
         }
         if !errors.is_empty() {
             return Err(miette::miette!(
@@ -520,7 +528,15 @@ fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
     // Validate BEFORE expanding presets (catches user errors like rules+access)
     let (errors, warnings) = crate::l7::validate_l7_policies(&data);
     for w in &warnings {
-        tracing::warn!(warning = %w, "L7 policy validation warning");
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(openshell_ocsf::SeverityId::Medium)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "validated")
+                .unmapped("warning", serde_json::json!(w.to_string()))
+                .message(format!("L7 policy validation warning: {w}"))
+                .build()
+        );
     }
     if !errors.is_empty() {
         return Err(miette::miette!(

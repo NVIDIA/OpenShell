@@ -12,7 +12,12 @@ use crate::{register_managed_child, unregister_managed_child};
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
+use openshell_ocsf::{
+    ActionId, ActivityId, AuthTypeId, ConfidenceId, DetectionFindingBuilder, DispositionId,
+    FindingInfo, SeverityId, SshActivityBuilder, StatusId, ocsf_emit,
+};
 use rand_core::OsRng;
+use tracing::warn;
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, Handle, Session};
 use russh::{ChannelId, CryptoVec};
@@ -26,7 +31,6 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tracing::{info, warn};
 
 const PREFACE_MAGIC: &str = "NSSH1";
 #[cfg(test)]
@@ -60,7 +64,14 @@ async fn ssh_server_init(
     let config = Arc::new(config);
     let ca_paths = ca_file_paths.as_ref().map(|p| Arc::new(p.clone()));
     let listener = TcpListener::bind(listen_addr).await.into_diagnostic()?;
-    info!(addr = %listen_addr, "SSH server listening");
+    ocsf_emit!(
+        SshActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Listen)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .message(format!("SSH server listening on {listen_addr}"))
+            .build()
+    );
 
     Ok((listener, config, ca_paths))
 }
@@ -139,7 +150,14 @@ pub async fn run_ssh_server(
             )
             .await
             {
-                warn!(error = %err, "SSH connection failed");
+                ocsf_emit!(
+                    SshActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .message(format!("SSH connection failed: {err}"))
+                        .build()
+                );
             }
         });
     }
@@ -160,17 +178,59 @@ async fn handle_connection(
     provider_env: HashMap<String, String>,
     nonce_cache: &NonceCache,
 ) -> Result<()> {
-    info!(peer = %peer, "SSH connection: reading handshake preface");
+    ocsf_emit!(
+        SshActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Open)
+            .severity(SeverityId::Informational)
+            .src_endpoint_addr(peer.ip(), peer.port())
+            .message(format!(
+                "SSH connection: reading handshake preface from {peer}"
+            ))
+            .build()
+    );
     let mut line = String::new();
     read_line(&mut stream, &mut line).await?;
-    info!(peer = %peer, preface_len = line.len(), "SSH connection: preface received, verifying");
+    ocsf_emit!(
+        SshActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Open)
+            .severity(SeverityId::Informational)
+            .src_endpoint_addr(peer.ip(), peer.port())
+            .message(format!(
+                "SSH connection: preface received from {peer}, verifying (len={})",
+                line.len()
+            ))
+            .build()
+    );
     if !verify_preface(&line, secret, handshake_skew_secs, nonce_cache)? {
-        warn!(peer = %peer, "SSH connection: handshake verification failed");
+        ocsf_emit!(
+            SshActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .src_endpoint_addr(peer.ip(), peer.port())
+                .message(format!(
+                    "SSH connection: handshake verification failed from {peer}"
+                ))
+                .build()
+        );
         let _ = stream.write_all(b"ERR\n").await;
         return Ok(());
     }
     stream.write_all(b"OK\n").await.into_diagnostic()?;
-    info!(peer = %peer, "SSH handshake accepted");
+    ocsf_emit!(
+        SshActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .src_endpoint_addr(peer.ip(), peer.port())
+            .auth_type(AuthTypeId::Other, "NSSH1")
+            .message(format!("SSH handshake accepted from {peer}"))
+            .build()
+    );
 
     let handler = SshHandler::new(
         policy,
@@ -245,7 +305,31 @@ fn verify_preface(
         .lock()
         .map_err(|_| miette::miette!("nonce cache lock poisoned"))?;
     if cache.contains_key(nonce) {
-        warn!(nonce = nonce, "NSSH1 nonce replay detected");
+        ocsf_emit!(
+            SshActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Other)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::High)
+                .auth_type(AuthTypeId::Other, "NSSH1")
+                .message(format!("NSSH1 nonce replay detected: {nonce}"))
+                .build()
+        );
+        ocsf_emit!(
+            DetectionFindingBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::High)
+                .is_alert(true)
+                .confidence(ConfidenceId::High)
+                .finding_info(FindingInfo::new(
+                    "nssh1-nonce-replay",
+                    "NSSH1 Nonce Replay Attack"
+                ))
+                .evidence("nonce", nonce)
+                .build()
+        );
         return Ok(false);
     }
     cache.insert(nonce.to_string(), Instant::now());
@@ -358,22 +442,30 @@ impl russh::server::Handler for SshHandler {
         // uses u32 for ports, but valid TCP ports are 0-65535.  Without this
         // check, port 65537 truncates to port 1 (privileged).
         if port_to_connect > u32::from(u16::MAX) {
-            warn!(
-                host = host_to_connect,
-                port = port_to_connect,
-                "direct-tcpip rejected: port exceeds valid TCP range (0-65535)"
-            );
+            ocsf_emit!(SshActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Refuse)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .message(format!(
+                    "direct-tcpip rejected: port {port_to_connect} exceeds valid TCP range for host {host_to_connect}"
+                ))
+                .build());
             return Ok(false);
         }
 
         // Only allow forwarding to loopback destinations to prevent the
         // sandbox SSH server from being used as a generic proxy.
         if !is_loopback_host(host_to_connect) {
-            warn!(
-                host = host_to_connect,
-                port = port_to_connect,
-                "direct-tcpip rejected: non-loopback destination"
-            );
+            ocsf_emit!(SshActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Refuse)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .message(format!(
+                    "direct-tcpip rejected: non-loopback destination {host_to_connect}:{port_to_connect}"
+                ))
+                .build());
             return Ok(false);
         }
 
@@ -386,7 +478,14 @@ impl russh::server::Handler for SshHandler {
             let tcp = match connect_in_netns(&addr, netns_fd).await {
                 Ok(stream) => stream,
                 Err(err) => {
-                    warn!(addr = %addr, error = %err, "direct-tcpip: failed to connect");
+                    ocsf_emit!(
+                        SshActivityBuilder::new(crate::ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::Low)
+                            .status(StatusId::Failure)
+                            .message(format!("direct-tcpip: failed to connect to {addr}: {err}"))
+                            .build()
+                    );
                     let _ = channel.close().await;
                     return;
                 }
@@ -513,7 +612,15 @@ impl russh::server::Handler for SshHandler {
             })?;
             state.input_sender = Some(input_sender);
         } else {
-            warn!(subsystem = name, "unsupported subsystem requested");
+            ocsf_emit!(
+                SshActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Refuse)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Rejected)
+                    .severity(SeverityId::Medium)
+                    .message(format!("unsupported subsystem requested: {name}"))
+                    .build()
+            );
             session.channel_failure(channel)?;
         }
         Ok(())

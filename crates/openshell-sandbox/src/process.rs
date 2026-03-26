@@ -20,7 +20,7 @@ use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
-use tracing::{debug, warn};
+use tracing::debug;
 
 const SSH_HANDSHAKE_SECRET_ENV: &str = "OPENSHELL_SSH_HANDSHAKE_SECRET";
 
@@ -325,7 +325,14 @@ impl ProcessHandle {
     pub fn kill(&mut self) -> Result<()> {
         // First try SIGTERM
         if let Err(e) = self.signal(Signal::SIGTERM) {
-            warn!(error = %e, "Failed to send SIGTERM");
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ProcessActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(openshell_ocsf::ActivityId::Close)
+                    .severity(openshell_ocsf::SeverityId::Medium)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .message(format!("Failed to send SIGTERM: {e}"))
+                    .build()
+            );
         }
 
         // Give the process a moment to terminate gracefully
