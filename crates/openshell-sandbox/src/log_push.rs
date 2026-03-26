@@ -69,10 +69,16 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
 
         let ts = current_time_ms().unwrap_or(0);
 
+        let is_ocsf = meta.target() == openshell_ocsf::OCSF_TARGET;
+
         let log = SandboxLogLine {
             sandbox_id: self.sandbox_id.clone(),
             timestamp_ms: ts,
-            level: meta.level().to_string(),
+            level: if is_ocsf {
+                "OCSF".to_string()
+            } else {
+                meta.level().to_string()
+            },
             target: meta.target().to_string(),
             message: msg,
             source: "sandbox".to_string(),
