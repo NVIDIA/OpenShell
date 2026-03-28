@@ -801,6 +801,11 @@ pub(crate) fn bundle_to_resolved_routes(
         .map(|r| {
             let (auth, default_headers) =
                 openshell_core::inference::auth_for_provider_type(&r.provider_type);
+            let timeout = if r.timeout_secs == 0 {
+                openshell_router::config::DEFAULT_ROUTE_TIMEOUT
+            } else {
+                Duration::from_secs(r.timeout_secs)
+            };
             openshell_router::config::ResolvedRoute {
                 name: r.name.clone(),
                 endpoint: r.base_url.clone(),
@@ -809,6 +814,7 @@ pub(crate) fn bundle_to_resolved_routes(
                 protocols: r.protocols.clone(),
                 auth,
                 default_headers,
+                timeout,
             }
         })
         .collect()
@@ -1517,6 +1523,7 @@ mod tests {
                         "openai_responses".to_string(),
                     ],
                     provider_type: "openai".to_string(),
+                    timeout_secs: 0,
                 },
                 openshell_core::proto::ResolvedRoute {
                     name: "local".to_string(),
@@ -1525,6 +1532,7 @@ mod tests {
                     model_id: "llama-3".to_string(),
                     protocols: vec!["openai_chat_completions".to_string()],
                     provider_type: String::new(),
+                    timeout_secs: 120,
                 },
             ],
             revision: "abc123".to_string(),
@@ -1545,10 +1553,20 @@ mod tests {
             routes[0].protocols,
             vec!["openai_chat_completions", "openai_responses"]
         );
+        assert_eq!(
+            routes[0].timeout,
+            openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+            "timeout_secs=0 should map to default"
+        );
         assert_eq!(routes[1].endpoint, "http://vllm:8000/v1");
         assert_eq!(
             routes[1].auth,
             openshell_core::inference::AuthHeader::Bearer
+        );
+        assert_eq!(
+            routes[1].timeout,
+            Duration::from_secs(120),
+            "timeout_secs=120 should map to 120s"
         );
     }
 
@@ -1574,6 +1592,7 @@ mod tests {
                 model_id: "model".to_string(),
                 protocols: vec!["openai_chat_completions".to_string()],
                 provider_type: "openai".to_string(),
+                timeout_secs: 0,
             }],
             revision: "rev".to_string(),
             generated_at_ms: 0,
@@ -1594,6 +1613,7 @@ mod tests {
                 protocols: vec!["openai_chat_completions".to_string()],
                 auth: openshell_core::inference::AuthHeader::Bearer,
                 default_headers: vec![],
+                timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
             },
             openshell_router::config::ResolvedRoute {
                 name: "sandbox-system".to_string(),
@@ -1603,6 +1623,7 @@ mod tests {
                 protocols: vec!["anthropic_messages".to_string()],
                 auth: openshell_core::inference::AuthHeader::Custom("x-api-key"),
                 default_headers: vec![],
+                timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
             },
         ];
 
@@ -1891,6 +1912,7 @@ filesystem_policy:
             auth: openshell_core::inference::AuthHeader::Bearer,
             protocols: vec!["openai_chat_completions".to_string()],
             default_headers: vec![],
+            timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         }];
 
         let cache = Arc::new(RwLock::new(routes));

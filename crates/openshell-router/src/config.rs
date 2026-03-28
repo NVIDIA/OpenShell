@@ -3,10 +3,13 @@
 
 use serde::Deserialize;
 use std::path::Path;
+use std::time::Duration;
 
 pub use openshell_core::inference::AuthHeader;
 
 use crate::RouterError;
+
+pub const DEFAULT_ROUTE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RouterConfig {
@@ -45,6 +48,8 @@ pub struct ResolvedRoute {
     pub auth: AuthHeader,
     /// Extra headers injected on every request (e.g. `anthropic-version`).
     pub default_headers: Vec<(String, String)>,
+    /// Per-request timeout for proxied inference calls.
+    pub timeout: Duration,
 }
 
 impl std::fmt::Debug for ResolvedRoute {
@@ -57,6 +62,7 @@ impl std::fmt::Debug for ResolvedRoute {
             .field("protocols", &self.protocols)
             .field("auth", &self.auth)
             .field("default_headers", &self.default_headers)
+            .field("timeout", &self.timeout)
             .finish()
     }
 }
@@ -129,6 +135,7 @@ impl RouteConfig {
             protocols,
             auth,
             default_headers,
+            timeout: DEFAULT_ROUTE_TIMEOUT,
         })
     }
 }
@@ -256,6 +263,7 @@ routes:
             protocols: vec!["openai_chat_completions".to_string()],
             auth: AuthHeader::Bearer,
             default_headers: Vec::new(),
+            timeout: DEFAULT_ROUTE_TIMEOUT,
         };
         let debug_output = format!("{route:?}");
         assert!(

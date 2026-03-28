@@ -5,8 +5,6 @@ mod backend;
 pub mod config;
 mod mock;
 
-use std::time::Duration;
-
 pub use backend::{
     ProxyResponse, StreamingProxyResponse, ValidatedEndpoint, ValidationFailure,
     ValidationFailureKind, verify_backend_endpoint,
@@ -39,7 +37,6 @@ pub struct Router {
 impl Router {
     pub fn new() -> Result<Self, RouterError> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| RouterError::Internal(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {

@@ -937,6 +937,10 @@ enum InferenceCommands {
         /// Skip endpoint verification before saving the route.
         #[arg(long)]
         no_verify: bool,
+
+        /// Request timeout in seconds for inference calls (0 = default 60s).
+        #[arg(long, default_value_t = 0)]
+        timeout: u64,
     },
 
     /// Update gateway-level inference configuration (partial update).
@@ -957,6 +961,10 @@ enum InferenceCommands {
         /// Skip endpoint verification before saving the route.
         #[arg(long)]
         no_verify: bool,
+
+        /// Request timeout in seconds for inference calls (0 = default 60s, unchanged if omitted).
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 
     /// Get gateway-level inference provider and model.
@@ -2026,10 +2034,12 @@ async fn main() -> Result<()> {
                     model,
                     system,
                     no_verify,
+                    timeout,
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
                     run::gateway_inference_set(
-                        endpoint, &provider, &model, route_name, no_verify, &tls,
+                        endpoint, &provider, &model, route_name, no_verify, timeout,
+                        &tls,
                     )
                     .await?;
                 }
@@ -2038,6 +2048,7 @@ async fn main() -> Result<()> {
                     model,
                     system,
                     no_verify,
+                    timeout,
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
                     run::gateway_inference_update(
@@ -2046,6 +2057,7 @@ async fn main() -> Result<()> {
                         model.as_deref(),
                         route_name,
                         no_verify,
+                        timeout,
                         &tls,
                     )
                     .await?;

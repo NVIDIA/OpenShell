@@ -86,6 +86,7 @@ impl Inference for InferenceService {
             route_name,
             &req.provider_name,
             &req.model_id,
+            req.timeout_secs,
             verify,
         )
         .await?;
@@ -103,6 +104,7 @@ impl Inference for InferenceService {
             route_name: route_name.to_string(),
             validation_performed: !route.validation.is_empty(),
             validated_endpoints: route.validation,
+            timeout_secs: config.timeout_secs,
         }))
     }
 
@@ -140,6 +142,7 @@ impl Inference for InferenceService {
             model_id: config.model_id.clone(),
             version: route.version,
             route_name: route_name.to_string(),
+            timeout_secs: config.timeout_secs,
         }))
     }
 }
@@ -149,6 +152,7 @@ async fn upsert_cluster_inference_route(
     route_name: &str,
     provider_name: &str,
     model_id: &str,
+    timeout_secs: u64,
     verify: bool,
 ) -> Result<UpsertedInferenceRoute, Status> {
     if provider_name.trim().is_empty() {
@@ -173,7 +177,7 @@ async fn upsert_cluster_inference_route(
         Vec::new()
     };
 
-    let config = build_cluster_inference_config(&provider, model_id);
+    let config = build_cluster_inference_config(&provider, model_id, timeout_secs);
 
     let existing = store
         .get_message_by_name::<InferenceRoute>(route_name)
@@ -204,10 +208,15 @@ async fn upsert_cluster_inference_route(
     Ok(UpsertedInferenceRoute { route, validation })
 }
 
-fn build_cluster_inference_config(provider: &Provider, model_id: &str) -> ClusterInferenceConfig {
+fn build_cluster_inference_config(
+    provider: &Provider,
+    model_id: &str,
+    timeout_secs: u64,
+) -> ClusterInferenceConfig {
     ClusterInferenceConfig {
         provider_name: provider.name.clone(),
         model_id: model_id.to_string(),
+        timeout_secs,
     }
 }
 
@@ -267,6 +276,7 @@ fn resolve_provider_route(provider: &Provider) -> Result<ResolvedProviderRoute, 
                 .iter()
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
                 .collect(),
+            timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         },
     })
 }
@@ -454,6 +464,7 @@ async fn resolve_route_by_name(
         api_key: resolved.route.api_key,
         protocols: resolved.route.protocols,
         provider_type: resolved.provider_type,
+        timeout_secs: config.timeout_secs,
     }))
 }
 
@@ -470,6 +481,7 @@ mod tests {
             config: Some(ClusterInferenceConfig {
                 provider_name: provider_name.to_string(),
                 model_id: model_id.to_string(),
+                timeout_secs: 0,
             }),
             version: 1,
         }
@@ -516,6 +528,7 @@ mod tests {
             CLUSTER_INFERENCE_ROUTE_NAME,
             "openai-dev",
             "gpt-4o",
+            0,
             false,
         )
         .await
@@ -528,6 +541,7 @@ mod tests {
             CLUSTER_INFERENCE_ROUTE_NAME,
             "openai-dev",
             "gpt-4.1",
+            0,
             false,
         )
         .await
@@ -654,6 +668,7 @@ mod tests {
             config: Some(ClusterInferenceConfig {
                 provider_name: "openai-dev".to_string(),
                 model_id: "test/model".to_string(),
+                timeout_secs: 0,
             }),
             version: 7,
         };
@@ -739,6 +754,7 @@ mod tests {
             SANDBOX_SYSTEM_ROUTE_NAME,
             "anthropic-dev",
             "claude-sonnet-4-20250514",
+            0,
             false,
         )
         .await
@@ -825,6 +841,7 @@ mod tests {
             SANDBOX_SYSTEM_ROUTE_NAME,
             "openai-dev",
             "gpt-4o-mini",
+            0,
             false,
         )
         .await
@@ -883,6 +900,7 @@ mod tests {
             CLUSTER_INFERENCE_ROUTE_NAME,
             "openai-dev",
             "gpt-4o-mini",
+            0,
             true,
         )
         .await
@@ -924,6 +942,7 @@ mod tests {
             CLUSTER_INFERENCE_ROUTE_NAME,
             "openai-dev",
             "gpt-4o-mini",
+            0,
             true,
         )
         .await
@@ -968,6 +987,7 @@ mod tests {
             CLUSTER_INFERENCE_ROUTE_NAME,
             "openai-dev",
             "gpt-4o-mini",
+            0,
             false,
         )
         .await
