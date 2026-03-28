@@ -1406,7 +1406,7 @@ The background task batches log lines and streams them to the gateway:
 
 ### Server-side ingestion
 
-**File:** `crates/openshell-server/src/grpc.rs` (`push_sandbox_logs`)
+**File:** `crates/openshell-server/src/grpc/streaming.rs` (`push_sandbox_logs`)
 
 The `PushSandboxLogs` RPC handler processes each batch:
 1. Validates `sandbox_id` is non-empty (skips empty batches).
@@ -1565,6 +1565,19 @@ Platform-specific code is abstracted through `crates/openshell-sandbox/src/sandb
 | Privilege dropping | `initgroups` + `setgid` + `setuid` | `setgid` + `setuid` (no `initgroups` on macOS) |
 
 On non-Linux platforms, the sandbox can still run commands with proxy-based network filtering, but the kernel-level isolation (filesystem, syscall, namespace) and process-identity binding are unavailable.
+
+## Background Task Lifecycle
+
+The sandbox supervisor spawns several background tasks during startup: the policy poll loop, inference route cache refresh, denial aggregator, bypass monitor, and log push task. All background tasks use `CancellationToken` for cooperative shutdown. When the supervised child process exits, the supervisor cancels the token, and each background task exits its work loop on the next select cycle rather than waiting for its poll interval to elapse.
+
+This pattern ensures the sandbox process exits promptly after the child terminates, without leaving orphaned background work running.
+
+### Gateway-Side Sandbox Watcher
+
+The gateway's sandbox watcher (documented in [Gateway Architecture](gateway.md#sandbox-watcher)) observes sandbox CRDs from the Kubernetes API. Two production hardening measures apply to this watcher:
+
+- **Label selector filtering**: The watcher filters by `openshell.ai/managed-by=openshell`, reducing watch traffic in shared clusters to only OpenShell-managed CRDs.
+- **Reconciliation backpressure**: A semaphore limits concurrent reconciliation operations to 10. This prevents a burst of Kubernetes events (such as during a full cluster resync) from overwhelming the persistence layer with concurrent writes.
 
 ## Cross-References
 

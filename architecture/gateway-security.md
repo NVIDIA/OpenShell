@@ -66,7 +66,7 @@ openshell-ca  (Self-signed Root CA, O=openshell, CN=openshell-ca)
 Key design decisions:
 
 - **Single client certificate**: One client cert is shared by the CLI and every sandbox pod. This simplifies secret management. Individual sandbox identity is not expressed at the TLS layer; post-authentication identification uses the `x-sandbox-id` gRPC header.
-- **Long-lived certificates**: Certificates use `rcgen` defaults (validity ~1975--4096), which effectively never expire. This is appropriate for an internal dev-cluster PKI where certificates are ephemeral to the cluster's lifetime.
+- **Certificate validity periods**: The CA certificate is valid for 10 years. Server and client leaf certificates are valid for 1 year. This balances operational convenience with standard cryptoperiod practices. When leaf certificates expire, re-running the bootstrap regenerates the full PKI (since the CA key is not persisted).
 - **CA key not persisted**: The CA private key is used only during generation and is not stored in any Kubernetes secret. Re-signing requires regenerating the entire PKI.
 
 See `crates/openshell-bootstrap/src/pki.rs:35` for the `generate_pki()` implementation and `crates/openshell-bootstrap/src/pki.rs:18` for the default SAN list.
@@ -185,14 +185,14 @@ The gateway supports three transport modes:
 
 ```
 TCP accept
-  → TLS handshake (mandatory client cert in mTLS mode, optional in dual-auth mode)
+  → TLS handshake with 10s timeout (mandatory client cert in mTLS mode, optional in dual-auth mode)
   → hyper auto-negotiates HTTP/1.1 or HTTP/2 via ALPN
   → MultiplexedService routes by content-type:
       ├── application/grpc → GrpcRouter
       └── other → Axum HTTP Router
 ```
 
-All traffic shares a single port. When TLS is enabled, the TLS handshake occurs before any HTTP parsing. In plaintext mode, the gateway expects an upstream reverse proxy or tunnel to be the outer security boundary.
+All traffic shares a single port. When TLS is enabled, the TLS handshake occurs before any HTTP parsing, with a 10-second timeout that drops connections failing to complete the handshake. This prevents slowloris-style attacks that hold connections open during negotiation. In plaintext mode, the gateway expects an upstream reverse proxy or tunnel to be the outer security boundary.
 
 ### Cloudflare-Specific HTTP Endpoints
 
@@ -397,7 +397,7 @@ This section defines the primary attacker profiles, what the current design prot
 |---|---|
 | No per-sandbox TLS identity | All sandboxes and CLI share one client certificate |
 | Broad blast radius on key compromise | Shared client key reuse across multiple components |
-| Weak cryptoperiod | Certificates are effectively non-expiring by default |
+| Leaf certificate renewal requires full PKI regeneration | CA key is not persisted; when 1-year leaf certs expire, the entire PKI is regenerated |
 | Limited fine-grained revocation | CA private key is not persisted; rotation is coarse-grained |
 | Local credential theft risk | CLI mTLS key material is stored on developer filesystem |
 | SSH token + mTLS = persistent access within trust boundary | SSH tokens expire after 24h (configurable) and are capped at 3 concurrent connections per token / 20 per sandbox, but within the mTLS trust boundary a stolen token remains usable until TTL expires |

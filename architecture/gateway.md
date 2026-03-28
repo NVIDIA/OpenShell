@@ -60,7 +60,7 @@ graph TD
 | Entry point | `crates/openshell-server/src/main.rs` | CLI argument parsing, config assembly, tracing setup, calls `run_server` |
 | Gateway runtime | `crates/openshell-server/src/lib.rs` | `ServerState` struct, `run_server()` accept loop |
 | Protocol mux | `crates/openshell-server/src/multiplex.rs` | `MultiplexService`, `MultiplexedService`, `GrpcRouter`, `BoxBody` |
-| gRPC: OpenShell | `crates/openshell-server/src/grpc.rs` | `OpenShellService` -- sandbox CRUD, provider CRUD, watch, exec, SSH sessions, policy delivery |
+| gRPC: OpenShell | `crates/openshell-server/src/grpc/` | `OpenShellService` -- split into domain-specific modules: `sandbox.rs`, `policy.rs`, `providers.rs`, `settings.rs`, `ssh.rs`, `streaming.rs`, `draft.rs`. The top-level `mod.rs` re-exports the service and delegates to these modules. |
 | gRPC: Inference | `crates/openshell-server/src/inference.rs` | `InferenceService` -- cluster inference config (set/get) and sandbox inference bundle delivery |
 | HTTP | `crates/openshell-server/src/http.rs` | Health endpoints, merged with SSH tunnel router |
 | Browser auth | `crates/openshell-server/src/auth.rs` | Cloudflare browser login relay at `/auth/connect` |
@@ -96,13 +96,24 @@ The gateway boots in `main()` (`crates/openshell-server/src/main.rs`) and procee
    1. Connect to the persistence store (`Store::connect`), which auto-detects SQLite vs Postgres from the URL prefix and runs migrations.
    2. Create `SandboxClient` (initializes a `kube::Client` from in-cluster or kubeconfig).
    3. Build `ServerState` (shared via `Arc<ServerState>` across all handlers).
-   4. **Spawn background tasks**:
+   4. **Spawn background tasks** with a shared `CancellationToken`:
       - `spawn_sandbox_watcher` -- watches Kubernetes Sandbox CRDs and syncs state to the store.
       - `spawn_kube_event_tailer` -- watches Kubernetes Events in the sandbox namespace and publishes them to the `PlatformEventBus`.
+      - `spawn_session_reaper` -- periodically removes expired and revoked SSH session records.
+      All background tasks receive a `CancellationToken` and select on it alongside their primary work loop. When the token is cancelled during shutdown, each task exits cooperatively without waiting for its next poll interval.
    5. Create `MultiplexService`.
    6. Bind `TcpListener` on `config.bind_address`.
    7. Optionally create `TlsAcceptor` from cert/key files.
-   8. Enter the accept loop: for each connection, spawn a tokio task that optionally performs a TLS handshake, then calls `MultiplexService::serve()`.
+   8. Enter the accept loop: for each connection, spawn a tokio task into a `JoinSet` that optionally performs a TLS handshake (with a 10-second timeout), then calls `MultiplexService::serve()`.
+
+### Graceful Shutdown
+
+The gateway installs signal handlers for `SIGTERM` and `SIGINT` via `tokio::signal`. On receiving either signal, the shutdown sequence proceeds:
+
+1. **Cancel background tasks** -- the shared `CancellationToken` is cancelled, causing the sandbox watcher, event tailer, session reaper, and any other background tasks to exit their work loops cooperatively.
+2. **Stop accepting connections** -- the TCP accept loop exits.
+3. **Drain active connections** -- the gateway awaits all spawned connection handlers in the `JoinSet` with a 30-second timeout. Connections that complete within the window are drained cleanly. After 30 seconds, remaining connections are dropped.
+4. **Exit** -- the process exits with code 0.
 
 ## Configuration
 
@@ -119,6 +130,7 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 | `--disable-gateway-auth` | `OPENSHELL_DISABLE_GATEWAY_AUTH` | `false` | Keep TLS enabled but allow no-certificate clients and rely on application-layer auth |
 | `--client-tls-secret-name` | `OPENSHELL_CLIENT_TLS_SECRET_NAME` | None | K8s secret name to mount into sandbox pods for mTLS |
 | `--db-url` | `OPENSHELL_DB_URL` | *required* | Database URL (`sqlite:...` or `postgres://...`). The Helm chart defaults to `sqlite:/var/openshell/openshell.db` (persistent volume). In-memory SQLite (`sqlite::memory:?cache=shared`) works for ephemeral/test environments but data is lost on restart. |
+| `--db-max-connections` | `OPENSHELL_DB_MAX_CONNECTIONS` | `10` (Postgres) | Maximum number of connections in the Postgres connection pool. Ignored for SQLite. |
 | `--sandbox-namespace` | `OPENSHELL_SANDBOX_NAMESPACE` | `default` | Kubernetes namespace for sandbox CRDs |
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | None | Default container image for sandbox pods |
 | `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | None | gRPC endpoint reachable from within the cluster (for sandbox callbacks) |
@@ -187,16 +199,17 @@ When TLS is enabled (`crates/openshell-server/src/tls.rs`):
 - When a client CA path is provided (`--tls-client-ca`), the server enforces mutual TLS using `WebPkiClientVerifier` by default. In Cloudflare-fronted deployments, `--disable-gateway-auth` keeps TLS enabled but allows no-certificate clients so the edge can forward a JWT instead.
 - `--disable-tls` removes gateway-side TLS entirely and serves plaintext HTTP behind a trusted reverse proxy or tunnel.
 - Supports PKCS#1, PKCS#8, and SEC1 private key formats.
-- The TLS handshake happens before the stream reaches Hyper's auto builder, so ALPN negotiation and HTTP version detection work together transparently.
+- The TLS handshake has a 10-second timeout. Connections that do not complete the handshake within this window are dropped. This prevents slowloris-style attacks where a client opens a connection and stalls during the TLS negotiation to exhaust server resources.
+- After the handshake, the TLS stream reaches Hyper's auto builder, so ALPN negotiation and HTTP version detection work together transparently.
 - Certificates are generated at cluster bootstrap time by the `openshell-bootstrap` crate using `rcgen`, not by a Helm Job. The bootstrap reconciles three K8s secrets: `openshell-server-tls` (server cert+key), `openshell-server-client-ca` (CA cert), and `openshell-client-tls` (client cert+key+CA, shared by CLI and sandbox pods).
-- **Certificate lifetime**: Certificates use `rcgen` defaults (effectively never expire), which is appropriate for an internal dev-cluster PKI where certs are ephemeral to the cluster's lifetime.
+- **Certificate lifetime**: The CA certificate is valid for 10 years. Server and client leaf certificates are valid for 1 year. This provides a reasonable cryptoperiod for an internal cluster PKI while avoiding the operational burden of frequent rotation.
 - **Redeploy behavior**: On redeploy, existing cluster TLS secrets are loaded and reused if they are complete and valid PEM. If secrets are missing, incomplete, or malformed, fresh PKI is generated. If rotation occurs and the openshell workload is already running, the bootstrap performs a rollout restart and waits for completion before persisting CLI-side credentials.
 
 ## gRPC Services
 
 ### OpenShell Service
 
-Defined in `proto/openshell.proto`, implemented in `crates/openshell-server/src/grpc.rs` as `OpenShellService`.
+Defined in `proto/openshell.proto`, implemented across the `crates/openshell-server/src/grpc/` module directory as `OpenShellService`. The implementation is split into domain-specific files: `sandbox.rs` (sandbox CRUD and exec), `policy.rs` (policy delivery and status), `providers.rs` (provider CRUD), `settings.rs` (settings resolution), `ssh.rs` (SSH session management), `streaming.rs` (watch and log streams), and `draft.rs` (policy recommendation pipeline).
 
 #### Sandbox Management
 
@@ -327,7 +340,7 @@ See [SSH Tunnel Gateway](#ssh-tunnel-gateway) for details.
 
 ## Watch Sandbox Stream
 
-The `WatchSandbox` RPC (`crates/openshell-server/src/grpc.rs`) provides a multiplexed server-streaming response that can include sandbox status snapshots, gateway log lines, and platform events.
+The `WatchSandbox` RPC (`crates/openshell-server/src/grpc/streaming.rs`) provides a multiplexed server-streaming response that can include sandbox status snapshots, gateway log lines, and platform events.
 
 ### Request Options
 
@@ -374,7 +387,7 @@ graph LR
 ```
 
 All buses use `tokio::sync::broadcast` channels keyed by sandbox ID. Buffer sizes:
-- `SandboxWatchBus`: 128 (signals only, no payload -- just `()`)
+- `SandboxWatchBus`: configurable via `with_capacity()` constructor (default 128). Signals only, no payload -- just `()`.
 - `TracingLogBus`: 1024 (full `SandboxStreamEvent` payloads)
 - `PlatformEventBus`: 1024 (full `SandboxStreamEvent` payloads)
 
@@ -386,7 +399,7 @@ Broadcast lag is translated to `Status::resource_exhausted` via `broadcast_to_st
 
 ## Remote Exec via SSH
 
-The `ExecSandbox` RPC (`crates/openshell-server/src/grpc.rs`) executes a command inside a sandbox pod over SSH and streams stdout/stderr/exit back to the client.
+The `ExecSandbox` RPC (`crates/openshell-server/src/grpc/ssh.rs`) executes a command inside a sandbox pod over SSH and streams stdout/stderr/exit back to the client.
 
 ### Execution Flow
 
@@ -437,9 +450,17 @@ The SSH tunnel endpoint (`crates/openshell-server/src/ssh_tunnel.rs`) allows ext
 The `Store` enum (`crates/openshell-server/src/persistence/mod.rs`) dispatches to either `SqliteStore` or `PostgresStore` based on the database URL prefix:
 
 - `sqlite:*` -- uses `sqlx::SqlitePool` (1 connection for in-memory, 5 for file-based).
-- `postgres://` or `postgresql://` -- uses `sqlx::PgPool` (max 10 connections).
+- `postgres://` or `postgresql://` -- uses `sqlx::PgPool` (default max 10 connections, configurable via `--db-max-connections`).
 
 Both backends auto-run migrations on connect from `crates/openshell-server/migrations/{sqlite,postgres}/`.
+
+Both pool implementations configure the following timeouts to prevent connection leaks and resource exhaustion:
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `acquire_timeout` | 5 seconds | Maximum time to wait when acquiring a connection from the pool. Prevents request handlers from blocking indefinitely when the pool is saturated. |
+| `idle_timeout` | 5 minutes | Connections idle longer than this are closed. Prevents accumulation of stale connections, particularly relevant for Postgres where idle connections consume server memory. |
+| `max_lifetime` | 30 minutes | Maximum total lifetime of a connection. Forces periodic reconnection to pick up server-side configuration changes and avoid long-lived connection issues. |
 
 ### Schema
 
@@ -507,9 +528,13 @@ The Helm chart template is at `deploy/helm/openshell/templates/statefulset.yaml`
 
 ### Sandbox Watcher
 
-`spawn_sandbox_watcher()` (`crates/openshell-server/src/sandbox/mod.rs`) runs a Kubernetes watcher on `Sandbox` CRDs and processes three event types:
+`spawn_sandbox_watcher()` (`crates/openshell-server/src/sandbox/mod.rs`) runs a Kubernetes watcher on `Sandbox` CRDs filtered by the label selector `openshell.ai/managed-by=openshell`. This limits the watch stream to sandboxes created by OpenShell, avoiding unnecessary processing of unrelated CRDs in shared clusters. The watcher receives a `CancellationToken` and exits cooperatively when the token is cancelled during shutdown.
 
-- **Applied**: Extracts the sandbox ID from labels (or falls back to name prefix stripping), reads the CRD status, derives the phase, and upserts the sandbox record in the store. Notifies the watch bus.
+The watcher uses a semaphore to limit concurrent reconciliation operations to 10. This backpressure mechanism prevents a burst of Kubernetes events (such as during a full resync) from overwhelming the store or the Kubernetes API with simultaneous writes.
+
+The watcher processes three event types:
+
+- **Applied**: Acquires a semaphore permit, extracts the sandbox ID from labels (or falls back to name prefix stripping), reads the CRD status, derives the phase, and upserts the sandbox record in the store. Notifies the watch bus. Releases the permit on completion.
 - **Deleted**: Removes the sandbox record from the store and the index. Notifies the watch bus.
 - **Restarted**: Re-processes all objects (full resync).
 
@@ -563,7 +588,7 @@ Updated by the sandbox watcher on every Applied event and by gRPC handlers durin
 
 - **Connection errors**: Logged at `error` level but do not crash the gateway. TLS handshake failures and individual connection errors are caught and logged per-connection.
 
-- **Background task errors**: The sandbox watcher and event tailer log warnings for individual processing failures but continue running. If the watcher stream ends, it logs a warning and the task exits (no automatic restart).
+- **Background task errors**: The sandbox watcher, event tailer, and session reaper log warnings for individual processing failures but continue running. If the watcher stream ends, it logs a warning and the task exits (no automatic restart). All background tasks monitor a shared `CancellationToken` and exit cleanly during graceful shutdown.
 
 ## Cross-References
 
