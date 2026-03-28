@@ -30,6 +30,9 @@ impl SqliteStore {
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .min_connections(max_connections)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .idle_timeout(std::time::Duration::from_secs(300))
+            .max_lifetime(std::time::Duration::from_secs(1800))
             .connect_with(options)
             .await
             .map_err(|e| map_db_error(&e))?;
