@@ -1,0 +1,136 @@
+name: Release Fork
+
+on:
+  push:
+    branches: [feat/credential-injection-query-param-basic-auth]
+  workflow_dispatch:
+
+concurrency:
+  group: release-fork-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-cli:
+    name: Build CLI (linux-amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "29.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-cli-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-cli-${{ runner.os }}-
+
+      - name: Build openshell CLI (release)
+        run: cargo build --release -p openshell-cli
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/release/openshell dist/
+          cd dist
+          tar czf openshell-linux-amd64.tar.gz openshell
+          sha256sum openshell-linux-amd64.tar.gz > openshell-linux-amd64.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openshell-linux-amd64
+          path: |
+            dist/openshell-linux-amd64.tar.gz
+            dist/openshell-linux-amd64.tar.gz.sha256
+
+  build-gateway:
+    name: Build gateway Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push gateway image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.images
+          target: gateway
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/htekdev/openshell-gateway:latest
+            ghcr.io/htekdev/openshell-gateway:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: Create GitHub Release
+    needs: [build-cli]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download CLI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: openshell-linux-amd64
+          path: dist/
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fork-latest
+          name: "Fork Release (credential injection)"
+          body: |
+            Pre-built OpenShell fork with L7 credential injection including
+            query-param rewriting and Basic auth encoding.
+
+            Branch: `feat/credential-injection-query-param-basic-auth`
+            Commit: ${{ github.sha }}
+
+            **Changes:** Extends the L7 proxy to inject API credentials at the
+            network layer for arbitrary REST endpoints, with support for query
+            parameter injection and HTTP Basic authentication encoding.
+
+            **Gateway image:** `ghcr.io/htekdev/openshell-gateway:latest`
+          draft: false
+          prerelease: true
+          make_latest: false
+          files: |
+            dist/openshell-linux-amd64.tar.gz
+            dist/openshell-linux-amd64.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
