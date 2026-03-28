@@ -123,22 +123,29 @@ async fn ssh_connect(
     }
 
     // Enforce per-sandbox concurrent connection limit.
-    {
+    let sandbox_over_limit = {
         let mut counts = state.ssh_connections_by_sandbox.lock().unwrap();
         let count = counts.entry(sandbox_id.clone()).or_insert(0);
         if *count >= MAX_CONNECTIONS_PER_SANDBOX {
-            // Roll back the per-token increment.
-            let mut token_counts = state.ssh_connections_by_token.lock().unwrap();
-            if let Some(c) = token_counts.get_mut(&token) {
-                *c = c.saturating_sub(1);
-                if *c == 0 {
-                    token_counts.remove(&token);
-                }
-            }
-            warn!(sandbox_id = %sandbox_id, "SSH tunnel: per-sandbox connection limit reached");
-            return StatusCode::TOO_MANY_REQUESTS.into_response();
+            true
+        } else {
+            *count += 1;
+            false
         }
-        *count += 1;
+    };
+    // Lock is released here before any rollback — avoids nested mutex acquisition.
+
+    if sandbox_over_limit {
+        // Roll back the per-token increment — no nested locks.
+        let mut token_counts = state.ssh_connections_by_token.lock().unwrap();
+        if let Some(c) = token_counts.get_mut(&token) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                token_counts.remove(&token);
+            }
+        }
+        warn!(sandbox_id = %sandbox_id, "SSH tunnel: per-sandbox connection limit reached");
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
 
     let handshake_secret = state.config.ssh_handshake_secret.clone();
