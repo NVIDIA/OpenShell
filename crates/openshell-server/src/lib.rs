@@ -206,18 +206,26 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
         if let Some(ref acceptor) = tls_acceptor {
             let tls_acceptor = acceptor.clone();
             tokio::spawn(async move {
-                match tls_acceptor.inner().accept(stream).await {
-                    Ok(tls_stream) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tls_acceptor.inner().accept(stream),
+                )
+                .await
+                {
+                    Ok(Ok(tls_stream)) => {
                         if let Err(e) = service.serve(tls_stream).await {
                             error!(error = %e, client = %addr, "Connection error");
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         if is_benign_tls_handshake_failure(&e) {
                             debug!(error = %e, client = %addr, "TLS handshake closed early");
                         } else {
                             error!(error = %e, client = %addr, "TLS handshake failed");
                         }
+                    }
+                    Err(_) => {
+                        debug!(client = %addr, "TLS handshake timed out");
                     }
                 }
             });
