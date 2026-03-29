@@ -404,6 +404,7 @@ async fn resolve_inference_bundle(store: &Store) -> Result<GetInferenceBundleRes
             r.api_key.hash(&mut hasher);
             r.protocols.hash(&mut hasher);
             r.provider_type.hash(&mut hasher);
+            r.timeout_secs.hash(&mut hasher);
         }
         format!("{:016x}", hasher.finish())
     };
