@@ -1772,6 +1772,42 @@ pub async fn doctor_check() -> Result<()> {
                 Err(_) => writeln!(stdout, "(not set, using default socket)").into_diagnostic()?,
             };
 
+            // --- inotify limits (Linux only) ---
+            #[cfg(target_os = "linux")]
+            {
+                write!(stdout, "  inotify instances .. ").into_diagnostic()?;
+                stdout.flush().into_diagnostic()?;
+                match std::fs::read_to_string("/proc/sys/fs/inotify/max_user_instances") {
+                    Ok(val) => {
+                        let current: u64 = val.trim().parse().unwrap_or(0);
+                        if current < 256 {
+                            writeln!(stdout, "warning ({current}, recommend 512+)")
+                                .into_diagnostic()?;
+                            writeln!(stdout).into_diagnostic()?;
+                            writeln!(stdout, "  Hosts running existing Kubernetes clusters or container workloads").into_diagnostic()?;
+                            writeln!(
+                                stdout,
+                                "  may not have enough inotify instances for the embedded k3s."
+                            )
+                            .into_diagnostic()?;
+                            writeln!(stdout).into_diagnostic()?;
+                            writeln!(
+                                stdout,
+                                "  Fix:      sudo sysctl -w fs.inotify.max_user_instances=512"
+                            )
+                            .into_diagnostic()?;
+                            writeln!(stdout, "  Persist:  echo 'fs.inotify.max_user_instances=512' | sudo tee /etc/sysctl.d/99-openshell.conf").into_diagnostic()?;
+                            writeln!(stdout).into_diagnostic()?;
+                        } else {
+                            writeln!(stdout, "ok ({current})").into_diagnostic()?;
+                        }
+                    }
+                    Err(_) => {
+                        writeln!(stdout, "skip (not available)").into_diagnostic()?;
+                    }
+                }
+            }
+
             writeln!(stdout, "\nAll checks passed.").into_diagnostic()?;
             Ok(())
         }

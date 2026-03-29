@@ -557,6 +557,33 @@ if [ "${USE_IPTABLES_LEGACY:-0}" = "1" ]; then
     EXTRA_KUBELET_ARGS="$EXTRA_KUBELET_ARGS --disable-network-policy"
 fi
 
+# ---------------------------------------------------------------------------
+# Check inotify limits
+# ---------------------------------------------------------------------------
+# The embedded k3s cluster and its components (containerd, kubelet, flannel,
+# CoreDNS) create many inotify instances. On hosts that already run Kubernetes
+# or other container workloads, the default limit (128) can be exhausted,
+# causing containerd's CRI plugin to fail with "too many open files" during
+# fsnotify watcher creation. This surfaces as the opaque "K8s namespace not
+# ready" timeout because the RuntimeService never registers.
+#
+# Check the current limit and warn if it is too low. We do not auto-modify
+# kernel parameters — enterprise environments may audit sysctl changes and
+# require them to go through change management.
+INOTIFY_MIN=256
+INOTIFY_RECOMMENDED=512
+INOTIFY_CURRENT=$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 0)
+if [ "$INOTIFY_CURRENT" -lt "$INOTIFY_MIN" ]; then
+    echo ""
+    echo "Warning: fs.inotify.max_user_instances is $INOTIFY_CURRENT (need $INOTIFY_MIN+, recommend $INOTIFY_RECOMMENDED)"
+    echo "  Hosts running existing Kubernetes clusters or container workloads may not"
+    echo "  have enough inotify instances for the gateway's embedded k3s."
+    echo ""
+    echo "  Fix:      sudo sysctl -w fs.inotify.max_user_instances=$INOTIFY_RECOMMENDED"
+    echo "  Persist:  echo 'fs.inotify.max_user_instances=$INOTIFY_RECOMMENDED' | sudo tee /etc/sysctl.d/99-openshell.conf"
+    echo ""
+fi
+
 # Docker Desktop can briefly start the container before its bridge default route
 # is fully installed. k3s exits immediately in that state, so wait briefly for
 # routing to settle first.
