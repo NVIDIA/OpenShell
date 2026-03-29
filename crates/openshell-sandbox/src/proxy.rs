@@ -944,7 +944,8 @@ async fn handle_inference_interception(
                 }
             }
             ParseResult::Invalid(reason) => {
-                let response = format_http_response(400, &[], reason.as_bytes());
+                warn!(reason = %reason, "rejecting malformed inference request");
+                let response = format_http_response(400, &[], b"Bad Request");
                 write_all(&mut tls_client, &response).await?;
                 return Ok(InferenceOutcome::Denied { reason });
             }

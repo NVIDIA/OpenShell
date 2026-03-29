@@ -242,14 +242,15 @@ fn parse_body_length(headers: &str) -> Result<BodyLength> {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("transfer-encoding:") {
             let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
-            if val.contains("chunked") {
+            if val.split(',').any(|enc| enc.trim() == "chunked") {
                 has_te_chunked = true;
             }
         }
-        if lower.starts_with("content-length:")
-            && let Some(val) = lower.split_once(':').map(|(_, v)| v.trim())
-            && let Ok(len) = val.parse::<u64>()
-        {
+        if lower.starts_with("content-length:") {
+            let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
+            let len: u64 = val.parse().map_err(|_| {
+                miette!("Request contains invalid Content-Length value")
+            })?;
             if let Some(prev) = cl_value {
                 if prev != len {
                     return Err(miette!(
@@ -707,6 +708,56 @@ mod tests {
             parse_body_length(headers).is_err(),
             "Must reject request with both TE and CL"
         );
+    }
+
+    /// SEC: Reject differing duplicate Content-Length headers.
+    #[test]
+    fn reject_differing_duplicate_content_length() {
+        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 50\r\n\r\n";
+        assert!(
+            parse_body_length(headers).is_err(),
+            "Must reject differing duplicate Content-Length"
+        );
+    }
+
+    /// SEC: Accept identical duplicate Content-Length headers.
+    #[test]
+    fn accept_identical_duplicate_content_length() {
+        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\nContent-Length: 42\r\n\r\n";
+        match parse_body_length(headers).unwrap() {
+            BodyLength::ContentLength(42) => {}
+            other => panic!("Expected ContentLength(42), got {other:?}"),
+        }
+    }
+
+    /// SEC: Reject non-numeric Content-Length values.
+    #[test]
+    fn reject_non_numeric_content_length() {
+        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n";
+        assert!(
+            parse_body_length(headers).is_err(),
+            "Must reject non-numeric Content-Length"
+        );
+    }
+
+    /// SEC: Reject when second Content-Length is non-numeric (bypass test).
+    #[test]
+    fn reject_valid_then_invalid_content_length() {
+        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\nContent-Length: abc\r\n\r\n";
+        assert!(
+            parse_body_length(headers).is_err(),
+            "Must reject when any Content-Length is non-numeric"
+        );
+    }
+
+    /// SEC: Transfer-Encoding substring match must not match partial tokens.
+    #[test]
+    fn te_substring_not_chunked() {
+        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunkedx\r\n\r\n";
+        match parse_body_length(headers).unwrap() {
+            BodyLength::None => {}
+            other => panic!("Expected None for non-matching TE, got {other:?}"),
+        }
     }
 
     /// SEC-009: Bare LF in headers enables header injection.
