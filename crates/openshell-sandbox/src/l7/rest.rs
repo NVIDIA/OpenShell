@@ -250,6 +250,13 @@ fn parse_body_length(headers: &str) -> Result<BodyLength> {
             && let Some(val) = lower.split_once(':').map(|(_, v)| v.trim())
             && let Ok(len) = val.parse::<u64>()
         {
+            if let Some(prev) = cl_value {
+                if prev != len {
+                    return Err(miette!(
+                        "Request contains multiple Content-Length headers with differing values ({prev} vs {len})"
+                    ));
+                }
+            }
             cl_value = Some(len);
         }
     }
