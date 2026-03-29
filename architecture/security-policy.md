@@ -716,7 +716,7 @@ If any condition fails, the proxy returns `403 Forbidden`.
 7. Rewrites the request: absolute-form → origin-form (`GET /path HTTP/1.1`), strips hop-by-hop headers, adds `Via: 1.1 openshell-sandbox` and `Connection: close`
 8. Forwards the rewritten request, then relays bidirectionally using `tokio::io::copy_bidirectional` (supports chunked transfer, SSE streams, and other long-lived responses with no idle timeout)
 
-**V1 simplifications**: Forward proxy v1 injects `Connection: close` (no keep-alive) and does not perform L7 inspection on the forwarded traffic. Every forward proxy connection handles exactly one request-response exchange.
+**V1 simplifications**: Forward proxy v1 injects `Connection: close` (no keep-alive). Every forward proxy connection handles exactly one request-response exchange. When an endpoint has L7 rules configured, the forward proxy evaluates the single request's method and path against L7 policy before forwarding.
 
 **Implementation**: See `crates/openshell-sandbox/src/proxy.rs` -- `handle_forward_proxy()`, `parse_proxy_uri()`, `rewrite_forward_request()`.
 

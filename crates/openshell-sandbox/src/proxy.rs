@@ -1803,10 +1803,79 @@ async fn handle_forward_proxy(
     };
     let policy_str = matched_policy.as_deref().unwrap_or("-");
 
-    // 4b. Reject if the endpoint has L7 config — the forward proxy path does
-    //     not perform per-request method/path inspection, so L7-configured
-    //     endpoints must go through the CONNECT tunnel where inspection happens.
-    if query_l7_config(&opa_engine, &decision, &host_lc, port).is_some() {
+    // 4b. If the endpoint has L7 config, evaluate the request against
+    //     L7 policy.  The forward proxy handles exactly one request per
+    //     connection (Connection: close), so a single evaluation suffices.
+    if let Some(l7_config) =
+        query_l7_config(&opa_engine, &decision, &host_lc, port)
+    {
+        let tunnel_engine =
+            opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
+                warn!(
+                    error = %e,
+                    "Failed to clone OPA engine for forward L7"
+                );
+                regorus::Engine::new()
+            });
+        let engine_mutex =
+            std::sync::Mutex::new(tunnel_engine);
+
+        let l7_ctx = crate::l7::relay::L7EvalContext {
+            host: host_lc.clone(),
+            port,
+            policy_name: matched_policy
+                .clone()
+                .unwrap_or_default(),
+            binary_path: decision
+                .binary
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            ancestors: decision
+                .ancestors
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            cmdline_paths: decision
+                .cmdline_paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            secret_resolver: secret_resolver.clone(),
+        };
+
+        let request_info = crate::l7::L7RequestInfo {
+            action: method.to_string(),
+            target: path.clone(),
+        };
+
+        let (allowed, reason) =
+            crate::l7::relay::evaluate_l7_request(
+                &engine_mutex,
+                &l7_ctx,
+                &request_info,
+            )
+            .unwrap_or_else(|e| {
+                warn!(
+                    error = %e,
+                    "L7 eval failed, denying request"
+                );
+                (false, format!("L7 evaluation error: {e}"))
+            });
+
+        let decision_str = match (
+            allowed,
+            l7_config.enforcement,
+        ) {
+            (true, _) => "allow",
+            (false, crate::l7::EnforcementMode::Audit) => {
+                "audit"
+            }
+            (false, crate::l7::EnforcementMode::Enforce) => {
+                "deny"
+            }
+        };
+
         info!(
             dst_host = %host_lc,
             dst_port = port,
@@ -1814,21 +1883,33 @@ async fn handle_forward_proxy(
             path = %path,
             binary = %binary_str,
             policy = %policy_str,
-            action = "deny",
-            reason = "endpoint has L7 rules; use CONNECT",
-            "FORWARD",
+            l7_protocol = "rest",
+            l7_decision = decision_str,
+            l7_deny_reason = %reason,
+            "FORWARD_L7",
         );
-        emit_denial_simple(
-            denial_tx,
-            &host_lc,
-            port,
-            &binary_str,
-            &decision,
-            "endpoint has L7 rules configured; forward proxy bypasses L7 inspection — use CONNECT",
-            "forward-l7-bypass",
-        );
-        respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-        return Ok(());
+
+        let effectively_denied = !allowed
+            && l7_config.enforcement
+                == crate::l7::EnforcementMode::Enforce;
+
+        if effectively_denied {
+            emit_denial_simple(
+                denial_tx,
+                &host_lc,
+                port,
+                &binary_str,
+                &decision,
+                &reason,
+                "forward-l7-deny",
+            );
+            respond(
+                client,
+                b"HTTP/1.1 403 Forbidden\r\n\r\n",
+            )
+            .await?;
+            return Ok(());
+        }
     }
 
     // 5. DNS resolution + SSRF defence (mirrors the CONNECT path logic).
