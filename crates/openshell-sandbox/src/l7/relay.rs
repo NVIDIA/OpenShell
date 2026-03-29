@@ -7,12 +7,12 @@
 //! Parses each request within the tunnel, evaluates it against OPA policy,
 //! and either forwards or denies the request.
 
-use crate::l7::provider::L7Provider;
+use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::secrets::SecretResolver;
 use miette::{IntoDiagnostic, Result, miette};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 /// Context for L7 request policy evaluation.
@@ -136,20 +136,42 @@ where
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             // Forward request to upstream and relay response
-            let reusable = crate::l7::rest::relay_http_request_with_resolver(
+            let outcome = crate::l7::rest::relay_http_request_with_resolver(
                 &req,
                 client,
                 upstream,
                 ctx.secret_resolver.as_deref(),
             )
             .await?;
-            if !reusable {
-                debug!(
-                    host = %ctx.host,
-                    port = ctx.port,
-                    "Upstream connection not reusable, closing L7 relay"
-                );
-                return Ok(());
+            match outcome {
+                RelayOutcome::Reusable => {} // continue loop
+                RelayOutcome::Consumed => {
+                    debug!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        "Upstream connection not reusable, closing L7 relay"
+                    );
+                    return Ok(());
+                }
+                RelayOutcome::Upgraded { overflow } => {
+                    info!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        overflow_bytes = overflow.len(),
+                        "101 Switching Protocols — switching to raw bidirectional relay"
+                    );
+                    // Forward any overflow bytes from the upgrade response
+                    if !overflow.is_empty() {
+                        client.write_all(&overflow).await.into_diagnostic()?;
+                        client.flush().await.into_diagnostic()?;
+                    }
+                    // Switch to raw bidirectional TCP copy for the upgraded
+                    // protocol (WebSocket, HTTP/2, etc.)
+                    tokio::io::copy_bidirectional(client, upstream)
+                        .await
+                        .into_diagnostic()?;
+                    return Ok(());
+                }
             }
         } else {
             // Enforce mode: deny with 403 and close connection
@@ -281,12 +303,29 @@ where
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends
         // the request upstream and reads the response back to the client.
-        let reusable =
+        let outcome =
             crate::l7::rest::relay_http_request_with_resolver(&req, client, upstream, resolver)
                 .await?;
 
-        if !reusable {
-            break;
+        match outcome {
+            RelayOutcome::Reusable => {} // continue loop
+            RelayOutcome::Consumed => break,
+            RelayOutcome::Upgraded { overflow } => {
+                info!(
+                    host = %ctx.host,
+                    port = ctx.port,
+                    overflow_bytes = overflow.len(),
+                    "101 Switching Protocols — switching to raw bidirectional relay"
+                );
+                if !overflow.is_empty() {
+                    client.write_all(&overflow).await.into_diagnostic()?;
+                    client.flush().await.into_diagnostic()?;
+                }
+                tokio::io::copy_bidirectional(client, upstream)
+                    .await
+                    .into_diagnostic()?;
+                return Ok(());
+            }
         }
     }
 

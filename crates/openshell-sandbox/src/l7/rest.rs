@@ -7,7 +7,7 @@
 //! policy, and relays allowed requests to upstream. Handles Content-Length
 //! and chunked transfer encoding for body framing.
 
-use crate::l7::provider::{BodyLength, L7Provider, L7Request};
+use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::secrets::rewrite_http_header_block;
 use miette::{IntoDiagnostic, Result, miette};
 use std::collections::HashMap;
@@ -32,7 +32,12 @@ impl L7Provider for RestProvider {
         parse_http_request(client).await
     }
 
-    async fn relay<C, U>(&self, req: &L7Request, client: &mut C, upstream: &mut U) -> Result<bool>
+    async fn relay<C, U>(
+        &self,
+        req: &L7Request,
+        client: &mut C,
+        upstream: &mut U,
+    ) -> Result<RelayOutcome>
     where
         C: AsyncRead + AsyncWrite + Unpin + Send,
         U: AsyncRead + AsyncWrite + Unpin + Send,
@@ -222,8 +227,13 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
 
 /// Forward an allowed HTTP request to upstream and relay the response back.
 ///
-/// Returns `true` if the upstream connection is reusable, `false` if consumed.
-async fn relay_http_request<C, U>(req: &L7Request, client: &mut C, upstream: &mut U) -> Result<bool>
+/// Returns the relay outcome indicating whether the connection is reusable,
+/// consumed, or has been upgraded (e.g. WebSocket via 101 Switching Protocols).
+async fn relay_http_request<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
@@ -236,7 +246,7 @@ pub(crate) async fn relay_http_request_with_resolver<C, U>(
     client: &mut C,
     upstream: &mut U,
     resolver: Option<&crate::secrets::SecretResolver>,
-) -> Result<bool>
+) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
@@ -273,8 +283,19 @@ where
         BodyLength::None => {}
     }
     upstream.flush().await.into_diagnostic()?;
-    let (reusable, _) = relay_response(&req.action, upstream, client).await?;
-    Ok(reusable)
+    let (reusable, status_code, resp_overflow) =
+        relay_response(&req.action, upstream, client).await?;
+
+    if status_code == 101 {
+        return Ok(RelayOutcome::Upgraded {
+            overflow: resp_overflow,
+        });
+    }
+    if reusable {
+        Ok(RelayOutcome::Reusable)
+    } else {
+        Ok(RelayOutcome::Consumed)
+    }
 }
 
 /// Send a 403 Forbidden JSON deny response.
@@ -519,7 +540,7 @@ where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
 {
-    let (reusable, _status) = relay_response(request_method, upstream, client).await?;
+    let (reusable, _status, _overflow) = relay_response(request_method, upstream, client).await?;
     Ok(reusable)
 }
 
@@ -527,7 +548,7 @@ async fn relay_response<U, C>(
     request_method: &str,
     upstream: &mut U,
     client: &mut C,
-) -> Result<(bool, u16)>
+) -> Result<(bool, u16, Vec<u8>)>
 where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
@@ -548,7 +569,7 @@ where
             if !buf.is_empty() {
                 client.write_all(&buf).await.into_diagnostic()?;
             }
-            return Ok((false, 0));
+            return Ok((false, 0, Vec::new()));
         }
         buf.extend_from_slice(&tmp[..n]);
 
@@ -574,6 +595,26 @@ where
         "relay_response framing"
     );
 
+    // 101 Switching Protocols: the connection has been upgraded (e.g. to
+    // WebSocket).  Forward the 101 headers to the client and signal the
+    // caller to switch to raw bidirectional TCP relay.  Any bytes read
+    // from upstream beyond the headers are overflow that belong to the
+    // upgraded protocol and must be forwarded before switching.
+    if status_code == 101 {
+        client
+            .write_all(&buf[..header_end])
+            .await
+            .into_diagnostic()?;
+        client.flush().await.into_diagnostic()?;
+        let overflow = buf[header_end..].to_vec();
+        debug!(
+            request_method,
+            overflow_bytes = overflow.len(),
+            "101 Switching Protocols — signaling protocol upgrade"
+        );
+        return Ok((false, status_code, overflow));
+    }
+
     // Bodiless responses (HEAD, 1xx, 204, 304): forward headers only, skip body
     if is_bodiless_response(request_method, status_code) {
         client
@@ -581,7 +622,7 @@ where
             .await
             .into_diagnostic()?;
         client.flush().await.into_diagnostic()?;
-        return Ok((!server_wants_close, status_code));
+        return Ok((!server_wants_close, status_code, Vec::new()));
     }
 
     // No explicit framing (no Content-Length, no Transfer-Encoding).
@@ -601,7 +642,7 @@ where
             }
             relay_until_eof(upstream, client).await?;
             client.flush().await.into_diagnostic()?;
-            return Ok((false, status_code));
+            return Ok((false, status_code, Vec::new()));
         }
         // No Connection: close — an HTTP/1.1 keep-alive server that omits
         // framing headers has an empty body.  Forward headers and continue
@@ -612,7 +653,7 @@ where
             .await
             .into_diagnostic()?;
         client.flush().await.into_diagnostic()?;
-        return Ok((true, status_code));
+        return Ok((true, status_code, Vec::new()));
     }
 
     // Forward response headers + any overflow body bytes
@@ -645,7 +686,7 @@ where
     // loop will exit via the normal error path.  Exiting early here would
     // tear down the CONNECT tunnel before the client can detect the close,
     // causing ~30 s retry delays in clients like `gh`.
-    Ok((true, status_code))
+    Ok((true, status_code, Vec::new()))
 }
 
 /// Parse the HTTP status code from a response status line.
@@ -1115,7 +1156,7 @@ mod tests {
         .await
         .expect("relay_response should not deadlock");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
+        let (reusable, _status, _overflow) = result.expect("relay_response should succeed");
         assert!(!reusable, "connection consumed by read-until-EOF");
 
         client_write.shutdown().await.unwrap();
@@ -1153,7 +1194,7 @@ mod tests {
         .await
         .expect("must not block when no Connection: close");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
+        let (reusable, _status, _overflow) = result.expect("relay_response should succeed");
         assert!(reusable, "keep-alive implied, connection reusable");
 
         client_write.shutdown().await.unwrap();
@@ -1186,7 +1227,7 @@ mod tests {
         .await
         .expect("HEAD relay must not deadlock waiting for body");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
+        let (reusable, _status, _overflow) = result.expect("relay_response should succeed");
         assert!(reusable, "HEAD response should be reusable");
 
         client_write.shutdown().await.unwrap();
@@ -1216,7 +1257,7 @@ mod tests {
         .await
         .expect("204 relay must not deadlock");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
+        let (reusable, _status, _overflow) = result.expect("relay_response should succeed");
         assert!(reusable, "204 response should be reusable");
 
         client_write.shutdown().await.unwrap();
@@ -1248,7 +1289,7 @@ mod tests {
         .await
         .expect("must not block when chunked body is complete in overflow");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
+        let (reusable, _status, _overflow) = result.expect("relay_response should succeed");
         assert!(reusable, "connection should be reusable");
 
         client_write.shutdown().await.unwrap();
@@ -1284,7 +1325,7 @@ mod tests {
         .await
         .expect("must not block when chunked response has trailers");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
+        let (reusable, _status, _overflow) = result.expect("relay_response should succeed");
         assert!(reusable, "chunked response should be reusable");
 
         client_write.shutdown().await.unwrap();
@@ -1319,7 +1360,7 @@ mod tests {
         .await
         .expect("normal relay must not deadlock");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
+        let (reusable, _status, _overflow) = result.expect("relay_response should succeed");
         assert!(reusable, "Content-Length response should be reusable");
 
         client_write.shutdown().await.unwrap();
@@ -1347,7 +1388,7 @@ mod tests {
         .await
         .expect("relay must not deadlock");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
+        let (reusable, _status, _overflow) = result.expect("relay_response should succeed");
         // With explicit framing, Connection: close is still reported as reusable
         // so the relay loop continues.  The *next* upstream write will fail and
         // exit the loop via the normal error path.
@@ -1360,6 +1401,51 @@ mod tests {
         let mut received = Vec::new();
         client_read.read_to_end(&mut received).await.unwrap();
         assert!(String::from_utf8_lossy(&received).contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn relay_response_101_switching_protocols_returns_overflow() {
+        // Build a 101 response followed by WebSocket frame data (overflow).
+        let mut response = Vec::new();
+        response.extend_from_slice(b"HTTP/1.1 101 Switching Protocols\r\n");
+        response.extend_from_slice(b"Upgrade: websocket\r\n");
+        response.extend_from_slice(b"Connection: Upgrade\r\n");
+        response.extend_from_slice(b"\r\n");
+        response.extend_from_slice(b"\x81\x05hello"); // WebSocket frame
+
+        let (upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, client_write) = tokio::io::duplex(4096);
+
+        upstream_write.write_all(&response).await.unwrap();
+        drop(upstream_write);
+
+        let mut upstream_read = upstream_read;
+        let mut client_write = client_write;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_response("GET", &mut upstream_read, &mut client_write),
+        )
+        .await
+        .expect("relay_response should not deadlock");
+
+        let (reusable, status, overflow) = result.expect("relay_response should succeed");
+        assert!(!reusable, "101 should signal non-reusable");
+        assert_eq!(status, 101);
+        assert_eq!(
+            &overflow,
+            b"\x81\x05hello",
+            "overflow should contain WebSocket frame data"
+        );
+
+        client_write.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client_read.read_to_end(&mut received).await.unwrap();
+        let received_str = String::from_utf8_lossy(&received);
+        assert!(
+            received_str.contains("101 Switching Protocols"),
+            "client should receive the 101 response headers"
+        );
     }
 
     #[test]
