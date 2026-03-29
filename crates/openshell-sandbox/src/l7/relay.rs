@@ -180,7 +180,7 @@ fn is_benign_connection_error(err: &miette::Report) -> bool {
 /// Evaluate an L7 request against the OPA engine.
 ///
 /// Returns `(allowed, deny_reason)`.
-fn evaluate_l7_request(
+pub fn evaluate_l7_request(
     engine: &Mutex<regorus::Engine>,
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
