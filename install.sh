@@ -183,8 +183,7 @@ verify_checksum() {
   _vc_expected="$(grep "$_vc_filename" "$_vc_checksums" | awk '{print $1}')"
 
   if [ -z "$_vc_expected" ]; then
-    warn "no checksum found for $_vc_filename, skipping verification"
-    return 0
+    error "no checksum found for $_vc_filename in checksums file"
   fi
 
   if has_cmd shasum; then
@@ -192,8 +191,7 @@ verify_checksum() {
   elif has_cmd sha256sum; then
     echo "$_vc_expected  $_vc_archive" | sha256sum -c --quiet 2>/dev/null
   else
-    warn "sha256sum/shasum not found, skipping checksum verification"
-    return 0
+    error "sha256sum or shasum is required to verify checksums"
   fi
 }
 
@@ -256,12 +254,11 @@ main() {
 
   # Verify checksum
   info "verifying checksum..."
-  if download "$_checksums_url" "${_tmpdir}/checksums.txt"; then
-    if ! verify_checksum "${_tmpdir}/${_filename}" "${_tmpdir}/checksums.txt" "$_filename"; then
-      error "checksum verification failed for ${_filename}"
-    fi
-  else
-    warn "could not download checksums file, skipping verification"
+  if ! download "$_checksums_url" "${_tmpdir}/checksums.txt"; then
+    error "could not download checksums file from ${_checksums_url}"
+  fi
+  if ! verify_checksum "${_tmpdir}/${_filename}" "${_tmpdir}/checksums.txt" "$_filename"; then
+    error "checksum verification failed for ${_filename}"
   fi
 
   # Extract
