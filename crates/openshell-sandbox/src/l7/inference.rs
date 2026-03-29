@@ -139,9 +139,11 @@ pub fn try_parse_http_request(buf: &[u8]) -> ParseResult {
             if name.eq_ignore_ascii_case("content-length") {
                 let new_len: usize = match value.parse() {
                     Ok(v) => v,
-                    Err(_) => return ParseResult::Invalid(
-                        format!("invalid Content-Length value: {value}")
-                    ),
+                    Err(_) => {
+                        return ParseResult::Invalid(format!(
+                            "invalid Content-Length value: {value}"
+                        ));
+                    }
                 };
                 if has_content_length && new_len != content_length {
                     return ParseResult::Invalid(format!(
@@ -590,7 +592,8 @@ mod tests {
 
     #[test]
     fn reject_non_numeric_content_length() {
-        let request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n";
+        let request =
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n";
         assert!(matches!(
             try_parse_http_request(request),
             ParseResult::Invalid(reason) if reason.contains("invalid Content-Length")

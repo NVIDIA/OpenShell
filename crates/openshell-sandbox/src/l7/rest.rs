@@ -248,9 +248,9 @@ fn parse_body_length(headers: &str) -> Result<BodyLength> {
         }
         if lower.starts_with("content-length:") {
             let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
-            let len: u64 = val.parse().map_err(|_| {
-                miette!("Request contains invalid Content-Length value")
-            })?;
+            let len: u64 = val
+                .parse()
+                .map_err(|_| miette!("Request contains invalid Content-Length value"))?;
             if let Some(prev) = cl_value {
                 if prev != len {
                     return Err(miette!(
@@ -713,7 +713,8 @@ mod tests {
     /// SEC: Reject differing duplicate Content-Length headers.
     #[test]
     fn reject_differing_duplicate_content_length() {
-        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 50\r\n\r\n";
+        let headers =
+            "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 50\r\n\r\n";
         assert!(
             parse_body_length(headers).is_err(),
             "Must reject differing duplicate Content-Length"
@@ -723,7 +724,8 @@ mod tests {
     /// SEC: Accept identical duplicate Content-Length headers.
     #[test]
     fn accept_identical_duplicate_content_length() {
-        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\nContent-Length: 42\r\n\r\n";
+        let headers =
+            "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\nContent-Length: 42\r\n\r\n";
         match parse_body_length(headers).unwrap() {
             BodyLength::ContentLength(42) => {}
             other => panic!("Expected ContentLength(42), got {other:?}"),
@@ -743,7 +745,8 @@ mod tests {
     /// SEC: Reject when second Content-Length is non-numeric (bypass test).
     #[test]
     fn reject_valid_then_invalid_content_length() {
-        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\nContent-Length: abc\r\n\r\n";
+        let headers =
+            "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\nContent-Length: abc\r\n\r\n";
         assert!(
             parse_body_length(headers).is_err(),
             "Must reject when any Content-Length is non-numeric"
