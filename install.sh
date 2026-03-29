@@ -87,27 +87,38 @@ check_downloader() {
 }
 
 # Download a URL to a file. Outputs nothing on success.
+# Limits redirects to prevent open-redirect abuse from download URLs.
 download() {
   _url="$1"
   _output="$2"
 
   if has_cmd curl; then
-    curl -fLsS --retry 3 -o "$_output" "$_url"
+    curl -fLsS --retry 3 --max-redirs 5 -o "$_output" "$_url"
   elif has_cmd wget; then
-    wget -q --tries=3 -O "$_output" "$_url"
+    wget -q --tries=3 --max-redirect=5 -O "$_output" "$_url"
   fi
 }
 
 # Follow a URL and print the final resolved URL (for detecting redirect targets).
+# Validates that the final URL is still within the expected GitHub origin to
+# prevent redirect-based attacks (e.g., compromised CDN or DNS poisoning).
 resolve_redirect() {
   _url="$1"
 
   if has_cmd curl; then
-    curl -fLsS -o /dev/null -w '%{url_effective}' "$_url"
+    _resolved_url="$(curl -fLsS -o /dev/null -w '%{url_effective}' "$_url")"
   elif has_cmd wget; then
     # wget --spider follows redirects; capture the final Location from stderr
-    wget --spider --max-redirect=10 "$_url" 2>&1 | sed -n 's/^.*Location: \([^ ]*\).*/\1/p' | tail -1
+    _resolved_url="$(wget --spider --max-redirect=10 "$_url" 2>&1 | sed -n 's/^.*Location: \([^ ]*\).*/\1/p' | tail -1)"
   fi
+
+  # Verify the final URL points to the expected GitHub repository.
+  case "$_resolved_url" in
+    https://github.com/${REPO}/*) ;;
+    *) error "redirect resolved to unexpected origin: ${_resolved_url} (expected https://github.com/${REPO}/...)" ;;
+  esac
+
+  echo "$_resolved_url"
 }
 
 # ---------------------------------------------------------------------------
