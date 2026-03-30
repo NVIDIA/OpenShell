@@ -128,12 +128,7 @@ impl BinaryIdentityCache {
             metadata.len(), path.display()
         );
 
-        let hash_start = std::time::Instant::now();
         let current_hash = hash_file(path)?;
-        debug!(
-            "      verify_or_cache SHA256: {}ms path={}",
-            hash_start.elapsed().as_millis(), path.display()
-        );
 
         let mut hashes = self
             .hashes

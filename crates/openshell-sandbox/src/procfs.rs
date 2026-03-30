@@ -6,7 +6,7 @@
 //! Provides functions to resolve binary paths and compute file hashes
 //! for process-identity binding in the OPA proxy policy engine.
 
-use miette::{IntoDiagnostic, Result};
+use miette::Result;
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -49,33 +49,9 @@ pub fn resolve_tcp_peer_binary(entrypoint_pid: u32, peer_port: u16) -> Result<Pa
 /// Needed for the ancestor walk: we must know the PID to walk `/proc/<pid>/status` PPid chain.
 #[cfg(target_os = "linux")]
 pub fn resolve_tcp_peer_identity(entrypoint_pid: u32, peer_port: u16) -> Result<(PathBuf, u32)> {
-    let start = std::time::Instant::now();
-
-    let phase = std::time::Instant::now();
     let inode = parse_proc_net_tcp(entrypoint_pid, peer_port)?;
-    debug!(
-        "    parse_proc_net_tcp: {}ms inode={}",
-        phase.elapsed().as_millis(), inode
-    );
-
-    let phase = std::time::Instant::now();
     let pid = find_pid_by_socket_inode(inode, entrypoint_pid)?;
-    debug!(
-        "    find_pid_by_socket_inode: {}ms pid={}",
-        phase.elapsed().as_millis(), pid
-    );
-
-    let phase = std::time::Instant::now();
     let path = binary_path(pid.cast_signed())?;
-    debug!(
-        "    binary_path: {}ms path={}",
-        phase.elapsed().as_millis(), path.display()
-    );
-
-    debug!(
-        "    resolve_tcp_peer_identity TOTAL: {}ms",
-        start.elapsed().as_millis()
-    );
     Ok((path, pid))
 }
 
@@ -252,32 +228,18 @@ fn parse_proc_net_tcp(pid: u32, peer_port: u16) -> Result<u64> {
 /// `/proc/<pid>/fd/` for processes running as a different user.
 #[cfg(target_os = "linux")]
 fn find_pid_by_socket_inode(inode: u64, entrypoint_pid: u32) -> Result<u32> {
-    let start = std::time::Instant::now();
     let target = format!("socket:[{inode}]");
 
-    let phase = std::time::Instant::now();
+    // First: scan descendants of the entrypoint process
     let descendants = collect_descendant_pids(entrypoint_pid);
-    debug!(
-        "      collect_descendant_pids: {}ms count={}",
-        phase.elapsed().as_millis(), descendants.len()
-    );
 
-    let phase = std::time::Instant::now();
     for &pid in &descendants {
         if let Some(found) = check_pid_fds(pid, &target) {
-            debug!(
-                "      find_pid_by_socket_inode: {}ms found_pid={} scan=descendants",
-                start.elapsed().as_millis(), found
-            );
             return Ok(found);
         }
     }
-    debug!(
-        "      descendant_fd_scan (not found): {}ms",
-        phase.elapsed().as_millis()
-    );
 
-    let phase = std::time::Instant::now();
+    // Fallback: scan all of /proc in case the process isn't in the tree
     if let Ok(proc_dir) = std::fs::read_dir("/proc") {
         for entry in proc_dir.flatten() {
             let name = entry.file_name();
@@ -285,22 +247,15 @@ fn find_pid_by_socket_inode(inode: u64, entrypoint_pid: u32) -> Result<u32> {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+            // Skip PIDs we already checked
             if descendants.contains(&pid) {
                 continue;
             }
             if let Some(found) = check_pid_fds(pid, &target) {
-                debug!(
-                    "      find_pid_by_socket_inode: {}ms found_pid={} scan=full_proc",
-                    start.elapsed().as_millis(), found
-                );
                 return Ok(found);
             }
         }
     }
-    debug!(
-        "      full_proc_scan (not found): {}ms",
-        phase.elapsed().as_millis()
-    );
 
     Err(miette::miette!(
         "No process found owning socket inode {} \
@@ -373,7 +328,8 @@ pub fn file_sha256(path: &Path) -> Result<String> {
     let mut buf = [0u8; 65536];
     let mut total_read = 0u64;
     loop {
-        let n = file.read(&mut buf).into_diagnostic()?;
+        let n = file.read(&mut buf)
+            .map_err(|e| miette::miette!("Failed to read {}: {e}", path.display()))?;
         if n == 0 {
             break;
         }

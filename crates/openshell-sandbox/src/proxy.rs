@@ -336,9 +336,6 @@ async fn handle_tcp_connection(
     let peer_addr = client.peer_addr().into_diagnostic()?;
     let local_addr = client.local_addr().into_diagnostic()?;
 
-    let connect_start = std::time::Instant::now();
-    debug!("handle_tcp_connection START host={host_lc} port={port}");
-
     // Evaluate OPA policy with process-identity binding.
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
     // /proc scanning + SHA256 hashing of binaries (e.g. node at 124MB).
@@ -358,10 +355,6 @@ async fn handle_tcp_connection(
     })
     .await
     .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
-    debug!(
-        "handle_tcp_connection evaluate_opa_tcp: {}ms",
-        connect_start.elapsed().as_millis()
-    );
 
     // Extract action string and matched policy for logging
     let (matched_policy, deny_reason) = match &decision.action {
@@ -726,9 +719,7 @@ fn evaluate_opa_tcp(
 
     let total_start = std::time::Instant::now();
     let peer_port = peer_addr.port();
-    debug!("evaluate_opa_tcp START host={host} port={port}");
 
-    let phase_start = std::time::Instant::now();
     let (bin_path, binary_pid) = match crate::procfs::resolve_tcp_peer_identity(pid, peer_port) {
         Ok(r) => r,
         Err(e) => {
@@ -741,14 +732,8 @@ fn evaluate_opa_tcp(
             );
         }
     };
-    debug!(
-        "  resolve_tcp_peer_identity: {}ms binary={} pid={}",
-        phase_start.elapsed().as_millis(),
-        bin_path.display(),
-        binary_pid
-    );
 
-    let phase_start = std::time::Instant::now();
+    // TOFU verify the immediate binary
     let bin_hash = match identity_cache.verify_or_cache(&bin_path) {
         Ok(h) => h,
         Err(e) => {
@@ -761,23 +746,11 @@ fn evaluate_opa_tcp(
             );
         }
     };
-    debug!(
-        "  tofu_verify_binary: {}ms binary={}",
-        phase_start.elapsed().as_millis(),
-        bin_path.display()
-    );
 
-    let phase_start = std::time::Instant::now();
+    // Walk the process tree upward to collect ancestor binaries
     let ancestors = crate::procfs::collect_ancestor_binaries(binary_pid, pid);
-    debug!(
-        "  collect_ancestor_binaries: {}ms count={}",
-        phase_start.elapsed().as_millis(),
-        ancestors.len()
-    );
 
-    let phase_start = std::time::Instant::now();
     for ancestor in &ancestors {
-        let ancestor_start = std::time::Instant::now();
         if let Err(e) = identity_cache.verify_or_cache(ancestor) {
             return deny(
                 format!(
@@ -790,27 +763,13 @@ fn evaluate_opa_tcp(
                 vec![],
             );
         }
-        debug!(
-            "    tofu_verify_ancestor: {}ms ancestor={}",
-            ancestor_start.elapsed().as_millis(),
-            ancestor.display()
-        );
     }
-    debug!(
-        "  tofu_verify_all_ancestors: {}ms",
-        phase_start.elapsed().as_millis()
-    );
 
-    let phase_start = std::time::Instant::now();
+    // Collect cmdline paths for script-based binary detection.
     let mut exclude = ancestors.clone();
     exclude.push(bin_path.clone());
     let cmdline_paths = crate::procfs::collect_cmdline_paths(binary_pid, pid, &exclude);
-    debug!(
-        "  collect_cmdline_paths: {}ms",
-        phase_start.elapsed().as_millis()
-    );
 
-    let phase_start = std::time::Instant::now();
     let input = NetworkInput {
         host: host.to_string(),
         port,
@@ -836,10 +795,6 @@ fn evaluate_opa_tcp(
             cmdline_paths,
         ),
     };
-    debug!(
-        "  opa_evaluate_network_action: {}ms",
-        phase_start.elapsed().as_millis()
-    );
     debug!(
         "evaluate_opa_tcp TOTAL: {}ms host={host} port={port}",
         total_start.elapsed().as_millis()
