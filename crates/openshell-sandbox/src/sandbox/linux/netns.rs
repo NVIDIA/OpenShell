@@ -19,6 +19,36 @@ const SUBNET_PREFIX: &str = "10.200.0";
 const HOST_IP_SUFFIX: u8 = 1;
 const SANDBOX_IP_SUFFIX: u8 = 2;
 
+/// Resolve the cluster DNS server IP for the iptables ACCEPT rule.
+///
+/// Priority:
+/// 1. `OPENSHELL_DNS_SERVER` environment variable (operator override)
+/// 2. First `nameserver` entry in `/etc/resolv.conf`
+///
+/// Returns `None` if neither source provides a valid IP, in which case
+/// no DNS ACCEPT rule will be installed and UDP DNS remains blocked.
+fn resolve_dns_server() -> Option<IpAddr> {
+    if let Ok(val) = std::env::var("OPENSHELL_DNS_SERVER") {
+        if let Ok(addr) = val.parse::<IpAddr>() {
+            return Some(addr);
+        }
+        warn!(value = %val, "OPENSHELL_DNS_SERVER is not a valid IP address, ignoring");
+    }
+
+    if let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") {
+        for line in contents.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("nameserver") {
+                if let Ok(addr) = rest.trim().parse::<IpAddr>() {
+                    return Some(addr);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Handle to a network namespace with veth pair.
 ///
 /// The namespace and veth interfaces are automatically cleaned up on drop.
@@ -397,6 +427,33 @@ impl NetworkNamespace {
                 "icmp-port-unreachable",
             ],
         )?;
+
+        // Rule 5.5: ACCEPT DNS (UDP port 53) to the cluster nameserver.
+        //
+        // Some libraries (e.g. Node.js `ws`, used by @slack/socket-mode)
+        // resolve hostnames directly via the system resolver, bypassing
+        // HTTP_PROXY / HTTPS_PROXY.  Allow UDP DNS to the nameserver
+        // configured in /etc/resolv.conf so that resolution succeeds
+        // without opening a broad UDP hole.
+        if let Some(dns_ip) = resolve_dns_server() {
+            let dns_ip_cidr = format!("{dns_ip}/32");
+            if let Err(e) = run_iptables_netns(
+                &self.name,
+                iptables_cmd,
+                &[
+                    "-A", "OUTPUT", "-d", &dns_ip_cidr, "-p", "udp", "--dport", "53", "-j",
+                    "ACCEPT",
+                ],
+            ) {
+                warn!(
+                    error = %e,
+                    dns_server = %dns_ip,
+                    "Failed to install DNS ACCEPT rule (non-fatal, UDP DNS will be rejected)"
+                );
+            } else {
+                info!(dns_server = %dns_ip, "Installed DNS ACCEPT rule for UDP port 53");
+            }
+        }
 
         // Rule 6: LOG UDP bypass attempts (rate-limited, covers DNS bypass)
         if let Err(e) = run_iptables_netns(
