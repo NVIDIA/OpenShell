@@ -115,6 +115,20 @@ In general, RFCs shouldn't be merged if no one else has read or commented on it.
 
 Once an RFC has been entirely implemented, its state should be moved to `implemented`. This represents ideas that have been fully developed. While discussion on implemented RFCs is permitted, changes would be expected to be infrequent.
 
+## Diagrams
+
+When an RFC needs diagrams to illustrate architecture, data flow, or component interactions, use [Mermaid](https://mermaid.js.org/) diagrams embedded directly in the Markdown. Mermaid renders natively on GitHub and keeps diagrams version-controlled alongside the text.
+
+````markdown
+```mermaid
+graph LR
+    A[Client] --> B[Gateway]
+    B --> C[Sandbox]
+```
+````
+
+Prefer Mermaid over external image files whenever possible. If a diagram is too complex for Mermaid (e.g., detailed UI mockups), commit the image to the same directory as the RFC and reference it with a relative path.
+
 ## Making changes to an RFC
 
 After your RFC has been merged, there is always opportunity to make changes. Open a pull request with the change you would like to make. If you are not the original author, be sure to @ the original authors to make sure they see and approve of the changes.
