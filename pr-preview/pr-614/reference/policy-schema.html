@@ -770,6 +770,11 @@
 <td><p>Yes</p></td>
 <td><p>URL path pattern. Supports <code class="docutils literal notranslate"><span class="pre">*</span></code> and <code class="docutils literal notranslate"><span class="pre">**</span></code> glob syntax.</p></td>
 </tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">allow.query</span></code></p></td>
+<td><p>map</p></td>
+<td><p>No</p></td>
+<td><p>Query parameter matchers keyed by decoded param name. Matcher value can be a glob string (<code class="docutils literal notranslate"><span class="pre">tag:</span> <span class="pre">&quot;foo-*&quot;</span></code>) or an object with <code class="docutils literal notranslate"><span class="pre">any</span></code> (<code class="docutils literal notranslate"><span class="pre">tag:</span> <span class="pre">{</span> <span class="pre">any:</span> <span class="pre">[&quot;foo-*&quot;,</span> <span class="pre">&quot;bar-*&quot;]</span> <span class="pre">}</span></code>).</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -784,9 +789,14 @@
 <span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
 <span class="w">      </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">GET</span>
 <span class="w">      </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/**/info/refs*</span>
+<span class="w">      </span><span class="nt">query</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">service</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;git-*&quot;</span>
 <span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
 <span class="w">      </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">POST</span>
 <span class="w">      </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/**/git-upload-pack</span>
+<span class="w">      </span><span class="nt">query</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">tag</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">any</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;v1.*&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;v2.*&quot;</span><span class="p p-Indicator">]</span>
 </pre></div>
 </div>
 </section>
