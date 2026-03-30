@@ -1806,26 +1806,20 @@ async fn handle_forward_proxy(
     // 4b. If the endpoint has L7 config, evaluate the request against
     //     L7 policy.  The forward proxy handles exactly one request per
     //     connection (Connection: close), so a single evaluation suffices.
-    if let Some(l7_config) =
-        query_l7_config(&opa_engine, &decision, &host_lc, port)
-    {
-        let tunnel_engine =
-            opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
-                warn!(
-                    error = %e,
-                    "Failed to clone OPA engine for forward L7"
-                );
-                regorus::Engine::new()
-            });
-        let engine_mutex =
-            std::sync::Mutex::new(tunnel_engine);
+    if let Some(l7_config) = query_l7_config(&opa_engine, &decision, &host_lc, port) {
+        let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
+            warn!(
+                error = %e,
+                "Failed to clone OPA engine for forward L7"
+            );
+            regorus::Engine::new()
+        });
+        let engine_mutex = std::sync::Mutex::new(tunnel_engine);
 
         let l7_ctx = crate::l7::relay::L7EvalContext {
             host: host_lc.clone(),
             port,
-            policy_name: matched_policy
-                .clone()
-                .unwrap_or_default(),
+            policy_name: matched_policy.clone().unwrap_or_default(),
             binary_path: decision
                 .binary
                 .as_ref()
@@ -1850,30 +1844,19 @@ async fn handle_forward_proxy(
         };
 
         let (allowed, reason) =
-            crate::l7::relay::evaluate_l7_request(
-                &engine_mutex,
-                &l7_ctx,
-                &request_info,
-            )
-            .unwrap_or_else(|e| {
-                warn!(
-                    error = %e,
-                    "L7 eval failed, denying request"
-                );
-                (false, format!("L7 evaluation error: {e}"))
-            });
+            crate::l7::relay::evaluate_l7_request(&engine_mutex, &l7_ctx, &request_info)
+                .unwrap_or_else(|e| {
+                    warn!(
+                        error = %e,
+                        "L7 eval failed, denying request"
+                    );
+                    (false, format!("L7 evaluation error: {e}"))
+                });
 
-        let decision_str = match (
-            allowed,
-            l7_config.enforcement,
-        ) {
+        let decision_str = match (allowed, l7_config.enforcement) {
             (true, _) => "allow",
-            (false, crate::l7::EnforcementMode::Audit) => {
-                "audit"
-            }
-            (false, crate::l7::EnforcementMode::Enforce) => {
-                "deny"
-            }
+            (false, crate::l7::EnforcementMode::Audit) => "audit",
+            (false, crate::l7::EnforcementMode::Enforce) => "deny",
         };
 
         info!(
@@ -1889,9 +1872,8 @@ async fn handle_forward_proxy(
             "FORWARD_L7",
         );
 
-        let effectively_denied = !allowed
-            && l7_config.enforcement
-                == crate::l7::EnforcementMode::Enforce;
+        let effectively_denied =
+            !allowed && l7_config.enforcement == crate::l7::EnforcementMode::Enforce;
 
         if effectively_denied {
             emit_denial_simple(
@@ -1903,11 +1885,7 @@ async fn handle_forward_proxy(
                 &reason,
                 "forward-l7-deny",
             );
-            respond(
-                client,
-                b"HTTP/1.1 403 Forbidden\r\n\r\n",
-            )
-            .await?;
+            respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
             return Ok(());
         }
     }
