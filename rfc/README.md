@@ -59,7 +59,9 @@ At the start of every RFC document, we include a brief amount of metadata in YAM
 authors:
   - "@username"
 state: draft
-pr: https://github.com/NVIDIA/OpenShell/pull/123
+links:
+  - https://github.com/NVIDIA/OpenShell/pull/123
+  - https://github.com/NVIDIA/OpenShell/discussions/456
 ---
 ```
 
@@ -67,7 +69,7 @@ We track the following metadata:
 
 - **authors**: The authors (and therefore owners) of an RFC. Listed as GitHub usernames.
 - **state**: Must be one of the states discussed below.
-- **pr**: For RFCs in or beyond the `discussion` state, this should be a link to the pull request.
+- **links**: Related PRs, discussions, or issues. Add entries as the RFC progresses.
 - **superseded_by**: *(optional)* For RFCs in the `superseded` state, the RFC number that replaces this one (e.g., `0005`).
 
 An RFC can be in one of the following states:

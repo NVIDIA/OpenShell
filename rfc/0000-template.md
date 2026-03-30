@@ -2,7 +2,8 @@
 authors:
   - "@your-github-username"
 state: draft
-pr: (link to PR when in discussion)
+links:
+  - (related PRs, discussions, or issues)
 ---
 
 # RFC NNNN - Your Title Here
@@ -31,7 +32,7 @@ What are we actually proposing? Explain the design in enough detail that someone
 
 How do we get from here to there? Consider rollout strategy, backwards compatibility, and migration.
 
-## Drawbacks
+## Risks
 
 Why should we *not* do this? What are the costs?
 
