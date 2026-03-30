@@ -79,7 +79,7 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
             policy.landlock.compatibility,
             LandlockCompatibility::BestEffort
         ) {
-            warn!(
+            debug!(
                 error = %err,
                 "Landlock filesystem sandbox is UNAVAILABLE — running WITHOUT filesystem restrictions. \
                  Set landlock.compatibility to 'hard_requirement' to make this a fatal error."
