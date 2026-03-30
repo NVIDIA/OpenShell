@@ -19,6 +19,46 @@ const SUBNET_PREFIX: &str = "10.200.0";
 const HOST_IP_SUFFIX: u8 = 1;
 const SANDBOX_IP_SUFFIX: u8 = 2;
 
+/// Resolve hostnames that require direct TCP access (bypassing the HTTP proxy).
+///
+/// Returns resolved IPv4 addresses for hosts listed in `OPENSHELL_DIRECT_TCP_HOSTS`
+/// (comma-separated hostnames). These hosts are resolved via the system DNS and
+/// get iptables ACCEPT rules for TCP port 443 in the sandbox netns, plus
+/// MASQUERADE on the host side so responses can return.
+///
+/// This is needed for libraries (e.g. Node.js `ws`) that make direct TCP
+/// connections after resolving DNS, ignoring HTTP_PROXY settings.
+fn resolve_direct_tcp_hosts() -> Vec<IpAddr> {
+    let hosts = match std::env::var("OPENSHELL_DIRECT_TCP_HOSTS") {
+        Ok(val) if !val.is_empty() => val,
+        _ => return Vec::new(),
+    };
+
+    let mut addrs = Vec::new();
+    for host in hosts.split(',') {
+        let host = host.trim();
+        if host.is_empty() {
+            continue;
+        }
+        // Use std::net to resolve — this runs in the pod netns (not sandbox)
+        // so cluster DNS works normally.
+        match std::net::ToSocketAddrs::to_socket_addrs(&(host, 443_u16)) {
+            Ok(iter) => {
+                for sa in iter {
+                    if sa.is_ipv4() && !addrs.contains(&sa.ip()) {
+                        addrs.push(sa.ip());
+                    }
+                }
+                info!(host = %host, count = addrs.len(), "Resolved direct TCP host");
+            }
+            Err(e) => {
+                warn!(host = %host, error = %e, "Failed to resolve direct TCP host");
+            }
+        }
+    }
+    addrs
+}
+
 /// Resolve the cluster DNS server IP for the iptables ACCEPT rule.
 ///
 /// Priority:
@@ -389,6 +429,36 @@ impl NetworkNamespace {
             );
         }
 
+        // Host-side forwarding for direct TCP 443 (OPENSHELL_DIRECT_TCP_HOSTS).
+        // Same pattern as DNS: MASQUERADE so the destination sees the pod IP.
+        let direct_tcp_ips = resolve_direct_tcp_hosts();
+        if !direct_tcp_ips.is_empty() {
+            let sandbox_cidr = format!("{}/32", self.sandbox_ip);
+            for ip in &direct_tcp_ips {
+                let ip_cidr = format!("{ip}/32");
+                let _ = Command::new(&iptables_path)
+                    .args([
+                        "-t", "nat", "-A", "POSTROUTING",
+                        "-s", &sandbox_cidr, "-d", &ip_cidr,
+                        "-p", "tcp", "--dport", "443",
+                        "-j", "MASQUERADE",
+                    ])
+                    .output();
+                let _ = Command::new(&iptables_path)
+                    .args([
+                        "-A", "FORWARD",
+                        "-s", &sandbox_cidr, "-d", &ip_cidr,
+                        "-p", "tcp", "--dport", "443",
+                        "-j", "ACCEPT",
+                    ])
+                    .output();
+            }
+            info!(
+                count = direct_tcp_ips.len(),
+                "Enabled direct TCP 443 forwarding for OPENSHELL_DIRECT_TCP_HOSTS"
+            );
+        }
+
         info!(
             namespace = %self.name,
             "Bypass detection rules installed"
@@ -475,6 +545,29 @@ impl NetworkNamespace {
                 "Failed to install LOG rule for TCP (xt_LOG module may not be loaded); \
                  bypass REJECT rules will still be installed"
             );
+        }
+
+        // Rule 4.5: ACCEPT direct TCP 443 to hosts listed in OPENSHELL_DIRECT_TCP_HOSTS.
+        //
+        // Some libraries (e.g. Node.js `ws`, used by @slack/socket-mode) resolve
+        // DNS and then connect directly to the resolved IP, ignoring HTTP_PROXY.
+        // For these hosts, allow TCP 443 through and rely on host-side MASQUERADE
+        // (set up in install_bypass_rules) to route the traffic.
+        for direct_ip in resolve_direct_tcp_hosts() {
+            let ip_cidr = format!("{direct_ip}/32");
+            if let Err(e) = run_iptables_netns(
+                &self.name,
+                iptables_cmd,
+                &[
+                    "-A", "OUTPUT", "-d", &ip_cidr, "-p", "tcp", "--dport", "443", "-j", "ACCEPT",
+                ],
+            ) {
+                warn!(
+                    error = %e,
+                    ip = %direct_ip,
+                    "Failed to install direct TCP ACCEPT rule"
+                );
+            }
         }
 
         // Rule 5: REJECT TCP bypass attempts (fast-fail)
