@@ -120,14 +120,36 @@ fn try_open_path(path: &Path, compatibility: &LandlockCompatibility) -> Result<O
         Ok(fd) => Ok(Some(fd)),
         Err(err) => {
             let reason = classify_path_fd_error(&err);
+            let is_not_found = matches!(
+                &err,
+                PathFdError::OpenCall { source, .. }
+                    if source.kind() == std::io::ErrorKind::NotFound
+            );
             match compatibility {
                 LandlockCompatibility::BestEffort => {
-                    warn!(
-                        path = %path.display(),
-                        error = %err,
-                        reason = reason,
-                        "Skipping inaccessible Landlock path (best-effort mode)"
-                    );
+                    // NotFound is expected for stale baseline paths (e.g.
+                    // /app baked into the server-stored policy but absent
+                    // in this container image).  Log at debug! to avoid
+                    // polluting SSH exec stdout — the pre_exec hook
+                    // inherits the tracing subscriber whose writer targets
+                    // fd 1 (the pipe/PTY).
+                    //
+                    // Other errors (permission denied, symlink loops, etc.)
+                    // are genuinely unexpected and logged at warn!.
+                    if is_not_found {
+                        debug!(
+                            path = %path.display(),
+                            reason,
+                            "Skipping non-existent Landlock path (best-effort mode)"
+                        );
+                    } else {
+                        warn!(
+                            path = %path.display(),
+                            error = %err,
+                            reason,
+                            "Skipping inaccessible Landlock path (best-effort mode)"
+                        );
+                    }
                     Ok(None)
                 }
                 LandlockCompatibility::HardRequirement => Err(miette::miette!(
