@@ -118,14 +118,16 @@ impl BinaryIdentityCache {
         {
             debug!(
                 "      verify_or_cache: {}ms CACHE HIT path={}",
-                start.elapsed().as_millis(), path.display()
+                start.elapsed().as_millis(),
+                path.display()
             );
             return Ok(cached_binary.hash.clone());
         }
 
         debug!(
             "      verify_or_cache: CACHE MISS size={} path={}",
-            metadata.len(), path.display()
+            metadata.len(),
+            path.display()
         );
 
         let current_hash = hash_file(path)?;
@@ -156,7 +158,8 @@ impl BinaryIdentityCache {
 
         debug!(
             "      verify_or_cache TOTAL (cold): {}ms path={}",
-            start.elapsed().as_millis(), path.display()
+            start.elapsed().as_millis(),
+            path.display()
         );
 
         Ok(current_hash)

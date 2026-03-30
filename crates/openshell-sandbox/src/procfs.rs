@@ -328,7 +328,8 @@ pub fn file_sha256(path: &Path) -> Result<String> {
     let mut buf = [0u8; 65536];
     let mut total_read = 0u64;
     loop {
-        let n = file.read(&mut buf)
+        let n = file
+            .read(&mut buf)
             .map_err(|e| miette::miette!("Failed to read {}: {e}", path.display()))?;
         if n == 0 {
             break;
@@ -340,7 +341,9 @@ pub fn file_sha256(path: &Path) -> Result<String> {
     let hash = hasher.finalize();
     debug!(
         "        file_sha256: {}ms size={} path={}",
-        start.elapsed().as_millis(), total_read, path.display()
+        start.elapsed().as_millis(),
+        total_read,
+        path.display()
     );
     Ok(hex::encode(hash))
 }
