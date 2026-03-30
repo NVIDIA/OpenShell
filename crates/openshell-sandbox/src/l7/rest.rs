@@ -141,7 +141,7 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
     }))
 }
 
-fn parse_target_query(target: &str) -> Result<(String, HashMap<String, Vec<String>>)> {
+pub(crate) fn parse_target_query(target: &str) -> Result<(String, HashMap<String, Vec<String>>)> {
     match target.split_once('?') {
         Some((path, query)) => Ok((path.to_string(), parse_query_params(query)?)),
         None => Ok((target.to_string(), HashMap::new())),
