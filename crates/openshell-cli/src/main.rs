@@ -2038,8 +2038,7 @@ async fn main() -> Result<()> {
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
                     run::gateway_inference_set(
-                        endpoint, &provider, &model, route_name, no_verify, timeout,
-                        &tls,
+                        endpoint, &provider, &model, route_name, no_verify, timeout, &tls,
                     )
                     .await?;
                 }
