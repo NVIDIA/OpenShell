@@ -899,12 +899,31 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
     let mut modified = false;
     for &path in PROXY_BASELINE_READ_ONLY {
         if !fs.read_only.iter().any(|p| p.as_str() == path) {
+            // Baseline paths are system-injected, not user-specified. Skip
+            // paths that do not exist in this container image to avoid noisy
+            // warnings from Landlock and, more critically, to prevent a single
+            // missing baseline path from abandoning the entire Landlock
+            // ruleset under best-effort mode (see issue #664).
+            if !std::path::Path::new(path).exists() {
+                debug!(
+                    path,
+                    "Baseline read-only path does not exist, skipping enrichment"
+                );
+                continue;
+            }
             fs.read_only.push(path.to_string());
             modified = true;
         }
     }
     for &path in PROXY_BASELINE_READ_WRITE {
         if !fs.read_write.iter().any(|p| p.as_str() == path) {
+            if !std::path::Path::new(path).exists() {
+                debug!(
+                    path,
+                    "Baseline read-write path does not exist, skipping enrichment"
+                );
+                continue;
+            }
             fs.read_write.push(path.to_string());
             modified = true;
         }
@@ -929,6 +948,15 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
     for &path in PROXY_BASELINE_READ_ONLY {
         let p = std::path::PathBuf::from(path);
         if !policy.filesystem.read_only.contains(&p) {
+            // Baseline paths are system-injected — skip non-existent paths to
+            // avoid Landlock ruleset abandonment (issue #664).
+            if !p.exists() {
+                debug!(
+                    path,
+                    "Baseline read-only path does not exist, skipping enrichment"
+                );
+                continue;
+            }
             policy.filesystem.read_only.push(p);
             modified = true;
         }
@@ -936,6 +964,13 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
     for &path in PROXY_BASELINE_READ_WRITE {
         let p = std::path::PathBuf::from(path);
         if !policy.filesystem.read_write.contains(&p) {
+            if !p.exists() {
+                debug!(
+                    path,
+                    "Baseline read-write path does not exist, skipping enrichment"
+                );
+                continue;
+            }
             policy.filesystem.read_write.push(p);
             modified = true;
         }

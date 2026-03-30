@@ -431,14 +431,20 @@ Landlock restricts the child process's filesystem access to an explicit allowlis
 1. Build path lists from `filesystem.read_only` and `filesystem.read_write`
 2. If `include_workdir` is true, add the working directory to `read_write`
 3. If both lists are empty, skip Landlock entirely (no-op)
-4. Create a Landlock ruleset targeting ABI V1:
+4. Create a Landlock ruleset targeting ABI V2:
    - Read-only paths receive `AccessFs::from_read(abi)` rights
    - Read-write paths receive `AccessFs::from_all(abi)` rights
-5. Call `ruleset.restrict_self()` -- this applies to the calling process and all descendants
+5. For each path, attempt `PathFd::new()`. If it fails:
+   - `BestEffort`: Log a warning with the error classification (not found, permission denied, symlink loop, etc.) and skip the path. Continue building the ruleset from remaining valid paths.
+   - `HardRequirement`: Return a fatal error, aborting the sandbox.
+6. If all paths failed (zero rules applied), return an error rather than calling `restrict_self()` on an empty ruleset (which would block all filesystem access)
+7. Call `ruleset.restrict_self()` -- this applies to the calling process and all descendants
 
-Error behavior depends on `LandlockCompatibility`:
+Kernel-level error behavior (e.g., Landlock ABI unavailable) depends on `LandlockCompatibility`:
 - `BestEffort`: Log a warning and continue without filesystem isolation
 - `HardRequirement`: Return a fatal error, aborting the sandbox
+
+**Baseline path filtering**: System-injected baseline paths (e.g., `/app`) are pre-filtered by `enrich_proto_baseline_paths()` / `enrich_sandbox_baseline_paths()` using `Path::exists()` before they reach Landlock. User-specified paths are not pre-filtered -- they are evaluated at Landlock apply time so misconfigurations surface as warnings or errors.
 
 ### Seccomp syscall filtering
 
