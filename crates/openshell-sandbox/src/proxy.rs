@@ -1838,10 +1838,8 @@ async fn handle_forward_proxy(
             secret_resolver: secret_resolver.clone(),
         };
 
-        let (target_path, query_params) =
-            crate::l7::rest::parse_target_query(&path).unwrap_or_else(|_| {
-                (path.clone(), std::collections::HashMap::new())
-            });
+        let (target_path, query_params) = crate::l7::rest::parse_target_query(&path)
+            .unwrap_or_else(|_| (path.clone(), std::collections::HashMap::new()));
         let request_info = crate::l7::L7RequestInfo {
             action: method.to_string(),
             target: target_path,
