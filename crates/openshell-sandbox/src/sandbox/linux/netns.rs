@@ -324,6 +324,71 @@ impl NetworkNamespace {
             }
         }
 
+        // Enable IP forwarding and NAT on the host side of the veth for DNS.
+        //
+        // The sandbox netns routes all traffic via 10.200.0.1 (host veth).
+        // The DNS ACCEPT rule in the sandbox allows UDP 53 to leave the
+        // sandbox, but the packet arrives on the host side with src=10.200.0.2
+        // which the pod network doesn't know how to route back to.
+        // Enable forwarding on the veth and MASQUERADE the DNS traffic
+        // so CoreDNS sees it as coming from the pod IP.
+        if let Some(dns_ip) = resolve_dns_server() {
+            let dns_ip_str = dns_ip.to_string();
+            let sandbox_ip_str = self.sandbox_ip.to_string();
+
+            // Enable forwarding on the host veth interface
+            let forwarding_path = format!(
+                "/proc/sys/net/ipv4/conf/{}/forwarding",
+                self.veth_host
+            );
+            if let Err(e) = std::fs::write(&forwarding_path, "1") {
+                warn!(
+                    error = %e,
+                    path = %forwarding_path,
+                    "Failed to enable IP forwarding on host veth (DNS may not work)"
+                );
+            }
+            // Also enable global forwarding
+            let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1");
+
+            // MASQUERADE DNS packets from sandbox IP to CoreDNS
+            let dns_cidr = format!("{dns_ip_str}/32");
+            let sandbox_cidr = format!("{sandbox_ip_str}/32");
+            let _ = Command::new(&iptables_path)
+                .args([
+                    "-t", "nat", "-A", "POSTROUTING",
+                    "-s", &sandbox_cidr, "-d", &dns_cidr,
+                    "-p", "udp", "--dport", "53",
+                    "-j", "MASQUERADE",
+                ])
+                .output();
+
+            // ACCEPT forwarded DNS packets
+            let _ = Command::new(&iptables_path)
+                .args([
+                    "-A", "FORWARD",
+                    "-s", &sandbox_cidr, "-d", &dns_cidr,
+                    "-p", "udp", "--dport", "53",
+                    "-j", "ACCEPT",
+                ])
+                .output();
+
+            // ACCEPT return traffic
+            let _ = Command::new(&iptables_path)
+                .args([
+                    "-A", "FORWARD",
+                    "-m", "state", "--state", "ESTABLISHED,RELATED",
+                    "-j", "ACCEPT",
+                ])
+                .output();
+
+            info!(
+                dns_server = %dns_ip_str,
+                veth = %self.veth_host,
+                "Enabled DNS forwarding from sandbox to cluster nameserver"
+            );
+        }
+
         info!(
             namespace = %self.name,
             "Bypass detection rules installed"
