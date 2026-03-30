@@ -903,7 +903,7 @@ Dynamic sections can be updated on a running sandbox with <code class="docutils 
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">landlock</span></code></p></td>
 <td><p>Static</p></td>
-<td><p>Configures Landlock LSM enforcement behavior. Set <code class="docutils literal notranslate"><span class="pre">compatibility</span></code> to <code class="docutils literal notranslate"><span class="pre">best_effort</span></code> (use the highest ABI the host kernel supports) or <code class="docutils literal notranslate"><span class="pre">hard_requirement</span></code> (fail if the required ABI is unavailable).</p></td>
+<td><p>Configures Landlock LSM enforcement behavior. Set <code class="docutils literal notranslate"><span class="pre">compatibility</span></code> to <code class="docutils literal notranslate"><span class="pre">best_effort</span></code> (skip individual inaccessible paths while applying remaining rules) or <code class="docutils literal notranslate"><span class="pre">hard_requirement</span></code> (fail if any path is inaccessible or the required kernel ABI is unavailable). See the <a class="reference internal" href="../reference/policy-schema.html#landlock"><span class="std std-ref">Policy Schema Reference</span></a> for the full behavior table.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">process</span></code></p></td>
 <td><p>Static</p></td>
@@ -916,6 +916,17 @@ Dynamic sections can be updated on a running sandbox with <code class="docutils 
 </tbody>
 </table>
 </div>
+</section>
+<section id="baseline-filesystem-paths">
+<h2>Baseline Filesystem Paths<a class="headerlink" href="#baseline-filesystem-paths" title="Link to this heading">#</a></h2>
+<p>When a sandbox runs in proxy mode (the default), OpenShell automatically adds baseline filesystem paths required for the sandbox child process to function: <code class="docutils literal notranslate"><span class="pre">/usr</span></code>, <code class="docutils literal notranslate"><span class="pre">/lib</span></code>, <code class="docutils literal notranslate"><span class="pre">/etc</span></code>, <code class="docutils literal notranslate"><span class="pre">/var/log</span></code> (read-only) and <code class="docutils literal notranslate"><span class="pre">/sandbox</span></code>, <code class="docutils literal notranslate"><span class="pre">/tmp</span></code> (read-write). Paths like <code class="docutils literal notranslate"><span class="pre">/app</span></code> are included in the baseline set but are only added if they exist in the container image.</p>
+<p>This filtering prevents a missing baseline path from degrading Landlock enforcement. Without it, a single missing path could cause the entire Landlock ruleset to fail, leaving the sandbox with no filesystem restrictions at all.</p>
+<p>User-specified paths in your policy YAML are not pre-filtered. If you list a path that does not exist:</p>
+<ul class="simple">
+<li><p>In <code class="docutils literal notranslate"><span class="pre">best_effort</span></code> mode, the path is skipped with a warning and remaining rules are still applied.</p></li>
+<li><p>In <code class="docutils literal notranslate"><span class="pre">hard_requirement</span></code> mode, sandbox startup fails immediately.</p></li>
+</ul>
+<p>This distinction means baseline system paths degrade gracefully while user-specified paths surface configuration errors.</p>
 </section>
 <section id="apply-a-custom-policy">
 <h2>Apply a Custom Policy<a class="headerlink" href="#apply-a-custom-policy" title="Link to this heading">#</a></h2>
@@ -1138,6 +1149,7 @@ Granular rules</label><div class="sd-tab-content docutils">
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#policy-structure">Policy Structure</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#baseline-filesystem-paths">Baseline Filesystem Paths</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#apply-a-custom-policy">Apply a Custom Policy</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#iterate-on-a-running-sandbox">Iterate on a Running Sandbox</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#global-policy-override">Global Policy Override</a></li>
