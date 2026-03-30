@@ -269,6 +269,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
 /// sender.  This allows `window_change_request` to resize the correct PTY when
 /// multiple channels are open simultaneously (e.g. parallel shells, shell +
 /// sftp, etc.).
+#[derive(Default)]
 struct ChannelState {
     input_sender: Option<mpsc::Sender<Vec<u8>>>,
     pty_master: Option<std::fs::File>,
@@ -323,10 +324,21 @@ impl russh::server::Handler for SshHandler {
 
     async fn channel_open_session(
         &mut self,
-        _channel: russh::Channel<russh::server::Msg>,
+        channel: russh::Channel<russh::server::Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        self.channels
+            .insert(channel.id(), ChannelState::default());
         Ok(true)
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.channels.remove(&channel);
+        Ok(())
     }
 
     async fn channel_open_direct_tcpip(
@@ -398,12 +410,8 @@ impl russh::server::Handler for SshHandler {
     ) -> Result<(), Self::Error> {
         let state = self
             .channels
-            .entry(channel)
-            .or_insert_with(|| ChannelState {
-                input_sender: None,
-                pty_master: None,
-                pty_request: None,
-            });
+            .get_mut(&channel)
+            .ok_or_else(|| anyhow::anyhow!("pty_request on unknown channel {channel:?}"))?;
         state.pty_request = Some(PtyRequest {
             term: term.to_string(),
             col_width,
@@ -496,12 +504,8 @@ impl russh::server::Handler for SshHandler {
             )?;
             let state = self
                 .channels
-                .entry(channel)
-                .or_insert_with(|| ChannelState {
-                    input_sender: None,
-                    pty_master: None,
-                    pty_request: None,
-                });
+                .get_mut(&channel)
+                .ok_or_else(|| anyhow::anyhow!("subsystem_request on unknown channel {channel:?}"))?;
             state.input_sender = Some(input_sender);
         } else {
             warn!(subsystem = name, "unsupported subsystem requested");
@@ -564,12 +568,8 @@ impl SshHandler {
     ) -> anyhow::Result<()> {
         let state = self
             .channels
-            .entry(channel)
-            .or_insert_with(|| ChannelState {
-                input_sender: None,
-                pty_master: None,
-                pty_request: None,
-            });
+            .get_mut(&channel)
+            .ok_or_else(|| anyhow::anyhow!("start_shell on unknown channel {channel:?}"))?;
         if let Some(pty) = state.pty_request.take() {
             // PTY was requested — allocate a real PTY (interactive shell or
             // exec that explicitly asked for a terminal).
@@ -1512,13 +1512,11 @@ mod tests {
 
         let mut state_a = ChannelState {
             input_sender: Some(tx_a),
-            pty_master: None,
-            pty_request: None,
+            ..Default::default()
         };
         let state_b = ChannelState {
             input_sender: Some(tx_b),
-            pty_master: None,
-            pty_request: None,
+            ..Default::default()
         };
 
         // Send data to channel A only.
