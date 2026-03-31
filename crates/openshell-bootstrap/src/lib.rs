@@ -31,7 +31,8 @@ use crate::constants::{
 };
 use crate::docker::{
     check_existing_gateway, check_port_conflicts, destroy_gateway_resources, ensure_container,
-    ensure_image, ensure_network, ensure_volume, start_container, stop_container,
+    ensure_image, ensure_network, ensure_volume, resolve_gpu_device_ids, start_container,
+    stop_container,
 };
 use crate::metadata::{
     create_gateway_metadata, create_gateway_metadata_with_host, local_gateway_host,
@@ -111,10 +112,13 @@ pub struct DeployOptions {
     /// bootstrap pull and inside the k3s cluster at runtime. Only needed
     /// for private registries.
     pub registry_token: Option<String>,
-    /// Enable NVIDIA GPU passthrough. When true, the Docker container is
-    /// created with GPU device requests (`--gpus all`) and the NVIDIA
-    /// k8s-device-plugin is deployed inside the k3s cluster.
-    pub gpu: bool,
+    /// GPU device IDs to inject into the gateway container.
+    ///
+    /// - `[]`          — no GPU passthrough (default)
+    /// - `["legacy"]`  — internal non-CDI fallback path (`driver="nvidia"`, `count=-1`)
+    /// - `["auto"]`    — resolved at deploy time: CDI if enabled on the daemon, else the non-CDI fallback
+    /// - `[cdi-ids…]`  — CDI DeviceRequest with the given device IDs
+    pub gpu: Vec<String>,
     /// When true, destroy any existing gateway resources before deploying.
     /// When false, an existing gateway is left as-is and deployment is
     /// skipped (the caller is responsible for prompting the user first).
@@ -133,7 +137,7 @@ impl DeployOptions {
             disable_gateway_auth: false,
             registry_username: None,
             registry_token: None,
-            gpu: false,
+            gpu: vec![],
             recreate: false,
         }
     }
@@ -187,9 +191,13 @@ impl DeployOptions {
         self
     }
 
-    /// Enable NVIDIA GPU passthrough for the cluster container.
+    /// Set GPU device IDs for the cluster container.
+    ///
+    /// Pass `vec!["auto"]` to auto-select between CDI and the non-CDI fallback
+    /// based on daemon capabilities at deploy time. The `legacy` sentinel is an
+    /// internal implementation detail for the fallback path.
     #[must_use]
-    pub fn with_gpu(mut self, gpu: bool) -> Self {
+    pub fn with_gpu(mut self, gpu: Vec<String>) -> Self {
         self.gpu = gpu;
         self
     }
@@ -287,6 +295,18 @@ where
         let preflight = check_docker_available().await?;
         (preflight.docker, None)
     };
+
+    // CDI is considered enabled when the daemon reports at least one CDI spec
+    // directory via `GET /info` (`SystemInfo.CDISpecDirs`). An empty list or
+    // missing field means CDI is not configured and we fall back to the legacy
+    // NVIDIA `DeviceRequest` (driver="nvidia"). Detection is best-effort —
+    // failure to query daemon info is non-fatal.
+    let cdi_supported = target_docker
+        .info()
+        .await
+        .ok()
+        .and_then(|info| info.cdi_spec_dirs)
+        .is_some_and(|dirs| !dirs.is_empty());
 
     // If an existing gateway is found, either tear it down (when recreate is
     // requested) or bail out so the caller can prompt the user / reuse it.
@@ -405,6 +425,7 @@ where
     // leaving an orphaned volume in a corrupted state that blocks retries.
     // See: https://github.com/NVIDIA/OpenShell/issues/463
     let deploy_result: Result<GatewayMetadata> = async {
+        let device_ids = resolve_gpu_device_ids(&gpu, cdi_supported);
         ensure_container(
             &target_docker,
             &name,
@@ -416,7 +437,7 @@ where
             disable_gateway_auth,
             registry_username.as_deref(),
             registry_token.as_deref(),
-            gpu,
+            &device_ids,
         )
         .await?;
         start_container(&target_docker, &name).await?;

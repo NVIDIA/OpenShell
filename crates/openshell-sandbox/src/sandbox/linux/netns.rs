@@ -262,15 +262,18 @@ impl NetworkNamespace {
 
         info!(
             namespace = %self.name,
-            iptables = iptables_path,
+            iptables = %iptables_path,
             proxy_addr = %format!("{}:{}", host_ip_str, proxy_port),
             "Installing bypass detection rules"
         );
 
         // Install IPv4 rules
-        if let Err(e) =
-            self.install_bypass_rules_for(iptables_path, &host_ip_str, &proxy_port_str, &log_prefix)
-        {
+        if let Err(e) = self.install_bypass_rules_for(
+            &iptables_path,
+            &host_ip_str,
+            &proxy_port_str,
+            &log_prefix,
+        ) {
             warn!(
                 namespace = %self.name,
                 error = %e,
@@ -281,7 +284,7 @@ impl NetworkNamespace {
 
         // Install IPv6 rules — best-effort.
         // Skip the proxy ACCEPT rule for IPv6 since the proxy address is IPv4.
-        if let Some(ip6_path) = find_ip6tables(iptables_path) {
+        if let Some(ip6_path) = find_ip6tables(&iptables_path) {
             if let Err(e) = self.install_bypass_rules_for_v6(&ip6_path, &log_prefix) {
                 warn!(
                     namespace = %self.name,
@@ -666,12 +669,92 @@ fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<
 const IPTABLES_SEARCH_PATHS: &[&str] =
     &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"];
 
+/// Returns true if xt extension modules (e.g. xt_comment) cannot be used
+/// via the given iptables binary.
+///
+/// Some kernels have nf_tables but lack the nft_compat bridge that allows
+/// xt extension modules to be used through the nf_tables path (e.g. Jetson
+/// Linux 5.15-tegra). This probe detects that condition by attempting to
+/// insert a rule using the xt_comment extension. If it fails, xt extensions
+/// are unavailable and the caller should fall back to iptables-legacy.
+fn xt_extensions_unavailable(iptables_path: &str) -> bool {
+    // Create a temporary probe chain. If this fails (e.g. no CAP_NET_ADMIN),
+    // we can't determine availability — assume extensions are available.
+    let created = Command::new(iptables_path)
+        .args(["-t", "filter", "-N", "_xt_probe"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !created {
+        return false;
+    }
+
+    // Attempt to insert a rule using xt_comment. Failure means nft_compat
+    // cannot bridge xt extension modules on this kernel.
+    let probe_ok = Command::new(iptables_path)
+        .args([
+            "-t",
+            "filter",
+            "-A",
+            "_xt_probe",
+            "-m",
+            "comment",
+            "--comment",
+            "probe",
+            "-j",
+            "ACCEPT",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    // Clean up — best-effort, ignore failures.
+    let _ = Command::new(iptables_path)
+        .args([
+            "-t",
+            "filter",
+            "-D",
+            "_xt_probe",
+            "-m",
+            "comment",
+            "--comment",
+            "probe",
+            "-j",
+            "ACCEPT",
+        ])
+        .output();
+    let _ = Command::new(iptables_path)
+        .args(["-t", "filter", "-X", "_xt_probe"])
+        .output();
+
+    !probe_ok
+}
+
 /// Find the iptables binary path, checking well-known locations.
-fn find_iptables() -> Option<&'static str> {
-    IPTABLES_SEARCH_PATHS
+///
+/// If xt extension modules are unavailable via the standard binary and
+/// `iptables-legacy` is available alongside it, the legacy binary is returned
+/// instead. This ensures bypass-detection rules can be installed on kernels
+/// where `nft_compat` is unavailable (e.g. Jetson Linux 5.15-tegra).
+fn find_iptables() -> Option<String> {
+    let standard_path = IPTABLES_SEARCH_PATHS
         .iter()
         .find(|path| std::path::Path::new(path).exists())
-        .copied()
+        .copied()?;
+
+    if xt_extensions_unavailable(standard_path) {
+        let legacy_path = standard_path.replace("iptables", "iptables-legacy");
+        if std::path::Path::new(&legacy_path).exists() {
+            debug!(
+                legacy = legacy_path,
+                "xt extensions unavailable; using iptables-legacy"
+            );
+            return Some(legacy_path);
+        }
+    }
+
+    Some(standard_path.to_string())
 }
 
 /// Find the ip6tables binary path, deriving it from the iptables location.

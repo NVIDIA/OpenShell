@@ -70,9 +70,22 @@ Dynamic sections can be updated on a running sandbox with `openshell policy set`
 | Section | Type | Description |
 |---|---|---|
 | `filesystem_policy` | Static | Controls which directories the agent can access on disk. Paths are split into `read_only` and `read_write` lists. Any path not listed in either list is inaccessible. Set `include_workdir: true` to automatically add the agent's working directory to `read_write`. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level. |
-| `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (use the highest ABI the host kernel supports) or `hard_requirement` (fail if the required ABI is unavailable). |
+| `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (skip individual inaccessible paths while applying remaining rules) or `hard_requirement` (fail if any path is inaccessible or the required kernel ABI is unavailable). See the [Policy Schema Reference](../reference/policy-schema.md#landlock) for the full behavior table. |
 | `process` | Static | Sets the OS-level identity for the agent process. `run_as_user` and `run_as_group` default to `sandbox`. Root (`root` or `0`) is rejected. The agent also runs with seccomp filters that block dangerous system calls. |
 | `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br>Every outbound connection except `https://inference.local` goes through the proxy, which queries the {doc}`policy engine <../about/architecture>` with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br>For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request is checked against that endpoint's `rules` (method and path). <br>Endpoints without `protocol` allow the TCP stream through without inspecting payloads. <br>If no endpoint matches, the connection is denied. Configure managed inference separately through {doc}`../inference/configure`. |
+
+## Baseline Filesystem Paths
+
+When a sandbox runs in proxy mode (the default), OpenShell automatically adds baseline filesystem paths required for the sandbox child process to function: `/usr`, `/lib`, `/etc`, `/var/log` (read-only) and `/sandbox`, `/tmp` (read-write). Paths like `/app` are included in the baseline set but are only added if they exist in the container image.
+
+This filtering prevents a missing baseline path from degrading Landlock enforcement. Without it, a single missing path could cause the entire Landlock ruleset to fail, leaving the sandbox with no filesystem restrictions at all.
+
+User-specified paths in your policy YAML are not pre-filtered. If you list a path that does not exist:
+
+- In `best_effort` mode, the path is skipped with a warning and remaining rules are still applied.
+- In `hard_requirement` mode, sandbox startup fails immediately.
+
+This distinction means baseline system paths degrade gracefully while user-specified paths surface configuration errors.
 
 ## Apply a Custom Policy
 
@@ -255,6 +268,32 @@ Endpoints with `protocol: rest` enable HTTP request inspection. The proxy auto-d
 ::::
 
 :::::
+
+### Query parameter matching
+
+REST rules can also constrain query parameter values:
+
+```yaml
+  download_api:
+    name: download_api
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/api/v1/download"
+              query:
+                slug: "skill-*"
+                version:
+                  any: ["1.*", "2.*"]
+    binaries:
+      - { path: /usr/bin/curl }
+```
+
+`query` matchers are case-sensitive and run on decoded values. If a request has duplicate keys (for example, `tag=a&tag=b`), every value for that key must match the configured glob(s).
 
 ## Next Steps
 

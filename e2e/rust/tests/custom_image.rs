@@ -26,7 +26,9 @@ RUN groupadd -g 1000 sandbox && \
     useradd -m -u 1000 -g sandbox sandbox
 
 # Write a marker file so we can verify this is our custom image.
-RUN echo "custom-image-e2e-marker" > /opt/marker.txt
+# Place under /etc (Landlock baseline read-only path) so the sandbox
+# can read it when filesystem restrictions are properly enforced.
+RUN echo "custom-image-e2e-marker" > /etc/marker.txt
 
 CMD ["sleep", "infinity"]
 "#;
@@ -53,7 +55,7 @@ async fn sandbox_from_custom_dockerfile() {
         dockerfile_str,
         "--",
         "cat",
-        "/opt/marker.txt",
+        "/etc/marker.txt",
     ])
     .await
     .expect("sandbox create from Dockerfile");

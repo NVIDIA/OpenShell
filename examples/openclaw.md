@@ -3,7 +3,7 @@
 ## Quick start
 
 ```sh
-openshell sandbox create --forward 18789 -- openclaw-start
+openshell sandbox create --forward 18789 --from openclaw -- openclaw-start
 ```
 
 `openclaw-start` is a helper script pre-installed in the sandbox that runs the
@@ -25,7 +25,7 @@ Note: you will need use the auth token present in the bootstrapping process to c
 ### Create the sandbox
 
 ```sh
-openshell sandbox create --forward 18789
+openshell sandbox create --forward 18789 --from openclaw
 ```
 
 Inside the sandbox, run the onboarding wizard and start the gateway:

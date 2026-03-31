@@ -104,6 +104,7 @@ Look for:
 - k3s startup errors (certificate issues, port binding failures)
 - Manifest copy errors from `/opt/openshell/manifests/`
 - `iptables` or `cgroup` errors (privilege/capability issues)
+- `Warning: br_netfilter does not appear to be loaded` — this is advisory only; many kernels work without the explicit module. Only act on it if you also see DNS failures or pod-to-service connectivity problems (see Common Failure Patterns).
 
 ### Step 2: Check k3s Cluster Health
 
@@ -344,6 +345,7 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | Port conflict | Another service on the configured gateway host port (default 8080) | Stop conflicting service or use `--port` on `openshell gateway start` to pick a different host port |
 | gRPC connect refused to `127.0.0.1:443` in CI | Docker daemon is remote (`DOCKER_HOST=tcp://...`) but metadata still points to loopback | Verify metadata endpoint host matches `DOCKER_HOST` and includes non-loopback host |
 | DNS failures inside container | Entrypoint DNS detection failed | `openshell doctor exec -- cat /etc/rancher/k3s/resolv.conf` and `openshell doctor logs --lines 20` |
+| Pods can't reach kube-dns / ClusterIP services | `br_netfilter` not loaded; bridge traffic bypasses iptables DNAT rules | `sudo modprobe br_netfilter` on the host, then `echo br_netfilter \| sudo tee /etc/modules-load.d/br_netfilter.conf` to persist. Known to be required on Jetson Linux 5.15-tegra; other kernels (e.g. standard x86/aarch64 Linux) may have bridge netfilter built in and work without the module. The entrypoint logs a warning when `/proc/sys/net/bridge/bridge-nf-call-iptables` is absent but does not abort — only act on it if DNS or service connectivity is actually broken. |
 | Node DiskPressure / MemoryPressure / PIDPressure | Insufficient disk, memory, or PIDs on host | Free disk (`docker system prune -a --volumes`), increase memory, or expand host resources. Bootstrap auto-detects via `HEALTHCHECK_NODE_PRESSURE` marker |
 | Pods evicted with "The node had condition: [DiskPressure]" | Host disk full, kubelet evicting pods | Free disk space on host, then `openshell gateway destroy <name> && openshell gateway start` |
 | `metrics-server` errors in logs | Normal k3s noise, not the root cause | These errors are benign — look for the actual failing health check component |

@@ -168,7 +168,7 @@ $ openshell gateway info --name my-remote-cluster
 
 | Flag | Purpose |
 |---|---|
-| `--gpu` | Enable NVIDIA GPU passthrough. Requires NVIDIA drivers and the Container Toolkit on the host. |
+| `--gpu` | Enable NVIDIA GPU passthrough. Requires NVIDIA drivers and the Container Toolkit on the host. OpenShell auto-selects CDI when enabled on the daemon and falls back to Docker's NVIDIA GPU request path (`--gpus all`) otherwise. |
 | `--plaintext` | Listen on HTTP instead of mTLS. Use behind a TLS-terminating reverse proxy. |
 | `--disable-gateway-auth` | Skip mTLS client certificate checks. Use when a reverse proxy cannot forward client certs. |
 | `--registry-username` | Username for registry authentication. Defaults to `__token__` when `--registry-token` is set. Only needed for private registries. Also configurable with `OPENSHELL_REGISTRY_USERNAME`. |

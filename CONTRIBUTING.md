@@ -186,8 +186,13 @@ These are the primary `mise` tasks for day-to-day development:
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `architecture/` | Architecture docs and plans                   |
+| `rfc/`          | Request for Comments proposals                |
 | `docs/`         | User-facing documentation (Sphinx/MyST)       |
 | `.agents/`      | Agent skills and persona definitions          |
+
+## RFCs
+
+For cross-cutting architectural decisions, API contract changes, or process proposals that need broad consensus, use the RFC process. RFCs live in `rfc/` — copy the template, fill it in, and open a PR for discussion. See [rfc/README.md](rfc/README.md) for the full lifecycle and guidelines on when to write an RFC versus a spike issue or architecture doc.
 
 ## Documentation
 

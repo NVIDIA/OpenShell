@@ -16,6 +16,7 @@ use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use tracing::debug;
 
 #[derive(Clone)]
 struct FileFingerprint {
@@ -100,6 +101,7 @@ impl BinaryIdentityCache {
     where
         F: FnMut(&Path) -> Result<String>,
     {
+        let start = std::time::Instant::now();
         let metadata = std::fs::metadata(path)
             .map_err(|error| miette::miette!("Failed to stat {}: {error}", path.display()))?;
         let fingerprint = FileFingerprint::from_metadata(&metadata);
@@ -114,8 +116,19 @@ impl BinaryIdentityCache {
         if let Some(cached_binary) = &cached
             && cached_binary.fingerprint == fingerprint
         {
+            debug!(
+                "      verify_or_cache: {}ms CACHE HIT path={}",
+                start.elapsed().as_millis(),
+                path.display()
+            );
             return Ok(cached_binary.hash.clone());
         }
+
+        debug!(
+            "      verify_or_cache: CACHE MISS size={} path={}",
+            metadata.len(),
+            path.display()
+        );
 
         let current_hash = hash_file(path)?;
 
@@ -141,6 +154,12 @@ impl BinaryIdentityCache {
                 hash: current_hash.clone(),
                 fingerprint,
             },
+        );
+
+        debug!(
+            "      verify_or_cache TOTAL (cold): {}ms path={}",
+            start.elapsed().as_millis(),
+            path.display()
         );
 
         Ok(current_hash)

@@ -25,6 +25,61 @@
 
 set -e
 
+# ---------------------------------------------------------------------------
+# Select iptables backend
+# ---------------------------------------------------------------------------
+# Some kernels (e.g. Jetson Linux 5.15-tegra) have the nf_tables subsystem
+# but lack the nft_compat bridge that allows flannel and kube-proxy to use
+# xt extension modules (xt_comment, xt_conntrack). Detect this by probing
+# whether xt_comment is usable via the current iptables backend. If the
+# probe fails, switch to iptables-legacy. Set USE_IPTABLES_LEGACY=1
+# externally to skip the probe and force the legacy backend.
+# ---------------------------------------------------------------------------
+# Check br_netfilter kernel module
+# ---------------------------------------------------------------------------
+# br_netfilter makes the kernel pass bridge (pod-to-pod) traffic through
+# iptables. Without it, kube-proxy's DNAT rules for ClusterIP services are
+# never applied to pod traffic, so pods cannot reach services such as
+# kube-dns (10.43.0.10), breaking all in-cluster DNS resolution.
+#
+# The module must be loaded on the HOST before the container starts —
+# containers cannot load kernel modules themselves. If it is missing, log a
+# warning rather than failing hard: some kernels have bridge netfilter support
+# built-in or expose it differently, and will work correctly without the module
+# being explicitly loaded as a separate .ko.
+if [ ! -f /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
+    echo "Warning: br_netfilter does not appear to be loaded on the host." >&2
+    echo "         Pod-to-service networking (including kube-dns) may not work without it." >&2
+    echo "         If the cluster fails to start or DNS is broken, try loading it on the host:" >&2
+    echo "           sudo modprobe br_netfilter" >&2
+    echo "         To persist across reboots:" >&2
+    echo "           echo br_netfilter | sudo tee /etc/modules-load.d/br_netfilter.conf" >&2
+fi
+
+if [ -z "${USE_IPTABLES_LEGACY:-}" ]; then
+    if iptables -t filter -N _xt_probe 2>/dev/null; then
+        _probe_rc=0
+        iptables -t filter -A _xt_probe -m comment --comment "probe" -j ACCEPT \
+            2>/dev/null || _probe_rc=$?
+        iptables -t filter -D _xt_probe -m comment --comment "probe" -j ACCEPT \
+            2>/dev/null || true
+        iptables -t filter -X _xt_probe 2>/dev/null || true
+        [ "$_probe_rc" -ne 0 ] && USE_IPTABLES_LEGACY=1
+    fi
+fi
+
+if [ "${USE_IPTABLES_LEGACY:-0}" = "1" ]; then
+    echo "iptables nf_tables xt extension bridge unavailable — switching to iptables-legacy"
+    if update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null && \
+       update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null; then
+        echo "Now using iptables-legacy mode"
+    else
+        echo "Warning: could not switch to iptables-legacy — cluster networking may fail"
+    fi
+fi
+
+IPTABLES=$([ "${USE_IPTABLES_LEGACY:-0}" = "1" ] && echo iptables-legacy || echo iptables)
+
 RESOLV_CONF="/etc/rancher/k3s/resolv.conf"
 
 has_default_route() {
@@ -74,11 +129,11 @@ setup_dns_proxy() {
     # Docker sets up rules like:
     #   -A DOCKER_OUTPUT -d 127.0.0.11/32 -p udp --dport 53 -j DNAT --to-destination 127.0.0.11:<port>
     #   -A DOCKER_OUTPUT -d 127.0.0.11/32 -p tcp --dport 53 -j DNAT --to-destination 127.0.0.11:<port>
-    UDP_PORT=$(iptables -t nat -S DOCKER_OUTPUT 2>/dev/null \
+    UDP_PORT=$($IPTABLES -t nat -S DOCKER_OUTPUT 2>/dev/null \
         | grep -- '-p udp.*--dport 53' \
         | sed -n 's/.*--to-destination 127.0.0.11:\([0-9]*\).*/\1/p' \
         | head -1)
-    TCP_PORT=$(iptables -t nat -S DOCKER_OUTPUT 2>/dev/null \
+    TCP_PORT=$($IPTABLES -t nat -S DOCKER_OUTPUT 2>/dev/null \
         | grep -- '-p tcp.*--dport 53' \
         | sed -n 's/.*--to-destination 127.0.0.11:\([0-9]*\).*/\1/p' \
         | head -1)
@@ -101,9 +156,9 @@ setup_dns_proxy() {
     echo "Setting up DNS proxy: ${CONTAINER_IP}:53 -> 127.0.0.11 (udp:${UDP_PORT}, tcp:${TCP_PORT})"
 
     # Forward DNS from pods (PREROUTING) and local processes (OUTPUT) to Docker's DNS
-    iptables -t nat -I PREROUTING -p udp --dport 53 -d "$CONTAINER_IP" -j DNAT \
+    $IPTABLES -t nat -I PREROUTING -p udp --dport 53 -d "$CONTAINER_IP" -j DNAT \
         --to-destination "127.0.0.11:${UDP_PORT}"
-    iptables -t nat -I PREROUTING -p tcp --dport 53 -d "$CONTAINER_IP" -j DNAT \
+    $IPTABLES -t nat -I PREROUTING -p tcp --dport 53 -d "$CONTAINER_IP" -j DNAT \
         --to-destination "127.0.0.11:${TCP_PORT}"
 
     echo "nameserver $CONTAINER_IP" > "$RESOLV_CONF"
@@ -493,6 +548,13 @@ EXTRA_KUBELET_ARGS=""
 if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
     echo "Detected cgroup v1 — adding kubelet compatibility flag (fail-cgroupv1=false)"
     EXTRA_KUBELET_ARGS="--kubelet-arg=fail-cgroupv1=false"
+fi
+
+# On kernels where xt_comment is unavailable, kube-router's network policy
+# controller panics at startup. Disable it when the iptables-legacy probe
+# triggered; sandbox isolation is enforced by the NSSH1 HMAC handshake instead.
+if [ "${USE_IPTABLES_LEGACY:-0}" = "1" ]; then
+    EXTRA_KUBELET_ARGS="$EXTRA_KUBELET_ARGS --disable-network-policy"
 fi
 
 # Docker Desktop can briefly start the container before its bridge default route

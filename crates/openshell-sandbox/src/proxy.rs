@@ -336,15 +336,25 @@ async fn handle_tcp_connection(
     let peer_addr = client.peer_addr().into_diagnostic()?;
     let local_addr = client.local_addr().into_diagnostic()?;
 
-    // Evaluate OPA policy with process-identity binding
-    let decision = evaluate_opa_tcp(
-        peer_addr,
-        &opa_engine,
-        &identity_cache,
-        &entrypoint_pid,
-        &host_lc,
-        port,
-    );
+    // Evaluate OPA policy with process-identity binding.
+    // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
+    // /proc scanning + SHA256 hashing of binaries (e.g. node at 124MB).
+    let opa_clone = opa_engine.clone();
+    let cache_clone = identity_cache.clone();
+    let pid_clone = entrypoint_pid.clone();
+    let host_clone = host_lc.clone();
+    let decision = tokio::task::spawn_blocking(move || {
+        evaluate_opa_tcp(
+            peer_addr,
+            &opa_clone,
+            &cache_clone,
+            &pid_clone,
+            &host_clone,
+            port,
+        )
+    })
+    .await
+    .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
 
     // Extract action string and matched policy for logging
     let (matched_policy, deny_reason) = match &decision.action {
@@ -426,6 +436,7 @@ async fn handle_tcp_connection(
     }
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
+    let dns_connect_start = std::time::Instant::now();
     let mut upstream = if !raw_allowed_ips.is_empty() {
         // allowed_ips mode: validate resolved IPs against CIDR allowlist.
         // Loopback and link-local are still always blocked.
@@ -501,6 +512,11 @@ async fn handle_tcp_connection(
             }
         }
     };
+
+    debug!(
+        "handle_tcp_connection dns_resolve_and_tcp_connect: {}ms host={host_lc}",
+        dns_connect_start.elapsed().as_millis()
+    );
 
     respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
@@ -736,7 +752,9 @@ fn evaluate_opa_tcp(
         );
     }
 
+    let total_start = std::time::Instant::now();
     let peer_port = peer_addr.port();
+
     let (bin_path, binary_pid) = match crate::procfs::resolve_tcp_peer_identity(pid, peer_port) {
         Ok(r) => r,
         Err(e) => {
@@ -767,7 +785,6 @@ fn evaluate_opa_tcp(
     // Walk the process tree upward to collect ancestor binaries
     let ancestors = crate::procfs::collect_ancestor_binaries(binary_pid, pid);
 
-    // TOFU verify each ancestor binary
     for ancestor in &ancestors {
         if let Err(e) = identity_cache.verify_or_cache(ancestor) {
             return deny(
@@ -784,7 +801,6 @@ fn evaluate_opa_tcp(
     }
 
     // Collect cmdline paths for script-based binary detection.
-    // Excludes exe paths already captured in bin_path/ancestors to avoid duplicates.
     let mut exclude = ancestors.clone();
     exclude.push(bin_path.clone());
     let cmdline_paths = crate::procfs::collect_cmdline_paths(binary_pid, pid, &exclude);
@@ -798,7 +814,7 @@ fn evaluate_opa_tcp(
         cmdline_paths: cmdline_paths.clone(),
     };
 
-    match engine.evaluate_network_action(&input) {
+    let result = match engine.evaluate_network_action(&input) {
         Ok(action) => ConnectDecision {
             action,
             binary: Some(bin_path),
@@ -813,7 +829,12 @@ fn evaluate_opa_tcp(
             ancestors,
             cmdline_paths,
         ),
-    }
+    };
+    debug!(
+        "evaluate_opa_tcp TOTAL: {}ms host={host} port={port}",
+        total_start.elapsed().as_millis()
+    );
+    result
 }
 
 /// Non-Linux stub: OPA identity binding requires /proc.
@@ -942,6 +963,12 @@ async fn handle_inference_interception(
                     }
                     buf.resize((buf.len() * 2).min(MAX_INFERENCE_BUF), 0);
                 }
+            }
+            ParseResult::Invalid(reason) => {
+                warn!(reason = %reason, "rejecting malformed inference request");
+                let response = format_http_response(400, &[], b"Bad Request");
+                write_all(&mut tls_client, &response).await?;
+                return Ok(InferenceOutcome::Denied { reason });
             }
         }
     }
@@ -1722,14 +1749,22 @@ async fn handle_forward_proxy(
     let peer_addr = client.peer_addr().into_diagnostic()?;
     let local_addr = client.local_addr().into_diagnostic()?;
 
-    let decision = evaluate_opa_tcp(
-        peer_addr,
-        &opa_engine,
-        &identity_cache,
-        &entrypoint_pid,
-        &host_lc,
-        port,
-    );
+    let opa_clone = opa_engine.clone();
+    let cache_clone = identity_cache.clone();
+    let pid_clone = entrypoint_pid.clone();
+    let host_clone = host_lc.clone();
+    let decision = tokio::task::spawn_blocking(move || {
+        evaluate_opa_tcp(
+            peer_addr,
+            &opa_clone,
+            &cache_clone,
+            &pid_clone,
+            &host_clone,
+            port,
+        )
+    })
+    .await
+    .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
 
     // Build log context
     let binary_str = decision
@@ -1797,10 +1832,65 @@ async fn handle_forward_proxy(
     };
     let policy_str = matched_policy.as_deref().unwrap_or("-");
 
-    // 4b. Reject if the endpoint has L7 config — the forward proxy path does
-    //     not perform per-request method/path inspection, so L7-configured
-    //     endpoints must go through the CONNECT tunnel where inspection happens.
-    if query_l7_config(&opa_engine, &decision, &host_lc, port).is_some() {
+    // 4b. If the endpoint has L7 config, evaluate the request against
+    //     L7 policy.  The forward proxy handles exactly one request per
+    //     connection (Connection: close), so a single evaluation suffices.
+    if let Some(l7_config) = query_l7_config(&opa_engine, &decision, &host_lc, port) {
+        let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
+            warn!(
+                error = %e,
+                "Failed to clone OPA engine for forward L7"
+            );
+            regorus::Engine::new()
+        });
+        let engine_mutex = std::sync::Mutex::new(tunnel_engine);
+
+        let l7_ctx = crate::l7::relay::L7EvalContext {
+            host: host_lc.clone(),
+            port,
+            policy_name: matched_policy.clone().unwrap_or_default(),
+            binary_path: decision
+                .binary
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            ancestors: decision
+                .ancestors
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            cmdline_paths: decision
+                .cmdline_paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            secret_resolver: secret_resolver.clone(),
+        };
+
+        let (target_path, query_params) = crate::l7::rest::parse_target_query(&path)
+            .unwrap_or_else(|_| (path.clone(), std::collections::HashMap::new()));
+        let request_info = crate::l7::L7RequestInfo {
+            action: method.to_string(),
+            target: target_path,
+            query_params,
+        };
+
+        let (allowed, reason) =
+            crate::l7::relay::evaluate_l7_request(&engine_mutex, &l7_ctx, &request_info)
+                .unwrap_or_else(|e| {
+                    warn!(
+                        error = %e,
+                        "L7 eval failed, denying request"
+                    );
+                    (false, format!("L7 evaluation error: {e}"))
+                });
+
+        let decision_str = match (allowed, l7_config.enforcement) {
+            (true, _) => "allow",
+            (false, crate::l7::EnforcementMode::Audit) => "audit",
+            (false, crate::l7::EnforcementMode::Enforce) => "deny",
+        };
+
         info!(
             dst_host = %host_lc,
             dst_port = port,
@@ -1808,21 +1898,28 @@ async fn handle_forward_proxy(
             path = %path,
             binary = %binary_str,
             policy = %policy_str,
-            action = "deny",
-            reason = "endpoint has L7 rules; use CONNECT",
-            "FORWARD",
+            l7_protocol = "rest",
+            l7_decision = decision_str,
+            l7_deny_reason = %reason,
+            "FORWARD_L7",
         );
-        emit_denial_simple(
-            denial_tx,
-            &host_lc,
-            port,
-            &binary_str,
-            &decision,
-            "endpoint has L7 rules configured; forward proxy bypasses L7 inspection — use CONNECT",
-            "forward-l7-bypass",
-        );
-        respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-        return Ok(());
+
+        let effectively_denied =
+            !allowed && l7_config.enforcement == crate::l7::EnforcementMode::Enforce;
+
+        if effectively_denied {
+            emit_denial_simple(
+                denial_tx,
+                &host_lc,
+                port,
+                &binary_str,
+                &decision,
+                &reason,
+                "forward-l7-deny",
+            );
+            respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+            return Ok(());
+        }
     }
 
     // 5. DNS resolution + SSRF defence (mirrors the CONNECT path logic).

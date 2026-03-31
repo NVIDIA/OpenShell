@@ -431,14 +431,20 @@ Landlock restricts the child process's filesystem access to an explicit allowlis
 1. Build path lists from `filesystem.read_only` and `filesystem.read_write`
 2. If `include_workdir` is true, add the working directory to `read_write`
 3. If both lists are empty, skip Landlock entirely (no-op)
-4. Create a Landlock ruleset targeting ABI V1:
+4. Create a Landlock ruleset targeting ABI V2:
    - Read-only paths receive `AccessFs::from_read(abi)` rights
    - Read-write paths receive `AccessFs::from_all(abi)` rights
-5. Call `ruleset.restrict_self()` -- this applies to the calling process and all descendants
+5. For each path, attempt `PathFd::new()`. If it fails:
+   - `BestEffort`: Log a warning with the error classification (not found, permission denied, symlink loop, etc.) and skip the path. Continue building the ruleset from remaining valid paths.
+   - `HardRequirement`: Return a fatal error, aborting the sandbox.
+6. If all paths failed (zero rules applied), return an error rather than calling `restrict_self()` on an empty ruleset (which would block all filesystem access)
+7. Call `ruleset.restrict_self()` -- this applies to the calling process and all descendants
 
-Error behavior depends on `LandlockCompatibility`:
+Kernel-level error behavior (e.g., Landlock ABI unavailable) depends on `LandlockCompatibility`:
 - `BestEffort`: Log a warning and continue without filesystem isolation
 - `HardRequirement`: Return a fatal error, aborting the sandbox
+
+**Baseline path filtering**: System-injected baseline paths (e.g., `/app`) are pre-filtered by `enrich_proto_baseline_paths()` / `enrich_sandbox_baseline_paths()` using `Path::exists()` before they reach Landlock. User-specified paths are not pre-filtered -- they are evaluated at Landlock apply time so misconfigurations surface as warnings or errors.
 
 ### Seccomp syscall filtering
 
@@ -962,7 +968,7 @@ flowchart LR
 | `EnforcementMode` | `Audit`, `Enforce` | What to do on L7 deny (log-only vs block) |
 | `L7EndpointConfig` | `{ protocol, tls, enforcement }` | Per-endpoint L7 configuration |
 | `L7Decision` | `{ allowed, reason, matched_rule }` | Result of L7 evaluation |
-| `L7RequestInfo` | `{ action, target }` | HTTP method + path for policy evaluation |
+| `L7RequestInfo` | `{ action, target, query_params }` | HTTP method, path, and decoded query multimap for policy evaluation |
 
 ### Access presets
 
@@ -1041,7 +1047,7 @@ This enables credential injection on all HTTPS endpoints automatically, without 
 
 Implements `L7Provider` for HTTP/1.1:
 
-- **`parse_request()`**: Reads up to 16 KiB of headers, parses the request line (method, path), determines body framing from `Content-Length` or `Transfer-Encoding: chunked` headers. Returns `L7Request` with raw header bytes (may include overflow body bytes).
+- **`parse_request()`**: Reads up to 16 KiB of headers, parses the request line (method, path), decodes query parameters into a multimap, determines body framing from `Content-Length` or `Transfer-Encoding: chunked` headers. Returns `L7Request` with raw header bytes (may include overflow body bytes).
 
 - **`relay()`**: Forwards request headers and body to upstream (handling Content-Length, chunked, and no-body cases), then reads and relays the full response back to the client.
 
@@ -1054,7 +1060,7 @@ Implements `L7Provider` for HTTP/1.1:
 `relay_with_inspection()` in `crates/openshell-sandbox/src/l7/relay.rs` is the main relay loop:
 
 1. Parse one HTTP request from client via the provider
-2. Build L7 input JSON with `request.method`, `request.path`, plus the CONNECT-level context (host, port, binary, ancestors, cmdline)
+2. Build L7 input JSON with `request.method`, `request.path`, `request.query_params`, plus the CONNECT-level context (host, port, binary, ancestors, cmdline)
 3. Evaluate `data.openshell.sandbox.allow_request` and `data.openshell.sandbox.request_deny_reason`
 4. Log the L7 decision (tagged `L7_REQUEST`)
 5. If allowed (or audit mode): relay request to upstream and response back to client, then loop

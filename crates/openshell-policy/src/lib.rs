@@ -15,8 +15,8 @@ use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    FilesystemPolicy, L7Allow, L7Rule, LandlockPolicy, NetworkBinary, NetworkEndpoint,
-    NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
+    FilesystemPolicy, L7Allow, L7QueryMatcher, L7Rule, LandlockPolicy, NetworkBinary,
+    NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -120,6 +120,22 @@ struct L7AllowDef {
     path: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     command: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    query: BTreeMap<String, QueryMatcherDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum QueryMatcherDef {
+    Glob(String),
+    Any(QueryAnyDef),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryAnyDef {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    any: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -176,6 +192,23 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                         method: r.allow.method,
                                         path: r.allow.path,
                                         command: r.allow.command,
+                                        query: r
+                                            .allow
+                                            .query
+                                            .into_iter()
+                                            .map(|(key, matcher)| {
+                                                let proto = match matcher {
+                                                    QueryMatcherDef::Glob(glob) => {
+                                                        L7QueryMatcher { glob, any: vec![] }
+                                                    }
+                                                    QueryMatcherDef::Any(any) => L7QueryMatcher {
+                                                        glob: String::new(),
+                                                        any: any.any,
+                                                    },
+                                                };
+                                                (key, proto)
+                                            })
+                                            .collect(),
                                     }),
                                 })
                                 .collect(),
@@ -275,6 +308,20 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                             method: a.method,
                                             path: a.path,
                                             command: a.command,
+                                            query: a
+                                                .query
+                                                .into_iter()
+                                                .map(|(key, matcher)| {
+                                                    let yaml_matcher = if !matcher.any.is_empty() {
+                                                        QueryMatcherDef::Any(QueryAnyDef {
+                                                            any: matcher.any,
+                                                        })
+                                                    } else {
+                                                        QueryMatcherDef::Glob(matcher.glob)
+                                                    };
+                                                    (key, yaml_matcher)
+                                                })
+                                                .collect(),
                                         },
                                     }
                                 })
@@ -752,6 +799,49 @@ network_policies:
         assert_eq!(rule.endpoints[0].port, 443);
         assert_eq!(rule.binaries.len(), 1);
         assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
+    }
+
+    #[test]
+    fn parse_l7_query_matchers_and_round_trip() {
+        let yaml = r#"
+version: 1
+network_policies:
+  query_test:
+    name: query_test
+    endpoints:
+      - host: api.example.com
+        port: 8080
+        protocol: rest
+        rules:
+          - allow:
+              method: GET
+              path: /download
+              query:
+                slug: "my-*"
+                tag:
+                  any: ["foo-*", "bar-*"]
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let allow = proto.network_policies["query_test"].endpoints[0].rules[0]
+            .allow
+            .as_ref()
+            .expect("allow");
+        assert_eq!(allow.query["slug"].glob, "my-*");
+        assert_eq!(allow.query["slug"].any, Vec::<String>::new());
+        assert_eq!(allow.query["tag"].any, vec!["foo-*", "bar-*"]);
+        assert!(allow.query["tag"].glob.is_empty());
+
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        let proto_round_trip = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        let allow_round_trip = proto_round_trip.network_policies["query_test"].endpoints[0].rules
+            [0]
+        .allow
+        .as_ref()
+        .expect("allow");
+        assert_eq!(allow_round_trip.query["slug"].glob, "my-*");
+        assert_eq!(allow_round_trip.query["tag"].any, vec!["foo-*", "bar-*"]);
     }
 
     #[test]
