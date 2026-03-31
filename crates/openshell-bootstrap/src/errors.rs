@@ -178,6 +178,8 @@ const FAILURE_PATTERNS: &[FailurePattern] = &[
             "unknown CDI device",
             "failed to inject CDI devices",
             "no CDI devices found",
+            "CDI device injection failed",
+            "unresolvable CDI devices",
         ],
         match_mode: MatchMode::Any,
         diagnose: diagnose_cdi_specs_missing,
@@ -967,6 +969,24 @@ mod tests {
         let diagnosis = diagnose_failure(
             "test",
             "could not run container: CDI device not found: nvidia.com/gpu=all",
+            None,
+        );
+        assert!(diagnosis.is_some());
+        let d = diagnosis.unwrap();
+        assert!(
+            d.summary.contains("CDI"),
+            "expected CDI diagnosis, got: {}",
+            d.summary
+        );
+        assert!(!d.retryable);
+    }
+
+    #[test]
+    fn test_diagnose_cdi_injection_failed_unresolvable() {
+        // Exact error observed from Docker 500 response
+        let diagnosis = diagnose_failure(
+            "test",
+            "Docker responded with status code 500: CDI device injection failed: unresolvable CDI devices nvidia.com/gpu=all",
             None,
         );
         assert!(diagnosis.is_some());
