@@ -11,6 +11,7 @@ rust-version.workspace = true
 
 [dependencies]
 openshell-core = { path = "../openshell-core" }
+async-stream = "0.3"
 base64 = "0.22"
 bollard = { version = "0.20", features = ["ssh"] }
 bytes = { workspace = true }
@@ -20,11 +21,11 @@ rcgen = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tar = "0.4"
+tempfile = "3"
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
 
 [lints]
 workspace = true
