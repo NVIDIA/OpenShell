@@ -254,6 +254,14 @@ async fn upsert_multi_model_route(
         return Err(Status::invalid_argument("models list is empty"));
     }
 
+    // The system route must remain single-model so the sandbox can always
+    // resolve it to exactly one backend without alias selection.
+    if route_name == SANDBOX_SYSTEM_ROUTE_NAME {
+        return Err(Status::invalid_argument(
+            "multi-model is not supported on the system route",
+        ));
+    }
+
     // Names reserved for internal route partitioning (sandbox uses
     // `name == "sandbox-system"` to split user vs system caches).
     const RESERVED_ALIASES: &[&str] = &["sandbox-system", "inference.local"];
@@ -1228,6 +1236,7 @@ mod tests {
             config: Some(ClusterInferenceConfig {
                 provider_name: "openai-dev".to_string(),
                 model_id: "gpt-4o".to_string(),
+                timeout_secs: 0,
                 models: vec![
                     InferenceModelEntry {
                         alias: "my-gpt".to_string(),
@@ -1278,6 +1287,7 @@ mod tests {
             config: Some(ClusterInferenceConfig {
                 provider_name: "openai-dev".to_string(),
                 model_id: "gpt-4o".to_string(),
+                timeout_secs: 0,
                 models: vec![
                     InferenceModelEntry {
                         alias: "my-gpt".to_string(),
@@ -1362,5 +1372,27 @@ mod tests {
             .expect_err("should reject reserved alias");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("reserved"));
+    }
+
+    #[tokio::test]
+    async fn upsert_multi_model_route_rejects_system_route() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let openai = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-openai");
+        store.put_message(&openai).await.expect("persist");
+
+        let models = vec![InferenceModelEntry {
+            alias: "fast-gpt".to_string(),
+            provider_name: "openai-dev".to_string(),
+            model_id: "gpt-4o-mini".to_string(),
+        }];
+
+        let err = upsert_multi_model_route(&store, SANDBOX_SYSTEM_ROUTE_NAME, &models, false)
+            .await
+            .expect_err("should reject system route");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("system route"));
     }
 }

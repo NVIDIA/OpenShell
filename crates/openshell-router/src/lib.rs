@@ -218,6 +218,7 @@ mod tests {
             protocols: protocols.into_iter().map(String::from).collect(),
             auth: config::AuthHeader::Bearer,
             default_headers: Vec::new(),
+            timeout: std::time::Duration::from_secs(60),
         }
     }
 

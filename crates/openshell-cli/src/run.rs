@@ -3754,6 +3754,15 @@ pub async fn gateway_inference_set_multi(
     }
     print_timeout(configured.timeout_secs);
     if configured.validation_performed {
+        println!("  {}", "Validated Endpoints:".dimmed());
+        for endpoint in configured.validated_endpoints {
+            println!("    - {} ({})", endpoint.url, endpoint.protocol);
+        }
+    }
+    Ok(())
+}
+
+pub async fn gateway_inference_update(
     server: &str,
     provider_name: Option<&str>,
     model_id: Option<&str>,
