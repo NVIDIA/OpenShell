@@ -227,7 +227,12 @@ is_on_path() {
 # ---------------------------------------------------------------------------
 
 main() {
-  _skip_checksum="${OPENSHELL_NO_VERIFY:-0}"
+  # Normalise OPENSHELL_NO_VERIFY to "1" or "0".
+  # Accept common truthy values: 1, true, yes, y (case-insensitive).
+  case "$(printf '%s' "${OPENSHELL_NO_VERIFY:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|y) _skip_checksum=1 ;;
+    *)            _skip_checksum=0 ;;
+  esac
 
   # Parse CLI flags
   for arg in "$@"; do

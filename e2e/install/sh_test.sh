@@ -71,13 +71,15 @@ test_guidance_mentions_restart() {
 test_skip_checksum_env() {
   printf 'TEST: OPENSHELL_NO_VERIFY=1 skips checksum verification\n'
 
-  _skip_dir="$(mktemp -d)/bin"
+  _skip_base="$(mktemp -d)"
+  _skip_dir="${_skip_base}/bin"
   _skip_output="$(OPENSHELL_NO_VERIFY=1 \
     OPENSHELL_INSTALL_DIR="$_skip_dir" \
     SHELL="/bin/sh" \
     PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     sh "$INSTALL_SCRIPT" 2>&1)" || {
     fail "install succeeds with OPENSHELL_NO_VERIFY=1" "exit code: $?"
+    rm -rf "$_skip_base"
     return 1
   }
 
@@ -89,6 +91,7 @@ test_skip_checksum_env() {
   else
     fail "binary installed with checksum skip" "not found at $_skip_dir/openshell"
   fi
+  rm -rf "$_skip_base"
 }
 
 test_no_env_scripts_created() {
