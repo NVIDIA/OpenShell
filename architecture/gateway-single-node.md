@@ -260,7 +260,7 @@ On Docker custom networks, `/etc/resolv.conf` contains `127.0.0.11` (Docker's in
 2. Getting the container's `eth0` IP as a routable address.
 3. Adding DNAT rules in PREROUTING to forward DNS from pod namespaces through to Docker's DNS.
 4. Writing a custom resolv.conf pointing to the container IP.
-5. Passing `--resolv-conf=/etc/rancher/k3s/resolv.conf` to k3s.
+5. Passing `--kubelet-arg=resolv-conf=/etc/rancher/k3s/resolv.conf` to k3s.
 
 Falls back to `8.8.8.8` / `8.8.4.4` if iptables detection fails.
 

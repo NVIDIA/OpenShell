@@ -12,7 +12,11 @@
 #   supervisor-builder  Release openshell-sandbox binary
 #   supervisor-output   Minimal stage exporting only the supervisor binary
 
+# Pin by tag AND manifest-list digest to prevent silent upstream republishes
+# from breaking the build. Update both when bumping k3s versions.
+# To refresh: docker buildx imagetools inspect rancher/k3s:<tag> | head -3
 ARG K3S_VERSION=v1.35.2-k3s1
+ARG K3S_DIGEST=sha256:c3184157c3048112bab0c3e17405991da486cb3413511eba23f7650efd70776b
 ARG K9S_VERSION=v0.50.18
 ARG HELM_VERSION=v3.17.3
 ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
@@ -181,7 +185,7 @@ CMD ["--port", "8080"]
 # ---------------------------------------------------------------------------
 # Cluster asset stages
 # ---------------------------------------------------------------------------
-FROM rancher/k3s:${K3S_VERSION} AS k3s
+FROM rancher/k3s:${K3S_VERSION}@${K3S_DIGEST} AS k3s
 
 FROM ubuntu:24.04 AS k9s
 ARG K9S_VERSION
@@ -262,6 +266,9 @@ RUN chmod +x /usr/local/bin/cluster-entrypoint.sh
 
 COPY deploy/docker/cluster-healthcheck.sh /usr/local/bin/cluster-healthcheck.sh
 RUN chmod +x /usr/local/bin/cluster-healthcheck.sh
+
+COPY deploy/docker/test-cluster-entrypoint.sh /usr/local/bin/test-cluster-entrypoint.sh
+RUN chmod +x /usr/local/bin/test-cluster-entrypoint.sh
 
 COPY deploy/docker/.build/charts/*.tgz /opt/openshell/charts/
 COPY deploy/kube/manifests/*.yaml /opt/openshell/manifests/
