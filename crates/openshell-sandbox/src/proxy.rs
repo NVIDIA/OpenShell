@@ -1617,7 +1617,7 @@ fn rewrite_forward_request(
     used: usize,
     path: &str,
     secret_resolver: Option<&SecretResolver>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, crate::secrets::UnresolvedPlaceholderError> {
     let header_end = raw[..used]
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -1698,7 +1698,15 @@ fn rewrite_forward_request(
         output.extend_from_slice(&raw[header_end..used]);
     }
 
-    output
+    // Fail-closed: scan for any remaining unresolved placeholders
+    if secret_resolver.is_some() {
+        let output_str = String::from_utf8_lossy(&output);
+        if output_str.contains(crate::secrets::PLACEHOLDER_PREFIX_PUBLIC) {
+            return Err(crate::secrets::UnresolvedPlaceholderError { location: "header" });
+        }
+    }
+
+    Ok(output)
 }
 
 /// Handle a plain HTTP forward proxy request (non-CONNECT).
@@ -2040,7 +2048,19 @@ async fn handle_forward_proxy(
     );
 
     // 9. Rewrite request and forward to upstream
-    let rewritten = rewrite_forward_request(buf, used, &path, secret_resolver.as_deref());
+    let rewritten = match rewrite_forward_request(buf, used, &path, secret_resolver.as_deref()) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(
+                dst_host = %host_lc,
+                dst_port = port,
+                error = %e,
+                "credential injection failed in forward proxy"
+            );
+            respond(client, b"HTTP/1.1 500 Internal Server Error\r\n\r\n").await?;
+            return Ok(());
+        }
+    };
     upstream.write_all(&rewritten).await.into_diagnostic()?;
 
     // 8. Relay remaining traffic bidirectionally (supports streaming)
@@ -2740,7 +2760,7 @@ mod tests {
     fn test_rewrite_get_request() {
         let raw =
             b"GET http://10.0.0.1:8000/api HTTP/1.1\r\nHost: 10.0.0.1:8000\r\nAccept: */*\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/api", None);
+        let result = rewrite_forward_request(raw, raw.len(), "/api", None).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.starts_with("GET /api HTTP/1.1\r\n"));
         assert!(result_str.contains("Host: 10.0.0.1:8000"));
@@ -2751,7 +2771,7 @@ mod tests {
     #[test]
     fn test_rewrite_strips_proxy_headers() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nProxy-Authorization: Basic abc\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", None);
+        let result = rewrite_forward_request(raw, raw.len(), "/p", None).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(
             !result_str
@@ -2765,7 +2785,7 @@ mod tests {
     #[test]
     fn test_rewrite_replaces_connection_header() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nConnection: keep-alive\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", None);
+        let result = rewrite_forward_request(raw, raw.len(), "/p", None).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Connection: close"));
         assert!(!result_str.contains("keep-alive"));
@@ -2774,7 +2794,7 @@ mod tests {
     #[test]
     fn test_rewrite_preserves_body_overflow() {
         let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 13\r\n\r\n{\"key\":\"val\"}";
-        let result = rewrite_forward_request(raw, raw.len(), "/api", None);
+        let result = rewrite_forward_request(raw, raw.len(), "/api", None).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("{\"key\":\"val\"}"));
         assert!(result_str.contains("POST /api HTTP/1.1"));
@@ -2783,7 +2803,7 @@ mod tests {
     #[test]
     fn test_rewrite_preserves_existing_via() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nVia: 1.0 upstream\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", None);
+        let result = rewrite_forward_request(raw, raw.len(), "/p", None).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Via: 1.0 upstream"));
         // Should not add a second Via header
@@ -2798,7 +2818,8 @@ mod tests {
                 .collect(),
         );
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nAuthorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", resolver.as_ref());
+        let result = rewrite_forward_request(raw, raw.len(), "/p", resolver.as_ref())
+            .expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Authorization: Bearer sk-test"));
         assert!(!result_str.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));

@@ -9,10 +9,10 @@
 
 use crate::l7::provider::L7Provider;
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
-use crate::secrets::SecretResolver;
+use crate::secrets::{self, SecretResolver};
 use miette::{IntoDiagnostic, Result, miette};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 /// Context for L7 request policy evaluation.
@@ -105,13 +105,36 @@ where
             }
         };
 
+        // Rewrite credential placeholders in the request target BEFORE OPA
+        // evaluation. OPA sees the redacted path; the resolved path goes only
+        // to the upstream write.
+        let (eval_target, redacted_target) = if let Some(ref resolver) = ctx.secret_resolver {
+            match secrets::rewrite_target_for_eval(&req.target, resolver) {
+                Ok(result) => (result.resolved, result.redacted),
+                Err(e) => {
+                    warn!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %e,
+                        "credential resolution failed in request target, rejecting"
+                    );
+                    let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    client.write_all(response).await.into_diagnostic()?;
+                    client.flush().await.into_diagnostic()?;
+                    return Ok(());
+                }
+            }
+        } else {
+            (req.target.clone(), req.target.clone())
+        };
+
         let request_info = L7RequestInfo {
             action: req.action.clone(),
-            target: req.target.clone(),
+            target: redacted_target.clone(),
             query_params: req.query_params.clone(),
         };
 
-        // Evaluate L7 policy via Rego
+        // Evaluate L7 policy via Rego (using redacted target)
         let (allowed, reason) = evaluate_l7_request(engine, ctx, &request_info)?;
 
         let decision_str = match (allowed, config.enforcement) {
@@ -120,19 +143,22 @@ where
             (false, EnforcementMode::Enforce) => "deny",
         };
 
-        // Log every L7 decision
+        // Log every L7 decision (using redacted target — never log real secrets)
         info!(
             dst_host = %ctx.host,
             dst_port = ctx.port,
             policy = %ctx.policy_name,
             l7_protocol = "rest",
             l7_action = %request_info.action,
-            l7_target = %request_info.target,
+            l7_target = %redacted_target,
             l7_query_params = ?request_info.query_params,
             l7_decision = decision_str,
             l7_deny_reason = %reason,
             "L7_REQUEST",
         );
+
+        // Store the resolved target for the deny response redaction
+        let _ = &eval_target;
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             // Forward request to upstream and relay response
@@ -152,9 +178,15 @@ where
                 return Ok(());
             }
         } else {
-            // Enforce mode: deny with 403 and close connection
+            // Enforce mode: deny with 403 and close connection (use redacted target)
             crate::l7::rest::RestProvider
-                .deny(&req, &ctx.policy_name, &reason, client)
+                .deny_with_redacted_target(
+                    &req,
+                    &ctx.policy_name,
+                    &reason,
+                    client,
+                    Some(&redacted_target),
+                )
                 .await?;
             return Ok(());
         }
@@ -266,13 +298,34 @@ where
 
         request_count += 1;
 
-        // Log for observability.
+        // Resolve and redact the target for logging.
+        let redacted_target = if let Some(ref res) = ctx.secret_resolver {
+            match secrets::rewrite_target_for_eval(&req.target, res) {
+                Ok(result) => result.redacted,
+                Err(e) => {
+                    warn!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %e,
+                        "credential resolution failed in request target, rejecting"
+                    );
+                    let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    client.write_all(response).await.into_diagnostic()?;
+                    client.flush().await.into_diagnostic()?;
+                    return Ok(());
+                }
+            }
+        } else {
+            req.target.clone()
+        };
+
+        // Log for observability (using redacted target — never log real secrets).
         let has_creds = resolver.is_some();
         info!(
             host = %ctx.host,
             port = ctx.port,
             method = %req.action,
-            path = %req.target,
+            path = %redacted_target,
             credentials_injected = has_creds,
             request_num = request_count,
             "HTTP_REQUEST",

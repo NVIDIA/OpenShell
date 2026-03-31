@@ -47,7 +47,21 @@ impl L7Provider for RestProvider {
         reason: &str,
         client: &mut C,
     ) -> Result<()> {
-        send_deny_response(req, policy_name, reason, client).await
+        send_deny_response(req, policy_name, reason, client, None).await
+    }
+}
+
+impl RestProvider {
+    /// Deny with a redacted target for the response body.
+    pub(crate) async fn deny_with_redacted_target<C: AsyncRead + AsyncWrite + Unpin + Send>(
+        &self,
+        req: &L7Request,
+        policy_name: &str,
+        reason: &str,
+        client: &mut C,
+        redacted_target: Option<&str>,
+    ) -> Result<()> {
+        send_deny_response(req, policy_name, reason, client, redacted_target).await
     }
 }
 
@@ -247,10 +261,11 @@ where
         .position(|w| w == b"\r\n\r\n")
         .map_or(req.raw_header.len(), |p| p + 4);
 
-    let rewritten_header = rewrite_http_header_block(&req.raw_header[..header_end], resolver);
+    let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
+        .map_err(|e| miette!("credential injection failed: {e}"))?;
 
     upstream
-        .write_all(&rewritten_header)
+        .write_all(&rewrite_result.rewritten)
         .await
         .into_diagnostic()?;
 
@@ -278,16 +293,21 @@ where
 }
 
 /// Send a 403 Forbidden JSON deny response.
+///
+/// When `redacted_target` is provided, it is used instead of `req.target`
+/// in the response body to avoid leaking resolved credential values.
 async fn send_deny_response<C: AsyncWrite + Unpin>(
     req: &L7Request,
     policy_name: &str,
     reason: &str,
     client: &mut C,
+    redacted_target: Option<&str>,
 ) -> Result<()> {
+    let target = redacted_target.unwrap_or(&req.target);
     let body = serde_json::json!({
         "error": "policy_denied",
         "policy": policy_name,
-        "rule": format!("{} {}", req.action, req.target),
+        "rule": format!("{} {}", req.action, target),
         "detail": reason
     });
     let body_bytes = body.to_string();
@@ -1371,8 +1391,8 @@ mod tests {
         );
         let raw = b"GET /v1/messages HTTP/1.1\r\nAuthorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY\r\nHost: example.com\r\n\r\n";
 
-        let rewritten = rewrite_http_header_block(raw, resolver.as_ref());
-        let rewritten = String::from_utf8(rewritten).expect("utf8");
+        let result = rewrite_http_header_block(raw, resolver.as_ref()).expect("should succeed");
+        let rewritten = String::from_utf8(result.rewritten).expect("utf8");
 
         assert!(rewritten.contains("Authorization: Bearer sk-test\r\n"));
         assert!(!rewritten.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));

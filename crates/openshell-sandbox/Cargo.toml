@@ -52,6 +52,9 @@ webpki-roots = { workspace = true }
 # HTTP
 bytes = { workspace = true }
 
+# Encoding
+base64 = { workspace = true }
+
 # IP network / CIDR parsing
 ipnet = "2"
 
