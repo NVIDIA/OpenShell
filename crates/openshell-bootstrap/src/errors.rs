@@ -169,6 +169,19 @@ const FAILURE_PATTERNS: &[FailurePattern] = &[
         match_mode: MatchMode::Any,
         diagnose: diagnose_docker_not_running,
     },
+    // CDI specs missing — Docker daemon has CDI configured but no spec files exist
+    // or the requested device ID (nvidia.com/gpu=all) is not in any spec.
+    // Matches errors from Docker 25+ and containerd CDI injection paths.
+    FailurePattern {
+        matchers: &[
+            "CDI device not found",
+            "unknown CDI device",
+            "failed to inject CDI devices",
+            "no CDI devices found",
+        ],
+        match_mode: MatchMode::Any,
+        diagnose: diagnose_cdi_specs_missing,
+    },
 ];
 
 fn diagnose_corrupted_state(gateway_name: &str) -> GatewayFailureDiagnosis {
@@ -392,6 +405,29 @@ fn diagnose_certificate_issue(gateway_name: &str) -> GatewayFailureDiagnosis {
             "Destroy and recreate the gateway to regenerate certificates",
             format!("openshell gateway destroy --name {gateway_name} && openshell gateway start"),
         )],
+        retryable: false,
+    }
+}
+
+fn diagnose_cdi_specs_missing(_gateway_name: &str) -> GatewayFailureDiagnosis {
+    GatewayFailureDiagnosis {
+        summary: "CDI specs not found on host".to_string(),
+        explanation: "GPU passthrough via CDI was selected (your Docker daemon has CDI spec \
+            directories configured) but no CDI device specs were found on the host. \
+            Specs must be pre-generated before OpenShell can inject the GPU into the \
+            cluster container."
+            .to_string(),
+        recovery_steps: vec![
+            RecoveryStep::with_command(
+                "Generate CDI specs on the host (nvidia-ctk creates /etc/cdi/ if it does not exist)",
+                "sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
+            ),
+            RecoveryStep::with_command(
+                "Verify the specs were generated and include nvidia.com/gpu entries",
+                "nvidia-ctk cdi list",
+            ),
+            RecoveryStep::new("Then retry: openshell gateway start --gpu"),
+        ],
         retryable: false,
     }
 }
@@ -923,6 +959,60 @@ mod tests {
         assert!(
             all_commands.contains("my-gw"),
             "commands should include gateway name, got: {all_commands}"
+        );
+    }
+
+    #[test]
+    fn test_diagnose_cdi_device_not_found() {
+        let diagnosis = diagnose_failure(
+            "test",
+            "could not run container: CDI device not found: nvidia.com/gpu=all",
+            None,
+        );
+        assert!(diagnosis.is_some());
+        let d = diagnosis.unwrap();
+        assert!(
+            d.summary.contains("CDI"),
+            "expected CDI diagnosis, got: {}",
+            d.summary
+        );
+        assert!(!d.retryable);
+    }
+
+    #[test]
+    fn test_diagnose_unknown_cdi_device() {
+        // containerd error path
+        let diagnosis = diagnose_failure(
+            "test",
+            "unknown CDI device requested: nvidia.com/gpu=all",
+            None,
+        );
+        assert!(diagnosis.is_some());
+        let d = diagnosis.unwrap();
+        assert!(
+            d.summary.contains("CDI"),
+            "expected CDI diagnosis, got: {}",
+            d.summary
+        );
+    }
+
+    #[test]
+    fn test_diagnose_cdi_recovery_mentions_nvidia_ctk() {
+        let d = diagnose_failure("test", "CDI device not found", None)
+            .expect("should match CDI pattern");
+        let all_steps: String = d
+            .recovery_steps
+            .iter()
+            .map(|s| format!("{} {}", s.description, s.command.as_deref().unwrap_or("")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_steps.contains("nvidia-ctk cdi generate"),
+            "recovery steps should mention nvidia-ctk cdi generate, got: {all_steps}"
+        );
+        assert!(
+            all_steps.contains("/etc/cdi/"),
+            "recovery steps should mention /etc/cdi/, got: {all_steps}"
         );
     }
 }
