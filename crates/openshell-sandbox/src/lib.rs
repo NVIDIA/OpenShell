@@ -884,21 +884,26 @@ const PROXY_BASELINE_READ_ONLY: &[&str] = &["/usr", "/lib", "/etc", "/app", "/va
 /// user working directory and temporary files.
 const PROXY_BASELINE_READ_WRITE: &[&str] = &["/sandbox", "/tmp"];
 
+/// Fixed read-only paths required when a GPU is present.
+///
+/// `/run/nvidia-persistenced`: NVML tries to connect to the persistenced
+/// socket at init time.  If the directory exists but landlock denies traversal
+/// (EACCES vs ECONNREFUSED), NVML returns NVML_ERROR_INSUFFICIENT_PERMISSIONS
+/// even though the daemon is optional.  Only read/traversal access is needed —
+/// NVML connects to the existing socket but does not create or modify files.
+const GPU_BASELINE_READ_ONLY_FIXED: &[&str] = &["/run/nvidia-persistenced"];
+
 /// Fixed read-write paths required when a GPU is present.
 ///
-/// - `/run/nvidia-persistenced`: NVML tries to connect to the persistenced
-///   socket at init time.  If the socket exists but landlock denies traversal
-///   (EACCES vs ECONNREFUSED), NVML returns NVML_ERROR_INSUFFICIENT_PERMISSIONS
-///   even though the daemon is optional.
-/// - `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`,
-///   `/dev/nvidia-modeset`: control and UVM devices injected by CDI.
-///   Landlock READ_FILE/WRITE_FILE restricts open(2) on device files even
-///   when DAC permissions would otherwise allow it.
+/// `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`,
+/// `/dev/nvidia-modeset`: control and UVM devices injected by CDI.
+/// Landlock READ_FILE/WRITE_FILE restricts open(2) on device files even
+/// when DAC permissions would otherwise allow it.  Device nodes need
+/// read-write because NVML opens them with O_RDWR.
 ///
 /// Per-GPU device files (`/dev/nvidia0`, `/dev/nvidia1`, …) are enumerated
 /// at runtime by `gpu_baseline_read_write_paths()` since the count varies.
 const GPU_BASELINE_READ_WRITE_FIXED: &[&str] = &[
-    "/run/nvidia-persistenced",
     "/dev/nvidiactl",
     "/dev/nvidia-uvm",
     "/dev/nvidia-uvm-tools",
@@ -908,6 +913,14 @@ const GPU_BASELINE_READ_WRITE_FIXED: &[&str] = &[
 /// Returns true if GPU devices are present in the container.
 fn has_gpu_devices() -> bool {
     std::path::Path::new("/dev/nvidiactl").exists()
+}
+
+/// Collect all GPU read-only paths (currently just the persistenced directory).
+fn gpu_baseline_read_only_paths() -> Vec<std::path::PathBuf> {
+    GPU_BASELINE_READ_ONLY_FIXED
+        .iter()
+        .map(|p| std::path::PathBuf::from(p))
+        .collect()
 }
 
 /// Collect all GPU read-write paths: fixed devices + per-GPU `/dev/nvidiaX`.
@@ -983,6 +996,25 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
     }
 
     if has_gpu_devices() {
+        for path in gpu_baseline_read_only_paths() {
+            let path_str = path.to_string_lossy();
+            if !fs.read_only.iter().any(|p| p.as_str() == path_str.as_ref())
+                && !fs
+                    .read_write
+                    .iter()
+                    .any(|p| p.as_str() == path_str.as_ref())
+            {
+                if !path.exists() {
+                    debug!(
+                        path = %path.display(),
+                        "GPU baseline read-only path does not exist, skipping enrichment"
+                    );
+                    continue;
+                }
+                fs.read_only.push(path_str.into_owned());
+                modified = true;
+            }
+        }
         for path in gpu_baseline_read_write_paths() {
             let path_str = path.to_string_lossy();
             if !fs
@@ -1051,6 +1083,21 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
     }
 
     if has_gpu_devices() {
+        for p in gpu_baseline_read_only_paths() {
+            if !policy.filesystem.read_only.contains(&p)
+                && !policy.filesystem.read_write.contains(&p)
+            {
+                if !p.exists() {
+                    debug!(
+                        path = %p.display(),
+                        "GPU baseline read-only path does not exist, skipping enrichment"
+                    );
+                    continue;
+                }
+                policy.filesystem.read_only.push(p);
+                modified = true;
+            }
+        }
         for p in gpu_baseline_read_write_paths() {
             if !policy.filesystem.read_write.contains(&p) {
                 if !p.exists() {
