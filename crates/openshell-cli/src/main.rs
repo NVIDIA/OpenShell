@@ -597,6 +597,7 @@ enum CliProviderType {
     Claude,
     Opencode,
     Codex,
+    Copilot,
     Generic,
     Openai,
     Anthropic,
@@ -627,6 +628,7 @@ impl CliProviderType {
             Self::Claude => "claude",
             Self::Opencode => "opencode",
             Self::Codex => "codex",
+            Self::Copilot => "copilot",
             Self::Generic => "generic",
             Self::Openai => "openai",
             Self::Anthropic => "anthropic",
@@ -3136,5 +3138,30 @@ mod tests {
             }
             other => panic!("expected settings delete command, got: {other:?}"),
         }
+    }
+
+    /// Ensure every provider registered in `ProviderRegistry` has a
+    /// corresponding `CliProviderType` variant (and vice-versa).
+    /// This test would have caught the missing `Copilot` variant from #707.
+    #[test]
+    fn cli_provider_types_match_registry() {
+        let registry = openshell_providers::ProviderRegistry::new();
+        let registry_types: std::collections::BTreeSet<&str> =
+            registry.known_types().into_iter().collect();
+
+        let cli_types: std::collections::BTreeSet<&str> =
+            <CliProviderType as ValueEnum>::value_variants()
+                .iter()
+                .map(CliProviderType::as_str)
+                .collect();
+
+        assert_eq!(
+            cli_types,
+            registry_types,
+            "CliProviderType variants must match ProviderRegistry.known_types(). \
+             CLI-only: {:?}, Registry-only: {:?}",
+            cli_types.difference(&registry_types).collect::<Vec<_>>(),
+            registry_types.difference(&cli_types).collect::<Vec<_>>(),
+        );
     }
 }
