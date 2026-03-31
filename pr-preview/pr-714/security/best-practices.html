@@ -472,6 +472,7 @@ You can update dynamic controls on a running sandbox with <code class="docutils 
 </section>
 <section id="network-controls">
 <h2>Network Controls<a class="headerlink" href="#network-controls" title="Link to this heading">#</a></h2>
+<p>The CONNECT proxy and OPA policy engine enforce all network controls at the gateway level.</p>
 <section id="deny-by-default-egress">
 <h3>Deny-by-Default Egress<a class="headerlink" href="#deny-by-default-egress" title="Link to this heading">#</a></h3>
 <p>Every outbound connection from the sandbox goes through the CONNECT proxy.
@@ -692,6 +693,7 @@ The system merges approved endpoints into the sandbox’s policy as a new durabl
 </section>
 <section id="filesystem-controls">
 <h2>Filesystem Controls<a class="headerlink" href="#filesystem-controls" title="Link to this heading">#</a></h2>
+<p>Landlock LSM restricts which paths the sandbox process can read or write at the kernel level.</p>
 <section id="landlock-lsm">
 <h3>Landlock LSM<a class="headerlink" href="#landlock-lsm" title="Link to this heading">#</a></h3>
 <p>Landlock enforces filesystem access at the kernel level.
@@ -723,6 +725,7 @@ All other paths are inaccessible.</p>
 </section>
 <section id="read-only-vs-read-write-paths">
 <h3>Read-Only vs Read-Write Paths<a class="headerlink" href="#read-only-vs-read-write-paths" title="Link to this heading">#</a></h3>
+<p>The policy separates filesystem paths into read-only and read-write groups.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Aspect</p></th>
@@ -778,6 +781,7 @@ All other paths are inaccessible.</p>
 </section>
 <section id="process-controls">
 <h2>Process Controls<a class="headerlink" href="#process-controls" title="Link to this heading">#</a></h2>
+<p>The sandbox supervisor drops privileges, applies seccomp filters, and enforces process-level restrictions during startup.</p>
 <section id="privilege-drop">
 <h3>Privilege Drop<a class="headerlink" href="#privilege-drop" title="Link to this heading">#</a></h3>
 <p>The sandbox process runs as a non-root user after explicit privilege dropping.</p>
@@ -844,6 +848,7 @@ This ordering is intentional: privilege dropping needs <code class="docutils lit
 </section>
 <section id="inference-controls">
 <h2>Inference Controls<a class="headerlink" href="#inference-controls" title="Link to this heading">#</a></h2>
+<p>OpenShell routes all inference traffic through the gateway to isolate provider credentials from the sandbox.</p>
 <section id="routed-inference-through-inference-local">
 <h3>Routed Inference through <code class="docutils literal notranslate"><span class="pre">inference.local</span></code><a class="headerlink" href="#routed-inference-through-inference-local" title="Link to this heading">#</a></h3>
 <p>The proxy intercepts HTTPS CONNECT requests to <code class="docutils literal notranslate"><span class="pre">inference.local</span></code> and routes matching inference API requests through the sandbox-local router.
@@ -874,6 +879,7 @@ The agent never receives the provider API key.</p>
 </section>
 <section id="gateway-security">
 <h2>Gateway Security<a class="headerlink" href="#gateway-security" title="Link to this heading">#</a></h2>
+<p>The gateway secures communication between the CLI, sandbox pods, and external clients with mutual TLS and token-based authentication.</p>
 <section id="mtls">
 <h3>mTLS<a class="headerlink" href="#mtls" title="Link to this heading">#</a></h3>
 <p>Communication between the CLI, sandbox pods, and the gateway is secured by mutual TLS.
@@ -930,25 +936,42 @@ OpenShell generates a cluster CA at bootstrap and distributes it through Kuberne
 </section>
 <section id="common-mistakes">
 <h2>Common Mistakes<a class="headerlink" href="#common-mistakes" title="Link to this heading">#</a></h2>
-<p><strong>Omitting <code class="docutils literal notranslate"><span class="pre">protocol:</span> <span class="pre">rest</span></code> on REST API endpoints.</strong>
-Without <code class="docutils literal notranslate"><span class="pre">protocol:</span> <span class="pre">rest</span></code>, the proxy uses L4-only enforcement.
-It allows the TCP stream through after checking host, port, and binary, but cannot inspect individual HTTP requests.
-Add <code class="docutils literal notranslate"><span class="pre">protocol:</span> <span class="pre">rest</span></code> with specific <code class="docutils literal notranslate"><span class="pre">rules</span></code> to enable per-request method and path control.</p>
-<p><strong>Using <code class="docutils literal notranslate"><span class="pre">access:</span> <span class="pre">full</span></code> when finer rules would suffice.</strong>
-<code class="docutils literal notranslate"><span class="pre">access:</span> <span class="pre">full</span></code> with <code class="docutils literal notranslate"><span class="pre">protocol:</span> <span class="pre">rest</span></code> enables inspection but allows all HTTP methods and paths.
-Use <code class="docutils literal notranslate"><span class="pre">access:</span> <span class="pre">read-only</span></code> or explicit <code class="docutils literal notranslate"><span class="pre">rules</span></code> to restrict what the agent can do at the HTTP level.</p>
-<p><strong>Adding endpoints permanently when operator approval would suffice.</strong>
-Operator-approved endpoints persist within the sandbox instance but reset on re-creation.
-Adding endpoints to the policy YAML makes them permanently reachable across all instances.</p>
-<p><strong>Using broad binary globs.</strong>
-A glob like <code class="docutils literal notranslate"><span class="pre">/**</span></code> allows any binary to reach the endpoint, defeating binary-scoped enforcement.
-Scope globs to specific directories (for example, <code class="docutils literal notranslate"><span class="pre">/sandbox/.vscode-server/**</span></code>).</p>
-<p><strong>Skipping TLS termination on HTTPS APIs.</strong>
-Setting <code class="docutils literal notranslate"><span class="pre">tls:</span> <span class="pre">skip</span></code> disables credential injection and L7 inspection.
-Use the default auto-detect behavior unless the upstream requires client-certificate mTLS.</p>
-<p><strong>Setting <code class="docutils literal notranslate"><span class="pre">enforcement:</span> <span class="pre">enforce</span></code> before auditing.</strong>
-Jumping to <code class="docutils literal notranslate"><span class="pre">enforce</span></code> without first running in <code class="docutils literal notranslate"><span class="pre">audit</span></code> mode risks breaking the agent’s workflow.
-Start with <code class="docutils literal notranslate"><span class="pre">audit</span></code>, review the logs, and switch to <code class="docutils literal notranslate"><span class="pre">enforce</span></code> once you have validated the rules.</p>
+<p>The following patterns weaken security without providing meaningful benefit.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Mistake</p></th>
+<th class="head"><p>Why it matters</p></th>
+<th class="head"><p>What to do instead</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Omitting <code class="docutils literal notranslate"><span class="pre">protocol:</span> <span class="pre">rest</span></code> on REST API endpoints</p></td>
+<td><p>Without <code class="docutils literal notranslate"><span class="pre">protocol:</span> <span class="pre">rest</span></code>, the proxy uses L4-only enforcement. It allows the TCP stream through after checking host, port, and binary, but cannot inspect individual HTTP requests.</p></td>
+<td><p>Add <code class="docutils literal notranslate"><span class="pre">protocol:</span> <span class="pre">rest</span></code> with specific <code class="docutils literal notranslate"><span class="pre">rules</span></code> to enable per-request method and path control.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Using <code class="docutils literal notranslate"><span class="pre">access:</span> <span class="pre">full</span></code> when finer rules would suffice</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">access:</span> <span class="pre">full</span></code> with <code class="docutils literal notranslate"><span class="pre">protocol:</span> <span class="pre">rest</span></code> enables inspection but allows all HTTP methods and paths.</p></td>
+<td><p>Use <code class="docutils literal notranslate"><span class="pre">access:</span> <span class="pre">read-only</span></code> or explicit <code class="docutils literal notranslate"><span class="pre">rules</span></code> to restrict what the agent can do at the HTTP level.</p></td>
+</tr>
+<tr class="row-even"><td><p>Adding endpoints permanently when operator approval would suffice</p></td>
+<td><p>Adding endpoints to the policy YAML makes them permanently reachable across all instances.</p></td>
+<td><p>Use operator approval. Approved endpoints persist within the sandbox instance but reset on re-creation.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Using broad binary globs</p></td>
+<td><p>A glob like <code class="docutils literal notranslate"><span class="pre">/**</span></code> allows any binary to reach the endpoint, defeating binary-scoped enforcement.</p></td>
+<td><p>Scope globs to specific directories (for example, <code class="docutils literal notranslate"><span class="pre">/sandbox/.vscode-server/**</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p>Skipping TLS termination on HTTPS APIs</p></td>
+<td><p>Setting <code class="docutils literal notranslate"><span class="pre">tls:</span> <span class="pre">skip</span></code> disables credential injection and L7 inspection.</p></td>
+<td><p>Use the default auto-detect behavior unless the upstream requires client-certificate mTLS.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Setting <code class="docutils literal notranslate"><span class="pre">enforcement:</span> <span class="pre">enforce</span></code> before auditing</p></td>
+<td><p>Jumping to <code class="docutils literal notranslate"><span class="pre">enforce</span></code> without first running in <code class="docutils literal notranslate"><span class="pre">audit</span></code> mode risks breaking the agent’s workflow.</p></td>
+<td><p>Start with <code class="docutils literal notranslate"><span class="pre">audit</span></code>, review the logs, and switch to <code class="docutils literal notranslate"><span class="pre">enforce</span></code> once you have validated the rules.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 </section>
 <section id="related-topics">
 <h2>Related Topics<a class="headerlink" href="#related-topics" title="Link to this heading">#</a></h2>
