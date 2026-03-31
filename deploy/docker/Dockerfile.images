@@ -267,9 +267,6 @@ RUN chmod +x /usr/local/bin/cluster-entrypoint.sh
 COPY deploy/docker/cluster-healthcheck.sh /usr/local/bin/cluster-healthcheck.sh
 RUN chmod +x /usr/local/bin/cluster-healthcheck.sh
 
-COPY deploy/docker/test-cluster-entrypoint.sh /usr/local/bin/test-cluster-entrypoint.sh
-RUN chmod +x /usr/local/bin/test-cluster-entrypoint.sh
-
 COPY deploy/docker/.build/charts/*.tgz /opt/openshell/charts/
 COPY deploy/kube/manifests/*.yaml /opt/openshell/manifests/
 COPY deploy/kube/gpu-manifests/*.yaml /opt/openshell/gpu-manifests/
