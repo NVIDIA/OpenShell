@@ -5,7 +5,11 @@
 
 from __future__ import annotations
 
-try:
+import contextlib
+
+# Proto stubs may not be generated yet (requires Rust build).
+# Suppress so subpackages like openshell.prover can still be imported.
+with contextlib.suppress(ImportError):
     from .sandbox import (
         ClusterInferenceConfig,
         ExecChunk,
@@ -18,10 +22,6 @@ try:
         SandboxSession,
         TlsConfig,
     )
-except ImportError:
-    # Proto stubs not yet generated (requires Rust build).
-    # Subpackages like openshell.prover can still be imported.
-    pass
 
 try:
     from importlib.metadata import version
