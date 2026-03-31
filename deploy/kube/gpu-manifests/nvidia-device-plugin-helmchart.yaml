@@ -12,6 +12,10 @@
 # (which requires nvidia.com/gpu.present=true) is overridden to empty
 # so it schedules on any node without requiring NFD/GFD labels.
 #
+# CDI injection mode: the device plugin uses deviceListStrategy=cdi-cri so that
+# devices are injected via CDI hooks before container start. Sandbox pods only
+# need the nvidia.com/gpu resource request — no runtimeClassName is required.
+#
 # k3s auto-detects nvidia-container-runtime on PATH and registers the "nvidia"
 # RuntimeClass automatically, so no manual RuntimeClass manifest is needed.
 
@@ -28,6 +32,11 @@ spec:
   createNamespace: true
   valuesContent: |-
     runtimeClassName: nvidia
+    deviceListStrategy: cdi-cri
+    deviceIDStrategy: index
+    cdi:
+      nvidiaHookPath: /usr/bin/nvidia-cdi-hook
+    nvidiaDriverRoot: "/"
     gfd:
       enabled: false
     nfd:

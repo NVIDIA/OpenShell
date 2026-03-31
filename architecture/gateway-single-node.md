@@ -302,7 +302,7 @@ GPU support is part of the single-node gateway bootstrap path rather than a sepa
   - **CDI not enabled**: `--gpus all` device request — `driver="nvidia"`, `count=-1`, which relies on the NVIDIA Container Runtime hook.
 - `deploy/docker/Dockerfile.images` installs NVIDIA Container Toolkit packages in a dedicated Ubuntu stage and copies the runtime binaries, config, and `libnvidia-container` shared libraries into the final Ubuntu-based cluster image.
 - `deploy/docker/cluster-entrypoint.sh` checks `GPU_ENABLED=true` and copies GPU-only manifests from `/opt/openshell/gpu-manifests/` into k3s's manifests directory.
-- `deploy/kube/gpu-manifests/nvidia-device-plugin-helmchart.yaml` installs the NVIDIA device plugin chart, currently pinned to `0.18.2`. NFD and GFD are disabled; the device plugin's default `nodeAffinity` (which requires `feature.node.kubernetes.io/pci-10de.present=true` or `nvidia.com/gpu.present=true` from NFD/GFD) is overridden to empty so the DaemonSet schedules on the single-node cluster without requiring those labels.
+- `deploy/kube/gpu-manifests/nvidia-device-plugin-helmchart.yaml` installs the NVIDIA device plugin chart, currently pinned to `0.18.2`. NFD and GFD are disabled; the device plugin's default `nodeAffinity` (which requires `feature.node.kubernetes.io/pci-10de.present=true` or `nvidia.com/gpu.present=true` from NFD/GFD) is overridden to empty so the DaemonSet schedules on the single-node cluster without requiring those labels. The chart is configured with `deviceListStrategy: cdi-cri` so the device plugin injects devices via direct CDI device requests in the CRI.
 - k3s auto-detects `nvidia-container-runtime` on `PATH`, registers the `nvidia` containerd runtime, and creates the `nvidia` `RuntimeClass` automatically.
 - The OpenShell Helm chart grants the gateway service account cluster-scoped read access to `node.k8s.io/runtimeclasses` and core `nodes` so GPU sandbox admission can verify both the `nvidia` `RuntimeClass` and allocatable GPU capacity before creating a sandbox.
 
@@ -313,14 +313,16 @@ Host GPU drivers & NVIDIA Container Toolkit
     └─ Docker: DeviceRequests (CDI when enabled, --gpus all otherwise)
         └─ k3s/containerd: nvidia-container-runtime on PATH -> auto-detected
             └─ k8s: nvidia-device-plugin DaemonSet advertises nvidia.com/gpu
-                └─ Pods: request nvidia.com/gpu in resource limits
+                └─ Pods: request nvidia.com/gpu in resource limits (CDI injection — no runtimeClassName needed)
 ```
 
 ### `--gpu` flag
 
 The `--gpu` flag on `gateway start` enables GPU passthrough. OpenShell auto-selects CDI when enabled on the daemon and falls back to Docker's NVIDIA GPU request path (`--gpus all`) otherwise.
 
-The expected smoke test is a plain pod requesting `nvidia.com/gpu: 1` with `runtimeClassName: nvidia` and running `nvidia-smi`.
+Device injection uses CDI (`deviceListStrategy: cdi-cri`): the device plugin injects devices via direct CDI device requests in the CRI. Sandbox pods only need `nvidia.com/gpu: 1` in their resource limits, and GPU pods do not set `runtimeClassName`.
+
+The expected smoke test is a plain pod requesting `nvidia.com/gpu: 1` without `runtimeClassName` and running `nvidia-smi`.
 
 ## Remote Image Transfer
 
