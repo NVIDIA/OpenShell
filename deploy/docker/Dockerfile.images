@@ -213,7 +213,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-        "nvidia-container-toolkit-base=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" \
+        "nvidia-container-toolkit-base=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" && \
     rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
