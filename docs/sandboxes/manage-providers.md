@@ -137,7 +137,7 @@ The proxy resolves credential placeholders in the following parts of an HTTP req
 | Location | How the agent uses it | Example |
 |---|---|---|
 | Header value | Agent reads `$API_KEY` from env and places it in a header. | `Authorization: Bearer <placeholder>` |
-| Header value (Basic auth) | Agent base64-encodes `user:<placeholder>` in an `Authorization: Basic` header. The proxy decodes, resolves, and re-encodes. | `Authorization: Basic dXNlcjpvcGVuc2hlbGw6...` |
+| Header value (Basic auth) | Agent base64-encodes `user:<placeholder>` in an `Authorization: Basic` header. The proxy decodes, resolves, and re-encodes. | `Authorization: Basic <base64>` |
 | Query parameter value | Agent places the placeholder in a URL query parameter. | `GET /api?key=<placeholder>` |
 | URL path segment | Agent builds a URL with the placeholder in the path. Supports concatenated patterns. | `POST /bot<placeholder>/sendMessage` |
 
