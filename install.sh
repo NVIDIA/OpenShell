@@ -13,6 +13,7 @@
 # Environment variables:
 #   OPENSHELL_VERSION     - Release tag to install (default: latest tagged release)
 #   OPENSHELL_INSTALL_DIR - Directory to install into (default: ~/.local/bin)
+#   OPENSHELL_NO_VERIFY   - Set to "1" to skip checksum verification (not recommended)
 #
 set -eu
 
@@ -50,11 +51,13 @@ USAGE:
     ./install.sh [OPTIONS]
 
 OPTIONS:
-    --help    Print this help message
+    --help                Print this help message
+    --no-verify-checksum  Skip SHA-256 checksum verification (not recommended)
 
 ENVIRONMENT VARIABLES:
     OPENSHELL_VERSION       Release tag to install (default: latest tagged release)
     OPENSHELL_INSTALL_DIR   Directory to install into (default: ~/.local/bin)
+    OPENSHELL_NO_VERIFY     Set to "1" to skip checksum verification (not recommended)
 
 EXAMPLES:
     # Install latest release
@@ -65,6 +68,9 @@ EXAMPLES:
 
     # Install to /usr/local/bin
     curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_INSTALL_DIR=/usr/local/bin sh
+
+    # Skip checksum verification (not recommended)
+    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_NO_VERIFY=1 sh
 EOF
 }
 
@@ -183,8 +189,7 @@ verify_checksum() {
   _vc_expected="$(grep "$_vc_filename" "$_vc_checksums" | awk '{print $1}')"
 
   if [ -z "$_vc_expected" ]; then
-    warn "no checksum found for $_vc_filename, skipping verification"
-    return 0
+    error "no checksum found for $_vc_filename in checksums file"
   fi
 
   if has_cmd shasum; then
@@ -192,8 +197,7 @@ verify_checksum() {
   elif has_cmd sha256sum; then
     echo "$_vc_expected  $_vc_archive" | sha256sum -c --quiet 2>/dev/null
   else
-    warn "sha256sum/shasum not found, skipping checksum verification"
-    return 0
+    error "sha256sum or shasum is required for checksum verification (install coreutils or set OPENSHELL_NO_VERIFY=1 to skip)"
   fi
 }
 
@@ -223,12 +227,17 @@ is_on_path() {
 # ---------------------------------------------------------------------------
 
 main() {
+  _skip_checksum="${OPENSHELL_NO_VERIFY:-0}"
+
   # Parse CLI flags
   for arg in "$@"; do
     case "$arg" in
       --help)
         usage
         exit 0
+        ;;
+      --no-verify-checksum)
+        _skip_checksum=1
         ;;
       *)
         error "unknown option: $arg"
@@ -255,13 +264,17 @@ main() {
   fi
 
   # Verify checksum
-  info "verifying checksum..."
-  if download "$_checksums_url" "${_tmpdir}/checksums.txt"; then
-    if ! verify_checksum "${_tmpdir}/${_filename}" "${_tmpdir}/checksums.txt" "$_filename"; then
-      error "checksum verification failed for ${_filename}"
-    fi
+  if [ "$_skip_checksum" = "1" ]; then
+    warn "checksum verification skipped (OPENSHELL_NO_VERIFY=1 or --no-verify-checksum)"
   else
-    warn "could not download checksums file, skipping verification"
+    info "verifying checksum..."
+    if download "$_checksums_url" "${_tmpdir}/checksums.txt"; then
+      if ! verify_checksum "${_tmpdir}/${_filename}" "${_tmpdir}/checksums.txt" "$_filename"; then
+        error "checksum verification failed for ${_filename}"
+      fi
+    else
+      error "failed to download checksums file from ${_checksums_url} (set OPENSHELL_NO_VERIFY=1 to skip verification)"
+    fi
   fi
 
   # Extract
