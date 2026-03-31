@@ -34,6 +34,10 @@ This page documents every configurable control, its default, what it protects, a
 For the full policy YAML schema, refer to the {doc}`../reference/policy-schema`.
 For the architecture of each enforcement layer, refer to {doc}`../about/architecture`.
 
+:::{seealso}
+If you use [NemoClaw](https://github.com/NVIDIA/NemoClaw) to run OpenClaw assistants, its [Security Best Practices](https://docs.nvidia.com/nemoclaw/latest/security/best-practices.html) guide covers additional entrypoint-level controls, policy presets, provider trust tiers, and posture profiles specific to the NemoClaw blueprint.
+:::
+
 ## Enforcement Layers
 
 OpenShell applies security controls at two enforcement points.
@@ -312,3 +316,4 @@ The following patterns weaken security without providing meaningful benefit.
 - {doc}`../reference/default-policy` for the built-in default policy breakdown.
 - {doc}`../reference/gateway-auth` for gateway authentication details.
 - {doc}`../about/architecture` for the system architecture.
+- NemoClaw [Security Best Practices](https://docs.nvidia.com/nemoclaw/latest/security/best-practices.html) for entrypoint-level controls (capability drops, PATH hardening, build toolchain removal), policy presets, provider trust tiers, and posture profiles.
