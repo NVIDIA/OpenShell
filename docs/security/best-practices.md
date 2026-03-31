@@ -73,6 +73,8 @@ You can update dynamic controls on a running sandbox with `openshell policy set`
 
 ## Network Controls
 
+The CONNECT proxy and OPA policy engine enforce all network controls at the gateway level.
+
 ### Deny-by-Default Egress
 
 Every outbound connection from the sandbox goes through the CONNECT proxy.
@@ -172,6 +174,8 @@ The system merges approved endpoints into the sandbox's policy as a new durable 
 
 ## Filesystem Controls
 
+Landlock LSM restricts which paths the sandbox process can read or write at the kernel level.
+
 ### Landlock LSM
 
 Landlock enforces filesystem access at the kernel level.
@@ -187,6 +191,8 @@ All other paths are inaccessible.
 | Recommendation | Use `best_effort` for development. Use `hard_requirement` in environments where any gap in filesystem isolation is unacceptable. Run on Ubuntu 22.04+ or any kernel 5.13+ for Landlock support. |
 
 ### Read-Only vs Read-Write Paths
+
+The policy separates filesystem paths into read-only and read-write groups.
 
 | Aspect | Detail |
 |---|---|
@@ -208,6 +214,8 @@ OpenShell validates policies before they take effect.
 | Combined `read_only` + `read_write` paths must not exceed 256. | Rejected with `INVALID_ARGUMENT`. |
 
 ## Process Controls
+
+The sandbox supervisor drops privileges, applies seccomp filters, and enforces process-level restrictions during startup.
 
 ### Privilege Drop
 
@@ -243,6 +251,8 @@ This ordering is intentional: privilege dropping needs `/etc/group` and `/etc/pa
 
 ## Inference Controls
 
+OpenShell routes all inference traffic through the gateway to isolate provider credentials from the sandbox.
+
 ### Routed Inference through `inference.local`
 
 The proxy intercepts HTTPS CONNECT requests to `inference.local` and routes matching inference API requests through the sandbox-local router.
@@ -256,6 +266,8 @@ The agent never receives the provider API key.
 | Recommendation | Do not add inference provider hosts to `network_policies`. Use OpenShell inference routing instead. |
 
 ## Gateway Security
+
+The gateway secures communication between the CLI, sandbox pods, and external clients with mutual TLS and token-based authentication.
 
 ### mTLS
 
@@ -282,30 +294,16 @@ SSH connections to sandboxes pass through the gateway's HTTP CONNECT tunnel with
 
 ## Common Mistakes
 
-**Omitting `protocol: rest` on REST API endpoints.**
-Without `protocol: rest`, the proxy uses L4-only enforcement.
-It allows the TCP stream through after checking host, port, and binary, but cannot inspect individual HTTP requests.
-Add `protocol: rest` with specific `rules` to enable per-request method and path control.
+The following patterns weaken security without providing meaningful benefit.
 
-**Using `access: full` when finer rules would suffice.**
-`access: full` with `protocol: rest` enables inspection but allows all HTTP methods and paths.
-Use `access: read-only` or explicit `rules` to restrict what the agent can do at the HTTP level.
-
-**Adding endpoints permanently when operator approval would suffice.**
-Operator-approved endpoints persist within the sandbox instance but reset on re-creation.
-Adding endpoints to the policy YAML makes them permanently reachable across all instances.
-
-**Using broad binary globs.**
-A glob like `/**` allows any binary to reach the endpoint, defeating binary-scoped enforcement.
-Scope globs to specific directories (for example, `/sandbox/.vscode-server/**`).
-
-**Skipping TLS termination on HTTPS APIs.**
-Setting `tls: skip` disables credential injection and L7 inspection.
-Use the default auto-detect behavior unless the upstream requires client-certificate mTLS.
-
-**Setting `enforcement: enforce` before auditing.**
-Jumping to `enforce` without first running in `audit` mode risks breaking the agent's workflow.
-Start with `audit`, review the logs, and switch to `enforce` once you have validated the rules.
+| Mistake | Why it matters | What to do instead |
+|---------|---------------|-------------------|
+| Omitting `protocol: rest` on REST API endpoints | Without `protocol: rest`, the proxy uses L4-only enforcement. It allows the TCP stream through after checking host, port, and binary, but cannot inspect individual HTTP requests. | Add `protocol: rest` with specific `rules` to enable per-request method and path control. |
+| Using `access: full` when finer rules would suffice | `access: full` with `protocol: rest` enables inspection but allows all HTTP methods and paths. | Use `access: read-only` or explicit `rules` to restrict what the agent can do at the HTTP level. |
+| Adding endpoints permanently when operator approval would suffice | Adding endpoints to the policy YAML makes them permanently reachable across all instances. | Use operator approval. Approved endpoints persist within the sandbox instance but reset on re-creation. |
+| Using broad binary globs | A glob like `/**` allows any binary to reach the endpoint, defeating binary-scoped enforcement. | Scope globs to specific directories (for example, `/sandbox/.vscode-server/**`). |
+| Skipping TLS termination on HTTPS APIs | Setting `tls: skip` disables credential injection and L7 inspection. | Use the default auto-detect behavior unless the upstream requires client-certificate mTLS. |
+| Setting `enforcement: enforce` before auditing | Jumping to `enforce` without first running in `audit` mode risks breaking the agent's workflow. | Start with `audit`, review the logs, and switch to `enforce` once you have validated the rules. |
 
 ## Related Topics
 
