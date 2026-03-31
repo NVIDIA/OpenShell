@@ -1624,16 +1624,7 @@ fn rewrite_forward_request(
         .map_or(used, |p| p + 4);
 
     let header_str = String::from_utf8_lossy(&raw[..header_end]);
-    let mut lines = header_str.split("\r\n").collect::<Vec<_>>();
-
-    // Rewrite request line: METHOD absolute-uri HTTP/1.1 → METHOD path HTTP/1.1
-    if let Some(first_line) = lines.first_mut() {
-        let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
-        if parts.len() == 3 {
-            let new_line = format!("{} {} {}", parts[0], path, parts[2]);
-            *first_line = Box::leak(new_line.into_boxed_str()); // safe: short-lived
-        }
-    }
+    let lines = header_str.split("\r\n").collect::<Vec<_>>();
 
     // Rebuild headers, stripping hop-by-hop and adding proxy headers
     let mut output = Vec::with_capacity(header_end + 128);
@@ -1642,8 +1633,17 @@ fn rewrite_forward_request(
 
     for (i, line) in lines.iter().enumerate() {
         if i == 0 {
-            // Request line — already rewritten
-            output.extend_from_slice(line.as_bytes());
+            // Rewrite request line: METHOD absolute-uri HTTP/1.1 → METHOD path HTTP/1.1
+            let parts: Vec<&str> = line.splitn(3, ' ').collect();
+            if parts.len() == 3 {
+                output.extend_from_slice(parts[0].as_bytes());
+                output.push(b' ');
+                output.extend_from_slice(path.as_bytes());
+                output.push(b' ');
+                output.extend_from_slice(parts[2].as_bytes());
+            } else {
+                output.extend_from_slice(line.as_bytes());
+            }
             output.extend_from_slice(b"\r\n");
             continue;
         }
