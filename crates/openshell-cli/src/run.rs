@@ -2045,7 +2045,16 @@ pub async fn sandbox_create(
         name: name.unwrap_or_default().to_string(),
     };
 
-    let response = client.create_sandbox(request).await.into_diagnostic()?;
+    let response = match client.create_sandbox(request).await {
+        Ok(resp) => resp,
+        Err(status) if status.code() == Code::AlreadyExists => {
+            return Err(miette::miette!(
+                "{}\n\nhint: delete it first with: openshell sandbox delete <name>\n      or use a different name",
+                status.message()
+            ));
+        }
+        Err(status) => return Err(status).into_diagnostic(),
+    };
     let sandbox = response
         .into_inner()
         .sandbox
