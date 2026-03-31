@@ -5,18 +5,23 @@
 
 from __future__ import annotations
 
-from .sandbox import (
-    ClusterInferenceConfig,
-    ExecChunk,
-    ExecResult,
-    InferenceRouteClient,
-    Sandbox,
-    SandboxClient,
-    SandboxError,
-    SandboxRef,
-    SandboxSession,
-    TlsConfig,
-)
+try:
+    from .sandbox import (
+        ClusterInferenceConfig,
+        ExecChunk,
+        ExecResult,
+        InferenceRouteClient,
+        Sandbox,
+        SandboxClient,
+        SandboxError,
+        SandboxRef,
+        SandboxSession,
+        TlsConfig,
+    )
+except ImportError:
+    # Proto stubs not yet generated (requires Rust build).
+    # Subpackages like openshell.prover can still be imported.
+    pass
 
 try:
     from importlib.metadata import version
