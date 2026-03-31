@@ -667,13 +667,35 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
                             .iter()
                             .map(|r| {
                                 let a = r.allow.as_ref();
-                                serde_json::json!({
-                                    "allow": {
-                                        "method": a.map_or("", |a| &a.method),
-                                        "path": a.map_or("", |a| &a.path),
-                                        "command": a.map_or("", |a| &a.command),
-                                    }
-                                })
+                                let mut allow = serde_json::json!({
+                                    "method": a.map_or("", |a| &a.method),
+                                    "path": a.map_or("", |a| &a.path),
+                                    "command": a.map_or("", |a| &a.command),
+                                });
+                                let query: serde_json::Map<String, serde_json::Value> = a
+                                    .map(|allow| {
+                                        allow
+                                            .query
+                                            .iter()
+                                            .map(|(key, matcher)| {
+                                                let mut matcher_json = serde_json::json!({});
+                                                if !matcher.glob.is_empty() {
+                                                    matcher_json["glob"] =
+                                                        matcher.glob.clone().into();
+                                                }
+                                                if !matcher.any.is_empty() {
+                                                    matcher_json["any"] =
+                                                        matcher.any.clone().into();
+                                                }
+                                                (key.clone(), matcher_json)
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                if !query.is_empty() {
+                                    allow["query"] = query.into();
+                                }
+                                serde_json::json!({ "allow": allow })
                             })
                             .collect();
                         ep["rules"] = rules.into();
@@ -714,8 +736,9 @@ mod tests {
     use super::*;
 
     use openshell_core::proto::{
-        FilesystemPolicy as ProtoFs, NetworkBinary, NetworkEndpoint, NetworkPolicyRule,
-        ProcessPolicy as ProtoProc, SandboxPolicy as ProtoSandboxPolicy,
+        FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, NetworkBinary,
+        NetworkEndpoint, NetworkPolicyRule, ProcessPolicy as ProtoProc,
+        SandboxPolicy as ProtoSandboxPolicy,
     };
 
     const TEST_POLICY: &str = include_str!("../data/sandbox-policy.rego");
@@ -1337,6 +1360,27 @@ network_policies:
         access: full
     binaries:
       - { path: /usr/bin/curl }
+  query_api:
+    name: query_api
+    endpoints:
+      - host: api.query.com
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/download"
+              query:
+                tag: "foo-*"
+          - allow:
+              method: GET
+              path: "/search"
+              query:
+                tag:
+                  any: ["foo-*", "bar-*"]
+    binaries:
+      - { path: /usr/bin/curl }
   l4_only:
     name: l4_only
     endpoints:
@@ -1359,6 +1403,16 @@ process:
     }
 
     fn l7_input(host: &str, port: u16, method: &str, path: &str) -> serde_json::Value {
+        l7_input_with_query(host, port, method, path, serde_json::json!({}))
+    }
+
+    fn l7_input_with_query(
+        host: &str,
+        port: u16,
+        method: &str,
+        path: &str,
+        query_params: serde_json::Value,
+    ) -> serde_json::Value {
         serde_json::json!({
             "network": { "host": host, "port": port },
             "exec": {
@@ -1368,7 +1422,8 @@ process:
             },
             "request": {
                 "method": method,
-                "path": path
+                "path": path,
+                "query_params": query_params
             }
         })
     }
@@ -1470,6 +1525,140 @@ process:
         // /repos/** should match /repos/org/repo
         let input = l7_input("api.example.com", 8080, "GET", "/repos/org/repo");
         assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_query_glob_allows_matching_duplicate_values() {
+        let engine = l7_engine();
+        let input = l7_input_with_query(
+            "api.query.com",
+            8080,
+            "GET",
+            "/download",
+            serde_json::json!({
+                "tag": ["foo-a", "foo-b"],
+                "extra": ["ignored"],
+            }),
+        );
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_query_glob_denies_on_mismatched_duplicate_value() {
+        let engine = l7_engine();
+        let input = l7_input_with_query(
+            "api.query.com",
+            8080,
+            "GET",
+            "/download",
+            serde_json::json!({
+                "tag": ["foo-a", "evil"],
+            }),
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_query_any_allows_if_every_value_matches_any_pattern() {
+        let engine = l7_engine();
+        let input = l7_input_with_query(
+            "api.query.com",
+            8080,
+            "GET",
+            "/search",
+            serde_json::json!({
+                "tag": ["foo-a", "bar-b"],
+            }),
+        );
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_query_missing_required_key_denied() {
+        let engine = l7_engine();
+        let input = l7_input_with_query(
+            "api.query.com",
+            8080,
+            "GET",
+            "/download",
+            serde_json::json!({}),
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_query_rules_from_proto_are_enforced() {
+        let mut query = std::collections::HashMap::new();
+        query.insert(
+            "tag".to_string(),
+            L7QueryMatcher {
+                glob: "foo-*".to_string(),
+                any: vec![],
+            },
+        );
+
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "query_proto".to_string(),
+            NetworkPolicyRule {
+                name: "query_proto".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.proto.com".to_string(),
+                    port: 8080,
+                    protocol: "rest".to_string(),
+                    enforcement: "enforce".to_string(),
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "GET".to_string(),
+                            path: "/download".to_string(),
+                            command: String::new(),
+                            query,
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+
+        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
+        let allow_input = l7_input_with_query(
+            "api.proto.com",
+            8080,
+            "GET",
+            "/download",
+            serde_json::json!({ "tag": ["foo-a"] }),
+        );
+        assert!(eval_l7(&engine, &allow_input));
+
+        let deny_input = l7_input_with_query(
+            "api.proto.com",
+            8080,
+            "GET",
+            "/download",
+            serde_json::json!({ "tag": ["evil"] }),
+        );
+        assert!(!eval_l7(&engine, &deny_input));
     }
 
     #[test]

@@ -105,7 +105,20 @@ Configures [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforc
 
 | Field | Type | Required | Values | Description |
 |---|---|---|---|---|
-| `compatibility` | string | No | `best_effort`, `hard_requirement` | How OpenShell handles kernel ABI differences. `best_effort` uses the highest Landlock ABI the host kernel supports. `hard_requirement` fails if the required ABI is unavailable. |
+| `compatibility` | string | No | `best_effort`, `hard_requirement` | How OpenShell handles Landlock failures. See behavior table below. |
+
+**Compatibility modes:**
+
+| Value | Kernel ABI unavailable | Individual path inaccessible | All paths inaccessible |
+|---|---|---|---|
+| `best_effort` | Warns and continues without Landlock. | Skips the path, applies remaining rules. | Warns and continues without Landlock (refuses to apply an empty ruleset). |
+| `hard_requirement` | Aborts sandbox startup. | Aborts sandbox startup. | Aborts sandbox startup. |
+
+`best_effort` (the default) is appropriate for most deployments. It handles missing paths gracefully -- for example, `/app` may not exist in every container image but is included in the baseline path set for containers that do have it. Individual missing paths are skipped while the remaining filesystem rules are still enforced.
+
+`hard_requirement` is for environments where any gap in filesystem isolation is unacceptable. If a listed path cannot be opened for any reason (missing, permission denied, symlink loop), sandbox startup fails immediately rather than running with reduced protection.
+
+When a path is skipped under `best_effort`, the sandbox logs a warning that includes the path, the specific error, and a human-readable reason (for example, "path does not exist" or "permission denied").
 
 Example:
 
@@ -183,6 +196,7 @@ Used when `access` is not set. Each rule explicitly allows a method and path com
 |---|---|---|---|
 | `allow.method` | string | Yes | HTTP method to allow (for example, `GET`, `POST`). |
 | `allow.path` | string | Yes | URL path pattern. Supports `*` and `**` glob syntax. |
+| `allow.query` | map | No | Query parameter matchers keyed by decoded param name. Matcher value can be a glob string (`tag: "foo-*"`) or an object with `any` (`tag: { any: ["foo-*", "bar-*"] }`). |
 
 Example with rules:
 
@@ -191,9 +205,14 @@ rules:
   - allow:
       method: GET
       path: /**/info/refs*
+      query:
+        service: "git-*"
   - allow:
       method: POST
       path: /**/git-upload-pack
+      query:
+        tag:
+          any: ["v1.*", "v2.*"]
 ```
 
 ### Binary Object

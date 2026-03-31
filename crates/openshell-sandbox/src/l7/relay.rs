@@ -108,6 +108,7 @@ where
         let request_info = L7RequestInfo {
             action: req.action.clone(),
             target: req.target.clone(),
+            query_params: req.query_params.clone(),
         };
 
         // Evaluate L7 policy via Rego
@@ -127,6 +128,7 @@ where
             l7_protocol = "rest",
             l7_action = %request_info.action,
             l7_target = %request_info.target,
+            l7_query_params = ?request_info.query_params,
             l7_decision = decision_str,
             l7_deny_reason = %reason,
             "L7_REQUEST",
@@ -180,7 +182,7 @@ fn is_benign_connection_error(err: &miette::Report) -> bool {
 /// Evaluate an L7 request against the OPA engine.
 ///
 /// Returns `(allowed, deny_reason)`.
-fn evaluate_l7_request(
+pub fn evaluate_l7_request(
     engine: &Mutex<regorus::Engine>,
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
@@ -198,6 +200,7 @@ fn evaluate_l7_request(
         "request": {
             "method": request.action,
             "path": request.target,
+            "query_params": request.query_params.clone(),
         }
     });
 

@@ -801,6 +801,11 @@ pub(crate) fn bundle_to_resolved_routes(
         .map(|r| {
             let (auth, default_headers) =
                 openshell_core::inference::auth_for_provider_type(&r.provider_type);
+            let timeout = if r.timeout_secs == 0 {
+                openshell_router::config::DEFAULT_ROUTE_TIMEOUT
+            } else {
+                Duration::from_secs(r.timeout_secs)
+            };
             openshell_router::config::ResolvedRoute {
                 name: r.name.clone(),
                 endpoint: r.base_url.clone(),
@@ -809,6 +814,7 @@ pub(crate) fn bundle_to_resolved_routes(
                 protocols: r.protocols.clone(),
                 auth,
                 default_headers,
+                timeout,
             }
         })
         .collect()
@@ -899,12 +905,31 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
     let mut modified = false;
     for &path in PROXY_BASELINE_READ_ONLY {
         if !fs.read_only.iter().any(|p| p.as_str() == path) {
+            // Baseline paths are system-injected, not user-specified. Skip
+            // paths that do not exist in this container image to avoid noisy
+            // warnings from Landlock and, more critically, to prevent a single
+            // missing baseline path from abandoning the entire Landlock
+            // ruleset under best-effort mode (see issue #664).
+            if !std::path::Path::new(path).exists() {
+                debug!(
+                    path,
+                    "Baseline read-only path does not exist, skipping enrichment"
+                );
+                continue;
+            }
             fs.read_only.push(path.to_string());
             modified = true;
         }
     }
     for &path in PROXY_BASELINE_READ_WRITE {
         if !fs.read_write.iter().any(|p| p.as_str() == path) {
+            if !std::path::Path::new(path).exists() {
+                debug!(
+                    path,
+                    "Baseline read-write path does not exist, skipping enrichment"
+                );
+                continue;
+            }
             fs.read_write.push(path.to_string());
             modified = true;
         }
@@ -929,6 +954,15 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
     for &path in PROXY_BASELINE_READ_ONLY {
         let p = std::path::PathBuf::from(path);
         if !policy.filesystem.read_only.contains(&p) {
+            // Baseline paths are system-injected — skip non-existent paths to
+            // avoid Landlock ruleset abandonment (issue #664).
+            if !p.exists() {
+                debug!(
+                    path,
+                    "Baseline read-only path does not exist, skipping enrichment"
+                );
+                continue;
+            }
             policy.filesystem.read_only.push(p);
             modified = true;
         }
@@ -936,6 +970,13 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
     for &path in PROXY_BASELINE_READ_WRITE {
         let p = std::path::PathBuf::from(path);
         if !policy.filesystem.read_write.contains(&p) {
+            if !p.exists() {
+                debug!(
+                    path,
+                    "Baseline read-write path does not exist, skipping enrichment"
+                );
+                continue;
+            }
             policy.filesystem.read_write.push(p);
             modified = true;
         }
@@ -1482,6 +1523,7 @@ mod tests {
                         "openai_responses".to_string(),
                     ],
                     provider_type: "openai".to_string(),
+                    timeout_secs: 0,
                 },
                 openshell_core::proto::ResolvedRoute {
                     name: "local".to_string(),
@@ -1490,6 +1532,7 @@ mod tests {
                     model_id: "llama-3".to_string(),
                     protocols: vec!["openai_chat_completions".to_string()],
                     provider_type: String::new(),
+                    timeout_secs: 120,
                 },
             ],
             revision: "abc123".to_string(),
@@ -1510,10 +1553,20 @@ mod tests {
             routes[0].protocols,
             vec!["openai_chat_completions", "openai_responses"]
         );
+        assert_eq!(
+            routes[0].timeout,
+            openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+            "timeout_secs=0 should map to default"
+        );
         assert_eq!(routes[1].endpoint, "http://vllm:8000/v1");
         assert_eq!(
             routes[1].auth,
             openshell_core::inference::AuthHeader::Bearer
+        );
+        assert_eq!(
+            routes[1].timeout,
+            Duration::from_secs(120),
+            "timeout_secs=120 should map to 120s"
         );
     }
 
@@ -1539,6 +1592,7 @@ mod tests {
                 model_id: "model".to_string(),
                 protocols: vec!["openai_chat_completions".to_string()],
                 provider_type: "openai".to_string(),
+                timeout_secs: 0,
             }],
             revision: "rev".to_string(),
             generated_at_ms: 0,
@@ -1559,6 +1613,7 @@ mod tests {
                 protocols: vec!["openai_chat_completions".to_string()],
                 auth: openshell_core::inference::AuthHeader::Bearer,
                 default_headers: vec![],
+                timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
             },
             openshell_router::config::ResolvedRoute {
                 name: "sandbox-system".to_string(),
@@ -1568,6 +1623,7 @@ mod tests {
                 protocols: vec!["anthropic_messages".to_string()],
                 auth: openshell_core::inference::AuthHeader::Custom("x-api-key"),
                 default_headers: vec![],
+                timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
             },
         ];
 
@@ -1856,6 +1912,7 @@ filesystem_policy:
             auth: openshell_core::inference::AuthHeader::Bearer,
             protocols: vec!["openai_chat_completions".to_string()],
             default_headers: vec![],
+            timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         }];
 
         let cache = Arc::new(RwLock::new(routes));

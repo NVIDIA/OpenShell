@@ -10,6 +10,7 @@
 use crate::l7::provider::{BodyLength, L7Provider, L7Request};
 use crate::secrets::rewrite_http_header_block;
 use miette::{IntoDiagnostic, Result, miette};
+use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
@@ -116,7 +117,7 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
         .next()
         .ok_or_else(|| miette!("Missing HTTP method"))?
         .to_string();
-    let path = parts
+    let target = parts
         .next()
         .ok_or_else(|| miette!("Missing HTTP path"))?
         .to_string();
@@ -129,13 +130,94 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
 
     // Determine body framing from headers
     let body_length = parse_body_length(header_str)?;
+    let (path, query_params) = parse_target_query(&target)?;
 
     Ok(Some(L7Request {
         action: method,
         target: path,
+        query_params,
         raw_header: buf, // exact header bytes up to and including \r\n\r\n
         body_length,
     }))
+}
+
+pub(crate) fn parse_target_query(target: &str) -> Result<(String, HashMap<String, Vec<String>>)> {
+    match target.split_once('?') {
+        Some((path, query)) => Ok((path.to_string(), parse_query_params(query)?)),
+        None => Ok((target.to_string(), HashMap::new())),
+    }
+}
+
+fn parse_query_params(query: &str) -> Result<HashMap<String, Vec<String>>> {
+    let mut params: HashMap<String, Vec<String>> = HashMap::new();
+    if query.is_empty() {
+        return Ok(params);
+    }
+
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+
+        let (raw_key, raw_value) = match pair.split_once('=') {
+            Some((key, value)) => (key, value),
+            None => (pair, ""),
+        };
+        let key = decode_query_component(raw_key)?;
+        let value = decode_query_component(raw_value)?;
+        params.entry(key).or_default().push(value);
+    }
+
+    Ok(params)
+}
+
+/// Decode a single query string component (key or value).
+///
+/// Handles both RFC 3986 percent-encoding (`%20` → space) and the
+/// `application/x-www-form-urlencoded` convention (`+` → space).
+/// Decoding `+` as space matches the behavior of Python's `urllib.parse`,
+/// JavaScript's `URLSearchParams`, Go's `url.ParseQuery`, and most HTTP
+/// frameworks. Callers that need a literal `+` should send `%2B`.
+fn decode_query_component(input: &str) -> Result<String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            decoded.push(b' ');
+            i += 1;
+            continue;
+        }
+
+        if bytes[i] != b'%' {
+            decoded.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+
+        if i + 2 >= bytes.len() {
+            return Err(miette!("Invalid percent-encoding in query component"));
+        }
+
+        let hi = decode_hex_nibble(bytes[i + 1])
+            .ok_or_else(|| miette!("Invalid percent-encoding in query component"))?;
+        let lo = decode_hex_nibble(bytes[i + 2])
+            .ok_or_else(|| miette!("Invalid percent-encoding in query component"))?;
+        decoded.push((hi << 4) | lo);
+        i += 3;
+    }
+
+    String::from_utf8(decoded).map_err(|_| miette!("Query component is not valid UTF-8"))
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Forward an allowed HTTP request to upstream and relay the response back.
@@ -242,14 +324,22 @@ fn parse_body_length(headers: &str) -> Result<BodyLength> {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("transfer-encoding:") {
             let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
-            if val.contains("chunked") {
+            if val.split(',').any(|enc| enc.trim() == "chunked") {
                 has_te_chunked = true;
             }
         }
-        if lower.starts_with("content-length:")
-            && let Some(val) = lower.split_once(':').map(|(_, v)| v.trim())
-            && let Ok(len) = val.parse::<u64>()
-        {
+        if lower.starts_with("content-length:") {
+            let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
+            let len: u64 = val
+                .parse()
+                .map_err(|_| miette!("Request contains invalid Content-Length value"))?;
+            if let Some(prev) = cl_value {
+                if prev != len {
+                    return Err(miette!(
+                        "Request contains multiple Content-Length headers with differing values ({prev} vs {len})"
+                    ));
+                }
+            }
             cl_value = Some(len);
         }
     }
@@ -681,6 +771,92 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_target_query_parses_duplicate_values() {
+        let (path, query) = parse_target_query("/download?tag=a&tag=b").expect("parse");
+        assert_eq!(path, "/download");
+        assert_eq!(
+            query.get("tag").cloned(),
+            Some(vec!["a".into(), "b".into()])
+        );
+    }
+
+    #[test]
+    fn parse_target_query_decodes_percent_and_plus() {
+        let (path, query) = parse_target_query("/download?slug=my%2Fskill&name=Foo+Bar").unwrap();
+        assert_eq!(path, "/download");
+        assert_eq!(
+            query.get("slug").cloned(),
+            Some(vec!["my/skill".to_string()])
+        );
+        // `+` is decoded as space per application/x-www-form-urlencoded.
+        // Literal `+` should be sent as `%2B`.
+        assert_eq!(
+            query.get("name").cloned(),
+            Some(vec!["Foo Bar".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_target_query_literal_plus_via_percent_encoding() {
+        let (_path, query) = parse_target_query("/search?q=a%2Bb").unwrap();
+        assert_eq!(
+            query.get("q").cloned(),
+            Some(vec!["a+b".to_string()]),
+            "%2B should decode to literal +"
+        );
+    }
+
+    #[test]
+    fn parse_target_query_empty_value() {
+        let (_path, query) = parse_target_query("/api?tag=").unwrap();
+        assert_eq!(
+            query.get("tag").cloned(),
+            Some(vec!["".to_string()]),
+            "key with empty value should produce empty string"
+        );
+    }
+
+    #[test]
+    fn parse_target_query_key_without_value() {
+        let (_path, query) = parse_target_query("/api?verbose").unwrap();
+        assert_eq!(
+            query.get("verbose").cloned(),
+            Some(vec!["".to_string()]),
+            "key without = should produce empty string value"
+        );
+    }
+
+    #[test]
+    fn parse_target_query_unicode_after_decoding() {
+        // "café" = c a f %C3%A9
+        let (_path, query) = parse_target_query("/search?q=caf%C3%A9").unwrap();
+        assert_eq!(
+            query.get("q").cloned(),
+            Some(vec!["café".to_string()]),
+            "percent-encoded UTF-8 should decode correctly"
+        );
+    }
+
+    #[test]
+    fn parse_target_query_empty_query_string() {
+        let (path, query) = parse_target_query("/api?").unwrap();
+        assert_eq!(path, "/api");
+        assert!(
+            query.is_empty(),
+            "empty query after ? should produce empty map"
+        );
+    }
+
+    #[test]
+    fn parse_target_query_rejects_malformed_percent_encoding() {
+        let err = parse_target_query("/download?slug=bad%2").expect_err("expected parse error");
+        assert!(
+            err.to_string().contains("percent-encoding"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// SEC-009: Reject requests with both Content-Length and Transfer-Encoding
     /// to prevent CL/TE request smuggling (RFC 7230 Section 3.3.3).
     #[test]
@@ -700,6 +876,59 @@ mod tests {
             parse_body_length(headers).is_err(),
             "Must reject request with both TE and CL"
         );
+    }
+
+    /// SEC: Reject differing duplicate Content-Length headers.
+    #[test]
+    fn reject_differing_duplicate_content_length() {
+        let headers =
+            "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 50\r\n\r\n";
+        assert!(
+            parse_body_length(headers).is_err(),
+            "Must reject differing duplicate Content-Length"
+        );
+    }
+
+    /// SEC: Accept identical duplicate Content-Length headers.
+    #[test]
+    fn accept_identical_duplicate_content_length() {
+        let headers =
+            "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\nContent-Length: 42\r\n\r\n";
+        match parse_body_length(headers).unwrap() {
+            BodyLength::ContentLength(42) => {}
+            other => panic!("Expected ContentLength(42), got {other:?}"),
+        }
+    }
+
+    /// SEC: Reject non-numeric Content-Length values.
+    #[test]
+    fn reject_non_numeric_content_length() {
+        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n";
+        assert!(
+            parse_body_length(headers).is_err(),
+            "Must reject non-numeric Content-Length"
+        );
+    }
+
+    /// SEC: Reject when second Content-Length is non-numeric (bypass test).
+    #[test]
+    fn reject_valid_then_invalid_content_length() {
+        let headers =
+            "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\nContent-Length: abc\r\n\r\n";
+        assert!(
+            parse_body_length(headers).is_err(),
+            "Must reject when any Content-Length is non-numeric"
+        );
+    }
+
+    /// SEC: Transfer-Encoding substring match must not match partial tokens.
+    #[test]
+    fn te_substring_not_chunked() {
+        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunkedx\r\n\r\n";
+        match parse_body_length(headers).unwrap() {
+            BodyLength::None => {}
+            other => panic!("Expected None for non-matching TE, got {other:?}"),
+        }
     }
 
     /// SEC-009: Bare LF in headers enables header injection.
@@ -746,6 +975,32 @@ mod tests {
         assert!(result.is_err(), "Must reject unsupported HTTP version");
     }
 
+    #[tokio::test]
+    async fn parse_http_request_splits_path_and_query_params() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(
+                    b"GET /download?slug=my%2Fskill&tag=foo&tag=bar HTTP/1.1\r\nHost: x\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let req = parse_http_request(&mut client)
+            .await
+            .expect("request should parse")
+            .expect("request should exist");
+        assert_eq!(req.target, "/download");
+        assert_eq!(
+            req.query_params.get("slug").cloned(),
+            Some(vec!["my/skill".to_string()])
+        );
+        assert_eq!(
+            req.query_params.get("tag").cloned(),
+            Some(vec!["foo".to_string(), "bar".to_string()])
+        );
+    }
+
     /// Regression test: two pipelined requests in a single write must be
     /// parsed independently.  Before the fix, the 1024-byte `read()` buffer
     /// could capture bytes from the second request, which were forwarded
@@ -770,6 +1025,7 @@ mod tests {
             .expect("expected first request");
         assert_eq!(first.action, "GET");
         assert_eq!(first.target, "/allowed");
+        assert!(first.query_params.is_empty());
         assert_eq!(
             first.raw_header, b"GET /allowed HTTP/1.1\r\nHost: example.com\r\n\r\n",
             "raw_header must contain only the first request's headers"
@@ -781,6 +1037,7 @@ mod tests {
             .expect("expected second request");
         assert_eq!(second.action, "POST");
         assert_eq!(second.target, "/blocked");
+        assert!(second.query_params.is_empty());
     }
 
     #[test]
@@ -1133,7 +1390,7 @@ mod tests {
     /// to the upstream API, causing 401 Unauthorized errors.
     #[tokio::test]
     async fn relay_request_with_resolver_rewrites_credential_placeholders() {
-        let provider_env: std::collections::HashMap<String, String> = [(
+        let provider_env: HashMap<String, String> = [(
             "NVIDIA_API_KEY".to_string(),
             "nvapi-real-secret-key".to_string(),
         )]
@@ -1149,6 +1406,7 @@ mod tests {
         let req = L7Request {
             action: "POST".to_string(),
             target: "/v1/chat/completions".to_string(),
+            query_params: HashMap::new(),
             raw_header: format!(
                 "POST /v1/chat/completions HTTP/1.1\r\n\
                  Host: integrate.api.nvidia.com\r\n\
@@ -1232,6 +1490,7 @@ mod tests {
         let req = L7Request {
             action: "POST".to_string(),
             target: "/v1/chat/completions".to_string(),
+            query_params: HashMap::new(),
             raw_header: format!(
                 "POST /v1/chat/completions HTTP/1.1\r\n\
                  Host: integrate.api.nvidia.com\r\n\

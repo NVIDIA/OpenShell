@@ -15,6 +15,7 @@ fn mock_candidates(base_url: &str) -> Vec<ResolvedRoute> {
         protocols: vec!["openai_chat_completions".to_string()],
         auth: AuthHeader::Bearer,
         default_headers: Vec::new(),
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }]
 }
 
@@ -117,6 +118,7 @@ async fn proxy_no_compatible_route_returns_error() {
         protocols: vec!["anthropic_messages".to_string()],
         auth: AuthHeader::Custom("x-api-key"),
         default_headers: Vec::new(),
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
     let err = router
@@ -178,6 +180,7 @@ async fn proxy_mock_route_returns_canned_response() {
         protocols: vec!["openai_chat_completions".to_string()],
         auth: AuthHeader::Bearer,
         default_headers: Vec::new(),
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -312,6 +315,7 @@ async fn proxy_uses_x_api_key_for_anthropic_route() {
         protocols: vec!["anthropic_messages".to_string()],
         auth: AuthHeader::Custom("x-api-key"),
         default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -370,6 +374,7 @@ async fn proxy_anthropic_does_not_send_bearer_auth() {
         protocols: vec!["anthropic_messages".to_string()],
         auth: AuthHeader::Custom("x-api-key"),
         default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
     let response = router
@@ -414,6 +419,7 @@ async fn proxy_forwards_client_anthropic_version_header() {
         protocols: vec!["anthropic_messages".to_string()],
         auth: AuthHeader::Custom("x-api-key"),
         default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({

@@ -6,10 +6,11 @@
 //! Provides functions to resolve binary paths and compute file hashes
 //! for process-identity binding in the OPA proxy policy engine.
 
-use miette::{IntoDiagnostic, Result};
+use miette::Result;
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
+use tracing::debug;
 
 /// Read the binary path of a process via `/proc/{pid}/exe` symlink.
 ///
@@ -229,8 +230,9 @@ fn parse_proc_net_tcp(pid: u32, peer_port: u16) -> Result<u64> {
 fn find_pid_by_socket_inode(inode: u64, entrypoint_pid: u32) -> Result<u32> {
     let target = format!("socket:[{inode}]");
 
-    // First: scan descendants of the entrypoint process (targeted, most likely to succeed)
+    // First: scan descendants of the entrypoint process
     let descendants = collect_descendant_pids(entrypoint_pid);
+
     for &pid in &descendants {
         if let Some(found) = check_pid_fds(pid, &target) {
             return Ok(found);
@@ -238,7 +240,6 @@ fn find_pid_by_socket_inode(inode: u64, entrypoint_pid: u32) -> Result<u32> {
     }
 
     // Fallback: scan all of /proc in case the process isn't in the tree
-    // (e.g., if /proc/<pid>/task/<tid>/children wasn't available)
     if let Ok(proc_dir) = std::fs::read_dir("/proc") {
         for entry in proc_dir.flatten() {
             let name = entry.file_name();
@@ -318,9 +319,32 @@ fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
 /// same hash, or the request is denied.
 pub fn file_sha256(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
+    use std::io::Read;
 
-    let bytes = std::fs::read(path).into_diagnostic()?;
-    let hash = Sha256::digest(&bytes);
+    let start = std::time::Instant::now();
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| miette::miette!("Failed to open {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    let mut total_read = 0u64;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| miette::miette!("Failed to read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        total_read += n as u64;
+        hasher.update(&buf[..n]);
+    }
+
+    let hash = hasher.finalize();
+    debug!(
+        "        file_sha256: {}ms size={} path={}",
+        start.elapsed().as_millis(),
+        total_read,
+        path.display()
+    );
     Ok(hex::encode(hash))
 }
 
