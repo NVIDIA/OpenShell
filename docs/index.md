@@ -174,6 +174,16 @@ Policy schema, environment variables, and system architecture.
 {bdg-secondary}`Reference`
 :::
 
+:::{grid-item-card} Security Best Practices
+:link: security/best-practices
+:link-type: doc
+
+Every configurable security control, its default, and the risk of changing it.
+
++++
+{bdg-secondary}`Concept`
+:::
+
 ::::
 
 ```{toctree}
@@ -228,6 +238,13 @@ reference/gateway-auth
 reference/default-policy
 reference/policy-schema
 reference/support-matrix
+```
+
+```{toctree}
+:caption: Security
+:hidden:
+
+security/best-practices
 ```
 
 ```{toctree}
