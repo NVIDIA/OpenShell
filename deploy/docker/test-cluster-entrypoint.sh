@@ -6,8 +6,13 @@
 # Smoke test for cluster-entrypoint.sh k3s flag construction.
 #
 # Validates that the flags the entrypoint passes to k3s are accepted by the
-# k3s binary bundled in the cluster image. This catches regressions like the
-# --resolv-conf flag removal in k3s v1.35.2 (issue #696).
+# k3s binary bundled in the cluster image. The entrypoint appends flags after
+# "$@" (the container CMD), so when CMD is empty (bare `docker run`) the
+# flags become top-level k3s args — which k3s rejects. This test ensures:
+#   1. The entrypoint uses --kubelet-arg=resolv-conf= (works in all positions)
+#   2. The Dockerfile provides a default CMD ["server"] as a safety net
+#
+# See: https://github.com/NVIDIA/OpenShell/issues/696
 #
 # Usage:
 #   docker run --rm --entrypoint sh <cluster-image> /usr/local/bin/test-cluster-entrypoint.sh
@@ -63,24 +68,22 @@ assert_ok "k3s --help succeeds" /bin/k3s --help
 assert_ok "k3s server --help succeeds" /bin/k3s server --help
 
 # ---------------------------------------------------------------------------
-# 3. k3s accepts --kubelet-arg=resolv-conf (the flag we pass)
+# 3. k3s flag compatibility for resolv-conf
 # ---------------------------------------------------------------------------
 echo "--- resolv-conf flag ---"
 
-# k3s server --help should list kubelet-arg as a valid flag
-assert_ok "k3s server accepts --kubelet-arg" \
-    /bin/k3s server --help
+# --kubelet-arg=resolv-conf= works regardless of CMD position
+assert_ok "k3s server accepts --kubelet-arg=resolv-conf" \
+    sh -c '/bin/k3s server --kubelet-arg=resolv-conf=/tmp/test --help 2>&1 | grep -q "USAGE"'
 
-# Verify --kubelet-arg=resolv-conf= is parseable by checking that k3s does
-# NOT reject it as an unknown flag. We use --help after the arg to prevent
-# k3s from actually starting a server.
-assert_ok "k3s server --kubelet-arg=resolv-conf=/tmp/test is parseable" \
-    sh -c '/bin/k3s server --help 2>&1 | grep -q "kubelet-arg"'
+# --resolv-conf works as a server subcommand flag (the historical path)
+assert_ok "k3s server accepts --resolv-conf after server subcommand" \
+    sh -c '/bin/k3s server --resolv-conf=/tmp/test --help 2>&1 | grep -q "USAGE"'
 
-# Verify the OLD flag format is NOT accepted as a top-level flag.
-# This ensures we don't regress back to the broken format.
-assert_fail "k3s rejects --resolv-conf as top-level flag" \
-    sh -c '/bin/k3s --resolv-conf=/tmp/test server --help 2>&1 | grep -qv "flag provided but not defined"'
+# --resolv-conf as a TOP-LEVEL flag (before server) is rejected by k3s.
+# This is the failure mode when CMD is empty (bare `docker run`).
+assert_fail "k3s rejects --resolv-conf as top-level flag (before server)" \
+    sh -c '/bin/k3s --resolv-conf=/tmp/test 2>&1 | grep -q "USAGE"'
 
 # ---------------------------------------------------------------------------
 # 4. Entrypoint script exists and is executable

@@ -275,6 +275,11 @@ COPY deploy/kube/manifests/*.yaml /opt/openshell/manifests/
 COPY deploy/kube/gpu-manifests/*.yaml /opt/openshell/gpu-manifests/
 
 ENTRYPOINT ["/usr/local/bin/cluster-entrypoint.sh"]
+# Default to "server" so bare `docker run <image>` works without requiring
+# the caller to pass a subcommand.  The openshell CLI already passes
+# ["server", "--disable=traefik", ...] as CMD; this default only affects
+# manual `docker run` invocations that omit a command.
+CMD ["server"]
 
 HEALTHCHECK --interval=5s --timeout=5s --start-period=20s --retries=60 \
   CMD ["/usr/local/bin/cluster-healthcheck.sh"]
