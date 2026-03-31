@@ -884,6 +884,53 @@ const PROXY_BASELINE_READ_ONLY: &[&str] = &["/usr", "/lib", "/etc", "/app", "/va
 /// user working directory and temporary files.
 const PROXY_BASELINE_READ_WRITE: &[&str] = &["/sandbox", "/tmp"];
 
+/// Fixed read-write paths required when a GPU is present.
+///
+/// - `/run/nvidia-persistenced`: NVML tries to connect to the persistenced
+///   socket at init time.  If the socket exists but landlock denies traversal
+///   (EACCES vs ECONNREFUSED), NVML returns NVML_ERROR_INSUFFICIENT_PERMISSIONS
+///   even though the daemon is optional.
+/// - `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`,
+///   `/dev/nvidia-modeset`: control and UVM devices injected by CDI.
+///   Landlock READ_FILE/WRITE_FILE restricts open(2) on device files even
+///   when DAC permissions would otherwise allow it.
+///
+/// Per-GPU device files (`/dev/nvidia0`, `/dev/nvidia1`, …) are enumerated
+/// at runtime by `gpu_baseline_read_write_paths()` since the count varies.
+const GPU_BASELINE_READ_WRITE_FIXED: &[&str] = &[
+    "/run/nvidia-persistenced",
+    "/dev/nvidiactl",
+    "/dev/nvidia-uvm",
+    "/dev/nvidia-uvm-tools",
+    "/dev/nvidia-modeset",
+];
+
+/// Returns true if GPU devices are present in the container.
+fn has_gpu_devices() -> bool {
+    std::path::Path::new("/dev/nvidiactl").exists()
+}
+
+/// Collect all GPU read-write paths: fixed devices + per-GPU `/dev/nvidiaX`.
+fn gpu_baseline_read_write_paths() -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = GPU_BASELINE_READ_WRITE_FIXED
+        .iter()
+        .map(|p| std::path::PathBuf::from(p))
+        .collect();
+
+    // Enumerate per-GPU device nodes injected by CDI (nvidia0, nvidia1, …).
+    if let Ok(entries) = std::fs::read_dir("/dev") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("nvidia") && name[6..].chars().all(|c| c.is_ascii_digit()) {
+                paths.push(entry.path());
+            }
+        }
+    }
+
+    paths
+}
+
 /// Ensure a proto `SandboxPolicy` includes the baseline filesystem paths
 /// required for proxy-mode sandboxes.  Paths are only added if missing;
 /// user-specified paths are never removed.
@@ -935,6 +982,27 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
         }
     }
 
+    if has_gpu_devices() {
+        for path in gpu_baseline_read_write_paths() {
+            let path_str = path.to_string_lossy();
+            if !fs
+                .read_write
+                .iter()
+                .any(|p| p.as_str() == path_str.as_ref())
+            {
+                if !path.exists() {
+                    debug!(
+                        path = %path.display(),
+                        "GPU baseline read-write path does not exist, skipping enrichment"
+                    );
+                    continue;
+                }
+                fs.read_write.push(path_str.into_owned());
+                modified = true;
+            }
+        }
+    }
+
     if modified {
         info!("Enriched policy with baseline filesystem paths for proxy mode");
     }
@@ -979,6 +1047,22 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
             }
             policy.filesystem.read_write.push(p);
             modified = true;
+        }
+    }
+
+    if has_gpu_devices() {
+        for p in gpu_baseline_read_write_paths() {
+            if !policy.filesystem.read_write.contains(&p) {
+                if !p.exists() {
+                    debug!(
+                        path = %p.display(),
+                        "GPU baseline read-write path does not exist, skipping enrichment"
+                    );
+                    continue;
+                }
+                policy.filesystem.read_write.push(p);
+                modified = true;
+            }
         }
     }
 
