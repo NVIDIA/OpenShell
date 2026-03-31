@@ -28,7 +28,7 @@ const REGISTRY_NAMESPACE_DEFAULT: &str = "openshell";
 /// | Input        | Output                                                       |
 /// |--------------|--------------------------------------------------------------|
 /// | `[]`         | `[]`  — no GPU                                               |
-/// | `["legacy"]` | `["legacy"]`  — pass through                                 |
+/// | `["legacy"]` | `["legacy"]`  — pass through to the non-CDI fallback path    |
 /// | `["auto"]`   | `["nvidia.com/gpu=all"]` if CDI enabled, else `["legacy"]`   |
 /// | `[cdi-ids…]` | unchanged                                                    |
 pub(crate) fn resolve_gpu_device_ids(gpu: &[String], cdi_enabled: bool) -> Vec<String> {
@@ -569,8 +569,8 @@ pub async fn ensure_container(
     //
     // The list is pre-resolved by `resolve_gpu_device_ids` before reaching here:
     //   []           — no GPU passthrough
-    //   ["legacy"]   — legacy nvidia DeviceRequest (driver="nvidia", count=-1);
-    //                  relies on the NVIDIA Container Runtime hook
+    //   ["legacy"]   — internal non-CDI fallback path: `driver="nvidia"`,
+    //                  `count=-1`; relies on the NVIDIA Container Runtime hook
     //   [cdi-ids…]   — CDI DeviceRequest (driver="cdi") with the given device IDs;
     //                  Docker resolves them against the host CDI spec at /etc/cdi/
     match device_ids {

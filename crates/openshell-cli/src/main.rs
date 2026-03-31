@@ -808,12 +808,11 @@ enum GatewayCommands {
         /// `nvidia.com/gpu` resources. Requires NVIDIA drivers and the
         /// NVIDIA Container Toolkit on the host.
         ///
-        /// An optional argument controls the injection mode:
-        ///
-        ///   --gpu            Auto-select: CDI when enabled on the daemon, legacy otherwise
-        ///   --gpu=legacy     Force legacy nvidia DeviceRequest
-        #[arg(long = "gpu", num_args = 0..=1, default_missing_value = "auto", value_name = "MODE")]
-        gpu: Option<String>,
+        /// When enabled, OpenShell auto-selects CDI when the Docker daemon has
+        /// CDI enabled and falls back to Docker's NVIDIA GPU request path
+        /// (`--gpus all`) otherwise.
+        #[arg(long)]
+        gpu: bool,
     },
 
     /// Stop the gateway (preserves state).
@@ -1117,8 +1116,10 @@ enum SandboxCommands {
         /// Request GPU resources for the sandbox.
         ///
         /// When no gateway is running, auto-bootstrap starts a GPU-enabled
-        /// gateway. GPU intent is also inferred automatically for known
-        /// GPU-designated image names such as `nvidia-gpu`.
+        /// gateway using the same automatic injection selection as
+        /// `openshell gateway start --gpu`. GPU intent is also inferred
+        /// automatically for known GPU-designated image names such as
+        /// `nvidia-gpu`.
         #[arg(long)]
         gpu: bool,
 
@@ -1575,15 +1576,10 @@ async fn main() -> Result<()> {
                 registry_token,
                 gpu,
             } => {
-                let gpu = match gpu.as_deref() {
-                    None => vec![],
-                    Some("auto") => vec!["auto".to_string()],
-                    Some("legacy") => vec!["legacy".to_string()],
-                    Some(other) => {
-                        return Err(miette::miette!(
-                            "unknown --gpu value: {other:?}; expected `legacy`"
-                        ));
-                    }
+                let gpu = if gpu {
+                    vec!["auto".to_string()]
+                } else {
+                    vec![]
                 };
                 run::gateway_admin_deploy(
                     &name,

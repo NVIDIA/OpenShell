@@ -115,8 +115,8 @@ pub struct DeployOptions {
     /// GPU device IDs to inject into the gateway container.
     ///
     /// - `[]`          — no GPU passthrough (default)
-    /// - `["legacy"]`  — legacy nvidia DeviceRequest (driver="nvidia", count=-1)
-    /// - `["auto"]`    — resolved at deploy time: CDI if enabled on the daemon, else legacy
+    /// - `["legacy"]`  — internal non-CDI fallback path (`driver="nvidia"`, `count=-1`)
+    /// - `["auto"]`    — resolved at deploy time: CDI if enabled on the daemon, else the non-CDI fallback
     /// - `[cdi-ids…]`  — CDI DeviceRequest with the given device IDs
     pub gpu: Vec<String>,
     /// When true, destroy any existing gateway resources before deploying.
@@ -193,9 +193,9 @@ impl DeployOptions {
 
     /// Set GPU device IDs for the cluster container.
     ///
-    /// Pass `vec!["auto"]` to auto-select between CDI and legacy based on Docker
-    /// version at deploy time, or an explicit list of CDI device IDs, or
-    /// `vec!["legacy"]` to force the legacy nvidia DeviceRequest.
+    /// Pass `vec!["auto"]` to auto-select between CDI and the non-CDI fallback
+    /// based on daemon capabilities at deploy time. The `legacy` sentinel is an
+    /// internal implementation detail for the fallback path.
     #[must_use]
     pub fn with_gpu(mut self, gpu: Vec<String>) -> Self {
         self.gpu = gpu;
