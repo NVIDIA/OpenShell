@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 _BASE_FILESYSTEM = sandbox_pb2.FilesystemPolicy(
     include_workdir=True,
-    read_only=["/usr", "/lib", "/etc", "/app", "/var/log"],
+    read_only=["/usr", "/lib", "/etc", "/app", "/var/log", "/proc", "/dev/urandom"],
     read_write=["/sandbox", "/tmp"],
 )
 _BASE_LANDLOCK = sandbox_pb2.LandlockPolicy(compatibility="best_effort")
