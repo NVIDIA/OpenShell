@@ -93,6 +93,10 @@ html_extra_path = ["project.json"]
 highlight_language = "console"
 
 html_theme_options = {
+    "announcement": (
+        "&#x1F514; NVIDIA OpenShell is <strong>alpha software</strong>. APIs and behavior"
+        " may change without notice. Do not use in production."
+    ),
     "icon_links": [
         {
             "name": "GitHub",
