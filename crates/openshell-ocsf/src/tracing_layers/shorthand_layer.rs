@@ -60,7 +60,7 @@ where
             if let Some(ocsf_event) = clone_current_event() {
                 let line = ocsf_event.format_shorthand();
                 if let Ok(mut w) = self.writer.lock() {
-                    let _ = writeln!(w, "{ts} {line}");
+                    let _ = writeln!(w, "{ts} OCSF {line}");
                 }
             }
         } else if self.include_non_ocsf {
