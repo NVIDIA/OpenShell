@@ -110,4 +110,46 @@ mod tests {
         let layer = OcsfShorthandLayer::new(buffer).with_non_ocsf(false);
         assert!(!layer.include_non_ocsf);
     }
+
+    #[test]
+    fn test_non_ocsf_fallback_includes_timestamp() {
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = SyncWriter(buffer.clone());
+        let layer = OcsfShorthandLayer::new(writer).with_non_ocsf(true);
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = subscriber.set_default();
+
+        tracing::info!("test message");
+
+        let output = buffer.lock().unwrap();
+        let line = String::from_utf8_lossy(&output);
+        // Should start with a timestamp like 2026-04-01T...
+        assert!(
+            line.contains('T') && line.contains('Z'),
+            "Expected timestamp in output, got: {line}"
+        );
+        assert!(
+            line.contains("test message"),
+            "Expected message, got: {line}"
+        );
+    }
+}
+
+/// Test helper: wraps `Arc<Mutex<Vec<u8>>>` so it implements `Write + Send`.
+#[cfg(test)]
+struct SyncWriter(std::sync::Arc<Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl Write for SyncWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
 }

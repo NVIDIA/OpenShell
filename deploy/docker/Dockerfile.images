@@ -139,6 +139,7 @@ COPY crates/openshell-sandbox/ crates/openshell-sandbox/
 
 RUN touch \
     crates/openshell-core/build.rs \
+    crates/openshell-ocsf/src/lib.rs \
     crates/openshell-sandbox/src/main.rs \
     proto/*.proto && \
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \

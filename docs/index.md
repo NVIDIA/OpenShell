@@ -164,6 +164,16 @@ Keep inference traffic private by routing API calls to local or self-hosted back
 {bdg-secondary}`Concept`
 :::
 
+:::{grid-item-card} Observability
+:link: observability/index
+:link-type: doc
+
+Understand sandbox logs, access them via CLI and TUI, and export OCSF JSON records.
+
++++
+{bdg-secondary}`How-To`
+:::
+
 :::{grid-item-card} Reference
 :link: reference/default-policy
 :link-type: doc
@@ -246,6 +256,16 @@ reference/gateway-auth
 reference/default-policy
 reference/policy-schema
 reference/support-matrix
+```
+
+```{toctree}
+:caption: Observability
+:hidden:
+
+observability/index
+observability/logging
+observability/accessing-logs
+observability/ocsf-json-export
 ```
 
 ```{toctree}
