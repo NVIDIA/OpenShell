@@ -203,54 +203,57 @@ impl VmConfig {
                 binary: default_runtime_gvproxy_path(),
             },
             reset: false,
-            gateway_name: DEFAULT_GATEWAY_NAME.to_string(),
+            gateway_name: format!("{GATEWAY_NAME_PREFIX}-default"),
         }
     }
 }
 
-/// Default gateway metadata name used by the legacy single-instance layout.
-pub const DEFAULT_GATEWAY_NAME: &str = "openshell-vm";
+/// Base prefix for gateway metadata names.
+const GATEWAY_NAME_PREFIX: &str = "openshell-vm";
 
-/// Resolve the gateway metadata name for an optional instance name.
-pub fn gateway_name(instance_name: Option<&str>) -> Result<String, VmError> {
-    match instance_name {
-        Some(name) => Ok(format!(
-            "{DEFAULT_GATEWAY_NAME}-{}",
-            sanitize_instance_name(name)?
-        )),
-        None => Ok(DEFAULT_GATEWAY_NAME.to_string()),
-    }
+/// Resolve the gateway metadata name for an instance name.
+pub fn gateway_name(instance_name: &str) -> Result<String, VmError> {
+    Ok(format!(
+        "{GATEWAY_NAME_PREFIX}-{}",
+        sanitize_instance_name(instance_name)?
+    ))
 }
 
-/// Resolve the rootfs path for a named instance.
+/// Resolve the rootfs path for a named instance (including the default gateway).
+///
+/// Layout: `$XDG_DATA_HOME/openshell/openshell-vm/{version}/instances/{name}/rootfs`
 pub fn named_rootfs_dir(instance_name: &str) -> Result<PathBuf, VmError> {
     let name = sanitize_instance_name(instance_name)?;
-    let base = openshell_bootstrap::paths::default_rootfs_dir()
-        .map_err(|e| VmError::RuntimeState(format!("resolve default VM rootfs: {e}")))?;
-    let parent = base.parent().ok_or_else(|| {
-        VmError::RuntimeState(format!("default rootfs has no parent: {}", base.display()))
-    })?;
-    Ok(parent.join("instances").join(name).join("rootfs"))
+    let base = openshell_bootstrap::paths::openshell_vm_base_dir()
+        .map_err(|e| VmError::RuntimeState(format!("resolve openshell-vm base dir: {e}")))?;
+    Ok(base
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("instances")
+        .join(name)
+        .join("rootfs"))
 }
 
-/// Ensure a named instance rootfs exists, cloning from the default rootfs
-/// on first use.
+/// Ensure a named instance rootfs exists, extracting from the embedded
+/// rootfs tarball on first use.
+///
+/// The default (unnamed) gateway should be routed here as `"default"`.
 pub fn ensure_named_rootfs(instance_name: &str) -> Result<PathBuf, VmError> {
     let instance_rootfs = named_rootfs_dir(instance_name)?;
     if instance_rootfs.is_dir() {
         return Ok(instance_rootfs);
     }
 
-    let default_rootfs = openshell_bootstrap::paths::default_rootfs_dir()
-        .map_err(|e| VmError::RuntimeState(format!("resolve default VM rootfs: {e}")))?;
-    if !default_rootfs.is_dir() {
-        return Err(VmError::RootfsNotFound {
-            path: default_rootfs.display().to_string(),
-        });
+    if embedded::has_embedded_rootfs() {
+        // Clean up rootfs directories left by older binary versions.
+        embedded::cleanup_old_rootfs()?;
+
+        embedded::extract_rootfs_to(&instance_rootfs)?;
+        return Ok(instance_rootfs);
     }
 
-    clone_rootfs(&default_rootfs, &instance_rootfs)?;
-    Ok(instance_rootfs)
+    Err(VmError::RootfsNotFound {
+        path: instance_rootfs.display().to_string(),
+    })
 }
 
 fn sanitize_instance_name(name: &str) -> Result<String, VmError> {
@@ -273,54 +276,6 @@ fn sanitize_instance_name(name: &str) -> Result<String, VmError> {
     }
 
     Ok(out)
-}
-
-fn clone_rootfs(source: &Path, dest: &Path) -> Result<(), VmError> {
-    let parent = dest.parent().ok_or_else(|| {
-        VmError::RuntimeState(format!("instance rootfs has no parent: {}", dest.display()))
-    })?;
-    std::fs::create_dir_all(parent).map_err(|e| {
-        VmError::RuntimeState(format!(
-            "create instance parent dir {}: {e}",
-            parent.display()
-        ))
-    })?;
-
-    let status = if cfg!(target_os = "macos") {
-        let clone_status = std::process::Command::new("cp")
-            .args(["-c", "-R"])
-            .arg(source)
-            .arg(dest)
-            .status()
-            .map_err(|e| VmError::RuntimeState(format!("clone rootfs with cp failed: {e}")))?;
-        if clone_status.success() {
-            clone_status
-        } else {
-            std::process::Command::new("cp")
-                .args(["-R"])
-                .arg(source)
-                .arg(dest)
-                .status()
-                .map_err(|e| VmError::RuntimeState(format!("copy rootfs with cp failed: {e}")))?
-        }
-    } else {
-        std::process::Command::new("cp")
-            .args(["-a", "--reflink=auto"])
-            .arg(source)
-            .arg(dest)
-            .status()
-            .map_err(|e| VmError::RuntimeState(format!("clone rootfs with cp failed: {e}")))?
-    };
-
-    if !status.success() {
-        return Err(VmError::RuntimeState(format!(
-            "failed to clone rootfs {} -> {}",
-            source.display(),
-            dest.display()
-        )));
-    }
-
-    Ok(())
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -430,10 +385,11 @@ pub fn default_runtime_gvproxy_path() -> PathBuf {
         .join("gvproxy")
 }
 
-/// Check if the given path matches the expected default rootfs location.
-fn is_default_rootfs_path(path: &Path) -> bool {
-    // Check if path matches the pattern: ~/.local/share/openshell/openshell-vm/.../rootfs
-    path.to_string_lossy().contains("openshell/openshell-vm") && path.ends_with("rootfs")
+/// Check if the given path looks like an openshell-vm instance rootfs.
+fn is_instance_rootfs_path(path: &Path) -> bool {
+    // Matches: .../openshell/openshell-vm/.../instances/.../rootfs
+    let s = path.to_string_lossy();
+    s.contains("openshell/openshell-vm") && s.contains("instances") && path.ends_with("rootfs")
 }
 
 #[cfg(target_os = "macos")]
@@ -900,11 +856,9 @@ fn path_to_cstring(path: &Path) -> Result<CString, VmError> {
 /// Returns the VM exit code (from `waitpid`).
 #[allow(clippy::similar_names)]
 pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
-    // Auto-extract embedded rootfs if using default path and it doesn't exist
-    if !config.rootfs.is_dir() {
-        if is_default_rootfs_path(&config.rootfs) && embedded::has_embedded_rootfs() {
-            embedded::ensure_rootfs_extracted()?;
-        }
+    // Auto-extract embedded rootfs if using an instance path and it doesn't exist
+    if !config.rootfs.is_dir() && is_instance_rootfs_path(&config.rootfs) && embedded::has_embedded_rootfs() {
+        embedded::extract_rootfs_to(&config.rootfs)?;
     }
 
     // Validate rootfs

@@ -538,8 +538,7 @@ fn rootfs_key(rootfs: &Path) -> String {
 }
 
 fn default_rootfs() -> Result<PathBuf, VmError> {
-    openshell_bootstrap::paths::default_rootfs_dir()
-        .map_err(|e| VmError::RuntimeState(format!("resolve default VM rootfs: {e}")))
+    crate::named_rootfs_dir("default")
 }
 
 fn load_vm_runtime_state(rootfs: Option<&Path>) -> Result<VmRuntimeState, VmError> {

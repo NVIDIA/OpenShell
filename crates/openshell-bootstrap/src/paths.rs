@@ -26,16 +26,6 @@ pub fn last_sandbox_path(gateway: &str) -> Result<PathBuf> {
     Ok(gateways_dir()?.join(gateway).join("last_sandbox"))
 }
 
-/// Default rootfs directory for gateway microVMs.
-///
-/// Location: `$XDG_DATA_HOME/openshell/openshell-vm/rootfs`
-pub fn default_rootfs_dir() -> Result<PathBuf> {
-    Ok(xdg_data_dir()?
-        .join("openshell")
-        .join("openshell-vm")
-        .join("rootfs"))
-}
-
 /// Base directory for openshell-vm data (without version).
 ///
 /// Location: `$XDG_DATA_HOME/openshell/openshell-vm/`

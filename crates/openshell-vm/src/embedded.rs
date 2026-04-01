@@ -157,54 +157,65 @@ pub fn runtime_cache_path() -> Result<PathBuf, VmError> {
     runtime_cache_dir()
 }
 
-/// Ensures the embedded rootfs is extracted to the cache directory.
+/// Extract the embedded rootfs to the given destination directory.
 ///
-/// Returns the path to the rootfs directory.
+/// If the destination already exists, it is returned as-is (no re-extraction).
+/// Otherwise the embedded `rootfs.tar.zst` is decompressed and unpacked into `dest`.
 ///
-/// On first call, this extracts the compressed embedded rootfs tarball to the cache.
-/// Subsequent calls return the cached path if valid.
-pub fn ensure_rootfs_extracted() -> Result<PathBuf, VmError> {
-    // Check if embedded rootfs is available (non-empty)
+/// A `.version` marker is written after successful extraction so that
+/// version-mismatched rootfs directories are detected and rebuilt.
+pub fn extract_rootfs_to(dest: &Path) -> Result<(), VmError> {
     if resources::ROOTFS.is_empty() {
         return Err(VmError::HostSetup(
             "Rootfs not embedded. Build with: mise run vm:build:embedded".to_string(),
         ));
     }
 
-    let rootfs_dir = rootfs_cache_dir()?;
-    let version_marker = rootfs_dir.join(".version");
+    let version_marker = dest.join(".version");
 
-    // Check if already extracted with correct version
+    // Already extracted with the correct version — nothing to do.
     if version_marker.exists() {
         if let Ok(cached_version) = fs::read_to_string(&version_marker) {
             if cached_version.trim() == VERSION {
                 tracing::debug!(
-                    path = %rootfs_dir.display(),
+                    path = %dest.display(),
                     "Using cached rootfs"
                 );
-                return Ok(rootfs_dir);
+                return Ok(());
             }
         }
     }
 
-    // Clean up old versions before extracting new one
-    cleanup_old_rootfs_versions(&rootfs_dir)?;
-
-    // Remove existing if present (version mismatch)
-    if rootfs_dir.exists() {
-        eprintln!("Removing outdated rootfs...");
-        fs::remove_dir_all(&rootfs_dir)
+    // Remove existing if present (version mismatch or incomplete extraction).
+    if dest.exists() {
+        eprintln!("Removing outdated rootfs at {}...", dest.display());
+        fs::remove_dir_all(dest)
             .map_err(|e| VmError::HostSetup(format!("remove old rootfs: {e}")))?;
     }
 
-    // Extract with progress bar
-    extract_rootfs_with_progress(resources::ROOTFS, &rootfs_dir)?;
+    // Extract with progress bar.
+    extract_rootfs_with_progress(resources::ROOTFS, dest)?;
 
-    // Write version marker
+    // Write version marker.
     fs::write(&version_marker, VERSION)
         .map_err(|e| VmError::HostSetup(format!("write rootfs version marker: {e}")))?;
 
-    Ok(rootfs_dir)
+    Ok(())
+}
+
+/// Clean up rootfs directories from older versions.
+///
+/// Call this periodically (e.g. at startup) to reclaim disk from previous
+/// releases. Removes all version directories under the openshell-vm base
+/// except the current version.
+pub fn cleanup_old_rootfs() -> Result<(), VmError> {
+    let base = rootfs_cache_base()?;
+    if !base.exists() {
+        return Ok(());
+    }
+
+    let current_version_dir = base.join(VERSION);
+    cleanup_old_versions_in_base(&base, &current_version_dir)
 }
 
 /// Check if the rootfs is embedded (non-empty).
@@ -226,12 +237,6 @@ fn runtime_cache_base() -> Result<PathBuf, VmError> {
     Ok(base.join("openshell").join("vm-runtime"))
 }
 
-fn rootfs_cache_dir() -> Result<PathBuf, VmError> {
-    let base = openshell_core::paths::xdg_data_dir()
-        .map_err(|e| VmError::HostSetup(format!("resolve XDG data dir: {e}")))?;
-    Ok(base.join("openshell").join("openshell-vm").join("rootfs"))
-}
-
 fn rootfs_cache_base() -> Result<PathBuf, VmError> {
     let base = openshell_core::paths::xdg_data_dir()
         .map_err(|e| VmError::HostSetup(format!("resolve XDG data dir: {e}")))?;
@@ -240,10 +245,6 @@ fn rootfs_cache_base() -> Result<PathBuf, VmError> {
 
 fn cleanup_old_versions(current_dir: &Path) -> Result<(), VmError> {
     cleanup_old_versions_in_base(&runtime_cache_base()?, current_dir)
-}
-
-fn cleanup_old_rootfs_versions(current_dir: &Path) -> Result<(), VmError> {
-    cleanup_old_versions_in_base(&rootfs_cache_base()?, current_dir)
 }
 
 fn cleanup_old_versions_in_base(base: &Path, current_dir: &Path) -> Result<(), VmError> {

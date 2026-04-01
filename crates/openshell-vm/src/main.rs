@@ -4,8 +4,9 @@
 //! Standalone openshell-vm binary.
 //!
 //! Boots a libkrun microVM running the OpenShell control plane (k3s +
-//! openshell-server). By default it uses the pre-built rootfs at
-//! `~/.local/share/openshell/openshell-vm/rootfs`.
+//! openshell-server). Each named instance gets its own rootfs extracted from
+//! the embedded tarball at
+//! `~/.local/share/openshell/openshell-vm/{version}/instances/<name>/rootfs`.
 //!
 //! # Codesigning (macOS)
 //!
@@ -32,18 +33,18 @@ struct Cli {
     command: Option<GatewayCommand>,
 
     /// Path to the rootfs directory (aarch64 Linux).
-    /// Defaults to `~/.local/share/openshell/openshell-vm/rootfs`.
+    /// Overrides the default instance-based rootfs resolution.
     #[arg(long, value_hint = ValueHint::DirPath)]
     rootfs: Option<PathBuf>,
 
     /// Named VM instance.
     ///
-    /// When set, the rootfs resolves to
-    /// `~/.local/share/openshell/openshell-vm/instances/<name>/rootfs`.
-    /// For launch mode, the instance rootfs is cloned from the default
-    /// rootfs on first use.
-    #[arg(long, conflicts_with = "rootfs")]
-    name: Option<String>,
+    /// The rootfs resolves to
+    /// `~/.local/share/openshell/openshell-vm/{version}/instances/<name>/rootfs`.
+    /// Each instance gets its own rootfs extracted from the embedded tarball
+    /// on first use.
+    #[arg(long, default_value = "default", conflicts_with = "rootfs")]
+    name: String,
 
     /// Executable path inside the VM. When set, runs this instead of
     /// the default k3s server.
@@ -142,11 +143,10 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         }
         return Ok(openshell_vm::exec_running_vm(
             openshell_vm::VmExecOptions {
-                rootfs: match (cli.rootfs, cli.name.as_deref()) {
-                    (Some(path), _) => Some(path),
-                    (None, Some(name)) => Some(openshell_vm::named_rootfs_dir(name)?),
-                    (None, None) => None,
-                },
+                rootfs: Some(
+                    cli.rootfs
+                        .unwrap_or(openshell_vm::named_rootfs_dir(&cli.name)?),
+                ),
                 command,
                 workdir,
                 env,
@@ -168,13 +168,12 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         }
     };
 
-    let rootfs = match (cli.rootfs, cli.name.as_deref()) {
-        (Some(path), _) => path,
-        (None, Some(name)) => openshell_vm::ensure_named_rootfs(name)?,
-        (None, None) => openshell_bootstrap::paths::default_rootfs_dir()?,
-    };
+    let rootfs = cli
+        .rootfs
+        .map(Ok)
+        .unwrap_or_else(|| openshell_vm::ensure_named_rootfs(&cli.name))?;
 
-    let gateway_name = openshell_vm::gateway_name(cli.name.as_deref())?;
+    let gateway_name = openshell_vm::gateway_name(&cli.name)?;
 
     let mut config = if let Some(exec_path) = cli.exec {
         openshell_vm::VmConfig {
