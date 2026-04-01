@@ -857,7 +857,10 @@ fn path_to_cstring(path: &Path) -> Result<CString, VmError> {
 #[allow(clippy::similar_names)]
 pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
     // Auto-extract embedded rootfs if using an instance path and it doesn't exist
-    if !config.rootfs.is_dir() && is_instance_rootfs_path(&config.rootfs) && embedded::has_embedded_rootfs() {
+    if !config.rootfs.is_dir()
+        && is_instance_rootfs_path(&config.rootfs)
+        && embedded::has_embedded_rootfs()
+    {
         embedded::extract_rootfs_to(&config.rootfs)?;
     }
 
