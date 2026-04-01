@@ -1404,32 +1404,22 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     // The TOCTOU window between lstat and chown is not exploitable because
     // no untrusted process is running yet (the child has not been forked).
     for path in &policy.filesystem.read_write {
-        // Virtual filesystems (/proc, /sys) are kernel-managed — skip chown
-        // and mkdir.  These paths are added to the Landlock ruleset only;
-        // ownership changes are meaningless and may fail (symlinks like
-        // /proc/self, permission errors on sysfs nodes).
-        let is_virtual_fs = path.starts_with("/proc") || path.starts_with("/sys");
-
-        if is_virtual_fs {
-            debug!(path = %path.display(), "Skipping chown for virtual filesystem path");
-        } else {
-            // Check for symlinks before touching the path.  Character/block devices
-            // (e.g. /dev/null) are legitimate read_write entries and must be allowed.
-            if let Ok(meta) = std::fs::symlink_metadata(path) {
-                if meta.file_type().is_symlink() {
-                    return Err(miette::miette!(
-                        "read_write path '{}' is a symlink — refusing to chown (potential privilege escalation)",
-                        path.display()
-                    ));
-                }
-            } else {
-                debug!(path = %path.display(), "Creating read_write directory");
-                std::fs::create_dir_all(path).into_diagnostic()?;
+        // Check for symlinks before touching the path.  Character/block devices
+        // (e.g. /dev/null) are legitimate read_write entries and must be allowed.
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return Err(miette::miette!(
+                    "read_write path '{}' is a symlink — refusing to chown (potential privilege escalation)",
+                    path.display()
+                ));
             }
-
-            debug!(path = %path.display(), ?uid, ?gid, "Setting ownership on read_write directory");
-            chown(path, uid, gid).into_diagnostic()?;
+        } else {
+            debug!(path = %path.display(), "Creating read_write directory");
+            std::fs::create_dir_all(path).into_diagnostic()?;
         }
+
+        debug!(path = %path.display(), ?uid, ?gid, "Setting ownership on read_write directory");
+        chown(path, uid, gid).into_diagnostic()?;
     }
 
     Ok(())
