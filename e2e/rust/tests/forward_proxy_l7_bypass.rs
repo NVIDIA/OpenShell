@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression test: the forward proxy path must reject requests to endpoints
-//! that have L7 rules configured.  Before the fix, plain `http://` requests
-//! (which use the forward proxy, not CONNECT) bypassed per-request method/path
-//! enforcement entirely.
+//! Regression tests: the forward proxy path must evaluate L7 rules for
+//! endpoints that have them configured.  Allowed requests (e.g. GET on a
+//! read-only endpoint) should succeed; denied requests (e.g. POST) should
+//! receive 403.
 
 #![cfg(feature = "e2e")]
 
@@ -145,6 +145,7 @@ network_policies:
       - host: host.openshell.internal
         port: {port}
         protocol: rest
+        enforcement: enforce
         allowed_ips:
           - "172.0.0.0/8"
         rules:
@@ -155,6 +156,7 @@ network_policies:
       - path: /usr/bin/curl
       - path: /usr/bin/python*
       - path: /usr/local/bin/python*
+      - path: /sandbox/.uv/python/*/bin/python*
 "#
     );
     file.write_all(policy.as_bytes())
@@ -164,24 +166,21 @@ network_policies:
     Ok(file)
 }
 
-/// The forward proxy path (plain http:// via HTTP_PROXY) must return 403 for
-/// endpoints with L7 rules, forcing clients through the CONNECT tunnel where
-/// per-request method/path inspection actually happens.
+/// GET /allowed should succeed — the L7 policy explicitly allows it.
 #[tokio::test]
-async fn forward_proxy_rejects_l7_configured_endpoint() {
+async fn forward_proxy_allows_l7_permitted_request() {
     let server = DockerServer::start()
         .await
         .expect("start docker test server");
-    let policy = write_policy_with_l7_rules(server.port).expect("write custom policy");
+    let policy =
+        write_policy_with_l7_rules(server.port)
+            .expect("write custom policy");
     let policy_path = policy
         .path()
         .to_str()
         .expect("temp policy path should be utf-8")
         .to_string();
 
-    // Python script that tries a plain http:// request (forward proxy path).
-    // HTTP_PROXY is set automatically by the sandbox, so urllib will use the
-    // forward proxy for http:// URLs (not CONNECT).
     let script = format!(
         r#"
 import urllib.request, urllib.error, json, sys
@@ -208,10 +207,60 @@ except Exception as e:
     .await
     .expect("sandbox create");
 
-    // The forward proxy should return 403 because the endpoint has L7 rules.
+    // L7 policy allows GET /allowed — should succeed.
+    assert!(
+        guard.create_output.contains("\"status\": 200"),
+        "expected 200 for L7-allowed GET, got:\n{}",
+        guard.create_output
+    );
+}
+
+/// POST /allowed should be denied — the L7 policy only allows GET.
+#[tokio::test]
+async fn forward_proxy_denies_l7_blocked_request() {
+    let server = DockerServer::start()
+        .await
+        .expect("start docker test server");
+    let policy =
+        write_policy_with_l7_rules(server.port)
+            .expect("write custom policy");
+    let policy_path = policy
+        .path()
+        .to_str()
+        .expect("temp policy path should be utf-8")
+        .to_string();
+
+    let script = format!(
+        r#"
+import urllib.request, urllib.error, json, sys
+url = "http://host.openshell.internal:{port}/allowed"
+req = urllib.request.Request(url, data=b"test", method="POST")
+try:
+    resp = urllib.request.urlopen(req, timeout=15)
+    print(json.dumps({{"status": resp.status, "error": None}}))
+except urllib.error.HTTPError as e:
+    print(json.dumps({{"status": e.code, "error": str(e)}}))
+except Exception as e:
+    print(json.dumps({{"status": -1, "error": str(e)}}))
+"#,
+        port = server.port,
+    );
+
+    let guard = SandboxGuard::create(&[
+        "--policy",
+        &policy_path,
+        "--",
+        "python3",
+        "-c",
+        &script,
+    ])
+    .await
+    .expect("sandbox create");
+
+    // L7 policy denies POST — should return 403.
     assert!(
         guard.create_output.contains("\"status\": 403"),
-        "expected 403 from forward proxy for L7-configured endpoint, got:\n{}",
+        "expected 403 for L7-denied POST, got:\n{}",
         guard.create_output
     );
 }

@@ -1355,7 +1355,7 @@ pub async fn gateway_admin_deploy(
     disable_gateway_auth: bool,
     registry_username: Option<&str>,
     registry_token: Option<&str>,
-    gpu: bool,
+    gpu: Vec<String>,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
@@ -2045,7 +2045,16 @@ pub async fn sandbox_create(
         name: name.unwrap_or_default().to_string(),
     };
 
-    let response = client.create_sandbox(request).await.into_diagnostic()?;
+    let response = match client.create_sandbox(request).await {
+        Ok(resp) => resp,
+        Err(status) if status.code() == Code::AlreadyExists => {
+            return Err(miette::miette!(
+                "{}\n\nhint: delete it first with: openshell sandbox delete <name>\n      or use a different name",
+                status.message()
+            ));
+        }
+        Err(status) => return Err(status).into_diagnostic(),
+    };
     let sandbox = response
         .into_inner()
         .sandbox
@@ -3481,6 +3490,7 @@ pub async fn gateway_inference_set(
     model_id: &str,
     route_name: &str,
     no_verify: bool,
+    timeout_secs: u64,
     tls: &TlsOptions,
 ) -> Result<()> {
     let progress = if std::io::stdout().is_terminal() {
@@ -3504,6 +3514,7 @@ pub async fn gateway_inference_set(
             route_name: route_name.to_string(),
             verify: false,
             no_verify,
+            timeout_secs,
         })
         .await;
 
@@ -3525,6 +3536,7 @@ pub async fn gateway_inference_set(
     println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
     println!("  {} {}", "Model:".dimmed(), configured.model_id);
     println!("  {} {}", "Version:".dimmed(), configured.version);
+    print_timeout(configured.timeout_secs);
     if configured.validation_performed {
         println!("  {}", "Validated Endpoints:".dimmed());
         for endpoint in configured.validated_endpoints {
@@ -3540,11 +3552,12 @@ pub async fn gateway_inference_update(
     model_id: Option<&str>,
     route_name: &str,
     no_verify: bool,
+    timeout_secs: Option<u64>,
     tls: &TlsOptions,
 ) -> Result<()> {
-    if provider_name.is_none() && model_id.is_none() {
+    if provider_name.is_none() && model_id.is_none() && timeout_secs.is_none() {
         return Err(miette::miette!(
-            "at least one of --provider or --model must be specified"
+            "at least one of --provider, --model, or --timeout must be specified"
         ));
     }
 
@@ -3561,6 +3574,7 @@ pub async fn gateway_inference_update(
 
     let provider = provider_name.unwrap_or(&current.provider_name);
     let model = model_id.unwrap_or(&current.model_id);
+    let timeout = timeout_secs.unwrap_or(current.timeout_secs);
 
     let progress = if std::io::stdout().is_terminal() {
         let spinner = ProgressBar::new_spinner();
@@ -3582,6 +3596,7 @@ pub async fn gateway_inference_update(
             route_name: route_name.to_string(),
             verify: false,
             no_verify,
+            timeout_secs: timeout,
         })
         .await;
 
@@ -3603,6 +3618,7 @@ pub async fn gateway_inference_update(
     println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
     println!("  {} {}", "Model:".dimmed(), configured.model_id);
     println!("  {} {}", "Version:".dimmed(), configured.version);
+    print_timeout(configured.timeout_secs);
     if configured.validation_performed {
         println!("  {}", "Validated Endpoints:".dimmed());
         for endpoint in configured.validated_endpoints {
@@ -3639,6 +3655,7 @@ pub async fn gateway_inference_get(
         println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
         println!("  {} {}", "Model:".dimmed(), configured.model_id);
         println!("  {} {}", "Version:".dimmed(), configured.version);
+        print_timeout(configured.timeout_secs);
     } else {
         // Show both routes by default.
         print_inference_route(&mut client, "Gateway inference", "").await;
@@ -3666,6 +3683,7 @@ async fn print_inference_route(
             println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
             println!("  {} {}", "Model:".dimmed(), configured.model_id);
             println!("  {} {}", "Version:".dimmed(), configured.version);
+            print_timeout(configured.timeout_secs);
         }
         Err(e) if e.code() == Code::NotFound => {
             println!("{}", format!("{label}:").cyan().bold());
@@ -3677,6 +3695,14 @@ async fn print_inference_route(
             println!();
             println!("  {} {}", "Error:".red(), e.message());
         }
+    }
+}
+
+fn print_timeout(timeout_secs: u64) {
+    if timeout_secs == 0 {
+        println!("  {} {}s (default)", "Timeout:".dimmed(), 60);
+    } else {
+        println!("  {} {}s", "Timeout:".dimmed(), timeout_secs);
     }
 }
 

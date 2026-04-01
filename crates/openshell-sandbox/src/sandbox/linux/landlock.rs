@@ -5,11 +5,11 @@
 
 use crate::policy::{LandlockCompatibility, SandboxPolicy};
 use landlock::{
-    ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreatedAttr,
+    ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, PathFdError, Ruleset,
+    RulesetAttr, RulesetCreatedAttr,
 };
 use miette::{IntoDiagnostic, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
@@ -29,6 +29,7 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
+    let total_paths = read_only.len() + read_write.len();
     let abi = ABI::V2;
     info!(
         abi = ?abi,
@@ -38,47 +39,61 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
         "Applying Landlock filesystem sandbox"
     );
 
+    let compatibility = &policy.landlock.compatibility;
+
     let result: Result<()> = (|| {
         let access_all = AccessFs::from_all(abi);
         let access_read = AccessFs::from_read(abi);
 
         let mut ruleset = Ruleset::default();
         ruleset = ruleset
-            .set_compatibility(compat_level(&policy.landlock.compatibility))
+            .set_compatibility(compat_level(compatibility))
             .handle_access(access_all)
             .into_diagnostic()?;
 
         let mut ruleset = ruleset.create().into_diagnostic()?;
+        let mut rules_applied: usize = 0;
 
-        for path in read_only {
-            debug!(path = %path.display(), "Landlock allow read-only");
-            ruleset = ruleset
-                .add_rule(PathBeneath::new(
-                    PathFd::new(path).into_diagnostic()?,
-                    access_read,
-                ))
-                .into_diagnostic()?;
+        for path in &read_only {
+            if let Some(path_fd) = try_open_path(path, compatibility)? {
+                debug!(path = %path.display(), "Landlock allow read-only");
+                ruleset = ruleset
+                    .add_rule(PathBeneath::new(path_fd, access_read))
+                    .into_diagnostic()?;
+                rules_applied += 1;
+            }
         }
 
-        for path in read_write {
-            debug!(path = %path.display(), "Landlock allow read-write");
-            ruleset = ruleset
-                .add_rule(PathBeneath::new(
-                    PathFd::new(path).into_diagnostic()?,
-                    access_all,
-                ))
-                .into_diagnostic()?;
+        for path in &read_write {
+            if let Some(path_fd) = try_open_path(path, compatibility)? {
+                debug!(path = %path.display(), "Landlock allow read-write");
+                ruleset = ruleset
+                    .add_rule(PathBeneath::new(path_fd, access_all))
+                    .into_diagnostic()?;
+                rules_applied += 1;
+            }
         }
+
+        if rules_applied == 0 {
+            return Err(miette::miette!(
+                "Landlock ruleset has zero valid paths — all {} path(s) failed to open. \
+                 Refusing to apply an empty ruleset that would block all filesystem access.",
+                total_paths,
+            ));
+        }
+
+        let skipped = total_paths - rules_applied;
+        info!(
+            rules_applied,
+            skipped, "Landlock ruleset built successfully"
+        );
 
         ruleset.restrict_self().into_diagnostic()?;
         Ok(())
     })();
 
     if let Err(err) = result {
-        if matches!(
-            policy.landlock.compatibility,
-            LandlockCompatibility::BestEffort
-        ) {
+        if matches!(compatibility, LandlockCompatibility::BestEffort) {
             warn!(
                 error = %err,
                 "Landlock filesystem sandbox is UNAVAILABLE — running WITHOUT filesystem restrictions. \
@@ -92,9 +107,177 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Attempt to open a path for Landlock rule creation.
+///
+/// In `BestEffort` mode, inaccessible paths (missing, permission denied, symlink
+/// loops, etc.) are skipped with a warning and `Ok(None)` is returned so the
+/// caller can continue building the ruleset from the remaining valid paths.
+///
+/// In `HardRequirement` mode, any failure is fatal — the caller propagates the
+/// error, which ultimately aborts sandbox startup.
+fn try_open_path(path: &Path, compatibility: &LandlockCompatibility) -> Result<Option<PathFd>> {
+    match PathFd::new(path) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(err) => {
+            let reason = classify_path_fd_error(&err);
+            let is_not_found = matches!(
+                &err,
+                PathFdError::OpenCall { source, .. }
+                    if source.kind() == std::io::ErrorKind::NotFound
+            );
+            match compatibility {
+                LandlockCompatibility::BestEffort => {
+                    // NotFound is expected for stale baseline paths (e.g.
+                    // /app baked into the server-stored policy but absent
+                    // in this container image).  Log at debug! to avoid
+                    // polluting SSH exec stdout — the pre_exec hook
+                    // inherits the tracing subscriber whose writer targets
+                    // fd 1 (the pipe/PTY).
+                    //
+                    // Other errors (permission denied, symlink loops, etc.)
+                    // are genuinely unexpected and logged at warn!.
+                    if is_not_found {
+                        debug!(
+                            path = %path.display(),
+                            reason,
+                            "Skipping non-existent Landlock path (best-effort mode)"
+                        );
+                    } else {
+                        warn!(
+                            path = %path.display(),
+                            error = %err,
+                            reason,
+                            "Skipping inaccessible Landlock path (best-effort mode)"
+                        );
+                    }
+                    Ok(None)
+                }
+                LandlockCompatibility::HardRequirement => Err(miette::miette!(
+                    "Landlock path unavailable in hard_requirement mode: {} ({}): {}",
+                    path.display(),
+                    reason,
+                    err,
+                )),
+            }
+        }
+    }
+}
+
+/// Classify a [`PathFdError`] into a human-readable reason.
+///
+/// `PathFd::new()` wraps `open(path, O_PATH | O_CLOEXEC)` which can fail for
+/// several reasons beyond simple non-existence. The `PathFdError::OpenCall`
+/// variant wraps the underlying `std::io::Error`.
+fn classify_path_fd_error(err: &PathFdError) -> &'static str {
+    match err {
+        PathFdError::OpenCall { source, .. } => classify_io_error(source),
+        // PathFdError is #[non_exhaustive], handle future variants gracefully.
+        _ => "unexpected error",
+    }
+}
+
+/// Classify a `std::io::Error` into a human-readable reason string.
+fn classify_io_error(err: &std::io::Error) -> &'static str {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => "path does not exist",
+        std::io::ErrorKind::PermissionDenied => "permission denied",
+        _ => match err.raw_os_error() {
+            Some(40) => "too many symlink levels",           // ELOOP
+            Some(36) => "path name too long",                // ENAMETOOLONG
+            Some(20) => "path component is not a directory", // ENOTDIR
+            _ => "unexpected error",
+        },
+    }
+}
+
 fn compat_level(level: &LandlockCompatibility) -> CompatLevel {
     match level {
         LandlockCompatibility::BestEffort => CompatLevel::BestEffort,
         LandlockCompatibility::HardRequirement => CompatLevel::HardRequirement,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_open_path_best_effort_returns_none_for_missing_path() {
+        let result = try_open_path(
+            &PathBuf::from("/nonexistent/openshell/test/path"),
+            &LandlockCompatibility::BestEffort,
+        );
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn try_open_path_hard_requirement_errors_for_missing_path() {
+        let result = try_open_path(
+            &PathBuf::from("/nonexistent/openshell/test/path"),
+            &LandlockCompatibility::HardRequirement,
+        );
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("hard_requirement"),
+            "error should mention hard_requirement mode: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("does not exist"),
+            "error should include the classified reason: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn try_open_path_succeeds_for_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = try_open_path(dir.path(), &LandlockCompatibility::BestEffort);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn classify_not_found() {
+        let err = std::io::Error::from_raw_os_error(libc::ENOENT);
+        assert_eq!(classify_io_error(&err), "path does not exist");
+    }
+
+    #[test]
+    fn classify_permission_denied() {
+        let err = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_eq!(classify_io_error(&err), "permission denied");
+    }
+
+    #[test]
+    fn classify_symlink_loop() {
+        let err = std::io::Error::from_raw_os_error(libc::ELOOP);
+        assert_eq!(classify_io_error(&err), "too many symlink levels");
+    }
+
+    #[test]
+    fn classify_name_too_long() {
+        let err = std::io::Error::from_raw_os_error(libc::ENAMETOOLONG);
+        assert_eq!(classify_io_error(&err), "path name too long");
+    }
+
+    #[test]
+    fn classify_not_a_directory() {
+        let err = std::io::Error::from_raw_os_error(libc::ENOTDIR);
+        assert_eq!(classify_io_error(&err), "path component is not a directory");
+    }
+
+    #[test]
+    fn classify_unknown_error() {
+        let err = std::io::Error::from_raw_os_error(libc::EIO);
+        assert_eq!(classify_io_error(&err), "unexpected error");
+    }
+
+    #[test]
+    fn classify_path_fd_error_extracts_io_error() {
+        // Use PathFd::new on a non-existent path to get a real PathFdError
+        // (the OpenCall variant is #[non_exhaustive] and can't be constructed directly).
+        let err = PathFd::new("/nonexistent/openshell/classify/test").unwrap_err();
+        assert_eq!(classify_path_fd_error(&err), "path does not exist");
     }
 }

@@ -244,6 +244,20 @@ impl OpenShell for OpenShellService {
             ..Default::default()
         };
 
+        // Reject duplicate names early, before touching the index or store.
+        // This mirrors the provider-creation pattern (see `create_provider`).
+        let existing = self
+            .state
+            .store
+            .get_message_by_name::<Sandbox>(&name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
+        if existing.is_some() {
+            return Err(Status::already_exists(format!(
+                "sandbox '{name}' already exists"
+            )));
+        }
+
         // Persist to the store FIRST so the sandbox watcher always finds
         // the record with `spec` populated.  If we created the k8s
         // resource first, the watcher could race us and write a fallback

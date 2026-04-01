@@ -271,6 +271,90 @@ def _forward_proxy_raw():
     return fn
 
 
+def _proxy_connect_then_http_with_server():
+    """Return a closure that starts a local HTTP server and sends CONNECT+HTTP."""
+
+    def fn(proxy_host, proxy_port, target_host, target_port, method="GET", path="/"):
+        import json as _json
+        import socket
+        import threading
+        import time
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                body = b"connect-server-ok"
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                self.send_response(200)
+                body = b"connect-server-ok"
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        srv = HTTPServer(("0.0.0.0", int(target_port)), Handler)
+        threading.Thread(target=srv.handle_request, daemon=True).start()
+        time.sleep(0.5)
+
+        conn = socket.create_connection((proxy_host, int(proxy_port)), timeout=10)
+        try:
+            conn.sendall(
+                f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}\r\n\r\n".encode()
+            )
+            connect_resp = conn.recv(256).decode("latin1")
+            if "200" not in connect_resp:
+                return _json.dumps(
+                    {"connect_status": connect_resp.strip(), "http_status": 0}
+                )
+
+            request = (
+                f"{method} {path} HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n"
+            )
+            conn.sendall(request.encode())
+
+            data = b""
+            conn.settimeout(5)
+            try:
+                while True:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            except socket.timeout:
+                pass
+
+            response = data.decode("latin1", errors="replace")
+            status_line = response.split("\r\n")[0] if response else ""
+            status_code = (
+                int(status_line.split()[1]) if len(status_line.split()) >= 2 else 0
+            )
+
+            header_end = response.find("\r\n\r\n")
+            headers_raw = response[:header_end] if header_end > 0 else ""
+            body = response[header_end + 4 :] if header_end > 0 else ""
+
+            return _json.dumps(
+                {
+                    "connect_status": connect_resp.strip(),
+                    "http_status": status_code,
+                    "headers": headers_raw,
+                    "body": body,
+                }
+            )
+        finally:
+            conn.close()
+            srv.server_close()
+
+    return fn
+
+
 def test_policy_applies_to_exec_commands(
     sandbox: Callable[..., Sandbox],
 ) -> None:
@@ -796,6 +880,8 @@ def test_ssrf_loopback_blocked_even_with_allowed_ips(
 # L7-T6: L7 deny response is valid JSON with expected fields
 # L7-T7: L7 request logging includes structured fields
 # L7-T8: Port 443 + protocol=rest without tls=terminate warns (L7 not evaluated)
+# L7-T9: Query matcher glob/any allows and denies as expected
+# L7-T10: Rule without query matcher allows any query params
 # =============================================================================
 
 
@@ -1100,6 +1186,166 @@ def test_l7_tls_log_fields(
         assert "l7_action" in log
         assert "l7_target" in log
         assert "l7_decision" in log
+
+
+def test_l7_query_matchers_enforced(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """L7-T9: Query matcher glob/any allows and denies as expected."""
+    policy = _base_policy(
+        network_policies={
+            "query_api": sandbox_pb2.NetworkPolicyRule(
+                name="query_api",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_FORWARD_PROXY_PORT,
+                        protocol="rest",
+                        enforcement="enforce",
+                        allowed_ips=["10.200.0.0/24"],
+                        rules=[
+                            sandbox_pb2.L7Rule(
+                                allow=sandbox_pb2.L7Allow(
+                                    method="GET",
+                                    path="/download",
+                                    query={
+                                        "tag": sandbox_pb2.L7QueryMatcher(glob="foo-*"),
+                                    },
+                                ),
+                            ),
+                            sandbox_pb2.L7Rule(
+                                allow=sandbox_pb2.L7Allow(
+                                    method="GET",
+                                    path="/search",
+                                    query={
+                                        "tag": sandbox_pb2.L7QueryMatcher(
+                                            any=["foo-*", "bar-*"]
+                                        ),
+                                    },
+                                ),
+                            ),
+                        ],
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        allowed = sb.exec_python(
+            _proxy_connect_then_http_with_server(),
+            args=(
+                _PROXY_HOST,
+                _PROXY_PORT,
+                _SANDBOX_IP,
+                _FORWARD_PROXY_PORT,
+                "GET",
+                "/download?tag=foo-a&tag=foo-b",
+            ),
+        )
+        assert allowed.exit_code == 0, allowed.stderr
+        allowed_resp = json.loads(allowed.stdout)
+        assert "200" in allowed_resp["connect_status"]
+        assert allowed_resp["http_status"] == 200
+        assert "connect-server-ok" in allowed_resp["body"]
+
+        denied = sb.exec_python(
+            _proxy_connect_then_http_with_server(),
+            args=(
+                _PROXY_HOST,
+                _PROXY_PORT,
+                _SANDBOX_IP,
+                _FORWARD_PROXY_PORT,
+                "GET",
+                "/download?tag=foo-a&tag=evil",
+            ),
+        )
+        assert denied.exit_code == 0, denied.stderr
+        denied_resp = json.loads(denied.stdout)
+        assert denied_resp["http_status"] == 403
+        assert "policy_denied" in denied_resp["body"]
+
+        any_allowed = sb.exec_python(
+            _proxy_connect_then_http_with_server(),
+            args=(
+                _PROXY_HOST,
+                _PROXY_PORT,
+                _SANDBOX_IP,
+                _FORWARD_PROXY_PORT,
+                "GET",
+                "/search?tag=foo-a&tag=bar-b",
+            ),
+        )
+        assert any_allowed.exit_code == 0, any_allowed.stderr
+        any_resp = json.loads(any_allowed.stdout)
+        assert any_resp["http_status"] == 200
+        assert "connect-server-ok" in any_resp["body"]
+
+        missing_required = sb.exec_python(
+            _proxy_connect_then_http_with_server(),
+            args=(
+                _PROXY_HOST,
+                _PROXY_PORT,
+                _SANDBOX_IP,
+                _FORWARD_PROXY_PORT,
+                "GET",
+                "/download?slug=skill-1",
+            ),
+        )
+        assert missing_required.exit_code == 0, missing_required.stderr
+        missing_resp = json.loads(missing_required.stdout)
+        assert missing_resp["http_status"] == 403
+        assert "policy_denied" in missing_resp["body"]
+
+
+def test_l7_rule_without_query_matcher_allows_any_query_params(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """L7-T10: Rule without query matcher allows any query params."""
+    policy = _base_policy(
+        network_policies={
+            "query_optional": sandbox_pb2.NetworkPolicyRule(
+                name="query_optional",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_FORWARD_PROXY_PORT,
+                        protocol="rest",
+                        enforcement="enforce",
+                        allowed_ips=["10.200.0.0/24"],
+                        rules=[
+                            sandbox_pb2.L7Rule(
+                                allow=sandbox_pb2.L7Allow(
+                                    method="GET",
+                                    path="/download",
+                                ),
+                            ),
+                        ],
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(
+            _proxy_connect_then_http_with_server(),
+            args=(
+                _PROXY_HOST,
+                _PROXY_PORT,
+                _SANDBOX_IP,
+                _FORWARD_PROXY_PORT,
+                "GET",
+                "/download?tag=anything&slug=any-value",
+            ),
+        )
+        assert result.exit_code == 0, result.stderr
+        resp = json.loads(result.stdout)
+        assert "200" in resp["connect_status"]
+        assert resp["http_status"] == 200
+        assert "connect-server-ok" in resp["body"]
 
 
 # =============================================================================

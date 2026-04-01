@@ -10,6 +10,7 @@
 //! works for both plaintext TCP and TLS-terminated connections.
 
 use miette::Result;
+use std::collections::HashMap;
 use std::future::Future;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -31,6 +32,8 @@ pub struct L7Request {
     pub action: String,
     /// Target: URL path for REST, empty for SQL.
     pub target: String,
+    /// Decoded query parameter multimap for REST requests.
+    pub query_params: HashMap<String, Vec<String>>,
     /// Raw request header bytes (request line + headers for HTTP, message for SQL).
     /// May include overflow body bytes read during header parsing.
     pub raw_header: Vec<u8>,

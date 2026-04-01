@@ -149,7 +149,7 @@ async fn send_backend_request(
         }
         Err(_) => body,
     };
-    builder = builder.body(body);
+    builder = builder.body(body).timeout(route.timeout);
 
     builder.send().await.map_err(|e| {
         if e.is_timeout() {
@@ -468,6 +468,7 @@ mod tests {
             protocols: protocols.iter().map(|p| (*p).to_string()).collect(),
             auth,
             default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+            timeout: crate::config::DEFAULT_ROUTE_TIMEOUT,
         }
     }
 

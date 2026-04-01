@@ -178,7 +178,11 @@ pub async fn run_bootstrap(
     {
         options = options.with_gateway_host(host);
     }
-    options = options.with_gpu(gpu);
+    options = options.with_gpu(if gpu {
+        vec!["auto".to_string()]
+    } else {
+        vec![]
+    });
 
     let handle = deploy_gateway_with_panel(options, &gateway_name, location).await?;
     let server = handle.gateway_endpoint().to_string();

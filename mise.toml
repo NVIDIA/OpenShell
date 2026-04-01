@@ -10,6 +10,7 @@ redactions = ["*_TOKEN", "*_PASSWORD"]
 
 [settings]
 experimental = true
+python.precompiled_flavor = "install_only_stripped"
 
 [tools]
 python = "3.13.12"

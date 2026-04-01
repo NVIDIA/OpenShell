@@ -28,12 +28,13 @@ content:
 
 This page covers the managed local inference endpoint (`https://inference.local`). External inference endpoints go through sandbox `network_policies`. Refer to [Policies](/sandboxes/policies.md) for details.
 
-The configuration consists of two values:
+The configuration consists of three values:
 
 | Value | Description |
 |---|---|
 | Provider record | The credential backend OpenShell uses to authenticate with the upstream model host. |
 | Model ID | The model to use for generation requests. |
+| Timeout | Per-request timeout in seconds for upstream inference calls. Defaults to 60 seconds. |
 
 For a list of tested providers and their base URLs, refer to [Supported Inference Providers](../sandboxes/manage-providers.md#supported-inference-providers).
 
@@ -111,6 +112,17 @@ $ openshell inference set \
     --model nvidia/nemotron-3-nano-30b-a3b
 ```
 
+To override the default 60-second per-request timeout, add `--timeout`:
+
+```console
+$ openshell inference set \
+    --provider nvidia-prod \
+    --model nvidia/nemotron-3-nano-30b-a3b \
+    --timeout 300
+```
+
+The value is in seconds. When `--timeout` is omitted (or set to `0`), the default of 60 seconds applies.
+
 ## Verify the Active Config
 
 Confirm that the provider and model are set correctly:
@@ -121,6 +133,7 @@ Gateway inference:
 
   Provider: nvidia-prod
   Model: nvidia/nemotron-3-nano-30b-a3b
+  Timeout: 300s
   Version: 1
 ```
 
@@ -136,6 +149,12 @@ Or switch providers without repeating the current model:
 
 ```console
 $ openshell inference update --provider openai-prod
+```
+
+Or change only the timeout:
+
+```console
+$ openshell inference update --timeout 120
 ```
 
 ## Use the Local Endpoint from a Sandbox
@@ -182,7 +201,7 @@ A successful response confirms the privacy router can reach the configured backe
 
 - Gateway-scoped: Every sandbox using the active gateway sees the same `inference.local` backend.
 - HTTPS only: `inference.local` is intercepted only for HTTPS traffic.
-- Hot reload: Provider and inference changes are picked up within about 5 seconds by default.
+- Hot reload: Provider, model, and timeout changes are picked up by running sandboxes within about 5 seconds by default. No sandbox recreation is required.
 
 ## Next Steps
 

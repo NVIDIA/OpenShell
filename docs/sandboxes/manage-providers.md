@@ -124,6 +124,47 @@ $ openshell sandbox create -- claude
 This detects `claude` as a known tool, finds your `ANTHROPIC_API_KEY`, creates
 a provider, attaches it to the sandbox, and launches Claude Code.
 
+## How Credential Injection Works
+
+The agent process inside the sandbox never sees real credential values. At startup, the proxy replaces each credential with an opaque placeholder token in the agent's environment. When the agent sends an HTTP request containing a placeholder, the proxy resolves it to the real credential before forwarding upstream.
+
+This resolution requires the proxy to see plaintext HTTP. Endpoints must use `protocol: rest` in the policy (which auto-terminates TLS) or explicit `tls: terminate`. Endpoints without TLS termination pass traffic through as an opaque stream, and credential placeholders are forwarded unresolved.
+
+### Supported injection locations
+
+The proxy resolves credential placeholders in the following parts of an HTTP request:
+
+| Location | How the agent uses it | Example |
+|---|---|---|
+| Header value | Agent reads `$API_KEY` from env and places it in a header. | `Authorization: Bearer <placeholder>` |
+| Header value (Basic auth) | Agent base64-encodes `user:<placeholder>` in an `Authorization: Basic` header. The proxy decodes, resolves, and re-encodes. | `Authorization: Basic <base64>` |
+| Query parameter value | Agent places the placeholder in a URL query parameter. | `GET /api?key=<placeholder>` |
+| URL path segment | Agent builds a URL with the placeholder in the path. Supports concatenated patterns. | `POST /bot<placeholder>/sendMessage` |
+
+The proxy does not modify request bodies, cookies, or response content.
+
+### Fail-closed behavior
+
+If the proxy detects a credential placeholder in a request but cannot resolve it, it rejects the request with HTTP 500 instead of forwarding the raw placeholder to the upstream server. This prevents accidental credential leakage in server logs or error responses.
+
+### Example: Telegram Bot API (path-based credential)
+
+Create a provider with the Telegram bot token:
+
+```console
+$ openshell provider create --name telegram --type generic --credential TELEGRAM_BOT_TOKEN=123456:ABC-DEF
+```
+
+The agent reads `TELEGRAM_BOT_TOKEN` from its environment and builds a request like `POST /bot<placeholder>/sendMessage`. The proxy resolves the placeholder in the URL path and forwards `POST /bot123456:ABC-DEF/sendMessage` to the upstream.
+
+### Example: Google API (query parameter credential)
+
+```console
+$ openshell provider create --name google --type generic --credential YOUTUBE_API_KEY=AIzaSy-secret
+```
+
+The agent sends `GET /youtube/v3/search?part=snippet&key=<placeholder>`. The proxy resolves the placeholder in the query parameter value and percent-encodes the result before forwarding.
+
 ## Supported Provider Types
 
 The following provider types are supported.

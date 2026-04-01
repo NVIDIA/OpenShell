@@ -305,18 +305,31 @@ start from `env_clear()`, so the handshake secret is not present there.
 
 ### Proxy-Time Secret Resolution
 
-When a sandboxed tool uses one of these placeholder env vars to populate an outbound HTTP
-header (for example `Authorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY`), the
-sandbox proxy rewrites the placeholder to the real secret value immediately before the
-request is forwarded upstream.
+When a sandboxed tool uses one of these placeholder env vars in an outbound HTTP request,
+the sandbox proxy rewrites the placeholder to the real secret value immediately before the
+request is forwarded upstream. Placeholders are resolved in four locations:
 
-This applies to:
+- **HTTP header values** — exact match (`x-api-key: openshell:resolve:env:KEY`), prefixed
+  match (`Authorization: Bearer openshell:resolve:env:KEY`), and Base64-decoded Basic auth
+  tokens (`Authorization: Basic <base64(user:openshell:resolve:env:PASS)>`)
+- **URL query parameters** — for APIs that authenticate via query string
+  (e.g., `?key=openshell:resolve:env:YOUTUBE_API_KEY`)
+- **URL path segments** — for APIs that embed tokens in the URL path
+  (e.g., `/bot<placeholder>/sendMessage` for Telegram Bot API)
 
-- forward-proxy HTTP requests, and
-- L7-inspected REST requests inside CONNECT tunnels.
+This applies to forward-proxy HTTP requests, L7-inspected REST requests inside CONNECT
+tunnels, and credential-injection-only passthrough relays on TLS-terminated connections.
+
+All rewriting fails closed: if any `openshell:resolve:env:*` placeholder is detected but
+cannot be resolved, the proxy rejects the request with HTTP 500 instead of forwarding the
+raw placeholder upstream. Resolved secret values are validated for prohibited control
+characters (CR, LF, null byte) to prevent header injection (CWE-113). Path segment
+credentials are additionally validated to reject traversal sequences, path separators, and
+URI delimiters (CWE-22).
 
 The real secret value remains in supervisor memory only; it is not re-injected into the
-child process environment.
+child process environment. See [Credential injection](sandbox.md#credential-injection) for
+the full implementation details, encoding rules, and security properties.
 
 ### End-to-End Flow
 

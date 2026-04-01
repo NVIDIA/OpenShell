@@ -95,11 +95,6 @@ def _upsert_managed_inference(
             except grpc.RpcError as create_exc:
                 if create_exc.code() == grpc.StatusCode.ALREADY_EXISTS:
                     continue
-                if (
-                    create_exc.code() == grpc.StatusCode.INTERNAL
-                    and "UNIQUE constraint failed" in (create_exc.details() or "")
-                ):
-                    continue
                 raise
     else:
         raise RuntimeError("failed to upsert managed e2e provider after retries")

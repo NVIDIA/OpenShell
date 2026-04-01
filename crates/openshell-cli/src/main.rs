@@ -807,6 +807,10 @@ enum GatewayCommands {
         /// NVIDIA k8s-device-plugin so Kubernetes workloads can request
         /// `nvidia.com/gpu` resources. Requires NVIDIA drivers and the
         /// NVIDIA Container Toolkit on the host.
+        ///
+        /// When enabled, OpenShell auto-selects CDI when the Docker daemon has
+        /// CDI enabled and falls back to Docker's NVIDIA GPU request path
+        /// (`--gpus all`) otherwise.
         #[arg(long)]
         gpu: bool,
     },
@@ -937,6 +941,10 @@ enum InferenceCommands {
         /// Skip endpoint verification before saving the route.
         #[arg(long)]
         no_verify: bool,
+
+        /// Request timeout in seconds for inference calls (0 = default 60s).
+        #[arg(long, default_value_t = 0)]
+        timeout: u64,
     },
 
     /// Update gateway-level inference configuration (partial update).
@@ -957,6 +965,10 @@ enum InferenceCommands {
         /// Skip endpoint verification before saving the route.
         #[arg(long)]
         no_verify: bool,
+
+        /// Request timeout in seconds for inference calls (0 = default 60s, unchanged if omitted).
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 
     /// Get gateway-level inference provider and model.
@@ -1104,8 +1116,10 @@ enum SandboxCommands {
         /// Request GPU resources for the sandbox.
         ///
         /// When no gateway is running, auto-bootstrap starts a GPU-enabled
-        /// gateway. GPU intent is also inferred automatically for known
-        /// GPU-designated image names such as `nvidia-gpu`.
+        /// gateway using the same automatic injection selection as
+        /// `openshell gateway start --gpu`. GPU intent is also inferred
+        /// automatically for known GPU-designated image names such as
+        /// `nvidia-gpu`.
         #[arg(long)]
         gpu: bool,
 
@@ -1562,6 +1576,11 @@ async fn main() -> Result<()> {
                 registry_token,
                 gpu,
             } => {
+                let gpu = if gpu {
+                    vec!["auto".to_string()]
+                } else {
+                    vec![]
+                };
                 run::gateway_admin_deploy(
                     &name,
                     remote.as_deref(),
@@ -2026,10 +2045,11 @@ async fn main() -> Result<()> {
                     model,
                     system,
                     no_verify,
+                    timeout,
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
                     run::gateway_inference_set(
-                        endpoint, &provider, &model, route_name, no_verify, &tls,
+                        endpoint, &provider, &model, route_name, no_verify, timeout, &tls,
                     )
                     .await?;
                 }
@@ -2038,6 +2058,7 @@ async fn main() -> Result<()> {
                     model,
                     system,
                     no_verify,
+                    timeout,
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
                     run::gateway_inference_update(
@@ -2046,6 +2067,7 @@ async fn main() -> Result<()> {
                         model.as_deref(),
                         route_name,
                         no_verify,
+                        timeout,
                         &tls,
                     )
                     .await?;

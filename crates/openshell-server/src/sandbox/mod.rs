@@ -31,7 +31,6 @@ pub const SANDBOX_KIND: &str = "Sandbox";
 const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
 const SANDBOX_MANAGED_LABEL: &str = "openshell.ai/managed-by";
 const SANDBOX_MANAGED_VALUE: &str = "openshell";
-const GPU_RUNTIME_CLASS_NAME: &str = "nvidia";
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const GPU_RESOURCE_QUANTITY: &str = "1";
 
@@ -127,25 +126,6 @@ impl SandboxClient {
     }
 
     pub async fn validate_gpu_support(&self) -> Result<(), tonic::Status> {
-        let runtime_classes: Api<DynamicObject> = Api::all_with(
-            self.client.clone(),
-            &ApiResource::from_gvk(&GroupVersionKind::gvk("node.k8s.io", "v1", "RuntimeClass")),
-        );
-
-        let runtime_class_exists = runtime_classes
-            .get_opt(GPU_RUNTIME_CLASS_NAME)
-            .await
-            .map_err(|err| {
-                tonic::Status::internal(format!("check GPU runtime class failed: {err}"))
-            })?
-            .is_some();
-
-        if !runtime_class_exists {
-            return Err(tonic::Status::failed_precondition(
-                "GPU sandbox requested, but the active gateway is not GPU-enabled. To start a gateway with GPU support run: `openshell gateway start --gpu`",
-            ));
-        }
-
         let nodes: Api<Node> = Api::all(self.client.clone());
         let node_list = nodes.list(&ListParams::default()).await.map_err(|err| {
             tonic::Status::internal(format!("check GPU node capacity failed: {err}"))
@@ -869,12 +849,7 @@ fn sandbox_template_to_k8s(
     }
 
     let mut spec = serde_json::Map::new();
-    if gpu {
-        spec.insert(
-            "runtimeClassName".to_string(),
-            serde_json::json!(GPU_RUNTIME_CLASS_NAME),
-        );
-    } else if !template.runtime_class_name.is_empty() {
+    if !template.runtime_class_name.is_empty() {
         spec.insert(
             "runtimeClassName".to_string(),
             serde_json::json!(template.runtime_class_name),
@@ -1660,11 +1635,69 @@ mod tests {
 
         assert_eq!(
             pod_template["spec"]["runtimeClassName"],
-            serde_json::json!(GPU_RUNTIME_CLASS_NAME)
+            serde_json::Value::Null
         );
         assert_eq!(
             pod_template["spec"]["containers"][0]["resources"]["limits"][GPU_RESOURCE_NAME],
             serde_json::json!(GPU_RESOURCE_QUANTITY)
+        );
+    }
+
+    #[test]
+    fn gpu_sandbox_uses_template_runtime_class_name_when_set() {
+        let template = SandboxTemplate {
+            runtime_class_name: "kata-containers".to_string(),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            true,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+            "",
+        );
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("kata-containers")
+        );
+    }
+
+    #[test]
+    fn non_gpu_sandbox_uses_template_runtime_class_name_when_set() {
+        let template = SandboxTemplate {
+            runtime_class_name: "kata-containers".to_string(),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+            "",
+        );
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("kata-containers")
         );
     }
 

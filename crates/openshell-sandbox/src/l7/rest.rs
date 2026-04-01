@@ -10,6 +10,7 @@
 use crate::l7::provider::{BodyLength, L7Provider, L7Request};
 use crate::secrets::rewrite_http_header_block;
 use miette::{IntoDiagnostic, Result, miette};
+use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
@@ -46,7 +47,21 @@ impl L7Provider for RestProvider {
         reason: &str,
         client: &mut C,
     ) -> Result<()> {
-        send_deny_response(req, policy_name, reason, client).await
+        send_deny_response(req, policy_name, reason, client, None).await
+    }
+}
+
+impl RestProvider {
+    /// Deny with a redacted target for the response body.
+    pub(crate) async fn deny_with_redacted_target<C: AsyncRead + AsyncWrite + Unpin + Send>(
+        &self,
+        req: &L7Request,
+        policy_name: &str,
+        reason: &str,
+        client: &mut C,
+        redacted_target: Option<&str>,
+    ) -> Result<()> {
+        send_deny_response(req, policy_name, reason, client, redacted_target).await
     }
 }
 
@@ -116,7 +131,7 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
         .next()
         .ok_or_else(|| miette!("Missing HTTP method"))?
         .to_string();
-    let path = parts
+    let target = parts
         .next()
         .ok_or_else(|| miette!("Missing HTTP path"))?
         .to_string();
@@ -129,13 +144,94 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
 
     // Determine body framing from headers
     let body_length = parse_body_length(header_str)?;
+    let (path, query_params) = parse_target_query(&target)?;
 
     Ok(Some(L7Request {
         action: method,
         target: path,
+        query_params,
         raw_header: buf, // exact header bytes up to and including \r\n\r\n
         body_length,
     }))
+}
+
+pub(crate) fn parse_target_query(target: &str) -> Result<(String, HashMap<String, Vec<String>>)> {
+    match target.split_once('?') {
+        Some((path, query)) => Ok((path.to_string(), parse_query_params(query)?)),
+        None => Ok((target.to_string(), HashMap::new())),
+    }
+}
+
+fn parse_query_params(query: &str) -> Result<HashMap<String, Vec<String>>> {
+    let mut params: HashMap<String, Vec<String>> = HashMap::new();
+    if query.is_empty() {
+        return Ok(params);
+    }
+
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+
+        let (raw_key, raw_value) = match pair.split_once('=') {
+            Some((key, value)) => (key, value),
+            None => (pair, ""),
+        };
+        let key = decode_query_component(raw_key)?;
+        let value = decode_query_component(raw_value)?;
+        params.entry(key).or_default().push(value);
+    }
+
+    Ok(params)
+}
+
+/// Decode a single query string component (key or value).
+///
+/// Handles both RFC 3986 percent-encoding (`%20` → space) and the
+/// `application/x-www-form-urlencoded` convention (`+` → space).
+/// Decoding `+` as space matches the behavior of Python's `urllib.parse`,
+/// JavaScript's `URLSearchParams`, Go's `url.ParseQuery`, and most HTTP
+/// frameworks. Callers that need a literal `+` should send `%2B`.
+fn decode_query_component(input: &str) -> Result<String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            decoded.push(b' ');
+            i += 1;
+            continue;
+        }
+
+        if bytes[i] != b'%' {
+            decoded.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+
+        if i + 2 >= bytes.len() {
+            return Err(miette!("Invalid percent-encoding in query component"));
+        }
+
+        let hi = decode_hex_nibble(bytes[i + 1])
+            .ok_or_else(|| miette!("Invalid percent-encoding in query component"))?;
+        let lo = decode_hex_nibble(bytes[i + 2])
+            .ok_or_else(|| miette!("Invalid percent-encoding in query component"))?;
+        decoded.push((hi << 4) | lo);
+        i += 3;
+    }
+
+    String::from_utf8(decoded).map_err(|_| miette!("Query component is not valid UTF-8"))
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Forward an allowed HTTP request to upstream and relay the response back.
@@ -165,10 +261,11 @@ where
         .position(|w| w == b"\r\n\r\n")
         .map_or(req.raw_header.len(), |p| p + 4);
 
-    let rewritten_header = rewrite_http_header_block(&req.raw_header[..header_end], resolver);
+    let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
+        .map_err(|e| miette!("credential injection failed: {e}"))?;
 
     upstream
-        .write_all(&rewritten_header)
+        .write_all(&rewrite_result.rewritten)
         .await
         .into_diagnostic()?;
 
@@ -196,16 +293,21 @@ where
 }
 
 /// Send a 403 Forbidden JSON deny response.
+///
+/// When `redacted_target` is provided, it is used instead of `req.target`
+/// in the response body to avoid leaking resolved credential values.
 async fn send_deny_response<C: AsyncWrite + Unpin>(
     req: &L7Request,
     policy_name: &str,
     reason: &str,
     client: &mut C,
+    redacted_target: Option<&str>,
 ) -> Result<()> {
+    let target = redacted_target.unwrap_or(&req.target);
     let body = serde_json::json!({
         "error": "policy_denied",
         "policy": policy_name,
-        "rule": format!("{} {}", req.action, req.target),
+        "rule": format!("{} {}", req.action, target),
         "detail": reason
     });
     let body_bytes = body.to_string();
@@ -242,14 +344,22 @@ fn parse_body_length(headers: &str) -> Result<BodyLength> {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("transfer-encoding:") {
             let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
-            if val.contains("chunked") {
+            if val.split(',').any(|enc| enc.trim() == "chunked") {
                 has_te_chunked = true;
             }
         }
-        if lower.starts_with("content-length:")
-            && let Some(val) = lower.split_once(':').map(|(_, v)| v.trim())
-            && let Ok(len) = val.parse::<u64>()
-        {
+        if lower.starts_with("content-length:") {
+            let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
+            let len: u64 = val
+                .parse()
+                .map_err(|_| miette!("Request contains invalid Content-Length value"))?;
+            if let Some(prev) = cl_value {
+                if prev != len {
+                    return Err(miette!(
+                        "Request contains multiple Content-Length headers with differing values ({prev} vs {len})"
+                    ));
+                }
+            }
             cl_value = Some(len);
         }
     }
@@ -652,6 +762,7 @@ fn is_benign_close(err: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use crate::secrets::SecretResolver;
+    use base64::Engine as _;
 
     #[test]
     fn parse_content_length() {
@@ -681,6 +792,92 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_target_query_parses_duplicate_values() {
+        let (path, query) = parse_target_query("/download?tag=a&tag=b").expect("parse");
+        assert_eq!(path, "/download");
+        assert_eq!(
+            query.get("tag").cloned(),
+            Some(vec!["a".into(), "b".into()])
+        );
+    }
+
+    #[test]
+    fn parse_target_query_decodes_percent_and_plus() {
+        let (path, query) = parse_target_query("/download?slug=my%2Fskill&name=Foo+Bar").unwrap();
+        assert_eq!(path, "/download");
+        assert_eq!(
+            query.get("slug").cloned(),
+            Some(vec!["my/skill".to_string()])
+        );
+        // `+` is decoded as space per application/x-www-form-urlencoded.
+        // Literal `+` should be sent as `%2B`.
+        assert_eq!(
+            query.get("name").cloned(),
+            Some(vec!["Foo Bar".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_target_query_literal_plus_via_percent_encoding() {
+        let (_path, query) = parse_target_query("/search?q=a%2Bb").unwrap();
+        assert_eq!(
+            query.get("q").cloned(),
+            Some(vec!["a+b".to_string()]),
+            "%2B should decode to literal +"
+        );
+    }
+
+    #[test]
+    fn parse_target_query_empty_value() {
+        let (_path, query) = parse_target_query("/api?tag=").unwrap();
+        assert_eq!(
+            query.get("tag").cloned(),
+            Some(vec!["".to_string()]),
+            "key with empty value should produce empty string"
+        );
+    }
+
+    #[test]
+    fn parse_target_query_key_without_value() {
+        let (_path, query) = parse_target_query("/api?verbose").unwrap();
+        assert_eq!(
+            query.get("verbose").cloned(),
+            Some(vec!["".to_string()]),
+            "key without = should produce empty string value"
+        );
+    }
+
+    #[test]
+    fn parse_target_query_unicode_after_decoding() {
+        // "café" = c a f %C3%A9
+        let (_path, query) = parse_target_query("/search?q=caf%C3%A9").unwrap();
+        assert_eq!(
+            query.get("q").cloned(),
+            Some(vec!["café".to_string()]),
+            "percent-encoded UTF-8 should decode correctly"
+        );
+    }
+
+    #[test]
+    fn parse_target_query_empty_query_string() {
+        let (path, query) = parse_target_query("/api?").unwrap();
+        assert_eq!(path, "/api");
+        assert!(
+            query.is_empty(),
+            "empty query after ? should produce empty map"
+        );
+    }
+
+    #[test]
+    fn parse_target_query_rejects_malformed_percent_encoding() {
+        let err = parse_target_query("/download?slug=bad%2").expect_err("expected parse error");
+        assert!(
+            err.to_string().contains("percent-encoding"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// SEC-009: Reject requests with both Content-Length and Transfer-Encoding
     /// to prevent CL/TE request smuggling (RFC 7230 Section 3.3.3).
     #[test]
@@ -700,6 +897,59 @@ mod tests {
             parse_body_length(headers).is_err(),
             "Must reject request with both TE and CL"
         );
+    }
+
+    /// SEC: Reject differing duplicate Content-Length headers.
+    #[test]
+    fn reject_differing_duplicate_content_length() {
+        let headers =
+            "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 50\r\n\r\n";
+        assert!(
+            parse_body_length(headers).is_err(),
+            "Must reject differing duplicate Content-Length"
+        );
+    }
+
+    /// SEC: Accept identical duplicate Content-Length headers.
+    #[test]
+    fn accept_identical_duplicate_content_length() {
+        let headers =
+            "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\nContent-Length: 42\r\n\r\n";
+        match parse_body_length(headers).unwrap() {
+            BodyLength::ContentLength(42) => {}
+            other => panic!("Expected ContentLength(42), got {other:?}"),
+        }
+    }
+
+    /// SEC: Reject non-numeric Content-Length values.
+    #[test]
+    fn reject_non_numeric_content_length() {
+        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n";
+        assert!(
+            parse_body_length(headers).is_err(),
+            "Must reject non-numeric Content-Length"
+        );
+    }
+
+    /// SEC: Reject when second Content-Length is non-numeric (bypass test).
+    #[test]
+    fn reject_valid_then_invalid_content_length() {
+        let headers =
+            "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\nContent-Length: abc\r\n\r\n";
+        assert!(
+            parse_body_length(headers).is_err(),
+            "Must reject when any Content-Length is non-numeric"
+        );
+    }
+
+    /// SEC: Transfer-Encoding substring match must not match partial tokens.
+    #[test]
+    fn te_substring_not_chunked() {
+        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunkedx\r\n\r\n";
+        match parse_body_length(headers).unwrap() {
+            BodyLength::None => {}
+            other => panic!("Expected None for non-matching TE, got {other:?}"),
+        }
     }
 
     /// SEC-009: Bare LF in headers enables header injection.
@@ -746,6 +996,32 @@ mod tests {
         assert!(result.is_err(), "Must reject unsupported HTTP version");
     }
 
+    #[tokio::test]
+    async fn parse_http_request_splits_path_and_query_params() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(
+                    b"GET /download?slug=my%2Fskill&tag=foo&tag=bar HTTP/1.1\r\nHost: x\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let req = parse_http_request(&mut client)
+            .await
+            .expect("request should parse")
+            .expect("request should exist");
+        assert_eq!(req.target, "/download");
+        assert_eq!(
+            req.query_params.get("slug").cloned(),
+            Some(vec!["my/skill".to_string()])
+        );
+        assert_eq!(
+            req.query_params.get("tag").cloned(),
+            Some(vec!["foo".to_string(), "bar".to_string()])
+        );
+    }
+
     /// Regression test: two pipelined requests in a single write must be
     /// parsed independently.  Before the fix, the 1024-byte `read()` buffer
     /// could capture bytes from the second request, which were forwarded
@@ -770,6 +1046,7 @@ mod tests {
             .expect("expected first request");
         assert_eq!(first.action, "GET");
         assert_eq!(first.target, "/allowed");
+        assert!(first.query_params.is_empty());
         assert_eq!(
             first.raw_header, b"GET /allowed HTTP/1.1\r\nHost: example.com\r\n\r\n",
             "raw_header must contain only the first request's headers"
@@ -781,6 +1058,7 @@ mod tests {
             .expect("expected second request");
         assert_eq!(second.action, "POST");
         assert_eq!(second.target, "/blocked");
+        assert!(second.query_params.is_empty());
     }
 
     #[test]
@@ -1114,8 +1392,8 @@ mod tests {
         );
         let raw = b"GET /v1/messages HTTP/1.1\r\nAuthorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY\r\nHost: example.com\r\n\r\n";
 
-        let rewritten = rewrite_http_header_block(raw, resolver.as_ref());
-        let rewritten = String::from_utf8(rewritten).expect("utf8");
+        let result = rewrite_http_header_block(raw, resolver.as_ref()).expect("should succeed");
+        let rewritten = String::from_utf8(result.rewritten).expect("utf8");
 
         assert!(rewritten.contains("Authorization: Bearer sk-test\r\n"));
         assert!(!rewritten.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
@@ -1133,7 +1411,7 @@ mod tests {
     /// to the upstream API, causing 401 Unauthorized errors.
     #[tokio::test]
     async fn relay_request_with_resolver_rewrites_credential_placeholders() {
-        let provider_env: std::collections::HashMap<String, String> = [(
+        let provider_env: HashMap<String, String> = [(
             "NVIDIA_API_KEY".to_string(),
             "nvapi-real-secret-key".to_string(),
         )]
@@ -1149,6 +1427,7 @@ mod tests {
         let req = L7Request {
             action: "POST".to_string(),
             target: "/v1/chat/completions".to_string(),
+            query_params: HashMap::new(),
             raw_header: format!(
                 "POST /v1/chat/completions HTTP/1.1\r\n\
                  Host: integrate.api.nvidia.com\r\n\
@@ -1232,6 +1511,7 @@ mod tests {
         let req = L7Request {
             action: "POST".to_string(),
             target: "/v1/chat/completions".to_string(),
+            query_params: HashMap::new(),
             raw_header: format!(
                 "POST /v1/chat/completions HTTP/1.1\r\n\
                  Host: integrate.api.nvidia.com\r\n\
@@ -1291,6 +1571,378 @@ mod tests {
         assert!(
             !forwarded.contains("nvapi-secret"),
             "Real secret should NOT appear without resolver, got: {forwarded}"
+        );
+    }
+
+    // =========================================================================
+    // Credential injection integration tests
+    //
+    // Each test exercises a different injection location through the full
+    // relay_http_request_with_resolver pipeline: child builds an HTTP request
+    // with a placeholder, the relay rewrites it, and we verify what upstream
+    // receives.
+    // =========================================================================
+
+    /// Helper: run a request through the relay and capture what upstream receives.
+    async fn relay_and_capture(
+        raw_header: Vec<u8>,
+        body_length: BodyLength,
+        resolver: Option<&SecretResolver>,
+    ) -> Result<String> {
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        // Parse the request line to extract action and target for L7Request
+        let header_str = String::from_utf8_lossy(&raw_header);
+        let first_line = header_str.lines().next().unwrap_or("");
+        let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
+        let action = parts.first().unwrap_or(&"GET").to_string();
+        let target = parts.get(1).unwrap_or(&"/").to_string();
+
+        let req = L7Request {
+            action,
+            target,
+            query_params: HashMap::new(),
+            raw_header,
+            body_length,
+        };
+
+        let content_len = match body_length {
+            BodyLength::ContentLength(n) => n,
+            _ => 0,
+        };
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let mut total = 0;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if let Some(hdr_end) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n") {
+                    if total >= hdr_end + 4 + content_len as usize {
+                        break;
+                    }
+                }
+            }
+            upstream_side
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+            String::from_utf8_lossy(&buf[..total]).to_string()
+        });
+
+        let relay = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            relay_http_request_with_resolver(
+                &req,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                resolver,
+            ),
+        )
+        .await
+        .map_err(|_| miette!("relay timed out"))?;
+        relay?;
+
+        let forwarded = upstream_task
+            .await
+            .map_err(|e| miette!("upstream task failed: {e}"))?;
+        Ok(forwarded)
+    }
+
+    #[tokio::test]
+    async fn relay_injects_bearer_header_credential() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("API_KEY".to_string(), "sk-real-secret-key".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let placeholder = child_env.get("API_KEY").unwrap();
+
+        let raw = format!(
+            "POST /v1/chat HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Authorization: Bearer {placeholder}\r\n\
+             Content-Length: 2\r\n\r\n{{}}"
+        );
+
+        let forwarded = relay_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(2),
+            resolver.as_ref(),
+        )
+        .await
+        .expect("relay should succeed");
+
+        assert!(
+            forwarded.contains("Authorization: Bearer sk-real-secret-key\r\n"),
+            "Upstream should see real Bearer token, got: {forwarded}"
+        );
+        assert!(
+            !forwarded.contains("openshell:resolve:env:"),
+            "Placeholder leaked to upstream: {forwarded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_injects_exact_header_credential() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("CUSTOM_TOKEN".to_string(), "tok-12345".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let placeholder = child_env.get("CUSTOM_TOKEN").unwrap();
+
+        let raw = format!(
+            "GET /api/data HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             x-api-key: {placeholder}\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+
+        let forwarded = relay_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(0),
+            resolver.as_ref(),
+        )
+        .await
+        .expect("relay should succeed");
+
+        assert!(
+            forwarded.contains("x-api-key: tok-12345\r\n"),
+            "Upstream should see real x-api-key, got: {forwarded}"
+        );
+        assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_injects_basic_auth_credential() {
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("REGISTRY_PASS".to_string(), "hunter2".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let placeholder = child_env.get("REGISTRY_PASS").unwrap();
+        let encoded = b64.encode(format!("deploy:{placeholder}").as_bytes());
+
+        let raw = format!(
+            "GET /v2/_catalog HTTP/1.1\r\n\
+             Host: registry.example.com\r\n\
+             Authorization: Basic {encoded}\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+
+        let forwarded = relay_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(0),
+            resolver.as_ref(),
+        )
+        .await
+        .expect("relay should succeed");
+
+        // Extract and decode the Basic auth token from what upstream received
+        let auth_line = forwarded
+            .lines()
+            .find(|l| l.starts_with("Authorization: Basic"))
+            .expect("upstream should have Authorization header");
+        let token = auth_line
+            .strip_prefix("Authorization: Basic ")
+            .unwrap()
+            .trim();
+        let decoded = b64.decode(token).expect("valid base64");
+        let decoded_str = std::str::from_utf8(&decoded).expect("valid utf8");
+
+        assert_eq!(
+            decoded_str, "deploy:hunter2",
+            "Decoded Basic auth should contain real password"
+        );
+        assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_injects_query_param_credential() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("YOUTUBE_KEY".to_string(), "AIzaSy-secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let placeholder = child_env.get("YOUTUBE_KEY").unwrap();
+
+        let raw = format!(
+            "GET /v3/search?part=snippet&key={placeholder} HTTP/1.1\r\n\
+             Host: www.googleapis.com\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+
+        let forwarded = relay_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(0),
+            resolver.as_ref(),
+        )
+        .await
+        .expect("relay should succeed");
+
+        assert!(
+            forwarded.contains("key=AIzaSy-secret"),
+            "Upstream should see real API key in query param, got: {forwarded}"
+        );
+        assert!(
+            forwarded.contains("part=snippet"),
+            "Non-secret query params should be preserved, got: {forwarded}"
+        );
+        assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_injects_url_path_credential_telegram_style() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [(
+                "TELEGRAM_TOKEN".to_string(),
+                "123456:ABC-DEF1234ghIkl".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let placeholder = child_env.get("TELEGRAM_TOKEN").unwrap();
+
+        let raw = format!(
+            "POST /bot{placeholder}/sendMessage HTTP/1.1\r\n\
+             Host: api.telegram.org\r\n\
+             Content-Length: 2\r\n\r\n{{}}"
+        );
+
+        let forwarded = relay_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(2),
+            resolver.as_ref(),
+        )
+        .await
+        .expect("relay should succeed");
+
+        assert!(
+            forwarded.contains("POST /bot123456:ABC-DEF1234ghIkl/sendMessage HTTP/1.1"),
+            "Upstream should see real token in URL path, got: {forwarded}"
+        );
+        assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_injects_url_path_credential_standalone_segment() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("ORG_TOKEN".to_string(), "org-abc-789".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let placeholder = child_env.get("ORG_TOKEN").unwrap();
+
+        let raw = format!(
+            "GET /api/{placeholder}/resources HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+
+        let forwarded = relay_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(0),
+            resolver.as_ref(),
+        )
+        .await
+        .expect("relay should succeed");
+
+        assert!(
+            forwarded.contains("GET /api/org-abc-789/resources HTTP/1.1"),
+            "Upstream should see real token in path segment, got: {forwarded}"
+        );
+        assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_injects_combined_path_and_header_credentials() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [
+                ("PATH_TOKEN".to_string(), "tok-path-123".to_string()),
+                ("HEADER_KEY".to_string(), "sk-header-456".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let path_ph = child_env.get("PATH_TOKEN").unwrap();
+        let header_ph = child_env.get("HEADER_KEY").unwrap();
+
+        let raw = format!(
+            "POST /bot{path_ph}/send HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             x-api-key: {header_ph}\r\n\
+             Content-Length: 2\r\n\r\n{{}}"
+        );
+
+        let forwarded = relay_and_capture(
+            raw.into_bytes(),
+            BodyLength::ContentLength(2),
+            resolver.as_ref(),
+        )
+        .await
+        .expect("relay should succeed");
+
+        assert!(
+            forwarded.contains("/bottok-path-123/send"),
+            "Upstream should see real token in path, got: {forwarded}"
+        );
+        assert!(
+            forwarded.contains("x-api-key: sk-header-456\r\n"),
+            "Upstream should see real token in header, got: {forwarded}"
+        );
+        assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_fail_closed_rejects_unresolved_placeholder() {
+        // Create a resolver that knows about KEY1 but not UNKNOWN_KEY
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("KEY1".to_string(), "secret1".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let _ = child_env;
+
+        // The request references a placeholder that the resolver doesn't know
+        let raw = b"GET /api HTTP/1.1\r\n\
+             Host: example.com\r\n\
+             x-api-key: openshell:resolve:env:UNKNOWN_KEY\r\n\
+             Content-Length: 0\r\n\r\n"
+            .to_vec();
+
+        let result = relay_and_capture(raw, BodyLength::ContentLength(0), resolver.as_ref()).await;
+
+        assert!(
+            result.is_err(),
+            "Relay should fail when placeholder cannot be resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_fail_closed_rejects_unresolved_path_placeholder() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("KEY1".to_string(), "secret1".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        let raw =
+            b"GET /api/openshell:resolve:env:UNKNOWN_KEY/data HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+                .to_vec();
+
+        let result = relay_and_capture(raw, BodyLength::ContentLength(0), resolver.as_ref()).await;
+
+        assert!(
+            result.is_err(),
+            "Relay should fail when path placeholder cannot be resolved"
         );
     }
 }

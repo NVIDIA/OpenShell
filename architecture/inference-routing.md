@@ -92,10 +92,10 @@ File: `proto/inference.proto`
 
 Key messages:
 
-- `SetClusterInferenceRequest` -- `provider_name` + `model_id` + optional `no_verify` override, with verification enabled by default
-- `SetClusterInferenceResponse` -- `provider_name` + `model_id` + `version`
+- `SetClusterInferenceRequest` -- `provider_name` + `model_id` + `timeout_secs` + optional `no_verify` override, with verification enabled by default
+- `SetClusterInferenceResponse` -- `provider_name` + `model_id` + `timeout_secs` + `version`
 - `GetInferenceBundleResponse` -- `repeated ResolvedRoute routes` + `revision` + `generated_at_ms`
-- `ResolvedRoute` -- `name`, `base_url`, `protocols`, `api_key`, `model_id`, `provider_type`
+- `ResolvedRoute` -- `name`, `base_url`, `protocols`, `api_key`, `model_id`, `provider_type`, `timeout_secs`
 
 ## Data Plane (Sandbox)
 
@@ -106,7 +106,7 @@ Files:
 - `crates/openshell-sandbox/src/lib.rs` -- inference context initialization, route refresh
 - `crates/openshell-sandbox/src/grpc_client.rs` -- `fetch_inference_bundle()`
 
-In cluster mode, the sandbox starts a background refresh loop as soon as the inference context is created. The loop polls the gateway every 5 seconds by default (`OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS` override) and uses the bundle revision hash to skip no-op cache writes.
+In cluster mode, the sandbox starts a background refresh loop as soon as the inference context is created. The loop polls the gateway every 5 seconds by default (`OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS` override) and uses the bundle revision hash to skip no-op cache writes. The revision hash covers all route fields including `timeout_secs`, so any configuration change (provider, model, or timeout) triggers a cache update on the next poll.
 
 ### Interception flow
 
@@ -143,7 +143,7 @@ If no pattern matches, the proxy returns `403 Forbidden` with `{"error": "connec
 ### Route cache
 
 - `InferenceContext` holds a `Router`, the pattern list, and an `Arc<RwLock<Vec<ResolvedRoute>>>` route cache.
-- In cluster mode, `spawn_route_refresh()` polls `GetInferenceBundle` every 30 seconds (`ROUTE_REFRESH_INTERVAL_SECS`). On failure, stale routes are kept.
+- In cluster mode, `spawn_route_refresh()` polls `GetInferenceBundle` every 5 seconds (`OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS`). On failure, stale routes are kept.
 - In file mode (`--inference-routes`), routes load once at startup from YAML. No refresh task is spawned.
 - In cluster mode, an empty initial bundle still enables the inference context so the refresh task can pick up later configuration.
 
@@ -209,9 +209,11 @@ File: `crates/openshell-router/src/mock.rs`
 
 Routes with `mock://` scheme endpoints return canned responses without making HTTP requests. Mock responses are protocol-aware (OpenAI chat completion, OpenAI completion, Anthropic messages, or generic JSON). Mock routes include an `x-openshell-mock: true` response header.
 
-### HTTP client
+### Per-request timeout
 
-The router uses a `reqwest::Client` with a 60-second timeout. Timeouts and connection failures map to `RouterError::UpstreamUnavailable`.
+Each `ResolvedRoute` carries a `timeout` field (`Duration`). The `reqwest::Client` has no global timeout; instead, each outgoing request applies `.timeout(route.timeout)` on the request builder. When `timeout_secs` is `0` in the proto message, the default of 60 seconds is used (defined as `DEFAULT_ROUTE_TIMEOUT` in `config.rs`). Timeouts and connection failures map to `RouterError::UpstreamUnavailable`.
+
+Timeout changes propagate dynamically to running sandboxes. The bundle revision hash includes `timeout_secs`, so when the timeout is updated via `openshell inference update --timeout`, the refresh loop detects the revision change and updates the route cache within one polling interval (5 seconds by default).
 
 ## Standalone Route File
 
@@ -297,12 +299,15 @@ The system route is stored as a separate `InferenceRoute` record in the gateway 
 
 Cluster inference commands:
 
-- `openshell inference set --provider <name> --model <id>` -- configures user-facing cluster inference
-- `openshell inference set --system --provider <name> --model <id>` -- configures system inference
+- `openshell inference set --provider <name> --model <id> [--timeout <secs>]` -- configures user-facing cluster inference
+- `openshell inference set --system --provider <name> --model <id> [--timeout <secs>]` -- configures system inference
+- `openshell inference update [--provider <name>] [--model <id>] [--timeout <secs>]` -- updates individual fields without resetting others
 - `openshell inference get` -- displays both user and system inference configuration
 - `openshell inference get --system` -- displays only the system inference configuration
 
 The `--provider` flag references a provider record name (not a provider type). The provider must already exist in the cluster and have a supported inference type (`openai`, `anthropic`, or `nvidia`).
+
+The `--timeout` flag sets the per-request timeout in seconds for upstream inference calls. When omitted or set to `0`, the default of 60 seconds applies. Timeout changes propagate to running sandboxes within the route refresh interval (5 seconds by default).
 
 Inference writes verify by default. `--no-verify` is the explicit opt-out for endpoints that are not up yet.
 
