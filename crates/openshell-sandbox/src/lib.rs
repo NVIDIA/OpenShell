@@ -877,8 +877,22 @@ pub(crate) fn spawn_route_refresh(
 
 /// Minimum read-only paths required for a proxy-mode sandbox child process to
 /// function: dynamic linker, shared libraries, DNS resolution, CA certs,
-/// Python venv, and openshell logs.
-const PROXY_BASELINE_READ_ONLY: &[&str] = &["/usr", "/lib", "/etc", "/app", "/var/log"];
+/// Python venv, openshell logs, process info, and random bytes.
+///
+/// `/proc` and `/dev/urandom` are included here for the same reasons they
+/// appear in `restrictive_default_policy()`: virtually every process needs
+/// them.  Before the Landlock per-path fix (#677) these were effectively free
+/// because a missing path silently disabled the entire ruleset; now they must
+/// be explicit.
+const PROXY_BASELINE_READ_ONLY: &[&str] = &[
+    "/usr",
+    "/lib",
+    "/etc",
+    "/app",
+    "/var/log",
+    "/proc",
+    "/dev/urandom",
+];
 
 /// Minimum read-write paths required for a proxy-mode sandbox child process:
 /// user working directory and temporary files.
@@ -899,7 +913,16 @@ const GPU_BASELINE_READ_ONLY_FIXED: &[&str] = &["/run/nvidia-persistenced"];
 /// `/dev/nvidia-modeset`: control and UVM devices injected by CDI.
 /// Landlock READ_FILE/WRITE_FILE restricts open(2) on device files even
 /// when DAC permissions would otherwise allow it.  Device nodes need
-/// read-write because NVML opens them with O_RDWR.
+/// read-write because NVML/CUDA opens them with O_RDWR.
+///
+/// `/proc`: CUDA writes to `/proc/<pid>/task/<tid>/comm` during `cuInit()`
+/// to set thread names.  Without write access, `cuInit()` returns error 304
+/// (`cudaErrorOperatingSystem`).  We must use `/proc` (not `/proc/self/task`)
+/// because Landlock rules bind to inodes: `/proc/self/task` in the pre_exec
+/// hook resolves to the shell's PID, but child processes (python, etc.)
+/// have different PIDs and thus different procfs inodes.  Security impact
+/// is limited — writable proc entries (`oom_score_adj`, etc.) are already
+/// kernel-restricted for non-root users; Landlock is defense-in-depth.
 ///
 /// Per-GPU device files (`/dev/nvidia0`, `/dev/nvidia1`, …) are enumerated
 /// at runtime by `gpu_baseline_read_write_paths()` since the count varies.
@@ -908,6 +931,7 @@ const GPU_BASELINE_READ_WRITE_FIXED: &[&str] = &[
     "/dev/nvidia-uvm",
     "/dev/nvidia-uvm-tools",
     "/dev/nvidia-modeset",
+    "/proc",
 ];
 
 /// Returns true if GPU devices are present in the container.
@@ -1380,22 +1404,32 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     // The TOCTOU window between lstat and chown is not exploitable because
     // no untrusted process is running yet (the child has not been forked).
     for path in &policy.filesystem.read_write {
-        // Check for symlinks before touching the path.  Character/block devices
-        // (e.g. /dev/null) are legitimate read_write entries and must be allowed.
-        if let Ok(meta) = std::fs::symlink_metadata(path) {
-            if meta.file_type().is_symlink() {
-                return Err(miette::miette!(
-                    "read_write path '{}' is a symlink — refusing to chown (potential privilege escalation)",
-                    path.display()
-                ));
-            }
-        } else {
-            debug!(path = %path.display(), "Creating read_write directory");
-            std::fs::create_dir_all(path).into_diagnostic()?;
-        }
+        // Virtual filesystems (/proc, /sys) are kernel-managed — skip chown
+        // and mkdir.  These paths are added to the Landlock ruleset only;
+        // ownership changes are meaningless and may fail (symlinks like
+        // /proc/self, permission errors on sysfs nodes).
+        let is_virtual_fs = path.starts_with("/proc") || path.starts_with("/sys");
 
-        debug!(path = %path.display(), ?uid, ?gid, "Setting ownership on read_write directory");
-        chown(path, uid, gid).into_diagnostic()?;
+        if is_virtual_fs {
+            debug!(path = %path.display(), "Skipping chown for virtual filesystem path");
+        } else {
+            // Check for symlinks before touching the path.  Character/block devices
+            // (e.g. /dev/null) are legitimate read_write entries and must be allowed.
+            if let Ok(meta) = std::fs::symlink_metadata(path) {
+                if meta.file_type().is_symlink() {
+                    return Err(miette::miette!(
+                        "read_write path '{}' is a symlink — refusing to chown (potential privilege escalation)",
+                        path.display()
+                    ));
+                }
+            } else {
+                debug!(path = %path.display(), "Creating read_write directory");
+                std::fs::create_dir_all(path).into_diagnostic()?;
+            }
+
+            debug!(path = %path.display(), ?uid, ?gid, "Setting ownership on read_write directory");
+            chown(path, uid, gid).into_diagnostic()?;
+        }
     }
 
     Ok(())
