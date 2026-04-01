@@ -145,15 +145,18 @@ async fn main() -> Result<()> {
     let (_file_guard, _jsonl_guard) = if let Some((file_writer, file_guard)) = file_logging {
         let file_filter = EnvFilter::new("info");
 
-        // OCSF JSONL file: append-only, created eagerly but gated by the
-        // enabled flag. The file exists on disk even when OCSF is off (0 bytes).
-        let jsonl_logging = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/var/log/openshell-ocsf.log")
+        // OCSF JSONL file: rolling appender matching the main log file
+        // (daily rotation, 3 files max). Created eagerly but gated by the
+        // enabled flag — no JSONL is written until ocsf_logging_enabled is set.
+        let jsonl_logging = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("openshell-ocsf")
+            .filename_suffix("log")
+            .max_log_files(3)
+            .build("/var/log")
             .ok()
-            .map(|f| {
-                let (writer, guard) = tracing_appender::non_blocking(f);
+            .map(|roller| {
+                let (writer, guard) = tracing_appender::non_blocking(roller);
                 let layer = OcsfJsonlLayer::new(writer).with_enabled_flag(ocsf_enabled.clone());
                 (layer, guard)
             });
