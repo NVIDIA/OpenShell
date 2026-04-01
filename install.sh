@@ -92,9 +92,9 @@ download() {
   _output="$2"
 
   if has_cmd curl; then
-    curl -fLsS --retry 3 -o "$_output" "$_url"
+    curl -fLsS --retry 3 --max-redirs 5 -o "$_output" "$_url"
   elif has_cmd wget; then
-    wget -q --tries=3 -O "$_output" "$_url"
+    wget -q --tries=3 --max-redirect=5 -O "$_output" "$_url"
   fi
 }
 
@@ -196,7 +196,7 @@ verify_checksum() {
     error "neither 'shasum' nor 'sha256sum' found; cannot verify download integrity"
   fi
 
-  _vc_expected="$(grep "$_vc_filename" "$_vc_checksums" | awk '{print $1}')"
+  _vc_expected="$(grep -F "$_vc_filename" "$_vc_checksums" | awk '{print $1}')"
 
   if [ -z "$_vc_expected" ]; then
     error "no checksum entry found for $_vc_filename in checksums file"
