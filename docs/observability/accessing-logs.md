@@ -59,17 +59,17 @@ For durable log storage, use the log files inside the sandbox or enable [OCSF JS
 
 ## Direct Filesystem Access
 
-If you have SSH access to the sandbox, you can read the log files directly:
+Use `openshell sandbox connect` to open a shell inside the sandbox and read the log files directly:
 
 ```console
-$ ssh sandbox@<sandbox-host> cat /var/log/openshell.2026-04-01.log
+$ openshell sandbox connect my-sandbox
+sandbox@my-sandbox:~$ cat /var/log/openshell.2026-04-01.log
 ```
 
-Or through the OpenShell SSH config:
+You can also run a one-off command without an interactive shell:
 
 ```console
-$ ssh -F <(openshell sandbox ssh-config smoke-l4) openshell-smoke-l4 \
-    "cat /var/log/openshell.2026-04-01.log"
+$ openshell sandbox connect my-sandbox -- cat /var/log/openshell.2026-04-01.log
 ```
 
 The log files inside the sandbox contain the complete record, including events that may have been dropped from the gRPC push channel under load (the push channel is bounded and drops events rather than blocking).
