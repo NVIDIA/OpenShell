@@ -44,20 +44,26 @@ These events cover startup plumbing, gRPC communication, and internal state tran
 
 Network, process, filesystem, and configuration events use the [Open Cybersecurity Schema Framework (OCSF)](https://ocsf.io) format. OCSF is an open standard for normalizing security telemetry across tools and platforms. OpenShell maps sandbox events to OCSF v1.7.0 event classes.
 
-In the log file, OCSF events appear in a shorthand format designed for quick human and agent scanning:
+In the log file, OCSF events appear in a shorthand format with an `OCSF` level label, designed for quick human and agent scanning:
 
 ```
-2026-04-01T03:28:39.811Z NET:OPEN [INFO] ALLOWED /usr/bin/curl(57) -> api.github.com:443 [policy:github_api engine:opa]
-2026-04-01T03:28:39.886Z HTTP:GET [INFO] ALLOWED GET http://api.github.com/zen [policy:github_api]
-2026-04-01T03:28:40.212Z NET:OPEN [MED] DENIED /usr/bin/curl(63) -> httpbin.org:443 [policy:- engine:opa]
+2026-04-01T04:04:13.058Z INFO openshell_sandbox: Starting sandbox
+2026-04-01T04:04:13.065Z OCSF CONFIG:DISCOVERY [INFO] Server returned no policy; attempting local discovery
+2026-04-01T04:04:13.074Z INFO openshell_sandbox: Creating OPA engine from proto policy data
+2026-04-01T04:04:13.078Z OCSF CONFIG:VALIDATED [INFO] Validated 'sandbox' user exists in image
+2026-04-01T04:04:32.118Z OCSF NET:OPEN [INFO] ALLOWED /usr/bin/curl(58) -> api.github.com:443 [policy:github_api engine:opa]
+2026-04-01T04:04:32.190Z OCSF HTTP:GET [INFO] ALLOWED GET http://api.github.com/zen [policy:github_api]
+2026-04-01T04:04:32.690Z OCSF NET:OPEN [MED] DENIED /usr/bin/curl(64) -> httpbin.org:443 [policy:- engine:opa]
 ```
 
-When viewed through the CLI or TUI (which receive logs via gRPC), OCSF events are labeled with `OCSF` instead of `INFO` to distinguish them from standard tracing:
+The `OCSF` label at column 25 distinguishes structured events from standard `INFO` tracing at the same position. Both formats appear in the same file.
+
+When viewed through the CLI or TUI (which receive logs via gRPC), the same distinction applies:
 
 ```
-[1775014138.811] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/curl(57) -> api.github.com:443 [policy:github_api engine:opa]
-[1775014139.212] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(63) -> httpbin.org:443 [policy:- engine:opa]
-[1775014119.160] [sandbox] [INFO ] [openshell_sandbox] Fetching sandbox policy via gRPC
+[1775014132.118] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/curl(58) -> api.github.com:443 [policy:github_api engine:opa]
+[1775014132.690] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(64) -> httpbin.org:443 [policy:- engine:opa]
+[1775014113.058] [sandbox] [INFO ] [openshell_sandbox] Starting sandbox
 ```
 
 ## OCSF Event Classes
@@ -112,35 +118,41 @@ CLASS:ACTIVITY [SEVERITY] ACTION DETAILS [CONTEXT]
 
 ### Examples
 
-A allowed HTTPS connection:
+An allowed HTTPS connection:
 ```
-NET:OPEN [INFO] ALLOWED /usr/bin/curl(57) -> api.github.com:443 [policy:github_api engine:opa]
+OCSF NET:OPEN [INFO] ALLOWED /usr/bin/curl(58) -> api.github.com:443 [policy:github_api engine:opa]
 ```
 
 An L7 read-only policy denying a POST:
 ```
-HTTP:POST [MED] DENIED POST http://api.github.com/user/repos [policy:github_api]
+OCSF HTTP:POST [MED] DENIED POST http://api.github.com/user/repos [policy:github_api]
 ```
 
 A connection denied because no policy matched:
 ```
-NET:OPEN [MED] DENIED /usr/bin/curl(63) -> httpbin.org:443 [policy:- engine:opa]
+OCSF NET:OPEN [MED] DENIED /usr/bin/curl(64) -> httpbin.org:443 [policy:- engine:opa]
 ```
 
-An SSH handshake accepted:
+Proxy and SSH servers ready:
 ```
-SSH:OPEN [INFO] ALLOWED 10.42.0.31:37494 [auth:NSSH1]
+OCSF NET:LISTEN [INFO] 10.200.0.1:3128
+OCSF SSH:LISTEN [INFO] 0.0.0.0:2222
+```
+
+An SSH handshake accepted (one event per connection):
+```
+OCSF SSH:OPEN [INFO] ALLOWED 10.42.0.52:42706 [auth:NSSH1]
 ```
 
 A process launched inside the sandbox:
 ```
-PROC:LAUNCH [INFO] sleep(49)
+OCSF PROC:LAUNCH [INFO] sleep(49)
 ```
 
 A policy reload after a settings change:
 ```
-CONFIG:DETECTED [INFO] Settings poll: config change detected [old_revision:2915564174587774909 new_revision:11008534403127604466 policy_changed:true]
-CONFIG:LOADED [INFO] Policy reloaded successfully [policy_hash:0cc0c2b525573c07]
+OCSF CONFIG:DETECTED [INFO] Settings poll: config change detected [old_revision:2915564174587774909 new_revision:11008534403127604466 policy_changed:true]
+OCSF CONFIG:LOADED [INFO] Policy reloaded successfully [policy_hash:0cc0c2b525573c07]
 ```
 
 ## Log File Location

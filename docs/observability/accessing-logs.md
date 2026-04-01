@@ -39,10 +39,10 @@ $ openshell logs smoke-l4 --source sandbox
 The CLI receives logs from the gateway over gRPC. Each line includes a timestamp, source, level, and message:
 
 ```
-[1775014138.811] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/curl(57) -> api.github.com:443 [policy:github_api engine:opa]
-[1775014138.886] [sandbox] [OCSF ] [ocsf] HTTP:GET [INFO] ALLOWED GET http://api.github.com/zen [policy:github_api]
-[1775014139.212] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(63) -> httpbin.org:443 [policy:- engine:opa]
-[1775014119.160] [sandbox] [INFO ] [openshell_sandbox] Fetching sandbox policy via gRPC
+[1775014132.118] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/curl(58) -> api.github.com:443 [policy:github_api engine:opa]
+[1775014132.190] [sandbox] [OCSF ] [ocsf] HTTP:GET [INFO] ALLOWED GET http://api.github.com/zen [policy:github_api]
+[1775014132.690] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(64) -> httpbin.org:443 [policy:- engine:opa]
+[1775014113.058] [sandbox] [INFO ] [openshell_sandbox] Starting sandbox
 ```
 
 OCSF structured events show `OCSF` as the level. Standard tracing events show `INFO`, `WARN`, or `ERROR`.
@@ -83,16 +83,19 @@ The shorthand format is designed for `grep`. Some useful patterns:
 $ grep "DENIED\|BLOCKED" /var/log/openshell.*.log
 
 # All network events
-$ grep "^NET:" /var/log/openshell.*.log
+$ grep "OCSF NET:" /var/log/openshell.*.log
 
 # All L7 enforcement decisions
-$ grep "^HTTP:" /var/log/openshell.*.log
+$ grep "OCSF HTTP:" /var/log/openshell.*.log
 
 # Security findings only
-$ grep "^FINDING:" /var/log/openshell.*.log
+$ grep "OCSF FINDING:" /var/log/openshell.*.log
 
 # Policy changes
-$ grep "^CONFIG:" /var/log/openshell.*.log
+$ grep "OCSF CONFIG:" /var/log/openshell.*.log
+
+# All OCSF events (exclude standard tracing)
+$ grep "^.* OCSF " /var/log/openshell.*.log
 
 # Events at medium severity or above
 $ grep "\[MED\]\|\[HIGH\]\|\[CRIT\]\|\[FATAL\]" /var/log/openshell.*.log
