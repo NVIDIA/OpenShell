@@ -150,7 +150,11 @@ pub async fn run_bootstrap(
     let build_options = |recreate: bool| {
         let mut opts = openshell_bootstrap::DeployOptions::new(&gateway_name)
             .with_recreate(recreate)
-            .with_gpu(gpu);
+            .with_gpu(if gpu {
+                vec!["auto".to_string()]
+            } else {
+                vec![]
+            });
         if let Some(dest) = remote {
             let mut remote_opts = openshell_bootstrap::RemoteOptions::new(dest);
             if let Some(key) = ssh_key {

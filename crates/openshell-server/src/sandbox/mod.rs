@@ -962,7 +962,6 @@ fn sandbox_template_to_k8s(
     result
 }
 
-
 fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_json::Value> {
     let mut resources =
         struct_to_json(&template.resources).unwrap_or_else(|| serde_json::json!({}));
