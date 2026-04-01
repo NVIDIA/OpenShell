@@ -902,7 +902,7 @@ const PROXY_BASELINE_READ_WRITE: &[&str] = &["/sandbox", "/tmp"];
 ///
 /// `/run/nvidia-persistenced`: NVML tries to connect to the persistenced
 /// socket at init time.  If the directory exists but Landlock denies traversal
-/// (EACCES vs ECONNREFUSED), NVML returns NVML_ERROR_INSUFFICIENT_PERMISSIONS
+/// (EACCES vs ECONNREFUSED), NVML returns `NVML_ERROR_INSUFFICIENT_PERMISSIONS`
 /// even though the daemon is optional.  Only read/traversal access is needed.
 const GPU_BASELINE_READ_ONLY: &[&str] = &["/run/nvidia-persistenced"];
 
@@ -951,8 +951,14 @@ fn enumerate_gpu_device_nodes() -> Vec<String> {
 /// Collect all baseline paths for enrichment: proxy defaults + GPU (if present).
 /// Returns `(read_only, read_write)` as owned `String` vecs.
 fn baseline_enrichment_paths() -> (Vec<String>, Vec<String>) {
-    let mut ro: Vec<String> = PROXY_BASELINE_READ_ONLY.iter().map(|&s| s.to_string()).collect();
-    let mut rw: Vec<String> = PROXY_BASELINE_READ_WRITE.iter().map(|&s| s.to_string()).collect();
+    let mut ro: Vec<String> = PROXY_BASELINE_READ_ONLY
+        .iter()
+        .map(|&s| s.to_string())
+        .collect();
+    let mut rw: Vec<String> = PROXY_BASELINE_READ_WRITE
+        .iter()
+        .map(|&s| s.to_string())
+        .collect();
 
     if has_gpu_devices() {
         ro.extend(GPU_BASELINE_READ_ONLY.iter().map(|&s| s.to_string()));
@@ -990,11 +996,12 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
     // mode (see issue #664).
     let mut modified = false;
     for path in &ro {
-        if !fs.read_only.iter().any(|p| p == path)
-            && !fs.read_write.iter().any(|p| p == path)
-        {
+        if !fs.read_only.iter().any(|p| p == path) && !fs.read_write.iter().any(|p| p == path) {
             if !std::path::Path::new(path).exists() {
-                debug!(path, "Baseline read-only path does not exist, skipping enrichment");
+                debug!(
+                    path,
+                    "Baseline read-only path does not exist, skipping enrichment"
+                );
                 continue;
             }
             fs.read_only.push(path.clone());
@@ -1004,7 +1011,10 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
     for path in &rw {
         if !fs.read_write.iter().any(|p| p == path) {
             if !std::path::Path::new(path).exists() {
-                debug!(path, "Baseline read-write path does not exist, skipping enrichment");
+                debug!(
+                    path,
+                    "Baseline read-write path does not exist, skipping enrichment"
+                );
                 continue;
             }
             fs.read_write.push(path.clone());
@@ -1032,11 +1042,12 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
     let mut modified = false;
     for path in &ro {
         let p = std::path::PathBuf::from(path);
-        if !policy.filesystem.read_only.contains(&p)
-            && !policy.filesystem.read_write.contains(&p)
-        {
+        if !policy.filesystem.read_only.contains(&p) && !policy.filesystem.read_write.contains(&p) {
             if !p.exists() {
-                debug!(path, "Baseline read-only path does not exist, skipping enrichment");
+                debug!(
+                    path,
+                    "Baseline read-only path does not exist, skipping enrichment"
+                );
                 continue;
             }
             policy.filesystem.read_only.push(p);
@@ -1047,7 +1058,10 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
         let p = std::path::PathBuf::from(path);
         if !policy.filesystem.read_write.contains(&p) {
             if !p.exists() {
-                debug!(path, "Baseline read-write path does not exist, skipping enrichment");
+                debug!(
+                    path,
+                    "Baseline read-write path does not exist, skipping enrichment"
+                );
                 continue;
             }
             policy.filesystem.read_write.push(p);
