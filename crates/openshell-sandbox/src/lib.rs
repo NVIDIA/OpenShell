@@ -898,35 +898,29 @@ const PROXY_BASELINE_READ_ONLY: &[&str] = &[
 /// user working directory and temporary files.
 const PROXY_BASELINE_READ_WRITE: &[&str] = &["/sandbox", "/tmp"];
 
-/// Fixed read-only paths required when a GPU is present.
+/// GPU read-only paths.
 ///
 /// `/run/nvidia-persistenced`: NVML tries to connect to the persistenced
-/// socket at init time.  If the directory exists but landlock denies traversal
+/// socket at init time.  If the directory exists but Landlock denies traversal
 /// (EACCES vs ECONNREFUSED), NVML returns NVML_ERROR_INSUFFICIENT_PERMISSIONS
-/// even though the daemon is optional.  Only read/traversal access is needed —
-/// NVML connects to the existing socket but does not create or modify files.
-const GPU_BASELINE_READ_ONLY_FIXED: &[&str] = &["/run/nvidia-persistenced"];
+/// even though the daemon is optional.  Only read/traversal access is needed.
+const GPU_BASELINE_READ_ONLY: &[&str] = &["/run/nvidia-persistenced"];
 
-/// Fixed read-write paths required when a GPU is present.
+/// GPU read-write paths (static).
 ///
 /// `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`,
 /// `/dev/nvidia-modeset`: control and UVM devices injected by CDI.
-/// Landlock READ_FILE/WRITE_FILE restricts open(2) on device files even
-/// when DAC permissions would otherwise allow it.  Device nodes need
-/// read-write because NVML/CUDA opens them with O_RDWR.
+/// Landlock restricts `open(2)` on device files even when DAC allows it;
+/// these need read-write because NVML/CUDA opens them with `O_RDWR`.
 ///
 /// `/proc`: CUDA writes to `/proc/<pid>/task/<tid>/comm` during `cuInit()`
-/// to set thread names.  Without write access, `cuInit()` returns error 304
-/// (`cudaErrorOperatingSystem`).  We must use `/proc` (not `/proc/self/task`)
-/// because Landlock rules bind to inodes: `/proc/self/task` in the pre_exec
-/// hook resolves to the shell's PID, but child processes (python, etc.)
-/// have different PIDs and thus different procfs inodes.  Security impact
-/// is limited — writable proc entries (`oom_score_adj`, etc.) are already
-/// kernel-restricted for non-root users; Landlock is defense-in-depth.
+/// to set thread names.  Without write access, `cuInit()` returns error 304.
+/// Must use `/proc` (not `/proc/self/task`) because Landlock rules bind to
+/// inodes and child processes have different procfs inodes than the parent.
 ///
-/// Per-GPU device files (`/dev/nvidia0`, `/dev/nvidia1`, …) are enumerated
-/// at runtime by `gpu_baseline_read_write_paths()` since the count varies.
-const GPU_BASELINE_READ_WRITE_FIXED: &[&str] = &[
+/// Per-GPU device files (`/dev/nvidia0`, …) are enumerated at runtime by
+/// `enumerate_gpu_device_nodes()` since the count varies.
+const GPU_BASELINE_READ_WRITE: &[&str] = &[
     "/dev/nvidiactl",
     "/dev/nvidia-uvm",
     "/dev/nvidia-uvm-tools",
@@ -939,33 +933,34 @@ fn has_gpu_devices() -> bool {
     std::path::Path::new("/dev/nvidiactl").exists()
 }
 
-/// Collect all GPU read-only paths (currently just the persistenced directory).
-fn gpu_baseline_read_only_paths() -> Vec<std::path::PathBuf> {
-    GPU_BASELINE_READ_ONLY_FIXED
-        .iter()
-        .map(|p| std::path::PathBuf::from(p))
-        .collect()
-}
-
-/// Collect all GPU read-write paths: fixed devices + per-GPU `/dev/nvidiaX`.
-fn gpu_baseline_read_write_paths() -> Vec<std::path::PathBuf> {
-    let mut paths: Vec<std::path::PathBuf> = GPU_BASELINE_READ_WRITE_FIXED
-        .iter()
-        .map(|p| std::path::PathBuf::from(p))
-        .collect();
-
-    // Enumerate per-GPU device nodes injected by CDI (nvidia0, nvidia1, …).
+/// Enumerate per-GPU device nodes (`/dev/nvidia0`, `/dev/nvidia1`, …).
+fn enumerate_gpu_device_nodes() -> Vec<String> {
+    let mut paths = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/dev") {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name.starts_with("nvidia") && name[6..].chars().all(|c| c.is_ascii_digit()) {
-                paths.push(entry.path());
+                paths.push(entry.path().to_string_lossy().into_owned());
             }
         }
     }
-
     paths
+}
+
+/// Collect all baseline paths for enrichment: proxy defaults + GPU (if present).
+/// Returns `(read_only, read_write)` as owned `String` vecs.
+fn baseline_enrichment_paths() -> (Vec<String>, Vec<String>) {
+    let mut ro: Vec<String> = PROXY_BASELINE_READ_ONLY.iter().map(|&s| s.to_string()).collect();
+    let mut rw: Vec<String> = PROXY_BASELINE_READ_WRITE.iter().map(|&s| s.to_string()).collect();
+
+    if has_gpu_devices() {
+        ro.extend(GPU_BASELINE_READ_ONLY.iter().map(|&s| s.to_string()));
+        rw.extend(GPU_BASELINE_READ_WRITE.iter().map(|&s| s.to_string()));
+        rw.extend(enumerate_gpu_device_nodes());
+    }
+
+    (ro, rw)
 }
 
 /// Ensure a proto `SandboxPolicy` includes the baseline filesystem paths
@@ -986,76 +981,34 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
             ..Default::default()
         });
 
-    let mut modified = false;
-    for &path in PROXY_BASELINE_READ_ONLY {
-        if !fs.read_only.iter().any(|p| p.as_str() == path) {
-            // Baseline paths are system-injected, not user-specified. Skip
-            // paths that do not exist in this container image to avoid noisy
-            // warnings from Landlock and, more critically, to prevent a single
-            // missing baseline path from abandoning the entire Landlock
-            // ruleset under best-effort mode (see issue #664).
-            if !std::path::Path::new(path).exists() {
-                debug!(
-                    path,
-                    "Baseline read-only path does not exist, skipping enrichment"
-                );
-                continue;
-            }
-            fs.read_only.push(path.to_string());
-            modified = true;
-        }
-    }
-    for &path in PROXY_BASELINE_READ_WRITE {
-        if !fs.read_write.iter().any(|p| p.as_str() == path) {
-            if !std::path::Path::new(path).exists() {
-                debug!(
-                    path,
-                    "Baseline read-write path does not exist, skipping enrichment"
-                );
-                continue;
-            }
-            fs.read_write.push(path.to_string());
-            modified = true;
-        }
-    }
+    let (ro, rw) = baseline_enrichment_paths();
 
-    if has_gpu_devices() {
-        for path in gpu_baseline_read_only_paths() {
-            let path_str = path.to_string_lossy();
-            if !fs.read_only.iter().any(|p| p.as_str() == path_str.as_ref())
-                && !fs
-                    .read_write
-                    .iter()
-                    .any(|p| p.as_str() == path_str.as_ref())
-            {
-                if !path.exists() {
-                    debug!(
-                        path = %path.display(),
-                        "GPU baseline read-only path does not exist, skipping enrichment"
-                    );
-                    continue;
-                }
-                fs.read_only.push(path_str.into_owned());
-                modified = true;
+    // Baseline paths are system-injected, not user-specified.  Skip paths
+    // that do not exist in this container image to avoid noisy warnings from
+    // Landlock and, more critically, to prevent a single missing baseline
+    // path from abandoning the entire Landlock ruleset under best-effort
+    // mode (see issue #664).
+    let mut modified = false;
+    for path in &ro {
+        if !fs.read_only.iter().any(|p| p == path)
+            && !fs.read_write.iter().any(|p| p == path)
+        {
+            if !std::path::Path::new(path).exists() {
+                debug!(path, "Baseline read-only path does not exist, skipping enrichment");
+                continue;
             }
+            fs.read_only.push(path.clone());
+            modified = true;
         }
-        for path in gpu_baseline_read_write_paths() {
-            let path_str = path.to_string_lossy();
-            if !fs
-                .read_write
-                .iter()
-                .any(|p| p.as_str() == path_str.as_ref())
-            {
-                if !path.exists() {
-                    debug!(
-                        path = %path.display(),
-                        "GPU baseline read-write path does not exist, skipping enrichment"
-                    );
-                    continue;
-                }
-                fs.read_write.push(path_str.into_owned());
-                modified = true;
+    }
+    for path in &rw {
+        if !fs.read_write.iter().any(|p| p == path) {
+            if !std::path::Path::new(path).exists() {
+                debug!(path, "Baseline read-write path does not exist, skipping enrichment");
+                continue;
             }
+            fs.read_write.push(path.clone());
+            modified = true;
         }
     }
 
@@ -1074,66 +1027,31 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
         return;
     }
 
+    let (ro, rw) = baseline_enrichment_paths();
+
     let mut modified = false;
-    for &path in PROXY_BASELINE_READ_ONLY {
+    for path in &ro {
         let p = std::path::PathBuf::from(path);
-        if !policy.filesystem.read_only.contains(&p) {
-            // Baseline paths are system-injected — skip non-existent paths to
-            // avoid Landlock ruleset abandonment (issue #664).
+        if !policy.filesystem.read_only.contains(&p)
+            && !policy.filesystem.read_write.contains(&p)
+        {
             if !p.exists() {
-                debug!(
-                    path,
-                    "Baseline read-only path does not exist, skipping enrichment"
-                );
+                debug!(path, "Baseline read-only path does not exist, skipping enrichment");
                 continue;
             }
             policy.filesystem.read_only.push(p);
             modified = true;
         }
     }
-    for &path in PROXY_BASELINE_READ_WRITE {
+    for path in &rw {
         let p = std::path::PathBuf::from(path);
         if !policy.filesystem.read_write.contains(&p) {
             if !p.exists() {
-                debug!(
-                    path,
-                    "Baseline read-write path does not exist, skipping enrichment"
-                );
+                debug!(path, "Baseline read-write path does not exist, skipping enrichment");
                 continue;
             }
             policy.filesystem.read_write.push(p);
             modified = true;
-        }
-    }
-
-    if has_gpu_devices() {
-        for p in gpu_baseline_read_only_paths() {
-            if !policy.filesystem.read_only.contains(&p)
-                && !policy.filesystem.read_write.contains(&p)
-            {
-                if !p.exists() {
-                    debug!(
-                        path = %p.display(),
-                        "GPU baseline read-only path does not exist, skipping enrichment"
-                    );
-                    continue;
-                }
-                policy.filesystem.read_only.push(p);
-                modified = true;
-            }
-        }
-        for p in gpu_baseline_read_write_paths() {
-            if !policy.filesystem.read_write.contains(&p) {
-                if !p.exists() {
-                    debug!(
-                        path = %p.display(),
-                        "GPU baseline read-write path does not exist, skipping enrichment"
-                    );
-                    continue;
-                }
-                policy.filesystem.read_write.push(p);
-                modified = true;
-            }
         }
     }
 
