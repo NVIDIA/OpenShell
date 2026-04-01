@@ -482,6 +482,12 @@ pub async fn ensure_container(
 ) -> Result<()> {
     let container_name = container_name(name);
 
+    // When an existing container is recreated due to an image change, we
+    // preserve its hostname so the new container registers with the same k3s
+    // node identity.  Without this, k3s sees a brand-new node while pods on
+    // the old (now-dead) node remain stuck in Terminating.
+    let mut preserved_hostname: Option<String> = None;
+
     // Check if the container already exists
     match docker
         .inspect_container(&container_name, None::<InspectContainerOptions>)
@@ -520,12 +526,21 @@ pub async fn ensure_container(
                 return Ok(());
             }
 
-            // Image changed — remove the stale container so we can recreate it
+            // Image changed — remove the stale container so we can recreate it.
+            // Capture the hostname before removal so the replacement container
+            // keeps the same k3s node identity.
+            preserved_hostname = info
+                .config
+                .as_ref()
+                .and_then(|c| c.hostname.clone())
+                .filter(|h| !h.is_empty());
+
             tracing::info!(
-                "Container {} exists but uses a different image (container={}, desired={}), recreating",
+                "Container {} exists but uses a different image (container={}, desired={}), recreating (preserving hostname {:?})",
                 container_name,
                 container_image_id.as_deref().map_or("unknown", truncate_id),
                 desired_id.as_deref().map_or("unknown", truncate_id),
+                preserved_hostname,
             );
 
             let _ = docker.stop_container(&container_name, None).await;
@@ -732,7 +747,14 @@ pub async fn ensure_container(
 
     let env = Some(env_vars);
 
+    // Use the preserved hostname from a previous container (image-change
+    // recreation) so k3s keeps the same node identity.  For fresh containers
+    // fall back to the Docker container name, giving a stable hostname that
+    // survives future image-change recreations.
+    let hostname = preserved_hostname.unwrap_or_else(|| container_name.clone());
+
     let config = ContainerCreateBody {
+        hostname: Some(hostname),
         image: Some(image_ref.to_string()),
         cmd: Some(cmd),
         env,
