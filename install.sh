@@ -161,6 +161,18 @@ resolve_version() {
   _latest_url="${GITHUB_URL}/releases/latest"
   _resolved="$(resolve_redirect "$_latest_url")" || error "failed to resolve latest release from ${_latest_url}"
 
+  # Validate that the redirect stayed on the expected GitHub origin.
+  # A MITM or DNS hijack could redirect to an attacker-controlled domain,
+  # which would also serve a matching checksums file (making checksum
+  # verification useless). See: https://github.com/NVIDIA/OpenShell/issues/638
+  case "$_resolved" in
+    https://github.com/${REPO}/releases/*)
+      ;;
+    *)
+      error "unexpected redirect target: ${_resolved} (expected https://github.com/${REPO}/releases/...)"
+      ;;
+  esac
+
   # Extract the tag from the resolved URL: .../releases/tag/v0.0.4 -> v0.0.4
   _version="${_resolved##*/}"
 
@@ -180,20 +192,20 @@ verify_checksum() {
   _vc_checksums="$2"
   _vc_filename="$3"
 
+  if ! has_cmd shasum && ! has_cmd sha256sum; then
+    error "neither 'shasum' nor 'sha256sum' found; cannot verify download integrity"
+  fi
+
   _vc_expected="$(grep "$_vc_filename" "$_vc_checksums" | awk '{print $1}')"
 
   if [ -z "$_vc_expected" ]; then
-    warn "no checksum found for $_vc_filename, skipping verification"
-    return 0
+    error "no checksum entry found for $_vc_filename in checksums file"
   fi
 
   if has_cmd shasum; then
     echo "$_vc_expected  $_vc_archive" | shasum -a 256 -c --quiet 2>/dev/null
   elif has_cmd sha256sum; then
     echo "$_vc_expected  $_vc_archive" | sha256sum -c --quiet 2>/dev/null
-  else
-    warn "sha256sum/shasum not found, skipping checksum verification"
-    return 0
   fi
 }
 
@@ -254,14 +266,13 @@ main() {
     error "failed to download ${_download_url}"
   fi
 
-  # Verify checksum
+  # Verify checksum (mandatory — never skip)
   info "verifying checksum..."
-  if download "$_checksums_url" "${_tmpdir}/checksums.txt"; then
-    if ! verify_checksum "${_tmpdir}/${_filename}" "${_tmpdir}/checksums.txt" "$_filename"; then
-      error "checksum verification failed for ${_filename}"
-    fi
-  else
-    warn "could not download checksums file, skipping verification"
+  if ! download "$_checksums_url" "${_tmpdir}/checksums.txt"; then
+    error "failed to download checksums file from ${_checksums_url}"
+  fi
+  if ! verify_checksum "${_tmpdir}/${_filename}" "${_tmpdir}/checksums.txt" "$_filename"; then
+    error "checksum verification failed for ${_filename}"
   fi
 
   # Extract
