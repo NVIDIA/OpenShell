@@ -1384,8 +1384,21 @@ pub async fn gateway_admin_deploy(
         }
     }
 
+    // When resuming an existing gateway (not recreating), prefer the port
+    // from stored metadata over the CLI default.  The user may have originally
+    // bootstrapped on a non-default port (e.g. `--port 8082`) and a bare
+    // `gateway start` without `--port` should honour that.
+    let effective_port = if !recreate {
+        openshell_bootstrap::load_gateway_metadata(name)
+            .ok()
+            .filter(|m| m.gateway_port > 0)
+            .map_or(port, |m| m.gateway_port)
+    } else {
+        port
+    };
+
     let mut options = DeployOptions::new(name)
-        .with_port(port)
+        .with_port(effective_port)
         .with_disable_tls(disable_tls)
         .with_disable_gateway_auth(disable_gateway_auth)
         .with_gpu(gpu)

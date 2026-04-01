@@ -429,7 +429,10 @@ where
     // See: https://github.com/NVIDIA/OpenShell/issues/463
     let deploy_result: Result<GatewayMetadata> = async {
         let device_ids = resolve_gpu_device_ids(&gpu, cdi_supported);
-        ensure_container(
+        // ensure_container returns the actual host port — which may differ from
+        // the requested `port` when reusing an existing container that was
+        // originally created with a different port.
+        let actual_port = ensure_container(
             &target_docker,
             &name,
             &image_ref,
@@ -443,16 +446,22 @@ where
             &device_ids,
         )
         .await?;
+        let port = actual_port;
         start_container(&target_docker, &name).await?;
 
         // Clean up stale k3s nodes left over from previous container instances that
-        // used the same persistent volume. Without this, pods remain scheduled on
+        // used the same persistent volume.  Without this, pods remain scheduled on
         // NotReady ghost nodes and the health check will time out.
+        //
+        // The function retries internally until kubectl becomes available (k3s may
+        // still be initialising after the container start).  It also force-deletes
+        // pods stuck in Terminating on the removed nodes so that StatefulSets can
+        // reschedule replacements immediately.
         match clean_stale_nodes(&target_docker, &name).await {
             Ok(0) => {}
-            Ok(n) => tracing::debug!("removed {n} stale node(s)"),
+            Ok(n) => tracing::info!("removed {n} stale node(s) and their orphaned pods"),
             Err(err) => {
-                tracing::debug!("stale node cleanup failed (non-fatal): {err}");
+                tracing::warn!("stale node cleanup failed (non-fatal): {err}");
             }
         }
 

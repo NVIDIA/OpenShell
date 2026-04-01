@@ -467,6 +467,9 @@ pub async fn ensure_image(
     Ok(())
 }
 
+/// Returns the actual host port the container is using.  When an existing
+/// container is reused (same image), this may differ from `gateway_port`
+/// because the container was originally created with a different port.
 pub async fn ensure_container(
     docker: &Docker,
     name: &str,
@@ -479,14 +482,8 @@ pub async fn ensure_container(
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     device_ids: &[String],
-) -> Result<()> {
+) -> Result<u16> {
     let container_name = container_name(name);
-
-    // When an existing container is recreated due to an image change, we
-    // preserve its hostname so the new container registers with the same k3s
-    // node identity.  Without this, k3s sees a brand-new node while pods on
-    // the old (now-dead) node remain stuck in Terminating.
-    let mut preserved_hostname: Option<String> = None;
 
     // Check if the container already exists
     match docker
@@ -523,24 +520,31 @@ pub async fn ensure_container(
                 // the current (just-created) network before returning.
                 let expected_net = network_name(name);
                 reconcile_container_network(docker, &container_name, &expected_net).await?;
-                return Ok(());
+
+                // Read the actual host port from the container's port bindings
+                // as a cross-check.  The caller should already pass the correct
+                // port (from stored metadata), but this catches mismatches if
+                // the container was recreated with a different port externally.
+                let actual_port = info
+                    .host_config
+                    .as_ref()
+                    .and_then(|hc| hc.port_bindings.as_ref())
+                    .and_then(|pb| pb.get("30051/tcp"))
+                    .and_then(|bindings| bindings.as_ref())
+                    .and_then(|bindings| bindings.first())
+                    .and_then(|b| b.host_port.as_ref())
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .unwrap_or(gateway_port);
+
+                return Ok(actual_port);
             }
 
             // Image changed — remove the stale container so we can recreate it.
-            // Capture the hostname before removal so the replacement container
-            // keeps the same k3s node identity.
-            preserved_hostname = info
-                .config
-                .as_ref()
-                .and_then(|c| c.hostname.clone())
-                .filter(|h| !h.is_empty());
-
             tracing::info!(
-                "Container {} exists but uses a different image (container={}, desired={}), recreating (preserving hostname {:?})",
+                "Container {} exists but uses a different image (container={}, desired={}), recreating",
                 container_name,
                 container_image_id.as_deref().map_or("unknown", truncate_id),
                 desired_id.as_deref().map_or("unknown", truncate_id),
-                preserved_hostname,
             );
 
             let _ = docker.stop_container(&container_name, None).await;
@@ -747,14 +751,7 @@ pub async fn ensure_container(
 
     let env = Some(env_vars);
 
-    // Use the preserved hostname from a previous container (image-change
-    // recreation) so k3s keeps the same node identity.  For fresh containers
-    // fall back to the Docker container name, giving a stable hostname that
-    // survives future image-change recreations.
-    let hostname = preserved_hostname.unwrap_or_else(|| container_name.clone());
-
     let config = ContainerCreateBody {
-        hostname: Some(hostname),
         image: Some(image_ref.to_string()),
         cmd: Some(cmd),
         env,
@@ -774,7 +771,7 @@ pub async fn ensure_container(
         .await
         .into_diagnostic()
         .wrap_err("failed to create gateway container")?;
-    Ok(())
+    Ok(gateway_port)
 }
 
 /// Information about a container that is holding a port we need.

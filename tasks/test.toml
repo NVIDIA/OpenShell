@@ -32,7 +32,8 @@ description = "Run Rust CLI e2e tests (requires a running cluster)"
 depends = ["cluster"]
 run = [
   "cargo build -p openshell-cli --features openshell-core/dev-settings",
-  "cargo test --manifest-path e2e/rust/Cargo.toml --features e2e",
+  # gateway_resume tests run in a dedicated CI job with their own cluster.
+  "cargo test --manifest-path e2e/rust/Cargo.toml --features e2e -- --skip gateway_resume_scenarios",
 ]
 
 ["e2e:python"]

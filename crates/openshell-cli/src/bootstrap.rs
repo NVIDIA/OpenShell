@@ -225,9 +225,13 @@ pub async fn run_bootstrap(
 
 /// Retry connecting to the gateway gRPC endpoint until it succeeds or a
 /// timeout is reached. Uses exponential backoff starting at 500 ms, doubling
-/// up to 4 s, with a total deadline of 30 s.
+/// up to 4 s, with a total deadline of 90 s.
+///
+/// The generous timeout accounts for gateway resume scenarios where stale k3s
+/// nodes must be cleaned up and workload pods rescheduled before the gRPC
+/// endpoint becomes available.
 pub(crate) async fn wait_for_grpc_ready(server: &str, tls: &TlsOptions) -> Result<()> {
-    const MAX_WAIT: Duration = Duration::from_secs(30);
+    const MAX_WAIT: Duration = Duration::from_secs(90);
     const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
     let start = std::time::Instant::now();
@@ -251,7 +255,7 @@ pub(crate) async fn wait_for_grpc_ready(server: &str, tls: &TlsOptions) -> Resul
 
     Err(last_err
         .unwrap_or_else(|| miette::miette!("timed out waiting for gateway"))
-        .wrap_err("gateway deployed but not accepting connections after 30 s"))
+        .wrap_err("gateway deployed but not accepting connections after 90 s"))
 }
 
 #[cfg(test)]

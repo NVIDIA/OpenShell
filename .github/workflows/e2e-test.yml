@@ -19,9 +19,25 @@ permissions:
 
 jobs:
   e2e:
-    name: E2E
+    name: "E2E (${{ matrix.suite }})"
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: python
+            cluster: e2e-python
+            port: "8080"
+            cmd: "mise run --no-prepare --skip-deps e2e:python"
+          - suite: rust
+            cluster: e2e-rust
+            port: "8081"
+            cmd: "mise run --no-prepare --skip-deps e2e:rust"
+          - suite: gateway-resume
+            cluster: e2e-resume
+            port: "8082"
+            cmd: "cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test gateway_resume"
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -38,6 +54,7 @@ jobs:
       OPENSHELL_REGISTRY_NAMESPACE: nvidia/openshell
       OPENSHELL_REGISTRY_USERNAME: ${{ github.actor }}
       OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+      OPENSHELL_GATEWAY: ${{ matrix.cluster }}
     steps:
       - uses: actions/checkout@v4
 
@@ -48,21 +65,26 @@ jobs:
         run: docker pull ghcr.io/nvidia/openshell/cluster:${{ inputs.image-tag }}
 
       - name: Install Python dependencies and generate protobuf stubs
+        if: matrix.suite == 'python'
         run: uv sync --frozen && mise run --no-prepare python:proto
 
-      - name: Bootstrap and deploy cluster
+      - name: Build Rust CLI
+        if: matrix.suite != 'python'
+        run: cargo build -p openshell-cli --features openshell-core/dev-settings
+
+      - name: Install SSH client
+        if: matrix.suite != 'python'
+        run: apt-get update && apt-get install -y --no-install-recommends openssh-client && rm -rf /var/lib/apt/lists/*
+
+      - name: Bootstrap cluster
         env:
           GATEWAY_HOST: host.docker.internal
-          GATEWAY_PORT: "8080"
+          GATEWAY_PORT: ${{ matrix.port }}
+          CLUSTER_NAME: ${{ matrix.cluster }}
           SKIP_IMAGE_PUSH: "1"
           SKIP_CLUSTER_IMAGE_BUILD: "1"
           OPENSHELL_CLUSTER_IMAGE: ghcr.io/nvidia/openshell/cluster:${{ inputs.image-tag }}
         run: mise run --no-prepare --skip-deps cluster
 
-      - name: Install SSH client for Rust CLI e2e tests
-        run: apt-get update && apt-get install -y --no-install-recommends openssh-client && rm -rf /var/lib/apt/lists/*
-
-      - name: Run E2E tests
-        run: |
-          mise run --no-prepare --skip-deps e2e:python
-          mise run --no-prepare --skip-deps e2e:rust
+      - name: Run tests
+        run: ${{ matrix.cmd }}

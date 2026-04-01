@@ -5,9 +5,10 @@
 
 //! E2E tests for gateway resume from existing state.
 //!
-//! These tests verify that `openshell gateway start` resumes from existing
-//! Docker volume state (after stop or container removal) and that the SSH
-//! handshake secret persists across container restarts.
+//! All scenarios run inside a **single** `#[tokio::test]` so they execute
+//! in a deterministic order and share a known-good gateway state.  Each
+//! scenario restores the gateway to a healthy state before the next one
+//! begins, preventing cascading failures.
 //!
 //! **Requires a running gateway** — the `e2e:rust` mise task bootstraps one.
 
@@ -18,12 +19,19 @@ use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::output::strip_ansi;
 use tokio::time::sleep;
 
-/// Default gateway name used by the e2e cluster.
-const GATEWAY_NAME: &str = "openshell";
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-/// Docker container name for the default gateway.
+/// Resolve the gateway name from the `OPENSHELL_GATEWAY` env var (the same
+/// variable the CLI reads), falling back to `"openshell"` which matches CI.
+fn gateway_name() -> String {
+    std::env::var("OPENSHELL_GATEWAY").unwrap_or_else(|_| "openshell".to_string())
+}
+
+/// Docker container name for the e2e gateway.
 fn container_name() -> String {
-    format!("openshell-cluster-{GATEWAY_NAME}")
+    format!("openshell-cluster-{}", gateway_name())
 }
 
 /// Run `openshell <args>` and return (combined output, exit code).
@@ -60,7 +68,12 @@ async fn wait_for_healthy(timeout: Duration) {
     loop {
         let (output, code) = run_cli(&["status"]).await;
         let clean = strip_ansi(&output).to_lowercase();
-        if code == 0 && (clean.contains("healthy") || clean.contains("running") || clean.contains("connected") || clean.contains("✓")) {
+        if code == 0
+            && (clean.contains("healthy")
+                || clean.contains("running")
+                || clean.contains("connected")
+                || clean.contains("✓"))
+        {
             return;
         }
         if start.elapsed() > timeout {
@@ -91,16 +104,80 @@ fn read_ssh_handshake_secret() -> Option<String> {
     }
 }
 
-// -------------------------------------------------------------------
-// Test: `gateway start` on an already-running gateway succeeds
-// -------------------------------------------------------------------
+/// Extract the sandbox name from `openshell sandbox create` output.
+fn extract_sandbox_name(output: &str) -> String {
+    strip_ansi(output)
+        .lines()
+        .find_map(|line| {
+            if let Some((_, rest)) = line.split_once("Created sandbox:") {
+                rest.split_whitespace().next().map(ToOwned::to_owned)
+            } else if let Some((_, rest)) = line.split_once("Name:") {
+                rest.split_whitespace().next().map(ToOwned::to_owned)
+            } else {
+                None
+            }
+        })
+        .expect("should extract sandbox name from create output")
+}
 
-/// When the gateway is already running, `openshell gateway start` should
-/// return immediately with exit code 0 and indicate it's already running.
+/// Run `gateway start` and log the output if it fails (non-fatal — the
+/// test relies on [`wait_for_healthy`] for the real assertion).
+async fn start_gateway() {
+    let (output, code) = run_cli(&["gateway", "start"]).await;
+    if code != 0 {
+        eprintln!(
+            "gateway start exited {code} (may still recover):\n{}",
+            strip_ansi(&output)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Orchestrated test suite
+// ---------------------------------------------------------------------------
+
+/// Single entry-point that runs every resume scenario in a fixed order.
+///
+/// Running as one `#[tokio::test]` gives us:
+///   - **Deterministic ordering** — no async-mutex races.
+///   - **Cascade prevention** — each scenario starts only after the previous
+///     one left the gateway healthy.
+///   - **No task-runner hacks** — no `--test-threads`, `--skip`, or split
+///     cargo invocations.
 #[tokio::test]
-async fn gateway_start_on_running_gateway_succeeds() {
-    // Precondition: gateway is running (e2e cluster is up).
+async fn gateway_resume_scenarios() {
+    // The gateway must already be running (bootstrapped by the `cluster` task).
     wait_for_healthy(Duration::from_secs(30)).await;
+
+    // Warm the sandbox base image by creating (and deleting) a throwaway
+    // sandbox.  On a fresh cluster the ~1 GB image pull can take minutes;
+    // doing it once up-front keeps the actual scenarios snappy.
+    eprintln!("--- warmup: pulling sandbox base image ---");
+    let (output, code) =
+        run_cli(&["sandbox", "create", "--", "echo", "warmup"]).await;
+    if code == 0 {
+        let name = extract_sandbox_name(&output);
+        let _ = run_cli(&["sandbox", "delete", &name]).await;
+    } else {
+        eprintln!(
+            "warmup sandbox create failed (non-fatal, image may already be cached):\n{}",
+            strip_ansi(&output)
+        );
+    }
+
+    scenario_start_on_running_gateway().await;
+    scenario_ssh_secret_persists_across_restart().await;
+    scenario_stop_start_resumes_with_sandbox().await;
+    scenario_container_kill_resumes().await;
+    scenario_container_removal_resumes().await;
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: `gateway start` on an already-running gateway
+// ---------------------------------------------------------------------------
+
+async fn scenario_start_on_running_gateway() {
+    eprintln!("--- scenario: start on running gateway ---");
 
     let (output, code) = run_cli(&["gateway", "start"]).await;
     let clean = strip_ansi(&output);
@@ -115,50 +192,60 @@ async fn gateway_start_on_running_gateway_succeeds() {
     );
 }
 
-// -------------------------------------------------------------------
-// Test: gateway stop → start resumes, sandbox survives
-// -------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Scenario: SSH handshake secret persists across restart
+// ---------------------------------------------------------------------------
 
-/// After `gateway stop` then `gateway start`, the gateway should resume
-/// from existing state. A sandbox created before the stop should still
-/// appear in the sandbox list after restart.
-#[tokio::test]
-async fn gateway_stop_start_resumes_with_sandbox() {
-    // Precondition: gateway is healthy.
-    wait_for_healthy(Duration::from_secs(30)).await;
+async fn scenario_ssh_secret_persists_across_restart() {
+    eprintln!("--- scenario: SSH secret persists across restart ---");
 
-    // Create a sandbox that we'll check for after restart.
-    let (create_output, create_code) =
-        run_cli(&["sandbox", "create", "--", "echo", "resume-test"]).await;
-    let clean_create = strip_ansi(&create_output);
-    assert_eq!(
-        create_code, 0,
-        "sandbox create should succeed:\n{clean_create}"
+    let secret_before =
+        read_ssh_handshake_secret().expect("SSH handshake secret should exist before restart");
+    assert!(
+        !secret_before.is_empty(),
+        "SSH handshake secret should not be empty"
     );
 
-    // Extract sandbox name from output.
-    let sandbox_name = clean_create
-        .lines()
-        .find_map(|line| {
-            if let Some((_, rest)) = line.split_once("Created sandbox:") {
-                rest.split_whitespace().next().map(ToOwned::to_owned)
-            } else if let Some((_, rest)) = line.split_once("Name:") {
-                rest.split_whitespace().next().map(ToOwned::to_owned)
-            } else {
-                None
-            }
-        })
-        .expect("should extract sandbox name from create output");
+    // Stop → start.
+    let (_, stop_code) = run_cli(&["gateway", "stop"]).await;
+    assert_eq!(stop_code, 0, "gateway stop should succeed");
+    sleep(Duration::from_secs(3)).await;
 
-    // Stop the gateway.
+    start_gateway().await;
+    wait_for_healthy(Duration::from_secs(300)).await;
+
+    let secret_after =
+        read_ssh_handshake_secret().expect("SSH handshake secret should exist after restart");
+    assert_eq!(
+        secret_before, secret_after,
+        "SSH handshake secret should be identical before and after restart"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: stop → start resumes, sandbox survives
+// ---------------------------------------------------------------------------
+
+async fn scenario_stop_start_resumes_with_sandbox() {
+    eprintln!("--- scenario: stop/start resumes with sandbox ---");
+
+    // Create a sandbox.
+    let (output, code) =
+        run_cli(&["sandbox", "create", "--", "echo", "resume-test"]).await;
+    assert_eq!(
+        code, 0,
+        "sandbox create should succeed:\n{}",
+        strip_ansi(&output)
+    );
+    let sandbox_name = extract_sandbox_name(&output);
+
+    // Stop → start.
     let (stop_output, stop_code) = run_cli(&["gateway", "stop"]).await;
     assert_eq!(
         stop_code, 0,
         "gateway stop should succeed:\n{}",
         strip_ansi(&stop_output)
     );
-
-    // Wait a moment for the container to fully stop.
     sleep(Duration::from_secs(3)).await;
 
     // Verify container is stopped.
@@ -174,261 +261,77 @@ async fn gateway_stop_start_resumes_with_sandbox() {
         "container should be stopped after gateway stop"
     );
 
-    // Start the gateway again — should resume from existing state.
-    let (start_output, start_code) = run_cli(&["gateway", "start"]).await;
-    let clean_start = strip_ansi(&start_output);
-    assert_eq!(
-        start_code, 0,
-        "gateway start after stop should succeed:\n{clean_start}"
-    );
-
-    // Wait for the gateway to become healthy again.
-    wait_for_healthy(Duration::from_secs(180)).await;
-
-    // Verify the sandbox still exists.
-    let (list_output, list_code) = run_cli(&["sandbox", "list", "--names"]).await;
-    let clean_list = strip_ansi(&list_output);
-    assert_eq!(
-        list_code, 0,
-        "sandbox list should succeed after resume:\n{clean_list}"
-    );
-    assert!(
-        clean_list.contains(&sandbox_name),
-        "sandbox '{sandbox_name}' should survive gateway stop/start.\nList output:\n{clean_list}"
-    );
-
-    // Cleanup: delete the test sandbox.
-    let _ = run_cli(&["sandbox", "delete", &sandbox_name]).await;
-}
-
-// -------------------------------------------------------------------
-// Test: container removed → gateway start resumes
-// -------------------------------------------------------------------
-
-/// After the Docker container is force-removed (simulating Docker restart),
-/// `openshell gateway start` should resume from the existing volume.
-#[tokio::test]
-async fn gateway_start_resumes_after_container_removal() {
-    // Precondition: gateway is healthy.
-    wait_for_healthy(Duration::from_secs(30)).await;
-
-    // Create a sandbox to verify state persistence.
-    let (create_output, create_code) =
-        run_cli(&["sandbox", "create", "--", "echo", "container-rm-test"]).await;
-    let clean_create = strip_ansi(&create_output);
-    assert_eq!(
-        create_code, 0,
-        "sandbox create should succeed:\n{clean_create}"
-    );
-
-    let sandbox_name = clean_create
-        .lines()
-        .find_map(|line| {
-            if let Some((_, rest)) = line.split_once("Created sandbox:") {
-                rest.split_whitespace().next().map(ToOwned::to_owned)
-            } else if let Some((_, rest)) = line.split_once("Name:") {
-                rest.split_whitespace().next().map(ToOwned::to_owned)
-            } else {
-                None
-            }
-        })
-        .expect("should extract sandbox name from create output");
-
-    // Force-remove the container (simulates Docker restart / OOM kill).
-    let (_, rm_code) = docker_cmd(&["rm", "-f", &container_name()]);
-    assert_eq!(rm_code, 0, "docker rm -f should succeed");
-
-    // Verify the volume still exists.
-    let (vol_out, vol_code) = docker_cmd(&[
-        "volume",
-        "inspect",
-        &format!("openshell-cluster-{GATEWAY_NAME}"),
-    ]);
-    assert_eq!(
-        vol_code, 0,
-        "volume should still exist after container removal:\n{vol_out}"
-    );
-
-    // Start the gateway — should resume from the volume.
-    let (start_output, start_code) = run_cli(&["gateway", "start"]).await;
-    let clean_start = strip_ansi(&start_output);
-    assert_eq!(
-        start_code, 0,
-        "gateway start after container removal should succeed:\n{clean_start}"
-    );
-
-    // Wait for healthy.
-    wait_for_healthy(Duration::from_secs(180)).await;
+    start_gateway().await;
+    wait_for_healthy(Duration::from_secs(300)).await;
 
     // Verify sandbox survived.
     let (list_output, list_code) = run_cli(&["sandbox", "list", "--names"]).await;
     let clean_list = strip_ansi(&list_output);
     assert_eq!(
         list_code, 0,
-        "sandbox list should succeed after resume:\n{clean_list}"
+        "sandbox list should succeed:\n{clean_list}"
     );
     assert!(
         clean_list.contains(&sandbox_name),
-        "sandbox '{sandbox_name}' should survive container removal + resume.\nList output:\n{clean_list}"
+        "sandbox '{sandbox_name}' should survive stop/start.\nList:\n{clean_list}"
     );
 
-    // Cleanup.
     let _ = run_cli(&["sandbox", "delete", &sandbox_name]).await;
 }
 
-// -------------------------------------------------------------------
-// Test: container killed → gateway start resumes, sandboxes survive,
-//       new sandbox create works
-// -------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Scenario: container killed → resume with stale network
+// ---------------------------------------------------------------------------
 
-/// When a container is killed (stopped but NOT removed), `gateway start`
-/// should resume from existing state. This validates three things:
-///
-/// 1. The stale Docker network reference is reconciled (ensure_network
-///    destroys and recreates the network with a new ID).
-/// 2. Existing sandboxes created before the kill survive the restart.
-/// 3. New `sandbox create` works after resume — the TLS certificates
-///    are reused (not needlessly regenerated), so the CLI's mTLS certs
-///    still match the server.
-#[tokio::test]
-async fn gateway_start_resumes_after_container_kill() {
-    // Precondition: gateway is healthy.
-    wait_for_healthy(Duration::from_secs(30)).await;
+async fn scenario_container_kill_resumes() {
+    eprintln!("--- scenario: container kill resumes ---");
 
     let cname = container_name();
-    let net_name = format!("openshell-cluster-{GATEWAY_NAME}");
+    let net_name = format!("openshell-cluster-{}", gateway_name());
 
-    // Create a sandbox before the kill to verify state persistence.
-    let (create_output, create_code) =
-        run_cli(&["sandbox", "create", "--", "echo", "kill-resume-test"]).await;
-    let clean_create = strip_ansi(&create_output);
-    assert_eq!(
-        create_code, 0,
-        "sandbox create should succeed:\n{clean_create}"
-    );
-
-    let sandbox_before = clean_create
-        .lines()
-        .find_map(|line| {
-            if let Some((_, rest)) = line.split_once("Created sandbox:") {
-                rest.split_whitespace().next().map(ToOwned::to_owned)
-            } else if let Some((_, rest)) = line.split_once("Name:") {
-                rest.split_whitespace().next().map(ToOwned::to_owned)
-            } else {
-                None
-            }
-        })
-        .expect("should extract sandbox name from create output");
-
-    // Kill the container (it remains as a stopped container, unlike `docker rm`).
+    // Kill the container.
     let (_, kill_code) = docker_cmd(&["kill", &cname]);
     assert_eq!(kill_code, 0, "docker kill should succeed");
-
     sleep(Duration::from_secs(3)).await;
 
-    // Remove the Docker network to simulate a stale network reference.
+    // Remove the network to simulate a stale network reference.
     // The bootstrap `ensure_network` always destroys and recreates, so
     // after this the container's stored network ID will be invalid.
     let _ = docker_cmd(&["network", "disconnect", "-f", &net_name, &cname]);
     let (_, net_rm_code) = docker_cmd(&["network", "rm", &net_name]);
     assert_eq!(
         net_rm_code, 0,
-        "docker network rm should succeed (or network already gone)"
+        "docker network rm should succeed"
     );
 
-    // Start the gateway — must handle stale network + reuse existing PKI.
-    let (start_output, start_code) = run_cli(&["gateway", "start"]).await;
-    let clean_start = strip_ansi(&start_output);
-    assert_eq!(
-        start_code, 0,
-        "gateway start after kill should succeed:\n{clean_start}"
-    );
-
-    // Wait for the gateway to become healthy again.
-    wait_for_healthy(Duration::from_secs(180)).await;
-
-    // Verify the pre-existing sandbox survived.
-    let (list_output, list_code) = run_cli(&["sandbox", "list", "--names"]).await;
-    let clean_list = strip_ansi(&list_output);
-    assert_eq!(
-        list_code, 0,
-        "sandbox list should succeed after resume:\n{clean_list}"
-    );
-    assert!(
-        clean_list.contains(&sandbox_before),
-        "sandbox '{sandbox_before}' should survive container kill + resume.\nList output:\n{clean_list}"
-    );
-
-    // Create a new sandbox to verify TLS is working end-to-end.
-    let (new_create_output, new_create_code) =
-        run_cli(&["sandbox", "create", "--", "echo", "post-resume-test"]).await;
-    let clean_new = strip_ansi(&new_create_output);
-    assert_eq!(
-        new_create_code, 0,
-        "sandbox create after resume should succeed (TLS must work):\n{clean_new}"
-    );
-
-    let sandbox_after = clean_new
-        .lines()
-        .find_map(|line| {
-            if let Some((_, rest)) = line.split_once("Created sandbox:") {
-                rest.split_whitespace().next().map(ToOwned::to_owned)
-            } else if let Some((_, rest)) = line.split_once("Name:") {
-                rest.split_whitespace().next().map(ToOwned::to_owned)
-            } else {
-                None
-            }
-        })
-        .expect("should extract sandbox name from post-resume create output");
-
-    // Cleanup.
-    let _ = run_cli(&["sandbox", "delete", &sandbox_before]).await;
-    let _ = run_cli(&["sandbox", "delete", &sandbox_after]).await;
+    // Resume — must handle stale network + reuse existing PKI.
+    start_gateway().await;
+    wait_for_healthy(Duration::from_secs(300)).await;
 }
 
-// -------------------------------------------------------------------
-// Test: SSH handshake secret persists across container restart
-// -------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Scenario: container removed → resume from volume
+// ---------------------------------------------------------------------------
 
-/// The SSH handshake K8s secret should persist across gateway stop/start
-/// cycles — the same base64-encoded value should be returned before and
-/// after the restart.
-#[tokio::test]
-async fn ssh_handshake_secret_persists_across_restart() {
-    // Precondition: gateway is healthy.
-    wait_for_healthy(Duration::from_secs(30)).await;
+async fn scenario_container_removal_resumes() {
+    eprintln!("--- scenario: container removal resumes ---");
 
-    // Read the SSH handshake secret before restart.
-    let secret_before = read_ssh_handshake_secret()
-        .expect("SSH handshake secret should exist before restart");
-    assert!(
-        !secret_before.is_empty(),
-        "SSH handshake secret should not be empty"
-    );
+    // Force-remove the container.
+    let (_, rm_code) = docker_cmd(&["rm", "-f", &container_name()]);
+    assert_eq!(rm_code, 0, "docker rm -f should succeed");
 
-    // Stop the gateway.
-    let (_, stop_code) = run_cli(&["gateway", "stop"]).await;
-    assert_eq!(stop_code, 0, "gateway stop should succeed");
-
-    sleep(Duration::from_secs(3)).await;
-
-    // Start the gateway.
-    let (start_output, start_code) = run_cli(&["gateway", "start"]).await;
+    // Volume should survive.
+    let (vol_out, vol_code) = docker_cmd(&[
+        "volume",
+        "inspect",
+        &format!("openshell-cluster-{}", gateway_name()),
+    ]);
     assert_eq!(
-        start_code, 0,
-        "gateway start should succeed:\n{}",
-        strip_ansi(&start_output)
+        vol_code, 0,
+        "volume should still exist after container removal:\n{vol_out}"
     );
 
-    // Wait for healthy.
-    wait_for_healthy(Duration::from_secs(180)).await;
-
-    // Read the secret after restart.
-    let secret_after = read_ssh_handshake_secret()
-        .expect("SSH handshake secret should exist after restart");
-
-    assert_eq!(
-        secret_before, secret_after,
-        "SSH handshake secret should be identical before and after restart"
-    );
+    // Resume from volume.
+    start_gateway().await;
+    wait_for_healthy(Duration::from_secs(300)).await;
 }

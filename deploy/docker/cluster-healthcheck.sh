@@ -71,3 +71,12 @@ fi
 
 # Verify SSH handshake secret exists (created by openshell-bootstrap alongside TLS secrets)
 kubectl -n openshell get secret openshell-ssh-handshake >/dev/null 2>&1 || exit 1
+
+# ---------------------------------------------------------------------------
+# Verify the gateway NodePort (30051) is actually accepting TCP connections.
+# After a container restart, kube-proxy may need extra time to re-program
+# iptables rules for NodePort routing.  Without this check the health check
+# can pass before the port is routable, causing "Connection refused" on the
+# host-mapped port.
+# ---------------------------------------------------------------------------
+timeout 2 bash -c 'echo >/dev/tcp/127.0.0.1/30051' 2>/dev/null || exit 1
