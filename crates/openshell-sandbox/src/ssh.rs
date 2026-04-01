@@ -69,6 +69,7 @@ async fn ssh_server_init(
             .activity(ActivityId::Listen)
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
+            .src_endpoint_addr(listen_addr.ip(), listen_addr.port())
             .message(format!("SSH server listening on {listen_addr}"))
             .build()
     );
@@ -178,29 +179,10 @@ async fn handle_connection(
     provider_env: HashMap<String, String>,
     nonce_cache: &NonceCache,
 ) -> Result<()> {
-    ocsf_emit!(
-        SshActivityBuilder::new(crate::ocsf_ctx())
-            .activity(ActivityId::Open)
-            .severity(SeverityId::Informational)
-            .src_endpoint_addr(peer.ip(), peer.port())
-            .message(format!(
-                "SSH connection: reading handshake preface from {peer}"
-            ))
-            .build()
-    );
+    tracing::debug!(peer = %peer, "SSH connection: reading handshake preface");
     let mut line = String::new();
     read_line(&mut stream, &mut line).await?;
-    ocsf_emit!(
-        SshActivityBuilder::new(crate::ocsf_ctx())
-            .activity(ActivityId::Open)
-            .severity(SeverityId::Informational)
-            .src_endpoint_addr(peer.ip(), peer.port())
-            .message(format!(
-                "SSH connection: preface received from {peer}, verifying (len={})",
-                line.len()
-            ))
-            .build()
-    );
+    tracing::debug!(peer = %peer, preface_len = line.len(), "SSH connection: preface received, verifying");
     if !verify_preface(&line, secret, handshake_skew_secs, nonce_cache)? {
         ocsf_emit!(
             SshActivityBuilder::new(crate::ocsf_ctx())

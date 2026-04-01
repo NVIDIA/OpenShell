@@ -107,7 +107,13 @@ impl OcsfEvent {
                     format!(" {actor_str} -> {dst}")
                 };
 
-                format!("NET:{activity} {sev} {action}{arrow}{rule_ctx}")
+                let detail = match (action.is_empty(), arrow.is_empty()) {
+                    (true, true) => String::new(),
+                    (true, false) => arrow,
+                    (false, true) => format!(" {action}"),
+                    (false, false) => format!(" {action}{arrow}"),
+                };
+                format!("NET:{activity} {sev}{detail}{rule_ctx}")
             }
 
             Self::HttpActivity(e) => {
@@ -138,7 +144,13 @@ impl OcsfEvent {
                     format!(" {actor_str} -> {method} {url_str}")
                 };
 
-                format!("HTTP:{method} {sev} {action}{arrow}{rule_ctx}")
+                let detail = match (action.is_empty(), arrow.is_empty()) {
+                    (true, true) => String::new(),
+                    (true, false) => arrow,
+                    (false, true) => format!(" {action}"),
+                    (false, false) => format!(" {action}{arrow}"),
+                };
+                format!("HTTP:{method} {sev}{detail}{rule_ctx}")
             }
 
             Self::SshActivity(e) => {
@@ -165,7 +177,21 @@ impl OcsfEvent {
                     })
                     .unwrap_or_default();
 
-                format!("SSH:{activity} {sev} {action} {peer}{auth_ctx}")
+                let detail = [
+                    if action.is_empty() { "" } else { &action },
+                    if peer.is_empty() { "" } else { &peer },
+                ]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ");
+                let detail = if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {detail}")
+                };
+                format!("SSH:{activity} {sev}{detail}{auth_ctx}")
             }
 
             Self::ProcessActivity(e) => {

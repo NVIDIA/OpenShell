@@ -166,7 +166,7 @@ impl ProxyHandle {
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
                 .dst_endpoint(Endpoint::from_ip(local_addr.ip(), local_addr.port()))
-                .message("Proxy listening")
+                .message(format!("Proxy listening on {local_addr}"))
                 .build();
             ocsf_emit!(event);
         }
