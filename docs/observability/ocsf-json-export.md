@@ -35,13 +35,13 @@ Use the `ocsf_json_enabled` setting to toggle JSON export. The setting can be ap
 Global:
 
 ```console
-$ openshell settings set --global ocsf_json_enabled true
+$ openshell settings set --global --key ocsf_json_enabled --value true
 ```
 
 Per-sandbox:
 
 ```console
-$ openshell settings set --sandbox smoke-l4 ocsf_json_enabled true
+$ openshell settings set my-sandbox --key ocsf_json_enabled --value true
 ```
 
 The setting takes effect on the next poll cycle (default: 10 seconds). No sandbox restart is required.
@@ -49,7 +49,7 @@ The setting takes effect on the next poll cycle (default: 10 seconds). No sandbo
 To disable:
 
 ```console
-$ openshell settings set --global ocsf_json_enabled false
+$ openshell settings set --global --key ocsf_json_enabled --value false
 ```
 
 ## Output Location
