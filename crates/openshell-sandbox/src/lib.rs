@@ -1986,15 +1986,11 @@ async fn run_policy_poll_loop(
             }
         }
 
-        // Apply OCSF logging toggle from the `ocsf_logging_enabled` setting.
-        let new_ocsf =
-            extract_bool_setting(&result.settings, "ocsf_logging_enabled").unwrap_or(false);
+        // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
+        let new_ocsf = extract_bool_setting(&result.settings, "ocsf_json_enabled").unwrap_or(false);
         let prev_ocsf = ocsf_enabled.swap(new_ocsf, Ordering::Relaxed);
         if new_ocsf != prev_ocsf {
-            info!(
-                ocsf_logging_enabled = new_ocsf,
-                "OCSF JSONL logging toggled"
-            );
+            info!(ocsf_json_enabled = new_ocsf, "OCSF JSONL logging toggled");
         }
 
         current_config_revision = result.config_revision;

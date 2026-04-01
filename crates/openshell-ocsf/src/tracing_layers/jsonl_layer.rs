@@ -21,7 +21,7 @@ use crate::tracing_layers::event_bridge::{OCSF_TARGET, clone_current_event};
 /// An optional enabled flag (`Arc<AtomicBool>`) can be set via
 /// [`with_enabled_flag`](Self::with_enabled_flag). When the flag is present and
 /// `false`, the layer short-circuits without writing. This allows the sandbox
-/// to hot-toggle OCSF JSONL output at runtime via the `ocsf_logging_enabled`
+/// to hot-toggle OCSF JSONL output at runtime via the `ocsf_json_enabled`
 /// setting without rebuilding the subscriber.
 pub struct OcsfJsonlLayer<W: Write + Send + 'static> {
     writer: Mutex<W>,

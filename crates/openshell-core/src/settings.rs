@@ -50,10 +50,10 @@ pub struct RegisteredSetting {
 /// 5. Add a unit test in this module's `tests` section to cover the new key.
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     // When true the sandbox writes OCSF v1.7.0 JSONL records to
-    // `/var/log/openshell-ocsf.log` in addition to the human-readable
-    // shorthand log. Defaults to false (JSONL file is not created).
+    // `/var/log/openshell-ocsf*.log` (daily rotation, 3 files) in addition
+    // to the human-readable shorthand log. Defaults to false (no JSONL written).
     RegisteredSetting {
-        key: "ocsf_logging_enabled",
+        key: "ocsf_json_enabled",
         kind: SettingValueKind::Bool,
     },
     // Test-only keys live behind the `dev-settings` feature flag so they

@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
     let _log_push_handle = log_push_state.map(|(_, handle)| handle);
 
     // Shared flag: the sandbox poll loop toggles this when the
-    // `ocsf_logging_enabled` setting changes. The JSONL layer checks it
+    // `ocsf_json_enabled` setting changes. The JSONL layer checks it
     // on each event and short-circuits when false.
     let ocsf_enabled = Arc::new(AtomicBool::new(false));
 
@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
 
         // OCSF JSONL file: rolling appender matching the main log file
         // (daily rotation, 3 files max). Created eagerly but gated by the
-        // enabled flag — no JSONL is written until ocsf_logging_enabled is set.
+        // enabled flag — no JSONL is written until ocsf_json_enabled is set.
         let jsonl_logging = tracing_appender::rolling::RollingFileAppender::builder()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix("openshell-ocsf")
