@@ -8,7 +8,6 @@
 //! to import the image into the gateway's containerd runtime.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
 
 use bollard::Docker;
@@ -176,36 +175,10 @@ fn walk_and_add(
         if path.is_dir() {
             walk_and_add(root, &path, ignore_patterns, builder)?;
         } else {
-            let mut file = std::fs::File::open(&path)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to open file: {}", path.display()))?;
-            let metadata = file
-                .metadata()
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to read metadata: {}", path.display()))?;
-
-            let mut header = tar::Header::new_gnu();
-            header.set_size(metadata.len());
-            header.set_mode(0o644);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                header.set_mode(metadata.permissions().mode());
-            }
-            header
-                .set_path(&relative_normalized)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to set tar entry path: {relative_normalized}"))?;
-            header.set_cksum();
-
-            #[allow(clippy::cast_possible_truncation)]
-            let mut contents = Vec::with_capacity(metadata.len() as usize);
-            file.read_to_end(&mut contents)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to read file: {}", path.display()))?;
-
+            // Use append_path_with_name which handles GNU LongName extensions
+            // for paths exceeding 100 bytes (the POSIX tar name field limit).
             builder
-                .append(&header, contents.as_slice())
+                .append_path_with_name(&path, &relative_normalized)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("failed to add file to tar: {relative_normalized}"))?;
         }
@@ -431,6 +404,39 @@ mod tests {
 
         assert!(!entries.iter().any(|e| e.contains("a.log")));
         assert!(entries.iter().any(|e| e.contains("important.log")));
+    }
+
+    #[test]
+    fn test_long_path_exceeding_100_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Build a nested path that exceeds 100 bytes when relative to root.
+        let deep_dir = dir_path.join(
+            "a/deeply/nested/directory/path/that/exceeds/one/hundred/bytes/total/from/the/build/context/root",
+        );
+        fs::create_dir_all(&deep_dir).unwrap();
+        fs::write(deep_dir.join("file.txt"), "deep content\n").unwrap();
+        fs::write(dir_path.join("Dockerfile"), "FROM ubuntu:24.04\n").unwrap();
+
+        let tar_bytes = create_build_context_tar(dir_path).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let entries: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        let long_entry = entries.iter().find(|e| e.contains("file.txt"));
+        assert!(
+            long_entry.is_some(),
+            "tar should contain deeply nested file; entries: {entries:?}"
+        );
+        assert!(
+            long_entry.unwrap().len() > 100,
+            "path should exceed 100 bytes to exercise GNU LongName handling"
+        );
     }
 
     #[test]
