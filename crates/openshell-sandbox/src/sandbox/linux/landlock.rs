@@ -169,11 +169,16 @@ fn try_open_path(path: &Path, compatibility: &LandlockCompatibility) -> Result<O
                             "Skipping non-existent Landlock path (best-effort mode)"
                         );
                     } else {
-                        warn!(
-                            path = %path.display(),
-                            error = %err,
-                            reason,
-                            "Skipping inaccessible Landlock path (best-effort mode)"
+                        openshell_ocsf::ocsf_emit!(
+                            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                                .severity(openshell_ocsf::SeverityId::Medium)
+                                .status(openshell_ocsf::StatusId::Failure)
+                                .state(openshell_ocsf::StateId::Other, "degraded")
+                                .message(format!(
+                                    "Skipping inaccessible Landlock path (best-effort) [path:{} error:{err}]",
+                                    path.display()
+                                ))
+                                .build()
                         );
                     }
                     Ok(None)

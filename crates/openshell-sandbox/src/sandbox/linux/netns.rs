@@ -283,17 +283,17 @@ impl NetworkNamespace {
             &proxy_port_str,
             &log_prefix,
         ) {
-            openshell_ocsf::ocsf_emit!(openshell_ocsf::ConfigStateChangeBuilder::new(
-                crate::ocsf_ctx()
-            )
-            .severity(openshell_ocsf::SeverityId::Medium)
-            .status(openshell_ocsf::StatusId::Failure)
-            .state(openshell_ocsf::StateId::Disabled, "failed")
-            .message(format!(
-                "Failed to install IPv4 bypass detection rules [ns:{}]: {e}",
-                self.name
-            ))
-            .build());
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Medium)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Disabled, "failed")
+                    .message(format!(
+                        "Failed to install IPv4 bypass detection rules [ns:{}]: {e}",
+                        self.name
+                    ))
+                    .build()
+            );
             return Err(e);
         }
 

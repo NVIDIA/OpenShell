@@ -2075,9 +2075,7 @@ async fn handle_forward_proxy(
                 .severity(SeverityId::Low)
                 .status(StatusId::Failure)
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .message(format!(
-                    "Failed to clone OPA engine for forward L7: {e}"
-                ))
+                .message(format!("Failed to clone OPA engine for forward L7: {e}"))
                 .build();
             ocsf_emit!(event);
             regorus::Engine::new()

@@ -17,7 +17,6 @@ use openshell_ocsf::{
     FindingInfo, SeverityId, SshActivityBuilder, StatusId, ocsf_emit,
 };
 use rand_core::OsRng;
-use tracing::warn;
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, Handle, Session};
 use russh::{ChannelId, CryptoVec};
@@ -31,6 +30,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tracing::warn;
 
 const PREFACE_MAGIC: &str = "NSSH1";
 #[cfg(test)]
