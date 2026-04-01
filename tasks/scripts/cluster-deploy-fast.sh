@@ -13,7 +13,7 @@ normalize_name() {
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
 CLUSTER_NAME=$(normalize_name "${CLUSTER_NAME}")
 CONTAINER_NAME="openshell-cluster-${CLUSTER_NAME}"
-IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${OPENSHELL_REGISTRY:-127.0.0.1:5000/openshell}}
+IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-}
 IMAGE_TAG=${IMAGE_TAG:-dev}
 RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-debug}
 DEPLOY_FAST_MODE=${DEPLOY_FAST_MODE:-auto}
@@ -39,6 +39,104 @@ fi
 # Run a command inside the cluster container with KUBECONFIG pre-configured.
 cluster_exec() {
   docker exec "${CONTAINER_NAME}" sh -c "KUBECONFIG=/etc/rancher/k3s/k3s.yaml $*"
+}
+
+image_repo_from_ref() {
+  local ref=$1
+  local tail=${ref##*/}
+  if [[ "${tail}" == *:* ]]; then
+    printf '%s\n' "${ref%:*}"
+  else
+    printf '%s\n' "${ref}"
+  fi
+}
+
+current_gateway_image_ref=$(cluster_exec "kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null" || true)
+current_gateway_pull_policy=$(cluster_exec "kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec.containers[0].imagePullPolicy}' 2>/dev/null" || true)
+current_gateway_repo=$(image_repo_from_ref "${current_gateway_image_ref}")
+current_image_repo_base=${current_gateway_repo%/gateway}
+bootstrap_gateway_repo=$(cluster_exec "kubectl -n kube-system get helmchart openshell -o jsonpath='{.spec.valuesContent}' 2>/dev/null | awk '/^[[:space:]]*repository:/ {print \$2; exit}'" || true)
+bootstrap_image_repo_base=${bootstrap_gateway_repo%/gateway}
+
+if [[ -z "${IMAGE_REPO_BASE}" ]]; then
+  if [[ -n "${OPENSHELL_REGISTRY:-}" ]]; then
+    IMAGE_REPO_BASE=${OPENSHELL_REGISTRY}
+  elif [[ -n "${bootstrap_image_repo_base}" ]]; then
+    IMAGE_REPO_BASE=${bootstrap_image_repo_base}
+  elif [[ -n "${current_image_repo_base}" ]]; then
+    IMAGE_REPO_BASE=${current_image_repo_base}
+  else
+    IMAGE_REPO_BASE=openshell
+  fi
+fi
+
+is_local_registry_host() {
+  [ "${IMAGE_REPO_BASE%%/*}" = "127.0.0.1:5000" ] || [ "${IMAGE_REPO_BASE%%/*}" = "localhost:5000" ]
+}
+
+uses_registry_transport() {
+  local repo_base=$1
+  case "${repo_base%%/*}" in
+    localhost|*.*|*:* )
+      return 0
+      ;;
+    * )
+      return 1
+      ;;
+  esac
+}
+
+GATEWAY_IMAGE_REPOSITORY="${IMAGE_REPO_BASE}/gateway"
+GATEWAY_IMAGE_PULL_POLICY=IfNotPresent
+GATEWAY_TRANSPORT_MODE=import
+if uses_registry_transport "${IMAGE_REPO_BASE}"; then
+  GATEWAY_TRANSPORT_MODE=registry
+  GATEWAY_IMAGE_PULL_POLICY=Always
+fi
+
+# Fast deploy can push rebuilt images to a host-local registry, but that only
+# works when the running k3s gateway was bootstrapped with a matching registry
+# mirror. Otherwise Helm will switch the workload to 127.0.0.1:5000/... and the
+# pod will fail with ImagePullBackOff inside the gateway container.
+ensure_fast_deploy_registry_config() {
+  if [[ "${GATEWAY_TRANSPORT_MODE}" != "registry" ]] || ! is_local_registry_host; then
+    return 0
+  fi
+
+  local registries_yaml
+  registries_yaml=$(cluster_exec "cat /etc/rancher/k3s/registries.yaml 2>/dev/null" || true)
+  if grep -Fq '"127.0.0.1:5000"' <<<"${registries_yaml}" || grep -Fq '"localhost:5000"' <<<"${registries_yaml}"; then
+    return 0
+  fi
+
+  local current_image=""
+  current_image=$(cluster_exec "kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null" || true)
+
+  cat >&2 <<EOF
+Error: fast deploy is configured to use the local registry (${IMAGE_REPO_BASE}),
+but this gateway was not bootstrapped with a matching k3s registry mirror.
+
+Current deployed image: ${current_image:-unknown}
+/etc/rancher/k3s/registries.yaml does not contain 127.0.0.1:5000 or localhost:5000.
+
+If this script proceeds, the gateway workload will be switched to ${GATEWAY_IMAGE_REPOSITORY}:${IMAGE_TAG}
+and the pod will fail with ImagePullBackOff inside the gateway container.
+
+Fix by recreating the cluster with consistent local-registry settings, or run
+the deploy with IMAGE_REPO_BASE/OPENSHELL_REGISTRY_* set to the registry that
+the active gateway was bootstrapped to use.
+EOF
+  exit 1
+}
+
+ensure_fast_deploy_registry_config
+
+import_gateway_image_into_k3s() {
+  local source_image="openshell/gateway:${IMAGE_TAG}"
+
+  echo "Importing updated gateway image into k3s containerd..."
+  docker save "${source_image}" | docker exec -i "${CONTAINER_NAME}" \
+    ctr -a /run/k3s/containerd/containerd.sock -n k8s.io images import -
 }
 
 # Path inside the container where the chart is copied for helm upgrades.
@@ -370,8 +468,12 @@ log_duration "Builds" "${build_start}" "${build_end}"
 declare -a pushed_images=()
 
 if [[ "${build_gateway}" == "1" ]]; then
-  docker tag "openshell/gateway:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}" 2>/dev/null || true
-  pushed_images+=("${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}")
+  if [[ "${GATEWAY_TRANSPORT_MODE}" == "registry" ]]; then
+    docker tag "openshell/gateway:${IMAGE_TAG}" "${GATEWAY_IMAGE_REPOSITORY}:${IMAGE_TAG}" 2>/dev/null || true
+    pushed_images+=("${GATEWAY_IMAGE_REPOSITORY}:${IMAGE_TAG}")
+  else
+    import_gateway_image_into_k3s
+  fi
   built_components+=("gateway")
 fi
 
@@ -387,9 +489,9 @@ fi
 
 # Evict rebuilt gateway image from k3s containerd cache so new pods pull
 # the updated image from the registry.
-if [[ "${build_gateway}" == "1" ]]; then
+if [[ "${build_gateway}" == "1" && "${GATEWAY_TRANSPORT_MODE}" == "registry" ]]; then
   echo "Evicting stale gateway image from k3s..."
-  docker exec "${CONTAINER_NAME}" crictl rmi "${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}" >/dev/null 2>&1 || true
+  docker exec "${CONTAINER_NAME}" crictl rmi "${GATEWAY_IMAGE_REPOSITORY}:${IMAGE_TAG}" >/dev/null 2>&1 || true
 fi
 
 if [[ "${needs_helm_upgrade}" == "1" ]]; then
@@ -426,9 +528,9 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
 
   cluster_exec "helm upgrade openshell ${CONTAINER_CHART_DIR} \
     --namespace openshell \
-    --set image.repository=${IMAGE_REPO_BASE}/gateway \
+    --set image.repository=${GATEWAY_IMAGE_REPOSITORY} \
     --set image.tag=${IMAGE_TAG} \
-    --set image.pullPolicy=Always \
+    --set image.pullPolicy=${GATEWAY_IMAGE_PULL_POLICY} \
     --set-string server.grpcEndpoint=https://openshell.openshell.svc.cluster.local:8080 \
     --set server.tls.certSecretName=openshell-server-tls \
     --set server.tls.clientCaSecretName=openshell-server-client-ca \
