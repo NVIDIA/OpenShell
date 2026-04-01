@@ -7,7 +7,7 @@
 //! Parses each request within the tunnel, evaluates it against OPA policy,
 //! and either forwards or denies the request.
 
-use crate::l7::provider::L7Provider;
+use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::secrets::{self, SecretResolver};
 use miette::{IntoDiagnostic, Result, miette};
@@ -66,6 +66,40 @@ where
             Ok(())
         }
     }
+}
+
+/// Handle an upgraded connection (101 Switching Protocols).
+///
+/// Forwards any overflow bytes from the upgrade response to the client, then
+/// switches to raw bidirectional TCP copy for the upgraded protocol (WebSocket,
+/// HTTP/2, etc.). L7 policy enforcement does not apply after the upgrade —
+/// the initial HTTP request was already evaluated.
+async fn handle_upgrade<C, U>(
+    client: &mut C,
+    upstream: &mut U,
+    overflow: Vec<u8>,
+    host: &str,
+    port: u16,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    info!(
+        host = %host,
+        port = port,
+        overflow_bytes = overflow.len(),
+        "101 Switching Protocols — switching to raw bidirectional relay \
+         (L7 enforcement no longer active)"
+    );
+    if !overflow.is_empty() {
+        client.write_all(&overflow).await.into_diagnostic()?;
+        client.flush().await.into_diagnostic()?;
+    }
+    tokio::io::copy_bidirectional(client, upstream)
+        .await
+        .into_diagnostic()?;
+    Ok(())
 }
 
 /// REST relay loop: parse request -> evaluate -> allow/deny -> relay response -> repeat.
@@ -137,10 +171,24 @@ where
         // Evaluate L7 policy via Rego (using redacted target)
         let (allowed, reason) = evaluate_l7_request(engine, ctx, &request_info)?;
 
-        let decision_str = match (allowed, config.enforcement) {
-            (true, _) => "allow",
-            (false, EnforcementMode::Audit) => "audit",
-            (false, EnforcementMode::Enforce) => "deny",
+        // Check if this is an upgrade request for logging purposes.
+        let header_end = req
+            .raw_header
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map_or(req.raw_header.len(), |p| p + 4);
+        let is_upgrade_request = {
+            let h = String::from_utf8_lossy(&req.raw_header[..header_end]);
+            h.lines()
+                .skip(1)
+                .any(|l| l.to_ascii_lowercase().starts_with("upgrade:"))
+        };
+
+        let decision_str = match (allowed, config.enforcement, is_upgrade_request) {
+            (true, _, true) => "allow_upgrade",
+            (true, _, false) => "allow",
+            (false, EnforcementMode::Audit, _) => "audit",
+            (false, EnforcementMode::Enforce, _) => "deny",
         };
 
         // Log every L7 decision (using redacted target — never log real secrets)
@@ -162,20 +210,26 @@ where
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             // Forward request to upstream and relay response
-            let reusable = crate::l7::rest::relay_http_request_with_resolver(
+            let outcome = crate::l7::rest::relay_http_request_with_resolver(
                 &req,
                 client,
                 upstream,
                 ctx.secret_resolver.as_deref(),
             )
             .await?;
-            if !reusable {
-                debug!(
-                    host = %ctx.host,
-                    port = ctx.port,
-                    "Upstream connection not reusable, closing L7 relay"
-                );
-                return Ok(());
+            match outcome {
+                RelayOutcome::Reusable => {} // continue loop
+                RelayOutcome::Consumed => {
+                    debug!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        "Upstream connection not reusable, closing L7 relay"
+                    );
+                    return Ok(());
+                }
+                RelayOutcome::Upgraded { overflow } => {
+                    return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+                }
             }
         } else {
             // Enforce mode: deny with 403 and close connection (use redacted target)
@@ -334,12 +388,16 @@ where
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends
         // the request upstream and reads the response back to the client.
-        let reusable =
+        let outcome =
             crate::l7::rest::relay_http_request_with_resolver(&req, client, upstream, resolver)
                 .await?;
 
-        if !reusable {
-            break;
+        match outcome {
+            RelayOutcome::Reusable => {} // continue loop
+            RelayOutcome::Consumed => break,
+            RelayOutcome::Upgraded { overflow } => {
+                return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+            }
         }
     }
 

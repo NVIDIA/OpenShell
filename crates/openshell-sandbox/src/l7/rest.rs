@@ -7,12 +7,12 @@
 //! policy, and relays allowed requests to upstream. Handles Content-Length
 //! and chunked transfer encoding for body framing.
 
-use crate::l7::provider::{BodyLength, L7Provider, L7Request};
+use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::secrets::rewrite_http_header_block;
 use miette::{IntoDiagnostic, Result, miette};
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::debug;
+use tracing::{debug, warn};
 
 const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
 const RELAY_BUF_SIZE: usize = 8192;
@@ -32,7 +32,12 @@ impl L7Provider for RestProvider {
         parse_http_request(client).await
     }
 
-    async fn relay<C, U>(&self, req: &L7Request, client: &mut C, upstream: &mut U) -> Result<bool>
+    async fn relay<C, U>(
+        &self,
+        req: &L7Request,
+        client: &mut C,
+        upstream: &mut U,
+    ) -> Result<RelayOutcome>
     where
         C: AsyncRead + AsyncWrite + Unpin + Send,
         U: AsyncRead + AsyncWrite + Unpin + Send,
@@ -236,8 +241,13 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
 
 /// Forward an allowed HTTP request to upstream and relay the response back.
 ///
-/// Returns `true` if the upstream connection is reusable, `false` if consumed.
-async fn relay_http_request<C, U>(req: &L7Request, client: &mut C, upstream: &mut U) -> Result<bool>
+/// Returns the relay outcome indicating whether the connection is reusable,
+/// consumed, or has been upgraded (e.g. WebSocket via 101 Switching Protocols).
+async fn relay_http_request<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
@@ -250,7 +260,7 @@ pub(crate) async fn relay_http_request_with_resolver<C, U>(
     client: &mut C,
     upstream: &mut U,
     resolver: Option<&crate::secrets::SecretResolver>,
-) -> Result<bool>
+) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
@@ -288,8 +298,27 @@ where
         BodyLength::None => {}
     }
     upstream.flush().await.into_diagnostic()?;
-    let (reusable, _) = relay_response(&req.action, upstream, client).await?;
-    Ok(reusable)
+
+    let outcome = relay_response(&req.action, upstream, client).await?;
+
+    // Validate that the client actually requested an upgrade before accepting
+    // a 101 from upstream. Per RFC 9110 Section 7.8, the server MUST NOT send
+    // 101 unless the client sent Upgrade + Connection: Upgrade headers. A
+    // non-compliant or malicious upstream could send an unsolicited 101 to
+    // bypass L7 inspection.
+    if matches!(outcome, RelayOutcome::Upgraded { .. }) {
+        let header_str = String::from_utf8_lossy(&req.raw_header[..header_end]);
+        if !client_requested_upgrade(&header_str) {
+            warn!(
+                method = %req.action,
+                target = %req.target,
+                "upstream sent unsolicited 101 without client Upgrade request — closing connection"
+            );
+            return Ok(RelayOutcome::Consumed);
+        }
+    }
+
+    Ok(outcome)
 }
 
 /// Send a 403 Forbidden JSON deny response.
@@ -525,29 +554,28 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
 
 /// Read and relay a full HTTP response (headers + body) from upstream to client.
 ///
-/// Returns `true` if the upstream connection is reusable (keep-alive),
-/// `false` if it was consumed (read-until-EOF or `Connection: close`).
-/// Relay an HTTP response from upstream back to the client.
+/// Returns a [`RelayOutcome`] indicating whether the connection is reusable,
+/// consumed, or has been upgraded (101 Switching Protocols).
 ///
-/// Returns `true` if the connection should stay alive for further requests.
+/// Note: callers that receive `Upgraded` are responsible for switching to
+/// raw bidirectional relay and forwarding the overflow bytes.
 pub(crate) async fn relay_response_to_client<U, C>(
     upstream: &mut U,
     client: &mut C,
     request_method: &str,
-) -> Result<bool>
+) -> Result<RelayOutcome>
 where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
 {
-    let (reusable, _status) = relay_response(request_method, upstream, client).await?;
-    Ok(reusable)
+    relay_response(request_method, upstream, client).await
 }
 
 async fn relay_response<U, C>(
     request_method: &str,
     upstream: &mut U,
     client: &mut C,
-) -> Result<(bool, u16)>
+) -> Result<RelayOutcome>
 where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
@@ -568,7 +596,7 @@ where
             if !buf.is_empty() {
                 client.write_all(&buf).await.into_diagnostic()?;
             }
-            return Ok((false, 0));
+            return Ok(RelayOutcome::Consumed);
         }
         buf.extend_from_slice(&tmp[..n]);
 
@@ -594,6 +622,26 @@ where
         "relay_response framing"
     );
 
+    // 101 Switching Protocols: the connection has been upgraded (e.g. to
+    // WebSocket).  Forward the 101 headers to the client and signal the
+    // caller to switch to raw bidirectional TCP relay.  Any bytes read
+    // from upstream beyond the headers are overflow that belong to the
+    // upgraded protocol and must be forwarded before switching.
+    if status_code == 101 {
+        client
+            .write_all(&buf[..header_end])
+            .await
+            .into_diagnostic()?;
+        client.flush().await.into_diagnostic()?;
+        let overflow = buf[header_end..].to_vec();
+        debug!(
+            request_method,
+            overflow_bytes = overflow.len(),
+            "101 Switching Protocols — signaling protocol upgrade"
+        );
+        return Ok(RelayOutcome::Upgraded { overflow });
+    }
+
     // Bodiless responses (HEAD, 1xx, 204, 304): forward headers only, skip body
     if is_bodiless_response(request_method, status_code) {
         client
@@ -601,7 +649,11 @@ where
             .await
             .into_diagnostic()?;
         client.flush().await.into_diagnostic()?;
-        return Ok((!server_wants_close, status_code));
+        return if server_wants_close {
+            Ok(RelayOutcome::Consumed)
+        } else {
+            Ok(RelayOutcome::Reusable)
+        };
     }
 
     // No explicit framing (no Content-Length, no Transfer-Encoding).
@@ -621,7 +673,7 @@ where
             }
             relay_until_eof(upstream, client).await?;
             client.flush().await.into_diagnostic()?;
-            return Ok((false, status_code));
+            return Ok(RelayOutcome::Consumed);
         }
         // No Connection: close — an HTTP/1.1 keep-alive server that omits
         // framing headers has an empty body.  Forward headers and continue
@@ -632,7 +684,7 @@ where
             .await
             .into_diagnostic()?;
         client.flush().await.into_diagnostic()?;
-        return Ok((true, status_code));
+        return Ok(RelayOutcome::Reusable);
     }
 
     // Forward response headers + any overflow body bytes
@@ -665,7 +717,7 @@ where
     // loop will exit via the normal error path.  Exiting early here would
     // tear down the CONNECT tunnel before the client can detect the close,
     // causing ~30 s retry delays in clients like `gh`.
-    Ok((true, status_code))
+    Ok(RelayOutcome::Reusable)
 }
 
 /// Parse the HTTP status code from a response status line.
@@ -687,6 +739,33 @@ fn parse_connection_close(headers: &str) -> bool {
         }
     }
     false
+}
+
+/// Check if the client request headers contain both `Upgrade` and
+/// `Connection: Upgrade` headers, indicating the client requested a
+/// protocol upgrade (e.g. WebSocket).
+///
+/// Per RFC 9110 Section 7.8, a server MUST NOT send 101 Switching Protocols
+/// unless the client sent these headers.
+fn client_requested_upgrade(headers: &str) -> bool {
+    let mut has_upgrade_header = false;
+    let mut connection_contains_upgrade = false;
+
+    for line in headers.lines().skip(1) {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("upgrade:") {
+            has_upgrade_header = true;
+        }
+        if lower.starts_with("connection:") {
+            let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
+            // Connection header can have comma-separated values
+            if val.split(',').any(|tok| tok.trim() == "upgrade") {
+                connection_contains_upgrade = true;
+            }
+        }
+    }
+
+    has_upgrade_header && connection_contains_upgrade
 }
 
 /// Returns true for responses that MUST NOT contain a message body per RFC 7230 §3.3.3:
@@ -1136,8 +1215,11 @@ mod tests {
         .await
         .expect("relay_response should not deadlock");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
-        assert!(!reusable, "connection consumed by read-until-EOF");
+        let outcome = result.expect("relay_response should succeed");
+        assert!(
+            matches!(outcome, RelayOutcome::Consumed),
+            "connection consumed by read-until-EOF"
+        );
 
         client_write.shutdown().await.unwrap();
         let mut received = Vec::new();
@@ -1174,8 +1256,11 @@ mod tests {
         .await
         .expect("must not block when no Connection: close");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
-        assert!(reusable, "keep-alive implied, connection reusable");
+        let outcome = result.expect("relay_response should succeed");
+        assert!(
+            matches!(outcome, RelayOutcome::Reusable),
+            "keep-alive implied, connection reusable"
+        );
 
         client_write.shutdown().await.unwrap();
         let mut received = Vec::new();
@@ -1207,8 +1292,11 @@ mod tests {
         .await
         .expect("HEAD relay must not deadlock waiting for body");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
-        assert!(reusable, "HEAD response should be reusable");
+        let outcome = result.expect("relay_response should succeed");
+        assert!(
+            matches!(outcome, RelayOutcome::Reusable),
+            "HEAD response should be reusable"
+        );
 
         client_write.shutdown().await.unwrap();
         let mut received = Vec::new();
@@ -1237,8 +1325,11 @@ mod tests {
         .await
         .expect("204 relay must not deadlock");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
-        assert!(reusable, "204 response should be reusable");
+        let outcome = result.expect("relay_response should succeed");
+        assert!(
+            matches!(outcome, RelayOutcome::Reusable),
+            "204 response should be reusable"
+        );
 
         client_write.shutdown().await.unwrap();
         let mut received = Vec::new();
@@ -1269,8 +1360,11 @@ mod tests {
         .await
         .expect("must not block when chunked body is complete in overflow");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
-        assert!(reusable, "connection should be reusable");
+        let outcome = result.expect("relay_response should succeed");
+        assert!(
+            matches!(outcome, RelayOutcome::Reusable),
+            "connection should be reusable"
+        );
 
         client_write.shutdown().await.unwrap();
         let mut received = Vec::new();
@@ -1305,8 +1399,11 @@ mod tests {
         .await
         .expect("must not block when chunked response has trailers");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
-        assert!(reusable, "chunked response should be reusable");
+        let outcome = result.expect("relay_response should succeed");
+        assert!(
+            matches!(outcome, RelayOutcome::Reusable),
+            "chunked response should be reusable"
+        );
 
         client_write.shutdown().await.unwrap();
         let mut received = Vec::new();
@@ -1340,8 +1437,11 @@ mod tests {
         .await
         .expect("normal relay must not deadlock");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
-        assert!(reusable, "Content-Length response should be reusable");
+        let outcome = result.expect("relay_response should succeed");
+        assert!(
+            matches!(outcome, RelayOutcome::Reusable),
+            "Content-Length response should be reusable"
+        );
 
         client_write.shutdown().await.unwrap();
         let mut received = Vec::new();
@@ -1368,12 +1468,12 @@ mod tests {
         .await
         .expect("relay must not deadlock");
 
-        let (reusable, _status) = result.expect("relay_response should succeed");
+        let outcome = result.expect("relay_response should succeed");
         // With explicit framing, Connection: close is still reported as reusable
         // so the relay loop continues.  The *next* upstream write will fail and
         // exit the loop via the normal error path.
         assert!(
-            reusable,
+            matches!(outcome, RelayOutcome::Reusable),
             "explicit framing keeps loop alive despite Connection: close"
         );
 
@@ -1381,6 +1481,224 @@ mod tests {
         let mut received = Vec::new();
         client_read.read_to_end(&mut received).await.unwrap();
         assert!(String::from_utf8_lossy(&received).contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn relay_response_101_switching_protocols_returns_upgraded_with_overflow() {
+        // Build a 101 response followed by WebSocket frame data (overflow).
+        let mut response = Vec::new();
+        response.extend_from_slice(b"HTTP/1.1 101 Switching Protocols\r\n");
+        response.extend_from_slice(b"Upgrade: websocket\r\n");
+        response.extend_from_slice(b"Connection: Upgrade\r\n");
+        response.extend_from_slice(b"\r\n");
+        response.extend_from_slice(b"\x81\x05hello"); // WebSocket frame
+
+        let (upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, client_write) = tokio::io::duplex(4096);
+
+        upstream_write.write_all(&response).await.unwrap();
+        drop(upstream_write);
+
+        let mut upstream_read = upstream_read;
+        let mut client_write = client_write;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_response("GET", &mut upstream_read, &mut client_write),
+        )
+        .await
+        .expect("relay_response should not deadlock");
+
+        let outcome = result.expect("relay_response should succeed");
+        match outcome {
+            RelayOutcome::Upgraded { overflow } => {
+                assert_eq!(
+                    &overflow, b"\x81\x05hello",
+                    "overflow should contain WebSocket frame data"
+                );
+            }
+            other => panic!("Expected Upgraded, got {other:?}"),
+        }
+
+        client_write.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client_read.read_to_end(&mut received).await.unwrap();
+        let received_str = String::from_utf8_lossy(&received);
+        assert!(
+            received_str.contains("101 Switching Protocols"),
+            "client should receive the 101 response headers"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_response_101_no_overflow() {
+        // 101 response with no trailing bytes — overflow should be empty.
+        let response = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
+        let (upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (_client_read, client_write) = tokio::io::duplex(4096);
+
+        upstream_write.write_all(response).await.unwrap();
+        drop(upstream_write);
+
+        let mut upstream_read = upstream_read;
+        let mut client_write = client_write;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_response("GET", &mut upstream_read, &mut client_write),
+        )
+        .await
+        .expect("relay_response should not deadlock");
+
+        match result.expect("should succeed") {
+            RelayOutcome::Upgraded { overflow } => {
+                assert!(overflow.is_empty(), "no overflow expected");
+            }
+            other => panic!("Expected Upgraded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_rejects_unsolicited_101_without_client_upgrade_header() {
+        // Client sends a normal GET without Upgrade headers.
+        // Upstream responds with 101 (non-compliant). The relay should
+        // reject the upgrade and return Consumed instead.
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/api".to_string(),
+            query_params: HashMap::new(),
+            raw_header: b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let upstream_task = tokio::spawn(async move {
+            // Read the request
+            let mut buf = vec![0u8; 4096];
+            let mut total = 0;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // Send unsolicited 101
+            upstream_side
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            relay_http_request_with_resolver(
+                &req,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                None,
+            ),
+        )
+        .await
+        .expect("relay must not deadlock");
+
+        let outcome = result.expect("relay should succeed");
+        assert!(
+            matches!(outcome, RelayOutcome::Consumed),
+            "unsolicited 101 should be rejected as Consumed, got {outcome:?}"
+        );
+
+        upstream_task.await.expect("upstream task should complete");
+    }
+
+    #[tokio::test]
+    async fn relay_accepts_101_with_client_upgrade_header() {
+        // Client sends a proper upgrade request with Upgrade + Connection headers.
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/ws".to_string(),
+            query_params: HashMap::new(),
+            raw_header: b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut total = 0;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            upstream_side
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            relay_http_request_with_resolver(
+                &req,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                None,
+            ),
+        )
+        .await
+        .expect("relay must not deadlock");
+
+        let outcome = result.expect("relay should succeed");
+        assert!(
+            matches!(outcome, RelayOutcome::Upgraded { .. }),
+            "proper upgrade request should be accepted, got {outcome:?}"
+        );
+
+        upstream_task.await.expect("upstream task should complete");
+    }
+
+    #[test]
+    fn client_requested_upgrade_detects_websocket_headers() {
+        let headers = "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        assert!(client_requested_upgrade(headers));
+    }
+
+    #[test]
+    fn client_requested_upgrade_rejects_missing_upgrade_header() {
+        let headers = "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert!(!client_requested_upgrade(headers));
+    }
+
+    #[test]
+    fn client_requested_upgrade_rejects_upgrade_without_connection() {
+        let headers = "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\r\n";
+        assert!(!client_requested_upgrade(headers));
+    }
+
+    #[test]
+    fn client_requested_upgrade_handles_comma_separated_connection() {
+        let headers = "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n";
+        assert!(client_requested_upgrade(headers));
     }
 
     #[test]

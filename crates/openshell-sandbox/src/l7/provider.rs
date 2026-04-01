@@ -14,6 +14,22 @@ use std::collections::HashMap;
 use std::future::Future;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+/// Outcome of relaying a single HTTP request/response pair.
+#[derive(Debug)]
+pub enum RelayOutcome {
+    /// Connection is reusable for further HTTP requests (keep-alive).
+    Reusable,
+    /// Connection was consumed (e.g. read-until-EOF or `Connection: close`).
+    Consumed,
+    /// Server responded with 101 Switching Protocols.
+    /// The connection has been upgraded (e.g. to WebSocket) and must be
+    /// relayed as raw bidirectional TCP from this point forward.
+    /// Contains any overflow bytes read from upstream past the 101 response
+    /// headers that belong to the upgraded protocol. The 101 headers
+    /// themselves have already been forwarded to the client.
+    Upgraded { overflow: Vec<u8> },
+}
+
 /// Body framing for HTTP requests/responses.
 #[derive(Debug, Clone, Copy)]
 pub enum BodyLength {
@@ -57,14 +73,15 @@ pub trait L7Provider: Send + Sync {
 
     /// Forward an allowed request to upstream and relay the response back.
     ///
-    /// Returns `true` if the upstream connection is reusable (keep-alive),
-    /// `false` if it was consumed (e.g. read-until-EOF or `Connection: close`).
+    /// Returns a [`RelayOutcome`] indicating whether the connection is
+    /// reusable (keep-alive), consumed, or has been upgraded (101 Switching
+    /// Protocols) and must be relayed as raw bidirectional TCP.
     fn relay<C, U>(
         &self,
         req: &L7Request,
         client: &mut C,
         upstream: &mut U,
-    ) -> impl Future<Output = Result<bool>> + Send
+    ) -> impl Future<Output = Result<RelayOutcome>> + Send
     where
         C: AsyncRead + AsyncWrite + Unpin + Send,
         U: AsyncRead + AsyncWrite + Unpin + Send;
