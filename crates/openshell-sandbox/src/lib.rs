@@ -41,6 +41,25 @@ use openshell_ocsf::{
     SandboxContext, SeverityId, StateId, StatusId, ocsf_emit,
 };
 
+// ---------------------------------------------------------------------------
+// OCSF Context
+// ---------------------------------------------------------------------------
+//
+// The following log sites intentionally remain as plain `tracing` macros
+// and are NOT migrated to OCSF builders:
+//
+// - DEBUG/TRACE events (zombie reaping, ip commands, gRPC connects, PTY state)
+// - Transient "about to do X" events where the result is logged separately
+//   (e.g., "Fetching sandbox policy via gRPC", "Creating OPA engine from proto")
+// - Internal SSH channel warnings (unknown channel, PTY resize failures)
+// - Denial flush telemetry (the individual denials are already OCSF events)
+// - Status reporting failures (sync to gateway, non-actionable)
+// - Route refresh interval validation warnings
+//
+// These are operational plumbing that don't represent security decisions,
+// policy changes, or observable sandbox behavior worth structuring.
+// ---------------------------------------------------------------------------
+
 /// Process-wide OCSF sandbox context. Initialized once during `run_sandbox()`
 /// startup and accessible from any module in the crate via [`ocsf_ctx()`].
 static OCSF_CTX: OnceLock<SandboxContext> = OnceLock::new();
@@ -209,15 +228,20 @@ pub async fn run_sandbox(
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "openshell-sandbox".to_string());
 
-        let _ = OCSF_CTX.set(SandboxContext {
-            sandbox_id: sandbox_id.clone().unwrap_or_default(),
-            sandbox_name: sandbox.as_deref().unwrap_or_default().to_string(),
-            container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
-            hostname,
-            product_version: openshell_core::VERSION.to_string(),
-            proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
-            proxy_port: 3128,
-        });
+        if OCSF_CTX
+            .set(SandboxContext {
+                sandbox_id: sandbox_id.clone().unwrap_or_default(),
+                sandbox_name: sandbox.as_deref().unwrap_or_default().to_string(),
+                container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
+                hostname,
+                product_version: openshell_core::VERSION.to_string(),
+                proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
+                proxy_port: 3128,
+            })
+            .is_err()
+        {
+            debug!("OCSF context already initialized, keeping existing");
+        }
     }
 
     // Load policy and initialize OPA engine

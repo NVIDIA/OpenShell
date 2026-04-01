@@ -403,11 +403,17 @@ impl NetworkNamespace {
                 "--log-uid",
             ],
         ) {
-            warn!(
-                error = %e,
-                "Failed to install LOG rule for TCP (xt_LOG module may not be loaded); \
-                 bypass REJECT rules will still be installed"
-            );
+            openshell_ocsf::ocsf_emit!(openshell_ocsf::ConfigStateChangeBuilder::new(
+                crate::ocsf_ctx()
+            )
+            .severity(openshell_ocsf::SeverityId::Low)
+            .status(openshell_ocsf::StatusId::Failure)
+            .state(openshell_ocsf::StateId::Other, "degraded")
+            .message(format!(
+                "Failed to install LOG rule for TCP (xt_LOG module may not be loaded) [ns:{}]: {e}",
+                self.name
+            ))
+            .build());
         }
 
         // Rule 5: REJECT TCP bypass attempts (fast-fail)
@@ -448,9 +454,16 @@ impl NetworkNamespace {
                 "--log-uid",
             ],
         ) {
-            warn!(
-                error = %e,
-                "Failed to install LOG rule for UDP; bypass REJECT rules will still be installed"
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Low)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Other, "degraded")
+                    .message(format!(
+                        "Failed to install LOG rule for UDP [ns:{}]: {e}",
+                        self.name
+                    ))
+                    .build()
             );
         }
 
@@ -525,7 +538,17 @@ impl NetworkNamespace {
                 "--log-uid",
             ],
         ) {
-            warn!(error = %e, "Failed to install IPv6 LOG rule for TCP");
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Low)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Other, "degraded")
+                    .message(format!(
+                        "Failed to install IPv6 LOG rule for TCP [ns:{}]: {e}",
+                        self.name
+                    ))
+                    .build()
+            );
         }
 
         // REJECT TCP bypass attempts
@@ -566,7 +589,17 @@ impl NetworkNamespace {
                 "--log-uid",
             ],
         ) {
-            warn!(error = %e, "Failed to install IPv6 LOG rule for UDP");
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Low)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Other, "degraded")
+                    .message(format!(
+                        "Failed to install IPv6 LOG rule for UDP [ns:{}]: {e}",
+                        self.name
+                    ))
+                    .build()
+            );
         }
 
         // REJECT UDP bypass attempts

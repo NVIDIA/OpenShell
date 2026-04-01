@@ -203,17 +203,29 @@ where
         // Log every L7 decision as an OCSF HTTP Activity event.
         // Uses redacted_target (path only, no query params) to avoid logging secrets.
         {
-            let (action_id, disposition_id) = match decision_str {
-                "allow" => (ActionId::Allowed, DispositionId::Allowed),
-                "deny" => (ActionId::Denied, DispositionId::Blocked),
-                "audit" => (ActionId::Allowed, DispositionId::Allowed),
-                _ => (ActionId::Other, DispositionId::Other),
+            let (action_id, disposition_id, severity) = match decision_str {
+                "allow" => (
+                    ActionId::Allowed,
+                    DispositionId::Allowed,
+                    SeverityId::Informational,
+                ),
+                "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
+                "audit" => (
+                    ActionId::Allowed,
+                    DispositionId::Allowed,
+                    SeverityId::Informational,
+                ),
+                _ => (
+                    ActionId::Other,
+                    DispositionId::Other,
+                    SeverityId::Informational,
+                ),
             };
             let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                 .activity(ActivityId::Other)
                 .action(action_id)
                 .disposition(disposition_id)
-                .severity(SeverityId::Informational)
+                .severity(severity)
                 .http_request(HttpRequest::new(
                     &request_info.action,
                     OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),

@@ -1004,7 +1004,7 @@ const INITIAL_INFERENCE_BUF: usize = 65536;
 async fn handle_inference_interception(
     client: TcpStream,
     host: &str,
-    _port: u16,
+    port: u16,
     tls_state: Option<&Arc<ProxyTlsState>>,
     inference_ctx: Option<&Arc<InferenceContext>>,
 ) -> Result<InferenceOutcome> {
@@ -1094,7 +1094,19 @@ async fn handle_inference_interception(
                 }
             }
             ParseResult::Invalid(reason) => {
-                warn!(reason = %reason, "rejecting malformed inference request");
+                {
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Refuse)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Rejected)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, port))
+                        .message(format!("Rejecting malformed inference request: {reason}"))
+                        .status_detail(&reason)
+                        .build();
+                    ocsf_emit!(event);
+                }
                 let response = format_http_response(400, &[], b"Bad Request");
                 write_all(&mut tls_client, &response).await?;
                 return Ok(InferenceOutcome::Denied { reason });
@@ -2133,17 +2145,29 @@ async fn handle_forward_proxy(
         };
 
         {
-            let (action_id, disposition_id) = match decision_str {
-                "allow" => (ActionId::Allowed, DispositionId::Allowed),
-                "deny" => (ActionId::Denied, DispositionId::Blocked),
-                "audit" => (ActionId::Allowed, DispositionId::Allowed),
-                _ => (ActionId::Other, DispositionId::Other),
+            let (action_id, disposition_id, severity) = match decision_str {
+                "allow" => (
+                    ActionId::Allowed,
+                    DispositionId::Allowed,
+                    SeverityId::Informational,
+                ),
+                "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
+                "audit" => (
+                    ActionId::Allowed,
+                    DispositionId::Allowed,
+                    SeverityId::Informational,
+                ),
+                _ => (
+                    ActionId::Other,
+                    DispositionId::Other,
+                    SeverityId::Informational,
+                ),
             };
             let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                 .activity(ActivityId::Other)
                 .action(action_id)
                 .disposition(disposition_id)
-                .severity(SeverityId::Informational)
+                .severity(severity)
                 .http_request(HttpRequest::new(
                     method,
                     OcsfUrl::new("http", &host_lc, &path, port),
