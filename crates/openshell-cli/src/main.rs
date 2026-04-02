@@ -1085,8 +1085,8 @@ enum SandboxCommands {
         /// Upload local files into the sandbox before running.
         ///
         /// Format: `<LOCAL_PATH>[:<SANDBOX_PATH>]`.
-        /// When `SANDBOX_PATH` is omitted, files are uploaded to the container
-        /// working directory (`/sandbox`).
+        /// When `SANDBOX_PATH` is omitted, files are uploaded to the container's
+        /// working directory.
         /// `.gitignore` rules are applied by default; use `--no-git-ignore` to
         /// upload everything.
         #[arg(long, value_hint = ValueHint::AnyPath, help_heading = "UPLOAD FLAGS")]
@@ -1247,7 +1247,7 @@ enum SandboxCommands {
         #[arg(value_hint = ValueHint::AnyPath)]
         local_path: String,
 
-        /// Destination path in the sandbox (defaults to `/sandbox`).
+        /// Destination path in the sandbox (defaults to the container's working directory).
         dest: Option<String>,
 
         /// Disable `.gitignore` filtering (uploads everything).
@@ -2211,7 +2211,7 @@ async fn main() -> Result<()> {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_edge_auth(&mut tls, &ctx.name);
-                    let sandbox_dest = dest.as_deref().unwrap_or("/sandbox");
+                    let sandbox_dest = dest.as_deref();
                     let local = std::path::Path::new(&local_path);
                     if !local.exists() {
                         return Err(miette::miette!(
@@ -2219,7 +2219,8 @@ async fn main() -> Result<()> {
                             local.display()
                         ));
                     }
-                    eprintln!("Uploading {} -> sandbox:{}", local.display(), sandbox_dest);
+                    let dest_display = sandbox_dest.unwrap_or("~");
+                    eprintln!("Uploading {} -> sandbox:{}", local.display(), dest_display);
                     if !no_git_ignore && let Ok((base_dir, files)) = run::git_sync_files(local) {
                         run::sandbox_sync_up_files(
                             &ctx.endpoint,

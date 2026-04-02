@@ -2300,8 +2300,12 @@ pub async fn sandbox_create(
             drop(client);
 
             if let Some((local_path, sandbox_path, git_ignore)) = upload {
-                let dest = sandbox_path.as_deref().unwrap_or("/sandbox");
-                eprintln!("  {} Uploading files to {dest}...", "\u{2022}".dimmed(),);
+                let dest = sandbox_path.as_deref();
+                let dest_display = dest.unwrap_or("~");
+                eprintln!(
+                    "  {} Uploading files to {dest_display}...",
+                    "\u{2022}".dimmed(),
+                );
                 let local = Path::new(local_path);
                 if *git_ignore && let Ok((base_dir, files)) = git_sync_files(local) {
                     sandbox_sync_up_files(
@@ -2619,7 +2623,6 @@ pub async fn sandbox_sync_command(
 ) -> Result<()> {
     match (up, down) {
         (Some(local_path), None) => {
-            let sandbox_dest = dest.unwrap_or("/sandbox");
             let local = Path::new(local_path);
             if !local.exists() {
                 return Err(miette::miette!(
@@ -2627,8 +2630,9 @@ pub async fn sandbox_sync_command(
                     local.display()
                 ));
             }
-            eprintln!("Syncing {} -> sandbox:{}", local.display(), sandbox_dest);
-            sandbox_sync_up(server, name, local, sandbox_dest, tls).await?;
+            let dest_display = dest.unwrap_or("~");
+            eprintln!("Syncing {} -> sandbox:{}", local.display(), dest_display);
+            sandbox_sync_up(server, name, local, dest, tls).await?;
             eprintln!("{} Sync complete", "✓".green().bold());
         }
         (None, Some(sandbox_path)) => {

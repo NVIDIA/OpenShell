@@ -465,14 +465,25 @@ enum UploadSource {
 /// Core tar-over-SSH upload: streams a tar archive into `dest_dir` on the
 /// sandbox.  Callers are responsible for splitting the destination path so
 /// that `dest_dir` is always a directory.
+///
+/// When `dest_dir` is `None`, the sandbox user's home directory (`$HOME`) is
+/// used as the extraction target.  This avoids hard-coding any particular
+/// path and works for custom container images with non-default `WORKDIR`.
 async fn ssh_tar_upload(
     server: &str,
     name: &str,
-    dest_dir: &str,
+    dest_dir: Option<&str>,
     source: UploadSource,
     tls: &TlsOptions,
 ) -> Result<()> {
     let session = ssh_session_config(server, name, tls).await?;
+
+    // When no explicit destination is given, use the unescaped `$HOME` shell
+    // variable so the remote shell resolves it at runtime.
+    let escaped_dest = match dest_dir {
+        Some(d) => shell_escape(d),
+        None => "$HOME".to_string(),
+    };
 
     let mut ssh = ssh_base_command(&session.proxy_command);
     ssh.arg("-T")
@@ -480,9 +491,7 @@ async fn ssh_tar_upload(
         .arg("RequestTTY=no")
         .arg("sandbox")
         .arg(format!(
-            "mkdir -p {} && cat | tar xf - -C {}",
-            shell_escape(dest_dir),
-            shell_escape(dest_dir)
+            "mkdir -p {escaped_dest} && cat | tar xf - -C {escaped_dest}",
         ))
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
@@ -571,13 +580,14 @@ fn split_sandbox_path(path: &str) -> (&str, &str) {
 /// Push a list of files from a local directory into a sandbox using tar-over-SSH.
 ///
 /// Files are streamed as a tar archive to `ssh ... tar xf - -C <dest>` on
-/// the sandbox side.
+/// the sandbox side.  When `dest` is `None`, files are uploaded to the
+/// sandbox user's home directory.
 pub async fn sandbox_sync_up_files(
     server: &str,
     name: &str,
     base_dir: &Path,
     files: &[String],
-    dest: &str,
+    dest: Option<&str>,
     tls: &TlsOptions,
 ) -> Result<()> {
     if files.is_empty() {
@@ -598,36 +608,44 @@ pub async fn sandbox_sync_up_files(
 
 /// Push a local path (file or directory) into a sandbox using tar-over-SSH.
 ///
-/// When uploading a single file to a destination that does not end with `/`,
-/// the destination is treated as a file path: the parent directory is created
-/// and the file is written with the destination's basename.  This matches
-/// `cp` / `scp` semantics and avoids creating a directory at the destination
-/// path.
+/// When `sandbox_path` is `None`, files are uploaded to the sandbox user's
+/// home directory.  When uploading a single file to an explicit destination
+/// that does not end with `/`, the destination is treated as a file path:
+/// the parent directory is created and the file is written with the
+/// destination's basename.  This matches `cp` / `scp` semantics.
 pub async fn sandbox_sync_up(
     server: &str,
     name: &str,
     local_path: &Path,
-    sandbox_path: &str,
+    sandbox_path: Option<&str>,
     tls: &TlsOptions,
 ) -> Result<()> {
-    // When uploading a single file to a path that looks like a file (does not
-    // end with '/'), split into parent directory + target basename so that
+    // When an explicit destination is given and looks like a file path (does
+    // not end with '/'), split into parent directory + target basename so that
     // `mkdir -p` creates the parent and tar extracts the file with the right
-    // name.  For directories or paths ending in '/', keep the original
-    // behavior where sandbox_path is the extraction directory.
-    if local_path.is_file() && !sandbox_path.ends_with('/') {
-        let (parent, target_name) = split_sandbox_path(sandbox_path);
-        return ssh_tar_upload(
-            server,
-            name,
-            parent,
-            UploadSource::SinglePath {
-                local_path: local_path.to_path_buf(),
-                tar_name: target_name.into(),
-            },
-            tls,
-        )
-        .await;
+    // name.
+    //
+    // Exception: if splitting would yield "/" as the parent (e.g. the user
+    // passed "/sandbox"), fall through to directory semantics instead.  The
+    // sandbox user cannot write to "/" and the intent is almost certainly
+    // "put the file inside /sandbox", not "create a file named sandbox in /".
+    if let Some(path) = sandbox_path {
+        if local_path.is_file() && !path.ends_with('/') {
+            let (parent, target_name) = split_sandbox_path(path);
+            if parent != "/" {
+                return ssh_tar_upload(
+                    server,
+                    name,
+                    Some(parent),
+                    UploadSource::SinglePath {
+                        local_path: local_path.to_path_buf(),
+                        tar_name: target_name.into(),
+                    },
+                    tls,
+                )
+                .await;
+            }
+        }
     }
 
     let tar_name = if local_path.is_file() {
