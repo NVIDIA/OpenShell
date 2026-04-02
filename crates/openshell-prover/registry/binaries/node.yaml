@@ -1,0 +1,18 @@
+binary: /usr/local/bin/node
+description: "Node.js runtime — general-purpose JavaScript runtime"
+protocols:
+  - name: http-programmatic
+    transport: https
+    description: "Node can construct arbitrary HTTP requests via fetch, axios, http module"
+    bypasses_l7: false
+    actions:
+      - { name: get, type: read }
+      - { name: post, type: write }
+      - { name: put, type: write }
+      - { name: delete, type: destructive }
+spawns:
+  - /usr/bin/curl
+  - /usr/bin/git
+can_exfiltrate: true
+exfil_mechanism: "Construct arbitrary HTTP requests, spawn subprocesses"
+can_construct_http: true

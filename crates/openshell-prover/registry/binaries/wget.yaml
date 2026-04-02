@@ -1,0 +1,14 @@
+binary: /usr/bin/wget
+description: "Non-interactive network downloader"
+protocols:
+  - name: http
+    transport: https
+    description: "HTTP/HTTPS downloads — can also POST with --post-data"
+    bypasses_l7: false
+    actions:
+      - { name: download, type: read }
+      - { name: post, type: write, description: "POST via --post-data or --post-file" }
+spawns: []
+can_exfiltrate: true
+exfil_mechanism: "POST file contents via --post-file to any reachable endpoint"
+can_construct_http: true

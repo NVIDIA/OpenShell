@@ -201,3 +201,4 @@ architecture/plans
 .claude/worktrees/
 rfc.md
 .worktrees
+.z3-trace

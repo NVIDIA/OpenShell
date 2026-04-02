@@ -1,0 +1,21 @@
+binary: /usr/local/bin/python3.13
+description: "Python interpreter — general-purpose runtime"
+protocols:
+  - name: http-programmatic
+    transport: https
+    description: "Python can construct arbitrary HTTP requests via urllib, httpx, requests"
+    bypasses_l7: false
+    actions:
+      - { name: get, type: read }
+      - { name: post, type: write }
+      - { name: put, type: write }
+      - { name: delete, type: destructive }
+spawns:
+  - /usr/bin/curl
+  - /usr/bin/git
+  - /usr/bin/ssh
+  - /usr/bin/nc
+  - /usr/bin/wget
+can_exfiltrate: true
+exfil_mechanism: "Construct arbitrary HTTP requests, write to files, spawn subprocesses"
+can_construct_http: true

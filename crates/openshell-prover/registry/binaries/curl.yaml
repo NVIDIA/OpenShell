@@ -1,0 +1,17 @@
+binary: /usr/bin/curl
+description: "Command-line HTTP client"
+protocols:
+  - name: http
+    transport: https
+    description: "HTTP/HTTPS requests — can construct arbitrary method, path, headers, body"
+    bypasses_l7: false
+    actions:
+      - { name: get, type: read, description: "HTTP GET request" }
+      - { name: post, type: write, description: "HTTP POST with arbitrary body" }
+      - { name: put, type: write, description: "HTTP PUT with arbitrary body" }
+      - { name: delete, type: destructive, description: "HTTP DELETE request" }
+      - { name: upload, type: write, description: "File upload via multipart POST" }
+spawns: []
+can_exfiltrate: true
+exfil_mechanism: "POST/PUT file contents to any reachable endpoint, or encode in URL query parameters"
+can_construct_http: true
