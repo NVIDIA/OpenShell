@@ -8,7 +8,7 @@
 
 FROM nvcr.io/nvidia/base/ubuntu:noble-20251013
 
-ARG DOCKER_VERSION=29.3.0
+ARG DOCKER_VERSION=29.3.1
 ARG BUILDX_VERSION=v0.32.1
 ARG TARGETARCH
 
@@ -34,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     jq \
     rsync \
+    && apt-get install -y --only-upgrade gpgv python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Docker CLI and buildx plugin used by CI jobs

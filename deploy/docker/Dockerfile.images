@@ -15,8 +15,8 @@
 # Pin by tag AND manifest-list digest to prevent silent upstream republishes
 # from breaking the build. Update both when bumping k3s versions.
 # To refresh: docker buildx imagetools inspect rancher/k3s:<tag> | head -3
-ARG K3S_VERSION=v1.35.2-k3s1
-ARG K3S_DIGEST=sha256:c3184157c3048112bab0c3e17405991da486cb3413511eba23f7650efd70776b
+ARG K3S_VERSION=v1.35.3-k3s1
+ARG K3S_DIGEST=sha256:4607083d3cac07e1ccde7317297271d13ed5f60f35a78f33fcef84858a9f1d69
 ARG K9S_VERSION=v0.50.18
 ARG HELM_VERSION=v3.17.3
 ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
@@ -165,7 +165,9 @@ COPY --from=supervisor-builder /build/out/openshell-sandbox /openshell-sandbox
 FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS gateway
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates && rm -rf /var/lib/apt/lists/*
+    ca-certificates && \
+    apt-get install -y --only-upgrade gpgv && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --user-group openshell
 
@@ -230,6 +232,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iptables \
     mount \
     dnsutils \
+    && apt-get install -y --only-upgrade gpgv \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=k3s /bin/ /bin/
