@@ -361,7 +361,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
 
 /// Parse a sandbox policy from a YAML string.
 pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
-    let raw: PolicyFile = serde_yaml::from_str(yaml)
+    let raw: PolicyFile = serde_yml::from_str(yaml)
         .into_diagnostic()
         .wrap_err("failed to parse sandbox policy YAML")?;
     Ok(to_proto(raw))
@@ -374,7 +374,7 @@ pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
 /// and is round-trippable through `parse_sandbox_policy`.
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
     let yaml_repr = from_proto(policy);
-    serde_yaml::to_string(&yaml_repr)
+    serde_yml::to_string(&yaml_repr)
         .into_diagnostic()
         .wrap_err("failed to serialize policy to YAML")
 }

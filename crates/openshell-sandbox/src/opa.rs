@@ -511,7 +511,7 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
 
 /// Preprocess YAML policy data: parse, normalize, validate, expand access presets, return JSON.
 fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
-    let mut data: serde_json::Value = serde_yaml::from_str(yaml_str)
+    let mut data: serde_json::Value = serde_yml::from_str(yaml_str)
         .map_err(|e| miette::miette!("failed to parse YAML data: {e}"))?;
 
     // Normalize port → ports for all endpoints so Rego always sees "ports" array.
@@ -944,12 +944,10 @@ mod tests {
         let config = engine.query_sandbox_config().unwrap();
         assert!(config.filesystem.include_workdir);
         assert!(config.filesystem.read_only.contains(&PathBuf::from("/usr")));
-        assert!(
-            config
-                .filesystem
-                .read_write
-                .contains(&PathBuf::from("/tmp"))
-        );
+        assert!(config
+            .filesystem
+            .read_write
+            .contains(&PathBuf::from("/tmp")));
     }
 
     #[test]
@@ -1308,12 +1306,10 @@ network_policies:
         let config = engine.query_sandbox_config().unwrap();
         assert!(config.filesystem.include_workdir);
         assert!(config.filesystem.read_only.contains(&PathBuf::from("/usr")));
-        assert!(
-            config
-                .filesystem
-                .read_write
-                .contains(&PathBuf::from("/tmp"))
-        );
+        assert!(config
+            .filesystem
+            .read_write
+            .contains(&PathBuf::from("/tmp")));
         assert_eq!(config.process.run_as_user.as_deref(), Some("sandbox"));
         assert_eq!(config.process.run_as_group.as_deref(), Some("sandbox"));
     }

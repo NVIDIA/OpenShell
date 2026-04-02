@@ -75,7 +75,7 @@ impl RouterConfig {
                 path.display()
             ))
         })?;
-        let config: Self = serde_yaml::from_str(&content).map_err(|e| {
+        let config: Self = serde_yml::from_str(&content).map_err(|e| {
             RouterError::Internal(format!(
                 "failed to parse router config {}: {e}",
                 path.display()

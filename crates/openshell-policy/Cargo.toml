@@ -13,7 +13,7 @@ repository.workspace = true
 [dependencies]
 openshell-core = { path = "../openshell-core" }
 serde = { workspace = true }
-serde_yaml = { workspace = true }
+serde_yml = { workspace = true }
 miette = { workspace = true }
 
 [lints]
