@@ -26,6 +26,15 @@
 set -e
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+# Escape a value for safe embedding as a YAML single-quoted scalar.
+# Single quotes are the only character that needs escaping ('  ->  '').
+yaml_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"
+}
+
+# ---------------------------------------------------------------------------
 # Select iptables backend
 # ---------------------------------------------------------------------------
 # Some kernels (e.g. Jetson Linux 5.15-tegra) have the nf_tables subsystem
@@ -269,8 +278,8 @@ REGEOF
 configs:
   "${REGISTRY_HOST}":
     auth:
-      username: ${REGISTRY_USERNAME}
-      password: ${REGISTRY_PASSWORD}
+      username: $(yaml_quote "${REGISTRY_USERNAME}")
+      password: $(yaml_quote "${REGISTRY_PASSWORD}")
 REGEOF
     fi
 
@@ -284,8 +293,8 @@ REGEOF
             cat >> "$REGISTRIES_YAML" <<REGEOF
   "${COMMUNITY_REGISTRY_HOST}":
     auth:
-      username: ${COMMUNITY_REGISTRY_USERNAME}
-      password: ${COMMUNITY_REGISTRY_PASSWORD}
+      username: $(yaml_quote "${COMMUNITY_REGISTRY_USERNAME}")
+      password: $(yaml_quote "${COMMUNITY_REGISTRY_PASSWORD}")
 REGEOF
         else
             cat >> "$REGISTRIES_YAML" <<REGEOF
@@ -293,8 +302,8 @@ REGEOF
 configs:
   "${COMMUNITY_REGISTRY_HOST}":
     auth:
-      username: ${COMMUNITY_REGISTRY_USERNAME}
-      password: ${COMMUNITY_REGISTRY_PASSWORD}
+      username: $(yaml_quote "${COMMUNITY_REGISTRY_USERNAME}")
+      password: $(yaml_quote "${COMMUNITY_REGISTRY_PASSWORD}")
 REGEOF
         fi
     fi
