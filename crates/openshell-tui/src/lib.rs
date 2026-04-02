@@ -1775,8 +1775,11 @@ fn spawn_draft_approve_all(
             name,
             include_security_flagged: false,
         };
-        match tokio::time::timeout(Duration::from_secs(30), client.approve_all_draft_chunks(req))
-            .await
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            client.approve_all_draft_chunks(req),
+        )
+        .await
         {
             Ok(Ok(resp)) => {
                 let inner = resp.into_inner();
@@ -1798,7 +1801,7 @@ fn spawn_draft_approve_all(
             }
             Err(_) => {
                 let _ = tx.send(Event::DraftActionResult(Err(
-                    "approve-all timed out".to_string(),
+                    "approve-all timed out".to_string()
                 )));
             }
         }

@@ -115,8 +115,7 @@ async fn auth_connect(
                 .into_response()
         }
         None => {
-            let csp =
-                "default-src 'none'; style-src 'unsafe-inline'".to_string();
+            let csp = "default-src 'none'; style-src 'unsafe-inline'".to_string();
             (
                 [(header::CONTENT_SECURITY_POLICY, csp)],
                 Html(render_waiting_page(params.callback_port, &params.code)),
