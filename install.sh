@@ -277,7 +277,7 @@ main() {
 
   # Extract
   info "extracting..."
-  tar -xzf "${_tmpdir}/${_filename}" -C "${_tmpdir}"
+  tar -xzf "${_tmpdir}/${_filename}" -C "${_tmpdir}" --no-same-owner --no-same-permissions "${APP_NAME}"
 
   # Install
   mkdir -p "$_install_dir" 2>/dev/null || true
