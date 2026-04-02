@@ -49,10 +49,9 @@ pub fn check_data_exfiltration(model: &ReachabilityModel) -> Vec<Finding> {
                         ),
                     )
                 } else {
-                    (
-                        "l7_allows_write".to_owned(),
-                        format!("L7 allows write methods — {} can POST/PUT data", bpath),
-                    )
+                    // L7 is enforced and allows write — policy is
+                    // working as intended. Not a finding.
+                    continue;
                 };
 
                 if !cap.exfil_mechanism.is_empty() {
@@ -133,7 +132,7 @@ pub fn check_write_bypass(model: &ReachabilityModel) -> Vec<Finding> {
         for ep in &rule.endpoints {
             // Only check endpoints where the intent is read-only or L4-only
             let intent = ep.intent();
-            if !matches!(intent, PolicyIntent::ReadOnly | PolicyIntent::L4Only) {
+            if !matches!(intent, PolicyIntent::ReadOnly) {
                 continue;
             }
 
