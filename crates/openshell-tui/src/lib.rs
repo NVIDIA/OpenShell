@@ -1753,13 +1753,15 @@ fn spawn_draft_reject(app: &App, tx: mpsc::UnboundedSender<Event>) {
     });
 }
 
-/// Approve the snapshotted draft chunks one by one.
+/// Approve all pending draft chunks via the bulk `ApproveAllDraftChunks` RPC.
 ///
-/// Only the chunks captured when `[A]` was pressed are approved — any new
-/// chunks that arrived while the confirmation modal was open are skipped.
+/// Uses the server-side bulk endpoint which respects the `security_notes`
+/// safety gate — security-flagged chunks are skipped unless explicitly
+/// included. The `snapshot` parameter is retained for the confirmation
+/// modal count display but is not iterated for per-chunk approval.
 fn spawn_draft_approve_all(
     app: &App,
-    snapshot: Vec<openshell_core::proto::PolicyChunk>,
+    _snapshot: Vec<openshell_core::proto::PolicyChunk>,
     tx: mpsc::UnboundedSender<Event>,
 ) {
     let mut client = app.client.clone();
@@ -1769,41 +1771,37 @@ fn spawn_draft_approve_all(
     };
 
     tokio::spawn(async move {
-        let total = snapshot.len();
-        let mut approved = 0u32;
-        let mut last_version = 0u32;
-        let mut errors: Vec<String> = Vec::new();
-
-        for chunk in &snapshot {
-            let req = openshell_core::proto::ApproveDraftChunkRequest {
-                name: name.clone(),
-                chunk_id: chunk.id.clone(),
-            };
-            match tokio::time::timeout(Duration::from_secs(5), client.approve_draft_chunk(req))
-                .await
-            {
-                Ok(Ok(resp)) => {
-                    approved += 1;
-                    last_version = resp.into_inner().policy_version;
-                }
-                Ok(Err(e)) => {
-                    errors.push(format!("{}: {}", chunk.rule_name, e.message()));
-                }
-                Err(_) => {
-                    errors.push(format!("{}: timed out", chunk.rule_name));
-                }
+        let req = openshell_core::proto::ApproveAllDraftChunksRequest {
+            name,
+            include_security_flagged: false,
+        };
+        match tokio::time::timeout(Duration::from_secs(30), client.approve_all_draft_chunks(req))
+            .await
+        {
+            Ok(Ok(resp)) => {
+                let inner = resp.into_inner();
+                let msg = if inner.chunks_skipped > 0 {
+                    format!(
+                        "Approved {} chunks, skipped {} security-flagged -> policy v{}",
+                        inner.chunks_approved, inner.chunks_skipped, inner.policy_version
+                    )
+                } else {
+                    format!(
+                        "Approved {} chunks -> policy v{}",
+                        inner.chunks_approved, inner.policy_version
+                    )
+                };
+                let _ = tx.send(Event::DraftActionResult(Ok(msg)));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::DraftActionResult(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::DraftActionResult(Err(
+                    "approve-all timed out".to_string(),
+                )));
             }
         }
-
-        let msg = if errors.is_empty() {
-            format!("Approved {approved}/{total} chunks -> policy v{last_version}")
-        } else {
-            format!(
-                "Approved {approved}/{total} chunks (errors: {})",
-                errors.join("; ")
-            )
-        };
-        let _ = tx.send(Event::DraftActionResult(Ok(msg)));
     });
 }
 

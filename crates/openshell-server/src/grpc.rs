@@ -1844,18 +1844,21 @@ impl OpenShell for OpenShellService {
                 rule_name: chunk.rule_name.clone(),
                 proposed_rule: proposed_rule_bytes,
                 rationale: chunk.rationale.clone(),
-                security_notes: chunk.security_notes.clone(),
-                confidence: f64::from(chunk.confidence),
+                // Re-compute security notes server-side — never trust
+                // sandbox-provided values (confused-deputy mitigation).
+                security_notes: generate_security_notes(
+                    &ep_host,
+                    u16::try_from(ep_port as u32).unwrap_or(0),
+                ),
+                confidence: f64::from(chunk.confidence.clamp(0.0, 1.0)),
                 created_at_ms: now_ms,
                 decided_at_ms: None,
                 host: ep_host,
                 port: ep_port,
                 binary: ep_binary,
-                hit_count: if chunk.hit_count > 0 {
-                    chunk.hit_count
-                } else {
-                    1
-                },
+                // Cap hit_count to a reasonable ceiling — don't trust
+                // sandbox-supplied counts.
+                hit_count: chunk.hit_count.clamp(1, 100),
                 first_seen_ms: if chunk.first_seen_ms > 0 {
                     chunk.first_seen_ms
                 } else {
@@ -3406,6 +3409,53 @@ fn policy_record_to_revision(record: &PolicyRecord, include_policy: bool) -> San
         loaded_at_ms: record.loaded_at_ms.unwrap_or(0),
         policy,
     }
+}
+
+/// Re-validate security notes server-side for a proposed policy chunk.
+///
+/// Duplicates the heuristics from the sandbox's `mechanistic_mapper` to
+/// ensure the gateway never trusts sandbox-provided security annotations.
+/// This prevents a confused-deputy attack where a compromised sandbox
+/// submits proposals with empty `security_notes` to bypass the safety
+/// gate during bulk approval (CWE-284).
+fn generate_security_notes(host: &str, port: u16) -> String {
+    let mut notes = Vec::new();
+
+    // Check for private/internal IP patterns.
+    if host.starts_with("10.")
+        || host.starts_with("172.")
+        || host.starts_with("192.168.")
+        || host == "localhost"
+        || host.starts_with("127.")
+    {
+        notes.push(format!(
+            "Destination '{host}' appears to be an internal/private address."
+        ));
+    }
+
+    // Host wildcard — broadly permissive.
+    if host.contains('*') {
+        notes.push(format!(
+            "Host '{host}' contains a wildcard — this may match unintended destinations."
+        ));
+    }
+
+    // Ephemeral port range.
+    if port > 49152 {
+        notes.push(format!(
+            "Port {port} is in the ephemeral range — this may be a temporary service."
+        ));
+    }
+
+    // Well-known database / service ports.
+    const DB_PORTS: [u16; 7] = [5432, 3306, 6379, 27017, 9200, 11211, 5672];
+    if DB_PORTS.contains(&port) {
+        notes.push(format!(
+            "Port {port} is a well-known database/service port."
+        ));
+    }
+
+    notes.join(" ")
 }
 
 fn current_time_ms() -> Result<i64, std::time::SystemTimeError> {
