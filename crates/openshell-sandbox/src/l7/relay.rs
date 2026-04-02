@@ -93,12 +93,18 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    info!(
-        host = %host,
-        port = port,
-        overflow_bytes = overflow.len(),
-        "101 Switching Protocols — switching to raw bidirectional relay \
-         (L7 enforcement no longer active)"
+    ocsf_emit!(
+        NetworkActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Other)
+            .activity_name("Upgrade")
+            .severity(SeverityId::Informational)
+            .dst_endpoint(Endpoint::from_domain(host, port))
+            .message(format!(
+                "101 Switching Protocols — raw bidirectional relay (L7 enforcement no longer active) \
+                 [host:{host} port:{port} overflow_bytes:{}]",
+                overflow.len()
+            ))
+            .build()
     );
     if !overflow.is_empty() {
         client.write_all(&overflow).await.into_diagnostic()?;
