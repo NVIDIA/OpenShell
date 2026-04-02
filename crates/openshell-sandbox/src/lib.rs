@@ -940,7 +940,10 @@ fn enumerate_gpu_device_nodes() -> Vec<String> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("nvidia") && name[6..].chars().all(|c| c.is_ascii_digit()) {
+            if let Some(suffix) = name.strip_prefix("nvidia") {
+                if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
                 paths.push(entry.path().to_string_lossy().into_owned());
             }
         }
@@ -965,6 +968,11 @@ fn baseline_enrichment_paths() -> (Vec<String>, Vec<String>) {
         rw.extend(GPU_BASELINE_READ_WRITE.iter().map(|&s| s.to_string()));
         rw.extend(enumerate_gpu_device_nodes());
     }
+
+    // A path promoted to read_write (e.g. /proc for GPU) should not also
+    // appear in read_only — Landlock handles the overlap correctly but the
+    // duplicate is confusing when inspecting the effective policy.
+    ro.retain(|p| !rw.contains(p));
 
     (ro, rw)
 }
@@ -1071,6 +1079,75 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
 
     if modified {
         info!("Enriched policy with baseline filesystem paths for proxy mode");
+    }
+}
+
+#[cfg(test)]
+mod baseline_tests {
+    use super::*;
+
+    #[test]
+    fn proc_not_in_both_read_only_and_read_write_when_gpu_present() {
+        // When GPU devices are present, /proc is promoted to read_write
+        // (CUDA needs to write /proc/<pid>/task/<tid>/comm). It should
+        // NOT also appear in read_only.
+        if !has_gpu_devices() {
+            // Can't test GPU dedup without GPU devices; skip silently.
+            return;
+        }
+        let (ro, rw) = baseline_enrichment_paths();
+        assert!(
+            rw.contains(&"/proc".to_string()),
+            "/proc should be in read_write when GPU is present"
+        );
+        assert!(
+            !ro.contains(&"/proc".to_string()),
+            "/proc should NOT be in read_only when it is already in read_write"
+        );
+    }
+
+    #[test]
+    fn proc_in_read_only_without_gpu() {
+        if has_gpu_devices() {
+            // On a GPU host we can't test the non-GPU path; skip silently.
+            return;
+        }
+        let (ro, _rw) = baseline_enrichment_paths();
+        assert!(
+            ro.contains(&"/proc".to_string()),
+            "/proc should be in read_only when GPU is not present"
+        );
+    }
+
+    #[test]
+    fn baseline_read_write_always_includes_sandbox_and_tmp() {
+        let (_ro, rw) = baseline_enrichment_paths();
+        assert!(rw.contains(&"/sandbox".to_string()));
+        assert!(rw.contains(&"/tmp".to_string()));
+    }
+
+    #[test]
+    fn enumerate_gpu_device_nodes_skips_bare_nvidia() {
+        // "nvidia" (without a trailing digit) is a valid /dev entry on some
+        // systems but is not a per-GPU device node.  The enumerator must
+        // not match it.
+        let nodes = enumerate_gpu_device_nodes();
+        assert!(
+            !nodes.contains(&"/dev/nvidia".to_string()),
+            "bare /dev/nvidia should not be enumerated: {nodes:?}"
+        );
+    }
+
+    #[test]
+    fn no_duplicate_paths_in_baseline() {
+        let (ro, rw) = baseline_enrichment_paths();
+        // No path should appear in both lists.
+        for path in &ro {
+            assert!(
+                !rw.contains(path),
+                "path {path} appears in both read_only and read_write"
+            );
+        }
     }
 }
 
