@@ -68,9 +68,11 @@ async fn auth_connect(
         .and_then(|v| v.to_str().ok())
         .map_or_else(|| state.config.bind_address.to_string(), String::from);
 
+    let safe_gateway = html_escape(&gateway_display);
+
     match cf_token {
         Some(token) => Html(render_connect_page(
-            &gateway_display,
+            &safe_gateway,
             params.callback_port,
             &token,
             &params.code,
