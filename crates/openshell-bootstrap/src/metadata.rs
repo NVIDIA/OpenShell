@@ -47,6 +47,34 @@ pub struct GatewayMetadata {
     pub edge_auth_url: Option<String>,
 }
 
+impl GatewayMetadata {
+    /// Extract the host portion from the stored `gateway_endpoint` URL.
+    ///
+    /// Returns `None` if the endpoint is malformed or uses a default loopback
+    /// address (`127.0.0.1`, `localhost`, `::1`) — those are never meaningful
+    /// as a `--gateway-host` override.
+    pub fn gateway_host(&self) -> Option<&str> {
+        // Endpoint format: "https://host:port" or "http://host:port"
+        let after_scheme = self
+            .gateway_endpoint
+            .strip_prefix("https://")
+            .or_else(|| self.gateway_endpoint.strip_prefix("http://"))?;
+        // Strip port suffix (":8082")
+        let host = after_scheme
+            .rsplit_once(':')
+            .map_or(after_scheme, |(h, _)| h);
+        if host.is_empty()
+            || host == "127.0.0.1"
+            || host == "localhost"
+            || host == "::1"
+            || host == "[::1]"
+        {
+            return None;
+        }
+        Some(host)
+    }
+}
+
 pub fn create_gateway_metadata(
     name: &str,
     remote: Option<&RemoteOptions>,
@@ -498,6 +526,61 @@ mod tests {
             true,
         );
         assert_eq!(meta.gateway_endpoint, "http://host.docker.internal:8080");
+    }
+
+    // ── GatewayMetadata::gateway_host() ──────────────────────────────
+
+    #[test]
+    fn gateway_host_returns_custom_host() {
+        let meta =
+            create_gateway_metadata_with_host("t", None, 8082, Some("host.docker.internal"), false);
+        assert_eq!(meta.gateway_host(), Some("host.docker.internal"));
+    }
+
+    #[test]
+    fn gateway_host_returns_none_for_loopback() {
+        let meta = create_gateway_metadata("t", None, 8080);
+        // Default endpoint is https://127.0.0.1:8080
+        assert_eq!(meta.gateway_host(), None);
+    }
+
+    #[test]
+    fn gateway_host_returns_none_for_localhost() {
+        let meta = GatewayMetadata {
+            name: "t".into(),
+            gateway_endpoint: "https://localhost:8080".into(),
+            is_remote: false,
+            gateway_port: 8080,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: None,
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+        assert_eq!(meta.gateway_host(), None);
+    }
+
+    #[test]
+    fn gateway_host_returns_ip_for_remote() {
+        let meta = GatewayMetadata {
+            name: "t".into(),
+            gateway_endpoint: "https://10.0.0.5:8080".into(),
+            is_remote: true,
+            gateway_port: 8080,
+            remote_host: Some("user@10.0.0.5".into()),
+            resolved_host: Some("10.0.0.5".into()),
+            auth_mode: None,
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+        assert_eq!(meta.gateway_host(), Some("10.0.0.5"));
+    }
+
+    #[test]
+    fn gateway_host_handles_http_scheme() {
+        let meta =
+            create_gateway_metadata_with_host("t", None, 8080, Some("host.docker.internal"), true);
+        assert_eq!(meta.gateway_host(), Some("host.docker.internal"));
     }
 
     #[test]

@@ -1385,17 +1385,24 @@ pub async fn gateway_admin_deploy(
     }
 
     // When resuming an existing gateway (not recreating), prefer the port
-    // from stored metadata over the CLI default.  The user may have originally
-    // bootstrapped on a non-default port (e.g. `--port 8082`) and a bare
-    // `gateway start` without `--port` should honour that.
-    let effective_port = if !recreate {
-        openshell_bootstrap::load_gateway_metadata(name)
-            .ok()
-            .filter(|m| m.gateway_port > 0)
-            .map_or(port, |m| m.gateway_port)
+    // and gateway host from stored metadata over the CLI defaults.  The user
+    // may have originally bootstrapped on a non-default port (e.g. `--port
+    // 8082`) or with `--gateway-host host.docker.internal`, and a bare
+    // `gateway start` without those flags should honour the original values.
+    let stored_metadata = if !recreate {
+        openshell_bootstrap::load_gateway_metadata(name).ok()
     } else {
-        port
+        None
     };
+    let effective_port = stored_metadata
+        .as_ref()
+        .filter(|m| m.gateway_port > 0)
+        .map_or(port, |m| m.gateway_port);
+    let effective_gateway_host: Option<String> = gateway_host.map(String::from).or_else(|| {
+        stored_metadata
+            .as_ref()
+            .and_then(|m| m.gateway_host().map(String::from))
+    });
 
     let mut options = DeployOptions::new(name)
         .with_port(effective_port)
@@ -1406,7 +1413,7 @@ pub async fn gateway_admin_deploy(
     if let Some(opts) = remote_opts {
         options = options.with_remote(opts);
     }
-    if let Some(host) = gateway_host {
+    if let Some(host) = effective_gateway_host {
         options = options.with_gateway_host(host);
     }
     if let Some(username) = registry_username {
