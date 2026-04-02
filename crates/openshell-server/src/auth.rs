@@ -22,10 +22,27 @@ use axum::{
     response::{Html, IntoResponse},
     routing::get,
 };
+use http::header;
 use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::ServerState;
+
+/// Validate that a confirmation code matches the CLI-generated format.
+///
+/// Codes are 3 alphanumeric characters, a dash, then 4 alphanumeric characters
+/// (e.g., "AB7-X9KM"). The CLI generates these from the charset `[A-Z2-9]`.
+fn is_valid_code(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    bytes.len() == 8
+        && bytes[3] == b'-'
+        && bytes[..3]
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        && bytes[4..]
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
 
 #[derive(Deserialize)]
 struct ConnectParams {
@@ -54,6 +71,15 @@ async fn auth_connect(
     Query(params): Query<ConnectParams>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Reject codes that don't match the CLI-generated format to prevent
+    // reflected XSS via crafted URLs.
+    if !is_valid_code(&params.code) {
+        return Html(
+            "<html><body><p>Invalid confirmation code format.</p></body></html>".to_string(),
+        )
+        .into_response();
+    }
+
     let cf_token = headers
         .get("cookie")
         .and_then(|v| v.to_str().ok())
@@ -71,13 +97,32 @@ async fn auth_connect(
     let safe_gateway = html_escape(&gateway_display);
 
     match cf_token {
-        Some(token) => Html(render_connect_page(
-            &safe_gateway,
-            params.callback_port,
-            &token,
-            &params.code,
-        )),
-        None => Html(render_waiting_page(params.callback_port, &params.code)),
+        Some(token) => {
+            let nonce = uuid::Uuid::new_v4().to_string();
+            let csp = format!(
+                "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; connect-src http://127.0.0.1:*"
+            );
+            (
+                [(header::CONTENT_SECURITY_POLICY, csp)],
+                Html(render_connect_page(
+                    &safe_gateway,
+                    params.callback_port,
+                    &token,
+                    &params.code,
+                    &nonce,
+                )),
+            )
+                .into_response()
+        }
+        None => {
+            let csp =
+                "default-src 'none'; style-src 'unsafe-inline'".to_string();
+            (
+                [(header::CONTENT_SECURITY_POLICY, csp)],
+                Html(render_waiting_page(params.callback_port, &params.code)),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -106,22 +151,27 @@ fn render_connect_page(
     callback_port: u16,
     cf_token: &str,
     code: &str,
+    nonce: &str,
 ) -> String {
-    // Escape the token for safe embedding in a JS string literal.
-    let escaped_token = cf_token
-        .replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('"', "\\\"")
-        .replace('<', "\\x3c")
-        .replace('>', "\\x3e");
+    // Use JSON serialization for JS-safe string embedding — handles all
+    // edge cases including \n, \r, U+2028, U+2029 that break JS string
+    // literals. serde_json::to_string produces a quoted JSON string
+    // (e.g., "value") which is a valid JS string literal.
+    //
+    // We additionally escape < and > to \u003c / \u003e because while
+    // they're valid in JSON, they're dangerous inside an HTML <script>
+    // block (the HTML parser sees </script> before the JS parser runs).
+    let json_token = serde_json::to_string(cf_token)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e");
+    let json_code = serde_json::to_string(code)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e");
 
-    // Escape the code the same way (it's alphanumeric + dash, but be safe).
-    let escaped_code = code
-        .replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('"', "\\\"")
-        .replace('<', "\\x3c")
-        .replace('>', "\\x3e");
+    // HTML-safe version of the code for display in the page body.
+    let html_code = html_escape(code);
 
     let version = openshell_core::VERSION;
 
@@ -252,7 +302,7 @@ fn render_connect_page(
         <div class="subtitle">Connect to Gateway</div>
         <div class="code-box">
             <div class="code-label">Confirmation Code</div>
-            <div class="code-value">{escaped_code}</div>
+            <div class="code-value">{html_code}</div>
             <div class="code-hint">Verify this matches the code shown in your terminal</div>
         </div>
         <div class="info">
@@ -273,9 +323,9 @@ fn render_connect_page(
         </div>
         <div class="status" id="status"></div>
     </div>
-    <script>
-        var token = '{escaped_token}';
-        var code = '{escaped_code}';
+    <script nonce="{nonce}">
+        var token = {json_token};
+        var code = {json_code};
         var port = {callback_port};
         function connect() {{
             var btn = document.getElementById('connectBtn');
@@ -442,6 +492,7 @@ mod tests {
             12345,
             "test-jwt-token",
             "ABC-1234",
+            "test-nonce",
         );
         assert!(html.contains("test-jwt-token"));
         assert!(html.contains("12345"));
@@ -454,23 +505,46 @@ mod tests {
         // Should POST with JSON
         assert!(html.contains("method: 'POST'"));
         assert!(html.contains("JSON.stringify"));
+        // CSP nonce should be on the script tag
+        assert!(html.contains("nonce=\"test-nonce\""));
     }
 
     #[test]
     fn render_connect_page_escapes_special_chars() {
-        let html =
-            render_connect_page("gw", 1234, "token<script>alert('xss')</script>", "ABC-1234");
-        // < and > should be escaped
+        let html = render_connect_page(
+            "gw",
+            1234,
+            "token<script>alert('xss')</script>",
+            "ABC-1234",
+            "nonce",
+        );
+        // < and > should be escaped via JSON encoding (\u003c)
         assert!(!html.contains("<script>alert"));
-        assert!(html.contains("\\x3c"));
     }
 
     #[test]
     fn render_connect_page_includes_code_in_js_payload() {
-        let html = render_connect_page("gw", 1234, "jwt", "XY7-9KLM");
-        // The JS should send the code in the JSON payload
-        assert!(html.contains("var code = 'XY7-9KLM'"));
+        let html = render_connect_page("gw", 1234, "jwt", "XY7-9KLM", "nonce");
+        // The JS should send the code in the JSON payload (now JSON-encoded)
+        assert!(html.contains(r#"var code = "XY7-9KLM""#));
         assert!(html.contains("code: code"));
+    }
+
+    #[test]
+    fn is_valid_code_accepts_valid_format() {
+        assert!(is_valid_code("AB7-X9KM"));
+        assert!(is_valid_code("222-AAAA"));
+        assert!(is_valid_code("ZZZ-9999"));
+    }
+
+    #[test]
+    fn is_valid_code_rejects_invalid_format() {
+        assert!(!is_valid_code(""));
+        assert!(!is_valid_code("too-long-code"));
+        assert!(!is_valid_code("abc-defg")); // lowercase
+        assert!(!is_valid_code("AB7X9KLM")); // no dash
+        assert!(!is_valid_code("AB7-9KL")); // too short
+        assert!(!is_valid_code("x\u{2028};fetch('//evil')//")); // XSS payload
     }
 
     #[test]
