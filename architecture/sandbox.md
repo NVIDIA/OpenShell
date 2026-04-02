@@ -24,7 +24,7 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `sandbox/mod.rs` | Platform abstraction -- dispatches to Linux or no-op |
 | `sandbox/linux/mod.rs` | Linux composition: Landlock then seccomp |
 | `sandbox/linux/landlock.rs` | Filesystem isolation via Landlock LSM (ABI V1) |
-| `sandbox/linux/seccomp.rs` | Syscall filtering via BPF on `SYS_socket` |
+| `sandbox/linux/seccomp.rs` | Syscall filtering via BPF: socket domain blocks, dangerous syscall blocks, conditional flag blocks |
 | `bypass_monitor.rs` | Background `/dev/kmsg` reader for iptables bypass detection events |
 | `sandbox/linux/netns.rs` | Network namespace creation, veth pair setup, bypass detection iptables rules, cleanup on drop |
 | `l7/mod.rs` | L7 types (`L7Protocol`, `TlsMode`, `EnforcementMode`, `L7EndpointConfig`), config parsing, validation, access preset expansion, deprecated `tls` value handling |
@@ -451,13 +451,7 @@ Kernel-level error behavior (e.g., Landlock ABI unavailable) depends on `Landloc
 
 **File:** `crates/openshell-sandbox/src/sandbox/linux/seccomp.rs`
 
-Seccomp blocks socket creation for specific address families. The filter targets a single syscall (`SYS_socket`) and inspects argument 0 (the domain).
-
-**Always blocked** (regardless of network mode):
-- `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, `AF_VSOCK`
-
-**Additionally blocked in `Block` mode** (no proxy):
-- `AF_INET`, `AF_INET6`
+Seccomp provides three layers of syscall restriction: socket domain blocks, unconditional syscall blocks, and conditional syscall blocks. The filter uses a default-allow policy (`SeccompAction::Allow`) with targeted rules that return `Errno(EPERM)`.
 
 **Skipped entirely** in `Allow` mode.
 
@@ -465,7 +459,43 @@ Setup:
 1. `prctl(PR_SET_NO_NEW_PRIVS, 1)` -- required before seccomp
 2. `seccompiler::apply_filter()` with default action `Allow` and per-rule action `Errno(EPERM)`
 
+#### Socket domain blocks
+
+| Domain | Always blocked | Additionally blocked in Block mode |
+|--------|:-:|:-:|
+| `AF_PACKET` | Yes | |
+| `AF_BLUETOOTH` | Yes | |
+| `AF_VSOCK` | Yes | |
+| `AF_INET` | | Yes |
+| `AF_INET6` | | Yes |
+| `AF_NETLINK` | | Yes |
+
 In `Proxy` mode, `AF_INET`/`AF_INET6` are allowed because the sandboxed process needs to connect to the proxy over the veth pair. The network namespace ensures it can only reach the proxy's IP (`10.200.0.1`).
+
+#### Unconditional syscall blocks
+
+These syscalls are blocked entirely (EPERM for any invocation):
+
+| Syscall | Reason |
+|---------|--------|
+| `memfd_create` | Fileless binary execution bypasses Landlock filesystem restrictions |
+| `ptrace` | Cross-process memory inspection and code injection |
+| `bpf` | Kernel BPF program loading |
+| `process_vm_readv` | Cross-process memory read |
+| `io_uring_setup` | Async I/O subsystem with extensive CVE history |
+| `mount` | Filesystem mount could subvert Landlock or overlay writable paths |
+
+#### Conditional syscall blocks
+
+These syscalls are only blocked when specific flag patterns are present:
+
+| Syscall | Condition | Reason |
+|---------|-----------|--------|
+| `execveat` | `AT_EMPTY_PATH` flag set (arg4) | Fileless execution from an anonymous fd |
+| `unshare` | `CLONE_NEWUSER` flag set (arg0) | User namespace creation enables privilege escalation |
+| `seccomp` | operation == `SECCOMP_SET_MODE_FILTER` (arg0) | Prevents sandboxed code from replacing the active filter |
+
+Conditional blocks use `MaskedEq` for flag checks (bit-test) and `Eq` for exact-value matches. This allows normal use of these syscalls while blocking the dangerous flag combinations.
 
 ### Network namespace isolation
 

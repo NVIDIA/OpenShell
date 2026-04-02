@@ -850,6 +850,10 @@ The response includes an `X-OpenShell-Policy` header and `Connection: close`. Se
 
 ## Seccomp Filter Details
 
+The seccomp filter uses a default-allow policy (`SeccompAction::Allow`) with targeted rules that return `EPERM`. It provides three layers of protection: socket domain blocks, unconditional syscall blocks, and conditional syscall blocks. See `crates/openshell-sandbox/src/sandbox/linux/seccomp.rs`.
+
+### Blocked socket domains
+
 Regardless of network mode, certain socket domains are always blocked:
 
 | Domain         | Constant | Reason                                                                          |
@@ -861,7 +865,30 @@ Regardless of network mode, certain socket domains are always blocked:
 
 In proxy mode (which is always active), `AF_INET` (2) and `AF_INET6` (10) are allowed so the sandbox process can reach the proxy.
 
-The seccomp filter uses a default-allow policy (`SeccompAction::Allow`) with specific `socket()` syscall rules that return `EPERM` when the first argument (domain) matches a blocked value. See `crates/openshell-sandbox/src/sandbox/linux/seccomp.rs`.
+### Blocked syscalls
+
+These syscalls are blocked unconditionally (EPERM for any invocation):
+
+| Syscall | NR (x86-64) | Reason |
+|---------|-------------|--------|
+| `memfd_create` | 319 | Fileless binary execution bypasses Landlock filesystem restrictions |
+| `ptrace` | 101 | Cross-process memory inspection and code injection |
+| `bpf` | 321 | Kernel BPF program loading |
+| `process_vm_readv` | 310 | Cross-process memory read |
+| `io_uring_setup` | 425 | Async I/O subsystem with extensive CVE history |
+| `mount` | 165 | Filesystem mount could subvert Landlock or overlay writable paths |
+
+### Conditionally blocked syscalls
+
+These syscalls are blocked only when specific flag patterns are present in their arguments:
+
+| Syscall | NR (x86-64) | Condition | Reason |
+|---------|-------------|-----------|--------|
+| `execveat` | 322 | `AT_EMPTY_PATH` (0x1000) set in flags (arg4) | Fileless execution from an anonymous fd |
+| `unshare` | 272 | `CLONE_NEWUSER` (0x10000000) set in flags (arg0) | User namespace creation enables privilege escalation |
+| `seccomp` | 317 | operation == `SECCOMP_SET_MODE_FILTER` (1) in arg0 | Prevents sandboxed code from replacing the active filter |
+
+Flag checks use `MaskedEq` (`(arg & mask) == mask`) to detect the flag bit regardless of other bits. The `seccomp` syscall check uses `Eq` for exact value comparison on the operation argument.
 
 ---
 
