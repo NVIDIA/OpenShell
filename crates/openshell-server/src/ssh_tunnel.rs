@@ -28,6 +28,15 @@ const PREFACE_MAGIC: &str = "NSSH1";
 /// Maximum concurrent SSH tunnel connections per session token.
 const MAX_CONNECTIONS_PER_TOKEN: u32 = 3;
 
+/// Redact a bearer token for safe logging — show only the last 4 characters.
+fn redact_token(token: &str) -> String {
+    if token.len() <= 4 {
+        "****".to_string()
+    } else {
+        format!("****{}", &token[token.len() - 4..])
+    }
+}
+
 /// Maximum concurrent SSH tunnel connections per sandbox.
 const MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
 
@@ -116,7 +125,7 @@ async fn ssh_connect(
         let mut counts = state.ssh_connections_by_token.lock().unwrap();
         let count = counts.entry(token.clone()).or_insert(0);
         if *count >= MAX_CONNECTIONS_PER_TOKEN {
-            warn!(token = %token, "SSH tunnel: per-token connection limit reached");
+            warn!(token = %redact_token(&token), "SSH tunnel: per-token connection limit reached");
             return StatusCode::TOO_MANY_REQUESTS.into_response();
         }
         *count += 1;
