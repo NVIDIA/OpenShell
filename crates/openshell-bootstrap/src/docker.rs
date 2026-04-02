@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::RemoteOptions;
-use crate::constants::{container_name, network_name, volume_name};
+use crate::constants::{container_name, network_name, node_name, volume_name};
 use crate::image::{self, DEFAULT_IMAGE_REPO_BASE, DEFAULT_REGISTRY, parse_image_ref};
 use bollard::API_DEFAULT_VERSION;
 use bollard::Docker;
@@ -684,6 +684,11 @@ pub async fn ensure_container(
         format!("REGISTRY_HOST={registry_host}"),
         format!("REGISTRY_INSECURE={registry_insecure}"),
         format!("IMAGE_REPO_BASE={image_repo_base}"),
+        // Deterministic k3s node name so the node identity survives container
+        // recreation (e.g. after an image upgrade). Without this, k3s uses
+        // the container ID as the hostname/node name, which changes on every
+        // container recreate and triggers stale-node PVC cleanup.
+        format!("OPENSHELL_NODE_NAME={}", node_name(name)),
     ];
     if let Some(endpoint) = registry_endpoint {
         env_vars.push(format!("REGISTRY_ENDPOINT={endpoint}"));
@@ -753,6 +758,14 @@ pub async fn ensure_container(
 
     let config = ContainerCreateBody {
         image: Some(image_ref.to_string()),
+        // Set the container hostname to the deterministic node name.
+        // k3s uses the container hostname as its default node name.  Without
+        // this, Docker defaults to the container ID (first 12 hex chars),
+        // which changes on every container recreation and can cause
+        // `clean_stale_nodes` to delete the wrong node on resume.  The
+        // hostname persists across container stop/start cycles, ensuring a
+        // stable node identity.
+        hostname: Some(node_name(name)),
         cmd: Some(cmd),
         env,
         exposed_ports: Some(exposed_ports),

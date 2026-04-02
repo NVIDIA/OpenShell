@@ -559,8 +559,26 @@ fi
 # routing to settle first.
 wait_for_default_route
 
+# ---------------------------------------------------------------------------
+# Deterministic k3s node name
+# ---------------------------------------------------------------------------
+# By default k3s uses the container hostname (= Docker container ID) as the
+# node name.  When the container is recreated (e.g. after an image upgrade),
+# the container ID changes, registering a new k3s node.  The bootstrap code
+# then deletes PVCs whose backing PVs have node affinity for the old node —
+# wiping the server database and any sandbox persistent volumes.
+#
+# OPENSHELL_NODE_NAME is set by the bootstrap code to a deterministic value
+# derived from the gateway name, so the node identity survives container
+# recreation and PVCs are never orphaned.
+NODE_NAME_ARG=""
+if [ -n "${OPENSHELL_NODE_NAME:-}" ]; then
+    NODE_NAME_ARG="--node-name=${OPENSHELL_NODE_NAME}"
+    echo "Using deterministic k3s node name: ${OPENSHELL_NODE_NAME}"
+fi
+
 # Execute k3s with explicit resolv-conf passed as a kubelet arg.
 # k3s v1.35.2+ no longer accepts --resolv-conf as a top-level server flag;
 # it must be passed via --kubelet-arg instead.
 # shellcheck disable=SC2086
-exec /bin/k3s "$@" --kubelet-arg=resolv-conf="$RESOLV_CONF" $EXTRA_KUBELET_ARGS
+exec /bin/k3s "$@" $NODE_NAME_ARG --kubelet-arg=resolv-conf="$RESOLV_CONF" $EXTRA_KUBELET_ARGS

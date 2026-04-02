@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::constants::{KUBECONFIG_PATH, container_name};
+use crate::constants::{KUBECONFIG_PATH, container_name, node_name};
 use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::exec::CreateExecOptions;
@@ -385,11 +385,19 @@ pub async fn clean_stale_nodes(docker: &Docker, name: &str) -> Result<usize> {
     let container_name = container_name(name);
     let mut stale_nodes: Vec<String> = Vec::new();
 
+    // Determine the current node name.  With the deterministic `--node-name`
+    // entrypoint change the k3s node is `openshell-{gateway}`.  However, older
+    // cluster images (built before that change) still use the container hostname
+    // (= Docker container ID) as the node name.  We must handle both:
+    //
+    //   1. If the expected deterministic name appears in the node list, use it.
+    //   2. Otherwise fall back to the container hostname (old behaviour).
+    //
+    // This ensures backward compatibility during upgrades where the bootstrap
+    // CLI is newer than the cluster image.
+    let deterministic_node = node_name(name);
+
     for attempt in 1..=MAX_ATTEMPTS {
-        // List ALL node names and the container's own hostname.  Any node that
-        // is not the current container is stale — we cannot rely on the Ready
-        // condition because k3s may not have marked the old node NotReady yet
-        // when this runs shortly after container start.
         let (output, exit_code) = exec_capture_with_exit(
             docker,
             &container_name,
@@ -406,16 +414,27 @@ pub async fn clean_stale_nodes(docker: &Docker, name: &str) -> Result<usize> {
         .await?;
 
         if exit_code == 0 {
-            // Determine the current node name (container hostname).
-            let (hostname_out, _) =
-                exec_capture_with_exit(docker, &container_name, vec!["hostname".to_string()])
-                    .await?;
-            let current_hostname = hostname_out.trim().to_string();
-
-            stale_nodes = output
+            let all_nodes: Vec<&str> = output
                 .lines()
                 .map(str::trim)
-                .filter(|l| !l.is_empty() && *l != current_hostname)
+                .filter(|l| !l.is_empty())
+                .collect();
+
+            // Pick the current node identity: prefer the deterministic name,
+            // fall back to the container hostname for older cluster images.
+            let current_node = if all_nodes.contains(&deterministic_node.as_str()) {
+                deterministic_node.clone()
+            } else {
+                // Older cluster image without --node-name: read hostname.
+                let (hostname_out, _) =
+                    exec_capture_with_exit(docker, &container_name, vec!["hostname".to_string()])
+                        .await?;
+                hostname_out.trim().to_string()
+            };
+
+            stale_nodes = all_nodes
+                .into_iter()
+                .filter(|n| *n != current_node)
                 .map(ToString::to_string)
                 .collect();
             break;

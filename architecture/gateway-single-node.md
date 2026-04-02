@@ -185,7 +185,7 @@ For the target daemon (local or remote):
 
 After the container starts:
 
-1. **Clean stale nodes**: `clean_stale_nodes()` finds `NotReady` nodes via `kubectl get nodes` and deletes them. This is needed when a container is recreated but reuses the persistent volume -- k3s registers a new node (using the container ID as hostname) while old node entries persist in etcd. Non-fatal on error; returns the count of removed nodes.
+1. **Clean stale nodes**: `clean_stale_nodes()` finds nodes whose name does not match the deterministic k3s `--node-name` and deletes them. That node name is derived from the gateway name but normalized to a Kubernetes-safe lowercase form so existing gateway names that contain `_`, `.`, or uppercase characters still produce a valid node identity. This cleanup is needed when a container is recreated but reuses the persistent volume -- old node entries can persist in etcd. Non-fatal on error; returns the count of removed nodes.
 2. **Push local images** (optional, local deploy only): If `OPENSHELL_PUSH_IMAGES` is set, the comma-separated image refs are exported from the local Docker daemon as a single tar, uploaded into the container via `docker put_archive`, and imported into containerd via `ctr images import` in the `k8s.io` namespace. After import, `kubectl rollout restart deployment/openshell openshell` is run, followed by `kubectl rollout status --timeout=180s` to wait for completion. See `crates/openshell-bootstrap/src/push.rs`.
 3. **Wait for gateway health**: `wait_for_gateway_ready()` polls the Docker HEALTHCHECK status up to 180 times, 2 seconds apart (6 min total). A background task streams container logs during this wait. Failure modes:
     - Container exits during polling: error includes recent log lines.
