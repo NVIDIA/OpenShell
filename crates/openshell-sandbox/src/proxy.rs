@@ -23,6 +23,12 @@ use tracing::{debug, info, warn};
 const MAX_HEADER_BYTES: usize = 8192;
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
 
+/// Maximum total bytes for a streaming inference response body (32 MiB).
+const MAX_STREAMING_BODY: usize = 32 * 1024 * 1024;
+
+/// Idle timeout per chunk when relaying streaming inference responses.
+const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Result of a proxy CONNECT policy decision.
 struct ConnectDecision {
     action: NetworkAction,
@@ -1045,16 +1051,33 @@ async fn route_inference_request(
                 let header_bytes = format_http_response_header(resp.status, &resp_headers);
                 write_all(tls_client, &header_bytes).await?;
 
-                // Stream body chunks as they arrive from the upstream.
+                // Stream body chunks with byte cap and idle timeout.
+                let mut total_bytes: usize = 0;
                 loop {
-                    match resp.next_chunk().await {
-                        Ok(Some(chunk)) => {
+                    match tokio::time::timeout(CHUNK_IDLE_TIMEOUT, resp.next_chunk()).await {
+                        Ok(Ok(Some(chunk))) => {
+                            total_bytes += chunk.len();
+                            if total_bytes > MAX_STREAMING_BODY {
+                                warn!(
+                                    total_bytes = total_bytes,
+                                    limit = MAX_STREAMING_BODY,
+                                    "streaming response exceeded byte limit, truncating"
+                                );
+                                break;
+                            }
                             let encoded = format_chunk(&chunk);
                             write_all(tls_client, &encoded).await?;
                         }
-                        Ok(None) => break,
-                        Err(e) => {
+                        Ok(Ok(None)) => break,
+                        Ok(Err(e)) => {
                             warn!(error = %e, "error reading upstream response chunk");
+                            break;
+                        }
+                        Err(_) => {
+                            warn!(
+                                idle_timeout_secs = CHUNK_IDLE_TIMEOUT.as_secs(),
+                                "streaming response chunk idle timeout, closing"
+                            );
                             break;
                         }
                     }
