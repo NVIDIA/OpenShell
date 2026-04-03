@@ -314,6 +314,7 @@ where
     //   idempotent and will reuse the volume, create a container if needed,
     //   and start it)
     let mut resume = false;
+    let mut resume_container_exists = false;
     if let Some(existing) = check_existing_gateway(&target_docker, &name).await? {
         if recreate {
             log("[status] Removing existing gateway".to_string());
@@ -321,17 +322,24 @@ where
         } else if existing.container_running {
             log("[status] Gateway is already running".to_string());
             resume = true;
+            resume_container_exists = true;
         } else {
             log("[status] Resuming gateway from existing state".to_string());
             resume = true;
+            resume_container_exists = existing.container_exists;
         }
     }
 
     // Ensure the image is available on the target Docker daemon.
-    // On resume the existing container already has its image — skip the
-    // pull to avoid failures when the original image tag (e.g. a local-only
+    // When both the container and volume exist we can skip the pull entirely
+    // — the container already references a valid local image.  This avoids
+    // failures when the original image tag (e.g. a local-only
     // `openshell/cluster:dev`) is not available from the default registry.
-    if !resume {
+    //
+    // When only the volume survives (container was removed), we still need
+    // the image to recreate the container, so the pull must happen.
+    let need_image = !resume || !resume_container_exists;
+    if need_image {
         if remote_opts.is_some() {
             log("[status] Downloading gateway".to_string());
             let on_log_clone = Arc::clone(&on_log);
