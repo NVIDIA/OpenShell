@@ -34,11 +34,14 @@ pub struct Router {
     client: reqwest::Client,
 }
 
-/// Select a route from `candidates` using alias-first, protocol-fallback strategy.
+/// Select a route from `candidates` using alias-first, model-second,
+/// protocol-fallback strategy.
 ///
-/// 1. If `model_hint` is provided, find a candidate whose `name` matches the hint
-///    **and** whose protocols include `protocol`.
-/// 2. Otherwise, return the first candidate whose protocols contain `protocol`.
+/// 1. If `model_hint` is provided, find a candidate whose `name` (alias)
+///    matches the hint **and** whose protocols include `protocol`.
+/// 2. Else if `model_hint` is provided, find a candidate whose `model`
+///    matches the hint **and** whose protocols include `protocol`.
+/// 3. Otherwise, return the first candidate whose protocols contain `protocol`.
 fn select_route<'a>(
     candidates: &'a [ResolvedRoute],
     protocol: &str,
@@ -46,13 +49,22 @@ fn select_route<'a>(
 ) -> Option<&'a ResolvedRoute> {
     if let Some(hint) = model_hint {
         let normalized_hint = hint.trim().to_ascii_lowercase();
+        // 1. Alias match (route name == model hint).
         if let Some(r) = candidates.iter().find(|r| {
             r.name.trim().to_ascii_lowercase() == normalized_hint
                 && r.protocols.iter().any(|p| p == protocol)
         }) {
             return Some(r);
         }
+        // 2. Model ID match (route model == model hint).
+        if let Some(r) = candidates.iter().find(|r| {
+            r.model.trim().to_ascii_lowercase() == normalized_hint
+                && r.protocols.iter().any(|p| p == protocol)
+        }) {
+            return Some(r);
+        }
     }
+    // 3. First protocol-compatible route.
     candidates
         .iter()
         .find(|r| r.protocols.iter().any(|p| p == protocol))
@@ -272,5 +284,33 @@ mod tests {
         ];
         let r = select_route(&routes, "openai_chat_completions", Some("my-gpt")).unwrap();
         assert_eq!(r.name, "My-GPT");
+    }
+
+    #[test]
+    fn select_route_model_id_match() {
+        // When the hint doesn't match any alias but does match a route's model,
+        // that route is selected.
+        let routes = vec![
+            make_route("ollama-local", vec!["openai_responses"]),
+            make_route("openai-codex", vec!["openai_responses"]),
+        ];
+        // openai-codex has model "openai-codex-model"; ollama-local has "ollama-local-model".
+        // Hint "openai-codex-model" doesn't match any alias, but matches the model field.
+        let r = select_route(&routes, "openai_responses", Some("openai-codex-model")).unwrap();
+        assert_eq!(r.name, "openai-codex");
+    }
+
+    #[test]
+    fn select_route_alias_beats_model_id() {
+        // Alias match takes priority over model ID match.
+        let mut routes = vec![
+            make_route("ollama-local", vec!["openai_chat_completions"]),
+            make_route("openai-prod", vec!["openai_chat_completions"]),
+        ];
+        // Give ollama-local a model that matches the second route's name.
+        routes[0].model = "openai-prod".to_string();
+        let r = select_route(&routes, "openai_chat_completions", Some("openai-prod")).unwrap();
+        // Alias match wins: route named "openai-prod", not the one with model="openai-prod".
+        assert_eq!(r.name, "openai-prod");
     }
 }

@@ -1175,12 +1175,21 @@ async fn route_inference_request(
             .ok()
             .and_then(|v| v.get("model")?.as_str().map(String::from));
 
+        // For patterns like codex that set strip_version_prefix, remove the
+        // /v1 proxy artifact from the path so the backend endpoint base URL
+        // alone controls the path prefix.
+        let routed_path = if pattern.strip_version_prefix && normalized_path.starts_with("/v1/") {
+            &normalized_path[3..]
+        } else {
+            &normalized_path
+        };
+
         match ctx
             .router
             .proxy_with_candidates_streaming(
                 &pattern.protocol,
                 &request.method,
-                &normalized_path,
+                routed_path,
                 filtered_headers,
                 bytes::Bytes::from(request.body.clone()),
                 &routes,

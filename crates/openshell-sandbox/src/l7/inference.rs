@@ -14,6 +14,10 @@ pub struct InferenceApiPattern {
     pub path_glob: String,
     pub protocol: String,
     pub kind: String,
+    /// When true, the `/v1` version prefix is stripped from the request path
+    /// before forwarding to the backend. This is needed for endpoints whose
+    /// base URL does not include `/v1` (e.g. `chatgpt.com/backend-api`).
+    pub strip_version_prefix: bool,
 }
 
 /// Default patterns for known inference APIs (`OpenAI`, Anthropic).
@@ -24,60 +28,70 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
             path_glob: "/v1/chat/completions".to_string(),
             protocol: "openai_chat_completions".to_string(),
             kind: "chat_completion".to_string(),
+            strip_version_prefix: false,
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/v1/completions".to_string(),
             protocol: "openai_completions".to_string(),
             kind: "completion".to_string(),
+            strip_version_prefix: false,
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/v1/responses".to_string(),
             protocol: "openai_responses".to_string(),
             kind: "responses".to_string(),
+            strip_version_prefix: false,
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/v1/codex/*".to_string(),
             protocol: "openai_responses".to_string(),
             kind: "codex_responses".to_string(),
+            strip_version_prefix: true,
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/v1/messages".to_string(),
             protocol: "anthropic_messages".to_string(),
             kind: "messages".to_string(),
+            strip_version_prefix: false,
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/api/chat".to_string(),
             protocol: "ollama_chat".to_string(),
             kind: "ollama_chat".to_string(),
+            strip_version_prefix: false,
         },
         InferenceApiPattern {
             method: "GET".to_string(),
             path_glob: "/api/tags".to_string(),
             protocol: "ollama_model_discovery".to_string(),
             kind: "ollama_tags".to_string(),
+            strip_version_prefix: false,
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/api/show".to_string(),
             protocol: "ollama_model_discovery".to_string(),
             kind: "ollama_show".to_string(),
+            strip_version_prefix: false,
         },
         InferenceApiPattern {
             method: "GET".to_string(),
             path_glob: "/v1/models".to_string(),
             protocol: "model_discovery".to_string(),
             kind: "models_list".to_string(),
+            strip_version_prefix: false,
         },
         InferenceApiPattern {
             method: "GET".to_string(),
             path_glob: "/v1/models/*".to_string(),
             protocol: "model_discovery".to_string(),
             kind: "models_get".to_string(),
+            strip_version_prefix: false,
         },
     ]
 }
