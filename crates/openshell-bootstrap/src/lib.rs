@@ -327,33 +327,38 @@ where
         }
     }
 
-    // Ensure the image is available on the target Docker daemon
-    if remote_opts.is_some() {
-        log("[status] Downloading gateway".to_string());
-        let on_log_clone = Arc::clone(&on_log);
-        let progress_cb = move |msg: String| {
-            if let Ok(mut f) = on_log_clone.lock() {
-                f(msg);
-            }
-        };
-        image::pull_remote_image(
-            &target_docker,
-            &image_ref,
-            registry_username.as_deref(),
-            registry_token.as_deref(),
-            progress_cb,
-        )
-        .await?;
-    } else {
-        // Local deployment: ensure image exists (pull if needed)
-        log("[status] Downloading gateway".to_string());
-        ensure_image(
-            &target_docker,
-            &image_ref,
-            registry_username.as_deref(),
-            registry_token.as_deref(),
-        )
-        .await?;
+    // Ensure the image is available on the target Docker daemon.
+    // On resume the existing container already has its image — skip the
+    // pull to avoid failures when the original image tag (e.g. a local-only
+    // `openshell/cluster:dev`) is not available from the default registry.
+    if !resume {
+        if remote_opts.is_some() {
+            log("[status] Downloading gateway".to_string());
+            let on_log_clone = Arc::clone(&on_log);
+            let progress_cb = move |msg: String| {
+                if let Ok(mut f) = on_log_clone.lock() {
+                    f(msg);
+                }
+            };
+            image::pull_remote_image(
+                &target_docker,
+                &image_ref,
+                registry_username.as_deref(),
+                registry_token.as_deref(),
+                progress_cb,
+            )
+            .await?;
+        } else {
+            // Local deployment: ensure image exists (pull if needed)
+            log("[status] Downloading gateway".to_string());
+            ensure_image(
+                &target_docker,
+                &image_ref,
+                registry_username.as_deref(),
+                registry_token.as_deref(),
+            )
+            .await?;
+        }
     }
 
     // All subsequent operations use the target Docker (remote or local)
@@ -444,6 +449,7 @@ where
             registry_username.as_deref(),
             registry_token.as_deref(),
             &device_ids,
+            resume,
         )
         .await?;
         let port = actual_port;

@@ -482,6 +482,7 @@ pub async fn ensure_container(
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     device_ids: &[String],
+    resume: bool,
 ) -> Result<u16> {
     let container_name = container_name(name);
 
@@ -491,25 +492,34 @@ pub async fn ensure_container(
         .await
     {
         Ok(info) => {
-            // Container exists — verify it is using the expected image.
-            // Resolve the desired image ref to its content-addressable ID so we
-            // can compare against the container's image field (which Docker
-            // stores as an ID).
-            let desired_id = docker
-                .inspect_image(image_ref)
-                .await
-                .ok()
-                .and_then(|img| img.id);
+            // On resume we always reuse the existing container — the persistent
+            // volume holds k3s etcd state, and recreating the container with
+            // different env vars would cause the entrypoint to rewrite the
+            // HelmChart manifest, triggering a Helm upgrade that changes the
+            // StatefulSet image reference while the old pod still runs with the
+            // previous image.  Reusing the container avoids this entirely.
+            //
+            // On a non-resume path we check whether the image changed and
+            // recreate only when necessary.
+            let reuse = if resume {
+                true
+            } else {
+                let desired_id = docker
+                    .inspect_image(image_ref)
+                    .await
+                    .ok()
+                    .and_then(|img| img.id);
 
-            let container_image_id = info.image;
+                let container_image_id = info.image.clone();
 
-            let image_matches = match (&desired_id, &container_image_id) {
-                (Some(desired), Some(current)) => desired == current,
-                _ => false,
+                match (&desired_id, &container_image_id) {
+                    (Some(desired), Some(current)) => desired == current,
+                    _ => false,
+                }
             };
 
-            if image_matches {
-                // The container exists with the correct image, but its network
+            if reuse {
+                // The container exists and should be reused. Its network
                 // attachment may be stale. When the gateway is resumed after a
                 // container kill, `ensure_network` destroys and recreates the
                 // Docker network (giving it a new ID). The stopped container
@@ -543,8 +553,8 @@ pub async fn ensure_container(
             tracing::info!(
                 "Container {} exists but uses a different image (container={}, desired={}), recreating",
                 container_name,
-                container_image_id.as_deref().map_or("unknown", truncate_id),
-                desired_id.as_deref().map_or("unknown", truncate_id),
+                info.image.as_deref().map_or("unknown", truncate_id),
+                image_ref,
             );
 
             let _ = docker.stop_container(&container_name, None).await;
