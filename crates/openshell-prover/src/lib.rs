@@ -50,7 +50,9 @@ pub fn prove(
             if crate_registry.is_dir() {
                 std::borrow::Cow::Owned(crate_registry)
             } else {
-                std::borrow::Cow::Owned(std::env::current_dir().unwrap_or_default().join("registry"))
+                std::borrow::Cow::Owned(
+                    std::env::current_dir().unwrap_or_default().join("registry"),
+                )
             }
         });
 
@@ -177,8 +179,7 @@ filesystem_policy:
         let reg_dir = registry_dir();
 
         let pol = policy::parse_policy(&policy_path).expect("parse policy");
-        let cred_set =
-            credentials::load_credential_set(&creds_path, &reg_dir).expect("load creds");
+        let cred_set = credentials::load_credential_set(&creds_path, &reg_dir).expect("load creds");
         let bin_reg = registry::load_binary_registry(&reg_dir).expect("load registry");
 
         let z3_model = model::build_model(pol, cred_set, bin_reg);
@@ -198,9 +199,10 @@ filesystem_policy:
 
         // At least one critical or high finding.
         assert!(
-            findings
-                .iter()
-                .any(|f| matches!(f.risk, finding::RiskLevel::Critical | finding::RiskLevel::High)),
+            findings.iter().any(|f| matches!(
+                f.risk,
+                finding::RiskLevel::Critical | finding::RiskLevel::High
+            )),
             "expected at least one critical/high finding"
         );
     }
@@ -213,8 +215,7 @@ filesystem_policy:
         let reg_dir = registry_dir();
 
         let pol = policy::parse_policy(&policy_path).expect("parse policy");
-        let cred_set =
-            credentials::load_credential_set(&creds_path, &reg_dir).expect("load creds");
+        let cred_set = credentials::load_credential_set(&creds_path, &reg_dir).expect("load creds");
         let bin_reg = registry::load_binary_registry(&reg_dir).expect("load registry");
 
         let z3_model = model::build_model(pol, cred_set, bin_reg);

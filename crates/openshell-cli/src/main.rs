@@ -1923,13 +1923,14 @@ async fn main() -> Result<()> {
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
         Some(Commands::Policy {
-            command: Some(PolicyCommands::Prove {
-                policy,
-                credentials,
-                registry,
-                accepted_risks,
-                compact,
-            }),
+            command:
+                Some(PolicyCommands::Prove {
+                    policy,
+                    credentials,
+                    registry,
+                    accepted_risks,
+                    compact,
+                }),
         }) => {
             // Prove runs locally — no gateway needed.
             let exit_code = openshell_prover::prove(

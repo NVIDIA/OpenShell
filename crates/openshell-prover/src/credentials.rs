@@ -213,10 +213,7 @@ fn load_api_registry(path: &Path) -> Result<ApiCapability> {
 /// Load credentials and all API registries from the registry directory.
 ///
 /// Expects `{registry_dir}/apis/*.yaml`.
-pub fn load_credential_set(
-    credentials_path: &Path,
-    registry_dir: &Path,
-) -> Result<CredentialSet> {
+pub fn load_credential_set(credentials_path: &Path, registry_dir: &Path) -> Result<CredentialSet> {
     let creds = load_credentials(credentials_path)?;
 
     let mut api_registries = HashMap::new();

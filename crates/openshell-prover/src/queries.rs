@@ -99,14 +99,10 @@ pub fn check_data_exfiltration(model: &ReachabilityModel) -> Vec<Finding> {
                 .to_owned(),
         );
     }
-    remediation.push(
-        "Restrict filesystem read access to only the paths the agent needs.".to_owned(),
-    );
+    remediation
+        .push("Restrict filesystem read access to only the paths the agent needs.".to_owned());
 
-    let paths: Vec<FindingPath> = exfil_paths
-        .into_iter()
-        .map(FindingPath::Exfil)
-        .collect();
+    let paths: Vec<FindingPath> = exfil_paths.into_iter().map(FindingPath::Exfil).collect();
 
     let n_paths = paths.len();
     vec![Finding {
@@ -142,8 +138,7 @@ pub fn check_write_bypass(model: &ReachabilityModel) -> Vec<Finding> {
 
                     // Check: binary bypasses L7 and can write
                     if cap.bypasses_l7() && cap.can_write() {
-                        let cred_actions =
-                            collect_credential_actions(model, &ep.host, &cap);
+                        let cred_actions = collect_credential_actions(model, &ep.host, &cap);
                         if !cred_actions.is_empty()
                             || model.credentials.credentials_for_host(&ep.host).is_empty()
                         {
@@ -161,8 +156,7 @@ pub fn check_write_bypass(model: &ReachabilityModel) -> Vec<Finding> {
 
                     // Check: L4-only endpoint + binary can construct HTTP + credential has write
                     if !ep.is_l7_enforced() && cap.can_construct_http {
-                        let cred_actions =
-                            collect_credential_actions(model, &ep.host, &cap);
+                        let cred_actions = collect_credential_actions(model, &ep.host, &cap);
                         if !cred_actions.is_empty() {
                             bypass_paths.push(WriteBypassPath {
                                 binary: b.path.clone(),
@@ -193,9 +187,7 @@ pub fn check_write_bypass(model: &ReachabilityModel) -> Vec<Finding> {
     vec![Finding {
         query: "write_bypass".to_owned(),
         title: "Write Bypass Detected — Read-Only Intent Violated".to_owned(),
-        description: format!(
-            "{n} path(s) allow write operations despite read-only policy intent."
-        ),
+        description: format!("{n} path(s) allow write operations despite read-only policy intent."),
         risk: RiskLevel::High,
         paths,
         remediation: vec![

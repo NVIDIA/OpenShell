@@ -106,10 +106,7 @@ fn path_matches_risk(path: &FindingPath, risk: &AcceptedRisk) -> bool {
 /// A finding is accepted if **all** of its paths match at least one accepted
 /// risk entry for that query. If only some paths match, the finding stays
 /// active with the unmatched paths.
-pub fn apply_accepted_risks(
-    findings: Vec<Finding>,
-    accepted: &[AcceptedRisk],
-) -> Vec<Finding> {
+pub fn apply_accepted_risks(findings: Vec<Finding>, accepted: &[AcceptedRisk]) -> Vec<Finding> {
     if accepted.is_empty() {
         return findings;
     }

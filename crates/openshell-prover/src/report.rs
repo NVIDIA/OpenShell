@@ -283,7 +283,10 @@ pub fn render_report(findings: &[Finding], policy_path: &str, credentials_path: 
                 risk_label(finding.risk).dimmed(),
                 finding.title.dimmed()
             );
-            println!("  {}", format!("Reason: {}", finding.accepted_reason).dimmed());
+            println!(
+                "  {}",
+                format!("Reason: {}", finding.accepted_reason).dimmed()
+            );
             println!();
         }
     }
