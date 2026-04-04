@@ -1043,6 +1043,7 @@ impl OpenShell for OpenShellService {
             .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
         let stdin_payload = req.stdin;
         let timeout_seconds = req.timeout_seconds;
+        let request_tty = req.tty;
         let sandbox_id = sandbox.id;
         let handshake_secret = self.state.config.ssh_handshake_secret.clone();
 
@@ -1056,6 +1057,7 @@ impl OpenShell for OpenShellService {
                 &command_str,
                 stdin_payload,
                 timeout_seconds,
+                request_tty,
                 &handshake_secret,
             )
             .await
@@ -3716,6 +3718,7 @@ async fn stream_exec_over_ssh(
     command: &str,
     stdin_payload: Vec<u8>,
     timeout_seconds: u32,
+    request_tty: bool,
     handshake_secret: &str,
 ) -> Result<(), Status> {
     let command_preview: String = command.chars().take(120).collect();
@@ -3764,8 +3767,13 @@ async fn stream_exec_over_ssh(
                 }
             };
 
-            let exec =
-                run_exec_with_russh(local_proxy_port, command, stdin_payload.clone(), tx.clone());
+            let exec = run_exec_with_russh(
+                local_proxy_port,
+                command,
+                stdin_payload.clone(),
+                request_tty,
+                tx.clone(),
+            );
 
             let exec_result = if timeout_seconds == 0 {
                 exec.await
@@ -3843,6 +3851,7 @@ async fn run_exec_with_russh(
     local_proxy_port: u16,
     command: &str,
     stdin_payload: Vec<u8>,
+    request_tty: bool,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
 ) -> Result<i32, Status> {
     // Defense-in-depth: validate command at the transport boundary even though
@@ -3885,6 +3894,22 @@ async fn run_exec_with_russh(
         .channel_open_session()
         .await
         .map_err(|e| Status::internal(format!("failed to open ssh channel: {e}")))?;
+
+    // Request a PTY before exec when the client asked for terminal allocation.
+    if request_tty {
+        channel
+            .request_pty(
+                false,
+                "xterm-256color",
+                0, // col_width — 0 lets the server decide
+                0, // row_height — 0 lets the server decide
+                0, // pix_width
+                0, // pix_height
+                &[],
+            )
+            .await
+            .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
+    }
 
     channel
         .exec(true, command.as_bytes())

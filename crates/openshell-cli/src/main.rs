@@ -1236,6 +1236,11 @@ enum SandboxCommands {
     /// remote command's exit code.
     ///
     /// For interactive shell sessions, use `sandbox connect` instead.
+    ///
+    /// Examples:
+    ///   openshell sandbox exec --name my-sandbox -- ls -la /workspace
+    ///   openshell sandbox exec -n my-sandbox --workdir /app -- python script.py
+    ///   echo "hello" | openshell sandbox exec -n my-sandbox -- cat
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Exec {
         /// Sandbox name (defaults to last-used sandbox).
@@ -1246,13 +1251,20 @@ enum SandboxCommands {
         #[arg(long)]
         workdir: Option<String>,
 
-        /// Set environment variables (KEY=VALUE). Can be specified multiple times.
-        #[arg(long = "env", short = 'e', value_name = "KEY=VALUE")]
-        env: Vec<String>,
-
         /// Timeout in seconds (0 = no timeout).
         #[arg(long, default_value_t = 0)]
         timeout: u32,
+
+        /// Allocate a pseudo-terminal for the remote command.
+        /// Defaults to auto-detection (on when stdin and stdout are terminals).
+        /// Use --tty to force a PTY even when auto-detection fails, or
+        /// --no-tty to disable.
+        #[arg(long, overrides_with = "no_tty")]
+        tty: bool,
+
+        /// Disable pseudo-terminal allocation.
+        #[arg(long, overrides_with = "tty")]
+        no_tty: bool,
 
         /// Command and arguments to execute.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -2340,22 +2352,31 @@ async fn main() -> Result<()> {
                         SandboxCommands::Exec {
                             name,
                             workdir,
-                            env,
                             timeout,
+                            tty,
+                            no_tty,
                             command,
                         } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
-                            let _ = save_last_sandbox(&ctx.name, &name);
+                            // Resolve --tty / --no-tty into an Option<bool> override.
+                            let tty_override = if no_tty {
+                                Some(false)
+                            } else if tty {
+                                Some(true)
+                            } else {
+                                None // auto-detect
+                            };
                             let exit_code = run::sandbox_exec_grpc(
                                 endpoint,
                                 &name,
                                 &command,
                                 workdir.as_deref(),
-                                &env,
                                 timeout,
+                                tty_override,
                                 &tls,
                             )
                             .await?;
+                            let _ = save_last_sandbox(&ctx.name, &name);
                             if exit_code != 0 {
                                 std::process::exit(exit_code);
                             }

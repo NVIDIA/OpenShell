@@ -247,6 +247,9 @@ message ExecSandboxRequest {
 
   // Optional stdin payload passed to the command.
   bytes stdin = 6;
+
+  // Request a pseudo-terminal for the remote command.
+  bool tty = 7;
 }
 
 // One stdout chunk from a sandbox exec.
