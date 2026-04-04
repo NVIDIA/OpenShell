@@ -158,7 +158,7 @@ pub fn load_credentials(path: &Path) -> Result<Vec<Credential>> {
     let contents = std::fs::read_to_string(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("reading credentials file {}", path.display()))?;
-    let raw: CredentialsFile = serde_yaml::from_str(&contents)
+    let raw: CredentialsFile = serde_yml::from_str(&contents)
         .into_diagnostic()
         .wrap_err("parsing credentials YAML")?;
 
@@ -180,7 +180,7 @@ fn load_api_registry(path: &Path) -> Result<ApiCapability> {
     let contents = std::fs::read_to_string(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("reading API registry {}", path.display()))?;
-    let raw: ApiRegistryDef = serde_yaml::from_str(&contents)
+    let raw: ApiRegistryDef = serde_yml::from_str(&contents)
         .into_diagnostic()
         .wrap_err_with(|| format!("parsing API registry {}", path.display()))?;
 

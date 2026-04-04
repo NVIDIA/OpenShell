@@ -60,10 +60,10 @@ struct PolicyFile {
     // Ignored fields the prover does not need.
     #[serde(default)]
     #[allow(dead_code)]
-    landlock: Option<serde_yaml::Value>,
+    landlock: Option<serde_yml::Value>,
     #[serde(default)]
     #[allow(dead_code)]
-    process: Option<serde_yaml::Value>,
+    process: Option<serde_yml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,7 +359,7 @@ pub fn parse_policy(path: &Path) -> Result<PolicyModel> {
 
 /// Parse a policy YAML string into a [`PolicyModel`].
 pub fn parse_policy_str(yaml: &str) -> Result<PolicyModel> {
-    let raw: PolicyFile = serde_yaml::from_str(yaml)
+    let raw: PolicyFile = serde_yml::from_str(yaml)
         .into_diagnostic()
         .wrap_err("parsing policy YAML")?;
 

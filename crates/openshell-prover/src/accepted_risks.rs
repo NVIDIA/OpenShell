@@ -57,7 +57,7 @@ pub fn load_accepted_risks(path: &Path) -> Result<Vec<AcceptedRisk>> {
     let contents = std::fs::read_to_string(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("reading accepted risks {}", path.display()))?;
-    let raw: AcceptedRisksFile = serde_yaml::from_str(&contents)
+    let raw: AcceptedRisksFile = serde_yml::from_str(&contents)
         .into_diagnostic()
         .wrap_err("parsing accepted risks YAML")?;
 

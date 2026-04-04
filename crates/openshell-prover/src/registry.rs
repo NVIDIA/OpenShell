@@ -255,7 +255,7 @@ fn load_binary_capability(path: &Path) -> Result<BinaryCapability> {
     let contents = std::fs::read_to_string(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("reading binary descriptor {}", path.display()))?;
-    let raw: BinaryCapabilityDef = serde_yaml::from_str(&contents)
+    let raw: BinaryCapabilityDef = serde_yml::from_str(&contents)
         .into_diagnostic()
         .wrap_err_with(|| format!("parsing binary descriptor {}", path.display()))?;
 
