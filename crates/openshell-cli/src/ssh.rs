@@ -437,6 +437,7 @@ pub async fn sandbox_exec(
     sandbox_exec_with_mode(server, name, command, tty, tls, true).await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn sandbox_exec_without_exec(
     server: &str,
     name: &str,

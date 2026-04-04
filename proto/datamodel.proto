@@ -33,6 +33,9 @@ message SandboxSpec {
   repeated string providers = 8;
   // Request NVIDIA GPU resources for this sandbox.
   bool gpu = 9;
+  // User-provided startup command. Persisted so it is re-executed when the
+  // sandbox pod is recreated (e.g. after gateway stop/start).
+  repeated string command = 10;
 }
 
 // Sandbox template mapped onto Kubernetes pod template inputs.

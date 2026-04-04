@@ -1936,7 +1936,7 @@ pub async fn sandbox_create(
     policy: Option<&str>,
     forward: Option<openshell_core::forward::ForwardSpec>,
     command: &[String],
-    tty_override: Option<bool>,
+    _tty_override: Option<bool>,
     bootstrap_override: Option<bool>,
     auto_providers_override: Option<bool>,
     tls: &TlsOptions,
@@ -2038,6 +2038,7 @@ pub async fn sandbox_create(
             policy,
             providers: configured_providers,
             template,
+            command: command.to_vec(),
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
@@ -2374,49 +2375,16 @@ pub async fn sandbox_create(
                 return Ok(());
             }
 
-            if command.is_empty() {
-                let connect_result = if persist {
-                    sandbox_connect(&effective_server, &sandbox_name, &effective_tls).await
-                } else {
-                    crate::ssh::sandbox_connect_without_exec(
-                        &effective_server,
-                        &sandbox_name,
-                        &effective_tls,
-                    )
-                    .await
-                };
-
-                return finalize_sandbox_create_session(
-                    &effective_server,
-                    &sandbox_name,
-                    persist,
-                    connect_result,
-                    &effective_tls,
-                    gateway_name,
-                )
-                .await;
-            }
-
-            // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise
-            // auto-detect from the local terminal.
-            let tty = tty_override.unwrap_or_else(|| {
-                std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
-            });
-            let exec_result = if persist {
-                sandbox_exec(
-                    &effective_server,
-                    &sandbox_name,
-                    command,
-                    tty,
-                    &effective_tls,
-                )
-                .await
+            // When a command is provided it is persisted in the sandbox spec
+            // and runs as the entrypoint via OPENSHELL_SANDBOX_COMMAND.  We
+            // always open an interactive shell here so the user can inspect
+            // the sandbox without executing the command a second time.
+            let connect_result = if persist {
+                sandbox_connect(&effective_server, &sandbox_name, &effective_tls).await
             } else {
-                crate::ssh::sandbox_exec_without_exec(
+                crate::ssh::sandbox_connect_without_exec(
                     &effective_server,
                     &sandbox_name,
-                    command,
-                    tty,
                     &effective_tls,
                 )
                 .await
@@ -2426,7 +2394,7 @@ pub async fn sandbox_create(
                 &effective_server,
                 &sandbox_name,
                 persist,
-                exec_result,
+                connect_result,
                 &effective_tls,
                 gateway_name,
             )

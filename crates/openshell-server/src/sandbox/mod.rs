@@ -920,6 +920,7 @@ fn sandbox_to_k8s_spec(
                     sandbox_id,
                     sandbox_name,
                     grpc_endpoint,
+                    &spec.command,
                     ssh_listen_addr,
                     ssh_handshake_secret,
                     ssh_handshake_skew_secs,
@@ -953,7 +954,11 @@ fn sandbox_to_k8s_spec(
     // podTemplate is required by the Kubernetes CRD - ensure it's always present
     if !root.contains_key("podTemplate") {
         let empty_env = std::collections::HashMap::new();
+        let empty_cmd: Vec<String> = Vec::new();
         let spec_env = spec.as_ref().map_or(&empty_env, |s| &s.environment);
+        let spec_cmd = spec
+            .as_ref()
+            .map_or(empty_cmd.as_slice(), |s| s.command.as_slice());
         root.insert(
             "podTemplate".to_string(),
             sandbox_template_to_k8s(
@@ -964,6 +969,7 @@ fn sandbox_to_k8s_spec(
                 sandbox_id,
                 sandbox_name,
                 grpc_endpoint,
+                spec_cmd,
                 ssh_listen_addr,
                 ssh_handshake_secret,
                 ssh_handshake_skew_secs,
@@ -989,6 +995,7 @@ fn sandbox_template_to_k8s(
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
+    sandbox_command: &[String],
     ssh_listen_addr: &str,
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
@@ -1045,6 +1052,7 @@ fn sandbox_template_to_k8s(
         sandbox_id,
         sandbox_name,
         grpc_endpoint,
+        sandbox_command,
         ssh_listen_addr,
         ssh_handshake_secret,
         ssh_handshake_skew_secs,
@@ -1176,6 +1184,7 @@ fn build_env_list(
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
+    sandbox_command: &[String],
     ssh_listen_addr: &str,
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
@@ -1189,6 +1198,7 @@ fn build_env_list(
         sandbox_id,
         sandbox_name,
         grpc_endpoint,
+        sandbox_command,
         ssh_listen_addr,
         ssh_handshake_secret,
         ssh_handshake_skew_secs,
@@ -1211,6 +1221,7 @@ fn apply_required_env(
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
+    sandbox_command: &[String],
     ssh_listen_addr: &str,
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
@@ -1219,7 +1230,14 @@ fn apply_required_env(
     upsert_env(env, "OPENSHELL_SANDBOX_ID", sandbox_id);
     upsert_env(env, "OPENSHELL_SANDBOX", sandbox_name);
     upsert_env(env, "OPENSHELL_ENDPOINT", grpc_endpoint);
-    upsert_env(env, "OPENSHELL_SANDBOX_COMMAND", "sleep infinity");
+    // Use the user-provided command if present, otherwise fall back to
+    // `sleep infinity` so the sandbox pod stays alive for interactive SSH.
+    let command_value = if sandbox_command.is_empty() {
+        "sleep infinity".to_string()
+    } else {
+        sandbox_command.join(" ")
+    };
+    upsert_env(env, "OPENSHELL_SANDBOX_COMMAND", &command_value);
     if !ssh_listen_addr.is_empty() {
         upsert_env(env, "OPENSHELL_SSH_LISTEN_ADDR", ssh_listen_addr);
     }
@@ -1617,6 +1635,7 @@ mod tests {
             "sandbox-1",
             "my-sandbox",
             "https://endpoint:8080",
+            &[],
             "0.0.0.0:2222",
             "my-secret-value",
             300,
@@ -1632,6 +1651,58 @@ mod tests {
         assert_eq!(
             secret_entry.get("value").and_then(|v| v.as_str()),
             Some("my-secret-value")
+        );
+    }
+
+    #[test]
+    fn apply_required_env_uses_sleep_infinity_when_no_command() {
+        let mut env = Vec::new();
+        apply_required_env(
+            &mut env,
+            "sandbox-1",
+            "my-sandbox",
+            "https://endpoint:8080",
+            &[],
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            false,
+        );
+
+        let cmd_entry = env
+            .iter()
+            .find(|e| e.get("name").and_then(|v| v.as_str()) == Some("OPENSHELL_SANDBOX_COMMAND"))
+            .expect("OPENSHELL_SANDBOX_COMMAND must be present in env");
+        assert_eq!(
+            cmd_entry.get("value").and_then(|v| v.as_str()),
+            Some("sleep infinity"),
+            "default sandbox command should be 'sleep infinity'"
+        );
+    }
+
+    #[test]
+    fn apply_required_env_uses_user_command_when_provided() {
+        let mut env = Vec::new();
+        apply_required_env(
+            &mut env,
+            "sandbox-1",
+            "my-sandbox",
+            "https://endpoint:8080",
+            &["python".to_string(), "app.py".to_string()],
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            false,
+        );
+
+        let cmd_entry = env
+            .iter()
+            .find(|e| e.get("name").and_then(|v| v.as_str()) == Some("OPENSHELL_SANDBOX_COMMAND"))
+            .expect("OPENSHELL_SANDBOX_COMMAND must be present in env");
+        assert_eq!(
+            cmd_entry.get("value").and_then(|v| v.as_str()),
+            Some("python app.py"),
+            "sandbox command should reflect user-provided command"
         );
     }
 
@@ -1747,6 +1818,7 @@ mod tests {
             "sandbox-1",
             "my-sandbox",
             "https://endpoint:8080",
+            &[],
             "0.0.0.0:2222",
             "secret",
             300,
@@ -1795,6 +1867,7 @@ mod tests {
             "sandbox-id",
             "sandbox-name",
             "https://gateway.example.com",
+            &[],
             "0.0.0.0:2222",
             "secret",
             300,
@@ -1829,6 +1902,7 @@ mod tests {
             "sandbox-id",
             "sandbox-name",
             "https://gateway.example.com",
+            &[],
             "0.0.0.0:2222",
             "secret",
             300,
@@ -1859,6 +1933,7 @@ mod tests {
             "sandbox-id",
             "sandbox-name",
             "https://gateway.example.com",
+            &[],
             "0.0.0.0:2222",
             "secret",
             300,
@@ -1902,6 +1977,7 @@ mod tests {
             "sandbox-id",
             "sandbox-name",
             "https://gateway.example.com",
+            &[],
             "0.0.0.0:2222",
             "secret",
             300,
@@ -1929,6 +2005,7 @@ mod tests {
             "sandbox-id",
             "sandbox-name",
             "https://gateway.example.com",
+            &[],
             "0.0.0.0:2222",
             "secret",
             300,
@@ -1960,6 +2037,7 @@ mod tests {
             "sandbox-id",
             "sandbox-name",
             "https://gateway.example.com",
+            &[],
             "0.0.0.0:2222",
             "secret",
             300,
@@ -1986,6 +2064,7 @@ mod tests {
             "sandbox-id",
             "sandbox-name",
             "https://gateway.example.com",
+            &[],
             "0.0.0.0:2222",
             "secret",
             300,
@@ -2126,6 +2205,7 @@ mod tests {
             "sandbox-id",
             "sandbox-name",
             "https://gateway.example.com",
+            &[],
             "0.0.0.0:2222",
             "secret",
             300,
