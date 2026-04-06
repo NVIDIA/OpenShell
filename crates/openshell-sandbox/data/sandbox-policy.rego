@@ -47,7 +47,7 @@ deny_reason := reason if {
 		policy := data.network_policies[name]
 		endpoint_allowed(policy, input.network)
 		not binary_allowed(policy, input.exec)
-		r := sprintf("binary '%s' (ancestors: [%s], cmdline: [%s]) not allowed in policy '%s'", [input.exec.path, ancestors_str, cmdline_str, name])
+		r := sprintf("binary '%s' (ancestors: [%s], cmdline: [%s]) not allowed in policy '%s' (hint: binary path is kernel-resolved via /proc/<pid>/exe; if you specified a symlink like /usr/bin/python3, the actual binary may be /usr/bin/python3.11)", [input.exec.path, ancestors_str, cmdline_str, name])
 	]
 	all_reasons := array.concat(endpoint_misses, binary_misses)
 	count(all_reasons) > 0
