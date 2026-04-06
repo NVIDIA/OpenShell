@@ -8,9 +8,6 @@ package openshell.v1;
 import "datamodel.proto";
 import "sandbox.proto";
 
-option java_multiple_files = true;
-option java_package = "com.anthropic.openshell.v1";
-
 // OpenShell service provides sandbox, provider, and runtime management capabilities.
 service OpenShell {
   // Check the health of the service.
