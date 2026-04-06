@@ -1,0 +1,80 @@
+name: GPU E2E Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu-runner:
+        description: GPU runner label to target
+        required: true
+        type: choice
+        default: linux-arm64-gpu-l4-latest-1
+        options:
+          - linux-arm64-gpu-l4-latest-1
+          - linux-amd64-gpu-rtxpro6000-latest-1
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-gateway:
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: gateway
+      platform: ${{ inputs.gpu-runner == 'linux-arm64-gpu-l4-latest-1' && 'linux/arm64' || 'linux/amd64' }}
+      runner: ${{ inputs.gpu-runner == 'linux-arm64-gpu-l4-latest-1' && 'build-arm64' || 'build-amd64' }}
+
+  build-cluster:
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: cluster
+      platform: ${{ inputs.gpu-runner == 'linux-arm64-gpu-l4-latest-1' && 'linux/arm64' || 'linux/amd64' }}
+      runner: ${{ inputs.gpu-runner == 'linux-arm64-gpu-l4-latest-1' && 'build-arm64' || 'build-amd64' }}
+
+  e2e-gpu:
+    name: GPU E2E
+    needs: [build-gateway, build-cluster]
+    runs-on: ${{ inputs.gpu-runner }}
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      IMAGE_TAG: ${{ github.sha }}
+      OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
+      OPENSHELL_REGISTRY_HOST: ghcr.io
+      OPENSHELL_REGISTRY_NAMESPACE: nvidia/openshell
+      OPENSHELL_REGISTRY_USERNAME: ${{ github.actor }}
+      OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+      OPENSHELL_GATEWAY: e2e-gpu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Pull cluster image
+        run: docker pull ghcr.io/nvidia/openshell/cluster:${{ github.sha }}
+
+      - name: Install Python dependencies and generate protobuf stubs
+        run: uv sync --frozen && mise run --no-prepare python:proto
+
+      - name: Bootstrap GPU cluster
+        env:
+          GATEWAY_HOST: host.docker.internal
+          GATEWAY_PORT: "8080"
+          CLUSTER_NAME: e2e-gpu
+          CLUSTER_GPU: "1"
+          SKIP_IMAGE_PUSH: "1"
+          SKIP_CLUSTER_IMAGE_BUILD: "1"
+          OPENSHELL_CLUSTER_IMAGE: ghcr.io/nvidia/openshell/cluster:${{ github.sha }}
+        run: mise run --no-prepare --skip-deps cluster
+
+      - name: Run GPU E2E test
+        run: mise run --no-prepare --skip-deps e2e:python:gpu
