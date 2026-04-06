@@ -1,0 +1,31 @@
+name: GPU Test
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch: {}
+  # Add `schedule:` here when we want nightly coverage from the same workflow.
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-gateway:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'test:e2e-gpu')
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: gateway
+
+  build-cluster:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'test:e2e-gpu')
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: cluster
+
+  e2e-gpu:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'test:e2e-gpu')
+    needs: [build-gateway, build-cluster]
+    uses: ./.github/workflows/e2e-gpu-test.yaml
+    with:
+      image-tag: ${{ github.sha }}
