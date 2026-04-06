@@ -3,6 +3,16 @@ name: Branch E2E Checks
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      gpu-runner:
+        description: GPU runner label to target
+        required: true
+        type: choice
+        default: linux-arm64-gpu-l4-latest-1
+        options:
+          - linux-arm64-gpu-l4-latest-1
+          - linux-amd64-gpu-rtxpro6000-latest-1
 
 permissions:
   contents: read
@@ -26,8 +36,34 @@ jobs:
       runner: build-arm64
 
   e2e:
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'test:e2e')
     needs: [build-gateway, build-cluster]
     uses: ./.github/workflows/e2e-test.yml
     with:
       image-tag: ${{ github.sha }}
       runner: build-arm64
+
+  build-gateway-gpu:
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: gateway
+      platform: ${{ inputs.gpu-runner == 'linux-arm64-gpu-l4-latest-1' && 'linux/arm64' || 'linux/amd64' }}
+      runner: ${{ inputs.gpu-runner == 'linux-arm64-gpu-l4-latest-1' && 'build-arm64' || 'build-amd64' }}
+
+  build-cluster-gpu:
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: cluster
+      platform: ${{ inputs.gpu-runner == 'linux-arm64-gpu-l4-latest-1' && 'linux/arm64' || 'linux/amd64' }}
+      runner: ${{ inputs.gpu-runner == 'linux-arm64-gpu-l4-latest-1' && 'build-arm64' || 'build-amd64' }}
+
+  e2e-gpu:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [build-gateway-gpu, build-cluster-gpu]
+    uses: ./.github/workflows/e2e-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      runner: ${{ inputs.gpu-runner }}
+      suite: python-gpu
