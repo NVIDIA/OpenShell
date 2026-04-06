@@ -718,17 +718,24 @@ pub async fn run_sandbox(
     // accessible via /proc/<pid>/root/. This expands symlinks like
     // /usr/bin/python3 → /usr/bin/python3.11 in the OPA policy data so that
     // either path matches at evaluation time.
+    //
+    // If /proc/<pid>/root/ is inaccessible (restricted ptrace, rootless
+    // container, etc.), resolve_binary_in_container logs a warning per binary
+    // and falls back to literal path matching. The reload itself still
+    // succeeds — only the symlink expansion is skipped.
     if let (Some(engine), Some(proto)) = (&opa_engine, &retained_proto) {
         let pid = handle.pid();
         if let Err(e) = engine.reload_from_proto_with_pid(proto, pid) {
             warn!(
                 error = %e,
-                "Failed to resolve binary symlinks in policy (non-fatal)"
+                "Failed to rebuild OPA engine with symlink resolution (non-fatal, \
+                 falling back to literal path matching)"
             );
         } else {
             info!(
                 pid = pid,
-                "Resolved policy binary symlinks via container filesystem"
+                "Policy binary symlink resolution attempted via container filesystem \
+                 (check logs above for per-binary results)"
             );
         }
     }

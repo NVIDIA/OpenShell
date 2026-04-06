@@ -645,14 +645,45 @@ fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option
 
     let container_path = format!("/proc/{entrypoint_pid}/root{policy_path}");
 
-    // Quick check: is this even a symlink?
-    let meta = std::fs::symlink_metadata(&container_path).ok()?;
+    // Check if we can access the container filesystem at all.
+    // Failure here means /proc/<pid>/root/ is inaccessible (missing
+    // CAP_SYS_PTRACE, restricted ptrace scope, rootless container, etc.).
+    let meta = match std::fs::symlink_metadata(&container_path) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                path = %policy_path,
+                container_path = %container_path,
+                pid = entrypoint_pid,
+                error = %e,
+                "Cannot access container filesystem for symlink resolution; \
+                 binary paths in policy will be matched literally. If a policy \
+                 binary is a symlink (e.g., /usr/bin/python3 -> python3.11), \
+                 use the canonical path instead, or run with CAP_SYS_PTRACE"
+            );
+            return None;
+        }
+    };
+
+    // Not a symlink — no expansion needed (this is the common, expected case)
     if !meta.file_type().is_symlink() {
         return None;
     }
 
     // Resolve through the container's filesystem (handles multi-level symlinks)
-    let canonical = std::fs::canonicalize(&container_path).ok()?;
+    let canonical = match std::fs::canonicalize(&container_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                path = %policy_path,
+                pid = entrypoint_pid,
+                error = %e,
+                "Symlink detected but canonicalize failed; \
+                 binary will be matched by original path only"
+            );
+            return None;
+        }
+    };
 
     // Strip the /proc/<pid>/root prefix to get the in-container absolute path
     let prefix = format!("/proc/{entrypoint_pid}/root");
@@ -663,7 +694,7 @@ fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option
     if resolved_str == policy_path {
         None
     } else {
-        tracing::debug!(
+        tracing::info!(
             original = %policy_path,
             resolved = %resolved_str,
             pid = entrypoint_pid,
@@ -3251,7 +3282,7 @@ network_policies:
 
     #[test]
     fn deny_reason_includes_symlink_hint() {
-        // Verify the deny reason includes the symlink hint for debugging
+        // Verify the deny reason includes an actionable symlink hint
         let engine = test_engine();
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
@@ -3264,8 +3295,13 @@ network_policies:
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(!decision.allowed);
         assert!(
-            decision.reason.contains("kernel-resolved"),
-            "Deny reason should include symlink hint, got: {}",
+            decision.reason.contains("SYMLINK HINT"),
+            "Deny reason should include prominent symlink hint, got: {}",
+            decision.reason
+        );
+        assert!(
+            decision.reason.contains("readlink -f"),
+            "Deny reason should include actionable fix command, got: {}",
             decision.reason
         );
     }
