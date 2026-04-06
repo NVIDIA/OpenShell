@@ -3270,9 +3270,25 @@ network_policies:
         );
     }
 
+    /// Check if `/proc/<pid>/root/` is accessible for the current process.
+    /// In CI containers or restricted environments, this path may not be
+    /// readable even for the process's own PID. Tests that depend on
+    /// procfs root access should skip gracefully when this returns false.
+    #[cfg(target_os = "linux")]
+    fn procfs_root_accessible() -> bool {
+        let pid = std::process::id();
+        let probe = format!("/proc/{pid}/root/tmp");
+        std::fs::symlink_metadata(&probe).is_ok()
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_binary_with_real_symlink() {
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
         // Create a real symlink in a temp directory and verify resolution
         // works through /proc/self/root (which maps to / on the host)
         use std::os::unix::fs::symlink;
@@ -3304,6 +3320,11 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_binary_non_symlink_returns_none() {
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
         // A regular file should return None (no expansion needed)
         use std::io::Write;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
@@ -3323,6 +3344,11 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_binary_multi_level_symlink() {
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
         // Test multi-level symlink resolution: python3 -> python3.11 -> cpython3.11
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
@@ -3349,6 +3375,11 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn from_proto_with_pid_expands_symlinks_in_container() {
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
         // End-to-end test: create a symlink, build engine with our PID,
         // verify the resolved path is allowed
         use std::os::unix::fs::symlink;
@@ -3420,6 +3451,11 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn reload_from_proto_with_pid_resolves_symlinks() {
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
         // Test hot-reload path: initial engine at pid=0, then reload with
         // real PID to trigger symlink resolution
         use std::os::unix::fs::symlink;
