@@ -637,58 +637,103 @@ fn normalize_endpoint_ports(data: &mut serde_json::Value) {
 /// - Path is not a symlink
 /// - Resolution fails (binary doesn't exist in container)
 /// - Resolved path equals the original
+/// Normalize a path by resolving `.` and `..` components without touching
+/// the filesystem. Only works correctly for absolute paths.
+fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut result = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => result.push(other),
+        }
+    }
+    result
+}
+
 #[cfg(target_os = "linux")]
 fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option<String> {
     if policy_path.contains('*') || entrypoint_pid == 0 {
         return None;
     }
 
-    let container_path = format!("/proc/{entrypoint_pid}/root{policy_path}");
+    // Walk the symlink chain inside the container filesystem using
+    // read_link rather than canonicalize. canonicalize resolves
+    // /proc/<pid>/root itself (a kernel pseudo-symlink to /) which
+    // strips the prefix we need. read_link only reads the target of
+    // the specified symlink, keeping us in the container's namespace.
+    let mut resolved = std::path::PathBuf::from(policy_path);
 
-    // Check if we can access the container filesystem at all.
-    // Failure here means /proc/<pid>/root/ is inaccessible (missing
-    // CAP_SYS_PTRACE, restricted ptrace scope, rootless container, etc.).
-    let meta = match std::fs::symlink_metadata(&container_path) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(
-                path = %policy_path,
-                container_path = %container_path,
-                pid = entrypoint_pid,
-                error = %e,
-                "Cannot access container filesystem for symlink resolution; \
-                 binary paths in policy will be matched literally. If a policy \
-                 binary is a symlink (e.g., /usr/bin/python3 -> python3.11), \
-                 use the canonical path instead, or run with CAP_SYS_PTRACE"
-            );
-            return None;
+    // Linux SYMLOOP_MAX is 40; stop before infinite loops
+    for _ in 0..40 {
+        let container_path = format!("/proc/{entrypoint_pid}/root{}", resolved.display());
+
+        let meta = match std::fs::symlink_metadata(&container_path) {
+            Ok(m) => m,
+            Err(e) => {
+                // Only warn on the first iteration (the original policy path).
+                // On subsequent iterations, the intermediate target may
+                // legitimately not exist (broken symlink chain).
+                if resolved.as_os_str() == policy_path {
+                    tracing::warn!(
+                        path = %policy_path,
+                        container_path = %container_path,
+                        pid = entrypoint_pid,
+                        error = %e,
+                        "Cannot access container filesystem for symlink resolution; \
+                         binary paths in policy will be matched literally. If a policy \
+                         binary is a symlink (e.g., /usr/bin/python3 -> python3.11), \
+                         use the canonical path instead, or run with CAP_SYS_PTRACE"
+                    );
+                } else {
+                    tracing::warn!(
+                        original = %policy_path,
+                        current = %resolved.display(),
+                        pid = entrypoint_pid,
+                        error = %e,
+                        "Symlink chain broken during resolution; \
+                         binary will be matched by original path only"
+                    );
+                }
+                return None;
+            }
+        };
+
+        if !meta.file_type().is_symlink() {
+            // Reached a non-symlink — this is the final resolved target
+            break;
         }
-    };
 
-    // Not a symlink — no expansion needed (this is the common, expected case)
-    if !meta.file_type().is_symlink() {
-        return None;
+        let target = match std::fs::read_link(&container_path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    path = %policy_path,
+                    current = %resolved.display(),
+                    pid = entrypoint_pid,
+                    error = %e,
+                    "Symlink detected but read_link failed; \
+                     binary will be matched by original path only"
+                );
+                return None;
+            }
+        };
+
+        if target.is_absolute() {
+            resolved = target;
+        } else {
+            // Relative symlink: resolve against the containing directory
+            // e.g., /usr/bin/python3 -> python3.11 becomes /usr/bin/python3.11
+            if let Some(parent) = resolved.parent() {
+                resolved = normalize_path(&parent.join(&target));
+            } else {
+                break;
+            }
+        }
     }
 
-    // Resolve through the container's filesystem (handles multi-level symlinks)
-    let canonical = match std::fs::canonicalize(&container_path) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                path = %policy_path,
-                pid = entrypoint_pid,
-                error = %e,
-                "Symlink detected but canonicalize failed; \
-                 binary will be matched by original path only"
-            );
-            return None;
-        }
-    };
-
-    // Strip the /proc/<pid>/root prefix to get the in-container absolute path
-    let prefix = format!("/proc/{entrypoint_pid}/root");
-    let in_container = canonical.strip_prefix(&prefix).ok()?;
-    let resolved = std::path::PathBuf::from("/").join(in_container);
     let resolved_str = resolved.to_string_lossy().into_owned();
 
     if resolved_str == policy_path {
@@ -2963,6 +3008,27 @@ process:
     // ========================================================================
 
     #[test]
+    fn normalize_path_resolves_parent_and_current() {
+        use std::path::{Path, PathBuf};
+        assert_eq!(
+            normalize_path(Path::new("/usr/bin/../lib/python3")),
+            PathBuf::from("/usr/lib/python3")
+        );
+        assert_eq!(
+            normalize_path(Path::new("/usr/bin/./python3")),
+            PathBuf::from("/usr/bin/python3")
+        );
+        assert_eq!(
+            normalize_path(Path::new("/a/b/c/../../d")),
+            PathBuf::from("/a/d")
+        );
+        assert_eq!(
+            normalize_path(Path::new("/usr/bin/python3")),
+            PathBuf::from("/usr/bin/python3")
+        );
+    }
+
+    #[test]
     fn resolve_binary_skips_glob_paths() {
         // Glob patterns should never be resolved — they're matched differently
         assert!(resolve_binary_in_container("/usr/bin/*", 1).is_none());
@@ -3306,15 +3372,30 @@ network_policies:
         );
     }
 
-    /// Check if `/proc/<pid>/root/` is accessible for the current process.
-    /// In CI containers or restricted environments, this path may not be
-    /// readable even for the process's own PID. Tests that depend on
-    /// procfs root access should skip gracefully when this returns false.
+    /// Check if symlink resolution through `/proc/<pid>/root/` actually works.
+    /// Creates a real symlink in a tempdir and attempts to resolve it via
+    /// the procfs root path. This catches environments where the probe path
+    /// is readable but canonicalization/read_link fails (e.g., containers
+    /// with restricted ptrace scope, rootless containers).
     #[cfg(target_os = "linux")]
     fn procfs_root_accessible() -> bool {
+        use std::os::unix::fs::symlink;
+        let dir = match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let target = dir.path().join("probe_target");
+        let link = dir.path().join("probe_link");
+        if std::fs::write(&target, b"probe").is_err() {
+            return false;
+        }
+        if symlink(&target, &link).is_err() {
+            return false;
+        }
         let pid = std::process::id();
-        let probe = format!("/proc/{pid}/root/tmp");
-        std::fs::symlink_metadata(&probe).is_ok()
+        let link_path = link.to_string_lossy().to_string();
+        // Actually attempt the same resolution our production code uses
+        resolve_binary_in_container(&link_path, pid).is_some()
     }
 
     #[cfg(target_os = "linux")]
