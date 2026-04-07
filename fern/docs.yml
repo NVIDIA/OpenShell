@@ -7,6 +7,9 @@ instances:
 
 title: NVIDIA OpenShell
 
+announcement:
+  message: "🔔 NVIDIA OpenShell is <strong>alpha software</strong>. APIs and behavior may change without notice. Do not use in production."
+
 footer: ./components/CustomFooter.tsx
 
 layout:

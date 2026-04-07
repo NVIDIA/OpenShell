@@ -859,6 +859,26 @@ svg.card-icon{
     text-decoration-style: underline !important;
 }
 
+/* Global alpha announcement banner */
+header[role="banner"] > div[class*="bg-(color:--accent)"][class*="text-(color:--accent-contrast)"] {
+    background: #005b3c;
+}
+
+header[role="banner"] > div[class*="bg-(color:--accent)"][class*="text-(color:--accent-contrast)"] > div {
+    min-height: 3rem;
+    padding-top: 0.25rem;
+    padding-bottom: 0.25rem;
+}
+
+header[role="banner"] > div[class*="bg-(color:--accent)"][class*="text-(color:--accent-contrast)"] .max-w-page-width {
+    text-align: left;
+}
+
+header[role="banner"] > div[class*="bg-(color:--accent)"][class*="text-(color:--accent-contrast)"] p {
+    font-size: 1rem;
+    line-height: 1.4;
+}
+
 /* Mobile Styles */
 @media (max-width: 768px) {
     .hero-section {
