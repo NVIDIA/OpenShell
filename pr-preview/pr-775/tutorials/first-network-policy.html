@@ -1,0 +1,764 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Write Your First Sandbox Network Policy &#8212; NVIDIA OpenShell Developer Guide</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/enhanced-search.css?v=2e2db37d" />
+    <link rel="stylesheet" type="text/css" href="../_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+
+
+    <script src="../_static/documentation_options.js?v=91d07486"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=6dbb43f8"></script>
+    <script src="../_static/search-assets.bundle.js?v=00e3e057"></script>
+    <script src="../_static/design-tabs.js?v=f930bc37"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'tutorials/first-network-policy';</script>
+
+    <link rel="canonical" href="https://docs.nvidia.com/openshell/latest/tutorials/first-network-policy.html" />
+    <link rel="icon" href="../_static/favicon.png"/>
+
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Grant GitHub Push Access to a Sandboxed Agent" href="github-sandbox.html" />
+    <link rel="prev" title="Tutorials" href="index.html" />
+
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+
+
+<script src="https://assets.adobedtm.com/5d4962a43b79/c1061d2c5e7b/launch-191c2462b890.min.js"></script>
+
+  </head>
+
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+<aside class="bd-header-announcement" aria-label="Announcement">
+  <div class="bd-header-announcement__content">&#x1F514; NVIDIA OpenShell is <strong>alpha software</strong>. APIs and behavior may change without notice. Do not use in production.</div>
+</aside>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA OpenShell Developer Guide - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="NVIDIA OpenShell Developer Guide - Home"/>
+  
+  
+    <p class="title logo__title">NVIDIA OpenShell Developer Guide</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+        <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://github.com/NVIDIA/OpenShell" title="GitHub" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-github fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">GitHub</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://pypi.org/project/openshell/" title="PyPI" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-python fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">PyPI</span></a>
+        </li>
+</ul></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA OpenShell Developer Guide - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="NVIDIA OpenShell Developer Guide - Home"/>
+  
+  
+    <p class="title logo__title">NVIDIA OpenShell Developer Guide</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+          <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://github.com/NVIDIA/OpenShell" title="GitHub" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-github fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">GitHub</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://pypi.org/project/openshell/" title="PyPI" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-python fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">PyPI</span></a>
+        </li>
+</ul></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../index.html">Home</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">About NVIDIA OpenShell</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../about/overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../about/architecture.html">How It Works</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../about/supported-agents.html">Supported Agents</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../about/release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../get-started/quickstart.html">Quickstart</a></li>
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">Tutorials</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">First Network Policy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="github-sandbox.html">GitHub Push Access</a></li>
+<li class="toctree-l2"><a class="reference internal" href="inference-ollama.html">Inference with Ollama</a></li>
+<li class="toctree-l2"><a class="reference internal" href="local-inference-lmstudio.html">Local Inference with LM Studio</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Gateways and Sandboxes</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../sandboxes/index.html">About Gateways and Sandboxes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sandboxes/manage-sandboxes.html">Sandboxes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sandboxes/manage-gateways.html">Gateways</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sandboxes/manage-providers.html">Providers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sandboxes/policies.html">Policies</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sandboxes/community-sandboxes.html">Community Sandboxes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Inference Routing</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../inference/index.html">About Inference Routing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../inference/configure.html">Configure Inference Routing</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/gateway-auth.html">Gateway Authentication</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/default-policy.html">Default Policy Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/policy-schema.html">Policy Schema Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Security</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../security/best-practices.html">Security Best Practices</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Resources</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../resources/license.html">License</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="index.html" class="nav-link">Tutorials</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Write Your First Sandbox Network Policy</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <!--
+  SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+<section class="tex2jax_ignore mathjax_ignore" id="write-your-first-sandbox-network-policy">
+<h1>Write Your First Sandbox Network Policy<a class="headerlink" href="#write-your-first-sandbox-network-policy" title="Link to this heading">#</a></h1>
+<p>This tutorial shows how OpenShell’s network policy system works in under five minutes. You create a sandbox, watch a request get blocked by the default-deny policy, apply a fine-grained L7 rule, and verify that reads are allowed while writes are blocked, all without restarting anything.</p>
+<p>After completing this tutorial, you understand:</p>
+<ul class="simple">
+<li><p>How default-deny networking blocks all outbound traffic from a sandbox.</p></li>
+<li><p>How to apply a network policy that grants read-only access to a specific API.</p></li>
+<li><p>How L7 enforcement distinguishes between HTTP methods such as GET and POST on the same endpoint.</p></li>
+<li><p>How to inspect deny logs for a complete audit trail.</p></li>
+</ul>
+<section id="prerequisites">
+<h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>A working OpenShell installation. Complete the <a class="reference internal" href="../get-started/quickstart.html"><span class="doc">Quickstart</span></a> before proceeding.</p></li>
+<li><p>Docker Desktop running on your machine.</p></li>
+</ul>
+<div class="admonition tip">
+<p class="admonition-title">Tip</p>
+<p>To run every step of this tutorial, you can also use the automated demo script at the <a class="reference external" href="https://github.com/NVIDIA/OpenShell/blob/main/examples/sandbox-policy-quickstart" rel="noreferer noopener" target="_blank">examples/sandbox-policy-quickstart</a> directory in the NVIDIA OpenShell repository. It runs the full walkthrough in under a minute but without any user interaction.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>bash<span class="w"> </span>examples/sandbox-policy-quickstart/demo.sh
+</pre></div>
+</div>
+</div>
+</section>
+<section id="create-a-sandbox">
+<h2>Create a Sandbox<a class="headerlink" href="#create-a-sandbox" title="Link to this heading">#</a></h2>
+<p>Start by creating a sandbox with no network policies. This gives you a clean environment to observe default-deny behavior.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>sandbox<span class="w"> </span>create<span class="w"> </span>--name<span class="w"> </span>demo<span class="w"> </span>--keep<span class="w"> </span>--no-auto-providers
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">--keep</span></code> keeps the sandbox running after you exit so you can reconnect later. <code class="docutils literal notranslate"><span class="pre">--no-auto-providers</span></code> skips the provider setup prompt since this tutorial uses <code class="docutils literal notranslate"><span class="pre">curl</span></code> instead of an AI agent.</p>
+<p>You land in an interactive shell inside the sandbox:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>sandbox@demo:~$
+</pre></div>
+</div>
+</section>
+<section id="try-to-reach-the-github-api">
+<h2>Try to Reach the GitHub API<a class="headerlink" href="#try-to-reach-the-github-api" title="Link to this heading">#</a></h2>
+<p>With no network policy in place, every outbound connection is blocked. Test this by making a simple API call from inside the sandbox:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>curl<span class="w"> </span>-s<span class="w"> </span>https://api.github.com/zen
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">https://api.github.com/zen</span></code> is a lightweight, unauthenticated GitHub REST endpoint that returns a random aphorism on each call. It requires no tokens or parameters, which makes it a convenient smoke-test target for verifying outbound HTTPS connectivity.</p>
+<p>The request fails. By default, all outbound network traffic is denied. The sandbox proxy intercepted the HTTPS CONNECT request to <code class="docutils literal notranslate"><span class="pre">api.github.com:443</span></code> and rejected it because no network policy authorizes <code class="docutils literal notranslate"><span class="pre">curl</span></code> to reach that host.</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>curl: (56) Received HTTP code 403 from proxy after CONNECT
+</pre></div>
+</div>
+<p>Exit the sandbox. The <code class="docutils literal notranslate"><span class="pre">--keep</span></code> flag keeps it running:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span><span class="nb">exit</span>
+</pre></div>
+</div>
+</section>
+<section id="check-the-deny-log">
+<h2>Check the Deny Log<a class="headerlink" href="#check-the-deny-log" title="Link to this heading">#</a></h2>
+<p>Every denied connection produces a structured log entry. Query the sandbox logs from your host to confirm the denial and inspect the reason.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>logs<span class="w"> </span>demo<span class="w"> </span>--since<span class="w"> </span>5m
+</pre></div>
+</div>
+<p>You see a line like:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>action=deny dst_host=api.github.com dst_port=443 binary=/usr/bin/curl deny_reason=&quot;no matching network policy&quot;
+</pre></div>
+</div>
+<p>Every denied connection is logged with the destination, the binary that attempted it, and the reason. Nothing gets out silently.</p>
+</section>
+<section id="apply-a-read-only-github-api-policy">
+<h2>Apply a Read-Only GitHub API Policy<a class="headerlink" href="#apply-a-read-only-github-api-policy" title="Link to this heading">#</a></h2>
+<p>To allow the sandbox to reach the GitHub API, define a network policy that grants read-only access. The policy specifies which host, port, binary, and HTTP methods are permitted. Create a file called <code class="docutils literal notranslate"><span class="pre">github-readonly.yaml</span></code> with the following content:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+
+<span class="nt">filesystem_policy</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">include_workdir</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">read_only</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">/usr</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/lib</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/proc</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/dev/urandom</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/app</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/etc</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/var/log</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">read_write</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">/sandbox</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/tmp</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/dev/null</span><span class="p p-Indicator">]</span>
+<span class="nt">landlock</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">compatibility</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">best_effort</span>
+<span class="nt">process</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">run_as_user</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sandbox</span>
+<span class="w">  </span><span class="nt">run_as_group</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sandbox</span>
+
+<span class="nt">network_policies</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">github_api</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">github-api-readonly</span>
+<span class="w">    </span><span class="nt">endpoints</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">host</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">api.github.com</span>
+<span class="w">        </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">443</span>
+<span class="w">        </span><span class="nt">protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rest</span>
+<span class="w">        </span><span class="nt">enforcement</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">enforce</span>
+<span class="w">        </span><span class="nt">access</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read-only</span>
+<span class="w">    </span><span class="nt">binaries</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/bin/curl</span><span class="w"> </span><span class="p p-Indicator">}</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">filesystem_policy</span></code>, <code class="docutils literal notranslate"><span class="pre">landlock</span></code>, and <code class="docutils literal notranslate"><span class="pre">process</span></code> sections preserve the default sandbox settings. This is required because <code class="docutils literal notranslate"><span class="pre">policy</span> <span class="pre">set</span></code> replaces the entire policy. The <code class="docutils literal notranslate"><span class="pre">network_policies</span></code> section is the key part: <code class="docutils literal notranslate"><span class="pre">curl</span></code> may make GET, HEAD, and OPTIONS requests to <code class="docutils literal notranslate"><span class="pre">api.github.com</span></code> over HTTPS. Everything else is denied. The proxy auto-detects TLS on HTTPS endpoints and terminates it to inspect each HTTP request and enforce the <code class="docutils literal notranslate"><span class="pre">read-only</span></code> access preset at the method level.</p>
+<p>Apply it:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>policy<span class="w"> </span><span class="nb">set</span><span class="w"> </span>demo<span class="w"> </span>--policy<span class="w"> </span>github-readonly.yaml<span class="w"> </span>--wait
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">--wait</span></code> blocks until the sandbox confirms the new policy is loaded. No restart required. Policies are hot-reloaded.</p>
+<div class="admonition tip">
+<p class="admonition-title">Tip</p>
+<p>This tutorial uses <code class="docutils literal notranslate"><span class="pre">curl</span></code> and <code class="docutils literal notranslate"><span class="pre">read-only</span></code> access to keep things simple. When building policies for real workloads:</p>
+<ul class="simple">
+<li><p>To scope the policy to an agent, replace the <code class="docutils literal notranslate"><span class="pre">binaries</span></code> section with your agent’s binary, such as <code class="docutils literal notranslate"><span class="pre">/usr/local/bin/claude</span></code>, instead of <code class="docutils literal notranslate"><span class="pre">curl</span></code>.</p></li>
+<li><p>To grant write access, change <code class="docutils literal notranslate"><span class="pre">access:</span> <span class="pre">read-only</span></code> to <code class="docutils literal notranslate"><span class="pre">read-write</span></code> or add explicit <code class="docutils literal notranslate"><span class="pre">rules</span></code> for specific paths. Refer to the <a class="reference internal" href="../reference/policy-schema.html"><span class="doc">Policy Schema Reference</span></a>.</p></li>
+<li><p>To allow additional endpoints, stack multiple policies in the same file for PyPI, npm, or your internal APIs. Refer to <a class="reference internal" href="../sandboxes/policies.html"><span class="doc">Customize Sandbox Policies</span></a> for examples.</p></li>
+</ul>
+</div>
+</section>
+<section id="verify-if-get-requests-are-allowed">
+<h2>Verify If GET Requests Are Allowed<a class="headerlink" href="#verify-if-get-requests-are-allowed" title="Link to this heading">#</a></h2>
+<p>The policy is now active. Reconnect to the sandbox and retry the same request to confirm that read access works.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>sandbox<span class="w"> </span>connect<span class="w"> </span>demo
+</pre></div>
+</div>
+<p>Retry the same request:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>curl<span class="w"> </span>-s<span class="w"> </span>https://api.github.com/zen
+</pre></div>
+</div>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>Anything added dilutes everything else.
+</pre></div>
+</div>
+<p>It works. The <code class="docutils literal notranslate"><span class="pre">read-only</span></code> preset allows GET requests through.</p>
+</section>
+<section id="try-a-write">
+<h2>Try a Write<a class="headerlink" href="#try-a-write" title="Link to this heading">#</a></h2>
+<p>The read-only preset allows GET but blocks mutating methods like POST, PUT, and DELETE. Test this by sending a POST request to the GitHub API while still inside the sandbox:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>https://api.github.com/repos/octocat/hello-world/issues<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;title&quot;:&quot;oops&quot;}&#39;</span>
+</pre></div>
+</div>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">&quot;error&quot;</span><span class="p">:</span><span class="s2">&quot;policy_denied&quot;</span><span class="p">,</span><span class="nt">&quot;policy&quot;</span><span class="p">:</span><span class="s2">&quot;github-api-readonly&quot;</span><span class="p">,</span><span class="nt">&quot;detail&quot;</span><span class="p">:</span><span class="s2">&quot;POST /repos/octocat/hello-world/issues not permitted by policy&quot;</span><span class="p">}</span>
+</pre></div>
+</div>
+<p>The CONNECT request succeeded because <code class="docutils literal notranslate"><span class="pre">api.github.com</span></code> is allowed, but the L7 proxy inspected the HTTP method and returned <code class="docutils literal notranslate"><span class="pre">403</span></code>. <code class="docutils literal notranslate"><span class="pre">POST</span></code> is not in the <code class="docutils literal notranslate"><span class="pre">read-only</span></code> preset. An agent with this policy can read code from GitHub but cannot create issues, push commits, or modify anything.</p>
+<p>Exit the sandbox:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span><span class="nb">exit</span>
+</pre></div>
+</div>
+</section>
+<section id="check-the-l7-deny-log">
+<h2>Check the L7 Deny Log<a class="headerlink" href="#check-the-l7-deny-log" title="Link to this heading">#</a></h2>
+<p>L7 denials are logged separately from connection-level denials. The log entry includes the exact HTTP method and path that the proxy rejected.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>logs<span class="w"> </span>demo<span class="w"> </span>--level<span class="w"> </span>warn<span class="w"> </span>--since<span class="w"> </span>5m
+</pre></div>
+</div>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>l7_decision=deny dst_host=api.github.com l7_action=POST l7_target=/repos/octocat/hello-world/issues l7_deny_reason=&quot;POST /repos/octocat/hello-world/issues not permitted by policy&quot;
+</pre></div>
+</div>
+<p>The log captures the exact HTTP method, path, and deny reason. In production, pipe these logs to your SIEM for a complete audit trail of every request your agent makes.</p>
+<div class="admonition tip">
+<p class="admonition-title">Tip</p>
+<p>To log violations without blocking requests, set <code class="docutils literal notranslate"><span class="pre">enforcement:</span> <span class="pre">audit</span></code> instead of <code class="docutils literal notranslate"><span class="pre">enforcement:</span> <span class="pre">enforce</span></code> in the policy. This is useful for building a policy iteratively: deploy in audit mode, review the logs, and switch to enforce when the rules are correct.</p>
+</div>
+</section>
+<section id="clean-up">
+<h2>Clean Up<a class="headerlink" href="#clean-up" title="Link to this heading">#</a></h2>
+<p>Delete the sandbox to free resources. This stops all processes and purges any injected credentials.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>sandbox<span class="w"> </span>delete<span class="w"> </span>demo
+</pre></div>
+</div>
+<div class="admonition tip">
+<p class="admonition-title">Tip</p>
+<p>To run this entire walkthrough non-interactively, use the automated demo script:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>bash<span class="w"> </span>examples/sandbox-policy-quickstart/demo.sh
+</pre></div>
+</div>
+</div>
+</section>
+<section id="next-steps">
+<h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>To walk through a full policy iteration with Claude Code, including diagnosing denials and applying fixes from outside the sandbox, refer to <a class="reference internal" href="github-sandbox.html"><span class="doc">Grant GitHub Push Access to a Sandboxed Agent</span></a>.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="index.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Tutorials</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="github-sandbox.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Grant GitHub Push Access to a Sandboxed Agent</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#create-a-sandbox">Create a Sandbox</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#try-to-reach-the-github-api">Try to Reach the GitHub API</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#check-the-deny-log">Check the Deny Log</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#apply-a-read-only-github-api-policy">Apply a Read-Only GitHub API Policy</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#verify-if-get-requests-are-allowed">Verify If GET Requests Are Allowed</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#try-a-write">Try a Write</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#check-the-l7-deny-log">Check the L7 Deny Log</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#clean-up">Clean Up</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#next-steps">Next Steps</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025-2026, NVIDIA Corporation.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+<script type="text/javascript">if (typeof _satellite !== "undefined") {_satellite.pageBottom();}</script>
+
+  </body>
+</html>
