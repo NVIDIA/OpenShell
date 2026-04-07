@@ -562,8 +562,11 @@ else
 fi
 
 # Write TLS secrets as a k3s auto-deploy manifest. k3s applies any YAML
-# in server/manifests/ on startup. We write this on every boot so that
-# a --reset (which wipes the kine DB) gets the secrets re-applied.
+# in server/manifests/ on startup. We write this on every boot so that:
+#   - A --reset (which wipes the kine DB and server/ tree) gets secrets re-applied.
+#   - A corrupt kine DB (removed by the host-side corruption check) gets secrets
+#     re-applied on the fresh database.
+# This is idempotent — k3s checksums manifests and only re-applies on change.
 ts "writing TLS secrets manifest..."
 mkdir -p "$K3S_MANIFESTS"
 CA_CRT_B64=$(base64 -w0 < "$PKI_DIR/ca.crt")
@@ -690,6 +693,26 @@ setsid sh -c '
         echo "=== [DIAG] done ==="
     } > "$DIAG" 2>&1
 ' &
+fi
+
+# ── Clear stale kine bootstrap lock ─────────────────────────────────────
+# k3s uses kine with a SQLite backend at state.db. When k3s starts, kine
+# sets a bootstrap lock row; if k3s is killed before completing bootstrap
+# (SIGKILL, host crash, power loss), the lock persists and the next k3s
+# instance hangs forever on:
+#   "Bootstrap key already locked — waiting for data to be populated by
+#    another server"
+#
+# We clear the lock row before starting k3s so that a warm boot with
+# persistent state.db succeeds. If state.db doesn't exist (first boot or
+# --reset), this is a harmless no-op. If state.db is corrupt, sqlite3
+# fails silently (|| true) and the host-side corruption check in exec.rs
+# will have already removed the file.
+KINE_DB="/var/lib/rancher/k3s/server/db/state.db"
+if [ -f "$KINE_DB" ]; then
+    ts "clearing stale kine bootstrap lock (if any)"
+    sqlite3 "$KINE_DB" "DELETE FROM kine WHERE name LIKE '/bootstrap/%';" 2>/dev/null || true
+    sqlite3 "$KINE_DB" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
 fi
 
 exec /usr/local/bin/k3s server "${K3S_ARGS[@]}"

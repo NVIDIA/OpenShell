@@ -26,7 +26,7 @@ use std::time::Instant;
 
 pub use exec::{
     VM_EXEC_VSOCK_PORT, VmExecOptions, VmRuntimeState, acquire_rootfs_lock, clear_vm_runtime_state,
-    ensure_vm_not_running, exec_running_vm, recover_stale_kine_db, reset_runtime_state,
+    ensure_vm_not_running, exec_running_vm, recover_corrupt_kine_db, reset_runtime_state,
     vm_exec_socket_path, vm_state_path, write_vm_runtime_state,
 };
 
@@ -885,12 +885,14 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
         None
     };
 
-    // Recover from a corrupt or bootstrap-locked kine (SQLite) database.
-    // Runs on every normal boot (not under --reset, which wipes the entire
-    // k3s/server/ tree anyway). Must happen after the lock so we know no
-    // other VM process is using the rootfs.
+    // Check for a corrupt kine (SQLite) database and remove it if the
+    // header is invalid. Stale bootstrap locks are handled inside the VM
+    // by the init script (sqlite3 DELETE before k3s starts). This runs on
+    // every normal boot (not --reset, which wipes k3s/server/ entirely).
+    // Must happen after the lock so we know no other VM process is using
+    // the rootfs.
     if !config.reset && config.exec_path == "/srv/openshell-vm-init.sh" {
-        recover_stale_kine_db(&config.rootfs);
+        recover_corrupt_kine_db(&config.rootfs)?;
     }
 
     // Wipe stale containerd/kubelet runtime state if requested.
@@ -1439,8 +1441,9 @@ fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Re
 ///
 /// When true, the host-side bootstrap (PKI generation, secret manifest writing,
 /// metadata storage) can be skipped because the virtio-fs rootfs persists k3s
-/// state (TLS certs, kine/sqlite, containerd images, helm releases) across VM
-/// restarts.
+/// state (TLS certs, kine/SQLite cluster objects, containerd images, helm
+/// releases) across VM restarts. The kine database is preserved on normal
+/// boots so that pods and other cluster objects survive restarts.
 fn is_warm_boot(gateway_name: &str) -> bool {
     let Ok(home) = std::env::var("HOME") else {
         return false;

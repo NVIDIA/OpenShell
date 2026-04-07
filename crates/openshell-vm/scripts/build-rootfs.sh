@@ -232,6 +232,7 @@ RUN apt-get update && \
         iproute2 \
         python3 \
         busybox-static \
+        sqlite3 \
         zstd \
     && rm -rf /var/lib/apt/lists/*
 # busybox-static provides udhcpc for DHCP inside the VM.
@@ -692,8 +693,15 @@ kill "${VM_PID}" 2>/dev/null || true
 wait "${VM_PID}" 2>/dev/null || true
 
 # Surgically clean the kine SQLite DB. Runtime objects (pods, events,
-# leases) would cause the VM's kubelet to reconcile against an empty
-# containerd on next boot.
+# leases) created during pre-initialization would cause the VM's kubelet
+# to reconcile against an empty containerd on first real boot.
+#
+# NOTE: This is build-time cleanup only — it produces a clean rootfs
+# image. At runtime, state.db is preserved across VM restarts so that
+# pods and other cluster objects persist. The init script
+# (openshell-vm-init.sh) handles stale bootstrap lock cleanup via
+# sqlite3, and the host-side Rust code (exec.rs) handles actual DB
+# corruption by removing the file.
 echo "    Cleaning runtime objects from kine DB..."
 DB="${ROOTFS_DIR}/var/lib/rancher/k3s/server/db/state.db"
 if [ -f "$DB" ]; then

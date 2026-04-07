@@ -134,7 +134,11 @@ pub fn clear_vm_runtime_state(rootfs: &Path) {
 /// - containerd images and content (no re-pull needed)
 /// - containerd snapshots (no re-extract needed)
 /// - containerd metadata database (meta.db — image/snapshot tracking)
-/// - k3s server state (kine/sqlite, TLS certs, manifests)
+///
+/// **Note:** This is the only path that wipes the kine/SQLite database.
+/// Normal boots preserve `state.db` (and all cluster objects) across
+/// restarts. The init script clears stale bootstrap locks via `sqlite3`,
+/// and `recover_corrupt_kine_db` handles actual file corruption.
 pub fn reset_runtime_state(rootfs: &Path, gateway_name: &str) -> Result<(), VmError> {
     // Full reset: wipe all k3s state so the VM cold-starts from scratch.
     // The init script will re-import airgap images, deploy manifests,
@@ -212,94 +216,84 @@ pub fn reset_runtime_state(rootfs: &Path, gateway_name: &str) -> Result<(), VmEr
     Ok(())
 }
 
-/// Recover from a corrupt or bootstrap-locked kine (SQLite) database.
+/// Remove a corrupt kine (SQLite) database so k3s can recreate it on boot.
 ///
 /// k3s uses kine with a SQLite backend at `var/lib/rancher/k3s/server/db/state.db`.
-/// If the VM is killed mid-write (SIGKILL, host crash, power loss), SQLite may
-/// not have checkpointed its WAL, leaving the database in one of two broken states:
+/// If the VM is killed mid-write (SIGKILL, host crash, power loss), the database
+/// file may be left in a corrupt state — the SQLite header magic is missing or the
+/// file is truncated. k3s would open the DB, get `SQLITE_NOTADB` /
+/// `SQLITE_CORRUPT`, and crash at startup.
 ///
-/// 1. **Corrupt file** — the SQLite header magic is missing or the file is
-///    truncated. k3s opens the DB, gets `SQLITE_NOTADB` / `SQLITE_CORRUPT`,
-///    and crashes at startup.
+/// This function checks the SQLite file header (first 100 bytes only) and removes
+/// the database plus its WAL/SHM sidecar files if the header is invalid. k3s will
+/// create a fresh database on startup and cluster state will be re-applied from
+/// the auto-deploy manifests in `server/manifests/`.
 ///
-/// 2. **Stale bootstrap lock** — the kine schema is intact but a previous server
-///    instance left the kine bootstrap lock held. k3s loops forever on
-///    "Bootstrap key already locked — waiting for data to be populated by
-///    another server" every 5 s. The VM appears booted but k3s never becomes
-///    ready.
+/// **Stale bootstrap locks** (a kine application-level issue where a killed k3s
+/// server leaves a lock row that causes the next instance to hang) are handled
+/// separately by the init script (`openshell-vm-init.sh`), which runs
+/// `sqlite3 state.db "DELETE FROM kine WHERE name LIKE '/bootstrap/%'"` before
+/// starting k3s. This allows the database — and all persistent cluster state — to
+/// survive normal restarts.
 ///
-/// Neither condition can be fixed inside the VM: k3s reads `state.db` before the
-/// init script has any chance to intervene. The only reliable recovery is to
-/// delete the file before boot and let k3s create a fresh one.
+/// **What is lost on corruption:** all cluster object records (Pods, Deployments,
+/// Secrets, ConfigMaps, CRDs, etc.) and the bootstrap token. These are re-created
+/// from manifests on the next boot.
 ///
-/// Since `state.db` contains only ephemeral single-node cluster state — all
-/// Kubernetes objects are re-applied from the auto-deploy manifests in
-/// `server/manifests/` on every cold start — removing it on every boot is safe.
-///
-/// **What is lost:** cluster object records (Pods, Deployments, etc.) and the
-/// bootstrap token. Both are re-created from manifests on boot.
-///
-/// **What is preserved:** all container images and snapshots (under `k3s/agent/`),
-/// PKI, and the `.initialized` sentinel.
+/// **What is always preserved:** container images and snapshots (under
+/// `k3s/agent/`), PKI, and the `.initialized` sentinel.
 ///
 /// This function is a no-op if `state.db` does not exist (e.g. first boot or
 /// after a full `--reset`).
-pub fn recover_stale_kine_db(rootfs: &Path) {
+pub fn recover_corrupt_kine_db(rootfs: &Path) -> Result<(), VmError> {
     let db_path = rootfs.join("var/lib/rancher/k3s/server/db/state.db");
     if !db_path.exists() {
-        return; // Nothing to check.
+        return Ok(()); // Nothing to check — first boot or post-reset.
     }
 
     // The SQLite file format begins with a 16-byte magic string.
     // Reference: https://www.sqlite.org/fileformat.html#the_database_header
     const SQLITE_MAGIC: &[u8] = b"SQLite format 3\x00";
 
-    let corrupt = match fs::read(&db_path) {
-        Err(_) => true,                         // Can't read → treat as corrupt.
-        Ok(bytes) if bytes.len() < 100 => true, // Too short to be a valid DB.
-        Ok(bytes) => !bytes.starts_with(SQLITE_MAGIC),
+    // Read only the first 100 bytes (the minimum valid SQLite header size)
+    // instead of loading the entire database into memory.
+    use std::io::Read;
+    let has_invalid_header = match fs::File::open(&db_path).and_then(|mut f| {
+        let mut buf = [0u8; 100];
+        let n = f.read(&mut buf)?;
+        Ok((n, buf))
+    }) {
+        Err(_) => true,                // Can't read → treat as corrupt.
+        Ok((n, _)) if n < 100 => true, // Too short to be a valid DB.
+        Ok((_, buf)) => !buf.starts_with(SQLITE_MAGIC),
     };
 
-    if corrupt {
-        eprintln!(
-            "Warning: kine database is corrupt ({}), removing for clean boot",
-            db_path.display()
-        );
-        if let Err(e) = fs::remove_file(&db_path) {
-            eprintln!("Warning: failed to remove corrupt kine database: {e}");
-        }
-        // Also remove any WAL/SHM sidecar files left by the interrupted write.
-        let _ = fs::remove_file(db_path.with_extension("db-wal"));
-        let _ = fs::remove_file(db_path.with_extension("db-shm"));
-        return;
+    if !has_invalid_header {
+        return Ok(()); // Valid database — preserve it for warm boot.
     }
 
-    // The file has a valid SQLite header. Even a structurally intact DB can
-    // cause k3s to hang forever with "Bootstrap key already locked — waiting
-    // for data to be populated by another server". This is a kine application-
-    // level lock: when a k3s server starts, kine marks bootstrap as "in
-    // progress"; if that server is killed before it finishes, the lock row
-    // persists and no subsequent server can complete bootstrap.
-    //
-    // There is no reliable way to detect this condition without executing
-    // SQLite queries (which would require a dependency). However, `state.db`
-    // contains only ephemeral cluster state for this single-node VM — all
-    // Kubernetes objects are re-created from the auto-deploy manifests in
-    // `server/manifests/` on every cold start. Removing the DB on every boot
-    // is therefore safe and guarantees a clean bootstrap every time, at the
-    // cost of ~1-2s extra startup time for k3s to recreate the schema.
-    //
-    // The DB is NOT removed under --reset (reset_runtime_state wipes the
-    // entire k3s/server/ tree, which is a superset of this operation).
     eprintln!(
-        "Removing stale kine database for clean boot ({})",
+        "Warning: kine database is corrupt ({}), removing for clean boot",
         db_path.display()
     );
-    if let Err(e) = fs::remove_file(&db_path) {
-        eprintln!("Warning: failed to remove kine database: {e}");
+
+    remove_kine_db_files(&db_path)?;
+
+    Ok(())
+}
+
+/// Remove the kine SQLite database and its WAL/SHM sidecar files.
+fn remove_kine_db_files(db_path: &Path) -> Result<(), VmError> {
+    if let Err(e) = fs::remove_file(db_path) {
+        return Err(VmError::RuntimeState(format!(
+            "failed to remove kine database {}: {e}",
+            db_path.display()
+        )));
     }
+    // Also remove any WAL/SHM sidecar files left by an interrupted write.
     let _ = fs::remove_file(db_path.with_extension("db-wal"));
     let _ = fs::remove_file(db_path.with_extension("db-shm"));
+    Ok(())
 }
 
 /// Acquire an exclusive lock on the rootfs lock file.
