@@ -1,0 +1,46 @@
+# Workflow 1 of 2 for Fern doc previews.
+#
+# Collects fern/ sources and PR metadata from the PR branch and uploads an artifact.
+# No secrets — safe for fork PRs via pull_request.
+#
+# Companion: fern-docs-preview-comment.yml (workflow_run) builds the preview with DOCS_FERN_TOKEN.
+
+name: "Preview Fern Docs: Build"
+
+on:
+  pull_request:
+    paths:
+      - "fern/**"
+      - ".github/workflows/fern-docs-preview-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Save PR metadata
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          mkdir -p .preview-metadata
+          echo "$PR_NUMBER" > .preview-metadata/pr_number
+          echo "$HEAD_REF" > .preview-metadata/head_ref
+          git diff --name-only "origin/${BASE_REF}...HEAD" -- '*.mdx' > .preview-metadata/changed_mdx_files 2>/dev/null || true
+
+      - name: Upload fern sources and metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fern-preview
+          path: |
+            fern/
+            .preview-metadata/
+          retention-days: 1

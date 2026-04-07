@@ -1,0 +1,35 @@
+# Validates Fern autodocs generation on pull requests (when docs.yml defines `libraries`,
+# output goes under fern/product-docs/ and is gitignored).
+# Requires org/repo secret: DOCS_FERN_TOKEN (from `fern token` for the Fern org).
+
+name: Fern docs (autodocs)
+
+on:
+  pull_request:
+    paths:
+      - "fern/**"
+      - ".github/workflows/fern-docs-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  generate-library-reference:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install Fern CLI
+        run: npm install -g fern-api
+
+      - name: Generate library reference MDX (product-docs)
+        env:
+          FERN_TOKEN: ${{ secrets.DOCS_FERN_TOKEN }}
+        working-directory: ./fern
+        run: fern docs md generate
