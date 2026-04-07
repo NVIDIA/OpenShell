@@ -10,7 +10,10 @@ export type BadgeItem = {
   alt: string;
 };
 
-export function BadgeLinks({ badges }: { badges: BadgeItem[] }) {
+export function BadgeLinks({ badges = [] }: { badges?: BadgeItem[] }) {
+  if (badges.length === 0) {
+    return null;
+  }
   return (
     <div
       className="badge-links"
