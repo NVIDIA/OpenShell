@@ -1,28 +1,9 @@
 ---
-title:
-  page: Write Your First Sandbox Network Policy
-  nav: First Network Policy
-description: See how OpenShell network policies work by creating a sandbox, observing default-deny in action, and applying a fine-grained L7 read-only rule.
-topics:
-- Generative AI
-- Cybersecurity
-tags:
-- Tutorial
-- Policy
-- Network Policy
-- Sandbox
-- Security
-content:
-  type: tutorial
-  difficulty: technical_beginner
-  audience:
-  - engineer
+title: "Write Your First Sandbox Network Policy"
+description: "See how OpenShell network policies work by creating a sandbox, observing default-deny in action, and applying a fine-grained L7 read-only rule."
 ---
-
-<!--
-  SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-  SPDX-License-Identifier: Apache-2.0
--->
+{/* SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0 */}
 
 # Write Your First Sandbox Network Policy
 
@@ -37,17 +18,17 @@ After completing this tutorial, you understand:
 
 ## Prerequisites
 
-- A working OpenShell installation. Complete the {doc}`/get-started/quickstart` before proceeding.
+- A working OpenShell installation. Complete the [Quickstart](/latest/get-started/quickstart) before proceeding.
 - Docker Desktop running on your machine.
 
-:::{tip}
+<Tip>
 To run every step of this tutorial, you can also use the automated demo script at the [examples/sandbox-policy-quickstart](https://github.com/NVIDIA/OpenShell/blob/main/examples/sandbox-policy-quickstart) directory in the NVIDIA OpenShell repository. It runs the full walkthrough in under a minute but without any user interaction.
 
 ```console
 $ bash examples/sandbox-policy-quickstart/demo.sh
 ```
 
-:::
+</Tip>
 
 ## Create a Sandbox
 
@@ -143,13 +124,14 @@ $ openshell policy set demo --policy github_readonly.yaml --wait
 
 `--wait` blocks until the sandbox confirms the new policy is loaded. No restart required. Policies are hot-reloaded.
 
-:::{tip}
+<Tip>
 This tutorial uses `curl` and `read-only` access to keep things simple. When building policies for real workloads:
 
 - To scope the policy to an agent, replace the `binaries` section with your agent's binary, such as `/usr/local/bin/claude`, instead of `curl`.
-- To grant write access, change `access: read-only` to `read-write` or add explicit `rules` for specific paths. Refer to the {doc}`/reference/policy-schema`.
-- To allow additional endpoints, stack multiple policies in the same file for PyPI, npm, or your internal APIs. Refer to {doc}`/sandboxes/policies` for examples.
-:::
+- To grant write access, change `access: read-only` to `read-write` or add explicit `rules` for specific paths. Refer to the [Policy Schema](/latest/reference/policy-schema).
+- To allow additional endpoints, stack multiple policies in the same file for PyPI, npm, or your internal APIs. Refer to [Policies](/latest/sandboxes/policies) for examples.
+
+</Tip>
 
 ## Verify If GET Requests Are Allowed
 
@@ -207,9 +189,10 @@ l7_decision=deny dst_host=api.github.com l7_action=POST l7_target=/repos/octocat
 
 The log captures the exact HTTP method, path, and deny reason. In production, pipe these logs to your SIEM for a complete audit trail of every request your agent makes.
 
-:::{tip}
+<Tip>
 To log violations without blocking requests, set `enforcement: audit` instead of `enforcement: enforce` in the policy. This is useful for building a policy iteratively: deploy in audit mode, review the logs, and switch to enforce when the rules are correct.
-:::
+
+</Tip>
 
 ## Clean Up
 
@@ -219,14 +202,15 @@ Delete the sandbox to free resources. This stops all processes and purges any in
 $ openshell sandbox delete demo
 ```
 
-:::{tip}
+<Tip>
 To run this entire walkthrough non-interactively, use the automated demo script:
 
 ```console
 $ bash examples/sandbox-policy-quickstart/demo.sh
 ```
-:::
+
+</Tip>
 
 ## Next Steps
 
-- To walk through a full policy iteration with Claude Code, including diagnosing denials and applying fixes from outside the sandbox, refer to {doc}`/tutorials/github-sandbox`.
+- To walk through a full policy iteration with Claude Code, including diagnosing denials and applying fixes from outside the sandbox, refer to [Github Sandbox](/latest/tutorials/github-sandbox).

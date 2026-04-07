@@ -1,0 +1,29 @@
+navigation:
+  - section: "Documentation"
+    contents:
+      - page: "Home"
+        path: ./latest/pages/index.mdx
+  - folder: ./latest/pages/about
+    title: "About NVIDIA OpenShell"
+    title-source: frontmatter
+  - section: "Get Started"
+    contents:
+      - page: "Quickstart"
+        path: ./latest/pages/get-started/quickstart.mdx
+      - page: "Tutorials"
+        path: ./latest/pages/tutorials/index.mdx
+  - folder: ./latest/pages/sandboxes
+    title: "Gateways and Sandboxes"
+    title-source: frontmatter
+  - folder: ./latest/pages/inference
+    title: "Inference Routing"
+    title-source: frontmatter
+  - folder: ./latest/pages/reference
+    title: "Reference"
+    title-source: frontmatter
+  - folder: ./latest/pages/security
+    title: "Security"
+    title-source: frontmatter
+  - folder: ./latest/pages/resources
+    title: "Resources"
+    title-source: frontmatter

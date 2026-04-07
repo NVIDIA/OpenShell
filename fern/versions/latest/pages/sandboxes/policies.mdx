@@ -1,32 +1,14 @@
 ---
-title:
-  page: Customize Sandbox Policies
-  nav: Policies
-description: Apply, iterate, and debug sandbox network policies with hot-reload on running OpenShell sandboxes.
-topics:
-- Generative AI
-- Cybersecurity
-tags:
-- Policy
-- Network Policy
-- Sandbox
-- Security
-- Hot Reload
-content:
-  type: how_to
-  difficulty: technical_intermediate
-  audience:
-  - engineer
+title: "Customize Sandbox Policies"
+description: "Apply, iterate, and debug sandbox network policies with hot-reload on running OpenShell sandboxes."
+position: 5
 ---
-
-<!--
-  SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-  SPDX-License-Identifier: Apache-2.0
--->
+{/* SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0 */}
 
 # Customize Sandbox Policies
 
-Use this page to apply and iterate policy changes on running sandboxes. For a full field-by-field YAML definition, use the [Policy Schema Reference](../reference/policy-schema.md).
+Use this page to apply and iterate policy changes on running sandboxes. For a full field-by-field YAML definition, use the [Policy Schema Reference](/latest/reference/policy-schema).
 
 ## Policy Structure
 
@@ -70,9 +52,9 @@ Dynamic sections can be updated on a running sandbox with `openshell policy set`
 | Section | Type | Description |
 |---|---|---|
 | `filesystem_policy` | Static | Controls which directories the agent can access on disk. Paths are split into `read_only` and `read_write` lists. Any path not listed in either list is inaccessible. Set `include_workdir: true` to automatically add the agent's working directory to `read_write`. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level. |
-| `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (skip individual inaccessible paths while applying remaining rules) or `hard_requirement` (fail if any path is inaccessible or the required kernel ABI is unavailable). See the [Policy Schema Reference](../reference/policy-schema.md#landlock) for the full behavior table. |
+| `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (skip individual inaccessible paths while applying remaining rules) or `hard_requirement` (fail if any path is inaccessible or the required kernel ABI is unavailable). See the [Policy Schema Reference](/latest/reference/policy-schema#landlock) for the full behavior table. |
 | `process` | Static | Sets the OS-level identity for the agent process. `run_as_user` and `run_as_group` default to `sandbox`. Root (`root` or `0`) is rejected. The agent also runs with seccomp filters that block dangerous system calls. |
-| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br />Every outbound connection except `https://inference.local` goes through the proxy, which queries the {doc}`policy engine <../about/architecture>` with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br />For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request is checked against that endpoint's `rules` (method and path). <br />Endpoints without `protocol` allow the TCP stream through without inspecting payloads. <br />If no endpoint matches, the connection is denied. Configure managed inference separately through {doc}`../inference/configure`. |
+| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br />Every outbound connection except `https://inference.local` goes through the proxy, which queries the [policy engine](/latest/about/architecture) with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br />For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request is checked against that endpoint's `rules` (method and path). <br />Endpoints without `protocol` allow the TCP stream through without inspecting payloads. <br />If no endpoint matches, the connection is denied. Configure managed inference separately through [Configure](/latest/inference/configure). |
 
 ## Baseline Filesystem Paths
 
@@ -110,7 +92,7 @@ The CLI uses the policy from `OPENSHELL_SANDBOX_POLICY` whenever `--policy` is n
 
 To change what the sandbox can access, pull the current policy, edit the YAML, and push the update. The workflow is iterative: create the sandbox, monitor logs for denied actions, pull the policy, modify it, push, and verify.
 
-```{mermaid}
+```mermaid
 flowchart TD
     A["1. Create sandbox with initial policy"] --> B["2. Monitor logs for denied actions"]
     B --> C["3. Pull current policy"]
@@ -201,9 +183,8 @@ Then push the updated policy as described above.
 Add these blocks to the `network_policies` section of your sandbox policy. Apply with `openshell policy set <name> --policy <file> --wait`.
 Use **Simple endpoint** for host-level allowlists and **Granular rules** for method/path control.
 
-:::::{tab-set}
-
-::::{tab-item} Simple endpoint
+<Tabs>
+<Tab title="Simple endpoint">
 Allow `pip install` and `uv pip install` to reach PyPI:
 
 ```yaml
@@ -220,14 +201,16 @@ Allow `pip install` and `uv pip install` to reach PyPI:
 ```
 
 Endpoints without `protocol` use TCP passthrough, where the proxy allows the stream without inspecting payloads.
-::::
+</Tab>
+</Tabs>
 
-::::{tab-item} Granular rules
+<Tab title="Granular rules">
 Allow Claude and the GitHub CLI to reach `api.github.com` with per-path rules: read-only (GET, HEAD, OPTIONS) and GraphQL (POST) for all paths; full write access for `alpha-repo`; and create/edit issues only for `bravo-repo`. Replace `<org_name>` with your GitHub org or username.
 
-:::{tip}
-For an end-to-end walkthrough that combines this policy with a GitHub credential provider and sandbox creation, refer to {doc}`/tutorials/github-sandbox`.
-:::
+<Tip>
+For an end-to-end walkthrough that combines this policy with a GitHub credential provider and sandbox creation, refer to [Github Sandbox](/latest/tutorials/github-sandbox).
+
+</Tip>
 
 ```yaml
   github_repos:
@@ -265,9 +248,7 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
 ```
 
 Endpoints with `protocol: rest` enable HTTP request inspection. The proxy auto-detects TLS on HTTPS endpoints, terminates it, and checks each HTTP request against the `rules` list.
-::::
-
-:::::
+</Tab>
 
 ### Query parameter matching
 
@@ -299,6 +280,6 @@ REST rules can also constrain query parameter values:
 
 Explore related topics:
 
-- To learn about network access rules and sandbox isolation layers, refer to {doc}`sandboxes/index`.
-- To view the full field-by-field YAML definition, refer to the [Policy Schema Reference](../reference/policy-schema.md).
-- To review the default policy breakdown, refer to {doc}`../reference/default-policy`.
+- To learn about network access rules and sandbox isolation layers, refer to [Index](/latest/sandboxes).
+- To view the full field-by-field YAML definition, refer to the [Policy Schema Reference](/latest/reference/policy-schema).
+- To review the default policy breakdown, refer to [Default Policy](/latest/reference/default-policy).
