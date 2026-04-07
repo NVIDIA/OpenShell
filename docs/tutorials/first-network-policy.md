@@ -105,7 +105,7 @@ Every denied connection is logged with the destination, the binary that attempte
 
 ## Apply a Read-Only GitHub API Policy
 
-To allow the sandbox to reach the `GitHub` API, define a network policy that grants read-only access. The policy specifies which host, port, binary, and HTTP methods are permitted. Create a file called `github_readonly.yaml` with the following content:
+To allow the sandbox to reach the GitHub API, define a network policy that grants read-only access. The policy specifies which host, port, binary, and HTTP methods are permitted. Create a file called `github-readonly.yaml` with the following content:
 
 ```yaml
 version: 1
@@ -138,7 +138,7 @@ The `filesystem_policy`, `landlock`, and `process` sections preserve the default
 Apply it:
 
 ```console
-$ openshell policy set demo --policy github_readonly.yaml --wait
+$ openshell policy set demo --policy github-readonly.yaml --wait
 ```
 
 `--wait` blocks until the sandbox confirms the new policy is loaded. No restart required. Policies are hot-reloaded.

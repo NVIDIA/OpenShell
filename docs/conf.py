@@ -65,9 +65,6 @@ myst_substitutions = {
 
 templates_path = ["_templates"]
 
-html_static_path = ["_static"]
-html_css_files = ["landing-terminal.css"]
-
 html_theme = "nvidia_sphinx_theme"
 html_copy_source = False
 html_show_sourcelink = False

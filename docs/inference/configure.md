@@ -207,7 +207,7 @@ A successful response confirms the privacy router can reach the configured backe
 
 Explore related topics:
 
-- To understand the inference routing flow and supported API patterns, refer to {doc}`inference/index`.
+- To understand the inference routing flow and supported API patterns, refer to {doc}`index`.
 - To follow a complete Ollama-based local setup, refer to {doc}`/tutorials/inference-ollama`.
 - To follow a complete LM Studio-based local setup, refer to {doc}`/tutorials/local-inference-lmstudio`.
 - To control external endpoints, refer to [Policies](/sandboxes/policies.md).
