@@ -1,7 +1,9 @@
 # Fern site config — merged with skills/convert-to-fern/assets/theme/nvidia/docs-theme.yml pattern
+# Root-hosted preview: internal links use /latest/... (from migrate_to_fern). When you add production
+# under docs.nvidia.com/openshell, set instances url + custom-domain to the SAME path and either run
+# update_links with the path prefix or enable basepath-aware — see convert-to-fern references/subpath-hosting.md
 instances:
   - url: https://openshell.docs.buildwithfern.com
-    custom-domain: docs.nvidia.com/openshell
 
 title: NVIDIA OpenShell
 
@@ -50,7 +52,6 @@ navbar-links:
 experimental:
   mdx-components:
     - ./components
-  basepath-aware: true
 
 versions:
   - display-name: Latest
