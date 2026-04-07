@@ -6,8 +6,6 @@ position: 6
 {/* SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0 */}
 
-# Community Sandboxes
-
 Use pre-built sandboxes from the OpenShell Community catalog, or contribute your
 own.
 
@@ -33,8 +31,8 @@ The following community sandboxes are available in the catalog.
 
 Launch a community sandbox by name with the `--from` flag:
 
-```console
-$ openshell sandbox create --from openclaw
+```shell
+openshell sandbox create --from openclaw
 ```
 
 When you pass `--from` with a community sandbox name, the CLI:
@@ -55,14 +53,14 @@ The `--from` flag also accepts:
 - Local directory paths: Point to a directory on disk that contains a
   Dockerfile and optional policy/skills:
 
-  ```console
-  $ openshell sandbox create --from ./my-sandbox-dir
+  ```shell
+  openshell sandbox create --from ./my-sandbox-dir
   ```
 
 - Container image references: Use an existing container image directly:
 
-  ```console
-  $ openshell sandbox create --from my-registry.example.com/my-image:latest
+  ```shell
+  openshell sandbox create --from my-registry.example.com/my-image:latest
   ```
 
 ## Contribute a Community Sandbox
@@ -96,5 +94,5 @@ or anything else), consider contributing it back so others can use it.
 
 Explore related topics:
 
-- **Need to supply API keys or tokens?** Set up [Manage Providers](/latest/sandboxes/manage-providers) for credential management.
-- **Want to customize the sandbox policy?** Write custom rules in [Policies](/latest/sandboxes/policies).
+- **Need to supply API keys or tokens?** Set up [Manage Providers](/sandboxes/manage-providers) for credential management.
+- **Want to customize the sandbox policy?** Write custom rules in [Policies](/sandboxes/policies).

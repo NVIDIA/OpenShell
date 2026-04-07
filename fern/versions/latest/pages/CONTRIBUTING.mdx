@@ -31,13 +31,13 @@ Verify the docs are built correctly by building them and checking the output.
 
 To build the docs, run:
 
-```bash
+```shell
 mise run docs
 ```
 
 To serve the docs locally and automatically rebuild on changes, run:
 
-```bash
+```shell
 mise run docs:serve
 ```
 
@@ -111,8 +111,8 @@ These patterns are common in LLM-generated text and erode trust with technical r
 - End every sentence with a period.
 - Use `code` formatting for CLI commands, file paths, flags, parameter names, and values.
 - Use code blocks with the `console` language for CLI examples. Prefix commands with `$`:
-  ```console
-  $ openshell gateway start
+  ```shell
+  openshell gateway start
   ```
 - Use tables for structured comparisons. Keep tables simple (no nested formatting).
 - Use MyST admonitions (`:::{tip}`, `:::{note}`, `:::{warning}`) for callouts, not bold text.

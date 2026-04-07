@@ -6,15 +6,13 @@ position: 1
 {/* SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0 */}
 
-# About Inference Routing
-
 NVIDIA OpenShell handles inference traffic through two endpoints: `inference.local` and external endpoints.
 The following table summarizes how OpenShell handles inference traffic.
 
 | Path | How It Works |
 |---|---|
-| External endpoints | Traffic to hosts like `api.openai.com` or `api.anthropic.com` is treated like any other outbound request, allowed or denied by `network_policies`. Refer to [Policies](/latest/sandboxes/policies). |
-| `inference.local` | A special endpoint exposed inside every sandbox for routing inference traffic locally, preserving privacy and security. The [privacy router](/latest/about/architecture) strips the original credentials, injects the configured backend credentials, and forwards to the managed model endpoint. |
+| External endpoints | Traffic to hosts like `api.openai.com` or `api.anthropic.com` is treated like any other outbound request, allowed or denied by `network_policies`. Refer to [Policies](/sandboxes/policies). |
+| `inference.local` | A special endpoint exposed inside every sandbox for routing inference traffic locally, preserving privacy and security. The [privacy router](/about/architecture) strips the original credentials, injects the configured backend credentials, and forwards to the managed model endpoint. |
 
 ## How `inference.local` Works
 
@@ -45,7 +43,6 @@ Supported request patterns depend on the provider configured for `inference.loca
 | Model Discovery | `GET` | `/v1/models/*` |
 
 </Tab>
-</Tabs>
 
 <Tab title="Anthropic-compatible">
 
@@ -55,11 +52,13 @@ Supported request patterns depend on the provider configured for `inference.loca
 
 </Tab>
 
+</Tabs>
+
 Requests to `inference.local` that do not match the configured provider's supported patterns are denied.
 
 ## Next Steps
 
 Continue with one of the following:
 
-- To set up the backend behind `inference.local`, refer to [Configure](/latest/inference/configure).
-- To control external endpoints, refer to [Policies](/latest/sandboxes/policies).
+- To set up the backend behind `inference.local`, refer to [Configure](/inference/configure).
+- To control external endpoints, refer to [Policies](/sandboxes/policies).

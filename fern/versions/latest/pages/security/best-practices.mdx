@@ -6,13 +6,11 @@ position: 1
 {/* SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0 */}
 
-# Security Best Practices
-
 OpenShell enforces sandbox security across four layers: network, filesystem, process, and inference.
 This page documents every configurable control, its default, what it protects, and the risk of relaxing it.
 
-For the full policy YAML schema, refer to the [Policy Schema](/latest/reference/policy-schema).
-For the architecture of each enforcement layer, refer to [Architecture](/latest/about/architecture).
+For the full policy YAML schema, refer to the [Policy Schema](/reference/policy-schema).
+For the architecture of each enforcement layer, refer to [Architecture](/about/architecture).
 
 <Note>
 If you use [NemoClaw](https://github.com/NVIDIA/NemoClaw) to run OpenClaw assistants, its [Security Best Practices](https://docs.nvidia.com/nemoclaw/latest/security/best-practices.html) guide covers additional entrypoint-level controls, policy presets, provider trust tiers, and posture profiles specific to the NemoClaw blueprint.
@@ -268,9 +266,9 @@ The following patterns weaken security without providing meaningful benefit.
 
 ## Related Topics
 
-- [Policies](/latest/sandboxes/policies) for applying and iterating on sandbox policies.
-- [Policy Schema](/latest/reference/policy-schema) for the full field-by-field YAML reference.
-- [Default Policy](/latest/reference/default-policy) for the built-in default policy breakdown.
-- [Gateway Auth](/latest/reference/gateway-auth) for gateway authentication details.
-- [Architecture](/latest/about/architecture) for the system architecture.
+- [Policies](/sandboxes/policies) for applying and iterating on sandbox policies.
+- [Policy Schema](/reference/policy-schema) for the full field-by-field YAML reference.
+- [Default Policy](/reference/default-policy) for the built-in default policy breakdown.
+- [Gateway Auth](/reference/gateway-auth) for gateway authentication details.
+- [Architecture](/about/architecture) for the system architecture.
 - NemoClaw [Security Best Practices](https://docs.nvidia.com/nemoclaw/latest/security/best-practices.html) for entrypoint-level controls (capability drops, PATH hardening, build toolchain removal), policy presets, provider trust tiers, and posture profiles.

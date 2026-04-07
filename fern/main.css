@@ -87,8 +87,65 @@ p {
 }
 
 /* Badge links: hide redundant external-link icon (badges already indicate links) */
+.badge-links {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+    line-height: 0;
+    margin: 0.25rem 0 0.75rem;
+}
+
+.badge-links a {
+    display: inline-flex;
+    align-items: center;
+}
+
+.badge-links img {
+    display: block;
+    margin: 0 !important;
+}
+
 .badge-links .fern-mdx-link svg {
     display: none;
+}
+
+.badge-links + p {
+    margin-top: 0 !important;
+}
+
+/* Opt-in tab panels for content that should read as a contained variant block. */
+.boxed-tabs {
+    margin-top: 0.75rem;
+    margin-bottom: 1.25rem;
+}
+
+.boxed-tabs [role="tabpanel"] {
+    margin-top: 0.2rem;
+    padding: 0.625rem 0.875rem 0.875rem;
+    border: 1px solid var(--border, var(--grayscale-a5));
+    border-radius: 14px;
+    background-color: #fcfcfa;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.boxed-tabs [role="tabpanel"] > :first-child {
+    margin-top: 0 !important;
+}
+
+.boxed-tabs [role="tabpanel"] > :last-child {
+    margin-bottom: 0 !important;
+}
+
+.boxed-tabs [role="tabpanel"] > .not-prose {
+    margin-top: 0.5rem !important;
+    margin-bottom: 0.75rem !important;
+}
+
+.dark .boxed-tabs [role="tabpanel"],
+html[data-theme=dark] .boxed-tabs [role="tabpanel"] {
+    background-color: var(--nv-dark-grey-2);
+    box-shadow: none;
 }
 
 /* Light theme (default) */
@@ -433,10 +490,6 @@ animation-range: 0 50px;
     border-radius: var(--rounded);
     background-color: transparent !important;
     transition: box-shadow 0.3s ease, outline 0.3s ease;
-}
-/* Hide line numbers */
-.code-block-line-gutter {
-    display: none !important;
 }
 .fern-footer-prev h4, .fern-footer-next h4{
     font-size: inherit !important;
@@ -871,7 +924,7 @@ svg.card-icon{
     }
 }
 
-/* OpenShell landing: terminal demo (styles moved from index.mdx — MDX parses { } as JSX) */
+/* OpenShell landing: terminal demo */
 .nc-term {
     background: #1a1a2e;
     border-radius: 8px;

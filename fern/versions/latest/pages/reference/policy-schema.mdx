@@ -6,15 +6,13 @@ position: 3
 {/* SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0 */}
 
-# Policy Schema Reference
-
 Complete field reference for the sandbox policy YAML. Each field is documented with its type, whether it is required, and whether it is static (locked at sandbox creation) or dynamic (hot-reloadable on a running sandbox).
 
 ## Top-Level Structure
 
 A policy YAML file contains the following top-level fields:
 
-```yaml
+```yaml showLineNumbers={false}
 version: 1
 filesystem_policy: { ... }
 landlock: { ... }
@@ -64,7 +62,7 @@ Policies that violate these constraints are rejected with `INVALID_ARGUMENT` at 
 
 Example:
 
-```yaml
+```yaml showLineNumbers={false}
 filesystem_policy:
   include_workdir: true
   read_only:
@@ -104,7 +102,7 @@ When a path is skipped under `best_effort`, the sandbox logs a warning that incl
 
 Example:
 
-```yaml
+```yaml showLineNumbers={false}
 landlock:
   compatibility: best_effort
 ```
@@ -124,7 +122,7 @@ Sets the OS-level identity for the agent process inside the sandbox.
 
 Example:
 
-```yaml
+```yaml showLineNumbers={false}
 process:
   run_as_user: sandbox
   run_as_group: sandbox
@@ -182,7 +180,7 @@ Used when `access` is not set. Each rule explicitly allows a method and path com
 
 Example with rules:
 
-```yaml
+```yaml showLineNumbers={false}
 rules:
   - allow:
       method: GET
@@ -209,7 +207,7 @@ Identifies an executable that is permitted to use the associated endpoints.
 
 The following policy grants read-only GitHub API access and npm registry access:
 
-```yaml
+```yaml showLineNumbers={false}
 network_policies:
   github_rest_api:
     name: github-rest-api

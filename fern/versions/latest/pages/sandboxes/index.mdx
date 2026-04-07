@@ -6,8 +6,6 @@ position: 1
 {/* SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0 */}
 
-# About Gateways and Sandboxes
-
 Every OpenShell deployment starts with a *gateway* and one or more *sandboxes*. The gateway is the control plane that manages sandbox lifecycle, providers, and policies. A sandbox is the data plane, a safe, private execution environment where an AI agent runs. Each sandbox runs with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.
 
 ## Gateway Types
@@ -49,15 +47,15 @@ When you create a sandbox without `--policy`, the default policy is applied. It 
 | Network | What the agent can reach on the network | Each policy block pairs allowed destinations (host and port) with allowed binaries (executable paths). The proxy matches every outbound connection to the binary that opened it. Both must match or the connection is denied. |
 | Process | What privileges the agent has | The agent runs as an unprivileged user with seccomp filters that block dangerous system calls. No `sudo`, no `setuid`, no path to elevated privileges. |
 
-For the full breakdown of each default policy block and agent compatibility details, refer to [Default Policy](/latest/reference/default-policy).
+For the full breakdown of each default policy block and agent compatibility details, refer to [Default Policy](/reference/default-policy).
 
-For the full policy structure with annotated YAML examples, refer to [Policies](/latest/sandboxes/policies).
+For the full policy structure with annotated YAML examples, refer to [Policies](/sandboxes/policies).
 
 ## Next Steps
 
 Continue with one of the following:
 
-- To create your first sandbox, refer to [Manage Sandboxes](/latest/sandboxes/manage-sandboxes).
-- To supply API keys or tokens, refer to [Manage Providers](/latest/sandboxes/manage-providers).
-- To control what the agent can access, refer to [Policies](/latest/sandboxes/policies).
-- To use a pre-built environment, refer to the [Community Sandboxes](/latest/sandboxes/community-sandboxes) catalog.
+- To create your first sandbox, refer to [Manage Sandboxes](/sandboxes/manage-sandboxes).
+- To supply API keys or tokens, refer to [Manage Providers](/sandboxes/manage-providers).
+- To control what the agent can access, refer to [Policies](/sandboxes/policies).
+- To use a pre-built environment, refer to the [Community Sandboxes](/sandboxes/community-sandboxes) catalog.

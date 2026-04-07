@@ -6,8 +6,6 @@ position: 1
 {/* SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0 */}
 
-# Overview of NVIDIA OpenShell
-
 NVIDIA OpenShell is an open-source runtime for executing autonomous AI agents in sandboxed environments with kernel-level isolation. It combines sandbox runtime controls and a declarative YAML policy so teams can run agents without giving them unrestricted access to local files, credentials, and external networks.
 
 ## Why OpenShell Exists
@@ -36,7 +34,7 @@ OpenShell applies defense in depth across the following policy domains.
 | Process | Blocks privilege escalation and dangerous syscalls. | Locked at sandbox creation. |
 | Inference | Reroutes model API calls to controlled backends. | Hot-reloadable at runtime. |
 
-For details, refer to [Sandbox Policies](/latest/sandboxes#sandbox-policies) and [Customize Sandbox Policies](/latest/sandboxes/policies).
+For details, refer to [Sandbox Policies](/sandboxes/about#sandbox-policies) and [Customize Sandbox Policies](/sandboxes/policies).
 
 ## Common Use Cases
 
@@ -55,6 +53,6 @@ OpenShell supports a range of agent deployment patterns.
 
 Explore these topics to go deeper:
 
-- To understand the components that make up the OpenShell runtime, refer to the [Architecture Overview](/latest/about/architecture).
-- To install the CLI and create your first sandbox, refer to the [Quickstart](/latest/get-started/quickstart).
-- To learn how OpenShell enforces isolation across all protection layers, refer to [Sandboxes](/latest/sandboxes).
+- To understand the components that make up the OpenShell runtime, refer to the [Architecture Overview](/about/architecture).
+- To install the CLI and create your first sandbox, refer to the [Quickstart](/get-started/quickstart).
+- To learn how OpenShell enforces isolation across all protection layers, refer to [Sandboxes](/sandboxes/about).

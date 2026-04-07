@@ -9,8 +9,6 @@ import { BadgeLinks } from "@/components/BadgeLinks";
 {/* SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0 */}
 
-# NVIDIA OpenShell
-
 <BadgeLinks
   badges={[
     {
@@ -41,6 +39,8 @@ uncontrolled network activity.
 Install the CLI and create your first sandbox in two commands.
 
 {/* Terminal demo styles live in fern/main.css — inline <style> with { } breaks MDX/acorn */}
+<llms-ignore>
+
 <div className="nc-term">
   <div className="nc-term-bar">
     <span className="nc-term-dot nc-term-dot-r" />
@@ -48,23 +48,35 @@ Install the CLI and create your first sandbox in two commands.
     <span className="nc-term-dot nc-term-dot-g" />
   </div>
   <div className="nc-term-body">
-    <div><span className="nc-ps">$ </span>uv tool install -U openshell</div>
     <div>
-      <span className="nc-ps">$ </span>openshell sandbox create{" "}
+      <span className="nc-ps">$ </span>
+      <span>{"uv tool install -U openshell"}</span>
+    </div>
+    <div>
+      <span className="nc-ps">$ </span>
+      <span>{"openshell sandbox create "}</span>
       <span className="nc-swap">
-        <span>-- <span className="nc-hl">claude</span></span>
-        <span>
-          --from <span className="nc-hl">openclaw</span>
-        </span>
-        <span>-- <span className="nc-hl">opencode</span></span>
-        <span>-- <span className="nc-hl">codex</span></span>
+        <span>{"-- "}<span className="nc-hl">claude</span><span className="nc-cursor" /></span>
+        <span>{"--from "}<span className="nc-hl">openclaw</span><span className="nc-cursor" /></span>
+        <span>{"-- "}<span className="nc-hl">opencode</span><span className="nc-cursor" /></span>
+        <span>{"-- "}<span className="nc-hl">codex<span className="nc-cursor" /></span></span>
       </span>
-      <span className="nc-cursor" />
     </div>
   </div>
 </div>
 
-Refer to the [Quickstart](/latest/get-started/quickstart) for more details.
+</llms-ignore>
+
+<llms-only>
+
+```shell
+uv tool install -U openshell
+openshell sandbox create --from openclaw
+```
+
+</llms-only>
+
+Refer to the [Quickstart](/get-started/quickstart) for more details.
 
 ---
 
@@ -72,43 +84,43 @@ Refer to the [Quickstart](/latest/get-started/quickstart) for more details.
 
 <Cards>
 
-<Card title="About OpenShell" href="/latest/about/overview">
+<Card title="About OpenShell" href="/about/overview">
 
 Learn about OpenShell and its capabilities.
 
 </Card>
 
-<Card title="Quickstart" href="/latest/get-started/quickstart">
+<Card title="Quickstart" href="/get-started/quickstart">
 
 Install the CLI and create your first sandbox in two commands.
 
 </Card>
 
-<Card title="Tutorials" href="/latest/tutorials">
+<Card title="Tutorials" href="/tutorials/index">
 
 Hands-on walkthroughs from first sandbox to custom policies.
 
 </Card>
 
-<Card title="Gateways and Sandboxes" href="/latest/sandboxes/manage-gateways">
+<Card title="Gateways and Sandboxes" href="/sandboxes/manage-gateways">
 
 Deploy gateways, create sandboxes, configure policies, providers, and community images for your AI agents.
 
 </Card>
 
-<Card title="Inference Routing" href="/latest/inference">
+<Card title="Inference Routing" href="/inference/about">
 
 Keep inference traffic private by routing API calls to local or self-hosted backends.
 
 </Card>
 
-<Card title="Reference" href="/latest/reference/default-policy">
+<Card title="Reference" href="/reference/default-policy">
 
 Policy schema, environment variables, and system architecture.
 
 </Card>
 
-<Card title="Security Best Practices" href="/latest/security/best-practices">
+<Card title="Security Best Practices" href="/security/best-practices">
 
 Every configurable security control, its default, and the risk of changing it.
 

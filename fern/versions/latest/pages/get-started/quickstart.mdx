@@ -6,8 +6,6 @@ position: 1
 {/* SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0 */}
 
-# Quickstart
-
 This page gets you from zero to a running, policy-enforced sandbox in two commands.
 
 ## Prerequisites
@@ -16,20 +14,20 @@ Before you begin, make sure you have:
 
 - Docker Desktop running on your machine.
 
-For a complete list of requirements, refer to [Support Matrix](/latest/reference/support-matrix).
+For a complete list of requirements, refer to [Support Matrix](/reference/support-matrix).
 
 ## Install the OpenShell CLI
 
 Run the install script:
 
-```console
-$ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+```shell
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
 If you prefer [uv](https://docs.astral.sh/uv/):
 
-```console
-$ uv tool install -U openshell
+```shell
+uv tool install -U openshell
 ```
 
 After installing the CLI, run `openshell --help` in your terminal to see the full CLI reference, including all commands and flags.
@@ -49,8 +47,8 @@ Choose the tab that matches your agent:
 
 Run the following command to create a sandbox with Claude Code:
 
-```console
-$ openshell sandbox create -- claude
+```shell
+openshell sandbox create -- claude
 ```
 
 The CLI prompts you to create a provider from local credentials.
@@ -63,8 +61,8 @@ If not, you can configure it from inside the sandbox after it launches.
 
 Run the following command to create a sandbox with OpenCode:
 
-```console
-$ openshell sandbox create -- opencode
+```shell
+openshell sandbox create -- opencode
 ```
 
 The CLI prompts you to create a provider from local credentials.
@@ -77,8 +75,8 @@ If not, you can configure it from inside the sandbox after it launches.
 
 Run the following command to create a sandbox with Codex:
 
-```console
-$ openshell sandbox create -- codex
+```shell
+openshell sandbox create -- codex
 ```
 
 The CLI prompts you to create a provider from local credentials.
@@ -91,8 +89,8 @@ If not, you can configure it from inside the sandbox after it launches.
 
 Run the following command to create a sandbox with OpenClaw:
 
-```console
-$ openshell sandbox create --from openclaw
+```shell
+openshell sandbox create --from openclaw
 ```
 
 The `--from` flag pulls a pre-built sandbox definition from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog.
@@ -104,8 +102,8 @@ Each definition bundles a container image, a tailored policy, and optional skill
 Use the `--from` flag to pull other OpenShell sandbox images from the [NVIDIA Container Registry](https://registry.nvidia.com/).
 For example, to pull the `base` image, run the following command:
 
-```console
-$ openshell sandbox create --from base
+```shell
+openshell sandbox create --from base
 ```
 
 </Tab>
@@ -128,13 +126,12 @@ Deploy an OpenShell gateway on Brev by clicking **Deploy** on the [OpenShell Lau
 After the instance starts running, find the gateway URL in the Brev console under **Using Secure Links**.
 Copy the shareable URL for **port 8080**, which is the gateway endpoint.
 
-```console
-$ openshell gateway add https://<your-port-8080-url>.brevlab.com
-$ openshell status
+```shell
+openshell gateway add https://<your-port-8080-url>.brevlab.com
+openshell status
 ```
 
 </Tab>
-</Tabs>
 
 <Tab title="DGX Spark">
 
@@ -145,11 +142,13 @@ Set up your Spark with NVIDIA Sync first, or make sure SSH access is configured 
 
 Deploy to a DGX Spark machine over SSH:
 
-```console
-$ openshell gateway start --remote <username>@<spark-ssid>.local
-$ openshell status
+```shell
+openshell gateway start --remote <username>@<spark-ssid>.local
+openshell status
 ```
 
 After `openshell status` shows the gateway as healthy, all subsequent commands route through the SSH tunnel.
 
 </Tab>
+
+</Tabs>

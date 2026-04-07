@@ -15,10 +15,7 @@ export function BadgeLinks({ badges = [] }: { badges?: BadgeItem[] }) {
     return null;
   }
   return (
-    <div
-      className="badge-links"
-      style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}
-    >
+    <div className="badge-links">
       {badges.map((b) => (
         <a key={b.href} href={b.href} target="_blank" rel="noreferrer">
           <img src={b.src} alt={b.alt} />
