@@ -73,6 +73,21 @@ navigation:
       - page: "Configure Inference Routing"
         slug: configure
         path: ./latest/pages/inference/configure.mdx
+  - section: "Observability"
+    slug: observability
+    contents:
+      - page: "Overview"
+        slug: index
+        path: ./latest/pages/observability/index.mdx
+      - page: "Logging"
+        slug: logging
+        path: ./latest/pages/observability/logging.mdx
+      - page: "Accessing Logs"
+        slug: accessing-logs
+        path: ./latest/pages/observability/accessing-logs.mdx
+      - page: "OCSF JSON Export"
+        slug: ocsf-json-export
+        path: ./latest/pages/observability/ocsf-json-export.mdx
   - folder: ./latest/pages/reference
     title: "Reference"
     title-source: frontmatter
