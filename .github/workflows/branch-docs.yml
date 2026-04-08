@@ -1,4 +1,4 @@
-name: Branch docs preview
+name: Branch Docs Preview
 
 on:
   pull_request:
