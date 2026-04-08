@@ -91,7 +91,7 @@ cd "$BUILD_DIR"
 
 # ── Clone libkrun ───────────────────────────────────────────────────────
 
-LIBKRUN_REF="${LIBKRUN_REF:-v1.17.4}"
+LIBKRUN_REF="${LIBKRUN_REF:-e5922f6}"
 
 if [ ! -d libkrun ]; then
     echo "==> Cloning libkrun..."
