@@ -1,0 +1,406 @@
+name: Release VM Kernel
+
+# Build custom libkrunfw (kernel firmware) + libkrun (VMM) + gvproxy for all
+# supported openshell-vm platforms.  Artifacts are uploaded to the rolling
+# "vm-dev" GitHub Release and consumed by release-vm-dev.yml when building the
+# openshell-vm binary.
+#
+# This workflow runs on-demand (or when kernel config / pins change).  It is
+# intentionally decoupled from the per-commit VM binary build because the
+# kernel rarely changes and takes 15-45 minutes to compile.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/openshell-vm/runtime/kernel/**"
+      - "crates/openshell-vm/pins.env"
+      - "tasks/scripts/vm/build-libkrun.sh"
+      - "tasks/scripts/vm/build-libkrun-macos.sh"
+      - "crates/openshell-vm/runtime/build-custom-libkrunfw.sh"
+
+permissions:
+  contents: write
+
+# Serialize with release-vm-dev.yml — both update the vm-dev release.
+concurrency:
+  group: vm-dev-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux ARM64 — native kernel + libkrun build
+  # ---------------------------------------------------------------------------
+  build-runtime-linux-arm64:
+    name: Build Runtime (Linux ARM64)
+    runs-on: build-arm64
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build libkrunfw + libkrun from source
+        run: tasks/scripts/vm/build-libkrun.sh
+
+      - name: Download gvproxy
+        run: |
+          set -euo pipefail
+          source crates/openshell-vm/pins.env 2>/dev/null || true
+          GVPROXY_VERSION="${GVPROXY_VERSION:-v0.8.8}"
+          curl -fsSL -o target/libkrun-build/gvproxy \
+            "https://github.com/containers/gvisor-tap-vsock/releases/download/${GVPROXY_VERSION}/gvproxy-linux-arm64"
+          chmod +x target/libkrun-build/gvproxy
+
+      - name: Write provenance metadata
+        run: |
+          set -euo pipefail
+          cd target/libkrun-build
+          LIBKRUNFW_COMMIT="unknown"
+          if [ -d libkrunfw/.git ]; then
+            LIBKRUNFW_COMMIT=$(git -C libkrunfw rev-parse HEAD)
+          fi
+          KERNEL_VERSION="unknown"
+          if [ -f libkrunfw/Makefile ]; then
+            KERNEL_VERSION=$(grep -oE 'KERNEL_VERSION\s*=\s*linux-[^\s]+' libkrunfw/Makefile | head -1 | sed 's/.*= *//' || echo unknown)
+          fi
+          jq -n \
+            --arg artifact "vm-runtime" \
+            --arg platform "linux-aarch64" \
+            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg kfw_commit "$LIBKRUNFW_COMMIT" \
+            --arg kver "$KERNEL_VERSION" \
+            --arg sha "$GITHUB_SHA" \
+            --arg run "$GITHUB_RUN_ID" \
+            '{artifact: $artifact, platform: $platform, build_timestamp: $ts, libkrunfw_commit: $kfw_commit, kernel_version: $kver, github_sha: $sha, github_run_id: $run}' \
+            > provenance.json
+
+      - name: Package runtime tarball
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cd target/libkrun-build
+
+          # Collect the runtime files
+          mkdir -p _package
+          cp libkrun.so _package/
+          # Copy libkrunfw — find versioned .so and create soname symlink
+          for f in libkrunfw.so*; do
+            [ -f "$f" ] && cp "$f" _package/
+          done
+          if [ ! -f _package/libkrunfw.so.5 ]; then
+            versioned=$(ls _package/libkrunfw.so.5.* 2>/dev/null | head -n1)
+            [ -n "$versioned" ] && cp "$versioned" _package/libkrunfw.so.5
+          fi
+          cp gvproxy _package/
+          cp provenance.json _package/
+
+          tar -C _package -cf - . | zstd -19 -T0 -o "${GITHUB_WORKSPACE}/artifacts/vm-runtime-linux-aarch64.tar.zst"
+          echo "Packaged vm-runtime-linux-aarch64.tar.zst ($(du -sh "${GITHUB_WORKSPACE}/artifacts/vm-runtime-linux-aarch64.tar.zst" | cut -f1))"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-runtime-linux-arm64
+          path: artifacts/vm-runtime-linux-aarch64.tar.zst
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # Linux AMD64 — native kernel + libkrun build
+  # ---------------------------------------------------------------------------
+  build-runtime-linux-amd64:
+    name: Build Runtime (Linux AMD64)
+    runs-on: build-amd64
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build libkrunfw + libkrun from source
+        run: tasks/scripts/vm/build-libkrun.sh
+
+      - name: Download gvproxy
+        run: |
+          set -euo pipefail
+          source crates/openshell-vm/pins.env 2>/dev/null || true
+          GVPROXY_VERSION="${GVPROXY_VERSION:-v0.8.8}"
+          curl -fsSL -o target/libkrun-build/gvproxy \
+            "https://github.com/containers/gvisor-tap-vsock/releases/download/${GVPROXY_VERSION}/gvproxy-linux-amd64"
+          chmod +x target/libkrun-build/gvproxy
+
+      - name: Write provenance metadata
+        run: |
+          set -euo pipefail
+          cd target/libkrun-build
+          LIBKRUNFW_COMMIT="unknown"
+          if [ -d libkrunfw/.git ]; then
+            LIBKRUNFW_COMMIT=$(git -C libkrunfw rev-parse HEAD)
+          fi
+          KERNEL_VERSION="unknown"
+          if [ -f libkrunfw/Makefile ]; then
+            KERNEL_VERSION=$(grep -oE 'KERNEL_VERSION\s*=\s*linux-[^\s]+' libkrunfw/Makefile | head -1 | sed 's/.*= *//' || echo unknown)
+          fi
+          jq -n \
+            --arg artifact "vm-runtime" \
+            --arg platform "linux-x86_64" \
+            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg kfw_commit "$LIBKRUNFW_COMMIT" \
+            --arg kver "$KERNEL_VERSION" \
+            --arg sha "$GITHUB_SHA" \
+            --arg run "$GITHUB_RUN_ID" \
+            '{artifact: $artifact, platform: $platform, build_timestamp: $ts, libkrunfw_commit: $kfw_commit, kernel_version: $kver, github_sha: $sha, github_run_id: $run}' \
+            > provenance.json
+
+      - name: Package runtime tarball
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cd target/libkrun-build
+
+          mkdir -p _package
+          cp libkrun.so _package/
+          for f in libkrunfw.so*; do
+            [ -f "$f" ] && cp "$f" _package/
+          done
+          if [ ! -f _package/libkrunfw.so.5 ]; then
+            versioned=$(ls _package/libkrunfw.so.5.* 2>/dev/null | head -n1)
+            [ -n "$versioned" ] && cp "$versioned" _package/libkrunfw.so.5
+          fi
+          cp gvproxy _package/
+          cp provenance.json _package/
+
+          tar -C _package -cf - . | zstd -19 -T0 -o "${GITHUB_WORKSPACE}/artifacts/vm-runtime-linux-x86_64.tar.zst"
+          echo "Packaged vm-runtime-linux-x86_64.tar.zst ($(du -sh "${GITHUB_WORKSPACE}/artifacts/vm-runtime-linux-x86_64.tar.zst" | cut -f1))"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-runtime-linux-amd64
+          path: artifacts/vm-runtime-linux-x86_64.tar.zst
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # macOS ARM64 — kernel built via krunvm, libkrun built natively
+  # ---------------------------------------------------------------------------
+  build-runtime-macos-arm64:
+    name: Build Runtime (macOS ARM64)
+    runs-on: macos-latest-xlarge
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          brew install rust lld dtc xz
+          # libkrunfw from Homebrew (used as a fallback/reference by build scripts)
+          brew install libkrunfw
+          # krunvm is needed to build the Linux kernel inside a Fedora VM
+          brew tap slp/krun
+          brew install krunvm
+
+      - name: Build custom libkrunfw (kernel)
+        run: crates/openshell-vm/runtime/build-custom-libkrunfw.sh
+
+      - name: Build portable libkrun
+        run: tasks/scripts/vm/build-libkrun-macos.sh
+
+      - name: Download gvproxy
+        run: |
+          set -euo pipefail
+          source crates/openshell-vm/pins.env 2>/dev/null || true
+          GVPROXY_VERSION="${GVPROXY_VERSION:-v0.8.8}"
+          mkdir -p target/libkrun-build
+          # Download the macOS (darwin) gvproxy binary for determinism
+          curl -fsSL -o target/libkrun-build/gvproxy \
+            "https://github.com/containers/gvisor-tap-vsock/releases/download/${GVPROXY_VERSION}/gvproxy-darwin"
+          chmod +x target/libkrun-build/gvproxy
+
+      - name: Write provenance metadata
+        run: |
+          set -euo pipefail
+          BUILD_DIR="target/libkrun-build"
+          CUSTOM_DIR="target/custom-runtime"
+
+          LIBKRUNFW_COMMIT="unknown"
+          if [ -f "${CUSTOM_DIR}/provenance.json" ]; then
+            LIBKRUNFW_COMMIT=$(python3 -c "import json; print(json.load(open('${CUSTOM_DIR}/provenance.json'))['libkrunfw_commit'])" 2>/dev/null || echo unknown)
+          fi
+          KERNEL_VERSION="unknown"
+          if [ -f "${CUSTOM_DIR}/provenance.json" ]; then
+            KERNEL_VERSION=$(python3 -c "import json; print(json.load(open('${CUSTOM_DIR}/provenance.json'))['kernel_version'])" 2>/dev/null || echo unknown)
+          fi
+
+          jq -n \
+            --arg artifact "vm-runtime" \
+            --arg platform "darwin-aarch64" \
+            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg kfw_commit "$LIBKRUNFW_COMMIT" \
+            --arg kver "$KERNEL_VERSION" \
+            --arg sha "$GITHUB_SHA" \
+            --arg run "$GITHUB_RUN_ID" \
+            '{artifact: $artifact, platform: $platform, build_timestamp: $ts, libkrunfw_commit: $kfw_commit, kernel_version: $kver, github_sha: $sha, github_run_id: $run}' \
+            > "${BUILD_DIR}/provenance.json"
+
+      - name: Package runtime tarball
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          BUILD_DIR="target/libkrun-build"
+          CUSTOM_DIR="target/custom-runtime"
+
+          mkdir -p "${BUILD_DIR}/_package"
+
+          # libkrun from portable build
+          cp "${BUILD_DIR}/libkrun.dylib" "${BUILD_DIR}/_package/"
+
+          # libkrunfw — prefer custom build, fall back to portable build dir
+          if [ -f "${BUILD_DIR}/libkrunfw.dylib" ]; then
+            cp "${BUILD_DIR}/libkrunfw.dylib" "${BUILD_DIR}/_package/"
+          elif [ -f "${CUSTOM_DIR}/libkrunfw.dylib" ]; then
+            cp "${CUSTOM_DIR}/libkrunfw.dylib" "${BUILD_DIR}/_package/"
+          fi
+          # Also copy versioned name if present
+          for f in "${BUILD_DIR}"/libkrunfw.5.dylib "${CUSTOM_DIR}"/libkrunfw.5.dylib; do
+            [ -f "$f" ] && cp "$f" "${BUILD_DIR}/_package/" && break
+          done
+
+          cp "${BUILD_DIR}/gvproxy" "${BUILD_DIR}/_package/"
+          cp "${BUILD_DIR}/provenance.json" "${BUILD_DIR}/_package/"
+
+          tar -C "${BUILD_DIR}/_package" -cf - . | zstd -19 -T0 -o "artifacts/vm-runtime-darwin-aarch64.tar.zst"
+          echo "Packaged vm-runtime-darwin-aarch64.tar.zst ($(du -sh artifacts/vm-runtime-darwin-aarch64.tar.zst | cut -f1))"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-runtime-macos-arm64
+          path: artifacts/vm-runtime-darwin-aarch64.tar.zst
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # Upload all runtime tarballs to the vm-dev rolling release
+  # ---------------------------------------------------------------------------
+  release-kernel:
+    name: Release Kernel Runtime
+    needs: [build-runtime-linux-arm64, build-runtime-linux-amd64, build-runtime-macos-arm64]
+    runs-on: build-amd64
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all runtime artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vm-runtime-*
+          path: release/
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum vm-runtime-*.tar.zst > vm-runtime-checksums-sha256.txt
+          cat vm-runtime-checksums-sha256.txt
+
+      - name: Ensure vm-dev tag exists
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -fa vm-dev -m "VM Development Build" "${GITHUB_SHA}"
+          git push --force origin vm-dev
+
+      - name: Prune stale runtime assets from vm-dev release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: 'vm-dev' });
+            } catch (err) {
+              if (err.status === 404) {
+                core.info('No existing vm-dev release; will create fresh.');
+                return;
+              }
+              throw err;
+            }
+            // Delete old runtime tarballs and checksums (keep vm binary assets)
+            for (const asset of release.data.assets) {
+              if (asset.name.startsWith('vm-runtime-')) {
+                core.info(`Deleting stale asset: ${asset.name}`);
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
+              }
+            }
+
+      - name: Create / update vm-dev GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OpenShell VM Development Build
+          prerelease: true
+          tag_name: vm-dev
+          target_commitish: ${{ github.sha }}
+          body: |
+            Rolling development build of **openshell-vm** — the MicroVM runtime for OpenShell.
+
+            > **NOTE**: This is a development build, not a tagged release, and may be unstable.
+            > The VM implementation itself is also experimental and may change or break without
+            > notice.
+
+            ### Kernel Runtime Artifacts
+
+            Pre-built kernel runtime (libkrunfw + libkrun + gvproxy) for embedding into
+            the openshell-vm binary. These are rebuilt when the kernel config or pinned
+            dependency versions change.
+
+            | Platform | Artifact |
+            |----------|----------|
+            | Linux ARM64 | `vm-runtime-linux-aarch64.tar.zst` |
+            | Linux x86_64 | `vm-runtime-linux-x86_64.tar.zst` |
+            | macOS ARM64 | `vm-runtime-darwin-aarch64.tar.zst` |
+
+            ### VM Binaries
+
+            Self-extracting openshell-vm binaries with embedded kernel runtime and base
+            rootfs. These are rebuilt on every push to main.
+
+            | Platform | Artifact |
+            |----------|----------|
+            | Linux ARM64 | `openshell-vm-aarch64-unknown-linux-gnu.tar.gz` |
+            | Linux x86_64 | `openshell-vm-x86_64-unknown-linux-gnu.tar.gz` |
+            | macOS ARM64 | `openshell-vm-aarch64-apple-darwin.tar.gz` |
+
+            **macOS users:** The binary must be codesigned with the Hypervisor entitlement:
+            ```bash
+            codesign --entitlements crates/openshell-vm/entitlements.plist --force -s - ./openshell-vm
+            ```
+
+          files: |
+            release/vm-runtime-linux-aarch64.tar.zst
+            release/vm-runtime-linux-x86_64.tar.zst
+            release/vm-runtime-darwin-aarch64.tar.zst
+            release/vm-runtime-checksums-sha256.txt

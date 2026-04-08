@@ -73,6 +73,11 @@ description = "Build portable libkrun from source (macOS, no GPU deps)"
 run = "tasks/scripts/vm/build-libkrun-macos.sh"
 hide = false
 
+["vm:runtime:download"]
+description = "Download pre-built kernel runtime from vm-dev GitHub Release"
+run = "tasks/scripts/vm/download-kernel-runtime.sh"
+hide = false
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Rootfs Management
 # ═══════════════════════════════════════════════════════════════════════════

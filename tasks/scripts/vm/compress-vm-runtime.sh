@@ -13,6 +13,10 @@
 #
 # Environment:
 #   OPENSHELL_VM_RUNTIME_COMPRESSED_DIR - Output directory (default: target/vm-runtime-compressed)
+#   VM_RUNTIME_TARBALL - Path to a pre-built vm-runtime-*.tar.zst tarball.
+#                        When set, the script extracts and re-compresses
+#                        artifacts from this tarball instead of looking for
+#                        local builds.  Used by CI and download-kernel-runtime.sh.
 #
 # The script sets OPENSHELL_VM_RUNTIME_COMPRESSED_DIR for use by build.rs.
 
@@ -49,6 +53,62 @@ OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-com
 
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
+
+# ── Fast path: pre-built tarball from CI or download-kernel-runtime.sh ──
+
+if [ -n "${VM_RUNTIME_TARBALL:-}" ]; then
+    echo "==> Using pre-built runtime tarball: ${VM_RUNTIME_TARBALL}"
+
+    if [ ! -f "${VM_RUNTIME_TARBALL}" ]; then
+        echo "Error: VM_RUNTIME_TARBALL not found: ${VM_RUNTIME_TARBALL}" >&2
+        exit 1
+    fi
+
+    # Extract tarball contents
+    zstd -d "${VM_RUNTIME_TARBALL}" --stdout | tar -xf - -C "$WORK_DIR"
+
+    echo "    Extracted files:"
+    ls -lah "$WORK_DIR"
+
+    echo ""
+    echo "==> Compressing with zstd (level 19)..."
+
+    for file in "$WORK_DIR"/*; do
+        [ -f "$file" ] || continue
+        name=$(basename "$file")
+        # Skip metadata files — not embedded
+        if [ "$name" = "provenance.json" ]; then
+            cp "$file" "${OUTPUT_DIR}/"
+            continue
+        fi
+        original_size=$(du -h "$file" | cut -f1)
+        zstd -19 -f -q -T0 -o "${OUTPUT_DIR}/${name}.zst" "$file"
+        chmod 644 "${OUTPUT_DIR}/${name}.zst"
+        compressed_size=$(du -h "${OUTPUT_DIR}/${name}.zst" | cut -f1)
+        echo "    ${name}: ${original_size} -> ${compressed_size}"
+    done
+
+    # Check for rootfs tarball (built separately)
+    ROOTFS_TARBALL="${OUTPUT_DIR}/rootfs.tar.zst"
+    if [ -f "$ROOTFS_TARBALL" ]; then
+        echo "    rootfs.tar.zst: $(du -h "$ROOTFS_TARBALL" | cut -f1) (pre-built)"
+    else
+        echo ""
+        echo "Note: rootfs.tar.zst not found."
+        echo "      For full embedded build, run: mise run vm:build:rootfs-tarball"
+    fi
+
+    echo ""
+    echo "==> Compressed artifacts in ${OUTPUT_DIR}:"
+    ls -lah "$OUTPUT_DIR"
+    TOTAL=$(du -sh "$OUTPUT_DIR" | cut -f1)
+    echo ""
+    echo "==> Total compressed size: ${TOTAL}"
+    echo ""
+    echo "Set this environment variable for cargo build:"
+    echo "  export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=${OUTPUT_DIR}"
+    exit 0
+fi
 
 echo "==> Detecting platform..."
 

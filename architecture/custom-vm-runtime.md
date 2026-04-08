@@ -176,6 +176,61 @@ mise run vm:build:embedded                # Then build embedded binary
 # For Linux (first time only)
 mise run vm:runtime:build-libkrun         # Build libkrun/libkrunfw from source
 mise run vm:build:embedded                # Then build embedded binary
+
+# Download pre-built kernel runtime from CI (skip local build)
+mise run vm:runtime:download              # Download from vm-dev GitHub Release
+mise run vm:build:embedded:quick          # Build binary with downloaded runtime
+```
+
+## CI/CD
+
+The openshell-vm build is split into two GitHub Actions workflows that publish to a
+rolling `vm-dev` GitHub Release:
+
+### Kernel Runtime (`release-vm-kernel.yml`)
+
+Builds the custom libkrunfw (kernel firmware), libkrun (VMM), and gvproxy for all
+supported platforms. Runs on-demand or when the kernel config / pinned versions change.
+
+| Platform | Runner | Build Method |
+|----------|--------|-------------|
+| Linux ARM64 | `build-arm64` (self-hosted) | Native `build-libkrun.sh` |
+| Linux x86_64 | `build-amd64` (self-hosted) | Native `build-libkrun.sh` |
+| macOS ARM64 | `macos-latest-xlarge` (GitHub-hosted) | `build-custom-libkrunfw.sh` (krunvm) + `build-libkrun-macos.sh` |
+
+Artifacts: `vm-runtime-{platform}.tar.zst` containing libkrun, libkrunfw, gvproxy, and
+provenance metadata.
+
+The macOS kernel build requires a real macOS ARM64 runner because it uses `krunvm` to
+compile the Linux kernel inside a Fedora VM (Hypervisor.framework). The kernel inside
+libkrunfw is always Linux regardless of host platform.
+
+### VM Binary (`release-vm-dev.yml`)
+
+Builds the self-extracting openshell-vm binary for all platforms. Runs on every push
+to `main` that touches VM-related crates.
+
+```
+compute-versions
+       │
+       ├── download-kernel-runtime (from vm-dev release)
+       │       │
+       │       ├── build-rootfs (arm64) ──── build-vm (linux-arm64) ────┐
+       │       │                                                         │
+       │       ├── build-rootfs (amd64) ──── build-vm (linux-amd64) ────┤
+       │       │                                                         │
+       │       └── build-vm-macos (osxcross, uses arm64 rootfs) ────────┤
+       │                                                                 │
+       └── release-vm-dev (upload to vm-dev rolling release) ───────────┘
+```
+
+The macOS binary is cross-compiled via osxcross (no macOS runner needed for the binary
+build — only for the kernel build). The macOS VM guest is always Linux ARM64, so it
+reuses the arm64 rootfs.
+
+macOS binaries produced via osxcross are not codesigned. Users must self-sign:
+```bash
+codesign --entitlements crates/openshell-vm/entitlements.plist --force -s - ./openshell-vm
 ```
 
 ## Rollout Strategy
@@ -183,6 +238,8 @@ mise run vm:build:embedded                # Then build embedded binary
 1. Custom runtime is embedded by default when building with `mise run vm:build:embedded`.
 2. The init script validates kernel capabilities at boot and fails fast if missing.
 3. For development, override with `OPENSHELL_VM_RUNTIME_DIR` to use a local directory.
+4. In CI, kernel runtime is pre-built and cached in the `vm-dev` release. The binary
+   build downloads it via `download-kernel-runtime.sh`.
 
 ## Related Files
 
@@ -200,5 +257,9 @@ mise run vm:build:embedded                # Then build embedded binary
 | `tasks/scripts/vm/compress-vm-runtime.sh` | Gather and compress runtime artifacts |
 | `tasks/scripts/vm/build-rootfs-tarball.sh` | Build and compress rootfs tarball |
 | `tasks/scripts/vm/build-libkrun.sh` | Build libkrun from source (Linux) |
+| `tasks/scripts/vm/download-kernel-runtime.sh` | Download pre-built runtime from vm-dev release |
 | `crates/openshell-vm/scripts/build-rootfs.sh` | Build rootfs (full by default, `--base` for lightweight) |
+| `deploy/docker/Dockerfile.vm-macos` | osxcross cross-compilation for macOS VM binary |
+| `.github/workflows/release-vm-kernel.yml` | CI: kernel runtime build (on-demand) |
+| `.github/workflows/release-vm-dev.yml` | CI: VM binary build (per-commit to main) |
 | `tasks/vm.toml` | Mise task definitions |
