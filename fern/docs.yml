@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Fern site config — merged with skills/convert-to-fern/assets/theme/nvidia/docs-theme.yml pattern
 # Production: https://docs.nvidia.com/openshell/ — preview + custom-domain share path prefix `openshell`.
 # Internal MDX links use /latest/...; basepath-aware resolves them under /openshell/ on production.

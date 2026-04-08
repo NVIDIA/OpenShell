@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Page ordering derived from toctree (use with add_frontmatter.py --nav-order)
 "./versions/latest/pages/about/overview.mdx": 1
 "./versions/latest/pages/get-started/quickstart.mdx": 1
