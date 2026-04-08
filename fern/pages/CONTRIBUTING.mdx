@@ -4,7 +4,7 @@ description: ""
 ---
 This guide covers how to write, edit, and review documentation for NVIDIA OpenShell. If you change code that affects user-facing behavior, update the relevant docs in the same PR.
 
-The published docs live in `fern/versions/latest/pages/`, and navigation is defined in `fern/versions/latest.yml`. The `docs/` tree is kept for legacy Sphinx builds and migration/reference work. Do not update `docs/` unless you are explicitly asked to do so.
+The published docs live in `fern/pages/`, and navigation is defined in `fern/versions/latest.yml`. The `docs/` tree is kept for legacy Sphinx builds and migration/reference work. Do not update `docs/` unless you are explicitly asked to do so.
 
 ## Use the Agent Skills
 
@@ -61,7 +61,7 @@ mise run docs:serve
 
 ### Format
 
-- Published docs use Fern MDX under `fern/versions/latest/pages/`.
+- Published docs use Fern MDX under `fern/pages/`.
 - Every page starts with YAML frontmatter. Use `title` and `description` on every page, then add page-level metadata like `sidebar-title`, `keywords`, `tags`, and `position` when the page needs them.
 - Include the SPDX license header after frontmatter:
   ```

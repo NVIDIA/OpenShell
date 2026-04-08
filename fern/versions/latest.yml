@@ -5,20 +5,20 @@ navigation:
   slug: get-started
   contents:
   - page: "Home"
-    path: ./latest/pages/index.mdx
+    path: ../pages/index.mdx
   - page: "Quickstart"
-    path: ./latest/pages/get-started/quickstart.mdx
-- folder: ./latest/pages/about
+    path: ../pages/get-started/quickstart.mdx
+- folder: ../pages/about
   title: "About NVIDIA OpenShell"
-- folder: ./latest/pages/tutorials
-- folder: ./latest/pages/sandboxes
-- folder: ./latest/pages/inference
+- folder: ../pages/tutorials
+- folder: ../pages/sandboxes
+- folder: ../pages/inference
   title: "Inference Routing"
-- folder: ./latest/pages/observability
+- folder: ../pages/observability
   title: "Observability"
-- folder: ./latest/pages/reference
+- folder: ../pages/reference
   title: "Reference"
-- folder: ./latest/pages/security
+- folder: ../pages/security
   title: "Security"
-- folder: ./latest/pages/resources
+- folder: ../pages/resources
   title: "Resources"

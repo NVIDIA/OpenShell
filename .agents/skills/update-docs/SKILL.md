@@ -10,8 +10,8 @@ Scan recent git history for commits that affect user-facing behavior and draft d
 ## Prerequisites
 
 - You must be in the OpenShell git repository.
-- The published docs tree must exist under `fern/versions/latest/pages/`.
-- Read `fern/versions/latest/pages/CONTRIBUTING.mdx` before writing any content. It contains the current style guide and formatting rules.
+- The published docs tree must exist under `fern/pages/`.
+- Read `fern/pages/CONTRIBUTING.mdx` before writing any content. It contains the current style guide and formatting rules.
 
 ## When to Use
 
@@ -48,16 +48,16 @@ For each relevant commit, determine which doc page(s) it affects. Use this mappi
 
 | Code area | Likely doc page(s) |
 |---|---|
-| `crates/openshell-cli/` (gateway commands) | `fern/versions/latest/pages/sandboxes/manage-gateways.mdx` |
-| `crates/openshell-cli/` (sandbox commands) | `fern/versions/latest/pages/sandboxes/manage-sandboxes.mdx` |
-| `crates/openshell-cli/` (provider commands) | `fern/versions/latest/pages/sandboxes/manage-providers.mdx` |
-| `crates/openshell-cli/` (new top-level command) | May need a new page or `fern/versions/latest/pages/reference/` entry |
-| Proxy or policy code | `fern/versions/latest/pages/sandboxes/policies.mdx`, `fern/versions/latest/pages/reference/policy-schema.mdx` |
-| Inference code | `fern/versions/latest/pages/inference/configure.mdx` |
-| `python/` (SDK changes) | `fern/versions/latest/pages/reference/` or `fern/versions/latest/pages/get-started/quickstart.mdx` |
-| `proto/` (API changes) | `fern/versions/latest/pages/reference/` |
-| `deploy/` (Dockerfile, Helm) | `fern/versions/latest/pages/sandboxes/manage-gateways.mdx`, `fern/versions/latest/pages/about/architecture.mdx` |
-| Community sandbox definitions | `fern/versions/latest/pages/sandboxes/community-sandboxes.mdx` |
+| `crates/openshell-cli/` (gateway commands) | `fern/pages/sandboxes/manage-gateways.mdx` |
+| `crates/openshell-cli/` (sandbox commands) | `fern/pages/sandboxes/manage-sandboxes.mdx` |
+| `crates/openshell-cli/` (provider commands) | `fern/pages/sandboxes/manage-providers.mdx` |
+| `crates/openshell-cli/` (new top-level command) | May need a new page or `fern/pages/reference/` entry |
+| Proxy or policy code | `fern/pages/sandboxes/policies.mdx`, `fern/pages/reference/policy-schema.mdx` |
+| Inference code | `fern/pages/inference/configure.mdx` |
+| `python/` (SDK changes) | `fern/pages/reference/` or `fern/pages/get-started/quickstart.mdx` |
+| `proto/` (API changes) | `fern/pages/reference/` |
+| `deploy/` (Dockerfile, Helm) | `fern/pages/sandboxes/manage-gateways.mdx`, `fern/pages/about/architecture.mdx` |
+| Community sandbox definitions | `fern/pages/sandboxes/community-sandboxes.mdx` |
 
 If a commit does not map to any existing page but introduces a user-visible concept, flag it as needing a new page.
 
@@ -88,7 +88,7 @@ Identify where the new content should go. Follow the page's existing structure.
 
 ## Step 5: Draft the Update
 
-Write the doc update following the rules in `fern/versions/latest/pages/CONTRIBUTING.mdx`. Key reminders:
+Write the doc update following the rules in `fern/pages/CONTRIBUTING.mdx`. Key reminders:
 
 - **Active voice, present tense, second person.**
 - **No unnecessary bold.** Reserve bold for UI labels and parameter names.
@@ -118,7 +118,7 @@ When updating an existing page:
 
 When creating a new page:
 
-- Follow the frontmatter template from `fern/versions/latest/pages/CONTRIBUTING.mdx`.
+- Follow the frontmatter template from `fern/pages/CONTRIBUTING.mdx`.
 - Add the page to the appropriate section in `fern/versions/latest.yml`.
 
 ## Step 6: Present the Results
@@ -129,8 +129,8 @@ After drafting all updates, present a summary to the user:
 ## Doc Updates from Commits
 
 ### Updated pages
-- `fern/versions/latest/pages/sandboxes/manage-gateways.mdx`: Added `--gpu` flag documentation (from commit abc1234).
-- `fern/versions/latest/pages/reference/policy-schema.mdx`: Updated network policy schema for new `tls_inspect` field (from commit def5678).
+- `fern/pages/sandboxes/manage-gateways.mdx`: Added `--gpu` flag documentation (from commit abc1234).
+- `fern/pages/reference/policy-schema.mdx`: Updated network policy schema for new `tls_inspect` field (from commit def5678).
 
 ### New pages needed
 - None (or list any new pages created).

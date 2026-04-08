@@ -197,10 +197,10 @@ For cross-cutting architectural decisions, API contract changes, or process prop
 
 ## Documentation
 
-If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `fern/versions/latest/pages/` in the same PR and adjust `fern/versions/latest.yml` if navigation changes. For explicit navbar entries, keep `page:` aligned with `sidebar-title` when present and put relative `slug:` values in `fern/versions/latest.yml`. Reserve frontmatter `slug` for folder-discovered pages or absolute URL overrides.
+If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `fern/pages/` in the same PR and adjust `fern/versions/latest.yml` if navigation changes. For explicit navbar entries, keep `page:` aligned with `sidebar-title` when present and put relative `slug:` values in `fern/versions/latest.yml`. Reserve frontmatter `slug` for folder-discovered pages or absolute URL overrides.
 
 To ensure your doc changes follow NVIDIA documentation style, use the `update-docs` skill.
-It scans commits, identifies doc pages that need updates, and drafts content that follows the style guide in `fern/versions/latest/pages/CONTRIBUTING.mdx`.
+It scans commits, identifies doc pages that need updates, and drafts content that follows the style guide in `fern/pages/CONTRIBUTING.mdx`.
 
 To preview Fern docs locally:
 
@@ -220,7 +220,7 @@ Fern docs publishing is handled by the `publish-fern-docs` job in `.github/workf
 
 `docs/` and `mise run docs` / `mise run docs:serve` are still kept for the legacy Sphinx build during the transition, but they are no longer the primary published docs workflow.
 
-See [fern/versions/latest/pages/CONTRIBUTING.mdx](fern/versions/latest/pages/CONTRIBUTING.mdx) for the current docs authoring guide.
+See [fern/pages/CONTRIBUTING.mdx](fern/pages/CONTRIBUTING.mdx) for the current docs authoring guide.
 
 ## Pull Requests
 
