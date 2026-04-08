@@ -12,6 +12,8 @@ permissions:
 
 jobs:
   preview:
+    # secrets is empty for fork PRs and when FERN_TOKEN is not configured,
+    # so this job is silently skipped in both cases — that is intentional.
     if: ${{ secrets.FERN_TOKEN != '' }}
     runs-on: ubuntu-latest
     steps:

@@ -197,7 +197,7 @@ For cross-cutting architectural decisions, API contract changes, or process prop
 
 ## Documentation
 
-If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `fern/versions/latest/pages/` in the same PR and adjust `fern/versions/latest.yml` if navigation changes. For explicit page entries, keep `page:` and align it with `sidebar-title` when present, otherwise with the page frontmatter `title`.
+If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `fern/versions/latest/pages/` in the same PR and adjust `fern/versions/latest.yml` if navigation changes. For explicit navbar entries, keep `page:` aligned with `sidebar-title` when present and put relative `slug:` values in `fern/versions/latest.yml`. Reserve frontmatter `slug` for folder-discovered pages or absolute URL overrides.
 
 To ensure your doc changes follow NVIDIA documentation style, use the `update-docs` skill.
 It scans commits, identifies doc pages that need updates, and drafts content that follows the style guide in `fern/versions/latest/pages/CONTRIBUTING.mdx`.

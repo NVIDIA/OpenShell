@@ -98,9 +98,10 @@ Write the doc update following the rules in `fern/versions/latest/pages/CONTRIBU
 - **Code examples use `shell` language** for copyable commands, with no `$` prompt prefix.
 - **Use `text` fences** for transcripts, logs, or shell sessions that should not be copied verbatim.
 - **Include the SPDX header** if creating a new page.
-- **Match existing Fern frontmatter format** if creating a new page, including `sidebar-title`, `slug`, `keywords`, `tags`, and `position` when they are relevant.
-- **Use `sidebar-title` for short nav labels** and `slug` for stable page URLs instead of keeping that metadata only in `fern/versions/latest.yml`.
+- **Match existing Fern frontmatter format** if creating a new page, including `sidebar-title`, `keywords`, `tags`, and `position` when they are relevant. Use frontmatter `slug` only for folder-discovered pages or absolute URL overrides.
+- **Use `sidebar-title` for short nav labels**. For explicit navbar entries, keep relative `slug` values in `fern/versions/latest.yml` instead of page frontmatter.
 - **Keep explicit `page:` entries in `fern/versions/latest.yml`**. Fern still requires them. If the page defines `sidebar-title`, set `page:` to that value. Otherwise set `page:` to the page frontmatter `title`.
+- **Use `skip-slug: true` in `fern/versions/latest.yml`** when a child page should live at the parent section path.
 - **Use `keywords` as a comma-separated string**. When migrating a page from `docs/`, combine the legacy `topics` and `tags` into `keywords` and preserve the legacy `tags` array when it is still useful.
 - **Do not add a duplicate H1**. Fern renders the page title from frontmatter.
 - **Always write NVIDIA in all caps.** Wrong: Nvidia, nvidia.

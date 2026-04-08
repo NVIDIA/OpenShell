@@ -31,13 +31,13 @@ Preview Fern docs first, then use the legacy Sphinx build only if you explicitly
 
 To preview Fern docs locally, run:
 
-```bash
+```shell
 fern docs dev
 ```
 
 To run non-interactive validation, run:
 
-```bash
+```shell
 fern check
 ```
 
@@ -60,7 +60,7 @@ mise run docs:serve
 ### Format
 
 - Published docs use Fern MDX under `fern/versions/latest/pages/`.
-- Every page starts with YAML frontmatter. Use `title` and `description` on every page, then add page-level metadata like `sidebar-title`, `slug`, `keywords`, `tags`, and `position` when the page needs them.
+- Every page starts with YAML frontmatter. Use `title` and `description` on every page, then add page-level metadata like `sidebar-title`, `keywords`, `tags`, and `position` when the page needs them.
 - Include the SPDX license header after frontmatter:
   ```
   {/* SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -74,7 +74,6 @@ mise run docs:serve
 ---
 title: "Page Title"
 sidebar-title: "Short Nav Title"
-slug: "section/page-slug"
 description: "One-sentence summary of the page."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing"
 tags:
@@ -85,12 +84,14 @@ tags:
 
 - `title` sets the page heading and browser title.
 - `sidebar-title` sets the shorter label in the sidebar when the full page title is too long.
-- `slug` sets the full path from the docs root. Use it to preserve stable URLs when you move slug metadata out of `fern/versions/latest.yml`.
 - `keywords` is a comma-separated string for page metadata. When migrating from `docs/`, combine the legacy `topics` and `tags` into `keywords`.
 - `tags` is an optional array for preserving legacy doc taxonomy or changelog tags. Fern does not treat `tags` as SEO metadata on ordinary pages, so still populate `keywords`.
 - `position` controls ordering for pages discovered through a `folder:` entry.
+- `slug` optionally overrides the page URL with a full path from the docs root.
 
 For explicit entries in `fern/versions/latest.yml`, keep `page:`. Fern still requires it. If the page defines `sidebar-title`, set `page:` to that value. Otherwise set `page:` to the frontmatter `title`.
+
+For explicit page and folder entries in `fern/versions/latest.yml`, put the relative `slug:` there instead of in frontmatter. Use `skip-slug: true` when a child page should live at the parent section path.
 
 ### Page Structure
 

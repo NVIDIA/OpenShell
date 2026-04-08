@@ -1,63 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 navigation:
-  - section: "Documentation"
-    contents:
-      - page: "Home"
-        path: ./latest/pages/index.mdx
-  - section: "About NVIDIA OpenShell"
-    slug: about
-    contents:
-      - page: "Overview"
-        path: ./latest/pages/about/overview.mdx
-      - page: "How It Works"
-        path: ./latest/pages/about/architecture.mdx
-      - page: "Supported Agents"
-        path: ./latest/pages/about/supported-agents.mdx
-      - page: "Release Notes"
-        path: ./latest/pages/about/release-notes.mdx
-  - section: "Get Started"
-    contents:
-    - page: "Quickstart"
-      path: ./latest/pages/get-started/quickstart.mdx
-    - folder: ./latest/pages/tutorials
-      collapsed: open-by-default
-  - section: "Gateways and Sandboxes"
-    slug: sandboxes
-    contents:
-      - page: "About Gateways and Sandboxes"
-        path: ./latest/pages/sandboxes/index.mdx
-      - page: "Sandboxes"
-        path: ./latest/pages/sandboxes/manage-sandboxes.mdx
-      - page: "Gateways"
-        path: ./latest/pages/sandboxes/manage-gateways.mdx
-      - page: "Providers"
-        path: ./latest/pages/sandboxes/manage-providers.mdx
-      - page: "Policies"
-        path: ./latest/pages/sandboxes/policies.mdx
-      - page: "Community Sandboxes"
-        path: ./latest/pages/sandboxes/community-sandboxes.mdx
-  - section: "Inference Routing"
-    slug: inference
-    contents:
-      - page: "About Inference Routing"
-        path: ./latest/pages/inference/index.mdx
-      - page: "Configure Inference Routing"
-        path: ./latest/pages/inference/configure.mdx
-  - section: "Observability"
-    slug: observability
-    contents:
-      - page: "Overview"
-        path: ./latest/pages/observability/index.mdx
-      - page: "Logging"
-        path: ./latest/pages/observability/logging.mdx
-      - page: "Accessing Logs"
-        path: ./latest/pages/observability/accessing-logs.mdx
-      - page: "OCSF JSON Export"
-        path: ./latest/pages/observability/ocsf-json-export.mdx
-  - folder: ./latest/pages/reference
-    title: "Reference"
-  - folder: ./latest/pages/security
-    title: "Security"
-  - folder: ./latest/pages/resources
-    title: "Resources"
+- section: "Get Started"
+  slug: get-started
+  contents:
+  - page: "Home"
+    path: ./latest/pages/index.mdx
+  - page: "Quickstart"
+    path: ./latest/pages/get-started/quickstart.mdx
+- folder: ./latest/pages/about
+  title: "About NVIDIA OpenShell"
+- folder: ./latest/pages/tutorials
+- folder: ./latest/pages/sandboxes
+- folder: ./latest/pages/inference
+  title: "Inference Routing"
+- folder: ./latest/pages/observability
+  title: "Observability"
+- folder: ./latest/pages/reference
+  title: "Reference"
+- folder: ./latest/pages/security
+  title: "Security"
+- folder: ./latest/pages/resources
+  title: "Resources"
