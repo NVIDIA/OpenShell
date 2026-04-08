@@ -42,6 +42,8 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `python/openshell/` | Python SDK | Python bindings and CLI packaging |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
+| `fern/` | Published docs | Fern site config, navigation, components, and MDX pages |
+| `docs/` | Legacy docs source | Sphinx/MyST source retained for migration, comparison, and legacy build tasks |
 | `.agents/skills/` | Agent skills | Workflow automation for development |
 | `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer, doc writer) |
 | `architecture/` | Architecture docs | Design decisions and component documentation |
@@ -184,8 +186,10 @@ ocsf_emit!(event);
 ## Documentation
 
 - When making changes, update the relevant documentation in the `architecture/` directory.
-- When changes affect user-facing behavior, also update the relevant pages under `docs/`.
-- Follow the style guide in [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): active voice, no unnecessary bold, no em dash overuse, no filler introductions.
+- When changes affect user-facing behavior, update the relevant published docs pages under `fern/versions/latest/pages/` and navigation in `fern/versions/latest.yml`.
+- `docs/` is retained for legacy Sphinx build tasks and migration/reference work. Do not update it unless the user explicitly asks.
+- Follow the docs style guide in [fern/versions/latest/pages/CONTRIBUTING.mdx](fern/versions/latest/pages/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
+- Fern PR previews run through `.github/workflows/branch-docs.yml`, and production publish runs through the `publish-fern-docs` job in `.github/workflows/release-tag.yml`.
 - Use the `update-docs` skill to scan recent commits and draft doc updates.
 
 ## Security

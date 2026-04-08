@@ -383,6 +383,30 @@ jobs:
             release/*.whl
             release/openshell-checksums-sha256.txt
 
+  publish-fern-docs:
+    name: Publish Fern Docs
+    needs: [release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install Fern CLI
+        run: npm install -g fern-api
+
+      - name: Publish Fern docs
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+        working-directory: ./fern
+        run: fern generate --docs
+
   trigger-wheel-publish:
     name: Trigger Wheel Publish
     needs: [compute-versions, build-python-wheels, release]

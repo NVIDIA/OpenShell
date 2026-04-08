@@ -1,102 +1,63 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 navigation:
-  - section: "Getting Started"
-    slug: get-started
+  - section: "Documentation"
     contents:
       - page: "Home"
         path: ./latest/pages/index.mdx
-      - page: "Quickstart"
-        slug: quickstart
-        path: ./latest/pages/get-started/quickstart.mdx
   - section: "About NVIDIA OpenShell"
     slug: about
     contents:
       - page: "Overview"
-        slug: overview
         path: ./latest/pages/about/overview.mdx
       - page: "How It Works"
-        slug: architecture
         path: ./latest/pages/about/architecture.mdx
       - page: "Supported Agents"
-        slug: supported-agents
         path: ./latest/pages/about/supported-agents.mdx
       - page: "Release Notes"
-        slug: release-notes
         path: ./latest/pages/about/release-notes.mdx
-  - section: "Tutorials"
-    slug: tutorials
+  - section: "Get Started"
     contents:
-      - page: "Tutorials"
-        slug: index
-        hidden: true
-        path: ./latest/pages/tutorials/index.mdx
-      - page: "First Network Policy"
-        slug: first-network-policy
-        path: ./latest/pages/tutorials/first-network-policy.mdx
-      - page: "GitHub Push Access"
-        slug: github-sandbox
-        path: ./latest/pages/tutorials/github-sandbox.mdx
-      - page: "Inference with Ollama"
-        slug: inference-ollama
-        path: ./latest/pages/tutorials/inference-ollama.mdx
-      - page: "Local Inference with LM Studio"
-        slug: local-inference-lmstudio
-        path: ./latest/pages/tutorials/local-inference-lmstudio.mdx
+    - page: "Quickstart"
+      path: ./latest/pages/get-started/quickstart.mdx
+    - folder: ./latest/pages/tutorials
+      collapsed: open-by-default
   - section: "Gateways and Sandboxes"
     slug: sandboxes
     contents:
       - page: "About Gateways and Sandboxes"
-        slug: about
         path: ./latest/pages/sandboxes/index.mdx
       - page: "Sandboxes"
-        slug: manage-sandboxes
         path: ./latest/pages/sandboxes/manage-sandboxes.mdx
       - page: "Gateways"
-        slug: manage-gateways
         path: ./latest/pages/sandboxes/manage-gateways.mdx
       - page: "Providers"
-        slug: manage-providers
         path: ./latest/pages/sandboxes/manage-providers.mdx
       - page: "Policies"
-        slug: policies
         path: ./latest/pages/sandboxes/policies.mdx
       - page: "Community Sandboxes"
-        slug: community-sandboxes
         path: ./latest/pages/sandboxes/community-sandboxes.mdx
   - section: "Inference Routing"
     slug: inference
     contents:
       - page: "About Inference Routing"
-        slug: about
         path: ./latest/pages/inference/index.mdx
       - page: "Configure Inference Routing"
-        slug: configure
         path: ./latest/pages/inference/configure.mdx
   - section: "Observability"
     slug: observability
     contents:
       - page: "Overview"
-        slug: index
         path: ./latest/pages/observability/index.mdx
       - page: "Logging"
-        slug: logging
         path: ./latest/pages/observability/logging.mdx
       - page: "Accessing Logs"
-        slug: accessing-logs
         path: ./latest/pages/observability/accessing-logs.mdx
       - page: "OCSF JSON Export"
-        slug: ocsf-json-export
         path: ./latest/pages/observability/ocsf-json-export.mdx
   - folder: ./latest/pages/reference
     title: "Reference"
-    title-source: frontmatter
-  - section: "Security"
-    slug: security
-    contents:
-      - page: "Security Best Practices"
-        slug: best-practices
-        path: ./latest/pages/security/best-practices.mdx
+  - folder: ./latest/pages/security
+    title: "Security"
   - folder: ./latest/pages/resources
     title: "Resources"
-    title-source: frontmatter

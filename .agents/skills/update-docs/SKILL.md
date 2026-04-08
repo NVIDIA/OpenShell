@@ -10,8 +10,8 @@ Scan recent git history for commits that affect user-facing behavior and draft d
 ## Prerequisites
 
 - You must be in the OpenShell git repository.
-- The `docs/` directory must exist with the current doc set.
-- Read `docs/CONTRIBUTING.md` before writing any content. It contains the style guide and formatting rules.
+- The published docs tree must exist under `fern/versions/latest/pages/`.
+- Read `fern/versions/latest/pages/CONTRIBUTING.mdx` before writing any content. It contains the current style guide and formatting rules.
 
 ## When to Use
 
@@ -48,16 +48,16 @@ For each relevant commit, determine which doc page(s) it affects. Use this mappi
 
 | Code area | Likely doc page(s) |
 |---|---|
-| `crates/openshell-cli/` (gateway commands) | `docs/sandboxes/manage-gateways.md` |
-| `crates/openshell-cli/` (sandbox commands) | `docs/sandboxes/manage-sandboxes.md` |
-| `crates/openshell-cli/` (provider commands) | `docs/sandboxes/manage-providers.md` |
-| `crates/openshell-cli/` (new top-level command) | May need a new page or `docs/reference/` entry |
-| `crates/openshell-proxy/` or policy code | `docs/sandboxes/policies.md`, `docs/reference/policy-schema.md` |
-| `crates/openshell-inference/` | `docs/inference/configure.md` |
-| `python/` (SDK changes) | `docs/reference/` or `docs/get-started/quickstart.md` |
-| `proto/` (API changes) | `docs/reference/` |
-| `deploy/` (Dockerfile, Helm) | `docs/sandboxes/manage-gateways.md`, `docs/about/architecture.md` |
-| Community sandbox definitions | `docs/sandboxes/community-sandboxes.md` |
+| `crates/openshell-cli/` (gateway commands) | `fern/versions/latest/pages/sandboxes/manage-gateways.mdx` |
+| `crates/openshell-cli/` (sandbox commands) | `fern/versions/latest/pages/sandboxes/manage-sandboxes.mdx` |
+| `crates/openshell-cli/` (provider commands) | `fern/versions/latest/pages/sandboxes/manage-providers.mdx` |
+| `crates/openshell-cli/` (new top-level command) | May need a new page or `fern/versions/latest/pages/reference/` entry |
+| Proxy or policy code | `fern/versions/latest/pages/sandboxes/policies.mdx`, `fern/versions/latest/pages/reference/policy-schema.mdx` |
+| Inference code | `fern/versions/latest/pages/inference/configure.mdx` |
+| `python/` (SDK changes) | `fern/versions/latest/pages/reference/` or `fern/versions/latest/pages/get-started/quickstart.mdx` |
+| `proto/` (API changes) | `fern/versions/latest/pages/reference/` |
+| `deploy/` (Dockerfile, Helm) | `fern/versions/latest/pages/sandboxes/manage-gateways.mdx`, `fern/versions/latest/pages/about/architecture.mdx` |
+| Community sandbox definitions | `fern/versions/latest/pages/sandboxes/community-sandboxes.mdx` |
 
 If a commit does not map to any existing page but introduces a user-visible concept, flag it as needing a new page.
 
@@ -88,16 +88,21 @@ Identify where the new content should go. Follow the page's existing structure.
 
 ## Step 5: Draft the Update
 
-Write the doc update following the rules in `docs/CONTRIBUTING.md`. Key reminders:
+Write the doc update following the rules in `fern/versions/latest/pages/CONTRIBUTING.mdx`. Key reminders:
 
 - **Active voice, present tense, second person.**
 - **No unnecessary bold.** Reserve bold for UI labels and parameter names.
 - **No em dashes** unless used sparingly. Prefer commas or separate sentences.
 - **Start sections with an introductory sentence** that orients the reader.
 - **No superlatives.** Say what the feature does, not how great it is.
-- **Code examples use `console` language** with `$` prompt prefix.
+- **Code examples use `shell` language** for copyable commands, with no `$` prompt prefix.
+- **Use `text` fences** for transcripts, logs, or shell sessions that should not be copied verbatim.
 - **Include the SPDX header** if creating a new page.
-- **Match existing frontmatter format** if creating a new page.
+- **Match existing Fern frontmatter format** if creating a new page, including `sidebar-title`, `slug`, `keywords`, `tags`, and `position` when they are relevant.
+- **Use `sidebar-title` for short nav labels** and `slug` for stable page URLs instead of keeping that metadata only in `fern/versions/latest.yml`.
+- **Keep explicit `page:` entries in `fern/versions/latest.yml`**. Fern still requires them. If the page defines `sidebar-title`, set `page:` to that value. Otherwise set `page:` to the page frontmatter `title`.
+- **Use `keywords` as a comma-separated string**. When migrating a page from `docs/`, combine the legacy `topics` and `tags` into `keywords` and preserve the legacy `tags` array when it is still useful.
+- **Do not add a duplicate H1**. Fern renders the page title from frontmatter.
 - **Always write NVIDIA in all caps.** Wrong: Nvidia, nvidia.
 - **Always capitalize OpenShell correctly.** Wrong: openshell, Openshell, openShell.
 - **Do not number section titles.** Wrong: "Section 1: Deploy a Gateway" or "Step 3: Verify." Use plain descriptive titles.
@@ -112,8 +117,8 @@ When updating an existing page:
 
 When creating a new page:
 
-- Follow the frontmatter template from `docs/CONTRIBUTING.md`.
-- Add the page to the appropriate `toctree` in `docs/index.md`.
+- Follow the frontmatter template from `fern/versions/latest/pages/CONTRIBUTING.mdx`.
+- Add the page to the appropriate section in `fern/versions/latest.yml`.
 
 ## Step 6: Present the Results
 
@@ -123,8 +128,8 @@ After drafting all updates, present a summary to the user:
 ## Doc Updates from Commits
 
 ### Updated pages
-- `docs/sandboxes/manage-gateways.md`: Added `--gpu` flag documentation (from commit abc1234).
-- `docs/reference/policy-schema.md`: Updated network policy schema for new `tls_inspect` field (from commit def5678).
+- `fern/versions/latest/pages/sandboxes/manage-gateways.mdx`: Added `--gpu` flag documentation (from commit abc1234).
+- `fern/versions/latest/pages/reference/policy-schema.mdx`: Updated network policy schema for new `tls_inspect` field (from commit def5678).
 
 ### New pages needed
 - None (or list any new pages created).
@@ -136,23 +141,29 @@ After drafting all updates, present a summary to the user:
 
 ## Step 7: Build and Verify
 
-After making changes, build the docs locally:
+After making changes, validate the Fern docs locally:
 
 ```bash
-mise run docs
+fern check
+```
+
+If a human needs to inspect rendering while iterating, they can also run:
+
+```bash
+fern docs dev
 ```
 
 Check for:
 
-- Build warnings or errors.
+- Validation warnings or errors.
 - Broken cross-references.
-- Correct rendering of new content.
+- Correct rendering of new content in the PR preview when available.
 
 ## Tips
 
 - When in doubt about whether a commit needs a doc update, check if the commit message references a CLI flag, config option, or user-visible behavior.
 - Group related commits that touch the same doc page into a single update rather than making multiple small edits.
-- If a commit is a breaking change, add a note at the top of the relevant section using a `:::{warning}` admonition.
+- If a commit is a breaking change, add a note at the top of the relevant section using a Fern `<Warning>` callout.
 - PRs that are purely internal refactors with no behavior change do not need doc updates, even if they touch high-signal directories.
 
 ## Example Usage
@@ -165,4 +176,4 @@ User says: "Catch up the docs for everything merged since v0.2.0."
 4. Read the commit diffs and current doc pages.
 5. Draft updates following the style guide.
 6. Present the summary.
-7. Build with `mise run docs` to verify.
+7. Run `fern check` to verify.

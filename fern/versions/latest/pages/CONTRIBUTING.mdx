@@ -4,6 +4,8 @@ description: ""
 ---
 This guide covers how to write, edit, and review documentation for NVIDIA OpenShell. If you change code that affects user-facing behavior, update the relevant docs in the same PR.
 
+The published docs live in `fern/versions/latest/pages/`, and navigation is defined in `fern/versions/latest.yml`. The `docs/` tree is kept for legacy Sphinx builds and migration/reference work. Do not update `docs/` unless you are explicitly asked to do so.
+
 ## Use the Agent Skills
 
 If you use an AI coding agent (Cursor, Claude Code, Codex, etc.), the repo includes skills that automate doc work. Use them before writing from scratch.
@@ -27,15 +29,29 @@ Update documentation when your change:
 
 ## Building Docs Locally
 
-Verify the docs are built correctly by building them and checking the output.
+Preview Fern docs first, then use the legacy Sphinx build only if you explicitly need it for comparison.
 
-To build the docs, run:
+To preview Fern docs locally, run:
+
+```shell
+fern docs dev
+```
+
+To run non-interactive validation, run:
+
+```shell
+fern check
+```
+
+PRs that touch `fern/**` also get a preview from `.github/workflows/branch-docs.yml` when `FERN_TOKEN` is available to the workflow.
+
+If you need the legacy Sphinx build during the transition, use:
 
 ```shell
 mise run docs
 ```
 
-To serve the docs locally and automatically rebuild on changes, run:
+To serve the legacy docs locally and automatically rebuild on changes, run:
 
 ```shell
 mise run docs:serve
@@ -45,42 +61,45 @@ mise run docs:serve
 
 ### Format
 
-- Docs use [MyST Markdown](https://myst-parser.readthedocs.io/), a Sphinx-compatible superset of CommonMark.
-- Every page starts with YAML frontmatter (title, description, topics, tags, content type).
+- Published docs use Fern MDX under `fern/versions/latest/pages/`.
+- Every page starts with YAML frontmatter. Use `title` and `description` on every page, then add page-level metadata like `sidebar-title`, `slug`, `keywords`, `tags`, and `position` when the page needs them.
 - Include the SPDX license header after frontmatter:
   ```
   {/* SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
     SPDX-License-Identifier: Apache-2.0 */}
   ```
+- Do not repeat the page title as a body H1. Fern renders the title from frontmatter.
 
 ### Frontmatter Template
 
 ```yaml
 ---
-title: "page: Page Title"
-  nav: Short Nav Title
-description: One-sentence summary of the page.
-topics:
-- Generative AI
-- Cybersecurity
+title: "Page Title"
+sidebar-title: "Short Nav Title"
+slug: "section/page-slug"
+description: "One-sentence summary of the page."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing"
 tags:
-- Relevant
-- Tags
-content:
-  type: concept | how_to | get_started | tutorial | reference
-  difficulty: technical_beginner | technical_intermediate | technical_advanced
-  audience:
-  - engineer
-  - data_scientist
+  - AI Agents
+  - Sandboxing
 ---
 ```
 
+- `title` sets the page heading and browser title.
+- `sidebar-title` sets the shorter label in the sidebar when the full page title is too long.
+- `slug` sets the full path from the docs root. Use it to preserve stable URLs when you move slug metadata out of `fern/versions/latest.yml`.
+- `keywords` is a comma-separated string for page metadata. When migrating from `docs/`, combine the legacy `topics` and `tags` into `keywords`.
+- `tags` is an optional array for preserving legacy doc taxonomy or changelog tags. Fern does not treat `tags` as SEO metadata on ordinary pages, so still populate `keywords`.
+- `position` controls ordering for pages discovered through a `folder:` entry.
+
+For explicit entries in `fern/versions/latest.yml`, keep `page:`. Fern still requires it. If the page defines `sidebar-title`, set `page:` to that value. Otherwise set `page:` to the frontmatter `title`.
+
 ### Page Structure
 
-1. H1 heading matching the `title.page` value.
+1. Frontmatter `title` and `description`, plus any relevant page metadata.
 2. A one- or two-sentence introduction stating what the page covers.
 3. Sections organized by task or concept, using H2 and H3. Start each section with an introductory sentence that orients the reader.
-4. A "Next Steps" section at the bottom linking to related pages.
+4. A "Next Steps" section at the bottom linking to related pages when it helps the reader continue.
 
 ## Style Guide
 
@@ -110,13 +129,14 @@ These patterns are common in LLM-generated text and erode trust with technical r
 
 - End every sentence with a period.
 - Use `code` formatting for CLI commands, file paths, flags, parameter names, and values.
-- Use code blocks with the `console` language for CLI examples. Prefix commands with `$`:
+- Use `shell` code blocks for copyable CLI examples. Do not prefix commands with `$`:
   ```shell
   openshell gateway start
   ```
+- Use `text` code blocks for transcripts, log output, and examples that should not be copied verbatim.
 - Use tables for structured comparisons. Keep tables simple (no nested formatting).
-- Use MyST admonitions (`:::{tip}`, `:::{note}`, `:::{warning}`) for callouts, not bold text.
-- Avoid nested admonitions.
+- Use Fern components like `<Note>`, `<Tip>`, and `<Warning>` for callouts, not bold text.
+- Use Fern components like `<Steps>` and `<Tabs>` when the page clearly benefits from them.
 - Do not number section titles. Write "Deploy a Gateway" not "Section 1: Deploy a Gateway" or "Step 3: Verify."
 - Do not use colons in titles. Write "Deploy and Manage Gateways" not "Gateways: Deploy and Manage."
 - Use colons only to introduce a list. Do not use colons as general-purpose punctuation between clauses.
@@ -140,9 +160,10 @@ Use these consistently:
 
 1. Create a branch following the project convention: `docs/<issue-id>-<description>/<username>`.
 2. Make your changes.
-3. Build locally with `mise run docs` and verify the output.
-4. Run `mise run pre-commit` to catch formatting issues.
-5. Open a PR with `docs:` as the conventional commit type.
+3. Preview locally with `fern docs dev`.
+4. Run `fern check`.
+5. Run `mise run pre-commit` to catch formatting issues.
+6. Open a PR with `docs:` as the conventional commit type.
 
 ```
 docs: update gateway deployment instructions
@@ -162,4 +183,4 @@ When reviewing documentation:
 - Watch for LLM-generated patterns (excessive bold, em dashes, filler).
 - Verify code examples are accurate and runnable.
 - Confirm cross-references and links are not broken.
-- Build locally to check rendering.
+- Preview the page with `fern docs dev`, run `fern check`, and, if available, review the PR preview from `branch-docs.yml`.

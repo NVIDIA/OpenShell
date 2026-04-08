@@ -173,7 +173,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run test`    | Default test suite                                      |
 | `mise run e2e`     | Default end-to-end test lane                            |
 | `mise run ci`      | Full local CI checks (lint, compile/type checks, tests) |
-| `mise run docs`    | Build and serve documentation locally                   |
+| `mise run docs`    | Build legacy Sphinx docs locally                        |
 | `mise run clean`   | Clean build artifacts                                   |
 
 ## Project Structure
@@ -185,9 +185,10 @@ These are the primary `mise` tasks for day-to-day development:
 | `proto/`        | Protocol buffer definitions                   |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
+| `fern/`         | Published Fern docs site and MDX pages        |
+| `docs/`         | Legacy Sphinx/MyST docs retained during transition |
 | `architecture/` | Architecture docs and plans                   |
 | `rfc/`          | Request for Comments proposals                |
-| `docs/`         | User-facing documentation (Sphinx/MyST)       |
 | `.agents/`      | Agent skills and persona definitions          |
 
 ## RFCs
@@ -196,19 +197,30 @@ For cross-cutting architectural decisions, API contract changes, or process prop
 
 ## Documentation
 
-If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `docs/` in the same PR.
+If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `fern/versions/latest/pages/` in the same PR and adjust `fern/versions/latest.yml` if navigation changes. For explicit page entries, keep `page:` and align it with `sidebar-title` when present, otherwise with the page frontmatter `title`.
 
 To ensure your doc changes follow NVIDIA documentation style, use the `update-docs` skill.
-It scans commits, identifies doc pages that need updates, and drafts content that follows the style guide in `docs/CONTRIBUTING.md`.
+It scans commits, identifies doc pages that need updates, and drafts content that follows the style guide in `fern/versions/latest/pages/CONTRIBUTING.mdx`.
 
-To build and preview docs locally:
+To preview Fern docs locally:
 
 ```bash
-mise run docs # to build the docs locally
-mise run docs:serve # to serve locally and automatically rebuild on changes
+fern docs dev
 ```
 
-See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for more details.
+To run non-interactive validation:
+
+```bash
+fern check
+```
+
+PRs that touch `fern/**` also get a preview from `.github/workflows/branch-docs.yml` when `FERN_TOKEN` is available to the workflow.
+
+Fern docs publishing is handled by the `publish-fern-docs` job in `.github/workflows/release-tag.yml` when a release tag is created.
+
+`docs/` and `mise run docs` / `mise run docs:serve` are still kept for the legacy Sphinx build during the transition, but they are no longer the primary published docs workflow.
+
+See [fern/versions/latest/pages/CONTRIBUTING.mdx](fern/versions/latest/pages/CONTRIBUTING.mdx) for the current docs authoring guide.
 
 ## Pull Requests
 
