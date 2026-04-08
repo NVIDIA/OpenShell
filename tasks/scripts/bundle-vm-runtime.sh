@@ -24,7 +24,7 @@ SOURCE_DIR="${ROOT}/target/vm-runtime"
 
 if [ ! -d "${SOURCE_DIR}" ]; then
     echo "ERROR: VM runtime source not found at ${SOURCE_DIR}"
-    echo "       Run: mise run vm:runtime:compress"
+    echo "       Run: mise run vm:setup"
     exit 1
 fi
 
@@ -36,7 +36,7 @@ for required in libkrun.so gvproxy; do
             continue
         fi
         echo "ERROR: Required runtime file not found: ${SOURCE_DIR}/${required}"
-        echo "       Run: mise run vm:runtime:compress"
+        echo "       Run: mise run vm:setup"
         exit 1
     fi
 done

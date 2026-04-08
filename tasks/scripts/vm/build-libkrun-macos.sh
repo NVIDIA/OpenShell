@@ -263,7 +263,7 @@ if $ALL_GOOD; then
     echo ""
     echo "All libraries are portable!"
     echo ""
-    echo "Next step: mise run vm:runtime:compress"
+    echo "Next step: mise run vm:build"
 else
     echo ""
     echo "Warning: Some libraries have non-portable paths"

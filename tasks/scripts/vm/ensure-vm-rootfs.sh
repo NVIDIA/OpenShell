@@ -37,7 +37,7 @@ done
 
 if [ ! -x "${GATEWAY_BIN}" ]; then
   echo "ERROR: openshell-vm binary not found at ${GATEWAY_BIN}" >&2
-  echo "       Run: mise run vm:build:embedded" >&2
+  echo "       Run: mise run vm:build" >&2
   exit 1
 fi
 

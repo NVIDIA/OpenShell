@@ -22,8 +22,12 @@
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/_lib.sh"
+ROOT="$(vm_lib_root)"
 
+# Source pins for gvproxy version
+source "${ROOT}/crates/openshell-vm/pins.env" 2>/dev/null || true
 GVPROXY_VERSION="${GVPROXY_VERSION:-v0.8.8}"
 
 # ── macOS dylib portability helpers ─────────────────────────────────────
@@ -71,22 +75,7 @@ if [ -n "${VM_RUNTIME_TARBALL:-}" ]; then
     ls -lah "$WORK_DIR"
 
     echo ""
-    echo "==> Compressing with zstd (level 19)..."
-
-    for file in "$WORK_DIR"/*; do
-        [ -f "$file" ] || continue
-        name=$(basename "$file")
-        # Skip metadata files — not embedded
-        if [ "$name" = "provenance.json" ]; then
-            cp "$file" "${OUTPUT_DIR}/"
-            continue
-        fi
-        original_size=$(du -h "$file" | cut -f1)
-        zstd -19 -f -q -T0 -o "${OUTPUT_DIR}/${name}.zst" "$file"
-        chmod 644 "${OUTPUT_DIR}/${name}.zst"
-        compressed_size=$(du -h "${OUTPUT_DIR}/${name}.zst" | cut -f1)
-        echo "    ${name}: ${original_size} -> ${compressed_size}"
-    done
+    compress_dir "$WORK_DIR" "$OUTPUT_DIR"
 
     # Check for rootfs tarball (built separately)
     ROOTFS_TARBALL="${OUTPUT_DIR}/rootfs.tar.zst"
@@ -95,7 +84,7 @@ if [ -n "${VM_RUNTIME_TARBALL:-}" ]; then
     else
         echo ""
         echo "Note: rootfs.tar.zst not found."
-        echo "      For full embedded build, run: mise run vm:build:rootfs-tarball"
+        echo "      To build one, run: mise run vm:rootfs -- --base"
     fi
 
     echo ""
@@ -105,8 +94,7 @@ if [ -n "${VM_RUNTIME_TARBALL:-}" ]; then
     echo ""
     echo "==> Total compressed size: ${TOTAL}"
     echo ""
-    echo "Set this environment variable for cargo build:"
-    echo "  export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=${OUTPUT_DIR}"
+    echo "Next step: mise run vm:build"
     exit 0
 fi
 
@@ -150,13 +138,17 @@ case "$(uname -s)-$(uname -m)" in
       cp "${CUSTOM_DIR}/libkrunfw.dylib" "$WORK_DIR/"
     else
       echo "Error: No portable libkrun build found." >&2
-      echo "       Run: mise run vm:runtime:build-libkrun-macos" >&2
+      echo "       Run: FROM_SOURCE=1 mise run vm:setup" >&2
       exit 1
     fi
     
-    # Normalize libkrunfw naming - ensure we have libkrunfw.dylib
+    # Normalize libkrunfw naming - ensure both names exist for build.rs
+    # build.rs expects libkrunfw.5.dylib.zst; some builds produce libkrunfw.dylib
     if [ ! -f "$WORK_DIR/libkrunfw.dylib" ] && [ -f "$WORK_DIR/libkrunfw.5.dylib" ]; then
       cp "$WORK_DIR/libkrunfw.5.dylib" "$WORK_DIR/libkrunfw.dylib"
+    fi
+    if [ ! -f "$WORK_DIR/libkrunfw.5.dylib" ] && [ -f "$WORK_DIR/libkrunfw.dylib" ]; then
+      cp "$WORK_DIR/libkrunfw.dylib" "$WORK_DIR/libkrunfw.5.dylib"
     fi
     
     # gvproxy - prefer Podman, fall back to Homebrew
@@ -187,7 +179,7 @@ case "$(uname -s)-$(uname -m)" in
     
     BUILD_DIR="${ROOT}/target/libkrun-build"
     if [ ! -f "${BUILD_DIR}/libkrun.so" ]; then
-      echo "Error: libkrun not found. Run: mise run vm:runtime:build-libkrun" >&2
+      echo "Error: libkrun not found. Run: FROM_SOURCE=1 mise run vm:setup" >&2
       exit 1
     fi
     
@@ -229,18 +221,7 @@ echo "==> Collected artifacts:"
 ls -lah "$WORK_DIR"
 
 echo ""
-echo "==> Compressing with zstd (level 19)..."
-
-for file in "$WORK_DIR"/*; do
-  [ -f "$file" ] || continue
-  name=$(basename "$file")
-  original_size=$(du -h "$file" | cut -f1)
-  zstd -19 -f -q -T0 -o "${OUTPUT_DIR}/${name}.zst" "$file"
-  # Ensure compressed file is readable/writable (source may be read-only)
-  chmod 644 "${OUTPUT_DIR}/${name}.zst"
-  compressed_size=$(du -h "${OUTPUT_DIR}/${name}.zst" | cut -f1)
-  echo "    ${name}: ${original_size} -> ${compressed_size}"
-done
+compress_dir "$WORK_DIR" "$OUTPUT_DIR"
 
 # Check for rootfs tarball (built separately by build-rootfs-tarball.sh)
 ROOTFS_TARBALL="${OUTPUT_DIR}/rootfs.tar.zst"
@@ -249,9 +230,9 @@ if [ -f "$ROOTFS_TARBALL" ]; then
 else
     echo ""
     echo "Note: rootfs.tar.zst not found."
-    echo "      For full embedded build, run: mise run vm:build:rootfs-tarball"
-    echo "      For quick build (without rootfs), the binary will still work but"
-    echo "      require the rootfs to be built separately on first run."
+      echo "      To build one, run: mise run vm:rootfs -- --base"
+      echo "      Without it, the binary will still work but require the rootfs"
+      echo "      to be built separately on first run."
 fi
 
 echo ""
@@ -262,5 +243,4 @@ TOTAL=$(du -sh "$OUTPUT_DIR" | cut -f1)
 echo ""
 echo "==> Total compressed size: ${TOTAL}"
 echo ""
-echo "Set this environment variable for cargo build:"
-echo "  export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=${OUTPUT_DIR}"
+echo "Next step: mise run vm:build"

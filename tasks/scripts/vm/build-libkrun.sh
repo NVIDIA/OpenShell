@@ -20,7 +20,13 @@
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/_lib.sh"
+ROOT="$(vm_lib_root)"
+
+# Source pinned dependency versions
+source "${ROOT}/crates/openshell-vm/pins.env" 2>/dev/null || true
+
 BUILD_DIR="${ROOT}/target/libkrun-build"
 OUTPUT_DIR="${BUILD_DIR}"
 KERNEL_CONFIG="${ROOT}/crates/openshell-vm/runtime/kernel/openshell.kconfig"
@@ -84,11 +90,18 @@ echo ""
 echo "==> Building libkrunfw with custom kernel config..."
 
 if [ ! -d libkrunfw ]; then
-  echo "    Cloning libkrunfw..."
-  git clone --depth 1 https://github.com/containers/libkrunfw.git
+  echo "    Cloning libkrunfw (pinned: ${LIBKRUNFW_REF:-HEAD})..."
+  git clone https://github.com/containers/libkrunfw.git
 fi
 
 cd libkrunfw
+
+# Ensure we're on the pinned commit for reproducible builds
+if [ -n "${LIBKRUNFW_REF:-}" ]; then
+  echo "    Checking out pinned ref: ${LIBKRUNFW_REF}"
+  git fetch origin
+  git checkout "${LIBKRUNFW_REF}"
+fi
 
 # Copy custom kernel config fragment
 if [ -f "$KERNEL_CONFIG" ]; then
@@ -232,4 +245,4 @@ echo "    Artifacts:"
 ls -lah "$OUTPUT_DIR"/*.so*
 
 echo ""
-echo "Next step: mise run vm:runtime:compress"
+echo "Next step: mise run vm:build"

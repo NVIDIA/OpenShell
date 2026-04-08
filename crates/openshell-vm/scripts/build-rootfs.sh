@@ -550,20 +550,20 @@ fi
 # virtio-fs.
 #
 # Requirements: the openshell-vm binary must be built and codesigned.
-# mise run vm:build:binary handles this.
+# mise run vm:build handles this.
 
 GATEWAY_BIN="${PROJECT_ROOT}/target/debug/openshell-vm"
 RUNTIME_DIR="${PROJECT_ROOT}/target/debug/openshell-vm.runtime"
 
 if [ ! -x "${GATEWAY_BIN}" ]; then
     echo "ERROR: openshell-vm binary not found at ${GATEWAY_BIN}"
-    echo "       Run: mise run vm:build:binary"
+    echo "       Run: mise run vm:build"
     exit 1
 fi
 
 if [ ! -d "${RUNTIME_DIR}" ]; then
     echo "ERROR: VM runtime bundle not found at ${RUNTIME_DIR}"
-    echo "       Run: mise run vm:bundle-runtime"
+    echo "       Run: mise run vm:build"
     exit 1
 fi
 

@@ -1,118 +1,44 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# openshell-vm development helpers
+# openshell-vm development tasks
+#
+# Workflow:
+#   mise run vm:setup          # one-time: download pre-built runtime (~30s)
+#   mise run vm                # build + run the VM
+#   mise run vm:clean          # wipe everything and start over
+#
+# See crates/openshell-vm/README.md for full documentation.
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Main VM Commands
+# Main Commands
 # ═══════════════════════════════════════════════════════════════════════════
 
 [vm]
-description = "Build and run the standalone openshell-vm microVM"
+description = "Build and run the openshell-vm microVM"
 depends = ["build:docker:gateway"]
 run = [
-  "mise run vm:build:embedded",
+  "mise run vm:build",
   "tasks/scripts/vm/run-vm.sh",
 ]
-hide = false
 
 ["vm:build"]
-description = "Force a fresh openshell-vm rebuild, including the rootfs"
-depends = ["build:docker:gateway"]
+description = "Build the openshell-vm binary with embedded runtime"
 run = [
-  "mise run vm:build:embedded",
-  "OPENSHELL_VM_FORCE_ROOTFS_REBUILD=1 tasks/scripts/vm/ensure-vm-rootfs.sh",
-  "tasks/scripts/vm/sync-vm-rootfs.sh",
-]
-hide = false
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Embedded Binary Build (Single Binary, No Sidecar)
-# ═══════════════════════════════════════════════════════════════════════════
-
-["vm:build:embedded"]
-description = "Build openshell-vm with embedded runtime (single binary, no sidecar)"
-run = [
-  "mise run vm:runtime:compress",
+  "tasks/scripts/vm/compress-vm-runtime.sh",
   "OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed cargo build -p openshell-vm",
   "tasks/scripts/vm/codesign-openshell-vm.sh",
+  "tasks/scripts/bundle-vm-runtime.sh",
 ]
-hide = false
 
-["vm:bundle-runtime"]
-description = "Stage the openshell-vm sidecar runtime bundle next to local build outputs"
-run = "tasks/scripts/bundle-vm-runtime.sh"
-hide = false
-
-["vm:build:binary"]
-description = "Build the standalone openshell-vm binary (requires vm:runtime:compress first)"
-run = "OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed cargo build -p openshell-vm"
-hide = true
-
-# ═══════════════════════════════════════════════════════════════════════════
-# VM Runtime Artifact Management
-# ═══════════════════════════════════════════════════════════════════════════
-
-["vm:runtime:compress"]
-description = "Gather and compress VM runtime artifacts for embedding"
-run = "tasks/scripts/vm/compress-vm-runtime.sh"
-hide = false
-
-["vm:runtime:build-libkrunfw"]
-description = "Build custom libkrunfw with bridge/netfilter kernel support"
-run = "crates/openshell-vm/runtime/build-custom-libkrunfw.sh"
-hide = false
-
-["vm:runtime:build-libkrun"]
-description = "Build libkrun and libkrunfw from source (Linux only)"
-run = "tasks/scripts/vm/build-libkrun.sh"
-hide = false
-
-["vm:runtime:build-libkrun-macos"]
-description = "Build portable libkrun from source (macOS, no GPU deps)"
-run = "tasks/scripts/vm/build-libkrun-macos.sh"
-hide = false
-
-["vm:runtime:download"]
-description = "Download pre-built kernel runtime from vm-dev GitHub Release"
-run = "tasks/scripts/vm/download-kernel-runtime.sh"
-hide = false
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Rootfs Management
-# ═══════════════════════════════════════════════════════════════════════════
+["vm:setup"]
+description = "One-time setup: download (or build) the VM runtime"
+run = "tasks/scripts/vm/vm-setup.sh"
 
 ["vm:rootfs"]
-description = "Prepare the default named openshell-vm rootfs if needed"
-run = "tasks/scripts/vm/ensure-vm-rootfs.sh"
-hide = true
-
-["vm:build:rootfs-tarball"]
-description = "Build and compress FULL rootfs tarball for embedding (~2GB+)"
+description = "Build the VM rootfs tarball (use -- --base for lightweight)"
 run = "tasks/scripts/vm/build-rootfs-tarball.sh"
-hide = false
 
-["vm:build:rootfs-tarball:base"]
-description = "Build and compress BASE rootfs tarball for embedding (~200-300MB)"
-run = "tasks/scripts/vm/build-rootfs-tarball.sh --base"
-hide = false
-
-["vm:build:embedded:quick"]
-description = "Build embedded binary using cached rootfs tarball (skips rootfs rebuild)"
-run = [
-  "mise run vm:runtime:compress",
-  "OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed cargo build -p openshell-vm",
-  "tasks/scripts/vm/codesign-openshell-vm.sh",
-]
-hide = false
-
-["vm:codesign"]
-description = "Codesign the openshell-vm binary for Hypervisor.framework access on macOS"
-depends = ["vm:build:binary"]
-run = "tasks/scripts/vm/codesign-openshell-vm.sh"
-hide = true
-
-["vm:check-capabilities"]
-description = "Check VM kernel capabilities (run inside the VM)"
-run = "echo 'This script must be run inside the VM. Copy it to the rootfs or exec into a running VM.'"
-hide = false
+["vm:clean"]
+description = "Remove all VM cached artifacts (runtime, rootfs, builds)"
+run = "tasks/scripts/vm/vm-clean.sh"

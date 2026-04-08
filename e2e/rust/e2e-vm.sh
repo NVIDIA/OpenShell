@@ -25,9 +25,8 @@
 # on that port and runs the smoke test. The VM exec check runs only when
 # --vm-name is provided (so the script can target the correct instance).
 #
-# Prerequisites (when starting a new VM): `mise run vm:build:binary`,
-# codesign, bundle-runtime, ensure-rootfs, and sync-rootfs must already
-# be done (the e2e:vm mise task handles these via depends).
+# Prerequisites (when starting a new VM): `mise run vm:build` must already
+# be done (the e2e:vm mise task handles this via depends).
 
 set -euo pipefail
 

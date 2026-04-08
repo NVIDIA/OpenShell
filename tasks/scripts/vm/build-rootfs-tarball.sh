@@ -113,4 +113,4 @@ else
     echo "    Type:       full (first boot ~3-5s, images pre-loaded)"
 fi
 echo ""
-echo "Next step: mise run vm:build:embedded:quick"
+echo "Next step: mise run vm:build"

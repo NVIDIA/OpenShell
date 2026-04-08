@@ -40,8 +40,8 @@ runtime/
 # Build custom libkrunfw (clones libkrunfw repo, applies config, builds)
 ./crates/openshell-vm/runtime/build-custom-libkrunfw.sh
 
-# Or via mise task:
-mise run vm:build-custom-runtime
+# Or build the full runtime from source via mise:
+FROM_SOURCE=1 mise run vm:setup
 ```
 
 ### Output
@@ -60,9 +60,9 @@ target/custom-runtime/
 ### Using the Custom Runtime
 
 ```bash
-# Point the bundle script at the custom build:
+# Point the bundle script at the custom build and rebuild:
 export OPENSHELL_VM_RUNTIME_SOURCE_DIR=target/custom-runtime
-mise run vm:bundle-runtime
+mise run vm:build
 
 # Then boot the VM as usual:
 mise run vm
@@ -122,10 +122,11 @@ To revert to the stock runtime:
 # Unset the custom runtime source:
 unset OPENSHELL_VM_RUNTIME_SOURCE_DIR
 
-# Re-bundle with stock libraries:
-mise run vm:bundle-runtime
+# Re-download pre-built runtime and rebuild:
+mise run vm:setup
+mise run vm:build
 
-# Boot — will auto-detect legacy-vm-net profile:
+# Boot:
 mise run vm
 ```
 
@@ -166,6 +167,6 @@ grep "runtime:" ~/.local/share/openshell/openshell-vm/console.log
 
 Re-build the custom runtime if needed:
 ```bash
-mise run vm:build-custom-runtime
-mise run vm:bundle-runtime
+FROM_SOURCE=1 mise run vm:setup
+mise run vm:build
 ```

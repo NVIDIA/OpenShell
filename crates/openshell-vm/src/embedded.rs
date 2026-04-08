@@ -398,7 +398,7 @@ mod tests {
             all(target_os = "linux", target_arch = "x86_64"),
         ))]
         {
-            // Note: This test only passes if `mise run vm:runtime:compress` was run
+            // Note: This test only passes if `mise run vm:setup` was run
             // before building. In CI without compressed artifacts, resources will be
             // empty stubs.
             if !resources::LIBKRUN.is_empty() {

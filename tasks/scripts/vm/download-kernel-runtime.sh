@@ -20,25 +20,15 @@
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/_lib.sh"
+ROOT="$(vm_lib_root)"
 
 RELEASE_TAG="${VM_RUNTIME_RELEASE_TAG:-vm-dev}"
 REPO="${GITHUB_REPOSITORY:-NVIDIA/OpenShell}"
 OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
 
-# ── Auto-detect platform ────────────────────────────────────────────────
-
-detect_platform() {
-    case "$(uname -s)-$(uname -m)" in
-        Darwin-arm64)   echo "darwin-aarch64" ;;
-        Linux-aarch64)  echo "linux-aarch64" ;;
-        Linux-x86_64)   echo "linux-x86_64" ;;
-        *)
-            echo "Error: Unsupported platform: $(uname -s)-$(uname -m)" >&2
-            exit 1
-            ;;
-    esac
-}
+# ── Auto-detect platform (detect_platform from _lib.sh) ─────────────────
 
 PLATFORM=""
 while [[ $# -gt 0 ]]; do
@@ -128,22 +118,7 @@ ls -lah "$EXTRACT_DIR"
 # the raw libraries, so we re-compress each one.
 
 echo ""
-echo "==> Compressing artifacts for embedding..."
-
-for file in "$EXTRACT_DIR"/*; do
-    [ -f "$file" ] || continue
-    name=$(basename "$file")
-    # Skip provenance.json — not embedded
-    if [ "$name" = "provenance.json" ]; then
-        cp "$file" "${OUTPUT_DIR}/"
-        continue
-    fi
-    original_size=$(du -h "$file" | cut -f1)
-    zstd -19 -f -q -T0 -o "${OUTPUT_DIR}/${name}.zst" "$file"
-    chmod 644 "${OUTPUT_DIR}/${name}.zst"
-    compressed_size=$(du -h "${OUTPUT_DIR}/${name}.zst" | cut -f1)
-    echo "    ${name}: ${original_size} -> ${compressed_size}"
-done
+compress_dir "$EXTRACT_DIR" "$OUTPUT_DIR"
 
 # ── Check for rootfs (may already be present from a separate build step) ──
 
@@ -153,7 +128,7 @@ if [ -f "${OUTPUT_DIR}/rootfs.tar.zst" ]; then
 else
     echo ""
     echo "Note: rootfs.tar.zst not found in ${OUTPUT_DIR}."
-    echo "      Build it with: mise run vm:build:rootfs-tarball"
+    echo "      Build it with: mise run vm:rootfs -- --base"
 fi
 
 echo ""
@@ -161,5 +136,6 @@ echo "==> Staged artifacts in ${OUTPUT_DIR}:"
 ls -lah "$OUTPUT_DIR"
 
 echo ""
-echo "==> Done. Set for cargo build:"
-echo "  export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=${OUTPUT_DIR}"
+echo "==> Done."
+echo ""
+echo "Next step: mise run vm:build"

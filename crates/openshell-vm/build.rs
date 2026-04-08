@@ -7,7 +7,7 @@
 //! gvproxy) to `OUT_DIR` for embedding via `include_bytes!()`.
 //!
 //! The compressed artifacts are expected to be prepared by:
-//!   `mise run vm:runtime:compress`
+//!   `mise run vm:setup` (one-time) then `mise run vm:build`
 //!
 //! Environment:
 //!   `OPENSHELL_VM_RUNTIME_COMPRESSED_DIR` - Path to compressed artifacts
@@ -53,7 +53,7 @@ fn main() {
         PathBuf::from(dir)
     } else {
         println!("cargo:warning=OPENSHELL_VM_RUNTIME_COMPRESSED_DIR not set");
-        println!("cargo:warning=Run: mise run vm:runtime:compress");
+        println!("cargo:warning=Run: mise run vm:setup");
         generate_stub_resources(&out_dir);
         return;
     };
@@ -63,7 +63,7 @@ fn main() {
             "cargo:warning=Compressed runtime dir not found: {}",
             compressed_dir.display()
         );
-        println!("cargo:warning=Run: mise run vm:runtime:compress");
+        println!("cargo:warning=Run: mise run vm:setup");
         generate_stub_resources(&out_dir);
         return;
     }
@@ -109,7 +109,7 @@ fn main() {
     }
 
     if !all_found {
-        println!("cargo:warning=Some artifacts missing. Run: mise run vm:runtime:compress");
+        println!("cargo:warning=Some artifacts missing. Run: mise run vm:setup");
         generate_stub_resources(&out_dir);
     }
 }

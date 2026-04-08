@@ -71,8 +71,8 @@ Container images are pulled on demand when sandboxes are created. First boot tak
 
 For fully air-gapped environments requiring pre-loaded images, build with:
 ```bash
-mise run vm:build:rootfs-tarball   # Full rootfs (~2GB, includes images)
-mise run vm:build:embedded:quick   # Rebuild binary with full rootfs
+mise run vm:rootfs                 # Full rootfs (~2GB, includes images)
+mise run vm:build                  # Rebuild binary with full rootfs
 ```
 
 ## Network Profile
@@ -158,28 +158,26 @@ commands work the same way they would inside the VM shell.
 ## Build Commands
 
 ```bash
-# Build embedded binary with base rootfs (~120MB, recommended)
-mise run vm:build:rootfs-tarball:base     # Build base rootfs tarball
-mise run vm:build:embedded                 # Build binary with embedded rootfs
+# One-time setup: download pre-built runtime (~30s)
+mise run vm:setup
 
-# Quick rebuild (uses cached artifacts, skips rootfs rebuild)
-mise run vm:build:embedded:quick
+# Build and run
+mise run vm
+
+# Build embedded binary with base rootfs (~120MB, recommended)
+mise run vm:rootfs -- --base              # Build base rootfs tarball
+mise run vm:build                          # Build binary with embedded rootfs
 
 # Build with full rootfs (air-gapped, ~2GB+)
-mise run vm:build:rootfs-tarball          # Build full rootfs tarball
-mise run vm:build:embedded:quick          # Rebuild binary
+mise run vm:rootfs                         # Build full rootfs tarball
+mise run vm:build                          # Rebuild binary
 
 # With custom kernel (optional, adds ~20 min)
-mise run vm:runtime:build-libkrunfw       # Build custom libkrunfw
-mise run vm:build:embedded                # Then build embedded binary
+FROM_SOURCE=1 mise run vm:setup            # Build runtime from source
+mise run vm:build                          # Then build embedded binary
 
-# For Linux (first time only)
-mise run vm:runtime:build-libkrun         # Build libkrun/libkrunfw from source
-mise run vm:build:embedded                # Then build embedded binary
-
-# Download pre-built kernel runtime from CI (skip local build)
-mise run vm:runtime:download              # Download from vm-dev GitHub Release
-mise run vm:build:embedded:quick          # Build binary with downloaded runtime
+# Wipe everything and start over
+mise run vm:clean
 ```
 
 ## CI/CD
@@ -235,7 +233,7 @@ codesign --entitlements crates/openshell-vm/entitlements.plist --force -s - ./op
 
 ## Rollout Strategy
 
-1. Custom runtime is embedded by default when building with `mise run vm:build:embedded`.
+1. Custom runtime is embedded by default when building with `mise run vm:build`.
 2. The init script validates kernel capabilities at boot and fails fast if missing.
 3. For development, override with `OPENSHELL_VM_RUNTIME_DIR` to use a local directory.
 4. In CI, kernel runtime is pre-built and cached in the `vm-dev` release. The binary
@@ -254,6 +252,10 @@ codesign --entitlements crates/openshell-vm/entitlements.plist --force -s - ./op
 | `crates/openshell-vm/scripts/openshell-vm-exec-agent.py` | Guest-side exec agent |
 | `crates/openshell-vm/scripts/check-vm-capabilities.sh` | Kernel capability checker |
 | `crates/openshell-vm/runtime/` | Build pipeline and kernel config |
+| `tasks/scripts/vm/vm-setup.sh` | One-time setup: download or build runtime |
+| `tasks/scripts/vm/vm-clean.sh` | Remove all VM cached artifacts |
+| `tasks/scripts/vm/_lib.sh` | Shared helpers (platform detection, compression) |
+| `tasks/scripts/vm/package-vm-runtime.sh` | CI: package runtime into release tarball |
 | `tasks/scripts/vm/compress-vm-runtime.sh` | Gather and compress runtime artifacts |
 | `tasks/scripts/vm/build-rootfs-tarball.sh` | Build and compress rootfs tarball |
 | `tasks/scripts/vm/build-libkrun.sh` | Build libkrun from source (Linux) |

@@ -19,6 +19,8 @@ on:
       - "tasks/scripts/vm/build-libkrun.sh"
       - "tasks/scripts/vm/build-libkrun-macos.sh"
       - "crates/openshell-vm/runtime/build-custom-libkrunfw.sh"
+      - "tasks/scripts/vm/package-vm-runtime.sh"
+      - "tasks/scripts/vm/_lib.sh"
 
 permissions:
   contents: write
@@ -57,60 +59,12 @@ jobs:
       - name: Build libkrunfw + libkrun from source
         run: tasks/scripts/vm/build-libkrun.sh
 
-      - name: Download gvproxy
-        run: |
-          set -euo pipefail
-          source crates/openshell-vm/pins.env 2>/dev/null || true
-          GVPROXY_VERSION="${GVPROXY_VERSION:-v0.8.8}"
-          curl -fsSL -o target/libkrun-build/gvproxy \
-            "https://github.com/containers/gvisor-tap-vsock/releases/download/${GVPROXY_VERSION}/gvproxy-linux-arm64"
-          chmod +x target/libkrun-build/gvproxy
-
-      - name: Write provenance metadata
-        run: |
-          set -euo pipefail
-          cd target/libkrun-build
-          LIBKRUNFW_COMMIT="unknown"
-          if [ -d libkrunfw/.git ]; then
-            LIBKRUNFW_COMMIT=$(git -C libkrunfw rev-parse HEAD)
-          fi
-          KERNEL_VERSION="unknown"
-          if [ -f libkrunfw/Makefile ]; then
-            KERNEL_VERSION=$(grep -oE 'KERNEL_VERSION\s*=\s*linux-[^\s]+' libkrunfw/Makefile | head -1 | sed 's/.*= *//' || echo unknown)
-          fi
-          jq -n \
-            --arg artifact "vm-runtime" \
-            --arg platform "linux-aarch64" \
-            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --arg kfw_commit "$LIBKRUNFW_COMMIT" \
-            --arg kver "$KERNEL_VERSION" \
-            --arg sha "$GITHUB_SHA" \
-            --arg run "$GITHUB_RUN_ID" \
-            '{artifact: $artifact, platform: $platform, build_timestamp: $ts, libkrunfw_commit: $kfw_commit, kernel_version: $kver, github_sha: $sha, github_run_id: $run}' \
-            > provenance.json
-
       - name: Package runtime tarball
         run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          cd target/libkrun-build
-
-          # Collect the runtime files
-          mkdir -p _package
-          cp libkrun.so _package/
-          # Copy libkrunfw — find versioned .so and create soname symlink
-          for f in libkrunfw.so*; do
-            [ -f "$f" ] && cp "$f" _package/
-          done
-          if [ ! -f _package/libkrunfw.so.5 ]; then
-            versioned=$(ls _package/libkrunfw.so.5.* 2>/dev/null | head -n1)
-            [ -n "$versioned" ] && cp "$versioned" _package/libkrunfw.so.5
-          fi
-          cp gvproxy _package/
-          cp provenance.json _package/
-
-          tar -C _package -cf - . | zstd -19 -T0 -o "${GITHUB_WORKSPACE}/artifacts/vm-runtime-linux-aarch64.tar.zst"
-          echo "Packaged vm-runtime-linux-aarch64.tar.zst ($(du -sh "${GITHUB_WORKSPACE}/artifacts/vm-runtime-linux-aarch64.tar.zst" | cut -f1))"
+          tasks/scripts/vm/package-vm-runtime.sh \
+            --platform linux-aarch64 \
+            --build-dir target/libkrun-build \
+            --output artifacts/vm-runtime-linux-aarch64.tar.zst
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -143,58 +97,12 @@ jobs:
       - name: Build libkrunfw + libkrun from source
         run: tasks/scripts/vm/build-libkrun.sh
 
-      - name: Download gvproxy
-        run: |
-          set -euo pipefail
-          source crates/openshell-vm/pins.env 2>/dev/null || true
-          GVPROXY_VERSION="${GVPROXY_VERSION:-v0.8.8}"
-          curl -fsSL -o target/libkrun-build/gvproxy \
-            "https://github.com/containers/gvisor-tap-vsock/releases/download/${GVPROXY_VERSION}/gvproxy-linux-amd64"
-          chmod +x target/libkrun-build/gvproxy
-
-      - name: Write provenance metadata
-        run: |
-          set -euo pipefail
-          cd target/libkrun-build
-          LIBKRUNFW_COMMIT="unknown"
-          if [ -d libkrunfw/.git ]; then
-            LIBKRUNFW_COMMIT=$(git -C libkrunfw rev-parse HEAD)
-          fi
-          KERNEL_VERSION="unknown"
-          if [ -f libkrunfw/Makefile ]; then
-            KERNEL_VERSION=$(grep -oE 'KERNEL_VERSION\s*=\s*linux-[^\s]+' libkrunfw/Makefile | head -1 | sed 's/.*= *//' || echo unknown)
-          fi
-          jq -n \
-            --arg artifact "vm-runtime" \
-            --arg platform "linux-x86_64" \
-            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --arg kfw_commit "$LIBKRUNFW_COMMIT" \
-            --arg kver "$KERNEL_VERSION" \
-            --arg sha "$GITHUB_SHA" \
-            --arg run "$GITHUB_RUN_ID" \
-            '{artifact: $artifact, platform: $platform, build_timestamp: $ts, libkrunfw_commit: $kfw_commit, kernel_version: $kver, github_sha: $sha, github_run_id: $run}' \
-            > provenance.json
-
       - name: Package runtime tarball
         run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          cd target/libkrun-build
-
-          mkdir -p _package
-          cp libkrun.so _package/
-          for f in libkrunfw.so*; do
-            [ -f "$f" ] && cp "$f" _package/
-          done
-          if [ ! -f _package/libkrunfw.so.5 ]; then
-            versioned=$(ls _package/libkrunfw.so.5.* 2>/dev/null | head -n1)
-            [ -n "$versioned" ] && cp "$versioned" _package/libkrunfw.so.5
-          fi
-          cp gvproxy _package/
-          cp provenance.json _package/
-
-          tar -C _package -cf - . | zstd -19 -T0 -o "${GITHUB_WORKSPACE}/artifacts/vm-runtime-linux-x86_64.tar.zst"
-          echo "Packaged vm-runtime-linux-x86_64.tar.zst ($(du -sh "${GITHUB_WORKSPACE}/artifacts/vm-runtime-linux-x86_64.tar.zst" | cut -f1))"
+          tasks/scripts/vm/package-vm-runtime.sh \
+            --platform linux-x86_64 \
+            --build-dir target/libkrun-build \
+            --output artifacts/vm-runtime-linux-x86_64.tar.zst
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -229,71 +137,14 @@ jobs:
       - name: Build portable libkrun
         run: tasks/scripts/vm/build-libkrun-macos.sh
 
-      - name: Download gvproxy
-        run: |
-          set -euo pipefail
-          source crates/openshell-vm/pins.env 2>/dev/null || true
-          GVPROXY_VERSION="${GVPROXY_VERSION:-v0.8.8}"
-          mkdir -p target/libkrun-build
-          # Download the macOS (darwin) gvproxy binary for determinism
-          curl -fsSL -o target/libkrun-build/gvproxy \
-            "https://github.com/containers/gvisor-tap-vsock/releases/download/${GVPROXY_VERSION}/gvproxy-darwin"
-          chmod +x target/libkrun-build/gvproxy
-
-      - name: Write provenance metadata
-        run: |
-          set -euo pipefail
-          BUILD_DIR="target/libkrun-build"
-          CUSTOM_DIR="target/custom-runtime"
-
-          LIBKRUNFW_COMMIT="unknown"
-          if [ -f "${CUSTOM_DIR}/provenance.json" ]; then
-            LIBKRUNFW_COMMIT=$(python3 -c "import json; print(json.load(open('${CUSTOM_DIR}/provenance.json'))['libkrunfw_commit'])" 2>/dev/null || echo unknown)
-          fi
-          KERNEL_VERSION="unknown"
-          if [ -f "${CUSTOM_DIR}/provenance.json" ]; then
-            KERNEL_VERSION=$(python3 -c "import json; print(json.load(open('${CUSTOM_DIR}/provenance.json'))['kernel_version'])" 2>/dev/null || echo unknown)
-          fi
-
-          jq -n \
-            --arg artifact "vm-runtime" \
-            --arg platform "darwin-aarch64" \
-            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --arg kfw_commit "$LIBKRUNFW_COMMIT" \
-            --arg kver "$KERNEL_VERSION" \
-            --arg sha "$GITHUB_SHA" \
-            --arg run "$GITHUB_RUN_ID" \
-            '{artifact: $artifact, platform: $platform, build_timestamp: $ts, libkrunfw_commit: $kfw_commit, kernel_version: $kver, github_sha: $sha, github_run_id: $run}' \
-            > "${BUILD_DIR}/provenance.json"
-
       - name: Package runtime tarball
+        env:
+          CUSTOM_PROVENANCE_DIR: target/custom-runtime
         run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          BUILD_DIR="target/libkrun-build"
-          CUSTOM_DIR="target/custom-runtime"
-
-          mkdir -p "${BUILD_DIR}/_package"
-
-          # libkrun from portable build
-          cp "${BUILD_DIR}/libkrun.dylib" "${BUILD_DIR}/_package/"
-
-          # libkrunfw — prefer custom build, fall back to portable build dir
-          if [ -f "${BUILD_DIR}/libkrunfw.dylib" ]; then
-            cp "${BUILD_DIR}/libkrunfw.dylib" "${BUILD_DIR}/_package/"
-          elif [ -f "${CUSTOM_DIR}/libkrunfw.dylib" ]; then
-            cp "${CUSTOM_DIR}/libkrunfw.dylib" "${BUILD_DIR}/_package/"
-          fi
-          # Also copy versioned name if present
-          for f in "${BUILD_DIR}"/libkrunfw.5.dylib "${CUSTOM_DIR}"/libkrunfw.5.dylib; do
-            [ -f "$f" ] && cp "$f" "${BUILD_DIR}/_package/" && break
-          done
-
-          cp "${BUILD_DIR}/gvproxy" "${BUILD_DIR}/_package/"
-          cp "${BUILD_DIR}/provenance.json" "${BUILD_DIR}/_package/"
-
-          tar -C "${BUILD_DIR}/_package" -cf - . | zstd -19 -T0 -o "artifacts/vm-runtime-darwin-aarch64.tar.zst"
-          echo "Packaged vm-runtime-darwin-aarch64.tar.zst ($(du -sh artifacts/vm-runtime-darwin-aarch64.tar.zst | cut -f1))"
+          tasks/scripts/vm/package-vm-runtime.sh \
+            --platform darwin-aarch64 \
+            --build-dir target/libkrun-build \
+            --output artifacts/vm-runtime-darwin-aarch64.tar.zst
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

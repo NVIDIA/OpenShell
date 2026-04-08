@@ -6,26 +6,21 @@ MicroVM runtime for OpenShell, powered by [libkrun](https://github.com/container
 
 ## Quick Start
 
-Build and run the VM in one command:
-
 ```bash
+# One-time setup: download pre-built runtime (~30s)
+mise run vm:setup
+
+# Build and run the VM
 mise run vm
 ```
 
-This will:
-
-1. Compress runtime artifacts (libkrun, libkrunfw, gvproxy, rootfs)
-2. Build the `openshell-vm` binary with embedded runtime
-3. Codesign it (macOS)
-4. Build the rootfs if needed
-5. Boot the VM
-
 ## Prerequisites
 
-- **macOS (Apple Silicon)** or **Linux (aarch64 with KVM)**
+- **macOS (Apple Silicon)** or **Linux (aarch64 or x86_64 with KVM)**
 - Rust toolchain
 - [mise](https://mise.jdx.dev/) task runner
 - Docker (for rootfs builds)
+- `gh` CLI (for downloading pre-built runtime)
 
 ### macOS-Specific
 
@@ -35,39 +30,53 @@ The binary must be codesigned with the Hypervisor.framework entitlement. The `mi
 codesign --entitlements crates/openshell-vm/entitlements.plist --force -s - target/debug/openshell-vm
 ```
 
+## Setup
+
+### Download Pre-Built Runtime (Default)
+
+Downloads libkrun, libkrunfw, and gvproxy from the `vm-dev` GitHub Release:
+
+```bash
+mise run vm:setup
+```
+
+### Build from Source
+
+Compiles the runtime from source (15-45 minutes, needed for custom kernel work):
+
+```bash
+FROM_SOURCE=1 mise run vm:setup
+```
+
+On macOS this builds a custom libkrunfw (kernel firmware with bridge/netfilter support) via `krunvm`, then builds a portable libkrun. On Linux it builds both natively.
+
 ## Build
 
-### Embedded Binary (Recommended)
-
-Produces a single self-extracting binary with all runtime artifacts baked in:
-
-```bash
-mise run vm:build:embedded
-```
-
-On first run, the binary extracts its runtime to `~/.local/share/openshell/vm-runtime/<version>/`.
-
-### Quick Rebuild (Skip Rootfs)
-
-If you already have a cached rootfs tarball and just want to rebuild the binary:
-
-```bash
-mise run vm:build:embedded:quick
-```
-
-### Force Full Rebuild
-
-Rebuilds everything including the rootfs:
+Build the openshell-vm binary with embedded runtime:
 
 ```bash
 mise run vm:build
+```
+
+This compresses runtime artifacts, compiles the Rust binary with `include_bytes!()` embedding, codesigns it (macOS), and stages the sidecar runtime bundle.
+
+## Rootfs
+
+The rootfs is an Ubuntu filesystem containing k3s, pre-loaded container images, and the OpenShell binaries. Build it with:
+
+```bash
+# Base rootfs (~200-300MB, cold starts in ~30-60s)
+mise run vm:rootfs -- --base
+
+# Full rootfs (~2GB+, pre-initialized, boots in ~3-5s)
+mise run vm:rootfs
 ```
 
 ## Run
 
 ### Default (Gateway Mode)
 
-Boots the full OpenShell gateway --- k3s + openshell-server + openshell-sandbox:
+Boots the full OpenShell gateway -- k3s + openshell-server + openshell-sandbox:
 
 ```bash
 mise run vm
@@ -131,56 +140,58 @@ Subcommands:
   exec                     Execute a command inside a running VM
 ```
 
-## Rootfs
+## mise Tasks Reference
 
-The rootfs is an aarch64 Ubuntu filesystem containing k3s, pre-loaded container images, and the OpenShell binaries.
+| Task | Description |
+|------|-------------|
+| `vm` | Build and run the VM |
+| `vm:build` | Build openshell-vm binary with embedded runtime |
+| `vm:setup` | One-time setup: download (or build) the VM runtime |
+| `vm:rootfs` | Build the VM rootfs tarball (`-- --base` for lightweight) |
+| `vm:clean` | Remove all VM cached artifacts |
+| `e2e:vm` | Boot VM and run smoke e2e tests |
 
-### Full Rootfs (~2GB+)
-
-Pre-initialized k3s cluster state for fast boot (~3-5s):
-
-```bash
-mise run vm:build:rootfs-tarball
-```
-
-### Minimal Rootfs (~200-300MB)
-
-Just k3s + supervisor, cold starts in ~30-60s:
+### Common Workflows
 
 ```bash
-mise run vm:build:rootfs-tarball:base
+# First time setup
+mise run vm:setup              # download pre-built runtime (~30s)
+mise run vm                    # build + run
+
+# Day-to-day iteration
+mise run vm                    # incremental build + run
+
+# Need fresh rootfs
+mise run vm:rootfs -- --base   # rebuild base rootfs
+mise run vm:build              # rebuild binary with new rootfs
+
+# Something broken, start over
+mise run vm:clean              # wipe everything
+mise run vm:setup              # re-download runtime
+mise run vm                    # full rebuild + run
+
+# Custom kernel work (rare)
+FROM_SOURCE=1 mise run vm:setup
 ```
-
-## Custom Kernel (libkrunfw)
-
-The stock libkrunfw (e.g. from Homebrew) lacks bridge, netfilter, and conntrack support needed for pod networking. OpenShell builds a custom libkrunfw with these enabled.
-
-Build it:
-
-```bash
-mise run vm:runtime:build-libkrunfw
-```
-
-See [`runtime/README.md`](runtime/README.md) for details on the kernel config and troubleshooting.
 
 ## Architecture
 
 ```
 Host (macOS / Linux)
   openshell-vm binary
-    ├── Embedded runtime (libkrun, libkrunfw, gvproxy, rootfs.tar.zst)
-    ├── FFI: loads libkrun at runtime via dlopen
-    ├── gvproxy: virtio-net networking (real eth0 + DHCP)
-    ├── virtio-fs: shares rootfs with guest
-    └── vsock: host-to-guest command execution (port 10777)
+    |-- Embedded runtime (libkrun, libkrunfw, gvproxy, rootfs.tar.zst)
+    |-- FFI: loads libkrun at runtime via dlopen
+    |-- gvproxy: virtio-net networking (real eth0 + DHCP)
+    |-- virtio-fs: shares rootfs with guest
+    \-- vsock: host-to-guest command execution (port 10777)
 
 Guest VM (aarch64 Linux)
   PID 1: openshell-vm-init.sh
-    ├── Mounts filesystems, configures networking
-    ├── Sets up bridge CNI, generates PKI
-    └── Execs k3s server
-        ├── openshell-server (gateway control plane)
-        └── openshell-sandbox (pod supervisor)
+    |-- Mounts filesystems, configures networking
+    |-- Sets up bridge CNI, generates PKI
+    \-- Execs k3s server
+        |-- openshell-server (gateway control plane)
+        \-- openshell-sandbox (pod supervisor)
 ```
 
 ## Environment Variables
@@ -190,23 +201,19 @@ Guest VM (aarch64 Linux)
 | `OPENSHELL_VM_RUNTIME_COMPRESSED_DIR` | Build time | Path to compressed runtime artifacts |
 | `OPENSHELL_VM_RUNTIME_DIR` | Runtime | Override the runtime bundle directory |
 | `OPENSHELL_VM_DIAG=1` | Runtime | Enable diagnostic output inside the VM |
+| `FROM_SOURCE=1` | `vm:setup` | Build runtime from source instead of downloading |
 
-## mise Tasks Reference
+## Custom Kernel (libkrunfw)
 
-| Task | Description |
-|------|-------------|
-| `vm` | Build and run the VM using a per-instance rootfs |
-| `vm:build` | Force full rebuild including rootfs |
-| `vm:rootfs` | Prepare the default named VM rootfs |
-| `vm:build:embedded` | Build single binary with embedded runtime |
-| `vm:build:embedded:quick` | Build using cached rootfs tarball |
-| `vm:build:rootfs-tarball` | Build full rootfs tarball |
-| `vm:build:rootfs-tarball:base` | Build base rootfs tarball |
-| `vm:runtime:compress` | Compress runtime artifacts for embedding |
-| `vm:runtime:build-libkrunfw` | Build custom libkrunfw |
-| `vm:runtime:build-libkrun` | Build libkrun from source (Linux) |
-| `vm:runtime:build-libkrun-macos` | Build libkrun from source (macOS) |
-| `vm:check-capabilities` | Check VM kernel capabilities |
+The stock libkrunfw (e.g. from Homebrew) lacks bridge, netfilter, and conntrack support needed for pod networking. OpenShell builds a custom libkrunfw with these enabled.
+
+Build it via the setup command:
+
+```bash
+FROM_SOURCE=1 mise run vm:setup
+```
+
+See [`runtime/README.md`](runtime/README.md) for details on the kernel config and troubleshooting.
 
 ## Testing
 
