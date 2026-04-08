@@ -12,23 +12,35 @@ permissions:
 
 jobs:
   preview:
-    # secrets is empty for fork PRs and when FERN_TOKEN is not configured,
-    # so this job is silently skipped in both cases — that is intentional.
-    if: ${{ secrets.FERN_TOKEN != '' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check Fern preview availability
+        id: fern-preview
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+        run: |
+          if [ -n "$FERN_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping Fern docs preview because FERN_TOKEN is unavailable. This is expected for fork PRs and repos without Fern preview credentials configured."
+          fi
+
       - name: Setup Node.js
+        if: ${{ steps.fern-preview.outputs.enabled == 'true' }}
         uses: actions/setup-node@v6
         with:
           node-version: "20"
 
       - name: Install Fern CLI
+        if: ${{ steps.fern-preview.outputs.enabled == 'true' }}
         run: npm install -g fern-api
 
       - name: Generate preview URL
+        if: ${{ steps.fern-preview.outputs.enabled == 'true' }}
         id: generate-docs
         env:
           FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
@@ -45,6 +57,7 @@ jobs:
           echo "preview_url=$URL" >> "$GITHUB_OUTPUT"
 
       - name: Post or update PR comment
+        if: ${{ steps.fern-preview.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
