@@ -552,6 +552,33 @@ svg.card-icon{
 .fern-docs-badge{
     border-radius: var(--rounded);
 }
+
+.explore-cards .fern-card {
+    display: flex;
+    height: 100%;
+}
+
+.explore-cards .fern-card > div,
+.explore-cards .fern-card > div > div {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    width: 100%;
+}
+
+.explore-cards .fern-card p {
+    margin-bottom: 0.75rem;
+}
+
+.explore-cards .fern-card .fern-docs-badge {
+    align-self: flex-start;
+    margin-top: auto;
+}
+
+.explore-cards .fern-card br {
+    display: none;
+}
+
 .fern-page-actions button:hover{
     background-color: transparent !important;
 }

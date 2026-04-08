@@ -8,9 +8,10 @@ navigation:
     path: ../pages/index.mdx
   - page: "Quickstart"
     path: ../pages/get-started/quickstart.mdx
+  - folder: ../pages/tutorials
+    skip-slug: true
 - folder: ../pages/about
   title: "About NVIDIA OpenShell"
-- folder: ../pages/tutorials
 - folder: ../pages/sandboxes
 - folder: ../pages/inference
   title: "Inference Routing"
