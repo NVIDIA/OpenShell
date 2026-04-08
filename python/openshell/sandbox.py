@@ -44,6 +44,61 @@ class SandboxRef:
 
 
 @dataclass(frozen=True)
+class SandboxFull:
+    id: str
+    name: str
+    namespace: str
+    phase: int
+    spec: object  # datamodel_pb2.SandboxSpec
+    status: object  # datamodel_pb2.SandboxStatus
+    created_at_ms: int
+    current_policy_version: int
+
+
+@dataclass(frozen=True)
+class ProviderRef:
+    id: str
+    name: str
+    type: str
+    config: dict[str, str]
+
+
+@dataclass(frozen=True)
+class DraftChunkRef:
+    id: str
+    status: str
+    rule_name: str
+    binary: str
+    rationale: str
+    security_notes: str
+    confidence: float
+    hit_count: int
+    endpoints: list[object]  # list of NetworkEndpoint proto messages
+
+
+@dataclass(frozen=True)
+class DraftPolicyResult:
+    chunks: list[DraftChunkRef]
+    rolling_summary: str
+    draft_version: int
+    last_analyzed_at_ms: int
+
+
+@dataclass(frozen=True)
+class PolicyUpdateResult:
+    version: int
+    policy_hash: str
+
+
+@dataclass(frozen=True)
+class ApproveAllResult:
+    version: int
+    policy_hash: str
+    chunks_approved: int
+    chunks_skipped: int
+
+
+@dataclass(frozen=True)
 class ExecChunk:
     stream: str
     data: bytes
@@ -231,6 +286,194 @@ class SandboxClient:
             timeout=self._timeout,
         )
         return bool(response.deleted)
+
+    def get_full(self, sandbox_name: str) -> SandboxFull:
+        response = self._stub.GetSandbox(
+            openshell_pb2.GetSandboxRequest(name=sandbox_name),
+            timeout=self._timeout,
+        )
+        sb = response.sandbox
+        return SandboxFull(
+            id=sb.id,
+            name=sb.name,
+            namespace=sb.namespace,
+            phase=sb.phase,
+            spec=sb.spec,
+            status=sb.status,
+            created_at_ms=sb.created_at_ms,
+            current_policy_version=sb.current_policy_version,
+        )
+
+    # ------------------------------------------------------------------
+    # Provider CRUD
+    # ------------------------------------------------------------------
+
+    def create_provider(
+        self,
+        *,
+        name: str,
+        provider_type: str,
+        credentials: dict[str, str] | None = None,
+        config: dict[str, str] | None = None,
+    ) -> ProviderRef:
+        provider = datamodel_pb2.Provider(
+            name=name,
+            type=provider_type,
+            credentials=credentials or {},
+            config=config or {},
+        )
+        response = self._stub.CreateProvider(
+            openshell_pb2.CreateProviderRequest(provider=provider),
+            timeout=self._timeout,
+        )
+        return _provider_ref(response.provider)
+
+    def get_provider(self, name: str) -> ProviderRef:
+        response = self._stub.GetProvider(
+            openshell_pb2.GetProviderRequest(name=name),
+            timeout=self._timeout,
+        )
+        return _provider_ref(response.provider)
+
+    def list_providers(
+        self, *, limit: int = 100, offset: int = 0
+    ) -> builtins.list[ProviderRef]:
+        response = self._stub.ListProviders(
+            openshell_pb2.ListProvidersRequest(limit=limit, offset=offset),
+            timeout=self._timeout,
+        )
+        return [_provider_ref(p) for p in response.providers]
+
+    def update_provider(
+        self,
+        *,
+        name: str,
+        provider_type: str,
+        credentials: dict[str, str] | None = None,
+        config: dict[str, str] | None = None,
+    ) -> ProviderRef:
+        provider = datamodel_pb2.Provider(
+            name=name,
+            type=provider_type,
+            credentials=credentials or {},
+            config=config or {},
+        )
+        response = self._stub.UpdateProvider(
+            openshell_pb2.UpdateProviderRequest(provider=provider),
+            timeout=self._timeout,
+        )
+        return _provider_ref(response.provider)
+
+    def delete_provider(self, name: str) -> bool:
+        response = self._stub.DeleteProvider(
+            openshell_pb2.DeleteProviderRequest(name=name),
+            timeout=self._timeout,
+        )
+        return bool(response.deleted)
+
+    # ------------------------------------------------------------------
+    # Draft policy recommendations
+    # ------------------------------------------------------------------
+
+    def get_draft_policy(
+        self,
+        sandbox_name: str,
+        *,
+        status_filter: str = "",
+    ) -> DraftPolicyResult:
+        response = self._stub.GetDraftPolicy(
+            openshell_pb2.GetDraftPolicyRequest(
+                name=sandbox_name,
+                status_filter=status_filter,
+            ),
+            timeout=self._timeout,
+        )
+        return DraftPolicyResult(
+            chunks=[_draft_chunk_ref(c) for c in response.chunks],
+            rolling_summary=response.rolling_summary,
+            draft_version=response.draft_version,
+            last_analyzed_at_ms=response.last_analyzed_at_ms,
+        )
+
+    def approve_draft_chunk(
+        self,
+        sandbox_name: str,
+        chunk_id: str,
+    ) -> PolicyUpdateResult:
+        response = self._stub.ApproveDraftChunk(
+            openshell_pb2.ApproveDraftChunkRequest(
+                name=sandbox_name,
+                chunk_id=chunk_id,
+            ),
+            timeout=self._timeout,
+        )
+        return PolicyUpdateResult(
+            version=response.policy_version,
+            policy_hash=response.policy_hash,
+        )
+
+    def reject_draft_chunk(
+        self,
+        sandbox_name: str,
+        chunk_id: str,
+        *,
+        reason: str = "",
+    ) -> None:
+        self._stub.RejectDraftChunk(
+            openshell_pb2.RejectDraftChunkRequest(
+                name=sandbox_name,
+                chunk_id=chunk_id,
+                reason=reason,
+            ),
+            timeout=self._timeout,
+        )
+
+    def approve_all_draft_chunks(
+        self,
+        sandbox_name: str,
+        *,
+        include_security_flagged: bool = False,
+    ) -> ApproveAllResult:
+        response = self._stub.ApproveAllDraftChunks(
+            openshell_pb2.ApproveAllDraftChunksRequest(
+                name=sandbox_name,
+                include_security_flagged=include_security_flagged,
+            ),
+            timeout=self._timeout,
+        )
+        return ApproveAllResult(
+            version=response.policy_version,
+            policy_hash=response.policy_hash,
+            chunks_approved=response.chunks_approved,
+            chunks_skipped=response.chunks_skipped,
+        )
+
+    # ------------------------------------------------------------------
+    # Policy updates
+    # ------------------------------------------------------------------
+
+    def update_config(
+        self,
+        sandbox_name: str,
+        policy: object,
+    ) -> PolicyUpdateResult:
+        from ._proto import sandbox_pb2  # noqa: local import to avoid circular
+
+        if not isinstance(policy, sandbox_pb2.SandboxPolicy):
+            raise TypeError(
+                f"policy must be a SandboxPolicy proto message, got {type(policy)}"
+            )
+        response = self._stub.UpdateConfig(
+            openshell_pb2.UpdateConfigRequest(
+                name=sandbox_name,
+                policy=policy,
+            ),
+            timeout=self._timeout,
+        )
+        return PolicyUpdateResult(
+            version=response.version,
+            policy_hash=response.policy_hash,
+        )
 
     def wait_deleted(self, sandbox_name: str, *, timeout_seconds: float = 60.0) -> None:
         deadline = time.time() + timeout_seconds
@@ -582,6 +825,29 @@ def _sandbox_ref(sandbox: datamodel_pb2.Sandbox) -> SandboxRef:
         name=sandbox.name,
         namespace=sandbox.namespace,
         phase=sandbox.phase,
+    )
+
+
+def _provider_ref(provider: datamodel_pb2.Provider) -> ProviderRef:
+    return ProviderRef(
+        id=provider.id,
+        name=provider.name,
+        type=provider.type,
+        config=dict(provider.config),
+    )
+
+
+def _draft_chunk_ref(chunk: object) -> DraftChunkRef:
+    return DraftChunkRef(
+        id=chunk.id,
+        status=chunk.status,
+        rule_name=chunk.rule_name,
+        binary=chunk.binary,
+        rationale=chunk.rationale,
+        security_notes=chunk.security_notes,
+        confidence=chunk.confidence,
+        hit_count=chunk.hit_count,
+        endpoints=list(chunk.proposed_rule.endpoints) if chunk.proposed_rule else [],
     )
 
 
