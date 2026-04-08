@@ -40,6 +40,7 @@ RUN . cross-build.sh && install_cross_toolchain && install_sccache && add_rust_t
 COPY Cargo.toml Cargo.lock ./
 COPY crates/openshell-cli/Cargo.toml crates/openshell-cli/Cargo.toml
 COPY crates/openshell-core/Cargo.toml crates/openshell-core/Cargo.toml
+COPY crates/openshell-ocsf/Cargo.toml crates/openshell-ocsf/Cargo.toml
 COPY crates/openshell-providers/Cargo.toml crates/openshell-providers/Cargo.toml
 COPY crates/openshell-router/Cargo.toml crates/openshell-router/Cargo.toml
 COPY crates/openshell-sandbox/Cargo.toml crates/openshell-sandbox/Cargo.toml
@@ -49,11 +50,12 @@ COPY crates/openshell-core/build.rs crates/openshell-core/build.rs
 COPY proto/ proto/
 
 # Create dummy source files to build dependencies.
-RUN mkdir -p crates/openshell-cli/src crates/openshell-core/src crates/openshell-providers/src crates/openshell-router/src crates/openshell-sandbox/src crates/openshell-server/src crates/openshell-bootstrap/src && \
+RUN mkdir -p crates/openshell-cli/src crates/openshell-core/src crates/openshell-ocsf/src crates/openshell-providers/src crates/openshell-router/src crates/openshell-sandbox/src crates/openshell-server/src crates/openshell-bootstrap/src && \
     echo "fn main() {}" > crates/openshell-cli/src/main.rs && \
     echo "fn main() {}" > crates/openshell-sandbox/src/main.rs && \
     echo "fn main() {}" > crates/openshell-server/src/main.rs && \
     touch crates/openshell-core/src/lib.rs && \
+    touch crates/openshell-ocsf/src/lib.rs && \
     touch crates/openshell-providers/src/lib.rs && \
     touch crates/openshell-router/src/lib.rs && \
     touch crates/openshell-bootstrap/src/lib.rs

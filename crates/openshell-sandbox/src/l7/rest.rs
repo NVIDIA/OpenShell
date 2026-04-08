@@ -309,10 +309,30 @@ where
     if matches!(outcome, RelayOutcome::Upgraded { .. }) {
         let header_str = String::from_utf8_lossy(&req.raw_header[..header_end]);
         if !client_requested_upgrade(&header_str) {
-            warn!(
-                method = %req.action,
-                target = %req.target,
-                "upstream sent unsolicited 101 without client Upgrade request — closing connection"
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
+                    .activity(openshell_ocsf::ActivityId::Open)
+                    .action(openshell_ocsf::ActionId::Denied)
+                    .disposition(openshell_ocsf::DispositionId::Blocked)
+                    .severity(openshell_ocsf::SeverityId::High)
+                    .confidence(openshell_ocsf::ConfidenceId::High)
+                    .is_alert(true)
+                    .finding_info(
+                        openshell_ocsf::FindingInfo::new(
+                            "unsolicited-101-upgrade",
+                            "Unsolicited 101 Switching Protocols",
+                        )
+                        .with_desc(&format!(
+                            "Upstream sent 101 without client Upgrade request for {} {} — \
+                             possible L7 inspection bypass. Connection closed.",
+                            req.action, req.target,
+                        )),
+                    )
+                    .message(format!(
+                        "Unsolicited 101 upgrade blocked: {} {}",
+                        req.action, req.target,
+                    ))
+                    .build()
             );
             return Ok(RelayOutcome::Consumed);
         }

@@ -10,6 +10,10 @@ use crate::opa::{NetworkAction, OpaEngine};
 use crate::policy::ProxyPolicy;
 use crate::secrets::{SecretResolver, rewrite_header_line};
 use miette::{IntoDiagnostic, Result};
+use openshell_ocsf::{
+    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
+    NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
+};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
@@ -156,7 +160,16 @@ impl ProxyHandle {
 
         let listener = TcpListener::bind(http_addr).await.into_diagnostic()?;
         let local_addr = listener.local_addr().into_diagnostic()?;
-        info!(addr = %local_addr, "Proxy listening (tcp)");
+        {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Listen)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .dst_endpoint(Endpoint::from_ip(local_addr.ip(), local_addr.port()))
+                .message(format!("Proxy listening on {local_addr}"))
+                .build();
+            ocsf_emit!(event);
+        }
 
         let join = tokio::spawn(async move {
             loop {
@@ -175,12 +188,24 @@ impl ProxyHandle {
                             )
                             .await
                             {
-                                warn!(error = %err, "Proxy connection error");
+                                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                                    .activity(ActivityId::Fail)
+                                    .severity(SeverityId::Low)
+                                    .status(StatusId::Failure)
+                                    .message(format!("Proxy connection error: {err}"))
+                                    .build();
+                                ocsf_emit!(event);
                             }
                         });
                     }
                     Err(err) => {
-                        warn!(error = %err, "Proxy accept error");
+                        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::Low)
+                            .status(StatusId::Failure)
+                            .message(format!("Proxy accept error: {err}"))
+                            .build();
+                        ocsf_emit!(event);
                         break;
                     }
                 }
@@ -334,13 +359,23 @@ async fn handle_tcp_connection(
         )
         .await?;
         if let InferenceOutcome::Denied { reason } = outcome {
-            info!(action = "deny", reason = %reason, host = INFERENCE_LOCAL_HOST, "Inference interception denied");
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, port))
+                .message(format!("Inference interception denied: {reason}"))
+                .status_detail(&reason)
+                .build();
+            ocsf_emit!(event);
         }
         return Ok(());
     }
 
     let peer_addr = client.peer_addr().into_diagnostic()?;
-    let local_addr = client.local_addr().into_diagnostic()?;
+    let _local_addr = client.local_addr().into_diagnostic()?;
 
     // Evaluate OPA policy with process-identity binding.
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
@@ -402,22 +437,23 @@ async fn handle_tcp_connection(
     // Allowed connections are logged after the L7 config check (below)
     // so we can distinguish CONNECT (L4-only) from CONNECT_L7 (L7 follows).
     if matches!(decision.action, NetworkAction::Deny { .. }) {
-        info!(
-            src_addr = %peer_addr.ip(),
-            src_port = peer_addr.port(),
-            proxy_addr = %local_addr,
-            dst_host = %host_lc,
-            dst_port = port,
-            binary = %binary_str,
-            binary_pid = %pid_str,
-            ancestors = %ancestors_str,
-            cmdline = %cmdline_str,
-            action = "deny",
-            engine = "opa",
-            policy = "-",
-            reason = %deny_reason,
-            "CONNECT",
-        );
+        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+            .actor_process(
+                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                    .with_cmd_line(&cmdline_str),
+            )
+            .firewall_rule("-", "opa")
+            .message(format!("CONNECT denied {host_lc}:{port}"))
+            .status_detail(&deny_reason)
+            .build();
+        ocsf_emit!(event);
         emit_denial(
             &denial_tx,
             &host_lc,
@@ -452,12 +488,27 @@ async fn handle_tcp_connection(
                     .await
                     .into_diagnostic()?,
                 Err(reason) => {
-                    warn!(
-                        dst_host = %host_lc,
-                        dst_port = port,
-                        reason = %reason,
-                        "CONNECT blocked: allowed_ips check failed"
-                    );
+                    {
+                        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                            .activity(ActivityId::Open)
+                            .action(ActionId::Denied)
+                            .disposition(DispositionId::Blocked)
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                            .actor_process(
+                                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                    .with_cmd_line(&cmdline_str),
+                            )
+                            .firewall_rule("-", "ssrf")
+                            .message(format!(
+                                "CONNECT blocked: allowed_ips check failed for {host_lc}:{port}"
+                            ))
+                            .status_detail(&reason)
+                            .build();
+                        ocsf_emit!(event);
+                    }
                     emit_denial(
                         &denial_tx,
                         &host_lc,
@@ -472,12 +523,27 @@ async fn handle_tcp_connection(
                 }
             },
             Err(reason) => {
-                warn!(
-                    dst_host = %host_lc,
-                    dst_port = port,
-                    reason = %reason,
-                    "CONNECT blocked: invalid allowed_ips in policy"
-                );
+                {
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Open)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                        .actor_process(
+                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                .with_cmd_line(&cmdline_str),
+                        )
+                        .firewall_rule("-", "ssrf")
+                        .message(format!(
+                            "CONNECT blocked: invalid allowed_ips in policy for {host_lc}:{port}"
+                        ))
+                        .status_detail(&reason)
+                        .build();
+                    ocsf_emit!(event);
+                }
                 emit_denial(
                     &denial_tx,
                     &host_lc,
@@ -498,12 +564,27 @@ async fn handle_tcp_connection(
                 .await
                 .into_diagnostic()?,
             Err(reason) => {
-                warn!(
-                    dst_host = %host_lc,
-                    dst_port = port,
-                    reason = %reason,
-                    "CONNECT blocked: internal address"
-                );
+                {
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Open)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                        .actor_process(
+                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                .with_cmd_line(&cmdline_str),
+                        )
+                        .firewall_rule("-", "ssrf")
+                        .message(format!(
+                            "CONNECT blocked: internal address {host_lc}:{port}"
+                        ))
+                        .status_detail(&reason)
+                        .build();
+                    ocsf_emit!(event);
+                }
                 emit_denial(
                     &denial_tx,
                     &host_lc,
@@ -536,22 +617,24 @@ async fn handle_tcp_connection(
     } else {
         "CONNECT"
     };
-    info!(
-        src_addr = %peer_addr.ip(),
-        src_port = peer_addr.port(),
-        proxy_addr = %local_addr,
-        dst_host = %host_lc,
-        dst_port = port,
-        binary = %binary_str,
-        binary_pid = %pid_str,
-        ancestors = %ancestors_str,
-        cmdline = %cmdline_str,
-        action = "allow",
-        engine = "opa",
-        policy = %policy_str,
-        reason = "",
-        "{connect_msg}",
-    );
+    {
+        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+            .actor_process(
+                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                    .with_cmd_line(&cmdline_str),
+            )
+            .firewall_rule(policy_str, "opa")
+            .message(format!("{connect_msg} allowed {host_lc}:{port}"))
+            .build();
+        ocsf_emit!(event);
+    }
 
     // Determine effective TLS mode. Check the raw endpoint config for
     // `tls: skip` independently of L7 config (which requires `protocol`).
@@ -616,11 +699,19 @@ async fn handle_tcp_connection(
 
                 if let Some(ref l7_config) = l7_config {
                     // L7 inspection on terminated TLS traffic.
-                    let tunnel_engine =
-                        opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
-                            warn!(error = %e, "Failed to clone OPA engine for L7, falling back to relay-only");
-                            regorus::Engine::new()
-                        });
+                    let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
+                        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::Low)
+                            .status(StatusId::Failure)
+                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                            .message(format!(
+                                "Failed to clone OPA engine for L7, falling back to relay-only: {e}"
+                            ))
+                            .build();
+                        ocsf_emit!(event);
+                        regorus::Engine::new()
+                    });
                     crate::l7::relay::relay_with_inspection(
                         l7_config,
                         std::sync::Mutex::new(tunnel_engine),
@@ -648,20 +739,29 @@ async fn handle_tcp_connection(
                         "TLS connection closed"
                     );
                 } else {
-                    warn!(
-                        host = %host_lc,
-                        port = port,
-                        error = %e,
-                        "TLS relay error"
-                    );
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .message(format!("TLS relay error: {e}"))
+                        .build();
+                    ocsf_emit!(event);
                 }
             }
         } else {
-            warn!(
-                host = %host_lc,
-                port = port,
-                "TLS detected but TLS state not configured, falling back to raw tunnel"
-            );
+            {
+                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Fail)
+                    .severity(SeverityId::Low)
+                    .status(StatusId::Failure)
+                    .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                    .message(format!(
+                        "TLS detected but TLS state not configured for {host_lc}:{port}, falling back to raw tunnel"
+                    ))
+                    .build();
+                ocsf_emit!(event);
+            }
             let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
                 .await
                 .into_diagnostic()?;
@@ -670,7 +770,16 @@ async fn handle_tcp_connection(
         // Plaintext HTTP detected.
         if let Some(ref l7_config) = l7_config {
             let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
-                warn!(error = %e, "Failed to clone OPA engine for L7, falling back to relay-only");
+                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Fail)
+                    .severity(SeverityId::Low)
+                    .status(StatusId::Failure)
+                    .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                    .message(format!(
+                        "Failed to clone OPA engine for L7, falling back to relay-only: {e}"
+                    ))
+                    .build();
+                ocsf_emit!(event);
                 regorus::Engine::new()
             });
             if let Err(e) = crate::l7::relay::relay_with_inspection(
@@ -685,7 +794,14 @@ async fn handle_tcp_connection(
                 if is_benign_relay_error(&e) {
                     debug!(host = %host_lc, port = port, error = %e, "L7 connection closed");
                 } else {
-                    warn!(host = %host_lc, port = port, error = %e, "L7 relay error");
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .message(format!("L7 relay error: {e}"))
+                        .build();
+                    ocsf_emit!(event);
                 }
             }
         } else {
@@ -700,7 +816,14 @@ async fn handle_tcp_connection(
                 if is_benign_relay_error(&e) {
                     debug!(host = %host_lc, port = port, error = %e, "HTTP relay closed");
                 } else {
-                    warn!(host = %host_lc, port = port, error = %e, "HTTP relay error");
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .message(format!("HTTP relay error: {e}"))
+                        .build();
+                    ocsf_emit!(event);
                 }
             }
         }
@@ -881,7 +1004,7 @@ const INITIAL_INFERENCE_BUF: usize = 65536;
 async fn handle_inference_interception(
     client: TcpStream,
     host: &str,
-    _port: u16,
+    port: u16,
     tls_state: Option<&Arc<ProxyTlsState>>,
     inference_ctx: Option<&Arc<InferenceContext>>,
 ) -> Result<InferenceOutcome> {
@@ -971,7 +1094,19 @@ async fn handle_inference_interception(
                 }
             }
             ParseResult::Invalid(reason) => {
-                warn!(reason = %reason, "rejecting malformed inference request");
+                {
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Refuse)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Rejected)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, port))
+                        .message(format!("Rejecting malformed inference request: {reason}"))
+                        .status_detail(&reason)
+                        .build();
+                    ocsf_emit!(event);
+                }
                 let response = format_http_response(400, &[], b"Bad Request");
                 write_all(&mut tls_client, &response).await?;
                 return Ok(InferenceOutcome::Denied { reason });
@@ -998,13 +1133,21 @@ async fn route_inference_request(
     if let Some(pattern) =
         detect_inference_pattern(&request.method, &normalized_path, &ctx.patterns)
     {
-        info!(
-            method = %request.method,
-            path = %normalized_path,
-            protocol = %pattern.protocol,
-            kind = %pattern.kind,
-            "Intercepted inference request, routing locally"
-        );
+        {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Detected)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, 443))
+                .message(format!(
+                    "Intercepted inference request, routing locally: {} {} (protocol={}, kind={})",
+                    request.method, normalized_path, pattern.protocol, pattern.kind
+                ))
+                .build();
+            ocsf_emit!(event);
+        }
 
         // Strip credential + framing/hop-by-hop headers.
         let filtered_headers = sanitize_inference_request_headers(&request.headers);
@@ -1070,14 +1213,25 @@ async fn route_inference_request(
                         }
                         Ok(Ok(None)) => break,
                         Ok(Err(e)) => {
-                            warn!(error = %e, "error reading upstream response chunk");
+                            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::Low)
+                                .status(StatusId::Failure)
+                                .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, 443))
+                                .message(format!("error reading upstream response chunk: {e}"))
+                                .build();
+                            ocsf_emit!(event);
                             break;
                         }
                         Err(_) => {
-                            warn!(
-                                idle_timeout_secs = CHUNK_IDLE_TIMEOUT.as_secs(),
-                                "streaming response chunk idle timeout, closing"
-                            );
+                            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::Low)
+                                .status(StatusId::Failure)
+                                .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, 443))
+                                .message("streaming response chunk idle timeout, closing")
+                                .build();
+                            ocsf_emit!(event);
                             break;
                         }
                     }
@@ -1087,7 +1241,18 @@ async fn route_inference_request(
                 write_all(tls_client, format_chunk_terminator()).await?;
             }
             Err(e) => {
-                warn!(error = %e, "inference endpoint detected but upstream service failed");
+                {
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, 443))
+                        .message(format!(
+                            "inference endpoint detected but upstream service failed: {e}"
+                        ))
+                        .build();
+                    ocsf_emit!(event);
+                }
                 let (status, msg) = router_error_to_http(&e);
                 let body = serde_json::json!({"error": msg});
                 let body_bytes = body.to_string();
@@ -1102,11 +1267,21 @@ async fn route_inference_request(
         Ok(true)
     } else {
         // Not an inference request — deny
-        info!(
-            method = %request.method,
-            path = %normalized_path,
-            "connection not allowed by policy"
-        );
+        {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, 443))
+                .message(format!(
+                    "connection not allowed by policy: {} {}",
+                    request.method, normalized_path
+                ))
+                .build();
+            ocsf_emit!(event);
+        }
         let body = serde_json::json!({"error": "connection not allowed by policy"});
         let body_bytes = body.to_string();
         let response = format_http_response(
@@ -1222,7 +1397,14 @@ fn query_l7_config(
         Ok(Some(val)) => crate::l7::parse_l7_config(&val),
         Ok(None) => None,
         Err(e) => {
-            warn!(error = %e, "Failed to query L7 endpoint config");
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!("Failed to query L7 endpoint config: {e}"))
+                .build();
+            ocsf_emit!(event);
             None
         }
     }
@@ -1457,12 +1639,16 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
         match parsed {
             Ok(n) => {
                 if n.prefix_len() < MIN_SAFE_PREFIX_LEN {
-                    warn!(
-                        cidr = %n,
-                        prefix_len = n.prefix_len(),
-                        "allowed_ips entry has a very broad CIDR (< /{MIN_SAFE_PREFIX_LEN}); \
-                         this may expose control-plane services on the same network"
-                    );
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Other)
+                        .severity(SeverityId::Medium)
+                        .message(format!(
+                            "allowed_ips entry has a very broad CIDR {n} (/{}) < /{MIN_SAFE_PREFIX_LEN}; \
+                             this may expose control-plane services on the same network",
+                            n.prefix_len()
+                        ))
+                        .build();
+                    ocsf_emit!(event);
                 }
                 nets.push(n);
             }
@@ -1505,7 +1691,16 @@ fn query_allowed_ips(
     match engine.query_allowed_ips(&input) {
         Ok(ips) => ips,
         Err(e) => {
-            warn!(error = %e, "Failed to query allowed_ips from endpoint config");
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!(
+                    "Failed to query allowed_ips from endpoint config: {e}"
+                ))
+                .build();
+            ocsf_emit!(event);
             vec![]
         }
     }
@@ -1754,7 +1949,13 @@ async fn handle_forward_proxy(
     let (scheme, host, port, path) = match parse_proxy_uri(target_uri) {
         Ok(parsed) => parsed,
         Err(e) => {
-            warn!(target_uri = %target_uri, error = %e, "FORWARD parse error");
+            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .message(format!("FORWARD parse error for {target_uri}: {e}"))
+                .build();
+            ocsf_emit!(event);
             respond(client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
             return Ok(());
         }
@@ -1763,11 +1964,20 @@ async fn handle_forward_proxy(
 
     // 2. Reject HTTPS — must use CONNECT for TLS
     if scheme == "https" {
-        info!(
-            dst_host = %host_lc,
-            dst_port = port,
-            "FORWARD rejected: HTTPS requires CONNECT"
-        );
+        {
+            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Refuse)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Rejected)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .message(format!(
+                    "FORWARD rejected: HTTPS requires CONNECT for {host_lc}:{port}"
+                ))
+                .build();
+            ocsf_emit!(event);
+        }
         respond(
             client,
             b"HTTP/1.1 400 Bad Request\r\nContent-Length: 27\r\n\r\nUse CONNECT for HTTPS URLs",
@@ -1778,7 +1988,7 @@ async fn handle_forward_proxy(
 
     // 3. Evaluate OPA policy (same identity binding as CONNECT)
     let peer_addr = client.peer_addr().into_diagnostic()?;
-    let local_addr = client.local_addr().into_diagnostic()?;
+    let _local_addr = client.local_addr().into_diagnostic()?;
 
     let opa_clone = opa_engine.clone();
     let cache_clone = identity_cache.clone();
@@ -1830,24 +2040,28 @@ async fn handle_forward_proxy(
     let matched_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone(),
         NetworkAction::Deny { reason } => {
-            info!(
-                src_addr = %peer_addr.ip(),
-                src_port = peer_addr.port(),
-                proxy_addr = %local_addr,
-                dst_host = %host_lc,
-                dst_port = port,
-                method = %method,
-                path = %path,
-                binary = %binary_str,
-                binary_pid = %pid_str,
-                ancestors = %ancestors_str,
-                cmdline = %cmdline_str,
-                action = "deny",
-                engine = "opa",
-                policy = "-",
-                reason = %reason,
-                "FORWARD",
-            );
+            {
+                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .http_request(HttpRequest::new(
+                        method,
+                        OcsfUrl::new("http", &host_lc, &path, port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                    .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                    .actor_process(
+                        Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                            .with_cmd_line(&cmdline_str),
+                    )
+                    .firewall_rule("-", "opa")
+                    .message(format!("FORWARD denied {method} {host_lc}:{port}{path}"))
+                    .build();
+                ocsf_emit!(event);
+            }
             emit_denial_simple(
                 denial_tx,
                 &host_lc,
@@ -1868,10 +2082,14 @@ async fn handle_forward_proxy(
     //     connection (Connection: close), so a single evaluation suffices.
     if let Some(l7_config) = query_l7_config(&opa_engine, &decision, &host_lc, port) {
         let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
-            warn!(
-                error = %e,
-                "Failed to clone OPA engine for forward L7"
-            );
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .message(format!("Failed to clone OPA engine for forward L7: {e}"))
+                .build();
+            ocsf_emit!(event);
             regorus::Engine::new()
         });
         let engine_mutex = std::sync::Mutex::new(tunnel_engine);
@@ -1909,10 +2127,14 @@ async fn handle_forward_proxy(
         let (allowed, reason) =
             crate::l7::relay::evaluate_l7_request(&engine_mutex, &l7_ctx, &request_info)
                 .unwrap_or_else(|e| {
-                    warn!(
-                        error = %e,
-                        "L7 eval failed, denying request"
-                    );
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .message(format!("L7 eval failed, denying request: {e}"))
+                        .build();
+                    ocsf_emit!(event);
                     (false, format!("L7 evaluation error: {e}"))
                 });
 
@@ -1922,18 +2144,47 @@ async fn handle_forward_proxy(
             (false, crate::l7::EnforcementMode::Enforce) => "deny",
         };
 
-        info!(
-            dst_host = %host_lc,
-            dst_port = port,
-            method = %method,
-            path = %path,
-            binary = %binary_str,
-            policy = %policy_str,
-            l7_protocol = "rest",
-            l7_decision = decision_str,
-            l7_deny_reason = %reason,
-            "FORWARD_L7",
-        );
+        {
+            let (action_id, disposition_id, severity) = match decision_str {
+                "allow" => (
+                    ActionId::Allowed,
+                    DispositionId::Allowed,
+                    SeverityId::Informational,
+                ),
+                "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
+                "audit" => (
+                    ActionId::Allowed,
+                    DispositionId::Allowed,
+                    SeverityId::Informational,
+                ),
+                _ => (
+                    ActionId::Other,
+                    DispositionId::Other,
+                    SeverityId::Informational,
+                ),
+            };
+            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Other)
+                .action(action_id)
+                .disposition(disposition_id)
+                .severity(severity)
+                .http_request(HttpRequest::new(
+                    method,
+                    OcsfUrl::new("http", &host_lc, &path, port),
+                ))
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                .actor_process(
+                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                        .with_cmd_line(&cmdline_str),
+                )
+                .firewall_rule(policy_str, "l7")
+                .message(format!(
+                    "FORWARD_L7 {decision_str} {method} {host_lc}:{port}{path} reason={reason}"
+                ))
+                .build();
+            ocsf_emit!(event);
+        }
 
         let effectively_denied =
             !allowed && l7_config.enforcement == crate::l7::EnforcementMode::Enforce;
@@ -1970,12 +2221,30 @@ async fn handle_forward_proxy(
             Ok(nets) => match resolve_and_check_allowed_ips(&host, port, &nets).await {
                 Ok(addrs) => addrs,
                 Err(reason) => {
-                    warn!(
-                        dst_host = %host_lc,
-                        dst_port = port,
-                        reason = %reason,
-                        "FORWARD blocked: allowed_ips check failed"
-                    );
+                    {
+                        let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                            .activity(ActivityId::Other)
+                            .action(ActionId::Denied)
+                            .disposition(DispositionId::Blocked)
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .http_request(HttpRequest::new(
+                                method,
+                                OcsfUrl::new("http", &host_lc, &path, port),
+                            ))
+                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                            .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                            .actor_process(
+                                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                    .with_cmd_line(&cmdline_str),
+                            )
+                            .firewall_rule(policy_str, "ssrf")
+                            .message(format!(
+                                "FORWARD blocked: allowed_ips check failed for {host_lc}:{port}: {reason}"
+                            ))
+                            .build();
+                        ocsf_emit!(event);
+                    }
                     emit_denial_simple(
                         denial_tx,
                         &host_lc,
@@ -1990,12 +2259,30 @@ async fn handle_forward_proxy(
                 }
             },
             Err(reason) => {
-                warn!(
-                    dst_host = %host_lc,
-                    dst_port = port,
-                    reason = %reason,
-                    "FORWARD blocked: invalid allowed_ips in policy"
-                );
+                {
+                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Other)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .http_request(HttpRequest::new(
+                            method,
+                            OcsfUrl::new("http", &host_lc, &path, port),
+                        ))
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                        .actor_process(
+                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                .with_cmd_line(&cmdline_str),
+                        )
+                        .firewall_rule(policy_str, "ssrf")
+                        .message(format!(
+                            "FORWARD blocked: invalid allowed_ips in policy for {host_lc}:{port}: {reason}"
+                        ))
+                        .build();
+                    ocsf_emit!(event);
+                }
                 emit_denial_simple(
                     denial_tx,
                     &host_lc,
@@ -2014,12 +2301,30 @@ async fn handle_forward_proxy(
         match resolve_and_reject_internal(&host, port).await {
             Ok(addrs) => addrs,
             Err(reason) => {
-                warn!(
-                    dst_host = %host_lc,
-                    dst_port = port,
-                    reason = %reason,
-                    "FORWARD blocked: internal IP without allowed_ips"
-                );
+                {
+                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Other)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .http_request(HttpRequest::new(
+                            method,
+                            OcsfUrl::new("http", &host_lc, &path, port),
+                        ))
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                        .actor_process(
+                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                .with_cmd_line(&cmdline_str),
+                        )
+                        .firewall_rule(policy_str, "ssrf")
+                        .message(format!(
+                            "FORWARD blocked: internal IP without allowed_ips for {host_lc}:{port}: {reason}"
+                        ))
+                        .build();
+                    ocsf_emit!(event);
+                }
                 emit_denial_simple(
                     denial_tx,
                     &host_lc,
@@ -2039,36 +2344,53 @@ async fn handle_forward_proxy(
     let mut upstream = match TcpStream::connect(addrs.as_slice()).await {
         Ok(s) => s,
         Err(e) => {
-            warn!(
-                dst_host = %host_lc,
-                dst_port = port,
-                error = %e,
-                "FORWARD upstream connect failed"
-            );
+            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .http_request(HttpRequest::new(
+                    method,
+                    OcsfUrl::new("http", &host_lc, &path, port),
+                ))
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                .actor_process(
+                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                        .with_cmd_line(&cmdline_str),
+                )
+                .message(format!(
+                    "FORWARD upstream connect failed for {host_lc}:{port}: {e}"
+                ))
+                .build();
+            ocsf_emit!(event);
             respond(client, b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
             return Ok(());
         }
     };
 
     // Log success
-    info!(
-        src_addr = %peer_addr.ip(),
-        src_port = peer_addr.port(),
-        proxy_addr = %local_addr,
-        dst_host = %host_lc,
-        dst_port = port,
-        method = %method,
-        path = %path,
-        binary = %binary_str,
-        binary_pid = %pid_str,
-        ancestors = %ancestors_str,
-        cmdline = %cmdline_str,
-        action = "allow",
-        engine = "opa",
-        policy = %policy_str,
-        reason = "",
-        "FORWARD",
-    );
+    {
+        let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Other)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .http_request(HttpRequest::new(
+                method,
+                OcsfUrl::new("http", &host_lc, &path, port),
+            ))
+            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+            .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+            .actor_process(
+                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                    .with_cmd_line(&cmdline_str),
+            )
+            .firewall_rule(policy_str, "opa")
+            .message(format!("FORWARD allowed {method} {host_lc}:{port}{path}"))
+            .build();
+        ocsf_emit!(event);
+    }
 
     // 9. Rewrite request and forward to upstream
     let rewritten = match rewrite_forward_request(buf, used, &path, secret_resolver.as_deref()) {

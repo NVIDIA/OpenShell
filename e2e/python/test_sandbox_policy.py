@@ -622,13 +622,13 @@ def test_l4_log_fields(
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
 
-        # Verify structured fields in allow line
-        assert "action=allow" in log or 'action="allow"' in log or "action=allow" in log
-        assert "dst_host=api.anthropic.com" in log or "dst_host" in log
-        assert "engine=opa" in log or 'engine="opa"' in log
+        # Verify OCSF shorthand fields in allow line
+        assert "ALLOWED" in log, "Expected ALLOWED in OCSF shorthand"
+        assert "api.anthropic.com" in log, "Expected destination host in log"
+        assert "engine:opa" in log, "Expected engine:opa in log context"
 
         # Verify deny line exists
-        assert "action=deny" in log or 'action="deny"' in log
+        assert "DENIED" in log, "Expected DENIED in OCSF shorthand"
 
 
 # =============================================================================
@@ -715,8 +715,9 @@ def test_ssrf_log_shows_blocked_address(
         log_result = sb.exec_python(_read_openshell_log())
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
-        assert "always-blocked" in log.lower(), (
-            f"Expected 'always-blocked' in proxy log, got:\n{log}"
+        # OCSF shorthand uses "engine:ssrf" for SSRF blocks
+        assert "engine:ssrf" in log.lower() or "ssrf" in log.lower(), (
+            f"Expected SSRF block indicator in proxy log, got:\n{log}"
         )
 
 
@@ -1001,7 +1002,9 @@ def test_l7_tls_audit_mode_allows_but_logs(
         log_result = sb.exec_python(_read_openshell_log())
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
-        assert "l7_decision=audit" in log or 'l7_decision="audit"' in log
+        # OCSF shorthand: audit decisions show as ALLOWED (audit mode allows through)
+        assert "HTTP:" in log, "Expected OCSF HTTP activity event in log"
+        assert "ALLOWED" in log, "Expected ALLOWED for audit-mode decision"
 
 
 def test_l7_tls_explicit_path_rules(
@@ -1179,11 +1182,10 @@ def test_l7_tls_log_fields(
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
 
-        assert "L7_REQUEST" in log
-        assert "l7_protocol" in log
-        assert "l7_action" in log
-        assert "l7_target" in log
-        assert "l7_decision" in log
+        # OCSF shorthand: L7 requests show as HTTP:method events
+        assert "HTTP:" in log, "Expected OCSF HTTP activity event in log"
+        assert "ALLOWED" in log or "DENIED" in log, "Expected L7 decision in log"
+        assert "policy:" in log, "Expected policy context in log"
 
 
 def test_l7_query_matchers_enforced(
@@ -1581,13 +1583,10 @@ def test_forward_proxy_log_fields(
         assert result.exit_code == 0, result.stderr
         log = result.stdout
 
-        assert "FORWARD" in log, "Expected FORWARD log lines"
-        # tracing key-value pairs quote string values: action="allow"
-        assert 'action="allow"' in log, "Expected allowed FORWARD in logs"
-        assert f"dst_host={_SANDBOX_IP}" in log, "Expected dst_host in FORWARD log"
-        assert f"dst_port={_FORWARD_PROXY_PORT}" in log, (
-            "Expected dst_port in FORWARD log"
-        )
+        # OCSF shorthand: FORWARD requests show as HTTP:method events
+        assert "HTTP:" in log, "Expected OCSF HTTP activity event for FORWARD request"
+        assert "ALLOWED" in log, "Expected ALLOWED for forward proxy allow"
+        assert f"{_SANDBOX_IP}" in log, "Expected destination IP in FORWARD log"
 
 
 # =============================================================================

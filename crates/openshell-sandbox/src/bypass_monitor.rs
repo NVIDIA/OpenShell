@@ -17,10 +17,14 @@
 //! still provide fast-fail UX — the monitor only adds diagnostic visibility.
 
 use crate::denial_aggregator::DenialEvent;
+use openshell_ocsf::{
+    ActionId, ActivityId, ConfidenceId, DetectionFindingBuilder, DispositionId, Endpoint,
+    FindingInfo, NetworkActivityBuilder, Process, SeverityId, ocsf_emit,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// A parsed iptables LOG entry from `/dev/kmsg`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,10 +130,15 @@ pub fn spawn(
         .status();
 
     if !dmesg_check.is_ok_and(|s| s.success()) {
-        warn!(
-            "dmesg not available; bypass detection monitor will not run. \
-             Bypass REJECT rules still provide fast-fail behavior."
-        );
+        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Other)
+            .severity(SeverityId::Low)
+            .message(
+                "dmesg not available; bypass detection monitor will not run. \
+                 Bypass REJECT rules still provide fast-fail behavior.",
+            )
+            .build();
+        ocsf_emit!(event);
         return None;
     }
 
@@ -149,7 +158,14 @@ pub fn spawn(
         {
             Ok(c) => c,
             Err(e) => {
-                warn!(error = %e, "Failed to start dmesg --follow; bypass monitor will not run");
+                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .severity(SeverityId::Low)
+                    .message(format!(
+                        "Failed to start dmesg --follow; bypass monitor will not run: {e}"
+                    ))
+                    .build();
+                ocsf_emit!(event);
                 return;
             }
         };
@@ -157,7 +173,12 @@ pub fn spawn(
         let stdout = match child.stdout.take() {
             Some(s) => s,
             None => {
-                warn!("dmesg --follow produced no stdout; bypass monitor will not run");
+                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .severity(SeverityId::Low)
+                    .message("dmesg --follow produced no stdout; bypass monitor will not run")
+                    .build();
+                ocsf_emit!(event);
                 return;
             }
         };
@@ -186,19 +207,59 @@ pub fn spawn(
                 };
 
             let hint = hint_for_event(&event);
+            let reason = "direct connection bypassed HTTP CONNECT proxy";
 
-            warn!(
-                dst_addr = %event.dst_addr,
-                dst_port = event.dst_port,
-                proto = %event.proto,
-                binary = %binary,
-                binary_pid = %binary_pid,
-                ancestors = %ancestors,
-                action = "reject",
-                reason = "direct connection bypassed HTTP CONNECT proxy",
-                hint = hint,
-                "BYPASS_DETECT",
-            );
+            // Dual-emit: Network Activity [4001] + Detection Finding [2004]
+            {
+                let dst_ep = if let Ok(ip) = event.dst_addr.parse::<std::net::IpAddr>() {
+                    Endpoint::from_ip(ip, event.dst_port)
+                } else {
+                    Endpoint::from_domain(&event.dst_addr, event.dst_port)
+                };
+
+                let net_event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Refuse)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Medium)
+                    .dst_endpoint(dst_ep.clone())
+                    .actor_process(Process::from_bypass(&binary, &binary_pid, &ancestors))
+                    .firewall_rule("bypass-detect", "iptables")
+                    .observation_point(3)
+                    .message(format!(
+                        "BYPASS_DETECT {}:{} proto={} binary={binary} action=reject reason={reason}",
+                        event.dst_addr, event.dst_port, event.proto,
+                    ))
+                    .build();
+                ocsf_emit!(net_event);
+
+                let finding_event = DetectionFindingBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Open)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Medium)
+                    .is_alert(true)
+                    .confidence(ConfidenceId::High)
+                    .finding_info(
+                        FindingInfo::new("bypass-detect", "Proxy Bypass Detected")
+                            .with_desc(reason),
+                    )
+                    .remediation(hint)
+                    .evidence_pairs(&[
+                        ("dst_addr", &event.dst_addr),
+                        ("dst_port", &event.dst_port.to_string()),
+                        ("proto", &event.proto),
+                        ("binary", &binary),
+                        ("binary_pid", &binary_pid),
+                        ("ancestors", &ancestors),
+                    ])
+                    .message(format!(
+                        "BYPASS_DETECT {}:{} proto={} binary={binary} hint={hint}",
+                        event.dst_addr, event.dst_port, event.proto,
+                    ))
+                    .build();
+                ocsf_emit!(finding_event);
+            }
 
             // Send to denial aggregator if available.
             if let Some(ref tx) = denial_tx {

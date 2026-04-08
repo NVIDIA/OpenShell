@@ -91,17 +91,27 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let tls = match get_object_str(val, "tls").as_deref() {
         Some("skip") => TlsMode::Skip,
         Some("terminate") => {
-            tracing::warn!(
-                "'tls: terminate' is deprecated; TLS termination is now automatic. \
-                 Use 'tls: skip' to explicitly disable. This field will be removed in a future version."
-            );
+            let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(openshell_ocsf::ActivityId::Other)
+                .severity(openshell_ocsf::SeverityId::Medium)
+                .message(
+                    "'tls: terminate' is deprecated; TLS termination is now automatic. \
+                     Use 'tls: skip' to explicitly disable. This field will be removed in a future version.",
+                )
+                .build();
+            openshell_ocsf::ocsf_emit!(event);
             TlsMode::Auto
         }
         Some("passthrough") => {
-            tracing::warn!(
-                "'tls: passthrough' is deprecated; TLS termination is now automatic. \
-                 Use 'tls: skip' to explicitly disable. This field will be removed in a future version."
-            );
+            let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(openshell_ocsf::ActivityId::Other)
+                .severity(openshell_ocsf::SeverityId::Medium)
+                .message(
+                    "'tls: passthrough' is deprecated; TLS termination is now automatic. \
+                     Use 'tls: skip' to explicitly disable. This field will be removed in a future version.",
+                )
+                .build();
+            openshell_ocsf::ocsf_emit!(event);
             TlsMode::Auto
         }
         _ => TlsMode::Auto,

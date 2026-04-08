@@ -11,6 +11,10 @@ use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::secrets::{self, SecretResolver};
 use miette::{IntoDiagnostic, Result, miette};
+use openshell_ocsf::{
+    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
+    NetworkActivityBuilder, SeverityId, Url as OcsfUrl, ocsf_emit,
+};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, warn};
@@ -55,11 +59,15 @@ where
         L7Protocol::Rest => relay_rest(config, &engine, client, upstream, ctx).await,
         L7Protocol::Sql => {
             // SQL provider is Phase 3 — fall through to passthrough with warning
-            warn!(
-                host = %ctx.host,
-                port = ctx.port,
-                "SQL L7 provider not yet implemented, falling back to passthrough"
-            );
+            {
+                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .severity(SeverityId::Low)
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .message("SQL L7 provider not yet implemented, falling back to passthrough")
+                    .build();
+                ocsf_emit!(event);
+            }
             tokio::io::copy_bidirectional(client, upstream)
                 .await
                 .into_diagnostic()?;
@@ -85,12 +93,18 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    info!(
-        host = %host,
-        port = port,
-        overflow_bytes = overflow.len(),
-        "101 Switching Protocols — switching to raw bidirectional relay \
-         (L7 enforcement no longer active)"
+    ocsf_emit!(
+        NetworkActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Other)
+            .activity_name("Upgrade")
+            .severity(SeverityId::Informational)
+            .dst_endpoint(Endpoint::from_domain(host, port))
+            .message(format!(
+                "101 Switching Protocols — raw bidirectional relay (L7 enforcement no longer active) \
+                 [host:{host} port:{port} overflow_bytes:{}]",
+                overflow.len()
+            ))
+            .build()
     );
     if !overflow.is_empty() {
         client.write_all(&overflow).await.into_diagnostic()?;
@@ -128,12 +142,13 @@ where
                         "L7 connection closed"
                     );
                 } else {
-                    warn!(
-                        host = %ctx.host,
-                        port = ctx.port,
-                        error = %e,
-                        "HTTP parse error in L7 relay"
-                    );
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                        .message(format!("HTTP parse error in L7 relay: {e}"))
+                        .build();
+                    ocsf_emit!(event);
                 }
                 return Ok(()); // Close connection on parse error
             }
@@ -191,19 +206,45 @@ where
             (false, EnforcementMode::Enforce, _) => "deny",
         };
 
-        // Log every L7 decision (using redacted target — never log real secrets)
-        info!(
-            dst_host = %ctx.host,
-            dst_port = ctx.port,
-            policy = %ctx.policy_name,
-            l7_protocol = "rest",
-            l7_action = %request_info.action,
-            l7_target = %redacted_target,
-            l7_query_params = ?request_info.query_params,
-            l7_decision = decision_str,
-            l7_deny_reason = %reason,
-            "L7_REQUEST",
-        );
+        // Log every L7 decision as an OCSF HTTP Activity event.
+        // Uses redacted_target (path only, no query params) to avoid logging secrets.
+        {
+            let (action_id, disposition_id, severity) = match decision_str {
+                "allow" => (
+                    ActionId::Allowed,
+                    DispositionId::Allowed,
+                    SeverityId::Informational,
+                ),
+                "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
+                "audit" => (
+                    ActionId::Allowed,
+                    DispositionId::Allowed,
+                    SeverityId::Informational,
+                ),
+                _ => (
+                    ActionId::Other,
+                    DispositionId::Other,
+                    SeverityId::Informational,
+                ),
+            };
+            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Other)
+                .action(action_id)
+                .disposition(disposition_id)
+                .severity(severity)
+                .http_request(HttpRequest::new(
+                    &request_info.action,
+                    OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
+                ))
+                .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                .firewall_rule(&ctx.policy_name, "l7")
+                .message(format!(
+                    "L7_REQUEST {decision_str} {} {}:{}{} reason={}",
+                    request_info.action, ctx.host, ctx.port, redacted_target, reason,
+                ))
+                .build();
+            ocsf_emit!(event);
+        }
 
         // Store the resolved target for the deny response redaction
         let _ = &eval_target;
@@ -373,17 +414,27 @@ where
             req.target.clone()
         };
 
-        // Log for observability (using redacted target — never log real secrets).
+        // Log for observability via OCSF HTTP Activity event.
+        // Uses redacted_target (path only, no query params) to avoid logging secrets.
         let has_creds = resolver.is_some();
-        info!(
-            host = %ctx.host,
-            port = ctx.port,
-            method = %req.action,
-            path = %redacted_target,
-            credentials_injected = has_creds,
-            request_num = request_count,
-            "HTTP_REQUEST",
-        );
+        {
+            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Other)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .severity(SeverityId::Informational)
+                .http_request(HttpRequest::new(
+                    &req.action,
+                    OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
+                ))
+                .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                .message(format!(
+                    "HTTP_REQUEST {} {}:{}{} credentials_injected={has_creds} request_num={request_count}",
+                    req.action, ctx.host, ctx.port, redacted_target,
+                ))
+                .build();
+            ocsf_emit!(event);
+        }
 
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends

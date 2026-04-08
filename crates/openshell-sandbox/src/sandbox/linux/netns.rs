@@ -62,11 +62,15 @@ impl NetworkNamespace {
             .parse()
             .unwrap();
 
-        info!(
-            namespace = %name,
-            host_veth = %veth_host,
-            sandbox_veth = %veth_sandbox,
-            "Creating network namespace"
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "creating")
+                .message(format!(
+                    "Creating network namespace [ns:{name} host_veth:{veth_host} sandbox_veth:{veth_sandbox}]"
+                ))
+                .build()
         );
 
         // Create the namespace
@@ -152,11 +156,15 @@ impl NetworkNamespace {
             }
         };
 
-        info!(
-            namespace = %name,
-            host_ip = %host_ip,
-            sandbox_ip = %sandbox_ip,
-            "Network namespace created"
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "created")
+                .message(format!(
+                    "Network namespace created [ns:{name} host_ip:{host_ip} sandbox_ip:{sandbox_ip}]"
+                ))
+                .build()
         );
 
         Ok(Self {
@@ -246,12 +254,17 @@ impl NetworkNamespace {
         let iptables_path = match find_iptables() {
             Some(path) => path,
             None => {
-                warn!(
-                    namespace = %self.name,
-                    search_paths = ?IPTABLES_SEARCH_PATHS,
-                    "iptables not found; bypass detection rules will not be installed. \
-                     Install the iptables package for proxy bypass diagnostics."
-                );
+                openshell_ocsf::ocsf_emit!(openshell_ocsf::ConfigStateChangeBuilder::new(
+                    crate::ocsf_ctx()
+                )
+                .severity(openshell_ocsf::SeverityId::Medium)
+                .status(openshell_ocsf::StatusId::Failure)
+                .state(openshell_ocsf::StateId::Disabled, "degraded")
+                .message(format!(
+                    "iptables not found; bypass detection rules will not be installed [ns:{}]",
+                    self.name
+                ))
+                .build());
                 return Ok(());
             }
         };
@@ -260,12 +273,8 @@ impl NetworkNamespace {
         let proxy_port_str = proxy_port.to_string();
         let log_prefix = format!("openshell:bypass:{}:", &self.name);
 
-        info!(
-            namespace = %self.name,
-            iptables = %iptables_path,
-            proxy_addr = %format!("{}:{}", host_ip_str, proxy_port),
-            "Installing bypass detection rules"
-        );
+        // "Installing bypass detection rules" is a transient step — skip OCSF.
+        // The completion event below covers the outcome.
 
         // Install IPv4 rules
         if let Err(e) = self.install_bypass_rules_for(
@@ -274,10 +283,16 @@ impl NetworkNamespace {
             &proxy_port_str,
             &log_prefix,
         ) {
-            warn!(
-                namespace = %self.name,
-                error = %e,
-                "Failed to install IPv4 bypass detection rules"
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Medium)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Disabled, "failed")
+                    .message(format!(
+                        "Failed to install IPv4 bypass detection rules [ns:{}]: {e}",
+                        self.name
+                    ))
+                    .build()
             );
             return Err(e);
         }
@@ -286,17 +301,30 @@ impl NetworkNamespace {
         // Skip the proxy ACCEPT rule for IPv6 since the proxy address is IPv4.
         if let Some(ip6_path) = find_ip6tables(&iptables_path) {
             if let Err(e) = self.install_bypass_rules_for_v6(&ip6_path, &log_prefix) {
-                warn!(
-                    namespace = %self.name,
-                    error = %e,
-                    "Failed to install IPv6 bypass detection rules (non-fatal)"
-                );
+                openshell_ocsf::ocsf_emit!(openshell_ocsf::ConfigStateChangeBuilder::new(
+                    crate::ocsf_ctx()
+                )
+                .severity(openshell_ocsf::SeverityId::Low)
+                .status(openshell_ocsf::StatusId::Failure)
+                .state(openshell_ocsf::StateId::Other, "degraded")
+                .message(format!(
+                    "Failed to install IPv6 bypass detection rules (non-fatal) [ns:{}]: {e}",
+                    self.name
+                ))
+                .build());
             }
         }
 
-        info!(
-            namespace = %self.name,
-            "Bypass detection rules installed"
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "installed")
+                .message(format!(
+                    "Bypass detection rules installed [ns:{}]",
+                    self.name
+                ))
+                .build()
         );
 
         Ok(())
@@ -375,11 +403,17 @@ impl NetworkNamespace {
                 "--log-uid",
             ],
         ) {
-            warn!(
-                error = %e,
-                "Failed to install LOG rule for TCP (xt_LOG module may not be loaded); \
-                 bypass REJECT rules will still be installed"
-            );
+            openshell_ocsf::ocsf_emit!(openshell_ocsf::ConfigStateChangeBuilder::new(
+                crate::ocsf_ctx()
+            )
+            .severity(openshell_ocsf::SeverityId::Low)
+            .status(openshell_ocsf::StatusId::Failure)
+            .state(openshell_ocsf::StateId::Other, "degraded")
+            .message(format!(
+                "Failed to install LOG rule for TCP (xt_LOG module may not be loaded) [ns:{}]: {e}",
+                self.name
+            ))
+            .build());
         }
 
         // Rule 5: REJECT TCP bypass attempts (fast-fail)
@@ -420,9 +454,16 @@ impl NetworkNamespace {
                 "--log-uid",
             ],
         ) {
-            warn!(
-                error = %e,
-                "Failed to install LOG rule for UDP; bypass REJECT rules will still be installed"
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Low)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Other, "degraded")
+                    .message(format!(
+                        "Failed to install LOG rule for UDP [ns:{}]: {e}",
+                        self.name
+                    ))
+                    .build()
             );
         }
 
@@ -497,7 +538,17 @@ impl NetworkNamespace {
                 "--log-uid",
             ],
         ) {
-            warn!(error = %e, "Failed to install IPv6 LOG rule for TCP");
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Low)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Other, "degraded")
+                    .message(format!(
+                        "Failed to install IPv6 LOG rule for TCP [ns:{}]: {e}",
+                        self.name
+                    ))
+                    .build()
+            );
         }
 
         // REJECT TCP bypass attempts
@@ -538,7 +589,17 @@ impl NetworkNamespace {
                 "--log-uid",
             ],
         ) {
-            warn!(error = %e, "Failed to install IPv6 LOG rule for UDP");
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Low)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Other, "degraded")
+                    .message(format!(
+                        "Failed to install IPv6 LOG rule for UDP [ns:{}]: {e}",
+                        self.name
+                    ))
+                    .build()
+            );
         }
 
         // REJECT UDP bypass attempts
@@ -588,7 +649,14 @@ impl Drop for NetworkNamespace {
             );
         }
 
-        info!(namespace = %self.name, "Network namespace cleaned up");
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Disabled, "cleaned_up")
+                .message(format!("Network namespace cleaned up [ns:{}]", self.name))
+                .build()
+        );
     }
 }
 

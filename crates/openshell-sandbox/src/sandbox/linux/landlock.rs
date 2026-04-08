@@ -10,7 +10,7 @@ use landlock::{
 };
 use miette::{IntoDiagnostic, Result};
 use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
     let read_only = policy.filesystem.read_only.clone();
@@ -31,12 +31,18 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
 
     let total_paths = read_only.len() + read_write.len();
     let abi = ABI::V2;
-    info!(
-        abi = ?abi,
-        compatibility = ?policy.landlock.compatibility,
-        read_only_paths = read_only.len(),
-        read_write_paths = read_write.len(),
-        "Applying Landlock filesystem sandbox"
+    openshell_ocsf::ocsf_emit!(
+        openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+            .severity(openshell_ocsf::SeverityId::Informational)
+            .status(openshell_ocsf::StatusId::Success)
+            .state(openshell_ocsf::StateId::Enabled, "applying")
+            .message(format!(
+                "Applying Landlock filesystem sandbox [abi:{abi:?} compat:{:?} ro:{} rw:{}]",
+                policy.landlock.compatibility,
+                read_only.len(),
+                read_write.len(),
+            ))
+            .build()
     );
 
     let compatibility = &policy.landlock.compatibility;
@@ -83,9 +89,15 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
         }
 
         let skipped = total_paths - rules_applied;
-        info!(
-            rules_applied,
-            skipped, "Landlock ruleset built successfully"
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "built")
+                .message(format!(
+                    "Landlock ruleset built [rules_applied:{rules_applied} skipped:{skipped}]"
+                ))
+                .build()
         );
 
         ruleset.restrict_self().into_diagnostic()?;
@@ -94,10 +106,24 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
 
     if let Err(err) = result {
         if matches!(compatibility, LandlockCompatibility::BestEffort) {
-            warn!(
-                error = %err,
-                "Landlock filesystem sandbox is UNAVAILABLE — running WITHOUT filesystem restrictions. \
-                 Set landlock.compatibility to 'hard_requirement' to make this a fatal error."
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
+                    .activity(openshell_ocsf::ActivityId::Open)
+                    .severity(openshell_ocsf::SeverityId::High)
+                    .confidence(openshell_ocsf::ConfidenceId::High)
+                    .is_alert(true)
+                    .finding_info(
+                        openshell_ocsf::FindingInfo::new(
+                            "landlock-unavailable",
+                            "Landlock Filesystem Sandbox Unavailable",
+                        )
+                        .with_desc(&format!(
+                            "Running WITHOUT filesystem restrictions: {err}. \
+                             Set landlock.compatibility to 'hard_requirement' to make this fatal."
+                        )),
+                    )
+                    .message(format!("Landlock filesystem sandbox unavailable: {err}"))
+                    .build()
             );
             return Ok(());
         }
@@ -143,11 +169,16 @@ fn try_open_path(path: &Path, compatibility: &LandlockCompatibility) -> Result<O
                             "Skipping non-existent Landlock path (best-effort mode)"
                         );
                     } else {
-                        warn!(
-                            path = %path.display(),
-                            error = %err,
-                            reason,
-                            "Skipping inaccessible Landlock path (best-effort mode)"
+                        openshell_ocsf::ocsf_emit!(
+                            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                                .severity(openshell_ocsf::SeverityId::Medium)
+                                .status(openshell_ocsf::StatusId::Failure)
+                                .state(openshell_ocsf::StateId::Other, "degraded")
+                                .message(format!(
+                                    "Skipping inaccessible Landlock path (best-effort) [path:{} error:{err}]",
+                                    path.display()
+                                ))
+                                .build()
                         );
                     }
                     Ok(None)

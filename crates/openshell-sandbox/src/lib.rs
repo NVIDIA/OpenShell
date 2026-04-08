@@ -27,12 +27,63 @@ use miette::{IntoDiagnostic, Result};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
+
+use openshell_ocsf::{
+    ActionId, ActivityId, AppLifecycleBuilder, ConfigStateChangeBuilder, DetectionFindingBuilder,
+    DispositionId, FindingInfo, LaunchTypeId, Process as OcsfProcess, ProcessActivityBuilder,
+    SandboxContext, SeverityId, StateId, StatusId, ocsf_emit,
+};
+
+// ---------------------------------------------------------------------------
+// OCSF Context
+// ---------------------------------------------------------------------------
+//
+// The following log sites intentionally remain as plain `tracing` macros
+// and are NOT migrated to OCSF builders:
+//
+// - DEBUG/TRACE events (zombie reaping, ip commands, gRPC connects, PTY state)
+// - Transient "about to do X" events where the result is logged separately
+//   (e.g., "Fetching sandbox policy via gRPC", "Creating OPA engine from proto")
+// - Internal SSH channel warnings (unknown channel, PTY resize failures)
+// - Denial flush telemetry (the individual denials are already OCSF events)
+// - Status reporting failures (sync to gateway, non-actionable)
+// - Route refresh interval validation warnings
+//
+// These are operational plumbing that don't represent security decisions,
+// policy changes, or observable sandbox behavior worth structuring.
+// ---------------------------------------------------------------------------
+
+/// Process-wide OCSF sandbox context. Initialized once during `run_sandbox()`
+/// startup and accessible from any module in the crate via [`ocsf_ctx()`].
+static OCSF_CTX: OnceLock<SandboxContext> = OnceLock::new();
+
+/// Fallback context used when `OCSF_CTX` has not been initialized (e.g. in
+/// unit tests that exercise individual functions without calling `run_sandbox`).
+static OCSF_CTX_FALLBACK: std::sync::LazyLock<SandboxContext> =
+    std::sync::LazyLock::new(|| SandboxContext {
+        sandbox_id: String::new(),
+        sandbox_name: String::new(),
+        container_image: String::new(),
+        hostname: "test".to_string(),
+        product_version: openshell_core::VERSION.to_string(),
+        proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
+        proxy_port: 3128,
+    });
+
+/// Return a reference to the process-wide [`SandboxContext`].
+///
+/// Falls back to a default context if `run_sandbox()` has not yet been called
+/// (e.g. during unit tests).
+pub(crate) fn ocsf_ctx() -> &'static SandboxContext {
+    OCSF_CTX.get().unwrap_or(&OCSF_CTX_FALLBACK)
+}
 
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
@@ -162,10 +213,36 @@ pub async fn run_sandbox(
     _health_check: bool,
     _health_port: u16,
     inference_routes: Option<String>,
+    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<i32> {
     let (program, args) = command
         .split_first()
         .ok_or_else(|| miette::miette!("No command specified"))?;
+
+    // Initialize the process-wide OCSF context early so that events emitted
+    // during policy loading (filesystem config, validation) have a context.
+    // Proxy IP/port use defaults here; they are only significant for network
+    // events which happen after the netns is created.
+    {
+        let hostname = std::fs::read_to_string("/etc/hostname")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "openshell-sandbox".to_string());
+
+        if OCSF_CTX
+            .set(SandboxContext {
+                sandbox_id: sandbox_id.clone().unwrap_or_default(),
+                sandbox_name: sandbox.as_deref().unwrap_or_default().to_string(),
+                container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
+                hostname,
+                product_version: openshell_core::VERSION.to_string(),
+                proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
+                proxy_port: 3128,
+            })
+            .is_err()
+        {
+            debug!("OCSF context already initialized, keeping existing");
+        }
+    }
 
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
@@ -190,11 +267,30 @@ pub async fn run_sandbox(
     let provider_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
         match grpc_client::fetch_provider_environment(endpoint, id).await {
             Ok(env) => {
-                info!(env_count = env.len(), "Fetched provider environment");
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "loaded")
+                        .message(format!(
+                            "Fetched provider environment [env_count:{}]",
+                            env.len()
+                        ))
+                        .build()
+                );
                 env
             }
             Err(e) => {
-                warn!(error = %e, "Failed to fetch provider environment, continuing without");
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Other, "degraded")
+                        .message(format!(
+                            "Failed to fetch provider environment, continuing without: {e}"
+                        ))
+                        .build()
+                );
                 std::collections::HashMap::new()
             }
         }
@@ -228,22 +324,41 @@ pub async fn run_sandbox(
                         let upstream_config = build_upstream_client_config();
                         let cert_cache = CertCache::new(ca);
                         let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
-                        info!("TLS termination enabled: ephemeral CA generated");
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Enabled, "enabled")
+                                .message("TLS termination enabled: ephemeral CA generated")
+                                .build()
+                        );
                         (Some(state), Some(paths))
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to write CA files, TLS termination disabled"
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Medium)
+                                .status(StatusId::Failure)
+                                .state(StateId::Disabled, "disabled")
+                                .message(format!(
+                                    "Failed to write CA files, TLS termination disabled: {e}"
+                                ))
+                                .build()
                         );
                         (None, None)
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to generate ephemeral CA, TLS termination disabled"
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Disabled, "disabled")
+                        .message(format!(
+                            "Failed to generate ephemeral CA, TLS termination disabled: {e}"
+                        ))
+                        .build()
                 );
                 (None, None)
             }
@@ -269,9 +384,15 @@ pub async fn run_sandbox(
                     .and_then(|p| p.http_addr)
                     .map_or(3128, |addr| addr.port());
                 if let Err(e) = ns.install_bypass_rules(proxy_port) {
-                    warn!(
-                        error = %e,
-                        "Failed to install bypass detection rules (non-fatal)"
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .state(StateId::Disabled, "degraded")
+                            .message(format!(
+                                "Failed to install bypass detection rules (non-fatal): {e}"
+                            ))
+                            .build()
                     );
                 }
                 Some(ns)
@@ -514,7 +635,14 @@ pub async fn run_sandbox(
             )
             .await
             {
-                tracing::error!(error = %err, "SSH server failed");
+                ocsf_emit!(
+                    AppLifecycleBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Critical)
+                        .status(StatusId::Failure)
+                        .message(format!("SSH server failed: {err}"))
+                        .build()
+                );
             }
         });
 
@@ -523,7 +651,14 @@ pub async fn run_sandbox(
         // SSH server startup when Kubernetes marks the pod Ready.
         match timeout(Duration::from_secs(10), ssh_ready_rx).await {
             Ok(Ok(Ok(()))) => {
-                info!("SSH server is ready to accept connections");
+                ocsf_emit!(
+                    AppLifecycleBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Open)
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .message("SSH server is ready to accept connections")
+                        .build()
+                );
             }
             Ok(Ok(Err(err))) => {
                 return Err(err.context("SSH server failed during startup"));
@@ -566,7 +701,18 @@ pub async fn run_sandbox(
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
     entrypoint_pid.store(handle.pid(), Ordering::Release);
-    info!(pid = handle.pid(), "Process started");
+    ocsf_emit!(
+        ProcessActivityBuilder::new(ocsf_ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .launch_type(LaunchTypeId::Spawn)
+            .process(OcsfProcess::new(program, i64::from(handle.pid())))
+            .message(format!("Process started: pid={}", handle.pid()))
+            .build()
+    );
 
     // Spawn background policy poll task (gRPC mode only).
     if let (Some(id), Some(endpoint), Some(engine)) =
@@ -575,17 +721,30 @@ pub async fn run_sandbox(
         let poll_id = id.clone();
         let poll_endpoint = endpoint.clone();
         let poll_engine = engine.clone();
+        let poll_ocsf_enabled = ocsf_enabled.clone();
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
 
         tokio::spawn(async move {
-            if let Err(e) =
-                run_policy_poll_loop(&poll_endpoint, &poll_id, &poll_engine, poll_interval_secs)
-                    .await
+            if let Err(e) = run_policy_poll_loop(
+                &poll_endpoint,
+                &poll_id,
+                &poll_engine,
+                poll_interval_secs,
+                &poll_ocsf_enabled,
+            )
+            .await
             {
-                warn!(error = %e, "Policy poll loop exited with error");
+                ocsf_emit!(
+                    AppLifecycleBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .message(format!("Policy poll loop exited with error: {e}"))
+                        .build()
+                );
             }
         });
 
@@ -625,7 +784,16 @@ pub async fn run_sandbox(
         if let Ok(result) = timeout(Duration::from_secs(timeout_secs), handle.wait()).await {
             result
         } else {
-            error!("Process timed out, killing");
+            ocsf_emit!(
+                ProcessActivityBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Close)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Critical)
+                    .status(StatusId::Failure)
+                    .message("Process timed out, killing")
+                    .build()
+            );
             handle.kill()?;
             return Ok(124); // Standard timeout exit code
         }
@@ -635,7 +803,17 @@ pub async fn run_sandbox(
 
     let status = result.into_diagnostic()?;
 
-    info!(exit_code = status.code(), "Process exited");
+    ocsf_emit!(
+        ProcessActivityBuilder::new(ocsf_ctx())
+            .activity(ActivityId::Close)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .exit_code(status.code())
+            .message(format!("Process exited with code {}", status.code()))
+            .build()
+    );
 
     Ok(status.code())
 }
@@ -672,12 +850,25 @@ async fn build_inference_context(
 
             // Standalone mode: load routes from file (fail-fast on errors)
             if sandbox_id.is_some() {
-                info!(
-                    inference_routes = %path,
-                    "Inference routes file takes precedence over cluster bundle"
-                );
+                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Enabled, "loaded")
+                    .unmapped("inference_routes", serde_json::json!(path))
+                    .message(format!(
+                        "Inference routes file takes precedence over cluster bundle [path:{path}]"
+                    ))
+                    .build());
             }
-            info!(inference_routes = %path, "Loading inference routes from file");
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Other, "loading")
+                    .unmapped("inference_routes", serde_json::json!(path))
+                    .message(format!("Loading inference routes from file [path:{path}]"))
+                    .build()
+            );
             let config = RouterConfig::load_from_file(std::path::Path::new(path))
                 .map_err(|e| miette::miette!("failed to load inference routes {path}: {e}"))?;
             config
@@ -694,10 +885,19 @@ async fn build_inference_context(
             match grpc_client::fetch_inference_bundle(endpoint).await {
                 Ok(bundle) => {
                     initial_revision = Some(bundle.revision.clone());
-                    info!(
-                        route_count = bundle.routes.len(),
-                        revision = %bundle.revision,
-                        "Loaded inference route bundle"
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .unmapped("route_count", serde_json::json!(bundle.routes.len()))
+                            .unmapped("revision", serde_json::json!(&bundle.revision))
+                            .message(format!(
+                                "Loaded inference route bundle [route_count:{} revision:{}]",
+                                bundle.routes.len(),
+                                bundle.revision
+                            ))
+                            .build()
                     );
                     bundle_to_resolved_routes(&bundle)
                 }
@@ -707,10 +907,28 @@ async fn build_inference_context(
                     // for this sandbox — skip gracefully. Other errors are unexpected.
                     let msg = e.to_string();
                     if msg.contains("permission denied") || msg.contains("not found") {
-                        info!(error = %e, "Inference bundle unavailable, routing disabled");
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Disabled, "disabled")
+                                .unmapped("error", serde_json::json!(e.to_string()))
+                                .message(format!(
+                                    "Inference bundle unavailable, routing disabled [error:{e}]"
+                                ))
+                                .build()
+                        );
                         return Ok(None);
                     }
-                    warn!(error = %e, "Failed to fetch inference bundle, inference routing disabled");
+                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Disabled, "disabled")
+                        .unmapped("error", serde_json::json!(e.to_string()))
+                        .message(format!(
+                            "Failed to fetch inference bundle, inference routing disabled [error:{e}]"
+                        ))
+                        .build());
                     return Ok(None);
                 }
             }
@@ -722,17 +940,37 @@ async fn build_inference_context(
     };
 
     if routes.is_empty() && disable_inference_on_empty_routes(source) {
-        info!("No usable inference routes, inference routing disabled");
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Disabled, "disabled")
+                .message("No usable inference routes, inference routing disabled")
+                .build()
+        );
         return Ok(None);
     }
 
     if routes.is_empty() {
-        info!("Inference route bundle is empty; keeping routing enabled and waiting for refresh");
+        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Other, "waiting")
+            .message("Inference route bundle is empty; keeping routing enabled and waiting for refresh")
+            .build());
     }
 
-    info!(
-        route_count = routes.len(),
-        "Inference routing enabled with local execution"
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Enabled, "enabled")
+            .unmapped("route_count", serde_json::json!(routes.len()))
+            .message(format!(
+                "Inference routing enabled with local execution [route_count:{}]",
+                routes.len()
+            ))
+            .build()
     );
 
     // Partition routes by name into user-facing and system caches.
@@ -853,18 +1091,34 @@ pub(crate) fn spawn_route_refresh(
 
                     let routes = bundle_to_resolved_routes(&bundle);
                     let (user_routes, system_routes) = partition_routes(routes);
-                    info!(
-                        user_route_count = user_routes.len(),
-                        system_route_count = system_routes.len(),
-                        revision = %bundle.revision,
-                        "Inference routes updated"
-                    );
+                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "updated")
+                        .unmapped("user_route_count", serde_json::json!(user_routes.len()))
+                        .unmapped("system_route_count", serde_json::json!(system_routes.len()))
+                        .unmapped("revision", serde_json::json!(&bundle.revision))
+                        .message(format!(
+                            "Inference routes updated [user_route_count:{} system_route_count:{} revision:{}]",
+                            user_routes.len(),
+                            system_routes.len(),
+                            bundle.revision
+                        ))
+                        .build());
                     current_revision = Some(bundle.revision);
                     *user_cache.write().await = user_routes;
                     *system_cache.write().await = system_routes;
                 }
                 Err(e) => {
-                    warn!(error = %e, "Failed to refresh inference route cache, keeping stale routes");
+                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Other, "stale")
+                        .unmapped("error", serde_json::json!(e.to_string()))
+                        .message(format!(
+                            "Failed to refresh inference route cache, keeping stale routes [error:{e}]"
+                        ))
+                        .build());
                 }
             }
         }
@@ -1031,7 +1285,14 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
     }
 
     if modified {
-        info!("Enriched policy with baseline filesystem paths for proxy mode");
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "enriched")
+                .message("Enriched policy with baseline filesystem paths for proxy mode")
+                .build()
+        );
     }
 
     modified
@@ -1078,7 +1339,14 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
     }
 
     if modified {
-        info!("Enriched policy with baseline filesystem paths for proxy mode");
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "enriched")
+                .message("Enriched policy with baseline filesystem paths for proxy mode")
+                .build()
+        );
     }
 }
 
@@ -1167,11 +1435,16 @@ async fn load_policy(
 ) -> Result<(SandboxPolicy, Option<Arc<OpaEngine>>)> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
-        info!(
-            policy_rules = %policy_file,
-            policy_data = %data_file,
-            "Loading OPA policy engine from local files"
-        );
+        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Other, "loading")
+            .unmapped("policy_rules", serde_json::json!(policy_file))
+            .unmapped("policy_data", serde_json::json!(data_file))
+            .message(format!(
+                "Loading OPA policy engine from local files [rules:{policy_file} data:{data_file}]"
+            ))
+            .build());
         let engine = OpaEngine::from_files(
             std::path::Path::new(policy_file),
             std::path::Path::new(data_file),
@@ -1206,7 +1479,14 @@ async fn load_policy(
                 // No policy configured on the server. Discover from disk or
                 // fall back to the restrictive default, then sync to the
                 // gateway so it becomes the authoritative baseline.
-                info!("Server returned no policy; attempting local discovery");
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Other, "discovery")
+                        .message("Server returned no policy; attempting local discovery")
+                        .build()
+                );
                 let mut discovered = discover_policy_from_disk_or_default();
                 // Enrich before syncing so the gateway baseline includes
                 // baseline paths from the start.
@@ -1268,10 +1548,22 @@ fn discover_policy_from_disk_or_default() -> openshell_core::proto::SandboxPolic
     }
     let legacy = std::path::Path::new(openshell_policy::LEGACY_CONTAINER_POLICY_PATH);
     if legacy.exists() {
-        info!(
-            legacy_path = %legacy.display(),
-            new_path = %primary.display(),
-            "Policy found at legacy path; consider moving to the new path"
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "loaded")
+                .unmapped(
+                    "legacy_path",
+                    serde_json::json!(legacy.display().to_string())
+                )
+                .unmapped("new_path", serde_json::json!(primary.display().to_string()))
+                .message(format!(
+                    "Policy found at legacy path; consider moving [legacy_path:{} new_path:{}]",
+                    legacy.display(),
+                    primary.display()
+                ))
+                .build()
         );
         return discover_policy_from_path(legacy);
     }
@@ -1287,9 +1579,16 @@ fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::S
 
     match std::fs::read_to_string(path) {
         Ok(yaml) => {
-            info!(
-                path = %path.display(),
-                "Loaded sandbox policy from container disk"
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Enabled, "loaded")
+                    .message(format!(
+                        "Loaded sandbox policy from container disk [path:{}]",
+                        path.display()
+                    ))
+                    .build()
             );
             match parse_sandbox_policy(&yaml) {
                 Ok(policy) => {
@@ -1297,29 +1596,56 @@ fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::S
                     if let Err(violations) = validate_sandbox_policy(&policy) {
                         let messages: Vec<String> =
                             violations.iter().map(ToString::to_string).collect();
-                        warn!(
-                            path = %path.display(),
-                            violations = %messages.join("; "),
-                            "Disk policy contains unsafe content, using restrictive default"
-                        );
+                        ocsf_emit!(DetectionFindingBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Open)
+                            .severity(SeverityId::Medium)
+                            .action(ActionId::Denied)
+                            .disposition(DispositionId::Blocked)
+                            .finding_info(
+                                FindingInfo::new(
+                                    "unsafe-disk-policy",
+                                    "Unsafe Disk Policy Content",
+                                )
+                                .with_desc(&format!(
+                                    "Disk policy at {} contains unsafe content: {}",
+                                    path.display(),
+                                    messages.join("; "),
+                                )),
+                            )
+                            .message(format!(
+                                "Disk policy contains unsafe content, using restrictive default [path:{}]",
+                                path.display()
+                            ))
+                            .build());
                         return restrictive_default_policy();
                     }
                     policy
                 }
                 Err(e) => {
-                    warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "Failed to parse disk policy, using restrictive default"
-                    );
+                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Other, "fallback")
+                        .message(format!(
+                            "Failed to parse disk policy, using restrictive default [path:{} error:{e}]",
+                            path.display()
+                        ))
+                        .build());
                     restrictive_default_policy()
                 }
             }
         }
         Err(_) => {
-            info!(
-                path = %path.display(),
-                "No policy file on disk, using restrictive default"
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Enabled, "default")
+                    .message(format!(
+                        "No policy file on disk, using restrictive default [path:{}]",
+                        path.display()
+                    ))
+                    .build()
             );
             restrictive_default_policy()
         }
@@ -1341,7 +1667,14 @@ fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
     if user_name.is_empty() || user_name == "sandbox" {
         match User::from_name("sandbox") {
             Ok(Some(_)) => {
-                info!("Validated 'sandbox' user exists in image");
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "validated")
+                        .message("Validated 'sandbox' user exists in image")
+                        .build()
+                );
             }
             Ok(None) => {
                 return Err(miette::miette!(
@@ -1512,9 +1845,11 @@ async fn run_policy_poll_loop(
     sandbox_id: &str,
     opa_engine: &Arc<OpaEngine>,
     interval_secs: u64,
+    ocsf_enabled: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     use crate::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::PolicySource;
+    use std::sync::atomic::Ordering;
 
     let client = CachedOpenShellClient::connect(endpoint).await?;
     let mut current_config_revision: u64 = 0;
@@ -1561,19 +1896,28 @@ async fn run_policy_poll_loop(
         // Log which settings changed.
         log_setting_changes(&current_settings, &result.settings);
 
-        info!(
-            old_config_revision = current_config_revision,
-            new_config_revision = result.config_revision,
-            policy_changed,
-            "Settings poll: config change detected"
-        );
+        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Other, "detected")
+            .unmapped("old_config_revision", serde_json::json!(current_config_revision))
+            .unmapped("new_config_revision", serde_json::json!(result.config_revision))
+            .unmapped("policy_changed", serde_json::json!(policy_changed))
+            .message(format!(
+                "Settings poll: config change detected [old_revision:{current_config_revision} new_revision:{} policy_changed:{policy_changed}]",
+                result.config_revision
+            ))
+            .build());
 
         // Only reload OPA when the policy payload actually changed.
         if policy_changed {
             let Some(policy) = result.policy.as_ref() else {
-                warn!(
-                    "Settings poll: policy hash changed but no policy payload present; skipping reload"
-                );
+                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .state(StateId::Other, "skipped")
+                    .message("Settings poll: policy hash changed but no policy payload present; skipping reload")
+                    .build());
                 current_config_revision = result.config_revision;
                 current_policy_hash = result.policy_hash;
                 current_settings = result.settings;
@@ -1583,15 +1927,30 @@ async fn run_policy_poll_loop(
             match opa_engine.reload_from_proto(policy) {
                 Ok(()) => {
                     if result.global_policy_version > 0 {
-                        info!(
-                            policy_hash = %result.policy_hash,
-                            global_version = result.global_policy_version,
-                            "Policy reloaded successfully (global)"
-                        );
+                        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                            .unmapped("global_version", serde_json::json!(result.global_policy_version))
+                            .message(format!(
+                                "Policy reloaded successfully (global) [policy_hash:{} global_version:{}]",
+                                result.policy_hash,
+                                result.global_policy_version
+                            ))
+                            .build());
                     } else {
-                        info!(
-                            policy_hash = %result.policy_hash,
-                            "Policy reloaded successfully"
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Enabled, "loaded")
+                                .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                                .message(format!(
+                                    "Policy reloaded successfully [policy_hash:{}]",
+                                    result.policy_hash
+                                ))
+                                .build()
                         );
                     }
                     if result.version > 0 && result.policy_source == PolicySource::Sandbox {
@@ -1604,11 +1963,17 @@ async fn run_policy_poll_loop(
                     }
                 }
                 Err(e) => {
-                    warn!(
-                            version = result.version,
-                        error = %e,
-                        "Policy reload failed, keeping last-known-good policy"
-                    );
+                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Other, "failed")
+                        .unmapped("version", serde_json::json!(result.version))
+                        .unmapped("error", serde_json::json!(e.to_string()))
+                        .message(format!(
+                            "Policy reload failed, keeping last-known-good policy [version:{} error:{e}]",
+                            result.version
+                        ))
+                        .build());
                     if result.version > 0 && result.policy_source == PolicySource::Sandbox {
                         if let Err(report_err) = client
                             .report_policy_status(sandbox_id, result.version, false, &e.to_string())
@@ -1621,10 +1986,33 @@ async fn run_policy_poll_loop(
             }
         }
 
+        // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
+        let new_ocsf = extract_bool_setting(&result.settings, "ocsf_json_enabled").unwrap_or(false);
+        let prev_ocsf = ocsf_enabled.swap(new_ocsf, Ordering::Relaxed);
+        if new_ocsf != prev_ocsf {
+            info!(ocsf_json_enabled = new_ocsf, "OCSF JSONL logging toggled");
+        }
+
         current_config_revision = result.config_revision;
         current_policy_hash = result.policy_hash;
         current_settings = result.settings;
     }
+}
+
+/// Extract a bool value from an effective setting, if present.
+fn extract_bool_setting(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    key: &str,
+) -> Option<bool> {
+    use openshell_core::proto::setting_value;
+    settings
+        .get(key)
+        .and_then(|es| es.value.as_ref())
+        .and_then(|sv| sv.value.as_ref())
+        .and_then(|v| match v {
+            setting_value::Value::BoolValue(b) => Some(*b),
+            _ => None,
+        })
 }
 
 /// Log individual setting changes between two snapshots.
@@ -1638,17 +2026,46 @@ fn log_setting_changes(
             Some(old_es) => {
                 let old_val = format_setting_value(old_es);
                 if old_val != new_val {
-                    info!(key, old = %old_val, new = %new_val, "Setting changed");
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "updated")
+                            .unmapped("key", serde_json::json!(key))
+                            .unmapped("old", serde_json::json!(old_val.to_string()))
+                            .unmapped("new", serde_json::json!(new_val.to_string()))
+                            .message(format!(
+                                "Setting changed [key:{key} old:{old_val} new:{new_val}]"
+                            ))
+                            .build()
+                    );
                 }
             }
             None => {
-                info!(key, value = %new_val, "Setting added");
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "enabled")
+                        .unmapped("key", serde_json::json!(key))
+                        .unmapped("value", serde_json::json!(new_val.to_string()))
+                        .message(format!("Setting added [key:{key} value:{new_val}]"))
+                        .build()
+                );
             }
         }
     }
     for key in old.keys() {
         if !new.contains_key(key) {
-            info!(key, "Setting removed");
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Disabled, "disabled")
+                    .unmapped("key", serde_json::json!(key))
+                    .message(format!("Setting removed [key:{key}]"))
+                    .build()
+            );
         }
     }
 }

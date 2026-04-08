@@ -35,6 +35,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
 | `crates/openshell-router/` | Privacy router | Privacy-aware LLM routing |
 | `crates/openshell-bootstrap/` | Cluster bootstrap | K3s cluster setup, image loading, mTLS PKI |
+| `crates/openshell-ocsf/` | OCSF logging | OCSF v1.7.0 event types, builders, shorthand/JSONL formatters, tracing layers |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
 | `crates/openshell-providers/` | Provider management | Credential provider backends |
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
@@ -65,6 +66,85 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 
 - Store plan documents in `architecture/plans`. This is git ignored so its for easier access for humans. When asked to create Spikes or issues, you can skip to GitHub issues. Only use the plans dir when you aren't writing data somewhere else specific.
 - When asked to write a plan, write it there without asking for the location.
+
+## Sandbox Logging (OCSF)
+
+When adding or modifying log emissions in `openshell-sandbox`, determine whether the event should use OCSF structured logging or plain `tracing`.
+
+### When to use OCSF
+
+Use an OCSF builder + `ocsf_emit!()` for events that represent **observable sandbox behavior** visible to operators, security teams, or agents monitoring the sandbox:
+
+- Network decisions (allow, deny, bypass detection)
+- HTTP/L7 enforcement decisions
+- SSH authentication (accepted, denied, nonce replay)
+- Process lifecycle (start, exit, timeout, signal failure)
+- Security findings (unsafe policy, unavailable controls, replay attacks)
+- Configuration changes (policy load/reload, TLS setup, inference routes, settings)
+- Application lifecycle (supervisor start, SSH server ready)
+
+### When to use plain tracing
+
+Use `info!()`, `debug!()`, `warn!()` for **internal operational plumbing** that doesn't represent a security decision or observable state change:
+
+- gRPC connection attempts and retries
+- "About to do X" events where the result is logged separately
+- Internal SSH channel state (unknown channel, PTY resize)
+- Zombie process reaping, denial flush telemetry
+- DEBUG/TRACE level diagnostics
+
+### Choosing the OCSF event class
+
+| Event type | Builder | When to use |
+|---|---|---|
+| TCP connections, proxy tunnels, bypass | `NetworkActivityBuilder` | L4 network decisions, proxy operational events |
+| HTTP requests, L7 enforcement | `HttpActivityBuilder` | Per-request method/path decisions |
+| SSH sessions | `SshActivityBuilder` | Authentication, channel operations |
+| Process start/stop | `ProcessActivityBuilder` | Entrypoint lifecycle, signal failures |
+| Security alerts | `DetectionFindingBuilder` | Nonce replay, bypass detection, unsafe policy. Dual-emit with the domain event. |
+| Policy/config changes | `ConfigStateChangeBuilder` | Policy load, Landlock apply, TLS setup, inference routes, settings |
+| Supervisor lifecycle | `AppLifecycleBuilder` | Sandbox start, SSH server ready/failed |
+
+### Severity guidelines
+
+| Severity | When |
+|---|---|
+| `Informational` | Allowed connections, successful operations, config loaded |
+| `Low` | DNS failures, non-fatal operational warnings, LOG rule failures |
+| `Medium` | Denied connections, policy violations, deprecated config |
+| `High` | Security findings (nonce replay, Landlock unavailable) |
+| `Critical` | Process timeout kills |
+
+### Example: adding a new network event
+
+```rust
+use openshell_ocsf::{
+    ocsf_emit, NetworkActivityBuilder, ActivityId, ActionId,
+    DispositionId, Endpoint, Process, SeverityId, StatusId,
+};
+
+let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+    .activity(ActivityId::Open)
+    .action(ActionId::Denied)
+    .disposition(DispositionId::Blocked)
+    .severity(SeverityId::Medium)
+    .status(StatusId::Failure)
+    .dst_endpoint(Endpoint::from_domain(&host, port))
+    .actor_process(Process::new(&binary, pid))
+    .firewall_rule(&policy_name, &engine_type)
+    .message(format!("CONNECT denied {host}:{port}"))
+    .build();
+ocsf_emit!(event);
+```
+
+### Key points
+
+- `crate::ocsf_ctx()` returns the process-wide `SandboxContext`. It is always available (falls back to defaults in tests).
+- `ocsf_emit!()` is non-blocking and cannot panic. It stores the event in a thread-local and emits via `tracing::info!()`.
+- The shorthand layer and JSONL layer extract the event from the thread-local. The shorthand format is derived automatically from the builder fields.
+- For security findings, **dual-emit**: one domain event (e.g., `SshActivityBuilder`) AND one `DetectionFindingBuilder` for the same incident.
+- Never log secrets, credentials, or query parameters in OCSF messages. The OCSF JSONL file may be shipped to external systems.
+- The `message` field should be a concise, grep-friendly summary. Details go in builder fields (dst_endpoint, firewall_rule, etc.).
 
 ## Sandbox Infra Changes
 

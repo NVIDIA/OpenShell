@@ -47,6 +47,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/openshell-bootstrap/Cargo.toml crates/openshell-bootstrap/Cargo.toml
 COPY crates/openshell-cli/Cargo.toml crates/openshell-cli/Cargo.toml
 COPY crates/openshell-core/Cargo.toml crates/openshell-core/Cargo.toml
+COPY crates/openshell-ocsf/Cargo.toml crates/openshell-ocsf/Cargo.toml
 COPY crates/openshell-policy/Cargo.toml crates/openshell-policy/Cargo.toml
 COPY crates/openshell-providers/Cargo.toml crates/openshell-providers/Cargo.toml
 COPY crates/openshell-router/Cargo.toml crates/openshell-router/Cargo.toml
@@ -60,6 +61,7 @@ RUN mkdir -p \
       crates/openshell-bootstrap/src \
       crates/openshell-cli/src \
       crates/openshell-core/src \
+      crates/openshell-ocsf/src \
       crates/openshell-policy/src \
       crates/openshell-providers/src \
       crates/openshell-router/src \
@@ -69,6 +71,7 @@ RUN mkdir -p \
     touch crates/openshell-bootstrap/src/lib.rs && \
     printf 'fn main() {}\n' > crates/openshell-cli/src/main.rs && \
     touch crates/openshell-core/src/lib.rs && \
+    touch crates/openshell-ocsf/src/lib.rs && \
     touch crates/openshell-policy/src/lib.rs && \
     touch crates/openshell-providers/src/lib.rs && \
     touch crates/openshell-router/src/lib.rs && \
@@ -129,12 +132,14 @@ FROM rust-deps AS supervisor-workspace
 ARG OPENSHELL_CARGO_VERSION
 
 COPY crates/openshell-core/ crates/openshell-core/
+COPY crates/openshell-ocsf/ crates/openshell-ocsf/
 COPY crates/openshell-policy/ crates/openshell-policy/
 COPY crates/openshell-router/ crates/openshell-router/
 COPY crates/openshell-sandbox/ crates/openshell-sandbox/
 
 RUN touch \
     crates/openshell-core/build.rs \
+    crates/openshell-ocsf/src/lib.rs \
     crates/openshell-sandbox/src/main.rs \
     proto/*.proto && \
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \

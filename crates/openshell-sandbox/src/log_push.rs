@@ -48,16 +48,37 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
         if *meta.level() > self.max_level {
             return;
         }
-        let mut visitor = LogVisitor::default();
-        event.record(&mut visitor);
 
-        let (msg, fields) = visitor.into_parts(meta.name());
+        // OCSF events carry their payload in a thread-local; extract the
+        // shorthand representation for the push message. Non-OCSF events
+        // use the original visitor-based extraction.
+        let (msg, fields) = if meta.target() == openshell_ocsf::OCSF_TARGET {
+            if let Some(ocsf_event) = openshell_ocsf::clone_current_event() {
+                (
+                    ocsf_event.format_shorthand(),
+                    std::collections::HashMap::new(),
+                )
+            } else {
+                return;
+            }
+        } else {
+            let mut visitor = LogVisitor::default();
+            event.record(&mut visitor);
+            visitor.into_parts(meta.name())
+        };
+
         let ts = current_time_ms().unwrap_or(0);
+
+        let is_ocsf = meta.target() == openshell_ocsf::OCSF_TARGET;
 
         let log = SandboxLogLine {
             sandbox_id: self.sandbox_id.clone(),
             timestamp_ms: ts,
-            level: meta.level().to_string(),
+            level: if is_ocsf {
+                "OCSF".to_string()
+            } else {
+                meta.level().to_string()
+            },
             target: meta.target().to_string(),
             message: msg,
             source: "sandbox".to_string(),
