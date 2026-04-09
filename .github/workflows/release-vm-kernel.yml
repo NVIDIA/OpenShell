@@ -127,24 +127,16 @@ jobs:
     needs: [build-runtime-linux-arm64]
     runs-on: macos-latest-xlarge
     timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install mise and toolchain
+      - name: Install dependencies
         run: |
           set -euo pipefail
-          curl https://mise.run | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
-
-      - name: Install tools via mise
-        env:
-          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          mise trust
-          mise install rust
-          mise reshim
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           brew install lld dtc xz
 
       - name: Download pre-built kernel.c
