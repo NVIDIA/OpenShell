@@ -2,10 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 navigation:
-- section: "Documentation"
-  contents:
-    - page: "Home"
-      path: index.mdx
+- page: "Home"
+  path: index.mdx
 - folder: about
   title: "About NVIDIA OpenShell"
 - section: "Get Started"
