@@ -66,10 +66,17 @@ versions:
 
 redirects:
   # Paths are relative to the site root; subpath prefix matches instances + custom-domain.
+  # Sphinx-style URLs used .../path/to/page/index.html; Fern canonical URLs omit index.html.
+  # List explicit /index.html routes before :path*/index.html so empty path segments do not
+  # mis-resolve (see NeMo-Curator fern/docs.yml). :path*.html must follow :path*/index.html rules.
   # https://www.buildwithfern.com/learn/docs/configuration/site-level-settings#redirects-configuration
   - source: "/openshell/index.html"
     destination: "/openshell/latest"
   - source: "/openshell/index"
+    destination: "/openshell/latest"
+  - source: "/openshell/latest/index.html"
+    destination: "/openshell/latest"
+  - source: "/openshell/latest/index"
     destination: "/openshell/latest"
   - source: "/openshell/latest/:path*/index.html"
     destination: "/openshell/latest/:path*"
