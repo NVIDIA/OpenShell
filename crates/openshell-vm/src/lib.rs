@@ -25,10 +25,9 @@ use std::ptr;
 use std::time::Instant;
 
 pub use exec::{
-    VM_EXEC_VSOCK_PORT, VmExecOptions, VmRuntimeState, acquire_rootfs_lock,
-    clear_vm_runtime_state, ensure_vm_not_running, exec_capture, exec_running_vm,
-    recover_corrupt_kine_db, reset_runtime_state, vm_exec_socket_path, vm_state_path,
-    write_vm_runtime_state,
+    VM_EXEC_VSOCK_PORT, VmExecOptions, VmRuntimeState, acquire_rootfs_lock, clear_vm_runtime_state,
+    ensure_vm_not_running, exec_capture, exec_running_vm, recover_corrupt_kine_db,
+    reset_runtime_state, vm_exec_socket_path, vm_state_path, write_vm_runtime_state,
 };
 
 // ── Error type ─────────────────────────────────────────────────────────
@@ -205,13 +204,11 @@ impl VmConfig {
     pub fn gateway(rootfs: PathBuf) -> Self {
         let state_disk = StateDiskConfig::for_rootfs(&rootfs);
         Self {
-            vsock_ports: vec![
-                VsockPort {
-                    port: VM_EXEC_VSOCK_PORT,
-                    socket_path: vm_exec_socket_path(&rootfs),
-                    listen: true,
-                },
-            ],
+            vsock_ports: vec![VsockPort {
+                port: VM_EXEC_VSOCK_PORT,
+                socket_path: vm_exec_socket_path(&rootfs),
+                listen: true,
+            }],
             rootfs,
             vcpus: 4,
             mem_mib: 8192,
@@ -1623,9 +1620,7 @@ fn fetch_pki_over_exec(
 }
 
 /// Attempt to read all six PEM files from the guest in one pass.
-fn try_read_pki_files(
-    exec_socket: &Path,
-) -> Result<openshell_bootstrap::pki::PkiBundle, VmError> {
+fn try_read_pki_files(exec_socket: &Path) -> Result<openshell_bootstrap::pki::PkiBundle, VmError> {
     let mut pems = std::collections::HashMap::new();
 
     for &(filename, _field) in PKI_FILES {
@@ -1635,17 +1630,14 @@ fn try_read_pki_files(
             VmError::Bootstrap(format!("PKI file {filename} is not valid UTF-8: {e}"))
         })?;
         if content.is_empty() {
-            return Err(VmError::Bootstrap(format!(
-                "PKI file {filename} is empty"
-            )));
+            return Err(VmError::Bootstrap(format!("PKI file {filename} is empty")));
         }
         pems.insert(filename, content);
     }
 
     let mut get = |key: &str| -> Result<String, VmError> {
-        pems.remove(key).ok_or_else(|| {
-            VmError::Bootstrap(format!("PKI file {key} missing from exec output"))
-        })
+        pems.remove(key)
+            .ok_or_else(|| VmError::Bootstrap(format!("PKI file {key} missing from exec output")))
     };
 
     Ok(openshell_bootstrap::pki::PkiBundle {
