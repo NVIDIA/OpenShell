@@ -13,6 +13,39 @@ use serde::{Deserialize, Serialize};
 
 use crate::VmError;
 
+/// Remove a directory, safely handling symlinks.
+///
+/// Uses `symlink_metadata` (lstat) to detect symlinks. If the path is a
+/// symlink (e.g. `var/run -> /run` in a Linux rootfs), the symlink itself
+/// is removed without following it — preventing traversal attacks where a
+/// symlink could redirect `remove_dir_all` to an arbitrary host path.
+/// If the path is a real directory, it is removed recursively.
+fn safe_remove_dir_all(path: &Path) -> Result<bool, VmError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                // Remove the symlink itself, not the target it points to.
+                fs::remove_file(path).map_err(|e| {
+                    VmError::RuntimeState(format!("reset: remove symlink {}: {e}", path.display()))
+                })?;
+                return Ok(true);
+            }
+            if !meta.is_dir() {
+                return Ok(false); // Not a directory — nothing to remove.
+            }
+            fs::remove_dir_all(path).map_err(|e| {
+                VmError::RuntimeState(format!("reset: remove {}: {e}", path.display()))
+            })?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(VmError::RuntimeState(format!(
+            "stat {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
 pub const VM_EXEC_VSOCK_PORT: u32 = 10_777;
 
 const VM_STATE_NAME: &str = "vm-state.json";
@@ -66,10 +99,20 @@ enum ServerFrame {
 }
 
 pub fn vm_exec_socket_path(rootfs: &Path) -> PathBuf {
-    let mut base = PathBuf::from("/tmp");
-    if !base.is_dir() {
-        base = std::env::temp_dir();
-    }
+    // Prefer XDG_RUNTIME_DIR (per-user, restricted permissions on Linux),
+    // fall back to /tmp. Ownership/symlink validation happens in
+    // secure_socket_base() when the gvproxy socket dir is created; here
+    // we just compute the path. The parent directory is created (with
+    // permission checks) at launch time via create_dir_all.
+    let base = if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
+        PathBuf::from(xdg)
+    } else {
+        let mut base = PathBuf::from("/tmp");
+        if !base.is_dir() {
+            base = std::env::temp_dir();
+        }
+        base
+    };
     let dir = base.join("ovm-exec");
     let id = hash_path_id(rootfs);
     dir.join(format!("{id}.sock"))
@@ -161,10 +204,7 @@ pub fn reset_runtime_state(rootfs: &Path, gateway_name: &str) -> Result<(), VmEr
 
     let mut cleaned = 0usize;
     for dir in &dirs_to_remove {
-        if dir.is_dir() {
-            fs::remove_dir_all(dir).map_err(|e| {
-                VmError::RuntimeState(format!("reset: remove {}: {e}", dir.display()))
-            })?;
+        if safe_remove_dir_all(dir)? {
             cleaned += 1;
         }
     }
@@ -177,8 +217,18 @@ pub fn reset_runtime_state(rootfs: &Path, gateway_name: &str) -> Result<(), VmEr
     let sentinel = rootfs.join("opt/openshell/.initialized");
     let reset_marker = rootfs.join("opt/openshell/.reset");
     if sentinel.exists() {
-        fs::remove_file(&sentinel).ok();
-        fs::write(&reset_marker, "").ok();
+        fs::remove_file(&sentinel).map_err(|e| {
+            VmError::RuntimeState(format!(
+                "reset: remove sentinel {}: {e}",
+                sentinel.display()
+            ))
+        })?;
+        fs::write(&reset_marker, "").map_err(|e| {
+            VmError::RuntimeState(format!(
+                "reset: write marker {}: {e}",
+                reset_marker.display()
+            ))
+        })?;
         cleaned += 1;
     }
 
@@ -196,7 +246,12 @@ pub fn reset_runtime_state(rootfs: &Path, gateway_name: &str) -> Result<(), VmEr
             .join(gateway_name)
             .join("mtls");
         if mtls_dir.is_dir() {
-            fs::remove_dir_all(&mtls_dir).ok();
+            fs::remove_dir_all(&mtls_dir).map_err(|e| {
+                VmError::RuntimeState(format!(
+                    "reset: remove mTLS dir {}: {e}",
+                    mtls_dir.display()
+                ))
+            })?;
         }
         // Also remove metadata so is_warm_boot() returns false.
         let metadata = PathBuf::from(&config_base)
@@ -204,7 +259,12 @@ pub fn reset_runtime_state(rootfs: &Path, gateway_name: &str) -> Result<(), VmEr
             .join(gateway_name)
             .join("metadata.json");
         if metadata.is_file() {
-            fs::remove_file(&metadata).ok();
+            fs::remove_file(&metadata).map_err(|e| {
+                VmError::RuntimeState(format!(
+                    "reset: remove metadata {}: {e}",
+                    metadata.display()
+                ))
+            })?;
         }
     }
 

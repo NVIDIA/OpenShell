@@ -9,7 +9,7 @@
 # at /opt/openshell/.initialized), the full manifest setup is skipped and
 # k3s resumes from its persisted state (~3-5s startup).
 
-set -e
+set -euo pipefail
 
 BOOT_START=$(date +%s%3N 2>/dev/null || date +%s)
 
@@ -50,6 +50,7 @@ ts "filesystems mounted"
 
 # ── Networking ──────────────────────────────────────────────────────────
 
+# Non-critical: hostname is cosmetic.
 hostname openshell-vm 2>/dev/null || true
 
 # Ensure loopback is up (k3s binds to 127.0.0.1).
@@ -95,7 +96,11 @@ DHCP_SCRIPT
         # -f: stay in foreground, -q: quit after obtaining lease,
         # -n: exit if no lease, -T 1: 1s between retries, -t 3: 3 retries
         # -A 1: wait 1s before first retry (aggressive for local gvproxy)
-        udhcpc -i eth0 -f -q -n -T 1 -t 3 -A 1 -s "$UDHCPC_SCRIPT" 2>&1 || true
+        if ! udhcpc -i eth0 -f -q -n -T 1 -t 3 -A 1 -s "$UDHCPC_SCRIPT" 2>&1; then
+            ts "WARNING: DHCP failed, falling back to static config"
+            ip addr add 192.168.127.2/24 dev eth0 2>/dev/null || true
+            ip route add default via 192.168.127.1 2>/dev/null || true
+        fi
     else
         # Fallback to static config if no DHCP client available.
         ts "no DHCP client, using static config"
@@ -440,12 +445,17 @@ CNI_BIN_DIR="/opt/cni/bin"
 mkdir -p "$CNI_CONF_DIR" "$CNI_BIN_DIR"
 
 # Enable IP forwarding (required for masquerade).
-echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+if ! echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null; then
+    echo "FATAL: failed to enable IP forwarding — pod networking will not work" >&2
+    exit 1
+fi
 
 # Enable bridge netfilter call (required for CNI bridge masquerade to
 # see bridged traffic).
 if [ -f /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
-    echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || true
+    if ! echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null; then
+        ts "WARNING: failed to enable bridge-nf-call-iptables — CNI masquerade may not work"
+    fi
 fi
 
 cat > "$CNI_CONF_DIR/10-bridge.conflist" << 'CNICFG'
@@ -806,8 +816,15 @@ fi
 KINE_DB="/var/lib/rancher/k3s/server/db/state.db"
 if [ -f "$KINE_DB" ]; then
     ts "clearing stale kine bootstrap lock (if any)"
-    sqlite3 "$KINE_DB" "DELETE FROM kine WHERE name LIKE '/bootstrap/%';" 2>/dev/null || true
-    sqlite3 "$KINE_DB" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
+    # If sqlite3 fails (corrupt DB, missing binary), log the failure.
+    # The host-side corruption check in exec.rs handles the corrupt case,
+    # but we should still know about it.
+    if ! sqlite3 "$KINE_DB" "DELETE FROM kine WHERE name LIKE '/bootstrap/%';" 2>/dev/null; then
+        ts "WARNING: failed to clear kine bootstrap lock — k3s may hang if DB is corrupt"
+    fi
+    if ! sqlite3 "$KINE_DB" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null; then
+        ts "WARNING: failed to checkpoint kine WAL"
+    fi
 fi
 
 exec /usr/local/bin/k3s server "${K3S_ARGS[@]}"

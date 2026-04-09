@@ -8,6 +8,7 @@
 //! to gRPC requests. This ensures we don't mark the server as ready before
 //! it has fully booted.
 
+use crate::VmError;
 use openshell_core::proto::{HealthRequest, ServiceStatus, open_shell_client::OpenShellClient};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -80,8 +81,10 @@ async fn grpc_health_check(gateway_port: u16, gateway_name: &str) -> Result<(), 
 /// This replaces the TCP-only probe with a proper gRPC health check that verifies
 /// the service is actually responding to requests, not just accepting connections.
 ///
-/// Falls back to TCP probe if mTLS materials aren't available yet.
-pub fn wait_for_gateway_ready(gateway_port: u16, gateway_name: &str) {
+/// Returns `Ok(())` when the gateway is confirmed healthy, or `Err` if the health
+/// check fails or times out. Falls back to TCP probe if mTLS materials aren't
+/// available yet.
+pub fn wait_for_gateway_ready(gateway_port: u16, gateway_name: &str) -> Result<(), VmError> {
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(90);
     let poll_interval = Duration::from_secs(1);
@@ -96,8 +99,7 @@ pub fn wait_for_gateway_ready(gateway_port: u16, gateway_name: &str) {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("  failed to create tokio runtime: {e}, falling back to TCP probe");
-            wait_for_tcp_only(gateway_port, timeout, poll_interval);
-            return;
+            return wait_for_tcp_only(gateway_port, timeout, poll_interval);
         }
     };
 
@@ -114,28 +116,24 @@ pub fn wait_for_gateway_ready(gateway_port: u16, gateway_name: &str) {
         match result {
             Ok(Ok(())) => {
                 eprintln!("Gateway healthy [{:.1}s]", start.elapsed().as_secs_f64());
-                return;
+                return Ok(());
             }
             Ok(Err(e)) => {
                 // gRPC call completed but failed
                 if start.elapsed() >= timeout {
-                    eprintln!(
-                        "  gateway health check failed after {:.0}s: {e}",
+                    return Err(VmError::Bootstrap(format!(
+                        "gateway health check failed after {:.0}s: {e}",
                         timeout.as_secs_f64()
-                    );
-                    eprintln!("  continuing anyway - gateway may not be fully operational");
-                    return;
+                    )));
                 }
             }
             Err(_) => {
                 // Timeout on the health check itself
                 if start.elapsed() >= timeout {
-                    eprintln!(
-                        "  gateway health check timed out after {:.0}s",
+                    return Err(VmError::Bootstrap(format!(
+                        "gateway health check timed out after {:.0}s",
                         timeout.as_secs_f64()
-                    );
-                    eprintln!("  continuing anyway - gateway may not be fully operational");
-                    return;
+                    )));
                 }
             }
         }
@@ -145,7 +143,11 @@ pub fn wait_for_gateway_ready(gateway_port: u16, gateway_name: &str) {
 }
 
 /// Fallback TCP-only probe when gRPC health check can't be performed.
-fn wait_for_tcp_only(gateway_port: u16, timeout: Duration, poll_interval: Duration) {
+fn wait_for_tcp_only(
+    gateway_port: u16,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(), VmError> {
     let start = std::time::Instant::now();
 
     loop {
@@ -154,15 +156,14 @@ fn wait_for_tcp_only(gateway_port: u16, timeout: Duration, poll_interval: Durati
                 "Service reachable (TCP) [{:.1}s]",
                 start.elapsed().as_secs_f64()
             );
-            return;
+            return Ok(());
         }
 
         if start.elapsed() >= timeout {
-            eprintln!(
-                "  gateway TCP probe failed after {:.0}s, continuing anyway",
+            return Err(VmError::Bootstrap(format!(
+                "gateway TCP probe failed after {:.0}s",
                 timeout.as_secs_f64()
-            );
-            return;
+            )));
         }
 
         std::thread::sleep(poll_interval);

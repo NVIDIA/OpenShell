@@ -790,7 +790,51 @@ impl VmContext {
 impl Drop for VmContext {
     fn drop(&mut self) {
         unsafe {
-            let _ = (self.krun.krun_free_ctx)(self.ctx_id);
+            let ret = (self.krun.krun_free_ctx)(self.ctx_id);
+            if ret < 0 {
+                eprintln!(
+                    "warning: krun_free_ctx({}) failed with code {ret}",
+                    self.ctx_id
+                );
+            }
+        }
+    }
+}
+
+/// RAII guard that kills and waits on a gvproxy child process when dropped.
+///
+/// This prevents orphaned gvproxy processes when early `?` returns in the
+/// launch function cause the child to be dropped before cleanup code runs.
+/// Call [`GvproxyGuard::disarm`] to take ownership of the child when it
+/// should outlive the guard (i.e., after a successful fork).
+struct GvproxyGuard {
+    child: Option<std::process::Child>,
+}
+
+impl GvproxyGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// Take the child out of the guard, preventing it from being killed on drop.
+    /// Use this after the launch is successful and the parent will manage cleanup.
+    fn disarm(&mut self) -> Option<std::process::Child> {
+        self.child.take()
+    }
+
+    /// Get the child's PID without disarming.
+    fn id(&self) -> Option<u32> {
+        self.child.as_ref().map(std::process::Child::id)
+    }
+}
+
+impl Drop for GvproxyGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let pid = child.id();
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("gvproxy cleaned up (pid {pid})");
         }
     }
 }
@@ -853,6 +897,8 @@ fn gvproxy_expose(api_sock: &Path, body: &str) -> Result<(), String> {
 ///
 /// We only kill the specific gvproxy PID recorded in the VM runtime state
 /// to avoid disrupting unrelated gvproxy instances (e.g. Podman Desktop).
+/// Before sending SIGTERM, we verify the process name contains "gvproxy"
+/// to guard against PID reuse.
 fn kill_stale_gvproxy(rootfs: &Path) {
     let state_path = vm_state_path(rootfs);
     let pid = std::fs::read(&state_path)
@@ -865,6 +911,15 @@ fn kill_stale_gvproxy(rootfs: &Path) {
         let pid_i32 = gvproxy_pid as libc::pid_t;
         let is_alive = unsafe { libc::kill(pid_i32, 0) } == 0;
         if is_alive {
+            // Verify the process is actually gvproxy before killing.
+            // Without this check, PID reuse could cause us to kill an
+            // unrelated process.
+            if !is_process_named(pid_i32, "gvproxy") {
+                eprintln!(
+                    "Stale gvproxy pid {gvproxy_pid} is no longer gvproxy (PID reused), skipping kill"
+                );
+                return;
+            }
             unsafe {
                 libc::kill(pid_i32, libc::SIGTERM);
             }
@@ -873,6 +928,43 @@ fn kill_stale_gvproxy(rootfs: &Path) {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
     }
+}
+
+/// Check whether a process with the given PID has the expected name.
+///
+/// On macOS, shells out to `ps` to query the process name. On Linux, reads
+/// `/proc/<pid>/comm`. Returns `false` if the process name cannot be
+/// determined (fail-safe: don't kill if we can't verify).
+#[cfg(target_os = "macos")]
+fn is_process_named(pid: libc::pid_t, expected: &str) -> bool {
+    // Use `ps -p <pid> -o comm=` to get just the process name.
+    // This avoids depending on libc kinfo_proc struct layout.
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .is_some_and(|name| name.trim().contains(expected))
+}
+
+#[cfg(target_os = "linux")]
+fn is_process_named(pid: libc::pid_t, expected: &str) -> bool {
+    let comm_path = format!("/proc/{pid}/comm");
+    std::fs::read_to_string(comm_path)
+        .map(|name| name.trim().contains(expected))
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn is_process_named(_pid: libc::pid_t, _expected: &str) -> bool {
+    // Cannot verify on this platform — fail-safe: don't kill.
+    false
 }
 
 fn vm_rootfs_key(rootfs: &Path) -> String {
@@ -964,15 +1056,64 @@ fn hash_path_id(path: &Path) -> String {
     format!("{:012x}", hash & 0x0000_ffff_ffff_ffff)
 }
 
-fn gvproxy_socket_dir(rootfs: &Path) -> Result<PathBuf, VmError> {
-    let mut base = PathBuf::from("/tmp");
-    if !base.is_dir() {
-        base = std::env::temp_dir();
+/// Return a secure base directory for temporary socket files.
+///
+/// Prefers `XDG_RUNTIME_DIR` (per-user, restricted permissions on Linux),
+/// falls back to `/tmp`. After `create_dir_all`, validates the directory
+/// is not a symlink and is owned by the current user.
+fn secure_socket_base(subdir: &str) -> Result<PathBuf, VmError> {
+    let base = if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
+        PathBuf::from(xdg)
+    } else {
+        let mut base = PathBuf::from("/tmp");
+        if !base.is_dir() {
+            base = std::env::temp_dir();
+        }
+        base
+    };
+    let dir = base.join(subdir);
+
+    // If the path exists, verify it is not a symlink before using it.
+    if dir.exists() {
+        let meta = dir
+            .symlink_metadata()
+            .map_err(|e| VmError::HostSetup(format!("lstat {}: {e}", dir.display())))?;
+        if meta.file_type().is_symlink() {
+            return Err(VmError::HostSetup(format!(
+                "socket directory {} is a symlink — refusing to use it",
+                dir.display()
+            )));
+        }
+        // Verify ownership matches current user.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let uid = unsafe { libc::getuid() };
+            if meta.uid() != uid {
+                return Err(VmError::HostSetup(format!(
+                    "socket directory {} is owned by uid {} but we are uid {} — refusing to use it",
+                    dir.display(),
+                    meta.uid(),
+                    uid
+                )));
+            }
+        }
+    } else {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| VmError::HostSetup(format!("create socket dir {}: {e}", dir.display())))?;
+        // Set restrictive permissions on the newly created directory.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
-    let dir = base.join("ovm-gv");
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        VmError::HostSetup(format!("create gvproxy socket dir {}: {e}", dir.display()))
-    })?;
+
+    Ok(dir)
+}
+
+fn gvproxy_socket_dir(rootfs: &Path) -> Result<PathBuf, VmError> {
+    let dir = secure_socket_base("ovm-gv")?;
 
     // macOS unix socket path limit is tight (~104 bytes). Keep paths very short.
     let id = hash_path_id(rootfs);
@@ -1114,8 +1255,9 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
     }
     vm.set_workdir(&config.workdir)?;
 
-    // Networking setup
-    let mut gvproxy_child: Option<std::process::Child> = None;
+    // Networking setup — use a drop guard so gvproxy is killed if we
+    // return early via `?` before reaching the parent's cleanup code.
+    let mut gvproxy_guard: Option<GvproxyGuard> = None;
     let mut gvproxy_api_sock: Option<PathBuf> = None;
 
     match &config.net {
@@ -1247,7 +1389,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                 "Networking: gvproxy (virtio-net) [{:.1}s]",
                 launch_start.elapsed().as_secs_f64()
             );
-            gvproxy_child = Some(child);
+            gvproxy_guard = Some(GvproxyGuard::new(child));
             gvproxy_api_sock = Some(api_sock);
         }
     }
@@ -1324,17 +1466,15 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
         _ => {
             // Parent: wait for child
             if config.exec_path == "/srv/openshell-vm-init.sh" {
-                let gvproxy_pid = gvproxy_child.as_ref().map(std::process::Child::id);
+                let gvproxy_pid = gvproxy_guard.as_ref().and_then(GvproxyGuard::id);
                 if let Err(err) =
                     write_vm_runtime_state(&config.rootfs, pid, &console_log, gvproxy_pid)
                 {
                     unsafe {
                         libc::kill(pid, libc::SIGTERM);
                     }
-                    if let Some(mut child) = gvproxy_child {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
+                    // Guard drop will kill gvproxy automatically
+                    drop(gvproxy_guard);
                     clear_vm_runtime_state(&config.rootfs);
                     return Err(err);
                 }
@@ -1421,19 +1561,14 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                 // Cold boot (Path 2) writes secret manifests into the
                 // k3s auto-deploy directory via virtio-fs.
                 let gateway_port = gateway_host_port(config);
-                if let Err(e) =
-                    bootstrap_gateway(&config.rootfs, &config.gateway_name, gateway_port)
-                {
-                    eprintln!("Bootstrap failed: {e}");
-                    eprintln!("  The VM is running but OpenShell may not be fully operational.");
-                }
+                bootstrap_gateway(&config.rootfs, &config.gateway_name, gateway_port)?;
 
                 // Wait for the gRPC health check to pass. This ensures
                 // the service is fully operational, not just accepting
                 // TCP connections. The health check confirms the full
                 // path (gvproxy → kube-proxy nftables → pod:8080) and
                 // that the gRPC service is responding to requests.
-                health::wait_for_gateway_ready(gateway_port, &config.gateway_name);
+                health::wait_for_gateway_ready(gateway_port, &config.gateway_name)?;
             }
 
             eprintln!("Ready [{:.1}s total]", boot_start.elapsed().as_secs_f64());
@@ -1457,11 +1592,14 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                 libc::waitpid(pid, &raw mut status, 0);
             }
 
-            // Clean up gvproxy
+            // Clean up gvproxy — disarm the guard and do explicit cleanup
+            // so we can print the "stopped" message.
             if config.exec_path == "/srv/openshell-vm-init.sh" {
                 clear_vm_runtime_state(&config.rootfs);
             }
-            if let Some(mut child) = gvproxy_child {
+            if let Some(mut guard) = gvproxy_guard
+                && let Some(mut child) = guard.disarm()
+            {
                 let _ = child.kill();
                 let _ = child.wait();
                 eprintln!("gvproxy stopped");
