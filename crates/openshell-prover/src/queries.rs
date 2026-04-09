@@ -217,7 +217,7 @@ pub fn run_all_queries(model: &ReachabilityModel) -> Vec<Finding> {
 // ---------------------------------------------------------------------------
 
 /// Check whether an endpoint in the policy is L7-enforced.
-fn is_endpoint_l7_enforced(policy: &crate::policy::PolicyModel, host: &str, port: u32) -> bool {
+fn is_endpoint_l7_enforced(policy: &crate::policy::PolicyModel, host: &str, port: u16) -> bool {
     for rule in policy.network_policies.values() {
         for ep in &rule.endpoints {
             if ep.host == host && ep.effective_ports().contains(&port) {

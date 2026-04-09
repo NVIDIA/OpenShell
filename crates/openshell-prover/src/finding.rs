@@ -26,7 +26,7 @@ impl fmt::Display for RiskLevel {
 pub struct ExfilPath {
     pub binary: String,
     pub endpoint_host: String,
-    pub endpoint_port: u32,
+    pub endpoint_port: u16,
     pub mechanism: String,
     pub policy_name: String,
     /// One of `"l4_only"`, `"l7_allows_write"`, `"l7_bypassed"`.
@@ -38,7 +38,7 @@ pub struct ExfilPath {
 pub struct WriteBypassPath {
     pub binary: String,
     pub endpoint_host: String,
-    pub endpoint_port: u32,
+    pub endpoint_port: u16,
     pub policy_name: String,
     pub policy_intent: String,
     /// One of `"l4_only"`, `"l7_bypass_protocol"`, `"credential_write_scope"`.

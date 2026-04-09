@@ -17,7 +17,7 @@ use crate::registry::BinaryRegistry;
 pub struct EndpointId {
     pub policy_name: String,
     pub host: String,
-    pub port: u32,
+    pub port: u16,
 }
 
 impl EndpointId {

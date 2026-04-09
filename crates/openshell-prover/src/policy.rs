@@ -68,16 +68,12 @@ struct PolicyFile {
 
 #[derive(Debug, Deserialize)]
 struct FilesystemDef {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     include_workdir: bool,
     #[serde(default)]
     read_only: Vec<String>,
     #[serde(default)]
     read_write: Vec<String>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,9 +91,9 @@ struct EndpointDef {
     #[serde(default)]
     host: String,
     #[serde(default)]
-    port: u32,
+    port: u16,
     #[serde(default)]
-    ports: Vec<u32>,
+    ports: Vec<u16>,
     #[serde(default)]
     protocol: String,
     #[serde(default)]
@@ -148,8 +144,8 @@ pub struct L7Rule {
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub host: String,
-    pub port: u32,
-    pub ports: Vec<u32>,
+    pub port: u16,
+    pub ports: Vec<u16>,
     pub protocol: String,
     pub tls: String,
     pub enforcement: String,
@@ -195,7 +191,7 @@ impl Endpoint {
     }
 
     /// The effective list of ports for this endpoint.
-    pub fn effective_ports(&self) -> Vec<u32> {
+    pub fn effective_ports(&self) -> Vec<u16> {
         if !self.ports.is_empty() {
             return self.ports.clone();
         }
@@ -263,7 +259,7 @@ pub struct FilesystemPolicy {
 impl Default for FilesystemPolicy {
     fn default() -> Self {
         Self {
-            include_workdir: true,
+            include_workdir: false,
             read_only: Vec::new(),
             read_write: Vec::new(),
         }
