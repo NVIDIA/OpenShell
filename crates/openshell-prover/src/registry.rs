@@ -3,12 +3,17 @@
 
 //! Binary capability registry — loads YAML descriptors that describe what each
 //! binary can do (protocols, exfiltration, HTTP construction, etc.).
+//!
+//! The built-in registry is embedded at compile time via `include_dir!`.
+//! A filesystem override can be provided at runtime for custom registries.
 
 use std::collections::HashMap;
-use std::path::Path;
 
+use include_dir::{include_dir, Dir};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::Deserialize;
+
+static EMBEDDED_REGISTRY: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/registry");
 
 // ---------------------------------------------------------------------------
 // Serde types
@@ -164,13 +169,15 @@ impl BinaryRegistry {
         if let Some(cap) = self.binaries.get(path) {
             return cap.clone();
         }
-        // Check glob patterns (e.g., registry has /usr/bin/python* matching /usr/bin/python3.13)
         for (reg_path, cap) in &self.binaries {
-            if reg_path.contains('*') && glob_match(reg_path, path) {
-                return cap.clone();
+            if reg_path.contains('*') {
+                if let Ok(pattern) = glob::Pattern::new(reg_path) {
+                    if pattern.matches(path) {
+                        return cap.clone();
+                    }
+                }
             }
         }
-        // Conservative default: unknown binary assumed capable of everything.
         BinaryCapability {
             path: path.to_owned(),
             description: "Unknown binary — not in registry".to_owned(),
@@ -183,81 +190,14 @@ impl BinaryRegistry {
     }
 }
 
-/// Simple glob matching supporting `*` (single segment) and `**` (multiple
-/// segments).
-fn glob_match(pattern: &str, path: &str) -> bool {
-    // Split both on `/` and match segment by segment.
-    let pat_parts: Vec<&str> = pattern.split('/').collect();
-    let path_parts: Vec<&str> = path.split('/').collect();
-    glob_match_segments(&pat_parts, &path_parts)
-}
-
-fn glob_match_segments(pat: &[&str], path: &[&str]) -> bool {
-    if pat.is_empty() {
-        return path.is_empty();
-    }
-    if pat[0] == "**" {
-        // ** matches zero or more segments.
-        for i in 0..=path.len() {
-            if glob_match_segments(&pat[1..], &path[i..]) {
-                return true;
-            }
-        }
-        return false;
-    }
-    if path.is_empty() {
-        return false;
-    }
-    if segment_match(pat[0], path[0]) {
-        return glob_match_segments(&pat[1..], &path[1..]);
-    }
-    false
-}
-
-fn segment_match(pattern: &str, segment: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    if !pattern.contains('*') {
-        return pattern == segment;
-    }
-    // Simple wildcard within a segment: split on '*' and check prefix/suffix.
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 2 {
-        return segment.starts_with(parts[0]) && segment.ends_with(parts[1]);
-    }
-    // Fallback: fnmatch-like. For simplicity, just check contains for each part.
-    let mut remaining = segment;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if i == 0 {
-            if !remaining.starts_with(part) {
-                return false;
-            }
-            remaining = &remaining[part.len()..];
-        } else if let Some(pos) = remaining.find(part) {
-            remaining = &remaining[pos + part.len()..];
-        } else {
-            return false;
-        }
-    }
-    true
-}
-
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
 
-/// Load a single binary capability descriptor from a YAML file.
-fn load_binary_capability(path: &Path) -> Result<BinaryCapability> {
-    let contents = std::fs::read_to_string(path)
+fn parse_binary_capability(contents: &str, source: &str) -> Result<BinaryCapability> {
+    let raw: BinaryCapabilityDef = serde_yml::from_str(contents)
         .into_diagnostic()
-        .wrap_err_with(|| format!("reading binary descriptor {}", path.display()))?;
-    let raw: BinaryCapabilityDef = serde_yml::from_str(&contents)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("parsing binary descriptor {}", path.display()))?;
+        .wrap_err_with(|| format!("parsing binary descriptor {source}"))?;
 
     let protocols = raw
         .protocols
@@ -293,10 +233,25 @@ fn load_binary_capability(path: &Path) -> Result<BinaryCapability> {
     })
 }
 
-/// Load all binary capability descriptors from a registry directory.
-///
-/// Expects `{registry_dir}/binaries/*.yaml`.
-pub fn load_binary_registry(registry_dir: &Path) -> Result<BinaryRegistry> {
+/// Load binary registry from the compile-time embedded registry data.
+pub fn load_embedded_binary_registry() -> Result<BinaryRegistry> {
+    let mut binaries = HashMap::new();
+    if let Some(dir) = EMBEDDED_REGISTRY.get_dir("binaries") {
+        for file in dir.files() {
+            if file.path().extension().is_some_and(|ext| ext == "yaml") {
+                let contents = file.contents_utf8().ok_or_else(|| {
+                    miette::miette!("non-UTF8 registry file: {}", file.path().display())
+                })?;
+                let cap = parse_binary_capability(contents, &file.path().display().to_string())?;
+                binaries.insert(cap.path.clone(), cap);
+            }
+        }
+    }
+    Ok(BinaryRegistry { binaries })
+}
+
+/// Load binary registry from a filesystem directory override.
+pub fn load_binary_registry_from_dir(registry_dir: &std::path::Path) -> Result<BinaryRegistry> {
     let mut binaries = HashMap::new();
     let binaries_dir = registry_dir.join("binaries");
     if binaries_dir.is_dir() {
@@ -307,10 +262,18 @@ pub fn load_binary_registry(registry_dir: &Path) -> Result<BinaryRegistry> {
             let entry = entry.into_diagnostic()?;
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "yaml") {
-                let cap = load_binary_capability(&path)?;
+                let contents = std::fs::read_to_string(&path)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("reading {}", path.display()))?;
+                let cap = parse_binary_capability(&contents, &path.display().to_string())?;
                 binaries.insert(cap.path.clone(), cap);
             }
         }
     }
     Ok(BinaryRegistry { binaries })
+}
+
+/// Accessor for the embedded registry (used by credentials module for API descriptors).
+pub fn embedded_registry() -> &'static Dir<'static> {
+    &EMBEDDED_REGISTRY
 }

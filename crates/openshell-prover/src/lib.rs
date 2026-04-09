@@ -21,11 +21,9 @@ use std::path::Path;
 use miette::Result;
 
 use accepted_risks::{apply_accepted_risks, load_accepted_risks};
-use credentials::load_credential_set;
 use model::build_model;
 use policy::parse_policy;
 use queries::run_all_queries;
-use registry::load_binary_registry;
 use report::{render_compact, render_report};
 
 /// Run the prover end-to-end and return an exit code.
@@ -33,6 +31,9 @@ use report::{render_compact, render_report};
 /// - `0` — pass (no critical/high findings, or all accepted)
 /// - `1` — fail (critical or high findings present)
 /// - `2` — input error
+///
+/// Binary and API capability registries are embedded at compile time.
+/// Pass `registry_dir` to override with a custom filesystem registry.
 pub fn prove(
     policy_path: &str,
     credentials_path: &str,
@@ -40,39 +41,30 @@ pub fn prove(
     accepted_risks_path: Option<&str>,
     compact: bool,
 ) -> Result<i32> {
-    // Determine registry directory.
-    let registry = registry_dir
-        .map(Path::new)
-        .map(std::borrow::Cow::Borrowed)
-        .unwrap_or_else(|| {
-            // Default: look for registry/ next to the prover crate, then CWD.
-            let crate_registry = Path::new(env!("CARGO_MANIFEST_DIR")).join("registry");
-            if crate_registry.is_dir() {
-                std::borrow::Cow::Owned(crate_registry)
-            } else {
-                std::borrow::Cow::Owned(
-                    std::env::current_dir().unwrap_or_default().join("registry"),
-                )
-            }
-        });
-
     let policy = parse_policy(Path::new(policy_path))?;
 
-    let credential_set = load_credential_set(Path::new(credentials_path), &registry)?;
+    let (credential_set, binary_registry) = match registry_dir {
+        Some(dir) => {
+            let dir = Path::new(dir);
+            (
+                credentials::load_credential_set_from_dir(Path::new(credentials_path), dir)?,
+                registry::load_binary_registry_from_dir(dir)?,
+            )
+        }
+        None => (
+            credentials::load_credential_set_embedded(Path::new(credentials_path))?,
+            registry::load_embedded_binary_registry()?,
+        ),
+    };
 
-    let binary_registry = load_binary_registry(&registry)?;
-
-    // Build Z3 model and run queries.
     let z3_model = build_model(policy, credential_set, binary_registry);
     let mut findings = run_all_queries(&z3_model);
 
-    // Apply accepted risks.
     if let Some(ar_path) = accepted_risks_path {
         let accepted = load_accepted_risks(Path::new(ar_path))?;
         findings = apply_accepted_risks(findings, &accepted);
     }
 
-    // Render.
     let exit_code = if compact {
         render_compact(&findings, policy_path, credentials_path)
     } else {
@@ -95,10 +87,6 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata")
     }
 
-    fn registry_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("registry")
-    }
-
     // 1. Parse testdata/policy.yaml, verify structure.
     #[test]
     fn test_parse_policy() {
@@ -118,14 +106,12 @@ mod tests {
         let path = testdata_dir().join("policy.yaml");
         let model = policy::parse_policy(&path).expect("failed to parse policy");
         let readable = model.filesystem_policy.readable_paths();
-        // read_only has 7 entries, read_write has 3 (/sandbox, /tmp, /dev/null).
-        // include_workdir=true but /sandbox is already in read_write, so no dup.
         assert!(readable.contains(&"/usr".to_owned()));
         assert!(readable.contains(&"/sandbox".to_owned()));
         assert!(readable.contains(&"/tmp".to_owned()));
     }
 
-    // 3. Workdir included by default.
+    // 3. Workdir NOT included by default (matches runtime behavior).
     #[test]
     fn test_include_workdir_default() {
         let yaml = r#"
@@ -136,7 +122,7 @@ filesystem_policy:
 "#;
         let model = policy::parse_policy_str(yaml).expect("parse");
         let readable = model.filesystem_policy.readable_paths();
-        assert!(readable.contains(&"/sandbox".to_owned()));
+        assert!(!readable.contains(&"/sandbox".to_owned()));
     }
 
     // 4. Workdir excluded when include_workdir: false.
@@ -171,21 +157,20 @@ filesystem_policy:
         assert_eq!(sandbox_count, 1);
     }
 
-    // 6. End-to-end: git push bypass findings detected.
+    // 6. End-to-end: git push bypass findings detected (uses embedded registry).
     #[test]
     fn test_git_push_bypass_findings() {
         let policy_path = testdata_dir().join("policy.yaml");
         let creds_path = testdata_dir().join("credentials.yaml");
-        let reg_dir = registry_dir();
 
         let pol = policy::parse_policy(&policy_path).expect("parse policy");
-        let cred_set = credentials::load_credential_set(&creds_path, &reg_dir).expect("load creds");
-        let bin_reg = registry::load_binary_registry(&reg_dir).expect("load registry");
+        let cred_set =
+            credentials::load_credential_set_embedded(&creds_path).expect("load creds");
+        let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
 
         let z3_model = model::build_model(pol, cred_set, bin_reg);
         let findings = queries::run_all_queries(&z3_model);
 
-        // Should have findings from both query types.
         let query_types: std::collections::HashSet<&str> =
             findings.iter().map(|f| f.query.as_str()).collect();
         assert!(
@@ -196,8 +181,6 @@ filesystem_policy:
             query_types.contains("write_bypass"),
             "expected write_bypass finding"
         );
-
-        // At least one critical or high finding.
         assert!(
             findings.iter().any(|f| matches!(
                 f.risk,
@@ -212,11 +195,11 @@ filesystem_policy:
     fn test_empty_policy_no_findings() {
         let policy_path = testdata_dir().join("empty-policy.yaml");
         let creds_path = testdata_dir().join("credentials.yaml");
-        let reg_dir = registry_dir();
 
         let pol = policy::parse_policy(&policy_path).expect("parse policy");
-        let cred_set = credentials::load_credential_set(&creds_path, &reg_dir).expect("load creds");
-        let bin_reg = registry::load_binary_registry(&reg_dir).expect("load registry");
+        let cred_set =
+            credentials::load_credential_set_embedded(&creds_path).expect("load creds");
+        let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
 
         let z3_model = model::build_model(pol, cred_set, bin_reg);
         let findings = queries::run_all_queries(&z3_model);

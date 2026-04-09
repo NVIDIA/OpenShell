@@ -175,14 +175,10 @@ pub fn load_credentials(path: &Path) -> Result<Vec<Credential>> {
         .collect())
 }
 
-/// Load an API capability registry from a YAML file.
-fn load_api_registry(path: &Path) -> Result<ApiCapability> {
-    let contents = std::fs::read_to_string(path)
+fn parse_api_registry(contents: &str, source: &str) -> Result<ApiCapability> {
+    let raw: ApiRegistryDef = serde_yml::from_str(contents)
         .into_diagnostic()
-        .wrap_err_with(|| format!("reading API registry {}", path.display()))?;
-    let raw: ApiRegistryDef = serde_yml::from_str(&contents)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("parsing API registry {}", path.display()))?;
+        .wrap_err_with(|| format!("parsing API registry {source}"))?;
 
     let scope_capabilities = raw
         .scope_capabilities
@@ -210,12 +206,24 @@ fn load_api_registry(path: &Path) -> Result<ApiCapability> {
     })
 }
 
-/// Load credentials and all API registries from the registry directory.
-///
-/// Expects `{registry_dir}/apis/*.yaml`.
-pub fn load_credential_set(credentials_path: &Path, registry_dir: &Path) -> Result<CredentialSet> {
-    let creds = load_credentials(credentials_path)?;
+fn load_embedded_api_registries() -> Result<HashMap<String, ApiCapability>> {
+    let registry = crate::registry::embedded_registry();
+    let mut api_registries = HashMap::new();
+    if let Some(dir) = registry.get_dir("apis") {
+        for file in dir.files() {
+            if file.path().extension().is_some_and(|ext| ext == "yaml") {
+                let contents = file.contents_utf8().ok_or_else(|| {
+                    miette::miette!("non-UTF8 API registry file: {}", file.path().display())
+                })?;
+                let api = parse_api_registry(contents, &file.path().display().to_string())?;
+                api_registries.insert(api.api.clone(), api);
+            }
+        }
+    }
+    Ok(api_registries)
+}
 
+fn load_api_registries_from_dir(registry_dir: &Path) -> Result<HashMap<String, ApiCapability>> {
     let mut api_registries = HashMap::new();
     let apis_dir = registry_dir.join("apis");
     if apis_dir.is_dir() {
@@ -226,12 +234,34 @@ pub fn load_credential_set(credentials_path: &Path, registry_dir: &Path) -> Resu
             let entry = entry.into_diagnostic()?;
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "yaml") {
-                let api = load_api_registry(&path)?;
+                let contents = std::fs::read_to_string(&path)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("reading {}", path.display()))?;
+                let api = parse_api_registry(&contents, &path.display().to_string())?;
                 api_registries.insert(api.api.clone(), api);
             }
         }
     }
+    Ok(api_registries)
+}
 
+/// Load credentials with API registries from the embedded registry.
+pub fn load_credential_set_embedded(credentials_path: &Path) -> Result<CredentialSet> {
+    let creds = load_credentials(credentials_path)?;
+    let api_registries = load_embedded_api_registries()?;
+    Ok(CredentialSet {
+        credentials: creds,
+        api_registries,
+    })
+}
+
+/// Load credentials with API registries from a filesystem directory override.
+pub fn load_credential_set_from_dir(
+    credentials_path: &Path,
+    registry_dir: &Path,
+) -> Result<CredentialSet> {
+    let creds = load_credentials(credentials_path)?;
+    let api_registries = load_api_registries_from_dir(registry_dir)?;
     Ok(CredentialSet {
         credentials: creds,
         api_registries,
