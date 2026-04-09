@@ -368,7 +368,7 @@ fn c_string_array(strings: &[&str]) -> Result<(Vec<CString>, Vec<*const libc::c_
 
 const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
 
-pub(crate) fn configured_runtime_dir() -> Result<PathBuf, VmError> {
+pub fn configured_runtime_dir() -> Result<PathBuf, VmError> {
     // Allow override for development
     if let Some(path) = std::env::var_os(VM_RUNTIME_DIR_ENV) {
         let path = PathBuf::from(path);

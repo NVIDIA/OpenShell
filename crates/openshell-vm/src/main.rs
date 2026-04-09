@@ -120,6 +120,44 @@ enum GatewayCommand {
 }
 
 fn main() {
+    // On macOS, libkrun loads libkrunfw.5.dylib via dlopen() with a bare name.
+    // The dynamic linker only finds it if DYLD_LIBRARY_PATH includes the runtime
+    // directory, but env vars set after process start are ignored by dyld. To work
+    // around this, re-exec the binary with DYLD_LIBRARY_PATH set if the runtime
+    // is available and the variable is not already configured.
+    #[cfg(target_os = "macos")]
+    {
+        if std::env::var_os("__OPENSHELL_VM_REEXEC").is_none() {
+            if let Ok(runtime_dir) = openshell_vm::configured_runtime_dir() {
+                let needs_reexec = std::env::var_os("DYLD_LIBRARY_PATH").map_or(true, |v| {
+                    !v.to_string_lossy()
+                        .contains(runtime_dir.to_str().unwrap_or(""))
+                });
+                if needs_reexec {
+                    let mut dyld_paths = vec![runtime_dir];
+                    if let Some(existing) = std::env::var_os("DYLD_LIBRARY_PATH") {
+                        dyld_paths.extend(std::env::split_paths(&existing));
+                    }
+                    let joined = std::env::join_paths(&dyld_paths).expect("join DYLD_LIBRARY_PATH");
+                    let exe = std::env::current_exe().expect("current_exe");
+                    let args: Vec<String> = std::env::args().skip(1).collect();
+                    let err = std::process::Command::new(exe)
+                        .args(&args)
+                        .env("DYLD_LIBRARY_PATH", &joined)
+                        .env("__OPENSHELL_VM_REEXEC", "1")
+                        .status();
+                    match err {
+                        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                        Err(e) => {
+                            eprintln!("Error: failed to re-exec with DYLD_LIBRARY_PATH: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
