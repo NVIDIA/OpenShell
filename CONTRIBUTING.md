@@ -119,6 +119,28 @@ Project requirements:
 - Rust 1.88+
 - Python 3.12+
 - Docker (running)
+- Z3 solver library (for the policy prover crate)
+
+### Z3 installation
+
+The `openshell-prover` crate links against the system Z3 library via pkg-config.
+
+```bash
+# macOS
+brew install z3
+
+# Ubuntu / Debian
+sudo apt install libz3-dev
+
+# Fedora
+sudo dnf install z3-devel
+```
+
+If you prefer not to install Z3 system-wide, you can compile it from source as a one-time step:
+
+```bash
+cargo build -p openshell-prover --features bundled-z3
+```
 
 ## Getting Started
 
