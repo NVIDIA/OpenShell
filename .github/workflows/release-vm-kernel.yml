@@ -254,9 +254,10 @@ jobs:
             | Linux x86_64 | `openshell-vm-x86_64-unknown-linux-gnu.tar.gz` |
             | macOS ARM64 | `openshell-vm-aarch64-apple-darwin.tar.gz` |
 
-            **macOS users:** The binary must be codesigned with the Hypervisor entitlement:
-            ```bash
-            codesign --entitlements crates/openshell-vm/entitlements.plist --force -s - ./openshell-vm
+            ### Quick install
+
+            ```
+            curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-vm.sh | sh
             ```
 
           files: |
