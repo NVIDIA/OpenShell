@@ -66,7 +66,7 @@ install_deps() {
   
   if command -v apt-get &>/dev/null; then
     # Debian/Ubuntu
-    DEPS="build-essential git python3 python3-pip python3-pyelftools flex bison libelf-dev libssl-dev bc curl libclang-dev cpio"
+    DEPS="build-essential git python3 python3-pip python3-pyelftools flex bison libelf-dev libssl-dev bc curl libclang-dev cpio zstd jq"
     MISSING=""
     for dep in $DEPS; do
       if ! dpkg -s "$dep" &>/dev/null; then
@@ -83,7 +83,7 @@ install_deps() {
     
   elif command -v dnf &>/dev/null; then
     # Fedora/RHEL
-    DEPS="make git python3 python3-pyelftools gcc flex bison elfutils-libelf-devel openssl-devel bc glibc-static curl clang-devel cpio"
+    DEPS="make git python3 python3-pyelftools gcc flex bison elfutils-libelf-devel openssl-devel bc glibc-static curl clang-devel cpio zstd jq"
     echo "    Installing dependencies via dnf..."
     $SUDO dnf install -y $DEPS
     
