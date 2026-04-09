@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::Deserialize;
 

@@ -164,8 +164,7 @@ filesystem_policy:
         let creds_path = testdata_dir().join("credentials.yaml");
 
         let pol = policy::parse_policy(&policy_path).expect("parse policy");
-        let cred_set =
-            credentials::load_credential_set_embedded(&creds_path).expect("load creds");
+        let cred_set = credentials::load_credential_set_embedded(&creds_path).expect("load creds");
         let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
 
         let z3_model = model::build_model(pol, cred_set, bin_reg);
@@ -197,8 +196,7 @@ filesystem_policy:
         let creds_path = testdata_dir().join("credentials.yaml");
 
         let pol = policy::parse_policy(&policy_path).expect("parse policy");
-        let cred_set =
-            credentials::load_credential_set_embedded(&creds_path).expect("load creds");
+        let cred_set = credentials::load_credential_set_embedded(&creds_path).expect("load creds");
         let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
 
         let z3_model = model::build_model(pol, cred_set, bin_reg);
