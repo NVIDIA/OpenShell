@@ -116,6 +116,9 @@ CONFIG_CGROUP_CPUACCT=y
 CONFIG_CGROUP_PIDS=y
 CONFIG_MEMCG=y
 
+# ── Disable kernel headers archive (avoids cpio issues in CI) ──────────
+# CONFIG_IKHEADERS is not set
+
 # ── Security features required by the sandbox runtime ───────────────────
 CONFIG_SECURITY_LANDLOCK=y
 CONFIG_SECCOMP_FILTER=y

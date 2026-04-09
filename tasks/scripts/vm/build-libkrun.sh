@@ -66,7 +66,7 @@ install_deps() {
   
   if command -v apt-get &>/dev/null; then
     # Debian/Ubuntu
-    DEPS="build-essential git python3 python3-pyelftools flex bison libelf-dev libssl-dev bc curl libclang-dev"
+    DEPS="build-essential git python3 python3-pip python3-pyelftools flex bison libelf-dev libssl-dev bc curl libclang-dev cpio"
     MISSING=""
     for dep in $DEPS; do
       if ! dpkg -s "$dep" &>/dev/null; then
@@ -83,14 +83,22 @@ install_deps() {
     
   elif command -v dnf &>/dev/null; then
     # Fedora/RHEL
-    DEPS="make git python3 python3-pyelftools gcc flex bison elfutils-libelf-devel openssl-devel bc glibc-static curl clang-devel"
+    DEPS="make git python3 python3-pyelftools gcc flex bison elfutils-libelf-devel openssl-devel bc glibc-static curl clang-devel cpio"
     echo "    Installing dependencies via dnf..."
     $SUDO dnf install -y $DEPS
     
   else
     echo "Warning: Unknown package manager. Please install manually:" >&2
     echo "  build-essential git python3 python3-pyelftools flex bison" >&2
-    echo "  libelf-dev libssl-dev bc curl" >&2
+    echo "  libelf-dev libssl-dev bc curl cpio" >&2
+  fi
+
+  # Ensure pyelftools is importable by the Python that will run bin2cbundle.py.
+  # The apt package may install to a different Python than the default python3.
+  if ! python3 -c "import elftools" &>/dev/null; then
+    echo "    pyelftools not importable, installing via pip..."
+    python3 -m pip install --break-system-packages pyelftools 2>/dev/null || \
+    python3 -m pip install pyelftools || true
   fi
 }
 
