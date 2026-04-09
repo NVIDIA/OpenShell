@@ -9,28 +9,26 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Security, Privac
 position: 1
 ---
 
-import { BadgeLinks } from "@/components/BadgeLinks";
-
-
-<BadgeLinks
-  badges={[
-    {
-      href: "https://github.com/NVIDIA/OpenShell",
-      src: "https://img.shields.io/badge/github-repo-green?logo=github",
-      alt: "GitHub",
-    },
-    {
-      href: "https://github.com/NVIDIA/OpenShell/blob/main/LICENSE",
-      src: "https://img.shields.io/badge/License-Apache_2.0-blue",
-      alt: "License",
-    },
-    {
-      href: "https://pypi.org/project/openshell/",
-      src: "https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi",
-      alt: "PyPI",
-    },
-  ]}
-/>
+<div className="badge-links">
+  <a href="https://github.com/NVIDIA/OpenShell" target="_blank" rel="noreferrer">
+    <img
+      src="https://img.shields.io/badge/github-repo-green?logo=github"
+      alt="GitHub"
+    />
+  </a>
+  <a href="https://github.com/NVIDIA/OpenShell/blob/main/LICENSE" target="_blank" rel="noreferrer">
+    <img
+      src="https://img.shields.io/badge/License-Apache_2.0-blue"
+      alt="License"
+    />
+  </a>
+  <a href="https://pypi.org/project/openshell/" target="_blank" rel="noreferrer">
+    <img
+      src="https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi"
+      alt="PyPI"
+    />
+  </a>
+</div>
 
 NVIDIA OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments
 that protect your data, credentials, and infrastructure. Agents run with exactly the permissions they need and
