@@ -197,10 +197,27 @@ pub async fn tls_connect_upstream(
     Ok(tls_stream)
 }
 
-/// Build a rustls `ClientConfig` with Mozilla root CAs for upstream connections.
-pub fn build_upstream_client_config() -> Arc<ClientConfig> {
+/// Build a rustls `ClientConfig` with Mozilla + system root CAs for upstream connections.
+///
+/// `system_ca_bundle` is the pre-read PEM contents of the system CA bundle
+/// (from [`read_system_ca_bundle`]). Pass the same string to [`write_ca_files`]
+/// to avoid reading the bundle from disk twice.
+pub fn build_upstream_client_config(system_ca_bundle: &str) -> Arc<ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    // System bundles typically overlap with webpki-roots (Mozilla roots);
+    // duplicates are harmless and ensure we also pick up any custom/corporate CAs.
+    let (added, ignored) = load_pem_certs_into_store(&mut root_store, system_ca_bundle);
+    if added > 0 {
+        tracing::debug!(added, "Loaded system CA certificates for upstream TLS");
+    }
+    if ignored > 0 {
+        tracing::warn!(
+            ignored,
+            "Some system CA certificates could not be parsed and were ignored"
+        );
+    }
 
     let mut config = ClientConfig::builder()
         .with_root_certificates(root_store)
@@ -216,15 +233,23 @@ pub fn build_upstream_client_config() -> Arc<ClientConfig> {
 /// 1. Standalone CA cert PEM (for `NODE_EXTRA_CA_CERTS` which is additive)
 /// 2. Combined bundle: system CAs + sandbox CA (for `SSL_CERT_FILE` which replaces default)
 ///
+/// `system_ca_bundle` is the pre-read PEM contents of the system CA bundle
+/// (from [`read_system_ca_bundle`]). Pass the same string to
+/// [`build_upstream_client_config`] to avoid reading the bundle from disk twice.
+///
 /// Returns `(ca_cert_path, combined_bundle_path)`.
-pub fn write_ca_files(ca: &SandboxCa, output_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+pub fn write_ca_files(
+    ca: &SandboxCa,
+    output_dir: &Path,
+    system_ca_bundle: &str,
+) -> Result<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(output_dir).into_diagnostic()?;
 
     let ca_cert_path = output_dir.join("openshell-ca.pem");
     std::fs::write(&ca_cert_path, ca.cert_pem()).into_diagnostic()?;
 
-    // Read system CA bundle and append our CA
-    let mut combined = read_system_ca_bundle();
+    // Combine system CAs with our sandbox CA
+    let mut combined = system_ca_bundle.to_string();
     if !combined.is_empty() && !combined.ends_with('\n') {
         combined.push('\n');
     }
@@ -236,8 +261,36 @@ pub fn write_ca_files(ca: &SandboxCa, output_dir: &Path) -> Result<(PathBuf, Pat
     Ok((ca_cert_path, combined_path))
 }
 
+/// Load PEM-encoded certificates from a string into a root certificate store.
+///
+/// Returns `(added, ignored)` counts. Invalid or unparseable certificates
+/// are silently ignored, matching the behavior of
+/// `RootCertStore::add_parsable_certificates`.
+fn load_pem_certs_into_store(
+    root_store: &mut rustls::RootCertStore,
+    pem_data: &str,
+) -> (usize, usize) {
+    if pem_data.is_empty() {
+        return (0, 0);
+    }
+    let mut reader = BufReader::new(pem_data.as_bytes());
+    // Collect all results so we can count PEM blocks that fail base64
+    // decoding — rustls_pemfile::certs silently drops those, so without
+    // this they wouldn't be reflected in the `ignored` count.
+    let all_results: Vec<_> = rustls_pemfile::certs(&mut reader).collect();
+    let pem_errors = all_results.iter().filter(|r| r.is_err()).count();
+    let certs: Vec<CertificateDer<'static>> =
+        all_results.into_iter().filter_map(Result::ok).collect();
+    let (added, ignored) = root_store.add_parsable_certificates(certs);
+    (added, ignored + pem_errors)
+}
+
 /// Read the system CA bundle from well-known paths.
-fn read_system_ca_bundle() -> String {
+///
+/// Returns the PEM contents of the first non-empty bundle found, or an empty
+/// string if none of the well-known paths exist. Call once and pass the result
+/// to both [`write_ca_files`] and [`build_upstream_client_config`].
+pub fn read_system_ca_bundle() -> String {
     for path in SYSTEM_CA_PATHS {
         if let Ok(contents) = std::fs::read_to_string(path)
             && !contents.is_empty()
@@ -373,7 +426,97 @@ mod tests {
     #[test]
     fn upstream_config_alpn() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let config = build_upstream_client_config();
+        let config = build_upstream_client_config("");
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    /// Helper: generate a self-signed CA and return its PEM string.
+    fn generate_ca_pem() -> String {
+        SandboxCa::generate().unwrap().ca_cert_pem
+    }
+
+    #[test]
+    fn load_pem_certs_single_ca() {
+        let pem = generate_ca_pem();
+        let mut store = rustls::RootCertStore::empty();
+        let (added, ignored) = load_pem_certs_into_store(&mut store, &pem);
+        assert_eq!(added, 1);
+        assert_eq!(ignored, 0);
+    }
+
+    #[test]
+    fn load_pem_certs_multiple_cas() {
+        let bundle = format!(
+            "{}\n{}\n{}\n",
+            generate_ca_pem(),
+            generate_ca_pem(),
+            generate_ca_pem()
+        );
+        let mut store = rustls::RootCertStore::empty();
+        let (added, ignored) = load_pem_certs_into_store(&mut store, &bundle);
+        assert_eq!(added, 3);
+        assert_eq!(ignored, 0);
+    }
+
+    #[test]
+    fn load_pem_certs_empty_string() {
+        let mut store = rustls::RootCertStore::empty();
+        let (added, ignored) = load_pem_certs_into_store(&mut store, "");
+        assert_eq!(added, 0);
+        assert_eq!(ignored, 0);
+    }
+
+    #[test]
+    fn load_pem_certs_garbage_input() {
+        let mut store = rustls::RootCertStore::empty();
+        let (added, ignored) = load_pem_certs_into_store(&mut store, "this is not PEM data at all");
+        assert_eq!(added, 0);
+        assert_eq!(ignored, 0);
+    }
+
+    #[test]
+    fn load_pem_certs_malformed_pem_block() {
+        let malformed = "-----BEGIN CERTIFICATE-----\nNOTBASE64!!!\n-----END CERTIFICATE-----\n";
+        let mut store = rustls::RootCertStore::empty();
+        let (added, ignored) = load_pem_certs_into_store(&mut store, malformed);
+        assert_eq!(added, 0);
+        assert_eq!(ignored, 1);
+    }
+
+    #[test]
+    fn load_pem_certs_mixed_valid_and_invalid() {
+        let malformed = "-----BEGIN CERTIFICATE-----\nNOTBASE64!!!\n-----END CERTIFICATE-----\n";
+        let bundle = format!(
+            "{}\n{}{}\n",
+            generate_ca_pem(),
+            malformed,
+            generate_ca_pem()
+        );
+        let mut store = rustls::RootCertStore::empty();
+        let (added, ignored) = load_pem_certs_into_store(&mut store, &bundle);
+        assert_eq!(added, 2);
+        assert_eq!(ignored, 1);
+    }
+
+    #[test]
+    fn write_ca_files_includes_sandbox_ca() {
+        let ca = SandboxCa::generate().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (ca_path, bundle_path) = write_ca_files(&ca, dir.path(), "").unwrap();
+
+        // Standalone CA cert file should exist and be valid PEM
+        let ca_pem = std::fs::read_to_string(&ca_path).unwrap();
+        assert!(ca_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+
+        // Combined bundle should contain at least the sandbox CA
+        let bundle_pem = std::fs::read_to_string(&bundle_path).unwrap();
+        assert!(bundle_pem.contains(ca.cert_pem()));
+
+        // Bundle should be parseable as PEM certificates
+        let mut reader = BufReader::new(bundle_pem.as_bytes());
+        assert!(
+            rustls_pemfile::certs(&mut reader).any(|r| r.is_ok()),
+            "bundle should contain at least one cert",
+        );
     }
 }

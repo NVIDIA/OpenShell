@@ -87,7 +87,8 @@ pub(crate) fn ocsf_ctx() -> &'static SandboxContext {
 
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
-    CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, write_ca_files,
+    CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
+    write_ca_files,
 };
 use crate::opa::OpaEngine;
 use crate::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
@@ -315,13 +316,14 @@ pub async fn run_sandbox(
         match SandboxCa::generate() {
             Ok(ca) => {
                 let tls_dir = std::path::Path::new("/etc/openshell-tls");
-                match write_ca_files(&ca, tls_dir) {
+                let system_ca_bundle = read_system_ca_bundle();
+                match write_ca_files(&ca, tls_dir, &system_ca_bundle) {
                     Ok(paths) => {
                         // /etc/openshell-tls is subsumed by the /etc baseline
                         // path injected by enrich_*_baseline_paths(), so no
                         // explicit Landlock entry is needed here.
 
-                        let upstream_config = build_upstream_client_config();
+                        let upstream_config = build_upstream_client_config(&system_ca_bundle);
                         let cert_cache = CertCache::new(ca);
                         let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
                         ocsf_emit!(

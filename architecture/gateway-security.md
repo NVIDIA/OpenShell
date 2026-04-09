@@ -425,7 +425,7 @@ The sandbox proxy automatically detects and terminates TLS on outbound HTTPS con
 1. **Ephemeral sandbox CA**: a per-sandbox CA (`CN=OpenShell Sandbox CA, O=OpenShell`) is generated at sandbox startup. This CA is completely independent of the cluster mTLS CA.
 2. **Trust injection**: the sandbox CA is written to the sandbox filesystem and injected via `NODE_EXTRA_CA_CERTS` and `SSL_CERT_FILE` so processes inside the sandbox trust it.
 3. **Dynamic leaf certs**: for each target hostname, the proxy generates and caches a leaf certificate signed by the sandbox CA (up to 256 entries).
-4. **Upstream verification**: the proxy verifies upstream server certificates against Mozilla root CAs (`webpki-roots`), not against the cluster CA.
+4. **Upstream verification**: the proxy verifies upstream server certificates against Mozilla root CAs (`webpki-roots`) and system CA certificates from the container's trust store, not against the cluster CA. Custom sandbox images can add corporate/internal CAs via `update-ca-certificates`.
 
 This capability is orthogonal to gateway mTLS -- it operates only on sandbox-to-internet traffic and uses entirely separate key material. See [Policy Language](security-policy.md) for configuration details.
 

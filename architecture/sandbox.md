@@ -94,7 +94,7 @@ flowchart TD
    - Generate ephemeral CA via `SandboxCa::generate()` using `rcgen`
    - Write CA cert PEM and combined bundle (system CAs + sandbox CA) to `/etc/openshell-tls/`
    - Add the TLS directory to `policy.filesystem.read_only` so Landlock allows the child to read it
-   - Build upstream `ClientConfig` with Mozilla root CAs via `webpki_roots`
+   - Build upstream `ClientConfig` with Mozilla root CAs (`webpki_roots`) plus system CA certificates from the container's trust store (e.g. corporate CAs added via `update-ca-certificates`)
    - Create `Arc<ProxyTlsState>` wrapping a `CertCache` and the upstream config
 
 6. **Network namespace** (Linux, proxy mode only):
@@ -1057,7 +1057,7 @@ TLS termination is automatic. The proxy peeks the first bytes of every CONNECT t
 
 **Connection flow (when TLS is detected):**
 1. `tls_terminate_client()`: Accept TLS from the sandboxed client using a `ServerConfig` with the hostname-specific leaf cert. ALPN: `http/1.1`.
-2. `tls_connect_upstream()`: Connect TLS to the real upstream using a `ClientConfig` with Mozilla root CAs (`webpki_roots`). ALPN: `http/1.1`.
+2. `tls_connect_upstream()`: Connect TLS to the real upstream using a `ClientConfig` with Mozilla root CAs (`webpki_roots`) and system CA certificates. ALPN: `http/1.1`.
 3. Proxy now holds plaintext on both sides. If L7 config is present, runs `relay_with_inspection()`. Otherwise, runs `relay_passthrough_with_credentials()` for credential injection without L7 evaluation.
 
 System CA bundles are searched at well-known paths: `/etc/ssl/certs/ca-certificates.crt` (Debian/Ubuntu), `/etc/pki/tls/certs/ca-bundle.crt` (RHEL), `/etc/ssl/ca-bundle.pem` (openSUSE), `/etc/ssl/cert.pem` (Alpine/macOS).
