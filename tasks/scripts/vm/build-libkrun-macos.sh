@@ -40,7 +40,7 @@ KERNEL_DIR=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --kernel-dir)
-            KERNEL_DIR="$2"; shift 2 ;;
+            KERNEL_DIR="$(cd "$2" && pwd)"; shift 2 ;;
         --help|-h)
             echo "Usage: $0 --kernel-dir <DIR>"
             echo ""
