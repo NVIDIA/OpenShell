@@ -89,6 +89,7 @@ validate_download_origin() {
   case "$_resolved" in
     https://github.com/${REPO}/*) ;;
     https://objects.githubusercontent.com/*) ;;
+    https://release-assets.githubusercontent.com/*) ;;
     *)
       error "unexpected redirect target: ${_resolved} (expected github.com/${REPO}/...)"
       ;;
