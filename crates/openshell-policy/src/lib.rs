@@ -411,6 +411,12 @@ pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolic
 /// supervisor probes this path before falling back to the restrictive default.
 pub const CONTAINER_POLICY_PATH: &str = "/etc/openshell/policy.yaml";
 
+/// Well-known path where a sandbox container image can ship a startup script.
+///
+/// When present, the sandbox supervisor runs this script on every pod start
+/// before launching the long-lived child process.
+pub const CONTAINER_BOOT_SCRIPT_PATH: &str = "/etc/openshell/boot.sh";
+
 /// Legacy path used before the navigator → openshell rename.
 ///
 /// Existing community sandbox images still ship their policy at this path.
@@ -888,6 +894,11 @@ network_policies:
     #[test]
     fn container_policy_path_is_expected() {
         assert_eq!(CONTAINER_POLICY_PATH, "/etc/openshell/policy.yaml");
+    }
+
+    #[test]
+    fn container_boot_script_path_is_expected() {
+        assert_eq!(CONTAINER_BOOT_SCRIPT_PATH, "/etc/openshell/boot.sh");
     }
 
     #[test]

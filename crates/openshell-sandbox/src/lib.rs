@@ -676,6 +676,33 @@ pub async fn run_sandbox(
         }
     }
 
+    // Run the optional boot hook under supervisor control before the main
+    // long-lived child starts. This stays a managed child process launched by
+    // the supervisor, not in-process supervisor logic and not image ENTRYPOINT
+    // behavior.
+    #[cfg(target_os = "linux")]
+    let _boot_hook_ran = run_boot_hook_at_path(
+        std::path::Path::new(openshell_policy::CONTAINER_BOOT_SCRIPT_PATH),
+        workdir.as_deref(),
+        &policy,
+        netns.as_ref(),
+        ca_file_paths.as_ref(),
+        &provider_env,
+        Some(entrypoint_pid.as_ref()),
+    )
+    .await?;
+
+    #[cfg(not(target_os = "linux"))]
+    let _boot_hook_ran = run_boot_hook_at_path(
+        std::path::Path::new(openshell_policy::CONTAINER_BOOT_SCRIPT_PATH),
+        workdir.as_deref(),
+        &policy,
+        ca_file_paths.as_ref(),
+        &provider_env,
+        Some(entrypoint_pid.as_ref()),
+    )
+    .await?;
+
     #[cfg(target_os = "linux")]
     let mut handle = ProcessHandle::spawn(
         program,
@@ -816,6 +843,121 @@ pub async fn run_sandbox(
     );
 
     Ok(status.code())
+}
+
+fn boot_hook_command(path: &std::path::Path) -> Option<(&'static str, Vec<String>)> {
+    path.is_file()
+        .then(|| ("/bin/sh", vec![path.display().to_string()]))
+}
+
+fn boot_hook_failed(path: &std::path::Path, exit_code: i32) -> miette::Report {
+    miette::miette!(
+        "Sandbox boot hook failed: {} exited with code {}",
+        path.display(),
+        exit_code
+    )
+}
+
+#[cfg(target_os = "linux")]
+async fn run_boot_hook_at_path(
+    path: &std::path::Path,
+    workdir: Option<&str>,
+    policy: &SandboxPolicy,
+    netns: Option<&NetworkNamespace>,
+    ca_paths: Option<&(std::path::PathBuf, std::path::PathBuf)>,
+    provider_env: &std::collections::HashMap<String, String>,
+    entrypoint_pid: Option<&AtomicU32>,
+) -> Result<bool> {
+    let Some((program, args)) = boot_hook_command(path) else {
+        debug!(path = %path.display(), "No sandbox boot hook found");
+        return Ok(false);
+    };
+
+    info!(
+        path = %path.display(),
+        "Running sandbox boot hook as supervisor-managed child process"
+    );
+    let mut handle = ProcessHandle::spawn(
+        program,
+        &args,
+        workdir,
+        false,
+        policy,
+        netns,
+        ca_paths,
+        provider_env,
+    )?;
+    if let Some(pid_slot) = entrypoint_pid {
+        // Reuse the entrypoint PID slot while the boot hook runs so proxy
+        // identity binding can attribute startup traffic to this process.
+        pid_slot.store(handle.pid(), Ordering::Release);
+    }
+
+    let wait_result = handle.wait().await;
+    if let Some(pid_slot) = entrypoint_pid {
+        pid_slot.store(0, Ordering::Release);
+    }
+    let status = wait_result.into_diagnostic()?;
+
+    if status.code() != 0 {
+        return Err(boot_hook_failed(path, status.code()));
+    }
+
+    info!(
+        path = %path.display(),
+        exit_code = status.code(),
+        "Sandbox boot hook completed"
+    );
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_boot_hook_at_path(
+    path: &std::path::Path,
+    workdir: Option<&str>,
+    policy: &SandboxPolicy,
+    ca_paths: Option<&(std::path::PathBuf, std::path::PathBuf)>,
+    provider_env: &std::collections::HashMap<String, String>,
+    entrypoint_pid: Option<&AtomicU32>,
+) -> Result<bool> {
+    let Some((program, args)) = boot_hook_command(path) else {
+        debug!(path = %path.display(), "No sandbox boot hook found");
+        return Ok(false);
+    };
+
+    info!(
+        path = %path.display(),
+        "Running sandbox boot hook as supervisor-managed child process"
+    );
+    let mut handle = ProcessHandle::spawn(
+        program,
+        &args,
+        workdir,
+        false,
+        policy,
+        ca_paths,
+        provider_env,
+    )?;
+    if let Some(pid_slot) = entrypoint_pid {
+        pid_slot.store(handle.pid(), Ordering::Release);
+    }
+
+    let wait_result = handle.wait().await;
+    if let Some(pid_slot) = entrypoint_pid {
+        pid_slot.store(0, Ordering::Release);
+    }
+    let status = wait_result.into_diagnostic()?;
+
+    if status.code() != 0 {
+        return Err(boot_hook_failed(path, status.code()));
+    }
+
+    info!(
+        path = %path.display(),
+        exit_code = status.code(),
+        "Sandbox boot hook completed"
+    );
+    Ok(true)
 }
 
 /// Build an inference context for local routing, if route sources are available.
@@ -2090,6 +2232,47 @@ mod tests {
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+    /// Test-only boot hook runner that exercises the boot hook logic
+    /// (command detection, process execution, PID tracking, error reporting)
+    /// without applying sandbox policies (seccomp, landlock, privilege
+    /// dropping). Sandbox enforcement has its own dedicated tests.
+    async fn run_test_boot_hook(
+        path: &std::path::Path,
+        entrypoint_pid: Option<&AtomicU32>,
+    ) -> Result<bool> {
+        let Some((program, args)) = boot_hook_command(path) else {
+            return Ok(false);
+        };
+
+        let workdir = path.parent();
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(dir) = workdir {
+            cmd.current_dir(dir);
+        }
+
+        let child = cmd.spawn().into_diagnostic()?;
+        let pid = child.id().unwrap_or(0);
+        if let Some(pid_slot) = entrypoint_pid {
+            pid_slot.store(pid, Ordering::Release);
+        }
+
+        let output = child.wait_with_output().await.into_diagnostic()?;
+        if let Some(pid_slot) = entrypoint_pid {
+            pid_slot.store(0, Ordering::Release);
+        }
+
+        let exit_code = output.status.code().unwrap_or(-1);
+        if exit_code != 0 {
+            return Err(boot_hook_failed(path, exit_code));
+        }
+
+        Ok(true)
+    }
+
     #[test]
     fn bundle_to_resolved_routes_converts_all_fields() {
         let bundle = openshell_core::proto::GetInferenceBundleResponse {
@@ -2338,6 +2521,85 @@ routes:
         assert!(disable_inference_on_empty_routes(
             InferenceRouteSource::None
         ));
+    }
+
+    #[tokio::test]
+    async fn boot_hook_missing_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boot.sh");
+        let pid = AtomicU32::new(99);
+        assert!(!run_test_boot_hook(&path, Some(&pid)).await.unwrap());
+        assert_eq!(
+            pid.load(Ordering::Acquire),
+            99,
+            "missing hook must not mutate entrypoint pid state"
+        );
+    }
+
+    #[test]
+    fn boot_hook_uses_shell_child_process_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boot.sh");
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let (program, args) = boot_hook_command(&path).expect("boot hook should be detected");
+        assert_eq!(program, "/bin/sh");
+        assert_eq!(args, vec![path.display().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn boot_hook_runs_and_primes_following_child_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("booted");
+        let boot = dir.path().join("boot.sh");
+        std::fs::write(&boot, "#!/bin/sh\necho booted > booted\n").unwrap();
+
+        let pid = AtomicU32::new(0);
+        assert!(run_test_boot_hook(&boot, Some(&pid)).await.unwrap());
+        assert_eq!(
+            pid.load(Ordering::Acquire),
+            0,
+            "boot hook should clear temporary entrypoint pid after completion"
+        );
+
+        let output = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "test -f booted"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "following child must observe boot side effects"
+        );
+        assert!(marker.exists());
+    }
+
+    #[tokio::test]
+    async fn boot_hook_runs_on_every_startup_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("counter");
+        let boot = dir.path().join("boot.sh");
+        std::fs::write(&boot, "#!/bin/sh\necho start >> counter\n").unwrap();
+
+        assert!(run_test_boot_hook(&boot, None).await.unwrap());
+        assert!(run_test_boot_hook(&boot, None).await.unwrap());
+
+        let contents = std::fs::read_to_string(&counter).unwrap();
+        assert_eq!(contents.lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn boot_hook_nonzero_exit_aborts_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let boot = dir.path().join("boot.sh");
+        std::fs::write(&boot, "#!/bin/sh\nexit 42\n").unwrap();
+
+        let err = run_test_boot_hook(&boot, None).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("boot hook failed"));
+        assert!(message.contains(&boot.display().to_string()));
+        assert!(message.contains("42"));
     }
 
     // ---- Policy disk discovery tests ----

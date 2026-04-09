@@ -67,7 +67,7 @@ The server applies these transforms to every sandbox pod template (`sandbox/mod.
 3. Overrides the agent container's `command` to `/opt/openshell/bin/openshell-sandbox`.
 4. Sets `runAsUser: 0` so the supervisor has root privileges for namespace creation, proxy setup, and Landlock/seccomp.
 
-These transforms apply to every generated pod template.
+These transforms apply to every generated pod template. The image's Docker `ENTRYPOINT` is not the OpenShell startup path. To run image-specific startup logic on sandbox creation and pod restart, install a script at `/etc/openshell/boot.sh`; the supervisor launches it as a managed child process before starting the long-lived child process.
 
 ## CLI Usage
 
@@ -97,7 +97,8 @@ openshell sandbox create --from ./my-sandbox/  # directory with Dockerfile
 The `openshell-sandbox` supervisor adapts to arbitrary environments:
 
 - **Log file fallback**: Attempts to open `/var/log/openshell.log` for append; silently falls back to stdout-only logging if the path is not writable.
-- **Command resolution**: Executes the command from CLI args, then the `OPENSHELL_SANDBOX_COMMAND` env var (set to `sleep infinity` by the server), then `/bin/bash` as a last resort.
+- **Boot hook**: Runs `/etc/openshell/boot.sh` with `/bin/sh` as a supervisor-managed child process on every pod start when that file exists. The script runs before the long-lived child process and must exit successfully for the sandbox to become ready.
+- **Command resolution**: After the boot hook completes, executes the command from CLI args, then the `OPENSHELL_SANDBOX_COMMAND` env var (set to `sleep infinity` by the server), then `/bin/bash` as a last resort.
 - **Network namespace**: Requires successful namespace creation for proxy isolation; startup fails in proxy mode if required capabilities (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`) or `iproute2` are unavailable. If the `iptables` package is present, the supervisor installs OUTPUT chain rules (LOG + REJECT) inside the namespace to provide fast-fail behavior (immediate `ECONNREFUSED` instead of a 30-second timeout) and diagnostic logging when processes attempt direct connections that bypass the HTTP CONNECT proxy. If `iptables` is absent, the supervisor logs a warning and continues — core network isolation still works via routing.
 
 ## Design Decisions
@@ -111,6 +112,7 @@ The `openshell-sandbox` supervisor adapts to arbitrary environments:
 | hostPath side-load | Supervisor binary lives on the node filesystem — no init container, no emptyDir, no extra image pull. Faster pod startup. |
 | Read-only mount in agent | Supervisor binary cannot be tampered with by the workload |
 | Command override | Ensures `openshell-sandbox` is the entrypoint regardless of the image's default CMD |
+| `/etc/openshell/boot.sh` hook | Gives images a restart-safe startup hook even though Docker `ENTRYPOINT` is bypassed |
 | Clear `run_as_user/group` for custom images | Prevents startup failure when the image lacks the default `sandbox` user |
 | Non-fatal log file init | `/var/log/openshell.log` may be unwritable in arbitrary images; falls back to stdout |
 | `docker save` / `ctr import` for push | Avoids requiring a registry for local dev; images land directly in the k3s containerd store |

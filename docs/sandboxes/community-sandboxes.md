@@ -59,7 +59,7 @@ When you pass `--from` with a community sandbox name, the CLI:
 
 1. Resolves the name against the
    [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) repository.
-2. Pulls the Dockerfile, policy, skills, and any startup scripts.
+2. Pulls the Dockerfile, policy, skills, and any boot-hook scripts.
 3. Builds the container image locally.
 4. Creates the sandbox with the bundled configuration applied.
 
@@ -96,7 +96,7 @@ You can also include the following optional files:
 
 - `policy.yaml` that defines the default policy applied when the sandbox launches.
 - `skills/` that contains agent skill definitions bundled with the sandbox.
-- Startup scripts that are any scripts the Dockerfile or entrypoint invokes.
+- `boot.sh` or another startup script that your Dockerfile installs at `/etc/openshell/boot.sh`. OpenShell runs that script as a supervisor-managed child process on every sandbox pod start, including restarts.
 
 To contribute, fork the repository, add your sandbox directory, and open a pull
 request. Refer to the repository's

@@ -65,8 +65,11 @@ flowchart TD
     L2 --> N{SSH enabled?}
     M --> N
     N -- Yes --> O[Spawn SSH server task]
-    N -- No --> P[Spawn child process]
-    O --> P
+    N -- No --> O1{`/etc/openshell/boot.sh`?}
+    O --> O1
+    O1 -- Yes --> O2[Run boot hook]
+    O1 -- No --> P[Spawn child process]
+    O2 --> P
     P --> Q[Store entrypoint PID]
     Q --> R{gRPC mode?}
     R -- Yes --> T[Spawn policy poll task]
@@ -111,16 +114,22 @@ flowchart TD
 
 8. **SSH server** (optional): If `--ssh-listen-addr` is provided, spawn an async task running `ssh::run_ssh_server()` with the policy, workdir, netns FD, proxy URL, CA paths, and provider env.
 
-9. **Child process spawning** (`ProcessHandle::spawn()`):
+9. **Boot hook** (optional): If `/etc/openshell/boot.sh` exists, run it with `/bin/sh` as a supervisor-managed child process before spawning the long-lived child process.
+   - The hook runs through the normal child spawn path, not as in-process supervisor code.
+   - The hook runs with the same privilege drop, Landlock/seccomp policy, proxy environment, provider environment, TLS trust files, and network namespace setup as the normal child process.
+   - While the hook is running, its PID is temporarily published through `entrypoint_pid` so proxy identity binding can attribute any startup traffic correctly.
+   - A non-zero exit code fails sandbox startup so Kubernetes retries the pod.
+
+10. **Child process spawning** (`ProcessHandle::spawn()`):
    - Build `tokio::process::Command` with inherited stdio and `kill_on_drop(true)`
    - Set environment variables: `OPENSHELL_SANDBOX=1`, provider credentials, proxy URLs, TLS trust store paths
    - Pre-exec closure (async-signal-safe): `setpgid` (if non-interactive) -> `setns` (enter netns) -> `drop_privileges` -> `sandbox::apply` (Landlock + seccomp)
 
-10. **Store entrypoint PID**: `entrypoint_pid.store(pid, Ordering::Release)` so the proxy can resolve TCP peer identity via `/proc`.
+11. **Store entrypoint PID**: `entrypoint_pid.store(pid, Ordering::Release)` so the proxy can resolve TCP peer identity via `/proc`.
 
-11. **Spawn policy poll task** (gRPC mode only): If `sandbox_id`, `openshell_endpoint`, and an OPA engine are all present, spawn `run_policy_poll_loop()` as a background tokio task. This task polls the gateway for policy updates and hot-reloads the OPA engine when a new version is detected. See [Policy Reload Lifecycle](#policy-reload-lifecycle) for details.
+12. **Spawn policy poll task** (gRPC mode only): If `sandbox_id`, `openshell_endpoint`, and an OPA engine are all present, spawn `run_policy_poll_loop()` as a background tokio task. This task polls the gateway for policy updates and hot-reloads the OPA engine when a new version is detected. See [Policy Reload Lifecycle](#policy-reload-lifecycle) for details.
 
-12. **Wait with timeout**: If `--timeout > 0`, wrap `handle.wait()` in `tokio::time::timeout()`. On timeout, kill the process and return exit code 124.
+13. **Wait with timeout**: If `--timeout > 0`, wrap `handle.wait()` in `tokio::time::timeout()`. On timeout, kill the process and return exit code 124.
 
 ## Policy Model
 
