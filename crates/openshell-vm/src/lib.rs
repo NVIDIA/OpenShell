@@ -1532,13 +1532,34 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                         r#"{{"local":":{host_port}","remote":"{guest_ip}:{guest_port}","protocol":"tcp"}}"#
                     );
 
-                    match gvproxy_expose(api_sock, &expose_body) {
-                        Ok(()) => {
-                            eprintln!("  port {host_port} -> {guest_ip}:{guest_port}");
+                    // Retry with exponential backoff — gvproxy's internal
+                    // netstack may not be ready immediately after socket creation.
+                    let mut expose_ok = false;
+                    let mut retry_interval = std::time::Duration::from_millis(100);
+                    let expose_deadline =
+                        Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        match gvproxy_expose(api_sock, &expose_body) {
+                            Ok(()) => {
+                                eprintln!("  port {host_port} -> {guest_ip}:{guest_port}");
+                                expose_ok = true;
+                                break;
+                            }
+                            Err(e) => {
+                                if Instant::now() >= expose_deadline {
+                                    eprintln!("  port {host_port}: {e} (retries exhausted)");
+                                    break;
+                                }
+                                std::thread::sleep(retry_interval);
+                                retry_interval = (retry_interval * 2)
+                                    .min(std::time::Duration::from_secs(1));
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("  port {host_port}: {e}");
-                        }
+                    }
+                    if !expose_ok {
+                        return Err(VmError::HostSetup(format!(
+                            "failed to forward port {host_port} via gvproxy"
+                        )));
                     }
                 }
                 eprintln!(
