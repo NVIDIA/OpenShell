@@ -7,6 +7,10 @@
 # This script builds libkrun (VMM) and libkrunfw (kernel firmware) from source
 # with OpenShell's custom kernel configuration for bridge/netfilter support.
 #
+# In addition to the platform's native .so artifacts, this script exports
+# kernel.c and ABI_VERSION metadata so that other platforms (e.g. macOS) can
+# compile their own libkrunfw wrapper without rebuilding the kernel.
+#
 # Prerequisites:
 #   - Linux (aarch64 or x86_64)
 #   - Build tools: make, git, gcc, flex, bison, bc
@@ -36,13 +40,26 @@ if [ "$(uname -s)" != "Linux" ]; then
   exit 1
 fi
 
-ARCH="$(uname -m)"
-echo "==> Building libkrun for Linux ${ARCH}"
+HOST_ARCH="$(uname -m)"
+echo "==> Building libkrun for Linux ${HOST_ARCH}"
 echo "    Build directory: ${BUILD_DIR}"
 echo "    Kernel config: ${KERNEL_CONFIG}"
 echo ""
 
+# Map host arch to kernel ARCH value
+case "$HOST_ARCH" in
+  aarch64) KARCH="arm64"; KERNEL_IMAGE_PATH="arch/arm64/boot/Image" ;;
+  x86_64)  KARCH="x86"; KERNEL_IMAGE_PATH="arch/x86/boot/bzImage" ;;
+  *)       echo "Error: Unsupported architecture: ${HOST_ARCH}" >&2; exit 1 ;;
+esac
+
 # ── Install dependencies ────────────────────────────────────────────────
+
+# Use sudo only when not already running as root (e.g. inside CI containers).
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+  SUDO="sudo"
+fi
 
 install_deps() {
   echo "==> Checking/installing build dependencies..."
@@ -58,8 +75,8 @@ install_deps() {
     done
     if [ -n "$MISSING" ]; then
       echo "    Installing:$MISSING"
-      sudo apt-get update
-      sudo apt-get install -y $MISSING
+      $SUDO apt-get update
+      $SUDO apt-get install -y $MISSING
     else
       echo "    All dependencies installed"
     fi
@@ -68,7 +85,7 @@ install_deps() {
     # Fedora/RHEL
     DEPS="make git python3 python3-pyelftools gcc flex bison elfutils-libelf-devel openssl-devel bc glibc-static curl clang-devel"
     echo "    Installing dependencies via dnf..."
-    sudo dnf install -y $DEPS
+    $SUDO dnf install -y $DEPS
     
   else
     echo "Warning: Unknown package manager. Please install manually:" >&2
@@ -123,7 +140,7 @@ echo "    Building kernel and libkrunfw (this may take 15-20 minutes)..."
 #   Phase 1: Run the Makefile's $(KERNEL_SOURCES) target, which:
 #              - downloads and extracts the kernel tarball (if needed)
 #              - applies patches
-#              - copies config-libkrunfw_aarch64 to $(KERNEL_SOURCES)/.config
+#              - copies config-libkrunfw_{arch} to $(KERNEL_SOURCES)/.config
 #              - runs olddefconfig
 #
 #   Phase 2: Merge our fragment on top of the .config produced by Phase 1
@@ -158,14 +175,14 @@ if [ -f openshell.kconfig ]; then
 
   # merge_config.sh must be called with ARCH set so it finds the right Kconfig
   # entry points. -m means "merge into existing .config" (vs starting fresh).
-  ARCH=arm64 KCONFIG_CONFIG="${KERNEL_SOURCES}/.config" \
+  ARCH="${KARCH}" KCONFIG_CONFIG="${KERNEL_SOURCES}/.config" \
     "${KERNEL_SOURCES}/scripts/kconfig/merge_config.sh" \
     -m -O "${KERNEL_SOURCES}" \
     "${KERNEL_SOURCES}/.config" \
     openshell.kconfig
 
   # Re-run olddefconfig to fill in any new symbols introduced by the fragment.
-  make -C "${KERNEL_SOURCES}" ARCH=arm64 olddefconfig
+  make -C "${KERNEL_SOURCES}" ARCH="${KARCH}" olddefconfig
 
   # Verify that the key options were actually applied.
   all_ok=true
@@ -185,7 +202,7 @@ if [ -f openshell.kconfig ]; then
 
   # The kernel binary and kernel.c from the previous (bad) build must be
   # removed so make rebuilds them with the updated .config.
-  rm -f kernel.c "${KERNEL_SOURCES}/arch/arm64/boot/Image" \
+  rm -f kernel.c "${KERNEL_SOURCES}/${KERNEL_IMAGE_PATH}" \
         "${KERNEL_SOURCES}/vmlinux" libkrunfw.so*
 fi
 
@@ -195,6 +212,22 @@ make -j"$(nproc)"
 # Copy output
 cp libkrunfw.so* "$OUTPUT_DIR/"
 echo "    Built: $(ls "$OUTPUT_DIR"/libkrunfw.so* | xargs -n1 basename | tr '\n' ' ')"
+
+# ── Export kernel.c for cross-platform builds ───────────────────────────
+# kernel.c is a C source file containing the compiled Linux kernel as a byte
+# array.  It is architecture-specific (aarch64 vs x86_64) but OS-agnostic —
+# any C compiler can turn it into a .so or .dylib.  We export it so the macOS
+# job can produce libkrunfw.dylib without rebuilding the kernel.
+
+ABI_VERSION="$(grep -oE 'ABI_VERSION\s*=\s*[0-9]+' Makefile | head -1 | sed 's/[^0-9]//g')"
+
+if [ -f kernel.c ]; then
+  cp kernel.c "$OUTPUT_DIR/kernel.c"
+  echo "${ABI_VERSION}" > "$OUTPUT_DIR/ABI_VERSION"
+  echo "    Exported kernel.c ($(du -sh kernel.c | cut -f1)) and ABI_VERSION=${ABI_VERSION}"
+else
+  echo "Warning: kernel.c not found — cross-platform builds will not work" >&2
+fi
 
 cd "$BUILD_DIR"
 
@@ -242,6 +275,7 @@ echo "==> Build complete!"
 echo "    Output directory: ${OUTPUT_DIR}"
 echo ""
 echo "    Artifacts:"
+ls -lah "$OUTPUT_DIR"/*.so* "$OUTPUT_DIR"/kernel.c "$OUTPUT_DIR"/ABI_VERSION 2>/dev/null || \
 ls -lah "$OUTPUT_DIR"/*.so*
 
 echo ""

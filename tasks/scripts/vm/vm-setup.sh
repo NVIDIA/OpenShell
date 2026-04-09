@@ -64,10 +64,19 @@ if [ "$FROM_SOURCE" = "1" ]; then
 
     case "$PLATFORM" in
         darwin-aarch64)
-            # macOS: build custom libkrunfw (kernel) then portable libkrun
-            "${ROOT}/crates/openshell-vm/runtime/build-custom-libkrunfw.sh"
-            echo ""
-            "${ROOT}/tasks/scripts/vm/build-libkrun-macos.sh"
+            # macOS: compile pre-built kernel.c into libkrunfw.dylib, then build libkrun.dylib.
+            # The kernel.c file must be obtained from a Linux ARM64 build first.
+            KERNEL_DIR="${ROOT}/target/libkrun-build"
+            if [ ! -f "${KERNEL_DIR}/kernel.c" ]; then
+                echo "Error: kernel.c not found at ${KERNEL_DIR}/kernel.c" >&2
+                echo "" >&2
+                echo "On macOS, the Linux kernel must be cross-compiled on a Linux host first." >&2
+                echo "Either:" >&2
+                echo "  1. Download pre-built runtime (default): mise run vm:setup" >&2
+                echo "  2. Build kernel.c on Linux, copy to ${KERNEL_DIR}/, then re-run." >&2
+                exit 1
+            fi
+            "${ROOT}/tasks/scripts/vm/build-libkrun-macos.sh" --kernel-dir "${KERNEL_DIR}"
             ;;
         linux-*)
             # Linux: build both libkrunfw and libkrun in one go

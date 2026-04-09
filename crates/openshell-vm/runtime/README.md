@@ -2,7 +2,7 @@
 
 > Status: Experimental and work in progress (WIP). VM support is under active development and may change.
 
-This directory contains the build infrastructure for a custom `libkrunfw` runtime
+This directory contains the kernel config fragment for a custom `libkrunfw` runtime
 that enables bridge CNI and netfilter support in the OpenShell gateway VM.
 
 ## Why
@@ -21,51 +21,61 @@ that enables these networking and sandboxing features.
 
 ```
 runtime/
-  build-custom-libkrunfw.sh   # Build script for custom libkrunfw
   kernel/
     openshell.kconfig          # Kernel config fragment (networking + sandboxing)
 ```
 
-## Building
+## Build Pipeline
 
-### Prerequisites
+The kernel is compiled on Linux CI runners. macOS reuses the pre-built `kernel.c`
+artifact from the Linux ARM64 build — no krunvm or Fedora VM needed.
 
-- Rust toolchain
-- make, git, curl
-- On macOS: Xcode command line tools and cross-compilation tools for aarch64
+```
+Linux ARM64:  builds aarch64 kernel -> .so + exports kernel.c  (parallel)
+Linux AMD64:  builds x86_64 kernel  -> .so                     (parallel)
+macOS ARM64:  reuses aarch64 kernel.c -> .dylib                (depends on ARM64)
+```
 
-### Quick Build
+### Build Scripts
+
+| Script | Platform | What it does |
+|--------|----------|-------------|
+| `tasks/scripts/vm/build-libkrun.sh` | Linux | Builds libkrunfw + libkrun from source, exports kernel.c |
+| `tasks/scripts/vm/build-libkrun-macos.sh` | macOS | Compiles pre-built kernel.c into .dylib, builds libkrun |
+| `tasks/scripts/vm/package-vm-runtime.sh` | Any | Packages runtime tarball (libs + gvproxy + provenance) |
+
+### Quick Build (Linux)
 
 ```bash
-# Build custom libkrunfw (clones libkrunfw repo, applies config, builds)
-./crates/openshell-vm/runtime/build-custom-libkrunfw.sh
+# Build both libkrunfw and libkrun from source
+tasks/scripts/vm/build-libkrun.sh
 
 # Or build the full runtime from source via mise:
 FROM_SOURCE=1 mise run vm:setup
 ```
 
-### Output
+### Quick Build (macOS)
 
-Build artifacts are placed in `target/custom-runtime/`:
-
-```
-target/custom-runtime/
-  libkrunfw.dylib              # The custom library
-  libkrunfw.<version>.dylib    # Version-suffixed copy
-  provenance.json              # Build metadata (commit, hash, timestamp)
-  openshell.kconfig            # The config fragment used
-  kernel.config                # Full kernel .config (for debugging)
-```
-
-### Using the Custom Runtime
+On macOS, you need a pre-built `kernel.c` from a Linux ARM64 build:
 
 ```bash
-# Point the bundle script at the custom build and rebuild:
-export OPENSHELL_VM_RUNTIME_SOURCE_DIR=target/custom-runtime
-mise run vm:build
+# Download pre-built runtime (recommended, ~30s):
+mise run vm:setup
 
-# Then boot the VM as usual:
-mise run vm
+# Or if you have kernel.c from a Linux build:
+tasks/scripts/vm/build-libkrun-macos.sh --kernel-dir target/libkrun-build
+```
+
+### Output
+
+Build artifacts are placed in `target/libkrun-build/`:
+
+```
+target/libkrun-build/
+  libkrun.so / libkrun.dylib       # The VMM library
+  libkrunfw.so* / libkrunfw.dylib  # Kernel firmware library
+  kernel.c                         # Linux kernel as C byte array (Linux only)
+  ABI_VERSION                      # ABI version number (Linux only)
 ```
 
 ## Networking

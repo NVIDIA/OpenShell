@@ -116,23 +116,29 @@ and makes it straightforward to correlate VM behavior with a specific runtime ar
 ```mermaid
 graph LR
     subgraph Source["crates/openshell-vm/runtime/"]
-        BUILD["build-custom-libkrunfw.sh\nClones libkrunfw, applies config, builds"]
         KCONF["kernel/openshell.kconfig\nKernel config fragment"]
         README["README.md\nOperator documentation"]
     end
 
-    subgraph Output["target/custom-runtime/"]
-        LIB["libkrunfw.dylib\nCustom library"]
-        META["provenance.json\nBuild metadata"]
-        FRAG["openshell.kconfig\nConfig fragment used"]
-        FULL["kernel.config\nFull kernel .config"]
+    subgraph Linux["Linux CI (build-libkrun.sh)"]
+        BUILD_L["Build kernel + libkrunfw.so + libkrun.so"]
+        KERNELC["kernel.c\nKernel as C byte array"]
     end
 
-    KCONF --> BUILD
-    BUILD --> LIB
-    BUILD --> META
-    BUILD --> FRAG
-    BUILD --> FULL
+    subgraph macOS["macOS CI (build-libkrun-macos.sh)"]
+        BUILD_M["Compile kernel.c -> libkrunfw.dylib\nBuild libkrun.dylib"]
+    end
+
+    subgraph Output["target/libkrun-build/"]
+        LIB_SO["libkrunfw.so + libkrun.so\n(Linux)"]
+        LIB_DY["libkrunfw.dylib + libkrun.dylib\n(macOS)"]
+    end
+
+    KCONF --> BUILD_L
+    BUILD_L --> LIB_SO
+    BUILD_L --> KERNELC
+    KERNELC --> BUILD_M
+    BUILD_M --> LIB_DY
 ```
 
 ## Kernel Config Fragment
@@ -222,16 +228,18 @@ supported platforms. Runs on-demand or when the kernel config / pinned versions 
 
 | Platform | Runner | Build Method |
 |----------|--------|-------------|
-| Linux ARM64 | `build-arm64` (self-hosted) | Native `build-libkrun.sh` |
+| Linux ARM64 | `build-arm64` (self-hosted) | Native `build-libkrun.sh` (also exports kernel.c) |
 | Linux x86_64 | `build-amd64` (self-hosted) | Native `build-libkrun.sh` |
-| macOS ARM64 | `macos-latest-xlarge` (GitHub-hosted) | `build-custom-libkrunfw.sh` (krunvm) + `build-libkrun-macos.sh` |
+| macOS ARM64 | `macos-latest-xlarge` (GitHub-hosted) | `build-libkrun-macos.sh --kernel-dir` (uses pre-built kernel.c from ARM64) |
 
 Artifacts: `vm-runtime-{platform}.tar.zst` containing libkrun, libkrunfw, gvproxy, and
 provenance metadata.
 
-The macOS kernel build requires a real macOS ARM64 runner because it uses `krunvm` to
-compile the Linux kernel inside a Fedora VM (Hypervisor.framework). The kernel inside
-libkrunfw is always Linux regardless of host platform.
+The aarch64 Linux kernel is compiled once on the Linux ARM64 runner. The resulting
+`kernel.c` (a C source file containing the kernel as a byte array) is passed to the
+macOS job, which compiles it into `libkrunfw.dylib` with Apple's `cc`. This eliminates
+the need for krunvm/Fedora VM and cuts macOS CI from ~45 min to ~5 min. The kernel
+inside libkrunfw is always Linux regardless of host platform.
 
 ### VM Binary (`release-vm-dev.yml`)
 
