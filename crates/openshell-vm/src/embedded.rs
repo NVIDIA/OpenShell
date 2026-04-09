@@ -135,6 +135,18 @@ pub fn ensure_runtime_extracted() -> Result<PathBuf, VmError> {
     )?;
     extract_resource(resources::GVPROXY, &cache_dir.join("gvproxy"))?;
 
+    // On macOS, libkrun.dylib references libkrunfw via @loader_path/libkrunfw.dylib
+    // (the unversioned name), but we embed as libkrunfw.5.dylib. Create the
+    // unversioned name so dyld can resolve the dependency.
+    #[cfg(target_os = "macos")]
+    {
+        let unversioned = cache_dir.join("libkrunfw.dylib");
+        if !unversioned.exists() {
+            std::os::unix::fs::symlink(resources::LIBKRUNFW_NAME, &unversioned)
+                .map_err(|e| VmError::HostSetup(format!("symlink libkrunfw.dylib: {e}")))?;
+        }
+    }
+
     // Make gvproxy executable
     #[cfg(unix)]
     {
