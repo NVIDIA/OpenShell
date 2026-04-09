@@ -46,7 +46,11 @@ named_vm_rootfs() {
 }
 
 vm_exec() {
-  "${GATEWAY_BIN}" --name "${VM_NAME}" exec -- "$@"
+  local rootfs_args=()
+  if [ -n "${VM_ROOTFS_DIR:-}" ]; then
+    rootfs_args=(--rootfs "${VM_ROOTFS_DIR}")
+  fi
+  "${GATEWAY_BIN}" "${rootfs_args[@]}" --name "${VM_NAME}" exec -- "$@"
 }
 
 prepare_named_vm_rootfs() {
@@ -55,6 +59,8 @@ prepare_named_vm_rootfs() {
   fi
 
   echo "Preparing named VM rootfs '${VM_NAME}'..."
+  VM_ROOTFS_DIR="$("${ROOT}/tasks/scripts/vm/ensure-vm-rootfs.sh" --name "${VM_NAME}" \
+    | tail -n 1 | sed 's/^using openshell-vm rootfs at //')"
   "${ROOT}/tasks/scripts/vm/sync-vm-rootfs.sh" --name "${VM_NAME}"
 }
 
@@ -105,6 +111,7 @@ wait_for_gateway_health() {
 # ── Parse arguments ──────────────────────────────────────────────────
 VM_PORT=""
 VM_NAME=""
+VM_ROOTFS_DIR=""
 for arg in "$@"; do
   case "$arg" in
     --vm-port=*) VM_PORT="${arg#--vm-port=}" ;;
@@ -149,7 +156,11 @@ else
   fi
 
   VM_LOG=$(mktemp /tmp/openshell-vm-e2e.XXXXXX)
-  "${GATEWAY_BIN}" --name "${VM_NAME}" --port "${HOST_PORT}:${GUEST_PORT}" 2>"${VM_LOG}" &
+  rootfs_args=()
+  if [ -n "${VM_ROOTFS_DIR}" ]; then
+    rootfs_args=(--rootfs "${VM_ROOTFS_DIR}")
+  fi
+  "${GATEWAY_BIN}" "${rootfs_args[@]}" --name "${VM_NAME}" --port "${HOST_PORT}:${GUEST_PORT}" 2>"${VM_LOG}" &
   VM_PID=$!
 
   # ── Wait for full bootstrap (mTLS certs + gRPC health) ─────────────

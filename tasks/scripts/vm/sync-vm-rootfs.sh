@@ -49,7 +49,10 @@ if [ "${#ROOTFS_ARGS[@]}" -gt 0 ]; then
     ensure_args=("${ROOTFS_ARGS[@]}" "${ensure_args[@]}")
 fi
 
-ROOTFS_DIR="$("${ROOT}/tasks/scripts/vm/ensure-vm-rootfs.sh" "${ensure_args[@]}" | tail -n 1 | sed 's/^using openshell-vm rootfs at //')"
+if ! ROOTFS_DIR="$("${ROOT}/tasks/scripts/vm/ensure-vm-rootfs.sh" "${ensure_args[@]}" | tail -n 1 | sed 's/^using openshell-vm rootfs at //')"; then
+    echo "ERROR: ensure-vm-rootfs.sh failed — no rootfs available." >&2
+    exit 1
+fi
 
 patch_vm_helmchart() {
     local helmchart="$1"
