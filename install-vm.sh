@@ -28,6 +28,10 @@ info() {
   printf '%s: %s\n' "$APP_NAME" "$*" >&2
 }
 
+warn() {
+  printf '%s: warning: %s\n' "$APP_NAME" "$*" >&2
+}
+
 error() {
   printf '%s: error: %s\n' "$APP_NAME" "$*" >&2
   exit 1
@@ -60,6 +64,35 @@ download() {
   elif has_cmd wget; then
     wget -q --tries=3 --max-redirect=5 -O "$_output" "$_url"
   fi
+}
+
+# Follow a URL and print the final resolved URL (for detecting redirect targets).
+resolve_redirect() {
+  _url="$1"
+
+  if has_cmd curl; then
+    curl -fLsS -o /dev/null -w '%{url_effective}' "$_url"
+  elif has_cmd wget; then
+    # wget --spider follows redirects; capture the final Location from stderr
+    wget --spider --max-redirect=10 "$_url" 2>&1 | sed -n 's/^.*Location: \([^ ]*\).*/\1/p' | tail -1
+  fi
+}
+
+# Validate that a download URL resolves to the expected GitHub origin.
+# A MITM or DNS hijack could redirect to an attacker-controlled domain,
+# which would also serve a matching checksums file (making checksum
+# verification useless). See: https://github.com/NVIDIA/OpenShell/issues/638
+validate_download_origin() {
+  _vdo_url="$1"
+  _resolved="$(resolve_redirect "$_vdo_url")" || return 0  # best-effort
+
+  case "$_resolved" in
+    https://github.com/${REPO}/*) ;;
+    https://objects.githubusercontent.com/*) ;;
+    *)
+      error "unexpected redirect target: ${_resolved} (expected github.com/${REPO}/...)"
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -107,10 +140,10 @@ verify_checksum() {
     error "no checksum entry found for $_vc_filename in checksums file"
   fi
 
-  if has_cmd sha256sum; then
-    echo "$_vc_expected  $_vc_archive" | sha256sum -c --quiet 2>/dev/null
-  elif has_cmd shasum; then
+  if has_cmd shasum; then
     echo "$_vc_expected  $_vc_archive" | shasum -a 256 -c --quiet 2>/dev/null
+  elif has_cmd sha256sum; then
+    echo "$_vc_expected  $_vc_archive" | sha256sum -c --quiet 2>/dev/null
   fi
 }
 
@@ -139,18 +172,19 @@ is_on_path() {
 
 codesign_binary() {
   _binary="$1"
+  _cs_tmpdir="$2"  # reuse caller's tmpdir for cleanup-safe temp files
 
   if [ "$(uname -s)" != "Darwin" ]; then
     return 0
   fi
 
   if ! has_cmd codesign; then
-    info "warning: codesign not found; the binary will fail without the Hypervisor entitlement"
+    warn "codesign not found; the binary will fail without the Hypervisor entitlement"
     return 0
   fi
 
   info "codesigning with Hypervisor entitlement..."
-  _entitlements="$(mktemp)"
+  _entitlements="${_cs_tmpdir}/entitlements.plist"
   cat > "$_entitlements" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -162,7 +196,6 @@ codesign_binary() {
 </plist>
 PLIST
   codesign --entitlements "$_entitlements" --force -s - "$_binary"
-  rm -f "$_entitlements"
 }
 
 # ---------------------------------------------------------------------------
@@ -178,9 +211,20 @@ install-vm.sh — Install the openshell-vm MicroVM runtime
 
 USAGE:
     curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-vm.sh | sh
+    ./install-vm.sh [OPTIONS]
+
+OPTIONS:
+    --help    Print this help message
 
 ENVIRONMENT VARIABLES:
     OPENSHELL_VM_INSTALL_DIR   Directory to install into (default: ~/.local/bin)
+
+EXAMPLES:
+    # Install latest dev build
+    curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-vm.sh | sh
+
+    # Install to /usr/local/bin
+    curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-vm.sh | OPENSHELL_VM_INSTALL_DIR=/usr/local/bin sh
 EOF
         exit 0
         ;;
@@ -197,6 +241,9 @@ EOF
   _install_dir="$(get_install_dir)"
 
   info "downloading ${APP_NAME} (${_target})..."
+
+  # Validate that the download URL resolves to the expected GitHub origin.
+  validate_download_origin "$_download_url"
 
   _tmpdir="$(mktemp -d)"
   trap 'rm -rf "$_tmpdir"' EXIT
@@ -226,23 +273,32 @@ EOF
     sudo install -m 755 "${_tmpdir}/${APP_NAME}" "${_install_dir}/${APP_NAME}"
   fi
 
-  codesign_binary "${_install_dir}/${APP_NAME}"
+  codesign_binary "${_install_dir}/${APP_NAME}" "$_tmpdir"
 
-  info "installed ${APP_NAME} to ${_install_dir}/${APP_NAME}"
+  _installed_version="$("${_install_dir}/${APP_NAME}" --version 2>/dev/null || echo "${RELEASE_TAG}")"
+  info "installed ${_installed_version} to ${_install_dir}/${APP_NAME}"
 
+  # If the install directory isn't on PATH, print instructions
   if ! is_on_path "$_install_dir"; then
     echo ""
     info "${_install_dir} is not on your PATH."
     info ""
-    info "Add it by appending the following to your shell config:"
+    info "Add it by appending the following to your shell configuration file"
+    info "(e.g. ~/.bashrc, ~/.zshrc, or ~/.config/fish/config.fish):"
     info ""
 
     _current_shell="$(basename "${SHELL:-sh}" 2>/dev/null || echo "sh")"
     case "$_current_shell" in
-      fish) info "    fish_add_path ${_install_dir}" ;;
-      *)    info "    export PATH=\"${_install_dir}:\$PATH\"" ;;
+      fish)
+        info "    fish_add_path ${_install_dir}"
+        ;;
+      *)
+        info "    export PATH=\"${_install_dir}:\$PATH\""
+        ;;
     esac
+
     info ""
+    info "Then restart your shell or run the command above in your current session."
   fi
 }
 
