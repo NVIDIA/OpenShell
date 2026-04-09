@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::VmError;
 
 pub const VM_EXEC_VSOCK_PORT: u32 = 10_777;
+pub const VM_PKI_VSOCK_PORT: u32 = 10_778;
 
 const VM_STATE_NAME: &str = "vm-state.json";
 const VM_LOCK_NAME: &str = "vm.lock";
@@ -71,6 +72,16 @@ pub fn vm_exec_socket_path(rootfs: &Path) -> PathBuf {
         base = std::env::temp_dir();
     }
     let dir = base.join("ovm-exec");
+    let id = hash_path_id(rootfs);
+    dir.join(format!("{id}.sock"))
+}
+
+pub fn vm_pki_socket_path(rootfs: &Path) -> PathBuf {
+    let mut base = PathBuf::from("/tmp");
+    if !base.is_dir() {
+        base = std::env::temp_dir();
+    }
+    let dir = base.join("ovm-pki");
     let id = hash_path_id(rootfs);
     dir.join(format!("{id}.sock"))
 }
@@ -140,20 +151,22 @@ pub fn clear_vm_runtime_state(rootfs: &Path) {
 /// restarts. The init script clears stale bootstrap locks via `sqlite3`,
 /// and `recover_corrupt_kine_db` handles actual file corruption.
 pub fn reset_runtime_state(rootfs: &Path, gateway_name: &str) -> Result<(), VmError> {
-    // Full reset: wipe all k3s state so the VM cold-starts from scratch.
-    // The init script will re-import airgap images, deploy manifests,
-    // and generate fresh cluster state. This is slower (~30-60s) but
-    // guarantees no stale state from previous runs.
+    // Full reset: wipe all runtime state so the VM cold-starts from scratch.
+    //
+    // With the block-device layout, k3s server/agent state, containerd, PVCs,
+    // and PKI all live on the state disk — the caller in lib.rs deletes the
+    // entire state disk image file, which achieves a complete wipe in one
+    // operation without touching the virtiofs rootfs.
+    //
+    // We still clean the virtiofs rootfs for paths that are NOT on the state
+    // disk: kubelet pod volumes, CNI state, and the pre-init sentinel.  These
+    // paths are present in the rootfs regardless of the storage layout.
     let dirs_to_remove = [
-        // All k3s server state: kine DB, TLS certs, manifests, tokens
-        rootfs.join("var/lib/rancher/k3s/server"),
-        // All k3s agent state: containerd images, snapshots, metadata
-        rootfs.join("var/lib/rancher/k3s/agent/containerd"),
         // Stale pod volume mounts and projected secrets
         rootfs.join("var/lib/kubelet/pods"),
         // CNI state: stale network namespace references from dead pods
         rootfs.join("var/lib/cni"),
-        // Runtime state (PIDs, sockets, containerd socket)
+        // Runtime state (PIDs, sockets) — on virtiofs, not block device
         rootfs.join("var/run"),
     ];
 
@@ -180,18 +193,12 @@ pub fn reset_runtime_state(rootfs: &Path, gateway_name: &str) -> Result<(), VmEr
         cleaned += 1;
     }
 
-    // Rotate PKI: wipe VM-side certs so the init script regenerates
-    // them on next boot, and wipe host-side mTLS creds so
-    // bootstrap_gateway() takes the first-boot path and copies the
-    // new certs down.
-    let pki_dir = rootfs.join("opt/openshell/pki");
-    if pki_dir.is_dir() {
-        fs::remove_dir_all(&pki_dir).ok();
-        cleaned += 1;
-        eprintln!("Reset: rotated PKI (will regenerate on next boot)");
-    }
+    // PKI lives on the state disk; deleting the state disk image (done by
+    // the caller) rotates it automatically.  Just note it for the log.
+    eprintln!("Reset: PKI will be regenerated on next boot (state disk wiped)");
 
-    // Wipe host-side mTLS credentials so bootstrap picks up the new certs.
+    // Wipe host-side mTLS credentials so bootstrap_gateway() takes the
+    // first-boot path and fetches new certs from the VM over vsock.
     if let Ok(home) = std::env::var("HOME") {
         let config_base =
             std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));

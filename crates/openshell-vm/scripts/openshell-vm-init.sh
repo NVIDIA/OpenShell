@@ -132,55 +132,115 @@ mkdir -p /etc/rancher/k3s
 ROOTFS_CONTAINERD_DIR="/var/lib/rancher/k3s/agent/containerd"
 CONTAINERD_DIR="$ROOTFS_CONTAINERD_DIR"
 
-# Mount mutable containerd state on a host-backed virtio-blk disk. This
-# keeps overlayfs upper/work dirs off virtio-fs while preserving state on
-# the host across VM restarts.
+# ── State disk: mount ALL mutable runtime state on the block device ────
+#
+# The virtio-fs share is the immutable OS image (read-only at runtime).
+# All state that changes after first boot lives on an ext4 virtio-blk
+# disk (/dev/vda). This gives full filesystem semantics (chown, hard
+# links, fsync) and keeps every writable path off the host filesystem.
+#
+# Directories on the state disk:
+#   containerd/          → k3s/agent/containerd  (overlayfs snapshotter)
+#   k3s-agent/           → k3s/agent             (kubelet certs, kubeconfigs)
+#   k3s-server-db/       → k3s/server/db         (kine SQLite)
+#   k3s-server-tls/      → k3s/server/tls        (cluster TLS certs)
+#   k3s-server-cred/     → k3s/server/cred       (bootstrap credentials)
+#   k3s-server-etc/      → k3s/server/etc        (k3s-generated config)
+#   local-path-storage/  → k3s/storage           (PVC data)
+#   pki/                 → opt/openshell/pki     (mTLS CA + server/client certs)
+#
+# Directories that stay on virtio-fs (read-only seeds from build-rootfs.sh):
+#   k3s/server/manifests   (k3s auto-deploy manifests, written by init script)
+#   k3s/server/static      (k3s bundled charts)
+#   k3s/agent/images       (airgap image tarballs, seeded once then on disk)
+
 STATE_DISK_DEVICE="${OPENSHELL_VM_STATE_DISK_DEVICE:-/dev/vda}"
 STATE_MOUNT_DIR="/mnt/openshell-state"
-STATE_CONTAINERD_DIR="${STATE_MOUNT_DIR}/containerd"
 STATE_DISK_ACTIVE=false
 mkdir -p "$STATE_MOUNT_DIR"
 
 if [ -b "$STATE_DISK_DEVICE" ]; then
-    ts "configuring block-backed containerd state on ${STATE_DISK_DEVICE}"
+    ts "configuring block-backed runtime state on ${STATE_DISK_DEVICE}"
     if ! blkid "$STATE_DISK_DEVICE" >/dev/null 2>&1; then
         mkfs.ext4 -F -L openshell-state "$STATE_DISK_DEVICE" >/dev/null 2>&1
         ts "formatted state disk"
     fi
-
     mount -t ext4 -o noatime "$STATE_DISK_DEVICE" "$STATE_MOUNT_DIR"
-    mkdir -p "$STATE_CONTAINERD_DIR"
 
+    # ── k3s agent: seed images once, then bind entire agent dir ──────────
+    # agent/images contains airgap image tarballs baked into the rootfs.
+    # Seed them to the block device on first use so containerd can import
+    # them; after that they live on the block device alongside everything else.
+    STATE_K3S_AGENT_DIR="${STATE_MOUNT_DIR}/k3s-agent"
+    mkdir -p "$STATE_K3S_AGENT_DIR"
+    if [ ! -f "${STATE_MOUNT_DIR}/.seeded-agent-images" ]; then
+        VIRTIOFS_AGENT_IMAGES="/var/lib/rancher/k3s/agent/images"
+        if [ -d "$VIRTIOFS_AGENT_IMAGES" ] && [ -n "$(ls -A "$VIRTIOFS_AGENT_IMAGES" 2>/dev/null)" ]; then
+            ts "seeding agent images to block device"
+            mkdir -p "${STATE_K3S_AGENT_DIR}/images"
+            tar -C "$VIRTIOFS_AGENT_IMAGES" -cf - . | tar -C "${STATE_K3S_AGENT_DIR}/images" -xf -
+        fi
+        date -u +%Y-%m-%dT%H:%M:%SZ > "${STATE_MOUNT_DIR}/.seeded-agent-images"
+    fi
+    mkdir -p /var/lib/rancher/k3s/agent
+    mount --bind "$STATE_K3S_AGENT_DIR" /var/lib/rancher/k3s/agent
+
+    # ── containerd: bind on top of agent ─────────────────────────────────
+    # Seeded from the virtiofs rootfs on first use (overlayfs snapshots,
+    # content store, meta.db pre-populated by build-rootfs.sh).
+    STATE_CONTAINERD_DIR="${STATE_MOUNT_DIR}/containerd"
+    mkdir -p "$STATE_CONTAINERD_DIR"
     if [ ! -f "${STATE_MOUNT_DIR}/.seeded-containerd" ]; then
         if [ -d "$ROOTFS_CONTAINERD_DIR" ] && [ -n "$(ls -A "$ROOTFS_CONTAINERD_DIR" 2>/dev/null)" ]; then
-            ts "seeding containerd state from rootfs"
+            ts "seeding containerd state to block device"
             tar -C "$ROOTFS_CONTAINERD_DIR" -cf - . | tar -C "$STATE_CONTAINERD_DIR" -xf -
         else
-            ts "state disk is empty; starting containerd with a fresh state directory"
+            ts "containerd state is empty; starting fresh"
         fi
         date -u +%Y-%m-%dT%H:%M:%SZ > "${STATE_MOUNT_DIR}/.seeded-containerd"
     fi
-
     mkdir -p "$ROOTFS_CONTAINERD_DIR"
     mount --bind "$STATE_CONTAINERD_DIR" "$ROOTFS_CONTAINERD_DIR"
+
+    # ── k3s server runtime state ──────────────────────────────────────────
+    # server/manifests and server/static stay on virtiofs (written by init
+    # script each boot from /opt/openshell/manifests; read-only after that).
+    for pair in \
+        "k3s-server-db:/var/lib/rancher/k3s/server/db" \
+        "k3s-server-tls:/var/lib/rancher/k3s/server/tls" \
+        "k3s-server-cred:/var/lib/rancher/k3s/server/cred" \
+        "k3s-server-etc:/var/lib/rancher/k3s/server/etc"
+    do
+        src="${STATE_MOUNT_DIR}/${pair%%:*}"
+        dst="${pair#*:}"
+        mkdir -p "$src" "$dst"
+        mount --bind "$src" "$dst"
+    done
+
+    # ── local-path PVC storage ─────────────────────────────────────────────
+    mkdir -p "${STATE_MOUNT_DIR}/local-path-storage" /var/lib/rancher/k3s/storage
+    mount --bind "${STATE_MOUNT_DIR}/local-path-storage" /var/lib/rancher/k3s/storage
+
+    # ── PKI ────────────────────────────────────────────────────────────────
+    # Certs live on the block device; the host reads them via vsock (port
+    # 10778) instead of polling the virtiofs rootfs path.
+    mkdir -p "${STATE_MOUNT_DIR}/pki" /opt/openshell/pki
+    mount --bind "${STATE_MOUNT_DIR}/pki" /opt/openshell/pki
+
     STATE_DISK_ACTIVE=true
-    ts "containerd state mounted from block disk"
+    ts "all runtime state mounted from block device"
 else
-    ts "no block state disk found; using virtio-fs-backed containerd state"
+    ts "no block device found; using virtiofs-backed runtime state"
 fi
 
-# Clean stale runtime artifacts from previous boots (virtio-fs persists
-# the rootfs between VM restarts).
-rm -rf /var/lib/rancher/k3s/server/tls/temporary-certs 2>/dev/null || true
-rm -f  /var/lib/rancher/k3s/server/kine.sock           2>/dev/null || true
-# Clean stale node password so k3s doesn't fail validation on reboot.
-# Each k3s start generates a new random node password; the old hash in
-# the database will not match. Removing the local password file forces
-# k3s to re-register with a fresh one.
-rm -f /var/lib/rancher/k3s/server/cred/node-passwd      2>/dev/null || true
-# Also clean any stale pid files and unix sockets
+# Clean stale sockets from previous boots. Sockets live in /run (tmpfs)
+# and /var/lib/rancher/k3s — they're stale on every boot regardless of
+# whether state is on virtiofs or the block device.
 find /var/lib/rancher/k3s -name '*.sock' -delete 2>/dev/null || true
 find /run -name '*.sock' -delete 2>/dev/null || true
+# On the block-device path, node-passwd is regenerated by k3s on each
+# start; clear it so k3s doesn't fail node re-registration validation.
+rm -f /var/lib/rancher/k3s/server/cred/node-passwd 2>/dev/null || true
 
 # Clean stale containerd runtime state from previous boots.
 #
@@ -496,11 +556,12 @@ fi
 # (pre-baked state from the Docker build used host-gw flannel).
 rm -f "/var/lib/rancher/k3s/agent/etc/cni/net.d/10-flannel.conflist" 2>/dev/null || true
 
-# ── PKI: generate once, write TLS secrets manifest every boot ──────────
+# ── PKI: generate once, serve over vsock (port 10778) ─────────────────
 # Certs are generated on first boot and stored at /opt/openshell/pki/.
-# They survive --reset (which only wipes k3s server/agent state).
-# The host-side bootstrap reads them from the rootfs via virtio-fs and
-# copies the client certs to ~/.config/openshell/gateways/<name>/mtls/.
+# With the block-device layout this path is on the state disk, fully
+# isolated from the virtiofs host filesystem.
+# The host-side bootstrap fetches certs over vsock port 10778 (mapped by
+# libkrun to a Unix socket) instead of reading them from the rootfs.
 
 PKI_DIR="/opt/openshell/pki"
 if [ ! -f "$PKI_DIR/ca.crt" ]; then
@@ -571,6 +632,18 @@ EOCLIENT
     ts "PKI generated"
 else
     ts "existing PKI found, skipping generation"
+fi
+
+# Start the PKI vsock server. It listens on AF_VSOCK port 10778 and serves
+# the six PEM files as a JSON object on each connection. The host-side
+# bootstrap connects via the libkrun vsock-to-Unix bridge to fetch certs
+# without touching the virtiofs rootfs path.
+if [ -f /srv/openshell-vm-pki-server.py ]; then
+    python3 /srv/openshell-vm-pki-server.py "$PKI_DIR" &
+    PKI_SERVER_PID=$!
+    ts "PKI vsock server started (port 10778, pid ${PKI_SERVER_PID})"
+else
+    ts "WARNING: PKI vsock server script not found at /srv/openshell-vm-pki-server.py"
 fi
 
 SSH_HANDSHAKE_SECRET_FILE="${PKI_DIR}/ssh-handshake-secret"

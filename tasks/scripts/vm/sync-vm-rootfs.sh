@@ -85,7 +85,7 @@ fi
 echo "Syncing development artifacts into rootfs..."
 
 # ── Init scripts and utilities ─────────────────────────────────────────
-for script in openshell-vm-init.sh openshell-vm-exec-agent.py check-vm-capabilities.sh; do
+for script in openshell-vm-init.sh openshell-vm-exec-agent.py openshell-vm-pki-server.py check-vm-capabilities.sh; do
     src="${SCRIPT_DIR}/${script}"
     dst="${ROOTFS_DIR}/srv/${script}"
     if [ -f "$src" ]; then

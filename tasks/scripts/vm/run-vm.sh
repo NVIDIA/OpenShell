@@ -61,8 +61,15 @@ if [ "${skip_prepare}" -eq 0 ] && [ -z "${subcommand}" ]; then
   if [ "${#rootfs_args[@]}" -gt 0 ]; then
     prep_args=("${rootfs_args[@]}" "${prep_args[@]}")
   fi
-  "${ROOT}/tasks/scripts/vm/ensure-vm-rootfs.sh" "${prep_args[@]}"
+  resolved_rootfs="$("${ROOT}/tasks/scripts/vm/ensure-vm-rootfs.sh" "${prep_args[@]}" \
+    | tail -n 1 | sed 's/^using openshell-vm rootfs at //')"
   "${ROOT}/tasks/scripts/vm/sync-vm-rootfs.sh" "${prep_args[@]}"
+
+  # When no --rootfs was supplied by the caller, inject the resolved rootfs path
+  # so the binary finds the rootfs regardless of whether it is embedded.
+  if [ "${#rootfs_args[@]}" -eq 0 ] && [ -n "${resolved_rootfs}" ]; then
+    args=(--rootfs "${resolved_rootfs}" "${args[@]}")
+  fi
 fi
 
 exec "${GATEWAY_BIN}" "${args[@]}"

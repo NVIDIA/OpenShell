@@ -91,10 +91,14 @@ pub fn ensure_runtime_extracted() -> Result<PathBuf, VmError> {
     let cache_dir = runtime_cache_dir()?;
     let version_marker = cache_dir.join(".version");
 
-    // Check if already extracted with correct version
+    // Cache key: version + content fingerprint (so dev builds at 0.0.0
+    // still invalidate when the embedded libraries change).
+    let cache_key = runtime_cache_key();
+
+    // Check if already extracted with the correct cache key
     if version_marker.exists()
-        && let Ok(cached_version) = fs::read_to_string(&version_marker)
-        && cached_version.trim() == VERSION
+        && let Ok(cached_key) = fs::read_to_string(&version_marker)
+        && cached_key.trim() == cache_key
     {
         // Validate files exist
         if validate_runtime_dir(&cache_dir).is_ok() {
@@ -139,8 +143,8 @@ pub fn ensure_runtime_extracted() -> Result<PathBuf, VmError> {
             .map_err(|e| VmError::HostSetup(format!("chmod gvproxy: {e}")))?;
     }
 
-    // Write version marker
-    fs::write(&version_marker, VERSION)
+    // Write version marker (includes content fingerprint for cache invalidation)
+    fs::write(&version_marker, runtime_cache_key())
         .map_err(|e| VmError::HostSetup(format!("write version marker: {e}")))?;
 
     tracing::info!(
@@ -222,6 +226,34 @@ pub fn has_embedded_rootfs() -> bool {
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────────
+
+/// Build a cache key that combines the version string with a short content
+/// fingerprint of the embedded runtime bytes.
+///
+/// Using the version alone is insufficient for dev builds (all `0.0.0`)
+/// because the embedded libraries can change between compiles without the
+/// version changing. The fingerprint is a simple XOR-fold of the first few
+/// bytes of each embedded resource — cheap to compute at startup without
+/// pulling in a hash dependency.
+fn runtime_cache_key() -> String {
+    // XOR-fold the first 64 bytes of each resource to get a cheap fingerprint.
+    let mut fp: u64 = 0;
+    for (i, chunk) in [resources::LIBKRUN, resources::LIBKRUNFW, resources::GVPROXY]
+        .iter()
+        .enumerate()
+    {
+        let sample = &chunk[..chunk.len().min(64)];
+        let mut word: u64 = 0;
+        for (j, &b) in sample.iter().enumerate() {
+            word ^= (b as u64) << ((j % 8) * 8);
+        }
+        // Mix in resource index so identical resources don't cancel out.
+        fp ^= word.rotate_left((i as u32) * 13 + 7);
+        // Also mix in the total length so size changes are detected.
+        fp ^= (chunk.len() as u64).rotate_left((i as u32) * 17 + 3);
+    }
+    format!("{VERSION}-{fp:016x}")
+}
 
 fn runtime_cache_dir() -> Result<PathBuf, VmError> {
     let base = openshell_core::paths::xdg_data_dir()

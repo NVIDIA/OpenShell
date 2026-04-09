@@ -51,5 +51,22 @@ else
   prepare_args+=(prepare-rootfs)
 fi
 
-ROOTFS_PATH="$("${GATEWAY_BIN}" "${prepare_args[@]}")"
-echo "using openshell-vm rootfs at ${ROOTFS_PATH}"
+if ROOTFS_PATH="$("${GATEWAY_BIN}" "${prepare_args[@]}" 2>/dev/null)"; then
+  echo "using openshell-vm rootfs at ${ROOTFS_PATH}"
+  exit 0
+fi
+
+# prepare-rootfs failed — no embedded rootfs in the binary.
+# Fall back to target/rootfs-build if it exists (rootfs was built separately
+# but not yet compressed for embedding via mise run vm:rootfs).
+if [ "${#ROOTFS_ARGS[@]}" -eq 0 ]; then
+  FALLBACK_ROOTFS="${ROOT}/target/rootfs-build"
+  if [ -d "${FALLBACK_ROOTFS}/srv" ]; then
+    echo "using openshell-vm rootfs at ${FALLBACK_ROOTFS}"
+    exit 0
+  fi
+fi
+
+echo "ERROR: No rootfs available." >&2
+echo "       Run: mise run vm:rootfs -- --base   # build rootfs (~5-10 min, requires Docker)" >&2
+exit 1

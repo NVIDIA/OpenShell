@@ -25,9 +25,10 @@ use std::ptr;
 use std::time::Instant;
 
 pub use exec::{
-    VM_EXEC_VSOCK_PORT, VmExecOptions, VmRuntimeState, acquire_rootfs_lock, clear_vm_runtime_state,
-    ensure_vm_not_running, exec_running_vm, recover_corrupt_kine_db, reset_runtime_state,
-    vm_exec_socket_path, vm_state_path, write_vm_runtime_state,
+    VM_EXEC_VSOCK_PORT, VM_PKI_VSOCK_PORT, VmExecOptions, VmRuntimeState, acquire_rootfs_lock,
+    clear_vm_runtime_state, ensure_vm_not_running, exec_running_vm, recover_corrupt_kine_db,
+    reset_runtime_state, vm_exec_socket_path, vm_pki_socket_path, vm_state_path,
+    write_vm_runtime_state,
 };
 
 // ── Error type ─────────────────────────────────────────────────────────
@@ -204,11 +205,18 @@ impl VmConfig {
     pub fn gateway(rootfs: PathBuf) -> Self {
         let state_disk = StateDiskConfig::for_rootfs(&rootfs);
         Self {
-            vsock_ports: vec![VsockPort {
-                port: VM_EXEC_VSOCK_PORT,
-                socket_path: vm_exec_socket_path(&rootfs),
-                listen: true,
-            }],
+            vsock_ports: vec![
+                VsockPort {
+                    port: VM_EXEC_VSOCK_PORT,
+                    socket_path: vm_exec_socket_path(&rootfs),
+                    listen: true,
+                },
+                VsockPort {
+                    port: VM_PKI_VSOCK_PORT,
+                    socket_path: vm_pki_socket_path(&rootfs),
+                    listen: true,
+                },
+            ],
             rootfs,
             vcpus: 4,
             mem_mib: 8192,
@@ -1263,6 +1271,9 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                 VmError::RuntimeState(format!("create vsock socket dir {}: {e}", parent.display()))
             })?;
         }
+        // libkrun returns EEXIST if the socket file is already present from a
+        // previous run. Remove any stale socket before registering the port.
+        let _ = std::fs::remove_file(&vsock_port.socket_path);
         vm.add_vsock_port(vsock_port)?;
     }
 
@@ -1486,27 +1497,15 @@ const DEFAULT_GATEWAY_PORT: u16 = 30051;
 
 /// Bootstrap the `OpenShell` control plane after k3s is ready.
 ///
-/// All operations use the virtio-fs rootfs — no kubectl or API server
-/// port forwarding required. This avoids exposing port 6443 outside the
-/// VM.
+/// Two paths:
 ///
-/// Three paths, in priority order:
+/// 1. **Warm boot**: host-side metadata and mTLS certs already exist from a
+///    previous run. Fetch PKI over vsock to detect cert drift (e.g. after
+///    a `--reset`), re-sync if needed, then proceed to the health check.
 ///
-/// 1. **Pre-baked rootfs** (from `build-rootfs.sh`): PKI files at
-///    `rootfs/opt/openshell/pki/`. TLS secrets already exist in the k3s
-///    database. Reads certs from the filesystem and stores metadata on the
-///    host.
-///
-/// 2. **Warm boot**: host-side metadata + mTLS certs survive across VM
-///    restarts. Nothing to do — service readiness is confirmed by the gRPC
-///    health check in `health::wait_for_gateway_ready()`.
-///
-/// The VM generates PKI on first boot (via openshell-vm-init.sh) and
-/// writes certs to `/opt/openshell/pki/` on the rootfs. This function:
-///
-/// 1. **Warm boot**: host already has certs at `~/.config/.../mtls/` — skip.
-/// 2. **First boot / post-reset**: polls the rootfs for `/opt/openshell/pki/ca.crt`
-///    (written by the VM init script), then copies client certs to the host.
+/// 2. **First boot / post-reset**: poll the PKI vsock server (port 10778,
+///    started by the VM init script after PKI generation) until certs are
+///    available, then store them in `~/.config/openshell/gateways/<name>/mtls/`.
 fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Result<(), VmError> {
     let bootstrap_start = Instant::now();
 
@@ -1530,33 +1529,19 @@ fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Re
         openshell_bootstrap::save_active_gateway(gateway_name)
             .map_err(|e| VmError::Bootstrap(format!("failed to set active cluster: {e}")))?;
 
-        // Verify host certs match the rootfs PKI. If they diverge (e.g.
-        // PKI was regenerated out-of-band, or the rootfs was replaced),
-        // re-sync the host certs from the authoritative rootfs copy.
-        //
-        // Wait for the PKI to be available — the VM may be generating it
-        // at boot time (non-pre-initialized rootfs). Without this wait,
-        // the sync check runs before the VM writes its certs, causing
-        // mTLS mismatch errors on connection.
-        let pki_dir = rootfs.join("opt/openshell/pki");
-        // Wait for client.crt — the last file in the PKI generation
-        // sequence — to ensure all cert files are fully written.
-        let sentinel_path = pki_dir.join("client.crt");
-        let pki_wait_timeout = std::time::Duration::from_secs(30);
-        let pki_wait_start = Instant::now();
-        while !sentinel_path.is_file()
-            || std::fs::metadata(&sentinel_path).map_or(true, |m| m.len() == 0)
-        {
-            if pki_wait_start.elapsed() >= pki_wait_timeout {
-                eprintln!("Warning: PKI not available after 30s, skipping cert sync");
-                break;
+        // Verify host certs match the VM's PKI. If they diverge (e.g.
+        // PKI was regenerated after a --reset, or the state disk was
+        // replaced), re-sync the host certs from the VM over vsock.
+        let pki_socket = vm_pki_socket_path(rootfs);
+        match fetch_pki_over_vsock(&pki_socket, std::time::Duration::from_secs(30)) {
+            Ok(bundle) => {
+                if let Err(e) = sync_host_certs_if_stale(gateway_name, &bundle) {
+                    eprintln!("Warning: cert sync check failed: {e}");
+                }
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        if sentinel_path.is_file()
-            && let Err(e) = sync_host_certs_if_stale(&pki_dir, gateway_name)
-        {
-            eprintln!("Warning: cert sync check failed: {e}");
+            Err(e) => {
+                eprintln!("Warning: PKI vsock fetch failed (non-fatal): {e}");
+            }
         }
 
         eprintln!(
@@ -1569,53 +1554,19 @@ fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Re
         return Ok(());
     }
 
-    // ── First boot / post-reset: wait for VM to generate PKI ──────
+    // ── First boot / post-reset: fetch PKI from VM over vsock ─────
     //
-    // The VM init script generates certs at /opt/openshell/pki/ on
-    // first boot. We poll the rootfs (visible via virtio-fs) until
-    // the CA cert appears, then copy client certs to the host.
+    // The VM init script generates certs on first boot and starts a
+    // PKI server on vsock port 10778. We poll that socket until the
+    // server is ready, then fetch all six PEM files in one round trip.
     eprintln!("Waiting for VM to generate PKI...");
-    let pki_dir = rootfs.join("opt/openshell/pki");
-    // Wait for client.crt — the last file written by the init script's
-    // PKI generation sequence (ca.crt → server.crt → client.crt).
-    // This avoids a race where ca.crt exists but the other certs
-    // haven't been written yet.
-    let sentinel_path = pki_dir.join("client.crt");
-    let poll_timeout = std::time::Duration::from_secs(120);
-    let poll_start = Instant::now();
+    let pki_socket = vm_pki_socket_path(rootfs);
+    let pki_bundle =
+        fetch_pki_over_vsock(&pki_socket, std::time::Duration::from_secs(120)).map_err(|e| {
+            VmError::Bootstrap(format!("VM did not serve PKI within 120s: {e}"))
+        })?;
 
-    loop {
-        if sentinel_path.is_file() {
-            // Verify the file has content (not a partial write).
-            if let Ok(m) = std::fs::metadata(&sentinel_path)
-                && m.len() > 0
-            {
-                break;
-            }
-        }
-        if poll_start.elapsed() >= poll_timeout {
-            return Err(VmError::Bootstrap(
-                "VM did not generate PKI within 120s".to_string(),
-            ));
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-
-    eprintln!("PKI ready — copying client certs to host...");
-
-    let read = |name: &str| -> Result<String, VmError> {
-        std::fs::read_to_string(pki_dir.join(name))
-            .map_err(|e| VmError::Bootstrap(format!("failed to read {name}: {e}")))
-    };
-
-    let pki_bundle = openshell_bootstrap::pki::PkiBundle {
-        ca_cert_pem: read("ca.crt")?,
-        ca_key_pem: read("ca.key")?,
-        server_cert_pem: read("server.crt")?,
-        server_key_pem: read("server.key")?,
-        client_cert_pem: read("client.crt")?,
-        client_key_pem: read("client.key")?,
-    };
+    eprintln!("PKI ready — storing client certs on host...");
 
     openshell_bootstrap::store_gateway_metadata(gateway_name, &metadata)
         .map_err(|e| VmError::Bootstrap(format!("failed to store metadata: {e}")))?;
@@ -1635,6 +1586,92 @@ fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Re
     eprintln!("  mTLS:     ~/.config/openshell/gateways/{gateway_name}/mtls/");
 
     Ok(())
+}
+
+/// Connect to the PKI vsock server (via its host-side Unix socket) and fetch
+/// the six PEM files as a JSON object.  Retries until `timeout` elapses,
+/// sleeping 500ms between attempts, to handle the window between VM boot and
+/// the Python server being ready.
+fn fetch_pki_over_vsock(
+    socket_path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<openshell_bootstrap::pki::PkiBundle, VmError> {
+    use std::os::unix::net::UnixStream;
+
+    let deadline = Instant::now() + timeout;
+
+    // Ensure the socket's parent directory exists (libkrun creates the socket
+    // file lazily when the VM boots and registers the vsock port).
+    if let Some(parent) = socket_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    loop {
+        match UnixStream::connect(socket_path) {
+            Ok(mut stream) => {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .ok();
+                // Read until EOF — the server sends one JSON line then closes.
+                let mut buf = String::new();
+                use std::io::Read;
+                let _ = stream.read_to_string(&mut buf);
+
+                // An empty response means the vsock bridge accepted the
+                // connection but the guest-side server isn't listening yet
+                // (libkrun creates the host socket immediately at VM start,
+                // before the init script runs inside the VM). Treat this the
+                // same as a connection refused and retry.
+                if buf.is_empty() {
+                    if Instant::now() >= deadline {
+                        return Err(VmError::Bootstrap(format!(
+                            "PKI vsock socket at {} returned empty response after timeout",
+                            socket_path.display()
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    continue;
+                }
+
+                let map: std::collections::HashMap<String, String> =
+                    serde_json::from_str(buf.trim()).map_err(|e| {
+                        VmError::Bootstrap(format!(
+                            "PKI vsock JSON parse error: {e} (got {} bytes)",
+                            buf.len()
+                        ))
+                    })?;
+
+                let get = |key: &str| -> Result<String, VmError> {
+                    let v = map.get(key).cloned().unwrap_or_default();
+                    if v.is_empty() {
+                        Err(VmError::Bootstrap(format!(
+                            "PKI vsock response missing or empty: {key}"
+                        )))
+                    } else {
+                        Ok(v)
+                    }
+                };
+
+                return Ok(openshell_bootstrap::pki::PkiBundle {
+                    ca_cert_pem: get("ca.crt")?,
+                    ca_key_pem: get("ca.key")?,
+                    server_cert_pem: get("server.crt")?,
+                    server_key_pem: get("server.key")?,
+                    client_cert_pem: get("client.crt")?,
+                    client_key_pem: get("client.key")?,
+                });
+            }
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    return Err(VmError::Bootstrap(format!(
+                        "PKI vsock socket not ready at {}",
+                        socket_path.display()
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
 }
 
 /// Check whether a previous bootstrap left valid state on disk.
@@ -1684,7 +1721,10 @@ fn is_warm_boot(gateway_name: &str) -> bool {
 ///
 /// This catches cases where PKI was regenerated (e.g. rootfs rebuilt,
 /// manual reset) but host-side certs survived from a previous boot cycle.
-fn sync_host_certs_if_stale(pki_dir: &Path, gateway_name: &str) -> Result<(), VmError> {
+fn sync_host_certs_if_stale(
+    gateway_name: &str,
+    bundle: &openshell_bootstrap::pki::PkiBundle,
+) -> Result<(), VmError> {
     let Ok(home) = std::env::var("HOME") else {
         return Ok(());
     };
@@ -1695,36 +1735,19 @@ fn sync_host_certs_if_stale(pki_dir: &Path, gateway_name: &str) -> Result<(), Vm
         .join(gateway_name)
         .join("mtls/ca.crt");
 
-    let rootfs_ca = std::fs::read_to_string(pki_dir.join("ca.crt"))
-        .map_err(|e| VmError::Bootstrap(format!("failed to read rootfs ca.crt: {e}")))?;
-
     let host_ca_contents = std::fs::read_to_string(&host_ca)
         .map_err(|e| VmError::Bootstrap(format!("failed to read host ca.crt: {e}")))?;
 
-    if rootfs_ca.trim() == host_ca_contents.trim() {
+    if bundle.ca_cert_pem.trim() == host_ca_contents.trim() {
         return Ok(());
     }
 
-    eprintln!("Cert drift detected — re-syncing mTLS certs from rootfs...");
+    eprintln!("Cert drift detected — re-syncing mTLS certs from VM...");
 
-    let read = |name: &str| -> Result<String, VmError> {
-        std::fs::read_to_string(pki_dir.join(name))
-            .map_err(|e| VmError::Bootstrap(format!("failed to read {name}: {e}")))
-    };
-
-    let pki_bundle = openshell_bootstrap::pki::PkiBundle {
-        ca_cert_pem: read("ca.crt")?,
-        ca_key_pem: read("ca.key")?,
-        server_cert_pem: read("server.crt")?,
-        server_key_pem: read("server.key")?,
-        client_cert_pem: read("client.crt")?,
-        client_key_pem: read("client.key")?,
-    };
-
-    openshell_bootstrap::mtls::store_pki_bundle(gateway_name, &pki_bundle)
+    openshell_bootstrap::mtls::store_pki_bundle(gateway_name, bundle)
         .map_err(|e| VmError::Bootstrap(format!("failed to store mTLS creds: {e}")))?;
 
-    eprintln!("  mTLS certs re-synced from rootfs");
+    eprintln!("  mTLS certs re-synced from VM");
     Ok(())
 }
 
