@@ -927,9 +927,7 @@ fn kill_stale_gvproxy_by_port(port: u16) {
         .output();
 
     let pids = match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).to_string()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
         _ => return,
     };
 
@@ -1577,8 +1575,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                     // netstack may not be ready immediately after socket creation.
                     let mut expose_ok = false;
                     let mut retry_interval = std::time::Duration::from_millis(100);
-                    let expose_deadline =
-                        Instant::now() + std::time::Duration::from_secs(10);
+                    let expose_deadline = Instant::now() + std::time::Duration::from_secs(10);
                     loop {
                         match gvproxy_expose(api_sock, &expose_body) {
                             Ok(()) => {
@@ -1592,8 +1589,8 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                                     break;
                                 }
                                 std::thread::sleep(retry_interval);
-                                retry_interval = (retry_interval * 2)
-                                    .min(std::time::Duration::from_secs(1));
+                                retry_interval =
+                                    (retry_interval * 2).min(std::time::Duration::from_secs(1));
                             }
                         }
                     }
