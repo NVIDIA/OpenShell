@@ -4,32 +4,34 @@
 # Documentation build, serve, and check tasks
 
 ["docs"]
-description = "Build HTML documentation"
-run = """
-if ! uv run sphinx-build -b html docs _build/docs; then
-  echo ""
-  echo "Build failed. If this is a dependency issue, try: mise run docs:deps"
-  exit 1
-fi
-echo ""
-echo "Documentation built successfully."
-echo "file://$(pwd)/_build/docs/index.html"
-"""
+description = "Validate Fern documentation"
+depends = ["docs:build:strict"]
 
 ["docs:deps"]
-description = "Install documentation dependencies"
-run = "uv sync --group docs"
+description = "Resolve Fern CLI for docs tasks"
+run = """
+FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
+npx --yes "fern-api@${FERN_VERSION}" --version
+"""
 
 ["docs:build:strict"]
-description = "Build HTML documentation with warnings as errors"
+description = "Validate docs config and links"
 depends = ["docs:deps"]
-run = "uv run sphinx-build -b html -W --keep-going docs _build/docs"
+run = """
+FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
+cd fern
+npx --yes "fern-api@${FERN_VERSION}" check
+"""
 
 ["docs:serve"]
-description = "Serve documentation with live reload on port 8000"
+description = "Serve Fern docs locally"
 depends = ["docs:deps"]
-run = "uv run sphinx-autobuild docs _build/docs --port 8000 --open-browser"
+run = """
+FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
+cd fern
+npx --yes "fern-api@${FERN_VERSION}" docs dev
+"""
 
 ["docs:clean"]
-description = "Remove built documentation"
-run = "rm -rf _build/docs"
+description = "Remove local Fern docs cache"
+run = "rm -rf .fern-cache fern/.fern-cache"

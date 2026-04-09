@@ -1,0 +1,87 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Accessing Logs"
+description: "How to view sandbox logs through the CLI, TUI, and directly on the sandbox filesystem."
+keywords: "Generative AI, Cybersecurity, Logging, CLI, TUI, Observability"
+---
+
+OpenShell provides three ways to access sandbox logs: the CLI, the TUI, and direct filesystem access inside the sandbox.
+
+## CLI
+
+Use `openshell logs` to stream logs from a running sandbox:
+
+```shell
+openshell logs smoke-l4 --source sandbox
+```
+
+The CLI receives logs from the gateway over gRPC. Each line includes a timestamp, source, level, and message:
+
+```text
+[1775014132.118] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/curl(58) -> api.github.com:443 [policy:github_api engine:opa]
+[1775014132.190] [sandbox] [OCSF ] [ocsf] HTTP:GET [INFO] ALLOWED GET http://api.github.com/zen [policy:github_api]
+[1775014132.690] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(64) -> httpbin.org:443 [policy:- engine:opa]
+[1775014113.058] [sandbox] [INFO ] [openshell_sandbox] Starting sandbox
+```
+
+OCSF structured events show `OCSF` as the level. Standard tracing events show `INFO`, `WARN`, or `ERROR`.
+
+## TUI
+
+The TUI dashboard displays sandbox logs in real time. Logs appear in the log panel with the same format as the CLI.
+
+## Gateway Log Storage
+
+The sandbox pushes logs to the gateway over gRPC in real time. The gateway stores a bounded buffer of recent log lines per sandbox. This buffer is not persisted to disk and is lost when the gateway restarts.
+
+For durable log storage, use the log files inside the sandbox or enable [OCSF JSON export](/observability/ocsf-json-export) and ship the JSONL files to an external log aggregator.
+
+## Direct Filesystem Access
+
+Use `openshell sandbox connect` to open a shell inside the sandbox and read the log files directly:
+
+```text
+openshell sandbox connect my-sandbox
+sandbox@my-sandbox:~$ cat /var/log/openshell.2026-04-01.log
+```
+
+You can also run a one-off command without an interactive shell:
+
+```shell
+openshell sandbox connect my-sandbox -- cat /var/log/openshell.2026-04-01.log
+```
+
+The log files inside the sandbox contain the complete record, including events that may have been dropped from the gRPC push channel under load. The push channel is bounded and drops events rather than blocking.
+
+## Filtering by Event Type
+
+The shorthand format is designed for `grep`. Some useful patterns:
+
+```shell
+# All denied connections
+grep "DENIED\|BLOCKED" /var/log/openshell.*.log
+
+# All network events
+grep "OCSF NET:" /var/log/openshell.*.log
+
+# All L7 enforcement decisions
+grep "OCSF HTTP:" /var/log/openshell.*.log
+
+# Security findings only
+grep "OCSF FINDING:" /var/log/openshell.*.log
+
+# Policy changes
+grep "OCSF CONFIG:" /var/log/openshell.*.log
+
+# All OCSF events, excluding standard tracing
+grep "^.* OCSF " /var/log/openshell.*.log
+
+# Events at medium severity or above
+grep "\[MED\]\|\[HIGH\]\|\[CRIT\]\|\[FATAL\]" /var/log/openshell.*.log
+```
+
+## Next Steps
+
+- Learn how the [log formats](/observability/logging) work and how to read the shorthand.
+- [Enable OCSF JSON export](/observability/ocsf-json-export) for machine-readable structured output.

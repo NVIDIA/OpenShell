@@ -795,6 +795,28 @@ mod tests {
         assert!(validate_policy_safety(&policy).is_ok());
     }
 
+    #[test]
+    fn validate_policy_safety_rejects_tld_wildcard() {
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "bad".into(),
+            NetworkPolicyRule {
+                name: "bad-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let err = validate_policy_safety(&policy).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("TLD wildcard"));
+    }
+
     // ---- Static field validation ----
 
     #[test]

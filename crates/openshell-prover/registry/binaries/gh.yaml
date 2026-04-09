@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+binary: /usr/bin/gh
+description: "GitHub CLI — REST API client for GitHub"
+protocols:
+  - name: github-rest
+    transport: https
+    description: "GitHub REST API via gh cli — uses standard HTTP, subject to L7 inspection"
+    bypasses_l7: false
+    actions:
+      - { name: api_read, type: read, description: "GET requests to GitHub API" }
+      - { name: api_write, type: write, description: "POST/PUT/PATCH requests (create issues, PRs, etc.)" }
+      - { name: api_delete, type: destructive, description: "DELETE requests (delete repos, branches, etc.)" }
+spawns:
+  - /usr/bin/git
+can_exfiltrate: true
+exfil_mechanism: "Create gists, issues, or PRs with file contents"
+can_construct_http: true

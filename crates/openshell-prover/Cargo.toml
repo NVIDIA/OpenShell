@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-prover"
+description = "Formal policy verification for OpenShell sandboxes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+bundled-z3 = ["z3/bundled"]
+
+[dependencies]
+z3 = { workspace = true }
+serde = { workspace = true }
+serde_yml = { workspace = true }
+miette = { workspace = true }
+owo-colors = { workspace = true }
+include_dir = { workspace = true }
+glob = { workspace = true }
+
+[lints]
+workspace = true

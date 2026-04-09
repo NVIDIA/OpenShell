@@ -1478,6 +1478,30 @@ enum PolicyCommands {
         #[arg(long)]
         yes: bool,
     },
+
+    /// Prove properties of a sandbox policy — or find counterexamples.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Prove {
+        /// Path to OpenShell sandbox policy YAML.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        policy: String,
+
+        /// Path to credential descriptor YAML.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        credentials: String,
+
+        /// Path to capability registry directory (default: bundled).
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        registry: Option<String>,
+
+        /// Path to accepted risks YAML.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        accepted_risks: Option<String>,
+
+        /// One-line-per-finding output (for demos and CI).
+        #[arg(long)]
+        compact: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1899,6 +1923,28 @@ async fn main() -> Result<()> {
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
         Some(Commands::Policy {
+            command:
+                Some(PolicyCommands::Prove {
+                    policy,
+                    credentials,
+                    registry,
+                    accepted_risks,
+                    compact,
+                }),
+        }) => {
+            // Prove runs locally — no gateway needed.
+            let exit_code = openshell_prover::prove(
+                &policy,
+                &credentials,
+                registry.as_deref(),
+                accepted_risks.as_deref(),
+                compact,
+            )?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
+        Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
@@ -1968,6 +2014,7 @@ async fn main() -> Result<()> {
                     }
                     run::gateway_setting_delete(&ctx.endpoint, "policy", yes, &tls).await?;
                 }
+                PolicyCommands::Prove { .. } => unreachable!(),
             }
         }
 

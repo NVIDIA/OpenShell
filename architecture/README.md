@@ -296,6 +296,7 @@ This opens an interactive SSH session into the sandbox, with all provider creden
 | [Sandbox Connect](sandbox-connect.md) | SSH tunneling into sandboxes through the gateway. |
 | [Sandbox Custom Containers](sandbox-custom-containers.md) | Building and using custom container images for sandboxes. |
 | [Providers](sandbox-providers.md) | External credential management, auto-discovery, and runtime injection. |
+| [Docs Site Architecture](docs-site.md) | Documentation source layout, navigation structure, local validation and preview workflow, and publish pipeline. |
 | [Policy Language](security-policy.md) | The YAML/Rego policy system that governs sandbox behavior. |
 | [Inference Routing](inference-routing.md) | Transparent interception and sandbox-local routing of AI inference API calls to configured backends. |
 | [System Architecture](system-architecture.md) | Top-level system architecture diagram with all deployable components and communication flows. |

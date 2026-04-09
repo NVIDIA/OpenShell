@@ -255,11 +255,14 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                         "{loc}: host wildcard must start with '*.' or '**.' (e.g., '*.example.com'), got '{host}'"
                     ));
                 } else {
-                    // Warn on very broad wildcards like *.com (2 labels)
+                    // Reject TLD wildcards like *.com (2 labels) — they are
+                    // accepted by the policy engine but silently fail at the
+                    // proxy layer (see #787).
                     let label_count = host.split('.').count();
                     if label_count <= 2 {
-                        warnings.push(format!(
-                            "{loc}: host wildcard '{host}' is very broad (covers all subdomains of a TLD)"
+                        errors.push(format!(
+                            "{loc}: TLD wildcard '{host}' is not allowed; \
+                             use subdomain wildcards like '*.example.com' instead"
                         ));
                     }
                 }
@@ -849,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_wildcard_host_broad_warning() {
+    fn validate_wildcard_host_tld_rejected() {
         let data = serde_json::json!({
             "network_policies": {
                 "test": {
@@ -861,11 +864,30 @@ mod tests {
                 }
             }
         });
-        let (errors, warnings) = validate_l7_policies(&data);
-        assert!(errors.is_empty(), "*.com should not error: {errors:?}");
+        let (errors, _warnings) = validate_l7_policies(&data);
         assert!(
-            warnings.iter().any(|w| w.contains("very broad")),
-            "*.com should warn about breadth, got warnings: {warnings:?}"
+            errors.iter().any(|e| e.contains("TLD wildcard")),
+            "*.com should be rejected as TLD wildcard, got errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_double_star_tld_rejected() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "**.org",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("TLD wildcard")),
+            "**.org should be rejected as TLD wildcard, got errors: {errors:?}"
         );
     }
 

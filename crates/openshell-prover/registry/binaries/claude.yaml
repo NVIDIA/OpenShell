@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+binary: /usr/local/bin/claude
+description: "Claude Code CLI — AI coding agent"
+protocols:
+  - name: anthropic-api
+    transport: https
+    description: "Anthropic API calls for inference"
+    bypasses_l7: false
+    actions:
+      - { name: inference, type: write, description: "Send prompts and receive completions" }
+  - name: http-via-tools
+    transport: https
+    description: "Claude can make HTTP requests via tool use (Bash, WebFetch)"
+    bypasses_l7: false
+    actions:
+      - { name: get, type: read }
+      - { name: post, type: write }
+      - { name: put, type: write }
+spawns:
+  - /usr/local/bin/node
+  - /usr/local/bin/python3.13
+  - /usr/bin/git
+  - /usr/bin/curl
+  - /usr/bin/ssh
+  - /usr/bin/nc
+can_exfiltrate: true
+exfil_mechanism: "Can read files and send contents via tool use, API calls, or spawned subprocesses"
+can_construct_http: true

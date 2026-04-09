@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+binary: /usr/bin/ssh
+description: "OpenSSH client"
+protocols:
+  - name: ssh
+    transport: ssh
+    description: "SSH protocol — encrypted tunnel, can forward ports and transfer files"
+    bypasses_l7: true
+    actions:
+      - { name: connect, type: read, description: "SSH shell connection" }
+      - { name: tunnel, type: write, description: "Port forwarding / tunnel" }
+      - { name: scp, type: write, description: "File transfer via SCP" }
+spawns: []
+can_exfiltrate: true
+exfil_mechanism: "SCP files or pipe data through SSH tunnel"
+can_construct_http: false

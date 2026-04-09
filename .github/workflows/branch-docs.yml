@@ -3,8 +3,12 @@ name: Branch Docs Preview
 on:
   pull_request:
     paths:
+      - "docs/**"
       - "fern/**"
+      - "mise.toml"
+      - "tasks/docs.toml"
       - ".github/workflows/branch-docs.yml"
+      - ".github/workflows/release-tag.yml"
 
 permissions:
   contents: read
@@ -30,14 +34,18 @@ jobs:
           fi
 
       - name: Setup Node.js
-        if: ${{ steps.fern-preview.outputs.enabled == 'true' }}
         uses: actions/setup-node@v6
         with:
           node-version: "24"
 
       - name: Install Fern CLI
-        if: ${{ steps.fern-preview.outputs.enabled == 'true' }}
-        run: npm install -g fern-api
+        run: |
+          FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
+          npm install -g "fern-api@${FERN_VERSION}"
+
+      - name: Validate docs
+        working-directory: ./fern
+        run: fern check
 
       - name: Generate preview URL
         if: ${{ steps.fern-preview.outputs.enabled == 'true' }}

@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+api: github
+host: api.github.com
+port: 443
+credential_type: github-pat
+
+scope_capabilities:
+  repo:
+    - { method: GET, path: "/repos/**", action: read_repo }
+    - { method: GET, path: "/user/repos", action: list_repos }
+    - { method: POST, path: "/repos/*/issues", action: create_issue }
+    - { method: POST, path: "/repos/*/issues/*/comments", action: comment_issue }
+    - { method: POST, path: "/repos/*/pulls", action: create_pr }
+    - { method: PUT, path: "/repos/*/contents/**", action: write_file }
+    - { method: DELETE, path: "/repos/*/contents/**", action: delete_file }
+    - { method: DELETE, path: "/repos/*/*", action: delete_repo }
+    - { method: POST, path: "/repos/*/git/**", action: write_git_data }
+    - { method: POST, path: "/repos/*/forks", action: fork_repo }
+    - { method: PATCH, path: "/repos/*/*", action: update_repo }
+    - { method: POST, path: "/repos/*/releases", action: create_release }
+    - { method: POST, path: "/repos/*/dispatches", action: trigger_workflow }
+  "read:org":
+    - { method: GET, path: "/orgs/**", action: read_org }
+    - { method: GET, path: "/user/orgs", action: list_orgs }
+  "write:org":
+    - { method: GET, path: "/orgs/**", action: read_org }
+    - { method: POST, path: "/orgs/*/repos", action: create_org_repo }
+    - { method: PUT, path: "/orgs/*/memberships/**", action: manage_members }
+  gist:
+    - { method: GET, path: "/gists/**", action: read_gists }
+    - { method: POST, path: "/gists", action: create_gist }
+    - { method: PATCH, path: "/gists/*", action: update_gist }
+    - { method: DELETE, path: "/gists/*", action: delete_gist }
+  "admin:repo_hook":
+    - { method: GET, path: "/repos/*/hooks/**", action: read_hooks }
+    - { method: POST, path: "/repos/*/hooks", action: create_hook }
+    - { method: DELETE, path: "/repos/*/hooks/*", action: delete_hook }
+
+action_risk:
+  read_repo: low
+  list_repos: low
+  create_issue: medium
+  comment_issue: medium
+  create_pr: medium
+  write_file: high
+  delete_file: high
+  delete_repo: critical
+  write_git_data: high
+  fork_repo: medium
+  update_repo: high
+  create_release: high
+  trigger_workflow: critical
+  read_org: low
+  list_orgs: low
+  create_org_repo: high
+  manage_members: critical
+  read_gists: low
+  create_gist: medium
+  update_gist: medium
+  delete_gist: medium
+  read_hooks: low
+  create_hook: critical
+  delete_hook: high

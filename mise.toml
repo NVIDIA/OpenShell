@@ -15,6 +15,7 @@ python.precompiled_flavor = "install_only_stripped"
 [tools]
 python = "3.13.12"
 rust = "stable"
+node = "24"
 kubectl = "1.35.1"
 uv = "0.10.2"
 protoc = "29.6"

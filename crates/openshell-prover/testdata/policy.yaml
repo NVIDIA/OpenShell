@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /app
+    - /etc
+    - /var/log
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+# Intent: read-only GitHub access for the agent.
+# The REST API has L7 enforcement — only GET allowed.
+# github.com is included for git clone — "it just needs connectivity."
+network_policies:
+  github_api:
+    name: github-api
+    endpoints:
+      # REST API — L7 enforced, read-only
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+      # github.com — for git clone.
+      # No protocol field — L4 only.
+      - host: github.com
+        port: 443
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/git }
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/gh }
+      - { path: /sandbox/.uv/python/**/python3* }

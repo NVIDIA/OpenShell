@@ -75,6 +75,12 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 # Clipboard (OSC 52)
 base64 = "0.22"
 
+# Filesystem embedding
+include_dir = "0.7"
+
+# Glob matching
+glob = "0.3"
+
 # Utilities
 futures = "0.3"
 bytes = "1"
@@ -93,6 +99,9 @@ k8s-openapi = { version = "0.21.1", features = ["v1_26"] }
 
 # IDs
 uuid = { version = "1.10", features = ["v4"] }
+
+# SMT solver (uses system libz3; enable z3/bundled via the prover's bundled-z3 feature for local dev without system z3)
+z3 = "0.19"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

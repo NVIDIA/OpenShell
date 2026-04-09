@@ -1,0 +1,29 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Default Policy Reference"
+sidebar-title: "Default Policy"
+description: "Breakdown of the built-in default policy applied when you create an OpenShell sandbox without a custom policy."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Security, Policy"
+position: 2
+---
+The default policy is the policy applied when you create an OpenShell sandbox without `--policy`. It is baked into the community base image ([`ghcr.io/nvidia/openshell-community/sandboxes/base`](https://github.com/nvidia/openshell-community)) and defined in the community repo's `dev-sandbox-policy.yaml`.
+
+## Agent Compatibility
+
+The following table shows the coverage of the default policy for common agents.
+
+| Agent | Coverage | Action Required |
+|---|---|---|
+| Claude Code | Full | None. Works out of the box. |
+| OpenCode | Partial | Add `opencode.ai` endpoint and OpenCode binary paths. |
+| Codex | None | Provide a complete custom policy with OpenAI endpoints and Codex binary paths. |
+
+<Info>
+If you run a non-Claude agent without a custom policy, the agent's API calls are denied by the proxy. You must provide a policy that declares the agent's endpoints and binaries.
+
+</Info>
+
+## Default Policy Blocks
+
+The default policy blocks are defined in the community base image. See the [openshell-community repository](https://github.com/nvidia/openshell-community) for the full `dev-sandbox-policy.yaml` source.
