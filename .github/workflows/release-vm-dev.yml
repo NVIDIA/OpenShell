@@ -526,6 +526,15 @@ jobs:
             curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-vm.sh | sh
             ```
 
+            Install to a custom directory:
+
+            ```
+            curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-vm.sh | OPENSHELL_VM_INSTALL_DIR=/usr/local/bin sh
+            ```
+
+            The installer auto-detects your platform, verifies checksums, and codesigns
+            on macOS (Hypervisor entitlement). Defaults to `~/.local/bin`.
+
           files: |
             release-final/openshell-vm-aarch64-unknown-linux-gnu.tar.gz
             release-final/openshell-vm-x86_64-unknown-linux-gnu.tar.gz
