@@ -222,8 +222,8 @@ if [ -b "$STATE_DISK_DEVICE" ]; then
     mount --bind "${STATE_MOUNT_DIR}/local-path-storage" /var/lib/rancher/k3s/storage
 
     # ── PKI ────────────────────────────────────────────────────────────────
-    # Certs live on the block device; the host reads them via vsock (port
-    # 10778) instead of polling the virtiofs rootfs path.
+    # Certs live on the block device; the host reads them via the exec
+    # agent (vsock port 10777) instead of polling the virtiofs rootfs path.
     mkdir -p "${STATE_MOUNT_DIR}/pki" /opt/openshell/pki
     mount --bind "${STATE_MOUNT_DIR}/pki" /opt/openshell/pki
 
@@ -556,12 +556,12 @@ fi
 # (pre-baked state from the Docker build used host-gw flannel).
 rm -f "/var/lib/rancher/k3s/agent/etc/cni/net.d/10-flannel.conflist" 2>/dev/null || true
 
-# ── PKI: generate once, serve over vsock (port 10778) ─────────────────
+# ── PKI: generate once, read via exec agent ───────────────────────────
 # Certs are generated on first boot and stored at /opt/openshell/pki/.
 # With the block-device layout this path is on the state disk, fully
 # isolated from the virtiofs host filesystem.
-# The host-side bootstrap fetches certs over vsock port 10778 (mapped by
-# libkrun to a Unix socket) instead of reading them from the rootfs.
+# The host-side bootstrap reads certs via the exec agent (vsock port
+# 10777) by running `cat` on each PEM file.
 
 PKI_DIR="/opt/openshell/pki"
 if [ ! -f "$PKI_DIR/ca.crt" ]; then
@@ -632,18 +632,6 @@ EOCLIENT
     ts "PKI generated"
 else
     ts "existing PKI found, skipping generation"
-fi
-
-# Start the PKI vsock server. It listens on AF_VSOCK port 10778 and serves
-# the six PEM files as a JSON object on each connection. The host-side
-# bootstrap connects via the libkrun vsock-to-Unix bridge to fetch certs
-# without touching the virtiofs rootfs path.
-if [ -f /srv/openshell-vm-pki-server.py ]; then
-    python3 /srv/openshell-vm-pki-server.py "$PKI_DIR" &
-    PKI_SERVER_PID=$!
-    ts "PKI vsock server started (port 10778, pid ${PKI_SERVER_PID})"
-else
-    ts "WARNING: PKI vsock server script not found at /srv/openshell-vm-pki-server.py"
 fi
 
 SSH_HANDSHAKE_SECRET_FILE="${PKI_DIR}/ssh-handshake-secret"

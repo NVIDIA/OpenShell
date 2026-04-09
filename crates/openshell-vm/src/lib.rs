@@ -25,9 +25,9 @@ use std::ptr;
 use std::time::Instant;
 
 pub use exec::{
-    VM_EXEC_VSOCK_PORT, VM_PKI_VSOCK_PORT, VmExecOptions, VmRuntimeState, acquire_rootfs_lock,
-    clear_vm_runtime_state, ensure_vm_not_running, exec_running_vm, recover_corrupt_kine_db,
-    reset_runtime_state, vm_exec_socket_path, vm_pki_socket_path, vm_state_path,
+    VM_EXEC_VSOCK_PORT, VmExecOptions, VmRuntimeState, acquire_rootfs_lock,
+    clear_vm_runtime_state, ensure_vm_not_running, exec_capture, exec_running_vm,
+    recover_corrupt_kine_db, reset_runtime_state, vm_exec_socket_path, vm_state_path,
     write_vm_runtime_state,
 };
 
@@ -209,11 +209,6 @@ impl VmConfig {
                 VsockPort {
                     port: VM_EXEC_VSOCK_PORT,
                     socket_path: vm_exec_socket_path(&rootfs),
-                    listen: true,
-                },
-                VsockPort {
-                    port: VM_PKI_VSOCK_PORT,
-                    socket_path: vm_pki_socket_path(&rootfs),
                     listen: true,
                 },
             ],
@@ -1500,12 +1495,12 @@ const DEFAULT_GATEWAY_PORT: u16 = 30051;
 /// Two paths:
 ///
 /// 1. **Warm boot**: host-side metadata and mTLS certs already exist from a
-///    previous run. Fetch PKI over vsock to detect cert drift (e.g. after
-///    a `--reset`), re-sync if needed, then proceed to the health check.
+///    previous run. Fetch PKI via the exec agent to detect cert drift (e.g.
+///    after a `--reset`), re-sync if needed, then proceed to the health check.
 ///
-/// 2. **First boot / post-reset**: poll the PKI vsock server (port 10778,
-///    started by the VM init script after PKI generation) until certs are
-///    available, then store them in `~/.config/openshell/gateways/<name>/mtls/`.
+/// 2. **First boot / post-reset**: poll the exec agent to `cat` each PEM file
+///    from `/opt/openshell/pki/` until the files exist (PKI generation has
+///    finished), then store them in `~/.config/openshell/gateways/<name>/mtls/`.
 fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Result<(), VmError> {
     let bootstrap_start = Instant::now();
 
@@ -1521,6 +1516,8 @@ fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Re
         edge_auth_url: None,
     };
 
+    let exec_socket = vm_exec_socket_path(rootfs);
+
     // ── Warm boot: host already has certs ──────────────────────────
     if is_warm_boot(gateway_name) {
         // Always (re-)store metadata so port/endpoint changes are picked up.
@@ -1531,16 +1528,21 @@ fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Re
 
         // Verify host certs match the VM's PKI. If they diverge (e.g.
         // PKI was regenerated after a --reset, or the state disk was
-        // replaced), re-sync the host certs from the VM over vsock.
-        let pki_socket = vm_pki_socket_path(rootfs);
-        match fetch_pki_over_vsock(&pki_socket, std::time::Duration::from_secs(30)) {
+        // replaced), re-sync the host certs from the VM via the exec agent.
+        //
+        // On warm boot the exec agent may not be ready yet (the VM is
+        // still booting). Use a short timeout — this is a non-critical
+        // drift check and the host already has valid certs. If the agent
+        // isn't reachable we skip silently rather than blocking boot for
+        // 30s.
+        match fetch_pki_over_exec(&exec_socket, std::time::Duration::from_secs(5)) {
             Ok(bundle) => {
                 if let Err(e) = sync_host_certs_if_stale(gateway_name, &bundle) {
                     eprintln!("Warning: cert sync check failed: {e}");
                 }
             }
-            Err(e) => {
-                eprintln!("Warning: PKI vsock fetch failed (non-fatal): {e}");
+            Err(_) => {
+                // Expected on warm boot — exec agent not ready yet.
             }
         }
 
@@ -1554,15 +1556,14 @@ fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Re
         return Ok(());
     }
 
-    // ── First boot / post-reset: fetch PKI from VM over vsock ─────
+    // ── First boot / post-reset: fetch PKI from VM via exec agent ──
     //
-    // The VM init script generates certs on first boot and starts a
-    // PKI server on vsock port 10778. We poll that socket until the
-    // server is ready, then fetch all six PEM files in one round trip.
+    // The VM init script generates certs on first boot at /opt/openshell/pki/.
+    // We poll the exec agent with `cat <file>` for each PEM file until they
+    // exist, retrying to handle the window between VM boot and PKI generation.
     eprintln!("Waiting for VM to generate PKI...");
-    let pki_socket = vm_pki_socket_path(rootfs);
-    let pki_bundle = fetch_pki_over_vsock(&pki_socket, std::time::Duration::from_secs(120))
-        .map_err(|e| VmError::Bootstrap(format!("VM did not serve PKI within 120s: {e}")))?;
+    let pki_bundle = fetch_pki_over_exec(&exec_socket, std::time::Duration::from_secs(120))
+        .map_err(|e| VmError::Bootstrap(format!("VM did not produce PKI within 120s: {e}")))?;
 
     eprintln!("PKI ready — storing client certs on host...");
 
@@ -1586,90 +1587,75 @@ fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Re
     Ok(())
 }
 
-/// Connect to the PKI vsock server (via its host-side Unix socket) and fetch
-/// the six PEM files as a JSON object.  Retries until `timeout` elapses,
-/// sleeping 500ms between attempts, to handle the window between VM boot and
-/// the Python server being ready.
-fn fetch_pki_over_vsock(
-    socket_path: &std::path::Path,
+/// PKI file names and the corresponding [`PkiBundle`] fields.
+const PKI_FILES: &[(&str, &str)] = &[
+    ("ca.crt", "ca_cert_pem"),
+    ("ca.key", "ca_key_pem"),
+    ("server.crt", "server_cert_pem"),
+    ("server.key", "server_key_pem"),
+    ("client.crt", "client_cert_pem"),
+    ("client.key", "client_key_pem"),
+];
+
+/// Fetch all six PEM files from `/opt/openshell/pki/` inside the guest by
+/// running `cat` via the exec agent.  Retries until `timeout` elapses,
+/// sleeping 500ms between attempts, to handle the window between VM boot
+/// and PKI generation completing.
+fn fetch_pki_over_exec(
+    exec_socket: &Path,
     timeout: std::time::Duration,
 ) -> Result<openshell_bootstrap::pki::PkiBundle, VmError> {
-    use std::os::unix::net::UnixStream;
-
     let deadline = Instant::now() + timeout;
 
-    // Ensure the socket's parent directory exists (libkrun creates the socket
-    // file lazily when the VM boots and registers the vsock port).
-    if let Some(parent) = socket_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
     loop {
-        match UnixStream::connect(socket_path) {
-            Ok(mut stream) => {
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                    .ok();
-                // Read until EOF — the server sends one JSON line then closes.
-                let mut buf = String::new();
-                use std::io::Read;
-                let _ = stream.read_to_string(&mut buf);
-
-                // An empty response means the vsock bridge accepted the
-                // connection but the guest-side server isn't listening yet
-                // (libkrun creates the host socket immediately at VM start,
-                // before the init script runs inside the VM). Treat this the
-                // same as a connection refused and retry.
-                if buf.is_empty() {
-                    if Instant::now() >= deadline {
-                        return Err(VmError::Bootstrap(format!(
-                            "PKI vsock socket at {} returned empty response after timeout",
-                            socket_path.display()
-                        )));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    continue;
-                }
-
-                let map: std::collections::HashMap<String, String> =
-                    serde_json::from_str(buf.trim()).map_err(|e| {
-                        VmError::Bootstrap(format!(
-                            "PKI vsock JSON parse error: {e} (got {} bytes)",
-                            buf.len()
-                        ))
-                    })?;
-
-                let get = |key: &str| -> Result<String, VmError> {
-                    let v = map.get(key).cloned().unwrap_or_default();
-                    if v.is_empty() {
-                        Err(VmError::Bootstrap(format!(
-                            "PKI vsock response missing or empty: {key}"
-                        )))
-                    } else {
-                        Ok(v)
-                    }
-                };
-
-                return Ok(openshell_bootstrap::pki::PkiBundle {
-                    ca_cert_pem: get("ca.crt")?,
-                    ca_key_pem: get("ca.key")?,
-                    server_cert_pem: get("server.crt")?,
-                    server_key_pem: get("server.key")?,
-                    client_cert_pem: get("client.crt")?,
-                    client_key_pem: get("client.key")?,
-                });
-            }
-            Err(_) => {
-                if Instant::now() >= deadline {
-                    return Err(VmError::Bootstrap(format!(
-                        "PKI vsock socket not ready at {}",
-                        socket_path.display()
-                    )));
-                }
+        match try_read_pki_files(exec_socket) {
+            Ok(bundle) => return Ok(bundle),
+            Err(_) if Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => {
+                return Err(VmError::Bootstrap(format!(
+                    "failed to read PKI files via exec agent: {e}"
+                )));
             }
         }
     }
+}
+
+/// Attempt to read all six PEM files from the guest in one pass.
+fn try_read_pki_files(
+    exec_socket: &Path,
+) -> Result<openshell_bootstrap::pki::PkiBundle, VmError> {
+    let mut pems = std::collections::HashMap::new();
+
+    for &(filename, _field) in PKI_FILES {
+        let path = format!("/opt/openshell/pki/{filename}");
+        let output = exec_capture(exec_socket, vec!["cat".to_string(), path])?;
+        let content = String::from_utf8(output).map_err(|e| {
+            VmError::Bootstrap(format!("PKI file {filename} is not valid UTF-8: {e}"))
+        })?;
+        if content.is_empty() {
+            return Err(VmError::Bootstrap(format!(
+                "PKI file {filename} is empty"
+            )));
+        }
+        pems.insert(filename, content);
+    }
+
+    let mut get = |key: &str| -> Result<String, VmError> {
+        pems.remove(key).ok_or_else(|| {
+            VmError::Bootstrap(format!("PKI file {key} missing from exec output"))
+        })
+    };
+
+    Ok(openshell_bootstrap::pki::PkiBundle {
+        ca_cert_pem: get("ca.crt")?,
+        ca_key_pem: get("ca.key")?,
+        server_cert_pem: get("server.crt")?,
+        server_key_pem: get("server.key")?,
+        client_cert_pem: get("client.crt")?,
+        client_key_pem: get("client.key")?,
+    })
 }
 
 /// Check whether a previous bootstrap left valid state on disk.

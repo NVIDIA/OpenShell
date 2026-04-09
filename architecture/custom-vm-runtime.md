@@ -16,25 +16,36 @@ the VM kernel, enabling standard Kubernetes networking.
 
 ## Architecture
 
-```
-Host (macOS/Linux)
-├── openshell-vm binary
-│   ├── Embedded runtime (zstd-compressed)
-│   │   ├── libkrun.{dylib,so}
-│   │   ├── libkrunfw.{dylib,so} (kernel)
-│   │   └── gvproxy
-│   ├── Extracts to ~/.local/share/openshell/vm-runtime/{version}/
-│   └── Logs runtime provenance
-└── gvproxy (networking proxy)
+```mermaid
+graph TD
+    subgraph Host["Host (macOS / Linux)"]
+        BIN[openshell-vm binary]
+        EMB["Embedded runtime (zstd-compressed)\nlibkrun · libkrunfw · gvproxy"]
+        CACHE["~/.local/share/openshell/vm-runtime/{version}/"]
+        PROV[Runtime provenance logging]
+        GVP[gvproxy networking proxy]
 
-Guest VM
-├── openshell-vm-init.sh (PID 1)
-│   ├── Validates kernel capabilities (fail-fast)
-│   ├── Configures bridge CNI
-│   ├── Starts openshell-vm-exec-agent.py on vsock port 10777
-│   └── Execs k3s server
-├── openshell-vm-exec-agent.py (guest exec agent)
-└── check-vm-capabilities.sh (diagnostics)
+        BIN --> EMB
+        BIN -->|extracts to| CACHE
+        BIN --> PROV
+        BIN -->|spawns| GVP
+    end
+
+    subgraph Guest["Guest VM"]
+        INIT["openshell-vm-init.sh (PID 1)"]
+        VAL[Validates kernel capabilities]
+        CNI[Configures bridge CNI]
+        EXECA["Starts exec agent\nvsock port 10777"]
+        PKI[Generates mTLS PKI]
+        K3S[Execs k3s server]
+        EXECPY["openshell-vm-exec-agent.py"]
+        CHK["check-vm-capabilities.sh"]
+
+        INIT --> VAL --> CNI --> EXECA --> PKI --> K3S
+    end
+
+    BIN -- "fork + krun_start_enter" --> INIT
+    GVP -- "virtio-net" --> Guest
 ```
 
 ## Embedded Runtime
@@ -46,7 +57,7 @@ these to XDG cache directories with progress bars:
 ```
 ~/.local/share/openshell/vm-runtime/{version}/
 ├── libkrun.{dylib,so}
-├── libkrunfw.{5.dylib,.so.5}
+├── libkrunfw.{5.dylib,so.5}
 └── gvproxy
 
 ~/.local/share/openshell/openshell-vm/{version}/instances/<name>/rootfs/
@@ -102,18 +113,26 @@ and makes it straightforward to correlate VM behavior with a specific runtime ar
 
 ## Build Pipeline
 
-```
-crates/openshell-vm/runtime/
-├── build-custom-libkrunfw.sh      # Clones libkrunfw, applies config, builds
-├── kernel/
-│   └── openshell.kconfig          # Kernel config fragment
-└── README.md                      # Operator documentation
+```mermaid
+graph LR
+    subgraph Source["crates/openshell-vm/runtime/"]
+        BUILD["build-custom-libkrunfw.sh\nClones libkrunfw, applies config, builds"]
+        KCONF["kernel/openshell.kconfig\nKernel config fragment"]
+        README["README.md\nOperator documentation"]
+    end
 
-Output: target/custom-runtime/
-├── libkrunfw.dylib                # Custom library
-├── provenance.json                # Build metadata
-├── openshell.kconfig              # Config fragment used
-└── kernel.config                  # Full kernel .config
+    subgraph Output["target/custom-runtime/"]
+        LIB["libkrunfw.dylib\nCustom library"]
+        META["provenance.json\nBuild metadata"]
+        FRAG["openshell.kconfig\nConfig fragment used"]
+        FULL["kernel.config\nFull kernel .config"]
+    end
+
+    KCONF --> BUILD
+    BUILD --> LIB
+    BUILD --> META
+    BUILD --> FRAG
+    BUILD --> FULL
 ```
 
 ## Kernel Config Fragment
@@ -121,19 +140,28 @@ Output: target/custom-runtime/
 The `openshell.kconfig` fragment enables these kernel features on top of the stock
 libkrunfw kernel:
 
-| Feature | Config | Purpose |
-|---------|--------|---------|
-| Bridge device | `CONFIG_BRIDGE` | cni0 bridge for pod networking |
-| Bridge netfilter | `CONFIG_BRIDGE_NETFILTER` | kube-proxy visibility into bridge traffic |
-| Netfilter | `CONFIG_NETFILTER` | iptables/nftables framework |
-| Connection tracking | `CONFIG_NF_CONNTRACK` | NAT state tracking |
-| NAT | `CONFIG_NF_NAT` | Service VIP DNAT/SNAT |
-| iptables | `CONFIG_IP_NF_IPTABLES` | CNI bridge masquerade |
-| nftables | `CONFIG_NF_TABLES` | kube-proxy nftables mode (primary) |
+| Feature | Key Configs | Purpose |
+|---------|-------------|---------|
+| Network namespaces | `CONFIG_NET_NS`, `CONFIG_NAMESPACES` | Pod isolation |
 | veth | `CONFIG_VETH` | Pod network namespace pairs |
-| IPVS | `CONFIG_IP_VS` | kube-proxy IPVS mode (optional) |
+| Bridge device | `CONFIG_BRIDGE`, `CONFIG_BRIDGE_NETFILTER` | cni0 bridge for pod networking, kube-proxy bridge traffic visibility |
+| Netfilter framework | `CONFIG_NETFILTER`, `CONFIG_NETFILTER_ADVANCED`, `CONFIG_NETFILTER_XTABLES` | iptables/nftables framework |
+| xtables match modules | `CONFIG_NETFILTER_XT_MATCH_CONNTRACK`, `_COMMENT`, `_MULTIPORT`, `_MARK`, `_STATISTIC`, `_ADDRTYPE`, `_RECENT`, `_LIMIT` | kube-proxy and kubelet iptables rules |
+| Connection tracking | `CONFIG_NF_CONNTRACK`, `CONFIG_NF_CT_NETLINK` | NAT state tracking |
+| NAT | `CONFIG_NF_NAT` | Service VIP DNAT/SNAT |
+| iptables | `CONFIG_IP_NF_IPTABLES`, `CONFIG_IP_NF_FILTER`, `CONFIG_IP_NF_NAT`, `CONFIG_IP_NF_MANGLE` | CNI bridge masquerade and compat |
+| nftables | `CONFIG_NF_TABLES`, `CONFIG_NFT_CT`, `CONFIG_NFT_NAT`, `CONFIG_NFT_MASQ`, `CONFIG_NFT_NUMGEN`, `CONFIG_NFT_FIB_IPV4` | kube-proxy nftables mode (primary) |
+| IP forwarding | `CONFIG_IP_ADVANCED_ROUTER`, `CONFIG_IP_MULTIPLE_TABLES` | Pod-to-pod routing |
+| IPVS | `CONFIG_IP_VS`, `CONFIG_IP_VS_RR`, `CONFIG_IP_VS_NFCT` | kube-proxy IPVS mode (optional) |
+| Traffic control | `CONFIG_NET_SCH_HTB`, `CONFIG_NET_CLS_CGROUP` | Kubernetes QoS |
+| Cgroups | `CONFIG_CGROUPS`, `CONFIG_CGROUP_DEVICE`, `CONFIG_MEMCG`, `CONFIG_CGROUP_PIDS` | Container resource limits |
+| TUN/TAP | `CONFIG_TUN` | CNI plugin support |
+| Dummy interface | `CONFIG_DUMMY` | Fallback networking |
 | Landlock | `CONFIG_SECURITY_LANDLOCK` | Filesystem sandboxing support |
 | Seccomp filter | `CONFIG_SECCOMP_FILTER` | Syscall filtering support |
+
+See `crates/openshell-vm/runtime/kernel/openshell.kconfig` for the full fragment with
+inline comments explaining why each option is needed.
 
 ## Verification
 
@@ -147,10 +175,12 @@ One verification tool is provided:
 The standalone `openshell-vm` binary supports `openshell-vm exec -- <command...>` for a running VM.
 
 - Each VM instance stores local runtime state next to its instance rootfs
-- libkrun maps a per-instance host unix socket into the guest on vsock port `10777`
+- libkrun maps a per-instance host Unix socket into the guest on vsock port `10777`
 - `openshell-vm-init.sh` starts `openshell-vm-exec-agent.py` during boot
-- `openshell-vm exec` connects to the host socket, which libkrun forwards into the guest agent
-- The guest agent spawns the command, then streams stdout, stderr, and exit status back
+- `openshell-vm exec` connects to the host socket, which libkrun forwards into the guest exec agent
+- The guest exec agent spawns the command, then streams stdout, stderr, and exit status back
+- The host-side bootstrap also uses the exec agent to read PKI cert files from the guest
+  (via `cat /opt/openshell/pki/<file>`) instead of requiring a separate vsock server
 
 `openshell-vm exec` also injects `KUBECONFIG=/etc/rancher/k3s/k3s.yaml` by default so kubectl-style
 commands work the same way they would inside the VM shell.
@@ -208,18 +238,17 @@ libkrunfw is always Linux regardless of host platform.
 Builds the self-extracting openshell-vm binary for all platforms. Runs on every push
 to `main` that touches VM-related crates.
 
-```
-compute-versions
-       │
-       ├── download-kernel-runtime (from vm-dev release)
-       │       │
-       │       ├── build-rootfs (arm64) ──── build-vm (linux-arm64) ────┐
-       │       │                                                         │
-       │       ├── build-rootfs (amd64) ──── build-vm (linux-amd64) ────┤
-       │       │                                                         │
-       │       └── build-vm-macos (osxcross, uses arm64 rootfs) ────────┤
-       │                                                                 │
-       └── release-vm-dev (upload to vm-dev rolling release) ───────────┘
+```mermaid
+graph TD
+    CV[compute-versions] --> DL[download-kernel-runtime\nfrom vm-dev release]
+    DL --> RFS_ARM[build-rootfs arm64]
+    DL --> RFS_AMD[build-rootfs amd64]
+    RFS_ARM --> VM_ARM[build-vm linux-arm64]
+    RFS_AMD --> VM_AMD[build-vm linux-amd64]
+    RFS_ARM --> VM_MAC["build-vm-macos\n(osxcross, reuses arm64 rootfs)"]
+    VM_ARM --> REL[release-vm-dev\nupload to rolling release]
+    VM_AMD --> REL
+    VM_MAC --> REL
 ```
 
 The macOS binary is cross-compiled via osxcross (no macOS runner needed for the binary
@@ -238,30 +267,3 @@ codesign --entitlements crates/openshell-vm/entitlements.plist --force -s - ./op
 3. For development, override with `OPENSHELL_VM_RUNTIME_DIR` to use a local directory.
 4. In CI, kernel runtime is pre-built and cached in the `vm-dev` release. The binary
    build downloads it via `download-kernel-runtime.sh`.
-
-## Related Files
-
-| File | Purpose |
-|------|---------|
-| `crates/openshell-vm/src/embedded.rs` | Embedded resource extraction and caching |
-| `crates/openshell-vm/src/ffi.rs` | Runtime loading, provenance capture |
-| `crates/openshell-vm/src/lib.rs` | VM launch, provenance logging |
-| `crates/openshell-vm/src/exec.rs` | Runtime state tracking and host-side exec transport |
-| `crates/openshell-vm/build.rs` | Build script for embedding compressed artifacts |
-| `crates/openshell-vm/scripts/openshell-vm-init.sh` | Guest init, network profile selection |
-| `crates/openshell-vm/scripts/openshell-vm-exec-agent.py` | Guest-side exec agent |
-| `crates/openshell-vm/scripts/check-vm-capabilities.sh` | Kernel capability checker |
-| `crates/openshell-vm/runtime/` | Build pipeline and kernel config |
-| `tasks/scripts/vm/vm-setup.sh` | One-time setup: download or build runtime |
-| `tasks/scripts/vm/vm-clean.sh` | Remove all VM cached artifacts |
-| `tasks/scripts/vm/_lib.sh` | Shared helpers (platform detection, compression) |
-| `tasks/scripts/vm/package-vm-runtime.sh` | CI: package runtime into release tarball |
-| `tasks/scripts/vm/compress-vm-runtime.sh` | Gather and compress runtime artifacts |
-| `tasks/scripts/vm/build-rootfs-tarball.sh` | Build and compress rootfs tarball |
-| `tasks/scripts/vm/build-libkrun.sh` | Build libkrun from source (Linux) |
-| `tasks/scripts/vm/download-kernel-runtime.sh` | Download pre-built runtime from vm-dev release |
-| `crates/openshell-vm/scripts/build-rootfs.sh` | Build rootfs (full by default, `--base` for lightweight) |
-| `deploy/docker/Dockerfile.vm-macos` | osxcross cross-compilation for macOS VM binary |
-| `.github/workflows/release-vm-kernel.yml` | CI: kernel runtime build (on-demand) |
-| `.github/workflows/release-vm-dev.yml` | CI: VM binary build (per-commit to main) |
-| `tasks/vm.toml` | Mise task definitions |

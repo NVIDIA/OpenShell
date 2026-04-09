@@ -28,7 +28,7 @@ run = [
   "tasks/scripts/vm/compress-vm-runtime.sh",
   "OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed cargo build -p openshell-vm",
   "tasks/scripts/vm/codesign-openshell-vm.sh",
-  "tasks/scripts/bundle-vm-runtime.sh",
+  "tasks/scripts/vm/bundle-vm-runtime.sh",
 ]
 
 ["vm:setup"]

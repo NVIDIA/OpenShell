@@ -11,14 +11,6 @@ name: Release VM Dev
 on:
   push:
     branches: [main]
-    paths:
-      - "crates/openshell-vm/**"
-      - "crates/openshell-core/**"
-      - "crates/openshell-bootstrap/**"
-      - "crates/openshell-policy/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/release-vm-dev.yml"
   workflow_dispatch:
 
 permissions:

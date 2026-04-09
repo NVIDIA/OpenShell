@@ -14,7 +14,7 @@
 # target/vm-runtime/ before compression; this script re-uses that work dir.
 #
 # Usage:
-#   ./tasks/scripts/bundle-vm-runtime.sh
+#   ./tasks/scripts/vm/bundle-vm-runtime.sh
 
 set -euo pipefail
 

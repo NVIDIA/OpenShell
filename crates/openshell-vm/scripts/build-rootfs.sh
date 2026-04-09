@@ -291,9 +291,6 @@ chmod +x "${ROOTFS_DIR}/srv/check-vm-capabilities.sh"
 cp "${SCRIPT_DIR}/openshell-vm-exec-agent.py" "${ROOTFS_DIR}/srv/openshell-vm-exec-agent.py"
 chmod +x "${ROOTFS_DIR}/srv/openshell-vm-exec-agent.py"
 
-cp "${SCRIPT_DIR}/openshell-vm-pki-server.py" "${ROOTFS_DIR}/srv/openshell-vm-pki-server.py"
-chmod +x "${ROOTFS_DIR}/srv/openshell-vm-pki-server.py"
-
 # ── Build and inject openshell-sandbox supervisor binary ─────────────
 # The supervisor binary runs inside every sandbox pod. It is side-loaded
 # from the node filesystem via a read-only hostPath volume mount at

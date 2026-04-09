@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use crate::VmError;
 
 pub const VM_EXEC_VSOCK_PORT: u32 = 10_777;
-pub const VM_PKI_VSOCK_PORT: u32 = 10_778;
 
 const VM_STATE_NAME: &str = "vm-state.json";
 const VM_LOCK_NAME: &str = "vm.lock";
@@ -72,16 +71,6 @@ pub fn vm_exec_socket_path(rootfs: &Path) -> PathBuf {
         base = std::env::temp_dir();
     }
     let dir = base.join("ovm-exec");
-    let id = hash_path_id(rootfs);
-    dir.join(format!("{id}.sock"))
-}
-
-pub fn vm_pki_socket_path(rootfs: &Path) -> PathBuf {
-    let mut base = PathBuf::from("/tmp");
-    if !base.is_dir() {
-        base = std::env::temp_dir();
-    }
-    let dir = base.join("ovm-pki");
     let id = hash_path_id(rootfs);
     dir.join(format!("{id}.sock"))
 }
@@ -198,7 +187,7 @@ pub fn reset_runtime_state(rootfs: &Path, gateway_name: &str) -> Result<(), VmEr
     eprintln!("Reset: PKI will be regenerated on next boot (state disk wiped)");
 
     // Wipe host-side mTLS credentials so bootstrap_gateway() takes the
-    // first-boot path and fetches new certs from the VM over vsock.
+    // first-boot path and fetches new certs from the VM via the exec agent.
     if let Ok(home) = std::env::var("HOME") {
         let config_base =
             std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
@@ -503,6 +492,78 @@ pub fn exec_running_vm(options: VmExecOptions) -> Result<i32, VmError> {
     exit_code.ok_or_else(|| {
         VmError::Exec("VM exec agent disconnected before returning an exit code".to_string())
     })
+}
+
+/// Run a command inside the guest via the exec agent and capture its stdout.
+///
+/// Unlike [`exec_running_vm`], this function does not pump host stdin or write
+/// to the terminal. It collects all stdout frames into a `Vec<u8>` and returns
+/// them on success (exit code 0). Stderr output is discarded.
+///
+/// This is the building block for internal host→guest queries (e.g. reading
+/// files from the guest filesystem) without requiring a dedicated vsock server.
+pub fn exec_capture(socket_path: &Path, argv: Vec<String>) -> Result<Vec<u8>, VmError> {
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        VmError::Exec(format!(
+            "connect to VM exec socket {}: {e}",
+            socket_path.display()
+        ))
+    })?;
+    let mut writer = stream
+        .try_clone()
+        .map_err(|e| VmError::Exec(format!("clone VM exec socket: {e}")))?;
+
+    let request = ExecRequest {
+        argv,
+        env: vec![],
+        cwd: None,
+        tty: false,
+    };
+    send_json_line(&mut writer, &request)?;
+
+    // Close stdin immediately — we have no input to send.
+    send_json_line(&mut writer, &ClientFrame::StdinClose)?;
+
+    let mut reader = BufReader::new(&mut stream);
+    let mut line = String::new();
+    let mut stdout_buf = Vec::new();
+
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|e| VmError::Exec(format!("read VM exec response: {e}")))?;
+        if bytes == 0 {
+            break;
+        }
+
+        let frame: ServerFrame = serde_json::from_str(line.trim_end())
+            .map_err(|e| VmError::Exec(format!("decode VM exec response frame: {e}")))?;
+
+        match frame {
+            ServerFrame::Stdout { data } => {
+                stdout_buf.extend_from_slice(&decode_payload(&data)?);
+            }
+            ServerFrame::Stderr { .. } => {
+                // Discard stderr for capture mode.
+            }
+            ServerFrame::Exit { code } => {
+                if code != 0 {
+                    return Err(VmError::Exec(format!(
+                        "guest command exited with code {code}"
+                    )));
+                }
+                return Ok(stdout_buf);
+            }
+            ServerFrame::Error { message } => {
+                return Err(VmError::Exec(message));
+            }
+        }
+    }
+
+    Err(VmError::Exec(
+        "VM exec agent disconnected before returning an exit code".to_string(),
+    ))
 }
 
 fn vm_run_dir(rootfs: &Path) -> PathBuf {

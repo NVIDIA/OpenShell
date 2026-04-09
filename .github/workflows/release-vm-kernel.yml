@@ -11,16 +11,6 @@ name: Release VM Kernel
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - "crates/openshell-vm/runtime/kernel/**"
-      - "crates/openshell-vm/pins.env"
-      - "tasks/scripts/vm/build-libkrun.sh"
-      - "tasks/scripts/vm/build-libkrun-macos.sh"
-      - "crates/openshell-vm/runtime/build-custom-libkrunfw.sh"
-      - "tasks/scripts/vm/package-vm-runtime.sh"
-      - "tasks/scripts/vm/_lib.sh"
 
 permissions:
   contents: write
