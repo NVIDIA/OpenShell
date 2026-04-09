@@ -493,6 +493,8 @@ pub enum PolicyViolation {
     FieldTooLong { path: String, length: usize },
     /// Too many filesystem paths in the policy.
     TooManyPaths { count: usize },
+    /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
+    TldWildcard { policy_name: String, host: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -522,6 +524,13 @@ impl fmt::Display for PolicyViolation {
                     "too many filesystem paths ({count} > {MAX_FILESYSTEM_PATHS})"
                 )
             }
+            Self::TldWildcard { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': TLD wildcard '{host}' is not allowed; \
+                     use subdomain wildcards like '*.example.com' instead"
+                )
+            }
         }
     }
 }
@@ -539,6 +548,7 @@ impl fmt::Display for PolicyViolation {
 /// - Read-write paths must not be overly broad (just `/`)
 /// - Individual path lengths must not exceed [`MAX_PATH_LENGTH`]
 /// - Total path count must not exceed [`MAX_FILESYSTEM_PATHS`]
+/// - Network endpoint hosts must not use TLD wildcards (e.g. `*.com`)
 pub fn validate_sandbox_policy(
     policy: &SandboxPolicy,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
@@ -604,6 +614,26 @@ pub fn validate_sandbox_policy(
                 violations.push(PolicyViolation::OverlyBroadPath {
                     path: path_str.clone(),
                 });
+            }
+        }
+    }
+
+    // Check network policy endpoint hosts for TLD wildcards.
+    for (key, rule) in &policy.network_policies {
+        let name = if rule.name.is_empty() {
+            key.clone()
+        } else {
+            rule.name.clone()
+        };
+        for ep in &rule.endpoints {
+            if ep.host.contains('*') && (ep.host.starts_with("*.") || ep.host.starts_with("**.")) {
+                let label_count = ep.host.split('.').count();
+                if label_count <= 2 {
+                    violations.push(PolicyViolation::TldWildcard {
+                        policy_name: name.clone(),
+                        host: ep.host.clone(),
+                    });
+                }
             }
         }
     }
@@ -1056,6 +1086,88 @@ network_policies:
                 .iter()
                 .any(|v| matches!(v, PolicyViolation::FieldTooLong { .. }))
         );
+    }
+
+    #[test]
+    fn validate_rejects_tld_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "bad".into(),
+            NetworkPolicyRule {
+                name: "bad-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::TldWildcard { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_double_star_tld_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "bad".into(),
+            NetworkPolicyRule {
+                name: "bad-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "**.org".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::TldWildcard { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_accepts_subdomain_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "ok".into(),
+            NetworkPolicyRule {
+                name: "ok-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.example.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_explicit_domain() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "ok".into(),
+            NetworkPolicyRule {
+                name: "ok-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
     #[test]
