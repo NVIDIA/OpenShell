@@ -56,7 +56,7 @@ navbar-links:
 
 experimental:
   mdx-components:
-    - ./components
+    - ../docs/_components
   basepath-aware: true
 
 versions:
@@ -78,10 +78,6 @@ redirects:
     destination: "/openshell/latest"
   - source: "/openshell/latest/index"
     destination: "/openshell/latest"
-  - source: "/openshell/get-started/home"
-    destination: "/openshell/get-started"
-  - source: "/openshell/latest/get-started/home"
-    destination: "/openshell/latest/get-started"
   - source: "/openshell/latest/:path*/index.html"
     destination: "/openshell/latest/:path*"
   - source: "/openshell/:path*/index.html"
