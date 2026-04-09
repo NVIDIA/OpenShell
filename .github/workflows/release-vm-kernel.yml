@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  packages: read
 
 # Serialize with release-vm-dev.yml — both update the vm-dev release.
 concurrency:
@@ -114,12 +115,9 @@ jobs:
       - name: Install dependencies
         run: |
           set -euo pipefail
-          brew install rust lld dtc xz
-          # libkrunfw from Homebrew (used as a fallback/reference by build scripts)
-          brew install libkrunfw
-          # krunvm is needed to build the Linux kernel inside a Fedora VM
+          # Tap slp/krun first so libkrunfw and krunvm formulae are available
           brew tap slp/krun
-          brew install krunvm
+          brew install rust lld dtc xz libkrunfw krunvm
 
       - name: Build custom libkrunfw (kernel)
         run: crates/openshell-vm/runtime/build-custom-libkrunfw.sh
