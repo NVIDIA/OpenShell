@@ -892,14 +892,19 @@ fn gvproxy_expose(api_sock: &Path, body: &str) -> Result<(), String> {
 /// Kill a stale gvproxy process from a previous openshell-vm run.
 ///
 /// If the CLI crashes or is killed before cleanup, gvproxy keeps running
-/// and holds port 2222. A new gvproxy instance then fails with
-/// "bind: address already in use".
+/// and holds its ports. A new gvproxy instance then fails with
+/// "bind: address already in use" when trying to forward ports.
 ///
-/// We only kill the specific gvproxy PID recorded in the VM runtime state
-/// to avoid disrupting unrelated gvproxy instances (e.g. Podman Desktop).
-/// Before sending SIGTERM, we verify the process name contains "gvproxy"
-/// to guard against PID reuse.
+/// We first try to kill the specific gvproxy PID recorded in the VM
+/// runtime state. If the state file was deleted (e.g. the user ran
+/// `rm -rf` on the data directory), we fall back to killing any gvproxy
+/// process holding the target ports.
 fn kill_stale_gvproxy(rootfs: &Path) {
+    kill_stale_gvproxy_by_state(rootfs);
+}
+
+/// Kill stale gvproxy using the PID from the VM state file.
+fn kill_stale_gvproxy_by_state(rootfs: &Path) {
     let state_path = vm_state_path(rootfs);
     let pid = std::fs::read(&state_path)
         .ok()
@@ -907,26 +912,56 @@ fn kill_stale_gvproxy(rootfs: &Path) {
         .and_then(|state| state.gvproxy_pid);
 
     if let Some(gvproxy_pid) = pid {
-        // Verify the process is still alive before killing it.
-        let pid_i32 = gvproxy_pid as libc::pid_t;
-        let is_alive = unsafe { libc::kill(pid_i32, 0) } == 0;
-        if is_alive {
-            // Verify the process is actually gvproxy before killing.
-            // Without this check, PID reuse could cause us to kill an
-            // unrelated process.
-            if !is_process_named(pid_i32, "gvproxy") {
-                eprintln!(
-                    "Stale gvproxy pid {gvproxy_pid} is no longer gvproxy (PID reused), skipping kill"
-                );
-                return;
-            }
-            unsafe {
-                libc::kill(pid_i32, libc::SIGTERM);
-            }
-            eprintln!("Killed stale gvproxy process (pid {gvproxy_pid})");
-            // Brief pause for the port to be released.
-            std::thread::sleep(std::time::Duration::from_millis(200));
+        kill_gvproxy_pid(gvproxy_pid);
+    }
+}
+
+/// Kill any gvproxy process holding a specific TCP port.
+///
+/// Used as a fallback when the VM state file is missing (e.g. after the
+/// user deleted the data directory while a VM was running).
+fn kill_stale_gvproxy_by_port(port: u16) {
+    // Use lsof to find PIDs listening on the target port.
+    let output = std::process::Command::new("lsof")
+        .args(["-ti", &format!(":{port}")])
+        .output();
+
+    let pids = match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).to_string()
         }
+        _ => return,
+    };
+
+    for line in pids.lines() {
+        if let Ok(pid) = line.trim().parse::<u32>() {
+            let pid_i32 = pid as libc::pid_t;
+            if is_process_named(pid_i32, "gvproxy") {
+                kill_gvproxy_pid(pid);
+            }
+        }
+    }
+}
+
+fn kill_gvproxy_pid(gvproxy_pid: u32) {
+    let pid_i32 = gvproxy_pid as libc::pid_t;
+    let is_alive = unsafe { libc::kill(pid_i32, 0) } == 0;
+    if is_alive {
+        // Verify the process is actually gvproxy before killing.
+        // Without this check, PID reuse could cause us to kill an
+        // unrelated process.
+        if !is_process_named(pid_i32, "gvproxy") {
+            eprintln!(
+                "Stale gvproxy pid {gvproxy_pid} is no longer gvproxy (PID reused), skipping kill"
+            );
+            return;
+        }
+        unsafe {
+            libc::kill(pid_i32, libc::SIGTERM);
+        }
+        eprintln!("Killed stale gvproxy process (pid {gvproxy_pid})");
+        // Brief pause for the port to be released.
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 
@@ -1289,9 +1324,15 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
             let api_sock = sock_base.with_extension("a");
 
             // Kill any stale gvproxy process from a previous run.
-            // If gvproxy is still holding port 2222, the new instance
-            // will fail with "bind: address already in use".
+            // First try via the saved PID in the state file, then fall
+            // back to killing any gvproxy holding our target ports (covers
+            // the case where the state file was deleted).
             kill_stale_gvproxy(&config.rootfs);
+            for pm in &config.port_map {
+                if let Some(host_port) = pm.split(':').next().and_then(|p| p.parse::<u16>().ok()) {
+                    kill_stale_gvproxy_by_port(host_port);
+                }
+            }
 
             // Clean stale sockets (including the -krun.sock file that
             // libkrun creates as its datagram endpoint on macOS).
