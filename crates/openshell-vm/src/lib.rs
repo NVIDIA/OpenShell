@@ -1561,10 +1561,8 @@ fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Re
     // server is ready, then fetch all six PEM files in one round trip.
     eprintln!("Waiting for VM to generate PKI...");
     let pki_socket = vm_pki_socket_path(rootfs);
-    let pki_bundle =
-        fetch_pki_over_vsock(&pki_socket, std::time::Duration::from_secs(120)).map_err(|e| {
-            VmError::Bootstrap(format!("VM did not serve PKI within 120s: {e}"))
-        })?;
+    let pki_bundle = fetch_pki_over_vsock(&pki_socket, std::time::Duration::from_secs(120))
+        .map_err(|e| VmError::Bootstrap(format!("VM did not serve PKI within 120s: {e}")))?;
 
     eprintln!("PKI ready — storing client certs on host...");
 
