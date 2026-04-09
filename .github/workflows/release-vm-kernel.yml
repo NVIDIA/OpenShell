@@ -130,10 +130,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install mise and toolchain
         run: |
           set -euo pipefail
-          brew install rust lld dtc xz
+          curl https://mise.run | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+
+      - name: Install tools via mise
+        env:
+          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mise trust
+          mise install rust
+          mise reshim
+          brew install lld dtc xz
 
       - name: Download pre-built kernel.c
         uses: actions/download-artifact@v4
