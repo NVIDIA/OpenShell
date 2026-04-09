@@ -18,36 +18,6 @@ Published documentation content lives under `docs/`. The `fern/` directory store
 
 The navigation source is `docs/index.yml`. `fern/docs.yml` points its `versions[].path` field at `../docs/index.yml`, so Fern reads page structure from `docs/` during validation, preview, and publish.
 
-## Component Interaction
-
-The following diagram shows how local commands and GitHub Actions consume the docs layout.
-
-```mermaid
-flowchart LR
-    DOCS["docs/<br/>MDX content + assets"]
-    NAV["docs/index.yml<br/>navigation"]
-    FERN["fern/<br/>config + components + theme + publish settings"]
-    LOCAL["mise run docs<br/>mise run docs:serve"]
-    PR[".github/workflows/branch-docs.yml"]
-    RELEASE[".github/workflows/release-tag.yml<br/>publish-fern-docs job"]
-    SITE["Published Fern docs site"]
-
-    DOCS -->|content| LOCAL
-    NAV -->|navigation| LOCAL
-    FERN -->|site config| LOCAL
-
-    DOCS -->|content| PR
-    NAV -->|navigation| PR
-    FERN -->|site config| PR
-
-    DOCS -->|content| RELEASE
-    NAV -->|navigation| RELEASE
-    FERN -->|site config| RELEASE
-
-    PR -->|validate + preview| SITE
-    RELEASE -->|release publish| SITE
-```
-
 ## Local Workflow
 
 `tasks/docs.toml` defines the local docs tasks:
