@@ -34,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     jq \
     rsync \
+    zstd \
     && apt-get install -y --only-upgrade gpgv python3 \
     && rm -rf /var/lib/apt/lists/*
 

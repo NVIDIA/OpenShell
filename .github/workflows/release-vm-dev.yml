@@ -155,6 +155,9 @@ jobs:
       - name: Install tools
         run: mise install
 
+      - name: Install zstd
+        run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
+
       - name: Build base rootfs tarball
         run: |
           set -euo pipefail
