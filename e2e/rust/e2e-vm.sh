@@ -136,10 +136,21 @@ else
   fi
 
   cleanup() {
+    local exit_code=$?
     if [ -n "${VM_PID:-}" ] && kill -0 "$VM_PID" 2>/dev/null; then
       echo "Stopping openshell-vm (pid ${VM_PID})..."
       kill "$VM_PID" 2>/dev/null || true
       wait "$VM_PID" 2>/dev/null || true
+    fi
+    # On failure, preserve the VM console log for post-mortem debugging.
+    if [ "$exit_code" -ne 0 ] && [ -n "${VM_NAME:-}" ]; then
+      local console_log
+      console_log="$(named_vm_rootfs)-console.log"
+      if [ -f "$console_log" ]; then
+        echo "=== VM console log (preserved for debugging) ==="
+        cat "$console_log"
+        echo "=== end VM console log ==="
+      fi
     fi
     rm -f "${VM_LOG:-}" 2>/dev/null || true
     if [ -n "${VM_NAME:-}" ]; then

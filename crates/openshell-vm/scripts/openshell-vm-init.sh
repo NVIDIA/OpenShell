@@ -116,7 +116,8 @@ DHCP_SCRIPT
     fi
 
     # Read back the IP we got (from DHCP or static).
-    NODE_IP=$(ip -4 addr show eth0 | grep -oP 'inet \K[^/]+' || echo "192.168.127.2")
+    NODE_IP=$(ip -4 addr show eth0 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]; exit}')
+    NODE_IP="${NODE_IP:-192.168.127.2}"
     ts "eth0 IP: $NODE_IP"
 else
     # TSI or no networking — create a dummy interface for k3s.
@@ -303,7 +304,8 @@ if ip link show cni0 >/dev/null 2>&1; then
 fi
 
 # Remove any leftover veth pairs (CNI bridge plugin creates vethXXXX).
-for veth in $(ip -o link show type veth 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1); do
+veths=$(ip -o link show type veth 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 || true)
+for veth in $veths; do
     ip link delete "$veth" 2>/dev/null || true
 done
 
@@ -322,7 +324,8 @@ ip route flush 10.42.0.0/24 2>/dev/null || true
 # configured from the prior boot. Removing all named network namespaces
 # forces containerd to create fresh ones.
 if [ -d /var/run/netns ]; then
-    for ns in $(ip netns list 2>/dev/null | awk '{print $1}'); do
+    netns_list=$(ip netns list 2>/dev/null | awk '{print $1}' || true)
+    for ns in $netns_list; do
         ip netns delete "$ns" 2>/dev/null || true
     done
 fi
@@ -526,7 +529,7 @@ link_cni_binaries() {
 # (k3s extracts to <hash>-tmp/ then renames to <hash>/).
 find_k3s_data_bin() {
     find /var/lib/rancher/k3s/data -maxdepth 2 -name bin -type d 2>/dev/null \
-        | grep -v '\-tmp/' | head -1
+        | grep -v '\-tmp/' | head -1 || true
 }
 
 K3S_DATA_BIN=$(find_k3s_data_bin)
