@@ -12,6 +12,7 @@
 pub mod config;
 pub mod error;
 pub mod forward;
+pub mod image;
 pub mod inference;
 pub mod paths;
 pub mod proto;

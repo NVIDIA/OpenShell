@@ -2455,13 +2455,6 @@ pub async fn sandbox_create(
     }
 }
 
-/// The default community sandbox registry prefix.
-///
-/// Bare sandbox names (e.g., `openclaw`) are expanded to
-/// `{prefix}/{name}:latest` using this value.  Override with the
-/// `OPENSHELL_COMMUNITY_REGISTRY` environment variable.
-const DEFAULT_COMMUNITY_REGISTRY: &str = "ghcr.io/nvidia/openshell-community/sandboxes";
-
 /// Resolved source for the `--from` flag on `sandbox create`.
 enum ResolvedSource {
     /// A ready-to-use container image reference.
@@ -2527,16 +2520,11 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
         ));
     }
 
-    // 3. Looks like a full image reference (contains / : or .).
-    if value.contains('/') || value.contains(':') || value.contains('.') {
-        return Ok(ResolvedSource::Image(value.to_string()));
-    }
-
-    // 4. Community sandbox name.
-    let prefix = std::env::var("OPENSHELL_COMMUNITY_REGISTRY")
-        .unwrap_or_else(|_| DEFAULT_COMMUNITY_REGISTRY.to_string());
-    let prefix = prefix.trim_end_matches('/');
-    Ok(ResolvedSource::Image(format!("{prefix}/{value}:latest")))
+    // 3. Full image reference or community sandbox name — delegate to shared
+    //    resolution in openshell-core.
+    Ok(ResolvedSource::Image(
+        openshell_core::image::resolve_community_image(value),
+    ))
 }
 
 fn source_requests_gpu(source: &str) -> bool {
