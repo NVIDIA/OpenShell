@@ -302,15 +302,17 @@ SUPERVISOR_TARGET="${RUST_TARGET}"
 SUPERVISOR_BIN="${PROJECT_ROOT}/target/${SUPERVISOR_TARGET}/release/openshell-sandbox"
 
 echo "==> Building openshell-sandbox supervisor binary (${SUPERVISOR_TARGET})..."
-if ! command -v cargo-zigbuild >/dev/null 2>&1; then
-    echo "ERROR: cargo-zigbuild is not installed."
-    echo "       Install it with: cargo install cargo-zigbuild"
-    echo "       Also requires: zig (brew install zig)"
-    exit 1
+if command -v cargo-zigbuild >/dev/null 2>&1; then
+    cargo zigbuild --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}" \
+        --manifest-path "${PROJECT_ROOT}/Cargo.toml" 2>&1 | tail -5
+else
+    # Fallback: use plain cargo build when cargo-zigbuild is not available.
+    # This works for native builds (e.g. building x86_64 on x86_64) but
+    # will fail for true cross-compilation without a cross toolchain.
+    echo "    cargo-zigbuild not found, falling back to cargo build..."
+    cargo build --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}" \
+        --manifest-path "${PROJECT_ROOT}/Cargo.toml" 2>&1 | tail -5
 fi
-
-cargo zigbuild --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}" \
-    --manifest-path "${PROJECT_ROOT}/Cargo.toml" 2>&1 | tail -5
 
 if [ ! -f "${SUPERVISOR_BIN}" ]; then
     echo "ERROR: supervisor binary not found at ${SUPERVISOR_BIN}"

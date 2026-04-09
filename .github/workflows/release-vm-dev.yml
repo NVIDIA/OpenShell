@@ -65,6 +65,11 @@ jobs:
     name: Download Kernel Runtime
     runs-on: build-amd64
     timeout-minutes: 10
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
