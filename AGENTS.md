@@ -43,8 +43,8 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `python/openshell/` | Python SDK | Python bindings and CLI packaging |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
-| `fern/` | Published docs | Fern site config, navigation, components, and MDX pages |
-| `docs/` | Legacy docs source | Sphinx/MyST source retained for migration, comparison, and legacy build tasks |
+| `docs/` | Published docs | MDX pages, navigation, and content assets |
+| `fern/` | Docs site config | Fern site config, components, and theme assets |
 | `.agents/skills/` | Agent skills | Workflow automation for development |
 | `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer, doc writer) |
 | `architecture/` | Architecture docs | Design decisions and component documentation |
@@ -187,9 +187,9 @@ ocsf_emit!(event);
 ## Documentation
 
 - When making changes, update the relevant documentation in the `architecture/` directory.
-- When changes affect user-facing behavior, update the relevant published docs pages under `fern/pages/` and navigation in `fern/versions/latest.yml`.
-- `docs/` is retained for legacy Sphinx build tasks and migration/reference work. Do not update it unless the user explicitly asks.
-- Follow the docs style guide in [fern/pages/CONTRIBUTING.mdx](fern/pages/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
+- When changes affect user-facing behavior, update the relevant published docs pages under `docs/` and navigation in `docs/index.yml`.
+- `fern/` contains the Fern site config, components, preview workflow inputs, and publish settings.
+- Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
 - Fern PR previews run through `.github/workflows/branch-docs.yml`, and production publish runs through the `publish-fern-docs` job in `.github/workflows/release-tag.yml`.
 - Use the `update-docs` skill to scan recent commits and draft doc updates.
 

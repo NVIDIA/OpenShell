@@ -10,8 +10,8 @@ Scan recent git history for commits that affect user-facing behavior and draft d
 ## Prerequisites
 
 - You must be in the OpenShell git repository.
-- The published docs tree must exist under `fern/pages/`.
-- Read `fern/pages/CONTRIBUTING.mdx` before writing any content. It contains the current style guide and formatting rules.
+- The published docs tree must exist under `docs/`.
+- Read `docs/CONTRIBUTING.mdx` before writing any content. It contains the current style guide and formatting rules.
 
 ## When to Use
 
@@ -48,16 +48,16 @@ For each relevant commit, determine which doc page(s) it affects. Use this mappi
 
 | Code area | Likely doc page(s) |
 |---|---|
-| `crates/openshell-cli/` (gateway commands) | `fern/pages/sandboxes/manage-gateways.mdx` |
-| `crates/openshell-cli/` (sandbox commands) | `fern/pages/sandboxes/manage-sandboxes.mdx` |
-| `crates/openshell-cli/` (provider commands) | `fern/pages/sandboxes/manage-providers.mdx` |
-| `crates/openshell-cli/` (new top-level command) | May need a new page or `fern/pages/reference/` entry |
-| Proxy or policy code | `fern/pages/sandboxes/policies.mdx`, `fern/pages/reference/policy-schema.mdx` |
-| Inference code | `fern/pages/inference/configure.mdx` |
-| `python/` (SDK changes) | `fern/pages/reference/` or `fern/pages/get-started/quickstart.mdx` |
-| `proto/` (API changes) | `fern/pages/reference/` |
-| `deploy/` (Dockerfile, Helm) | `fern/pages/sandboxes/manage-gateways.mdx`, `fern/pages/about/architecture.mdx` |
-| Community sandbox definitions | `fern/pages/sandboxes/community-sandboxes.mdx` |
+| `crates/openshell-cli/` (gateway commands) | `docs/sandboxes/manage-gateways.mdx` |
+| `crates/openshell-cli/` (sandbox commands) | `docs/sandboxes/manage-sandboxes.mdx` |
+| `crates/openshell-cli/` (provider commands) | `docs/sandboxes/manage-providers.mdx` |
+| `crates/openshell-cli/` (new top-level command) | May need a new page or `docs/reference/` entry |
+| Proxy or policy code | `docs/sandboxes/policies.mdx`, `docs/reference/policy-schema.mdx` |
+| Inference code | `docs/inference/configure.mdx` |
+| `python/` (SDK changes) | `docs/reference/` or `docs/get-started/quickstart.mdx` |
+| `proto/` (API changes) | `docs/reference/` |
+| `deploy/` (Dockerfile, Helm) | `docs/sandboxes/manage-gateways.mdx`, `docs/about/architecture.mdx` |
+| Community sandbox definitions | `docs/sandboxes/community-sandboxes.mdx` |
 
 If a commit does not map to any existing page but introduces a user-visible concept, flag it as needing a new page.
 
@@ -88,7 +88,7 @@ Identify where the new content should go. Follow the page's existing structure.
 
 ## Step 5: Draft the Update
 
-Write the doc update following the rules in `fern/pages/CONTRIBUTING.mdx`. Key reminders:
+Write the doc update following the rules in `docs/CONTRIBUTING.mdx`. Key reminders:
 
 - **Active voice, present tense, second person.**
 - **No unnecessary bold.** Reserve bold for UI labels and parameter names.
@@ -97,12 +97,12 @@ Write the doc update following the rules in `fern/pages/CONTRIBUTING.mdx`. Key r
 - **No superlatives.** Say what the feature does, not how great it is.
 - **Code examples use `shell` language** for copyable commands, with no `$` prompt prefix.
 - **Use `text` fences** for transcripts, logs, or shell sessions that should not be copied verbatim.
-- **Include the SPDX header** if creating a new page.
-- **Match existing Fern frontmatter format** if creating a new page, including `sidebar-title`, `keywords`, `tags`, and `position` when they are relevant. Use frontmatter `slug` only for folder-discovered pages or absolute URL overrides.
-- **Use `sidebar-title` for short nav labels**. For explicit navbar entries, keep relative `slug` values in `fern/versions/latest.yml` instead of page frontmatter.
-- **Keep explicit `page:` entries in `fern/versions/latest.yml`**. Fern still requires them. If the page defines `sidebar-title`, set `page:` to that value. Otherwise set `page:` to the page frontmatter `title`.
-- **Use `skip-slug: true` in `fern/versions/latest.yml`** when a child page should live at the parent section path.
-- **Use `keywords` as a comma-separated string**. When migrating a page from `docs/`, combine the legacy `topics` and `tags` into `keywords` and preserve the legacy `tags` array when it is still useful.
+- **Include the SPDX header as YAML comments in frontmatter** if creating a new page.
+- **Match existing Fern frontmatter format** if creating a new page, including `sidebar-title`, `keywords`, and `position` when they are relevant. Use frontmatter `slug` only for folder-discovered pages or absolute URL overrides.
+- **Use `sidebar-title` for short nav labels**. For explicit navigation entries, keep relative `slug` values in `docs/index.yml` instead of page frontmatter.
+- **Keep explicit `page:` entries in `docs/index.yml`**. Fern still requires them. If the page defines `sidebar-title`, set `page:` to that value. Otherwise set `page:` to the page frontmatter `title`.
+- **Use `skip-slug: true` in `docs/index.yml`** when a child page should live at the parent section path.
+- **Use `keywords` as a comma-separated string**.
 - **Do not add a duplicate H1**. Fern renders the page title from frontmatter.
 - **Always write NVIDIA in all caps.** Wrong: Nvidia, nvidia.
 - **Always capitalize OpenShell correctly.** Wrong: openshell, Openshell, openShell.
@@ -118,8 +118,8 @@ When updating an existing page:
 
 When creating a new page:
 
-- Follow the frontmatter template from `fern/pages/CONTRIBUTING.mdx`.
-- Add the page to the appropriate section in `fern/versions/latest.yml`.
+- Follow the frontmatter template from `docs/CONTRIBUTING.mdx`.
+- Add the page to the appropriate section in `docs/index.yml`.
 
 ## Step 6: Present the Results
 
@@ -129,8 +129,8 @@ After drafting all updates, present a summary to the user:
 ## Doc Updates from Commits
 
 ### Updated pages
-- `fern/pages/sandboxes/manage-gateways.mdx`: Added `--gpu` flag documentation (from commit abc1234).
-- `fern/pages/reference/policy-schema.mdx`: Updated network policy schema for new `tls_inspect` field (from commit def5678).
+- `docs/sandboxes/manage-gateways.mdx`: Added `--gpu` flag documentation (from commit abc1234).
+- `docs/reference/policy-schema.mdx`: Updated network policy schema for new `tls_inspect` field (from commit def5678).
 
 ### New pages needed
 - None (or list any new pages created).
@@ -145,13 +145,13 @@ After drafting all updates, present a summary to the user:
 After making changes, validate the Fern docs locally:
 
 ```bash
-fern check
+mise run docs
 ```
 
 If a human needs to inspect rendering while iterating, they can also run:
 
 ```bash
-fern docs dev
+mise run docs:serve
 ```
 
 Check for:
@@ -177,4 +177,4 @@ User says: "Catch up the docs for everything merged since v0.2.0."
 4. Read the commit diffs and current doc pages.
 5. Draft updates following the style guide.
 6. Present the summary.
-7. Run `fern check` to verify.
+7. Run `mise run docs` to verify.

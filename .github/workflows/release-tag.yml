@@ -399,7 +399,9 @@ jobs:
           node-version: "24"
 
       - name: Install Fern CLI
-        run: npm install -g fern-api
+        run: |
+          FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
+          npm install -g "fern-api@${FERN_VERSION}"
 
       - name: Publish Fern docs
         env:
