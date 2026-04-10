@@ -58,12 +58,21 @@ impl Url {
     }
 
     /// Format as a display string.
+    ///
+    /// Includes the port when it is present and differs from the scheme default
+    /// (443 for `https`, 80 for `http`).
     #[must_use]
     pub fn to_display_string(&self) -> String {
         let scheme = self.scheme.as_deref().unwrap_or("https");
         let hostname = self.hostname.as_deref().unwrap_or("unknown");
         let path = self.path.as_deref().unwrap_or("/");
-        format!("{scheme}://{hostname}{path}")
+        let port_suffix = match self.port {
+            Some(443) if scheme == "https" => String::new(),
+            Some(80) if scheme == "http" => String::new(),
+            Some(p) => format!(":{p}"),
+            None => String::new(),
+        };
+        format!("{scheme}://{hostname}{port_suffix}{path}")
     }
 }
 
@@ -94,9 +103,39 @@ mod tests {
     }
 
     #[test]
-    fn test_url_display_string() {
+    fn test_url_display_string_default_port() {
         let url = Url::new("https", "api.example.com", "/v1/data", 443);
         assert_eq!(url.to_display_string(), "https://api.example.com/v1/data");
+
+        let url = Url::new("http", "example.com", "/index", 80);
+        assert_eq!(url.to_display_string(), "http://example.com/index");
+    }
+
+    #[test]
+    fn test_url_display_string_non_default_port() {
+        let url = Url::new("http", "172.20.0.1", "/test", 9876);
+        assert_eq!(url.to_display_string(), "http://172.20.0.1:9876/test");
+
+        let url = Url::new("https", "api.example.com", "/v1/data", 8443);
+        assert_eq!(
+            url.to_display_string(),
+            "https://api.example.com:8443/v1/data"
+        );
+
+        // HTTP on 443 is non-default — should show port
+        let url = Url::new("http", "example.com", "/path", 443);
+        assert_eq!(url.to_display_string(), "http://example.com:443/path");
+    }
+
+    #[test]
+    fn test_url_display_string_no_port() {
+        let url = Url {
+            scheme: Some("https".to_string()),
+            hostname: Some("example.com".to_string()),
+            path: Some("/path".to_string()),
+            port: None,
+        };
+        assert_eq!(url.to_display_string(), "https://example.com/path");
     }
 
     #[test]

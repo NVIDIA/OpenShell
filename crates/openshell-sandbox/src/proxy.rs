@@ -463,7 +463,16 @@ async fn handle_tcp_connection(
             &deny_reason,
             "connect",
         );
-        respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+        respond(
+            &mut client,
+            &build_json_error_response(
+                403,
+                "Forbidden",
+                "policy_denied",
+                &format!("CONNECT {host_lc}:{port} not permitted by policy"),
+            ),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -518,7 +527,16 @@ async fn handle_tcp_connection(
                         &reason,
                         "ssrf",
                     );
-                    respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                    respond(
+                        &mut client,
+                        &build_json_error_response(
+                            403,
+                            "Forbidden",
+                            "ssrf_denied",
+                            &format!("CONNECT {host_lc}:{port} blocked: allowed_ips check failed"),
+                        ),
+                    )
+                    .await?;
                     return Ok(());
                 }
             },
@@ -553,7 +571,16 @@ async fn handle_tcp_connection(
                     &reason,
                     "ssrf",
                 );
-                respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                respond(
+                    &mut client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!("CONNECT {host_lc}:{port} blocked: invalid allowed_ips in policy"),
+                    ),
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -594,7 +621,16 @@ async fn handle_tcp_connection(
                     &reason,
                     "ssrf",
                 );
-                respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                respond(
+                    &mut client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!("CONNECT {host_lc}:{port} blocked: internal address"),
+                    ),
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -2071,7 +2107,16 @@ async fn handle_forward_proxy(
                 reason,
                 "forward",
             );
-            respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+            respond(
+                client,
+                &build_json_error_response(
+                    403,
+                    "Forbidden",
+                    "policy_denied",
+                    &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                ),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -2199,7 +2244,16 @@ async fn handle_forward_proxy(
                 &reason,
                 "forward-l7-deny",
             );
-            respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+            respond(
+                client,
+                &build_json_error_response(
+                    403,
+                    "Forbidden",
+                    "policy_denied",
+                    &format!("{method} {host_lc}:{port}{path} denied by L7 policy"),
+                ),
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -2254,7 +2308,16 @@ async fn handle_forward_proxy(
                         &reason,
                         "ssrf",
                     );
-                    respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                    respond(
+                        client,
+                        &build_json_error_response(
+                            403,
+                            "Forbidden",
+                            "ssrf_denied",
+                            &format!("{method} {host_lc}:{port} blocked: allowed_ips check failed"),
+                        ),
+                    )
+                    .await?;
                     return Ok(());
                 }
             },
@@ -2292,7 +2355,18 @@ async fn handle_forward_proxy(
                     &reason,
                     "ssrf",
                 );
-                respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!(
+                            "{method} {host_lc}:{port} blocked: invalid allowed_ips in policy"
+                        ),
+                    ),
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -2334,7 +2408,16 @@ async fn handle_forward_proxy(
                     &reason,
                     "ssrf",
                 );
-                respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!("{method} {host_lc}:{port} blocked: internal address"),
+                    ),
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -2363,7 +2446,16 @@ async fn handle_forward_proxy(
                 ))
                 .build();
             ocsf_emit!(event);
-            respond(client, b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
+            respond(
+                client,
+                &build_json_error_response(
+                    502,
+                    "Bad Gateway",
+                    "upstream_unreachable",
+                    &format!("connection to {host_lc}:{port} failed"),
+                ),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -2402,7 +2494,16 @@ async fn handle_forward_proxy(
                 error = %e,
                 "credential injection failed in forward proxy"
             );
-            respond(client, b"HTTP/1.1 500 Internal Server Error\r\n\r\n").await?;
+            respond(
+                client,
+                &build_json_error_response(
+                    500,
+                    "Internal Server Error",
+                    "credential_injection_failed",
+                    "unresolved credential placeholder in request",
+                ),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -2429,6 +2530,30 @@ fn parse_target(target: &str) -> Result<(String, u16)> {
 async fn respond(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     client.write_all(bytes).await.into_diagnostic()?;
     Ok(())
+}
+
+/// Build an HTTP error response with a JSON body.
+///
+/// Returns bytes ready to write to the client socket.  The body is a JSON
+/// object with `error` and `detail` fields, matching the format used by the
+/// L7 deny path in `l7/rest.rs`.
+fn build_json_error_response(status: u16, status_text: &str, error: &str, detail: &str) -> Vec<u8> {
+    let body = serde_json::json!({
+        "error": error,
+        "detail": detail,
+    });
+    let body_str = body.to_string();
+    format!(
+        "HTTP/1.1 {status} {status_text}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body_str.len(),
+        body_str,
+    )
+    .into_bytes()
 }
 
 /// Check if a miette error represents a benign connection close.
@@ -3291,5 +3416,66 @@ mod tests {
     fn test_implicit_allowed_ips_returns_empty_for_wildcard() {
         let result = implicit_allowed_ips_for_ip_host("*.example.com");
         assert!(result.is_empty());
+    }
+
+    // -- build_json_error_response --
+
+    #[test]
+    fn test_json_error_response_403() {
+        let resp = build_json_error_response(
+            403,
+            "Forbidden",
+            "policy_denied",
+            "CONNECT api.example.com:443 not permitted by policy",
+        );
+        let resp_str = String::from_utf8(resp).unwrap();
+
+        assert!(resp_str.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+        assert!(resp_str.contains("Content-Type: application/json\r\n"));
+        assert!(resp_str.contains("Connection: close\r\n"));
+
+        // Extract body after \r\n\r\n
+        let body_start = resp_str.find("\r\n\r\n").unwrap() + 4;
+        let body: serde_json::Value = serde_json::from_str(&resp_str[body_start..]).unwrap();
+        assert_eq!(body["error"], "policy_denied");
+        assert_eq!(
+            body["detail"],
+            "CONNECT api.example.com:443 not permitted by policy"
+        );
+    }
+
+    #[test]
+    fn test_json_error_response_502() {
+        let resp = build_json_error_response(
+            502,
+            "Bad Gateway",
+            "upstream_unreachable",
+            "connection to api.example.com:443 failed",
+        );
+        let resp_str = String::from_utf8(resp).unwrap();
+
+        assert!(resp_str.starts_with("HTTP/1.1 502 Bad Gateway\r\n"));
+
+        let body_start = resp_str.find("\r\n\r\n").unwrap() + 4;
+        let body: serde_json::Value = serde_json::from_str(&resp_str[body_start..]).unwrap();
+        assert_eq!(body["error"], "upstream_unreachable");
+        assert_eq!(body["detail"], "connection to api.example.com:443 failed");
+    }
+
+    #[test]
+    fn test_json_error_response_content_length_matches() {
+        let resp = build_json_error_response(403, "Forbidden", "test", "detail");
+        let resp_str = String::from_utf8(resp).unwrap();
+
+        // Extract Content-Length value
+        let cl_line = resp_str
+            .lines()
+            .find(|l| l.starts_with("Content-Length:"))
+            .unwrap();
+        let cl: usize = cl_line.split(": ").nth(1).unwrap().trim().parse().unwrap();
+
+        // Verify body length matches
+        let body_start = resp_str.find("\r\n\r\n").unwrap() + 4;
+        assert_eq!(resp_str[body_start..].len(), cl);
     }
 }
