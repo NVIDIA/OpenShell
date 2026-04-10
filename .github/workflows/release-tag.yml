@@ -171,10 +171,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # Build CLI binaries (Linux musl — static, native on each arch)
   #
-  # Builds run directly on the CI host (glibc Ubuntu).  Zig provides a
-  # musl-targeting C/C++ compiler so that bundled-z3 produces musl-compatible
-  # objects without glibc contamination.  This avoids Docker-in-Docker and
-  # lets sccache work normally.
+  # Builds run directly on the CI host (glibc Ubuntu).  The system g++ is
+  # used for C++ compilation (z3) with _FORTIFY_SOURCE disabled to avoid
+  # glibc-specific hardened symbols that do not exist in musl.
   # ---------------------------------------------------------------------------
   build-cli-linux:
     name: Build CLI (Linux ${{ matrix.arch }})
@@ -185,11 +184,9 @@ jobs:
           - arch: amd64
             runner: build-amd64
             target: x86_64-unknown-linux-musl
-            zig_target: x86_64-linux-musl
           - arch: arm64
             runner: build-arm64
             target: aarch64-unknown-linux-musl
-            zig_target: aarch64-linux-musl
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     container:
@@ -227,35 +224,19 @@ jobs:
       - name: Add Rust musl target
         run: mise x -- rustup target add ${{ matrix.target }}
 
-      - name: Set up zig-musl toolchain
+      - name: Set up musl C++ wrapper
         run: |
           set -euo pipefail
-          ZIG="$(mise which zig)"
-          ZIG_TARGET="${{ matrix.zig_target }}"
-          mkdir -p /tmp/zig-musl
+          # System g++ with _FORTIFY_SOURCE disabled.  FORTIFY_SOURCE makes
+          # g++ emit glibc-specific hardened calls (__printf_chk, __memcpy_chk)
+          # that do not exist in musl, causing linker failures.  Disabling it
+          # produces standard POSIX calls that resolve against musl.
+          printf '#!/bin/sh\nexec g++ -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 "$@"\n' \
+            > /usr/local/bin/musl-g++
+          chmod +x /usr/local/bin/musl-g++
 
-          # cc-rs injects --target=<rust-triple> (e.g. aarch64-unknown-linux-musl)
-          # which zig cannot parse.  The wrappers strip any --target flags and use
-          # the correct zig target instead.
-          for tool in cc c++; do
-            cat > "/tmp/zig-musl/${tool}" <<WRAPPER
-          #!/bin/bash
-          args=()
-          for arg in "\$@"; do
-            case "\$arg" in --target=*) ;; *) args+=("\$arg") ;; esac
-          done
-          exec "$ZIG" $tool --target=$ZIG_TARGET "\${args[@]}"
-          WRAPPER
-            chmod +x "/tmp/zig-musl/${tool}"
-          done
-
-          # Tell cargo / cc-rs / cmake to use zig for C/C++ compilation.
-          # Do NOT set the linker — Rust's default linker (system cc/gcc)
-          # works correctly because Rust ships its own musl CRT objects.
-          # Using zig as the linker causes duplicate _start symbols.
           TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
-          echo "CC_${TARGET_ENV}=/tmp/zig-musl/cc" >> "$GITHUB_ENV"
-          echo "CXX_${TARGET_ENV}=/tmp/zig-musl/c++" >> "$GITHUB_ENV"
+          echo "CXX_${TARGET_ENV}=/usr/local/bin/musl-g++" >> "$GITHUB_ENV"
 
       - name: Scope workspace to CLI crates
         run: |
