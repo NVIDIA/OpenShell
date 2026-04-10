@@ -202,6 +202,16 @@ jobs:
           apt-get install -y --no-install-recommends musl-tools
           rm -rf /var/lib/apt/lists/*
 
+      - name: Create musl-g++ wrapper
+        run: |
+          set -euo pipefail
+          # musl-tools ships musl-gcc (C wrapper) but not a C++ equivalent.
+          # z3's bundled cmake build needs a C++ compiler that targets musl.
+          # Extract the specs path from musl-gcc and create a parallel g++ wrapper.
+          SPECS=$(sed -n 's/.*-specs "\([^"]*\)".*/\1/p' "$(which musl-gcc)")
+          printf '#!/bin/sh\nexec g++ "$@" -specs "%s"\n' "$SPECS" > /usr/local/bin/musl-g++
+          chmod +x /usr/local/bin/musl-g++
+
       - name: Add Rust musl target
         run: mise x -- rustup target add ${{ matrix.target }}
 
@@ -221,11 +231,8 @@ jobs:
 
       - name: Build ${{ matrix.target }}
         env:
-          # musl-tools only provides musl-gcc (C); z3 bundled build needs a
-          # C++ compiler.  The system g++ works because z3's public API uses
-          # C linkage and libstdc++ is statically linked in the final binary.
-          CXX_aarch64_unknown_linux_musl: g++
-          CXX_x86_64_unknown_linux_musl: g++
+          CXX_aarch64_unknown_linux_musl: musl-g++
+          CXX_x86_64_unknown_linux_musl: musl-g++
         run: mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-cli --features bundled-z3
 
       - name: sccache stats
