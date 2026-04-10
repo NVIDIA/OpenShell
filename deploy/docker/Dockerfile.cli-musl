@@ -17,6 +17,11 @@ ARG CARGO_TARGET_CACHE_SCOPE=default
 
 ENV PATH="/usr/local/cargo/bin:${PATH}"
 ENV LIBCLANG_PATH="/usr/lib"
+# Build scripts (build.rs) are compiled for the host, which in Alpine defaults
+# to static musl linking.  Static musl binaries cannot dlopen, so bindgen fails
+# to load libclang.so.  Disabling crt-static for host builds makes build scripts
+# dynamically linked while keeping the target CLI binary fully static.
+ENV CARGO_HOST_RUSTFLAGS="-C target-feature=-crt-static"
 
 WORKDIR /build
 
