@@ -12,10 +12,11 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    cmake \
     curl \
     gcc \
     libc6-dev \
-    libz3-dev \
+    libclang-dev \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -74,7 +75,7 @@ RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=loc
     --mount=type=cache,id=cargo-git-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-python-wheels-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
     --mount=type=cache,id=sccache-python-wheels-${TARGETARCH},sharing=locked,target=/tmp/sccache \
-    . cross-build.sh && cargo_cross_build --release -p openshell-cli 2>/dev/null || true
+    . cross-build.sh && cargo_cross_build --release -p openshell-cli --features bundled-z3 2>/dev/null || true
 
 # Copy actual source code and Python packaging files.
 COPY crates/ crates/
@@ -108,7 +109,7 @@ RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=loc
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi && \
-    maturin build --release --target "${CARGO_BUILD_TARGET}" --out /wheels
+    maturin build --release --target "${CARGO_BUILD_TARGET}" --features bundled-z3 --out /wheels
 
 FROM scratch AS wheels
 COPY --from=builder /wheels/*.whl /

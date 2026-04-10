@@ -211,7 +211,7 @@ jobs:
           # Remove workspace members that are not needed for openshell-cli.
           # This avoids Cargo feature-unification pulling in aws-lc-sys (via
           # russh in openshell-sandbox / openshell-server).
-          sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-cli", "crates/openshell-core", "crates/openshell-bootstrap", "crates/openshell-policy", "crates/openshell-providers", "crates/openshell-tui"]|' Cargo.toml
+          sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-cli", "crates/openshell-core", "crates/openshell-bootstrap", "crates/openshell-policy", "crates/openshell-prover", "crates/openshell-providers", "crates/openshell-tui"]|' Cargo.toml
 
       - name: Patch workspace version
         if: needs.compute-versions.outputs.cargo_version != ''
@@ -220,7 +220,7 @@ jobs:
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
 
       - name: Build ${{ matrix.target }}
-        run: mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-cli
+        run: mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-cli --features bundled-z3
 
       - name: sccache stats
         if: always()
