@@ -227,8 +227,7 @@ jobs:
       - name: Create musl-g++ wrapper
         run: |
           set -euo pipefail
-          SPECS=$(sed -n 's/.*-specs "\([^"]*\)".*/\1/p' "$(which musl-gcc)")
-          printf '#!/bin/sh\nexec g++ "$@" -specs "%s"\n' "$SPECS" > /usr/local/bin/musl-g++
+          printf '#!/bin/sh\nexec g++ -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 "$@"\n' > /usr/local/bin/musl-g++
           chmod +x /usr/local/bin/musl-g++
 
       - name: Add Rust musl target
