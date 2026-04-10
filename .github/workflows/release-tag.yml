@@ -178,9 +178,11 @@ jobs:
       matrix:
         include:
           - arch: amd64
+            docker_platform: linux/amd64
             runner: build-amd64
             target: x86_64-unknown-linux-musl
           - arch: arm64
+            docker_platform: linux/arm64
             runner: build-arm64
             target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
@@ -191,6 +193,8 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
       options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
@@ -207,62 +211,29 @@ jobs:
       - name: Fetch tags
         run: git fetch --tags --force
 
-      - name: Install tools
-        run: mise install
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/setup-buildx
 
-      - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        with:
-          shared-key: cli-musl-${{ matrix.arch }}
-          cache-directories: .cache/sccache
-          cache-targets: "true"
-
-      - name: Install musl toolchain
+      - name: Build ${{ matrix.target }} via Docker
         run: |
           set -euo pipefail
-          apt-get update
-          apt-get install -y --no-install-recommends musl-tools
-          rm -rf /var/lib/apt/lists/*
-
-      - name: Create musl-g++ wrapper
-        run: |
-          set -euo pipefail
-          printf '#!/bin/sh\nexec g++ -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 "$@"\n' > /usr/local/bin/musl-g++
-          chmod +x /usr/local/bin/musl-g++
-
-      - name: Add Rust musl target
-        run: mise x -- rustup target add ${{ matrix.target }}
-
-      - name: Scope workspace to CLI crates
-        run: |
-          set -euo pipefail
-          # Remove workspace members that are not needed for openshell-cli.
-          # This avoids Cargo feature-unification pulling in aws-lc-sys (via
-          # russh in openshell-sandbox / openshell-server).
-          sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-cli", "crates/openshell-core", "crates/openshell-bootstrap", "crates/openshell-policy", "crates/openshell-prover", "crates/openshell-providers", "crates/openshell-tui"]|' Cargo.toml
-
-      - name: Patch workspace version
-        if: needs.compute-versions.outputs.cargo_version != ''
-        run: |
-          set -euo pipefail
-          sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
-
-      - name: Build ${{ matrix.target }}
-        env:
-          CXX_aarch64_unknown_linux_musl: musl-g++
-          CXX_x86_64_unknown_linux_musl: musl-g++
-        run: mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-cli --features bundled-z3
-
-      - name: sccache stats
-        if: always()
-        run: mise x -- sccache --show-stats
+          docker buildx build \
+            --platform "${{ matrix.docker_platform }}" \
+            --file deploy/docker/Dockerfile.cli-musl \
+            --build-arg TARGET_TRIPLE="${{ matrix.target }}" \
+            --build-arg OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" \
+            --build-arg OPENSHELL_IMAGE_TAG="${{ needs.compute-versions.outputs.semver }}" \
+            --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
+            --target binary \
+            --output type=local,dest=out/ \
+            .
 
       - name: Package binary
         run: |
           set -euo pipefail
           mkdir -p artifacts
           tar -czf artifacts/openshell-${{ matrix.target }}.tar.gz \
-            -C target/${{ matrix.target }}/release openshell
+            -C out openshell
           ls -lh artifacts/
 
       - name: Upload artifact

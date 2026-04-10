@@ -3,61 +3,38 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Cross-compile the openshell CLI binary for macOS aarch64 (Apple Silicon)
-# using the osxcross toolchain.  Produces a standalone binary — no Python
-# wheel wrapping.
+# Build a fully static OpenShell CLI binary inside a native musl environment.
 #
-# Usage:
-#   docker buildx build -f deploy/docker/Dockerfile.cli-macos \
-#     --build-arg OPENSHELL_CARGO_VERSION=0.6.0 \
-#     --output type=local,dest=out/ .
+# This avoids the glibc contamination that occurs when bundled-z3 is compiled
+# with the Debian/Ubuntu host C++ toolchain and then linked into a musl target.
 
-ARG OSXCROSS_IMAGE=crazymax/osxcross:latest
+ARG RUST_IMAGE=rust:1.88-alpine3.22
 
-FROM ${OSXCROSS_IMAGE} AS osxcross
+FROM ${RUST_IMAGE} AS builder
 
-FROM python:3.12-slim AS builder
-
+ARG TARGET_TRIPLE
 ARG CARGO_TARGET_CACHE_SCOPE=default
 
-ENV PATH="/root/.cargo/bin:/usr/local/bin:/osxcross/bin:${PATH}"
-ENV LD_LIBRARY_PATH="/osxcross/lib"
-
-COPY --from=osxcross /osxcross /osxcross
-
-RUN SDKROOT="$(echo /osxcross/SDK/MacOSX*.sdk)" && ln -sfn "${SDKROOT}" /osxcross/SDK/MacOSX.sdk
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    ca-certificates \
-    clang \
-    cmake \
-    curl \
-    libclang-dev \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88.0
-
-# aws-lc-sys probes with --target=arm64-apple-macosx and clang then looks for
-# arm64-apple-macosx-ld.  Provide a linker alias to osxcross ld64.
-RUN ln -sf /osxcross/bin/arm64-apple-darwin25.1-ld /usr/local/bin/arm64-apple-macosx-ld
-
-RUN rustup target add aarch64-apple-darwin
+ENV PATH="/usr/local/cargo/bin:${PATH}"
+ENV LIBCLANG_PATH="/usr/lib"
 
 WORKDIR /build
 
-ENV CC_aarch64_apple_darwin=oa64-clang
-ENV CXX_aarch64_apple_darwin=oa64-clang++
-ENV AR_aarch64_apple_darwin=aarch64-apple-darwin25.1-ar
-ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=oa64-clang
-ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_AR=aarch64-apple-darwin25.1-ar
-ENV SDKROOT=/osxcross/SDK/MacOSX.sdk
-ENV BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin=--target=arm64-apple-macosx\ -isysroot\ ${SDKROOT}
+RUN apk add --no-cache \
+    build-base \
+    clang20-dev \
+    llvm20-dev \
+    cmake \
+    musl-dev \
+    perl \
+    pkgconf \
+    python3
+
+RUN /usr/local/cargo/bin/rustup target add "${TARGET_TRIPLE}"
 
 # ---------------------------------------------------------------------------
 # Stage 1: dependency caching — copy only manifests, create dummy sources,
-# build dependencies.  This layer is cached unless Cargo.toml/lock changes.
+# build dependencies. This layer is cached unless Cargo.toml/lock changes.
 # ---------------------------------------------------------------------------
 COPY Cargo.toml Cargo.lock ./
 COPY crates/openshell-bootstrap/Cargo.toml crates/openshell-bootstrap/Cargo.toml
@@ -70,9 +47,7 @@ COPY crates/openshell-prover/Cargo.toml   crates/openshell-prover/Cargo.toml
 COPY crates/openshell-core/build.rs       crates/openshell-core/build.rs
 COPY proto/ proto/
 
-# Scope workspace to CLI crates only — avoids compiling aws-lc-sys (pulled
-# by russh in openshell-sandbox/openshell-server) which is difficult to
-# cross-compile and unnecessary for the CLI binary.
+# Scope workspace to CLI crates only — avoids compiling unnecessary members.
 RUN sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-cli", "crates/openshell-core", "crates/openshell-bootstrap", "crates/openshell-policy", "crates/openshell-prover", "crates/openshell-providers", "crates/openshell-tui"]|' Cargo.toml
 
 RUN mkdir -p crates/openshell-cli/src \
@@ -90,10 +65,10 @@ RUN mkdir -p crates/openshell-cli/src \
     touch crates/openshell-prover/src/lib.rs && \
     touch crates/openshell-tui/src/lib.rs
 
-RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
-    --mount=type=cache,id=cargo-git-cli-macos,sharing=locked,target=/root/.cargo/git \
-    --mount=type=cache,id=cargo-target-cli-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    cargo build --release --target aarch64-apple-darwin -p openshell-cli --features bundled-z3 2>/dev/null || true
+RUN --mount=type=cache,id=cargo-registry-cli-musl-${TARGET_TRIPLE},sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git-cli-musl-${TARGET_TRIPLE},sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,id=cargo-target-cli-musl-${TARGET_TRIPLE}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
+    /usr/local/cargo/bin/cargo build --release --target "${TARGET_TRIPLE}" -p openshell-cli --features bundled-z3 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Stage 2: real build
@@ -115,14 +90,15 @@ RUN touch crates/openshell-cli/src/main.rs \
 # invalidate the expensive dependency-build layers above on every commit.
 ARG OPENSHELL_CARGO_VERSION
 ARG OPENSHELL_IMAGE_TAG
-RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
-    --mount=type=cache,id=cargo-git-cli-macos,sharing=locked,target=/root/.cargo/git \
-    --mount=type=cache,id=cargo-target-cli-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
+RUN --mount=type=cache,id=cargo-registry-cli-musl-${TARGET_TRIPLE},sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git-cli-musl-${TARGET_TRIPLE},sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,id=cargo-target-cli-musl-${TARGET_TRIPLE}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi && \
-    cargo build --release --target aarch64-apple-darwin -p openshell-cli --features bundled-z3 && \
-    cp target/aarch64-apple-darwin/release/openshell /openshell
+    OPENSHELL_IMAGE_TAG="${OPENSHELL_IMAGE_TAG:-dev}" \
+    /usr/local/cargo/bin/cargo build --release --target "${TARGET_TRIPLE}" -p openshell-cli --features bundled-z3 && \
+    cp "target/${TARGET_TRIPLE}/release/openshell" /openshell
 
 FROM scratch AS binary
 COPY --from=builder /openshell /openshell

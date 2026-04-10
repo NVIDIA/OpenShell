@@ -19,6 +19,8 @@ ENV LD_LIBRARY_PATH="/osxcross/lib"
 
 COPY --from=osxcross /osxcross /osxcross
 
+RUN SDKROOT="$(echo /osxcross/SDK/MacOSX*.sdk)" && ln -sfn "${SDKROOT}" /osxcross/SDK/MacOSX.sdk
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
@@ -45,6 +47,8 @@ ENV CXX_aarch64_apple_darwin=oa64-clang++
 ENV AR_aarch64_apple_darwin=aarch64-apple-darwin25.1-ar
 ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=oa64-clang
 ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_AR=aarch64-apple-darwin25.1-ar
+ENV SDKROOT=/osxcross/SDK/MacOSX.sdk
+ENV BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin=--target=arm64-apple-macosx\ -isysroot\ ${SDKROOT}
 
 # Copy dependency manifests first for better caching.
 COPY Cargo.toml Cargo.lock ./
