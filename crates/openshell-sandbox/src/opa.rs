@@ -670,6 +670,10 @@ fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option
     for _ in 0..40 {
         let container_path = format!("/proc/{entrypoint_pid}/root{}", resolved.display());
 
+        tracing::debug!(
+            "Symlink resolution: probing container_path={container_path} for policy_path={policy_path} pid={entrypoint_pid}"
+        );
+
         let meta = match std::fs::symlink_metadata(&container_path) {
             Ok(m) => m,
             Err(e) => {
@@ -678,23 +682,18 @@ fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option
                 // legitimately not exist (broken symlink chain).
                 if resolved.as_os_str() == policy_path {
                     tracing::warn!(
-                        path = %policy_path,
-                        container_path = %container_path,
-                        pid = entrypoint_pid,
-                        error = %e,
-                        "Cannot access container filesystem for symlink resolution; \
-                         binary paths in policy will be matched literally. If a policy \
-                         binary is a symlink (e.g., /usr/bin/python3 -> python3.11), \
-                         use the canonical path instead, or run with CAP_SYS_PTRACE"
+                        "Cannot access container filesystem for symlink resolution: \
+                         path={policy_path} container_path={container_path} pid={entrypoint_pid} \
+                         error={e}. Binary paths in policy will be matched literally. \
+                         If this binary is a symlink (e.g., /usr/bin/python3 -> python3.11), \
+                         use the canonical path instead, or run with CAP_SYS_PTRACE."
                     );
                 } else {
                     tracing::warn!(
-                        original = %policy_path,
-                        current = %resolved.display(),
-                        pid = entrypoint_pid,
-                        error = %e,
-                        "Symlink chain broken during resolution; \
-                         binary will be matched by original path only"
+                        "Symlink chain broken during resolution: \
+                         original={policy_path} current={} pid={entrypoint_pid} error={e}. \
+                         Binary will be matched by original path only.",
+                        resolved.display()
                     );
                 }
                 return None;
@@ -710,12 +709,10 @@ fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(
-                    path = %policy_path,
-                    current = %resolved.display(),
-                    pid = entrypoint_pid,
-                    error = %e,
-                    "Symlink detected but read_link failed; \
-                     binary will be matched by original path only"
+                    "Symlink detected but read_link failed: \
+                     path={policy_path} current={} pid={entrypoint_pid} error={e}. \
+                     Binary will be matched by original path only.",
+                    resolved.display()
                 );
                 return None;
             }
@@ -740,10 +737,8 @@ fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option
         None
     } else {
         tracing::info!(
-            original = %policy_path,
-            resolved = %resolved_str,
-            pid = entrypoint_pid,
-            "Resolved policy binary symlink via container filesystem"
+            "Resolved policy binary symlink via container filesystem: \
+             original={policy_path} resolved={resolved_str} pid={entrypoint_pid}"
         );
         Some(resolved_str)
     }
