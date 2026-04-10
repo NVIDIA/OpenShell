@@ -235,7 +235,15 @@ jobs:
             > /usr/local/bin/musl-g++
           chmod +x /usr/local/bin/musl-g++
 
+          # Point both CC and CXX at wrappers that disable _FORTIFY_SOURCE.
+          # CC must be set explicitly or cc-rs probes for aarch64-linux-musl-gcc
+          # which does not exist on the Ubuntu CI host.
+          printf '#!/bin/sh\nexec cc -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 "$@"\n' \
+            > /usr/local/bin/musl-cc
+          chmod +x /usr/local/bin/musl-cc
+
           TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
+          echo "CC_${TARGET_ENV}=/usr/local/bin/musl-cc" >> "$GITHUB_ENV"
           echo "CXX_${TARGET_ENV}=/usr/local/bin/musl-g++" >> "$GITHUB_ENV"
 
       - name: Scope workspace to CLI crates
