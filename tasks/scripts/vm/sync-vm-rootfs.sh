@@ -104,19 +104,23 @@ done
 HELM_CHART_DIR="${ROOT}/deploy/helm/openshell"
 CHART_STAGING="${ROOTFS_DIR}/opt/openshell/charts"
 if [ -d "${HELM_CHART_DIR}" ]; then
-    mkdir -p "${CHART_STAGING}"
-    # Package into a temp dir and compare — only update if changed.
-    TMP_CHART=$(mktemp -d)
-    helm package "${HELM_CHART_DIR}" -d "${TMP_CHART}" >/dev/null 2>&1
-    for tgz in "${TMP_CHART}"/*.tgz; do
-        [ -f "$tgz" ] || continue
-        base=$(basename "$tgz")
-        if ! cmp -s "$tgz" "${CHART_STAGING}/${base}" 2>/dev/null; then
-            cp "$tgz" "${CHART_STAGING}/${base}"
-            echo "  updated: /opt/openshell/charts/${base}"
-        fi
-    done
-    rm -rf "${TMP_CHART}"
+    if ! command -v helm >/dev/null 2>&1; then
+        echo "  warning: helm not found — skipping chart sync (run: mise install)" >&2
+    else
+        mkdir -p "${CHART_STAGING}"
+        # Package into a temp dir and compare — only update if changed.
+        TMP_CHART=$(mktemp -d)
+        helm package "${HELM_CHART_DIR}" -d "${TMP_CHART}" >/dev/null 2>&1
+        for tgz in "${TMP_CHART}"/*.tgz; do
+            [ -f "$tgz" ] || continue
+            base=$(basename "$tgz")
+            if ! cmp -s "$tgz" "${CHART_STAGING}/${base}" 2>/dev/null; then
+                cp "$tgz" "${CHART_STAGING}/${base}"
+                echo "  updated: /opt/openshell/charts/${base}"
+            fi
+        done
+        rm -rf "${TMP_CHART}"
+    fi
 fi
 
 # ── Kubernetes manifests ───────────────────────────────────────────────

@@ -119,6 +119,10 @@ CONFIG_MEMCG=y
 # ── Disable kernel headers archive (avoids cpio issues in CI) ──────────
 # CONFIG_IKHEADERS is not set
 
+# ── POSIX message queues (required by runc to mount /dev/mqueue in containers) ─
+CONFIG_POSIX_MQUEUE=y
+CONFIG_POSIX_MQUEUE_SYSCTL=y
+
 # ── Security features required by the sandbox runtime ───────────────────
 CONFIG_SECURITY_LANDLOCK=y
 CONFIG_SECCOMP_FILTER=y

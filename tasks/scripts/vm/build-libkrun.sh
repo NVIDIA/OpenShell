@@ -93,16 +93,32 @@ install_deps() {
     echo "  libelf-dev libssl-dev bc curl cpio" >&2
   fi
 
-  # Ensure pyelftools is importable by the Python that will run bin2cbundle.py.
-  # The apt package may install to a different Python than the default python3.
-  if ! python3 -c "import elftools" &>/dev/null; then
-    echo "    pyelftools not importable, installing via pip..."
-    python3 -m pip install --break-system-packages pyelftools 2>/dev/null || \
-    python3 -m pip install pyelftools || true
-  fi
 }
 
 install_deps
+
+# libkrunfw's Makefile invokes `python3` from PATH for bin2cbundle.py. A mise shim,
+# project venv, or other early PATH entry often shadows /usr/bin/python3 and does
+# not ship pyelftools even when python3-pyelftools is installed for the distro.
+ensure_python3_with_pyelftools_for_libkrunfw() {
+  echo "    Checking Python 3 + pyelftools (libkrunfw bin2cbundle.py)..."
+  if python3 -c 'from elftools.elf.elffile import ELFFile' 2>/dev/null; then
+    echo "       OK ($(command -v python3))"
+    return 0
+  fi
+  if [ -x /usr/bin/python3 ] && /usr/bin/python3 -c 'from elftools.elf.elffile import ELFFile' 2>/dev/null; then
+    export PATH="/usr/bin:${PATH}"
+    echo "       Using /usr/bin/python3 (PATH python3 lacked pyelftools; system Python has it)."
+    return 0
+  fi
+  echo "ERROR: Python 3 with pyelftools is required to build libkrunfw (kernel.c generation)." >&2
+  echo "       Install:  Debian/Ubuntu: sudo apt-get install -y python3-pyelftools" >&2
+  echo "                Fedora/RHEL:   sudo dnf install -y python3-pyelftools" >&2
+  echo "                pip:         python3 -m pip install --user pyelftools" >&2
+  echo "       If the package is installed but this still fails, PATH may point at another python3 (mise, venv)." >&2
+  echo "       Try:  PATH=/usr/bin:\$PATH mise run vm:setup" >&2
+  exit 1
+}
 
 # ── Setup build directory ───────────────────────────────────────────────
 
@@ -113,6 +129,8 @@ cd "$BUILD_DIR"
 
 echo ""
 echo "==> Building libkrunfw with custom kernel config..."
+
+ensure_python3_with_pyelftools_for_libkrunfw
 
 if [ ! -d libkrunfw ]; then
   echo "    Cloning libkrunfw (pinned: ${LIBKRUNFW_REF:-HEAD})..."
@@ -221,54 +239,168 @@ make -j"$(nproc)"
 cp libkrunfw.so* "$OUTPUT_DIR/"
 echo "    Built: $(ls "$OUTPUT_DIR"/libkrunfw.so* | xargs -n1 basename | tr '\n' ' ')"
 
-# ── Export kernel.c for cross-platform builds ───────────────────────────
-# kernel.c is a C source file containing the compiled Linux kernel as a byte
-# array.  It is architecture-specific (aarch64 vs x86_64) but OS-agnostic —
-# any C compiler can turn it into a .so or .dylib.  We export it so the macOS
-# job can produce libkrunfw.dylib without rebuilding the kernel.
-
-ABI_VERSION="$(grep -oE 'ABI_VERSION\s*=\s*[0-9]+' Makefile | head -1 | sed 's/[^0-9]//g')"
-
-if [ -f kernel.c ]; then
-  cp kernel.c "$OUTPUT_DIR/kernel.c"
-  echo "${ABI_VERSION}" > "$OUTPUT_DIR/ABI_VERSION"
-  echo "    Exported kernel.c ($(du -sh kernel.c | cut -f1)) and ABI_VERSION=${ABI_VERSION}"
-else
-  echo "Warning: kernel.c not found — cross-platform builds will not work" >&2
-fi
-
 cd "$BUILD_DIR"
 
 # ── Build libkrun (VMM) ─────────────────────────────────────────────────
 
+# libkrun's Makefile invokes plain `cargo`. Ubuntu/Debian often put /usr/bin/cargo
+# (e.g. 1.75) ahead of mise/rustup; upstream requires edition 2024 (Cargo >= 1.85).
+ensure_cargo_for_libkrun() {
+  local min_ver="${LIBKRUN_MIN_CARGO_VERSION:-1.85}"
+  local have ver_line bindir candidates_mise candidates_home
+
+  cargo_meets_min() {
+    local bin="$1"
+    local v
+    [ -x "$bin" ] || return 1
+    v="$("$bin" --version 2>/dev/null | awk '{print $2}')"
+    [ -n "$v" ] || return 1
+    [ "$(printf '%s\n' "${min_ver}" "$v" | sort -V | head -n1)" = "${min_ver}" ]
+  }
+
+  echo "    Checking Cargo (libkrun needs >= ${min_ver}, edition 2024)..."
+  if cargo_meets_min "$(command -v cargo 2>/dev/null || true)"; then
+    echo "       OK ($(command -v cargo) — $(cargo --version))"
+    return 0
+  fi
+
+  candidates_mise=""
+  if command -v mise &>/dev/null; then
+    if ver_line="$(mise which cargo 2>/dev/null)" && [ -n "${ver_line}" ]; then
+      candidates_mise="$(dirname "${ver_line}")"
+    fi
+  fi
+  candidates_home="${HOME}/.cargo/bin"
+
+  for bindir in "${candidates_mise}" "${candidates_home}"; do
+    [ -n "${bindir}" ] || continue
+    if cargo_meets_min "${bindir}/cargo"; then
+      export PATH="${bindir}:${PATH}"
+      echo "       Using ${bindir}/cargo ($("${bindir}/cargo" --version))"
+      return 0
+    fi
+  done
+
+  echo "ERROR: Cargo >= ${min_ver} is required to build libkrun (Rust edition 2024)." >&2
+  echo "       Current: $(command -v cargo 2>/dev/null || echo '(no cargo in PATH)') $(cargo --version 2>/dev/null || true)" >&2
+  echo "       Typical fix: run vm:setup via mise from the repo so Rust stable is on PATH," >&2
+  echo "       or:  rustup update stable && export PATH=\"\$HOME/.cargo/bin:\$PATH\"" >&2
+  echo "       Override minimum: LIBKRUN_MIN_CARGO_VERSION=…" >&2
+  exit 1
+}
+
+# Directory must contain libclang.so or libclang-<ver>.so (what clang-sys expects
+# for linking; bare .so.N sonames alone are not enough).
+_libclang_dir_usable() {
+  local d="$1"
+  [ -n "$d" ] && [ -d "$d" ] || return 1
+  if [ -e "$d/libclang.so" ]; then
+    return 0
+  fi
+  local f base
+  for f in "$d"/libclang-*.so; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+    case "$base" in
+      *-cpp.so*) continue ;;
+    esac
+    if [[ "$base" == libclang-*.so ]] && [[ "$base" != *.so.[0-9]* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_libclang_for_libkrun() {
+  local user_libclang="${LIBCLANG_PATH:-}"
+
+  if [ -n "$user_libclang" ] && _libclang_dir_usable "$user_libclang"; then
+    export LIBCLANG_PATH="$user_libclang"
+    echo "    LIBCLANG_PATH=$LIBCLANG_PATH (from environment)"
+    return 0
+  fi
+
+  if [ -n "$user_libclang" ]; then
+    echo "    Warning: LIBCLANG_PATH='$user_libclang' has no libclang.so or libclang-*.so symlink;" >&2
+    echo "             those are required for clang-sys. Searching other system locations..." >&2
+  fi
+  unset LIBCLANG_PATH
+
+  local llvm_lib
+  if command -v llvm-config &>/dev/null; then
+    llvm_lib="$(llvm-config --libdir 2>/dev/null)" || true
+    if [ -n "${llvm_lib}" ] && _libclang_dir_usable "$llvm_lib"; then
+      export LIBCLANG_PATH="$llvm_lib"
+      echo "    LIBCLANG_PATH=$LIBCLANG_PATH (from llvm-config --libdir)"
+      return 0
+    fi
+  fi
+
+  shopt -s nullglob
+  local candidates=(/usr/lib/llvm-*/lib)
+  shopt -u nullglob
+  while IFS= read -r llvm_lib; do
+    [ -n "$llvm_lib" ] || continue
+    if _libclang_dir_usable "$llvm_lib"; then
+      export LIBCLANG_PATH="$llvm_lib"
+      echo "    LIBCLANG_PATH=$LIBCLANG_PATH (from /usr/lib/llvm-*/lib)"
+      return 0
+    fi
+  done < <(printf '%s\n' "${candidates[@]}" | sort -rV)
+
+  local multi
+  multi="$(gcc -print-multiarch 2>/dev/null || true)"
+  if [ -n "$multi" ] && _libclang_dir_usable "/usr/lib/${multi}"; then
+    export LIBCLANG_PATH="/usr/lib/${multi}"
+    echo "    LIBCLANG_PATH=$LIBCLANG_PATH (from gcc multiarch /usr/lib/${multi})"
+    return 0
+  fi
+
+  if _libclang_dir_usable "/usr/lib64"; then
+    export LIBCLANG_PATH="/usr/lib64"
+    echo "    LIBCLANG_PATH=$LIBCLANG_PATH (from /usr/lib64)"
+    return 0
+  fi
+
+  echo "ERROR: libclang is required to build libkrun (Rust bindgen / clang-sys) but was not found." >&2
+  if [ -n "$user_libclang" ]; then
+    echo "       You had LIBCLANG_PATH='$user_libclang' (ignored after search failed)." >&2
+  fi
+  echo "       Install LLVM/Clang development packages, then re-run vm:setup:" >&2
+  echo "         Debian/Ubuntu: sudo apt-get install -y libclang-dev" >&2
+  echo "         Fedora/RHEL:   sudo dnf install -y clang-devel" >&2
+  echo "       Then unset LIBCLANG_PATH or set it to a directory that contains libclang.so." >&2
+  exit 1
+}
+
 echo ""
 echo "==> Building libkrun..."
 
+ensure_cargo_for_libkrun
+ensure_libclang_for_libkrun
+
+LIBKRUN_REF="${LIBKRUN_REF:-v1.17.4}"
+
 if [ ! -d libkrun ]; then
   echo "    Cloning libkrun..."
-  git clone --depth 1 https://github.com/containers/libkrun.git
+  git clone https://github.com/containers/libkrun.git
 fi
 
 cd libkrun
 
-# Build with NET support for gvproxy networking and BLK support for the
-# host-backed state disk.
-echo "    Building libkrun with NET=1 BLK=1..."
-
-# Locate libclang for clang-sys if LIBCLANG_PATH isn't already set.
-# clang-sys looks for libclang.so or libclang-*.so; on Debian/Ubuntu the
-# versioned file (e.g. libclang-18.so.18) lives under the LLVM lib dir.
-if [ -z "${LIBCLANG_PATH:-}" ]; then
-  for llvm_lib in /usr/lib/llvm-*/lib; do
-    if ls "$llvm_lib"/libclang*.so* &>/dev/null; then
-      export LIBCLANG_PATH="$llvm_lib"
-      echo "    LIBCLANG_PATH=$LIBCLANG_PATH"
-      break
-    fi
-  done
+if [ -n "${LIBKRUN_REF:-}" ]; then
+  echo "    Checking out pinned ref: ${LIBKRUN_REF}"
+  git fetch origin "${LIBKRUN_REF}" 2>/dev/null || git fetch origin
+  git checkout "${LIBKRUN_REF}" 2>/dev/null || git checkout "origin/${LIBKRUN_REF}" 2>/dev/null || true
 fi
 
-make NET=1 BLK=1 -j"$(nproc)"
+if [ -f init/Makefile ] || grep -q 'init/init' Makefile 2>/dev/null; then
+  echo "    Building init/init binary..."
+  make init/init
+fi
+
+echo "    Building libkrun with NET=1 BLK=1..."
+cargo build --release --features blk --features net --target-dir="$(pwd)/target"
 
 # Copy output
 cp target/release/libkrun.so "$OUTPUT_DIR/"
@@ -283,7 +415,6 @@ echo "==> Build complete!"
 echo "    Output directory: ${OUTPUT_DIR}"
 echo ""
 echo "    Artifacts:"
-ls -lah "$OUTPUT_DIR"/*.so* "$OUTPUT_DIR"/kernel.c "$OUTPUT_DIR"/ABI_VERSION 2>/dev/null || \
 ls -lah "$OUTPUT_DIR"/*.so*
 
 echo ""

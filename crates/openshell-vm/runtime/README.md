@@ -27,21 +27,20 @@ runtime/
 
 ## Build Pipeline
 
-The kernel is compiled on Linux CI runners. macOS reuses the pre-built `kernel.c`
-artifact from the Linux ARM64 build — no krunvm or Fedora VM needed.
+Each platform builds its own kernel and runtime natively.
 
 ```
-Linux ARM64:  builds aarch64 kernel -> .so + exports kernel.c  (parallel)
-Linux AMD64:  builds x86_64 kernel  -> .so                     (parallel)
-macOS ARM64:  reuses aarch64 kernel.c -> .dylib                (depends on ARM64)
+Linux ARM64:  builds aarch64 kernel -> .so  (parallel)
+Linux AMD64:  builds x86_64 kernel  -> .so  (parallel)
+macOS ARM64:  builds aarch64 kernel -> .dylib
 ```
 
 ### Build Scripts
 
 | Script | Platform | What it does |
 |--------|----------|-------------|
-| `tasks/scripts/vm/build-libkrun.sh` | Linux | Builds libkrunfw + libkrun from source, exports kernel.c |
-| `tasks/scripts/vm/build-libkrun-macos.sh` | macOS | Compiles pre-built kernel.c into .dylib, builds libkrun |
+| `tasks/scripts/vm/build-libkrun.sh` | Linux | Builds libkrunfw + libkrun from source |
+| `tasks/scripts/vm/build-libkrun-macos.sh` | macOS | Builds libkrunfw + libkrun from source |
 | `tasks/scripts/vm/package-vm-runtime.sh` | Any | Packages runtime tarball (libs + gvproxy + provenance) |
 
 ### Quick Build (Linux)
@@ -56,14 +55,12 @@ FROM_SOURCE=1 mise run vm:setup
 
 ### Quick Build (macOS)
 
-On macOS, you need a pre-built `kernel.c` from a Linux ARM64 build:
-
 ```bash
 # Download pre-built runtime (recommended, ~30s):
 mise run vm:setup
 
-# Or if you have kernel.c from a Linux build:
-tasks/scripts/vm/build-libkrun-macos.sh --kernel-dir target/libkrun-build
+# Or build from source:
+FROM_SOURCE=1 mise run vm:setup
 ```
 
 ### Output
@@ -74,8 +71,6 @@ Build artifacts are placed in `target/libkrun-build/`:
 target/libkrun-build/
   libkrun.so / libkrun.dylib       # The VMM library
   libkrunfw.so* / libkrunfw.dylib  # Kernel firmware library
-  kernel.c                         # Linux kernel as C byte array (Linux only)
-  ABI_VERSION                      # ABI version number (Linux only)
 ```
 
 ## Networking
