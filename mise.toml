@@ -23,6 +23,7 @@ helm = "4.1.1"
 "ubi:mozilla/sccache" = { version = "0.14.0", matching = "sccache-v" }
 "ubi:anchore/syft" = { version = "1.42.3", matching = "syft_" }
 "ubi:EmbarkStudios/cargo-about" = "0.8.4"
+zig = "0.14.1"
 
 [env]
 _.path = ["{{config_root}}/scripts/bin"]
