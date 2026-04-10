@@ -76,6 +76,7 @@ tracing-subscriber = { workspace = true }
 workspace = true
 
 [features]
+bundled-z3 = ["openshell-prover/bundled-z3"]
 dev-settings = ["openshell-core/dev-settings"]
 
 [dev-dependencies]

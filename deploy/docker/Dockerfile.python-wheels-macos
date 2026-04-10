@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     clang \
+    cmake \
     curl \
     libssl-dev \
     pkg-config \
@@ -78,7 +79,7 @@ RUN mkdir -p crates/openshell-cli/src crates/openshell-core/src crates/openshell
 RUN --mount=type=cache,id=cargo-registry-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-python-wheels-macos-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    cargo build --release --target aarch64-apple-darwin -p openshell-cli 2>/dev/null || true
+    cargo build --release --target aarch64-apple-darwin -p openshell-cli --features bundled-z3 2>/dev/null || true
 
 # Copy actual source code and Python packaging files.
 COPY crates/ crates/
@@ -109,7 +110,7 @@ RUN --mount=type=cache,id=cargo-registry-python-wheels-macos-${TARGETARCH},shari
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi && \
-    maturin build --release --target aarch64-apple-darwin --out /wheels
+    maturin build --release --target aarch64-apple-darwin --features bundled-z3 --out /wheels
 
 FROM scratch AS wheels
 COPY --from=builder /wheels/*.whl /
