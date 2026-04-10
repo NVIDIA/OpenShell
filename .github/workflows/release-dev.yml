@@ -220,6 +220,12 @@ jobs:
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
 
       - name: Build ${{ matrix.target }}
+        env:
+          # musl-tools only provides musl-gcc (C); z3 bundled build needs a
+          # C++ compiler.  The system g++ works because z3's public API uses
+          # C linkage and libstdc++ is statically linked in the final binary.
+          CXX_aarch64_unknown_linux_musl: g++
+          CXX_x86_64_unknown_linux_musl: g++
         run: mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-cli --features bundled-z3
 
       - name: sccache stats

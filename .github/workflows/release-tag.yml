@@ -242,6 +242,9 @@ jobs:
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
 
       - name: Build ${{ matrix.target }}
+        env:
+          CXX_aarch64_unknown_linux_musl: g++
+          CXX_x86_64_unknown_linux_musl: g++
         run: mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-cli --features bundled-z3
 
       - name: sccache stats
