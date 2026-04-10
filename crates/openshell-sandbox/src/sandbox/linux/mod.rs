@@ -12,6 +12,39 @@ use miette::Result;
 use std::path::PathBuf;
 use std::sync::Once;
 
+/// Opaque handle to a prepared-but-not-yet-enforced sandbox.
+/// Holds the Landlock ruleset with PathFds opened as root.
+pub struct PreparedSandbox {
+    landlock: Option<landlock::PreparedRuleset>,
+    policy: SandboxPolicy,
+}
+
+/// Phase 1: Prepare sandbox restrictions **as root** (before `drop_privileges`).
+///
+/// Opens Landlock PathFds while the process still has root privileges,
+/// ensuring paths like mode-700 directories are accessible.
+pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<PreparedSandbox> {
+    let landlock = landlock::prepare(policy, workdir)?;
+    Ok(PreparedSandbox {
+        landlock,
+        policy: policy.clone(),
+    })
+}
+
+/// Phase 2: Enforce prepared sandbox restrictions (after `drop_privileges`).
+///
+/// Calls `restrict_self()` for Landlock and applies seccomp filters.
+/// Neither operation requires root privileges.
+pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
+    if let Some(ruleset) = prepared.landlock {
+        landlock::enforce(ruleset)?;
+    }
+    seccomp::apply(&prepared.policy)?;
+    Ok(())
+}
+
+/// Legacy single-phase apply. Kept for backward compatibility.
+/// New callers should use [`prepare`] + [`enforce`] for correct privilege ordering.
 pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
     landlock::apply(policy, workdir)?;
     seccomp::apply(policy)?;

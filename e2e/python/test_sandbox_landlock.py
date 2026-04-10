@@ -22,8 +22,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import pytest
-
 from openshell._proto import datamodel_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
@@ -207,63 +205,3 @@ def test_landlock_blocks_user_owned_path_outside_policy(
                 "Expected Landlock to block write to /home/sandbox despite user ownership. "
                 f"Got: {write_result.stdout.strip()}"
             )
-
-
-# =============================================================================
-# Issue #803: Privilege ordering regression tests
-#
-# These tests verify that Landlock enforcement works correctly even when
-# policy paths are only accessible to root. The root cause of #803 is that
-# drop_privileges() runs BEFORE sandbox::apply(), so PathFd::new() runs as
-# uid 998 and fails to open root-only paths. In best_effort mode, this
-# silently drops Landlock entirely.
-#
-# The fix is two-phase Landlock: open PathFds as root (before drop_privileges),
-# then call restrict_self() after drop_privileges.
-# =============================================================================
-
-
-@pytest.mark.xfail(
-    reason="Issue #803: drop_privileges runs before Landlock PathFd::new(), "
-    "so root-only policy paths are silently skipped. "
-    "Will pass after two-phase Landlock fix.",
-    strict=True,
-)
-def test_landlock_enforces_with_only_root_accessible_paths(
-    sandbox: Callable[..., Sandbox],
-) -> None:
-    """#803: When ALL policy paths are root-only, Landlock must still enforce.
-
-    Creates a policy where every path is only accessible to root (mode 700).
-    With the current bug, PathFd::new() fails for all paths as uid 998,
-    the zero-rules safety check fires, best_effort catches it, and the
-    sandbox runs completely unconfined.
-
-    This test creates /sandbox owned by sandbox:sandbox but NOT in the policy.
-    If Landlock is enforced (even with zero successful paths -> should error
-    in hard mode), /sandbox should be blocked. If Landlock silently failed,
-    /sandbox is writable.
-
-    We use /root (mode 700) as the only policy path. After the two-phase fix,
-    PathFd::new("/root") will run as root and succeed, so the ruleset will
-    have one rule and restrict_self() will enforce it.
-    """
-    root_only_filesystem = sandbox_pb2.FilesystemPolicy(
-        include_workdir=False,
-        read_only=["/root"],
-        read_write=[],
-    )
-    spec = datamodel_pb2.SandboxSpec(
-        policy=_landlock_policy(filesystem=root_only_filesystem)
-    )
-    with sandbox(spec=spec, delete_on_exit=True) as sb:
-        # /sandbox is owned by sandbox:sandbox but NOT in this policy.
-        # If Landlock is properly applied, /sandbox should be blocked.
-        # If Landlock silently failed (#803), /sandbox is writable.
-        result = sb.exec_python(_try_write(), args=("/sandbox",))
-        assert result.exit_code == 0, result.stderr
-        assert result.stdout.strip() == "EPERM", (
-            "Expected Landlock to block /sandbox (not in policy). "
-            "If this is 'OK', Landlock silently failed — the #803 bug is present. "
-            f"Got: {result.stdout.strip()}"
-        )

@@ -160,6 +160,13 @@ impl ProcessHandle {
         #[cfg(target_os = "linux")]
         sandbox::linux::log_sandbox_readiness(policy, workdir);
 
+        // Phase 1 (as root): Prepare Landlock ruleset by opening PathFds.
+        // This MUST happen before drop_privileges() so that root-only paths
+        // (e.g. mode 700 directories) can be opened. See issue #803.
+        #[cfg(target_os = "linux")]
+        let prepared_sandbox = sandbox::linux::prepare(policy, workdir)
+            .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
+
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
@@ -167,7 +174,10 @@ impl ProcessHandle {
         // setpgid and setns are async-signal-safe and safe to call in this context.
         {
             let policy = policy.clone();
-            let workdir = workdir.map(str::to_string);
+            // Wrap in Option so we can .take() it out of the FnMut closure.
+            // pre_exec is only called once (after fork, before exec).
+            #[cfg(target_os = "linux")]
+            let mut prepared_sandbox = Some(prepared_sandbox);
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
@@ -184,14 +194,20 @@ impl ProcessHandle {
                         }
                     }
 
-                    // Drop privileges before applying sandbox restrictions.
-                    // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
-                    // which may be blocked by Landlock.
+                    // Drop privileges. initgroups/setgid/setuid need access to
+                    // /etc/group and /etc/passwd which would be blocked if
+                    // Landlock were already enforced.
                     drop_privileges(&policy)
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
 
-                    sandbox::apply(&policy, workdir.as_deref())
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    // Phase 2 (as unprivileged user): Enforce the prepared
+                    // Landlock ruleset via restrict_self() + apply seccomp.
+                    // restrict_self() does not require root.
+                    #[cfg(target_os = "linux")]
+                    if let Some(prepared) = prepared_sandbox.take() {
+                        sandbox::linux::enforce(prepared)
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    }
 
                     Ok(())
                 });
