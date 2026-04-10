@@ -111,6 +111,38 @@ pub fn log_sandbox_readiness(policy: &SandboxPolicy, workdir: Option<&str>) {
         _ => {
             // Landlock is NOT available — this is the critical log that was
             // previously invisible because it only fired inside pre_exec.
+            let is_best_effort = matches!(
+                policy.landlock.compatibility,
+                crate::policy::LandlockCompatibility::BestEffort
+            );
+            let (desc, msg) = if is_best_effort {
+                (
+                    format!(
+                        "Sandbox will run WITHOUT filesystem restrictions: {availability}. \
+                         Policy requests {total_paths} path rule(s) \
+                         (ro:{} rw:{}) but Landlock cannot enforce them. \
+                         Set landlock.compatibility to 'hard_requirement' to make this fatal.",
+                        read_only.len(),
+                        read_write.len(),
+                    ),
+                    format!(
+                        "Landlock filesystem sandbox unavailable (best_effort, degraded): {availability}"
+                    ),
+                )
+            } else {
+                (
+                    format!(
+                        "Landlock is unavailable: {availability}. \
+                         Policy requires {total_paths} path rule(s) \
+                         (ro:{} rw:{}) with hard_requirement — sandbox startup will fail.",
+                        read_only.len(),
+                        read_write.len(),
+                    ),
+                    format!(
+                        "Landlock filesystem sandbox unavailable (hard_requirement, will fail): {availability}"
+                    ),
+                )
+            };
             openshell_ocsf::ocsf_emit!(
                 openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
                     .activity(openshell_ocsf::ActivityId::Open)
@@ -122,19 +154,9 @@ pub fn log_sandbox_readiness(policy: &SandboxPolicy, workdir: Option<&str>) {
                             "landlock-unavailable",
                             "Landlock Filesystem Sandbox Unavailable",
                         )
-                        .with_desc(&format!(
-                            "Sandbox will run WITHOUT filesystem restrictions: {availability}. \
-                             Policy requests {total_paths} path rule(s) \
-                             (ro:{} rw:{}, compat:{:?}) but Landlock cannot enforce them. \
-                             Set landlock.compatibility to 'hard_requirement' to make this fatal.",
-                            read_only.len(),
-                            read_write.len(),
-                            policy.landlock.compatibility,
-                        )),
+                        .with_desc(&desc),
                     )
-                    .message(format!(
-                        "Landlock filesystem sandbox unavailable: {availability}"
-                    ))
+                    .message(msg)
                     .build()
             );
         }

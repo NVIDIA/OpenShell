@@ -92,6 +92,7 @@ pub fn probe_availability() -> LandlockAvailability {
 /// `drop_privileges()` — `restrict_self()` does not require elevated privileges.
 pub struct PreparedRuleset {
     ruleset: landlock::RulesetCreated,
+    compatibility: LandlockCompatibility,
 }
 
 /// Phase 1: Open PathFds and build the Landlock ruleset **as root**.
@@ -189,7 +190,10 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
                 .build()
         );
 
-        Ok(PreparedRuleset { ruleset })
+        Ok(PreparedRuleset {
+            ruleset,
+            compatibility: compatibility.clone(),
+        })
     })();
 
     match result {
@@ -228,8 +232,40 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
 /// This runs **after** `drop_privileges()`. The `restrict_self()` syscall does
 /// not require root — it only restricts the calling thread (and its future
 /// children), which is always permitted.
+///
+/// Respects the same `best_effort` / `hard_requirement` compatibility as
+/// [`prepare`]: if `restrict_self()` fails and the policy is `best_effort`,
+/// the error is logged and the sandbox continues without Landlock.
 pub fn enforce(prepared: PreparedRuleset) -> Result<()> {
-    prepared.ruleset.restrict_self().into_diagnostic()?;
+    let result = prepared.ruleset.restrict_self().into_diagnostic();
+    if let Err(err) = result {
+        if matches!(prepared.compatibility, LandlockCompatibility::BestEffort) {
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
+                    .activity(openshell_ocsf::ActivityId::Open)
+                    .severity(openshell_ocsf::SeverityId::High)
+                    .confidence(openshell_ocsf::ConfidenceId::High)
+                    .is_alert(true)
+                    .finding_info(
+                        openshell_ocsf::FindingInfo::new(
+                            "landlock-enforce-failed",
+                            "Landlock restrict_self Failed",
+                        )
+                        .with_desc(&format!(
+                            "Ruleset was prepared but restrict_self() failed: {err}. \
+                             Running WITHOUT filesystem restrictions. \
+                             Set landlock.compatibility to 'hard_requirement' to make this fatal."
+                        )),
+                    )
+                    .message(format!(
+                        "Landlock restrict_self failed (best_effort): {err}"
+                    ))
+                    .build()
+            );
+            return Ok(());
+        }
+        return Err(err);
+    }
     Ok(())
 }
 
