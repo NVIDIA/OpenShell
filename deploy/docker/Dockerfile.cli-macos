@@ -61,25 +61,28 @@ COPY crates/openshell-core/Cargo.toml     crates/openshell-core/Cargo.toml
 COPY crates/openshell-policy/Cargo.toml   crates/openshell-policy/Cargo.toml
 COPY crates/openshell-providers/Cargo.toml crates/openshell-providers/Cargo.toml
 COPY crates/openshell-tui/Cargo.toml      crates/openshell-tui/Cargo.toml
+COPY crates/openshell-prover/Cargo.toml   crates/openshell-prover/Cargo.toml
 COPY crates/openshell-core/build.rs       crates/openshell-core/build.rs
 COPY proto/ proto/
 
 # Scope workspace to CLI crates only — avoids compiling aws-lc-sys (pulled
 # by russh in openshell-sandbox/openshell-server) which is difficult to
 # cross-compile and unnecessary for the CLI binary.
-RUN sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-cli", "crates/openshell-core", "crates/openshell-bootstrap", "crates/openshell-policy", "crates/openshell-providers", "crates/openshell-tui"]|' Cargo.toml
+RUN sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-cli", "crates/openshell-core", "crates/openshell-bootstrap", "crates/openshell-policy", "crates/openshell-prover", "crates/openshell-providers", "crates/openshell-tui"]|' Cargo.toml
 
 RUN mkdir -p crates/openshell-cli/src \
              crates/openshell-core/src \
              crates/openshell-bootstrap/src \
              crates/openshell-policy/src \
              crates/openshell-providers/src \
+             crates/openshell-prover/src \
              crates/openshell-tui/src && \
     echo "fn main() {}" > crates/openshell-cli/src/main.rs && \
     touch crates/openshell-core/src/lib.rs && \
     touch crates/openshell-bootstrap/src/lib.rs && \
     touch crates/openshell-policy/src/lib.rs && \
     touch crates/openshell-providers/src/lib.rs && \
+    touch crates/openshell-prover/src/lib.rs && \
     touch crates/openshell-tui/src/lib.rs
 
 RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
