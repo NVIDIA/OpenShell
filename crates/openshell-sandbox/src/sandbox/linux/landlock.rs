@@ -12,6 +12,81 @@ use miette::{IntoDiagnostic, Result};
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
+/// Result of probing the kernel for Landlock support.
+#[derive(Debug)]
+pub enum LandlockAvailability {
+    /// Landlock is available with the given ABI version.
+    Available { abi: i32 },
+    /// Kernel does not implement Landlock (ENOSYS).
+    NotImplemented,
+    /// Landlock is compiled in but not enabled at boot (EOPNOTSUPP).
+    NotEnabled,
+    /// Landlock syscall is blocked, likely by a container seccomp profile (EPERM).
+    Blocked,
+    /// Unexpected error from the probe syscall.
+    Unknown(i32),
+}
+
+impl std::fmt::Display for LandlockAvailability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Available { abi } => write!(f, "available (ABI v{abi})"),
+            Self::NotImplemented => {
+                write!(f, "not implemented (kernel lacks CONFIG_SECURITY_LANDLOCK)")
+            }
+            Self::NotEnabled => write!(
+                f,
+                "not enabled (Landlock built into kernel but not in active LSM list)"
+            ),
+            Self::Blocked => write!(
+                f,
+                "blocked (container seccomp profile denies Landlock syscalls)"
+            ),
+            Self::Unknown(errno) => write!(f, "unexpected probe error (errno {errno})"),
+        }
+    }
+}
+
+/// Probe the kernel for Landlock support by issuing the `landlock_create_ruleset`
+/// syscall with the version-check flag.
+///
+/// This is safe to call from the parent process and does not create any file
+/// descriptors or modify process state.
+pub fn probe_availability() -> LandlockAvailability {
+    // landlock_create_ruleset syscall number (same on x86_64 and aarch64).
+    const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+    // Flag: return the highest supported ABI version instead of creating a ruleset.
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1 << 0;
+
+    // SAFETY: landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)
+    // is a read-only probe that returns the ABI version or an error code.
+    // It does not allocate file descriptors or modify process state.
+    #[allow(unsafe_code)]
+    let ret = unsafe {
+        libc::syscall(
+            SYS_LANDLOCK_CREATE_RULESET,
+            std::ptr::null::<libc::c_void>(),
+            0_usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+
+    if ret >= 0 {
+        #[allow(clippy::cast_possible_truncation)]
+        LandlockAvailability::Available { abi: ret as i32 }
+    } else {
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(0);
+        match errno {
+            libc::ENOSYS => LandlockAvailability::NotImplemented,
+            libc::EOPNOTSUPP => LandlockAvailability::NotEnabled,
+            libc::EPERM => LandlockAvailability::Blocked,
+            other => LandlockAvailability::Unknown(other),
+        }
+    }
+}
+
 pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
     let read_only = policy.filesystem.read_only.clone();
     let mut read_write = policy.filesystem.read_write.clone();
@@ -310,5 +385,24 @@ mod tests {
         // (the OpenCall variant is #[non_exhaustive] and can't be constructed directly).
         let err = PathFd::new("/nonexistent/openshell/classify/test").unwrap_err();
         assert_eq!(classify_path_fd_error(&err), "path does not exist");
+    }
+
+    #[test]
+    fn probe_availability_returns_a_result() {
+        // The probe should not panic regardless of whether Landlock is available.
+        // On Linux hosts with Landlock, this returns Available; on Docker Desktop
+        // linuxkit or older kernels, it returns NotImplemented/NotEnabled/Blocked.
+        let result = probe_availability();
+        let display = format!("{result}");
+        assert!(
+            !display.is_empty(),
+            "probe_availability Display should produce output"
+        );
+        // Verify the Debug impl works too.
+        let debug = format!("{result:?}");
+        assert!(
+            !debug.is_empty(),
+            "probe_availability Debug should produce output"
+        );
     }
 }

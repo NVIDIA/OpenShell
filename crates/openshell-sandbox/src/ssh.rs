@@ -898,6 +898,10 @@ fn spawn_pty_shell(
         cmd.current_dir(dir);
     }
 
+    // Probe Landlock availability from the parent process where tracing works.
+    #[cfg(target_os = "linux")]
+    crate::sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
+
     #[cfg(unix)]
     {
         unsafe_pty::install_pre_exec(
@@ -1033,6 +1037,10 @@ fn spawn_pipe_exec(
     if let Some(dir) = workdir.as_deref() {
         cmd.current_dir(dir);
     }
+
+    // Probe Landlock availability from the parent process where tracing works.
+    #[cfg(target_os = "linux")]
+    crate::sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
 
     #[cfg(unix)]
     {

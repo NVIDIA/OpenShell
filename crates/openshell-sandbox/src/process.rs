@@ -154,6 +154,12 @@ impl ProcessHandle {
             }
         }
 
+        // Probe Landlock availability and emit OCSF logs from the parent
+        // process where the tracing subscriber is functional. The child's
+        // pre_exec context cannot reliably emit structured logs.
+        #[cfg(target_os = "linux")]
+        sandbox::linux::log_sandbox_readiness(policy, workdir);
+
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
