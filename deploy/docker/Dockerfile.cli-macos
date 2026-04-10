@@ -53,6 +53,9 @@ ENV AR_aarch64_apple_darwin=aarch64-apple-darwin25.1-ar
 ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=oa64-clang
 ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_AR=aarch64-apple-darwin25.1-ar
 ENV SDKROOT=/osxcross/SDK/MacOSX.sdk
+ENV MACOSX_DEPLOYMENT_TARGET=13.3
+ENV CFLAGS_aarch64_apple_darwin=--target=arm64-apple-macosx\ -mmacosx-version-min=13.3
+ENV CXXFLAGS_aarch64_apple_darwin=--target=arm64-apple-macosx\ -mmacosx-version-min=13.3
 ENV BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin=--target=arm64-apple-macosx\ -isysroot\ ${SDKROOT}
 
 # ---------------------------------------------------------------------------
