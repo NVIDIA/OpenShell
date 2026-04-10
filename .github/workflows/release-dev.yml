@@ -227,11 +227,13 @@ jobs:
             chmod +x "/tmp/zig-musl/${tool}"
           done
 
-          # Tell cargo / cc-rs / cmake to use zig for the musl target
+          # Tell cargo / cc-rs / cmake to use zig for C/C++ compilation.
+          # Do NOT set the linker — Rust's default linker (system cc/gcc)
+          # works correctly because Rust ships its own musl CRT objects.
+          # Using zig as the linker causes duplicate _start symbols.
           TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
           echo "CC_${TARGET_ENV}=/tmp/zig-musl/cc" >> "$GITHUB_ENV"
           echo "CXX_${TARGET_ENV}=/tmp/zig-musl/c++" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_${TARGET_ENV^^}_LINKER=/tmp/zig-musl/cc" >> "$GITHUB_ENV"
 
       - name: Scope workspace to CLI crates
         run: |
