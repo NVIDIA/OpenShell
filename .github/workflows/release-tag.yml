@@ -231,15 +231,28 @@ jobs:
         run: |
           set -euo pipefail
           ZIG="$(mise which zig)"
+          ZIG_TARGET="${{ matrix.zig_target }}"
           mkdir -p /tmp/zig-musl
-          printf '#!/bin/sh\nexec "%s" cc --target=${{ matrix.zig_target }} "$@"\n' "$ZIG" > /tmp/zig-musl/cc
-          printf '#!/bin/sh\nexec "%s" c++ --target=${{ matrix.zig_target }} "$@"\n' "$ZIG" > /tmp/zig-musl/cxx
-          chmod +x /tmp/zig-musl/cc /tmp/zig-musl/cxx
+
+          # cc-rs injects --target=<rust-triple> (e.g. aarch64-unknown-linux-musl)
+          # which zig cannot parse.  The wrappers strip any --target flags and use
+          # the correct zig target instead.
+          for tool in cc c++; do
+            cat > "/tmp/zig-musl/${tool}" <<WRAPPER
+          #!/bin/bash
+          args=()
+          for arg in "\$@"; do
+            case "\$arg" in --target=*) ;; *) args+=("\$arg") ;; esac
+          done
+          exec "$ZIG" $tool --target=$ZIG_TARGET "\${args[@]}"
+          WRAPPER
+            chmod +x "/tmp/zig-musl/${tool}"
+          done
 
           # Tell cargo / cc-rs / cmake to use zig for the musl target
           TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
           echo "CC_${TARGET_ENV}=/tmp/zig-musl/cc" >> "$GITHUB_ENV"
-          echo "CXX_${TARGET_ENV}=/tmp/zig-musl/cxx" >> "$GITHUB_ENV"
+          echo "CXX_${TARGET_ENV}=/tmp/zig-musl/c++" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_${TARGET_ENV^^}_LINKER=/tmp/zig-musl/cc" >> "$GITHUB_ENV"
 
       - name: Scope workspace to CLI crates
