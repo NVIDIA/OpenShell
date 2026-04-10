@@ -150,9 +150,8 @@ jobs:
   # ---------------------------------------------------------------------------
   # Build CLI binaries (Linux musl — static, native on each arch)
   #
-  # Builds run directly on the CI host (glibc Ubuntu).  The system g++ is
-  # used for C++ compilation (z3) with _FORTIFY_SOURCE disabled to avoid
-  # glibc-specific hardened symbols that do not exist in musl.
+  # Builds run directly on the CI host (glibc Ubuntu).  Zig provides musl
+  # C/C++ toolchains for bundled-z3 and ring, and is also used as the linker.
   # ---------------------------------------------------------------------------
   build-cli-linux:
     name: Build CLI (Linux ${{ matrix.arch }})
@@ -163,9 +162,11 @@ jobs:
           - arch: amd64
             runner: build-amd64
             target: x86_64-unknown-linux-musl
+            zig_target: x86_64-linux-musl
           - arch: arm64
             runner: build-arm64
             target: aarch64-unknown-linux-musl
+            zig_target: aarch64-linux-musl
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     container:
@@ -202,27 +203,36 @@ jobs:
       - name: Add Rust musl target
         run: mise x -- rustup target add ${{ matrix.target }}
 
-      - name: Set up musl C++ wrapper
+      - name: Set up zig musl wrappers
         run: |
           set -euo pipefail
-          # System g++ with _FORTIFY_SOURCE disabled.  FORTIFY_SOURCE makes
-          # g++ emit glibc-specific hardened calls (__printf_chk, __memcpy_chk)
-          # that do not exist in musl, causing linker failures.  Disabling it
-          # produces standard POSIX calls that resolve against musl.
-          printf '#!/bin/sh\nexec g++ -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 "$@"\n' \
-            > /usr/local/bin/musl-g++
-          chmod +x /usr/local/bin/musl-g++
+          ZIG="$(mise which zig)"
+          ZIG_TARGET="${{ matrix.zig_target }}"
+          mkdir -p /tmp/zig-musl
 
-          # Point both CC and CXX at wrappers that disable _FORTIFY_SOURCE.
-          # CC must be set explicitly or cc-rs probes for aarch64-linux-musl-gcc
-          # which does not exist on the Ubuntu CI host.
-          printf '#!/bin/sh\nexec cc -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 "$@"\n' \
-            > /usr/local/bin/musl-cc
-          chmod +x /usr/local/bin/musl-cc
+          # cc-rs injects --target=<rust-triple> (for example
+          # aarch64-unknown-linux-musl), which zig does not parse.  Strip any
+          # caller-provided --target and use the wrapper's zig-native target.
+          for tool in cc c++; do
+            printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    --target=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec "%s" %s --target=%s "${args[@]}"\n' \
+              "$ZIG" "$tool" "$ZIG_TARGET" > "/tmp/zig-musl/${tool}"
+            chmod +x "/tmp/zig-musl/${tool}"
+          done
 
           TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
-          echo "CC_${TARGET_ENV}=/usr/local/bin/musl-cc" >> "$GITHUB_ENV"
-          echo "CXX_${TARGET_ENV}=/usr/local/bin/musl-g++" >> "$GITHUB_ENV"
+          TARGET_ENV_UPPER=${TARGET_ENV^^}
+
+          # Use zig for C/C++ compilation and final linking.
+          echo "CC_${TARGET_ENV}=/tmp/zig-musl/cc" >> "$GITHUB_ENV"
+          echo "CXX_${TARGET_ENV}=/tmp/zig-musl/c++" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=/tmp/zig-musl/cc" >> "$GITHUB_ENV"
+
+          # Let zig own CRT/startfiles to avoid duplicate _start symbols.
+          echo "CARGO_TARGET_${TARGET_ENV_UPPER}_RUSTFLAGS=-Clink-self-contained=no" >> "$GITHUB_ENV"
+
+          # z3 built with zig c++ uses libc++ symbols (std::__1::*).
+          # Override z3-sys default (stdc++) so Rust links the matching runtime.
+          echo "CXXSTDLIB=c++" >> "$GITHUB_ENV"
 
       - name: Scope workspace to CLI crates
         run: |
