@@ -50,11 +50,11 @@ install_cross_toolchain() {
     arm64)
       dpkg --add-architecture arm64
       apt-get update && apt-get install -y --no-install-recommends \
-        gcc-aarch64-linux-gnu libc6-dev-arm64-cross ;;
+        gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross ;;
     amd64)
       dpkg --add-architecture amd64
       apt-get update && apt-get install -y --no-install-recommends \
-        gcc-x86-64-linux-gnu libc6-dev-amd64-cross ;;
+        gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libc6-dev-amd64-cross ;;
   esac
   rm -rf /var/lib/apt/lists/*
 }
