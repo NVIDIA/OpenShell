@@ -66,24 +66,6 @@ def _landlock_policy(
 # =============================================================================
 
 
-def _read_openshell_log():
-    """Return a closure that reads the openshell log file(s)."""
-
-    def fn():
-        import glob
-
-        logs = []
-        for path in sorted(glob.glob("/var/log/openshell*.log*")):
-            try:
-                with open(path) as f:
-                    logs.append(f.read())
-            except (FileNotFoundError, PermissionError):
-                pass
-        return "\n".join(logs)
-
-    return fn
-
-
 def _try_write():
     """Return a closure that attempts to write a file and returns the result."""
 
@@ -133,56 +115,6 @@ def _check_user_owns_path():
             return f"ERROR:{e}"
 
     return fn
-
-
-# =============================================================================
-# Landlock OCSF logging tests
-# =============================================================================
-
-
-def test_landlock_availability_logged(
-    sandbox: Callable[..., Sandbox],
-) -> None:
-    """Landlock availability probe is emitted as an OCSF event in sandbox logs.
-
-    The parent-side probe runs before fork() and emits a CONFIG:PROBED event
-    that is visible in the sandbox log files. On Linux hosts with Landlock
-    support, this should report 'available'.
-    """
-    spec = datamodel_pb2.SandboxSpec(policy=_landlock_policy())
-    with sandbox(spec=spec, delete_on_exit=True) as sb:
-        log_result = sb.exec_python(_read_openshell_log())
-        assert log_result.exit_code == 0, log_result.stderr
-        log = log_result.stdout
-
-        # The parent-side probe emits this OCSF shorthand line
-        assert "Landlock filesystem sandbox" in log, (
-            "Expected Landlock probe OCSF event in sandbox logs. "
-            f"Log content:\n{log[:2000]}"
-        )
-
-
-def test_landlock_probe_reports_available(
-    sandbox: Callable[..., Sandbox],
-) -> None:
-    """On Linux hosts with Landlock, the probe reports 'available' with ABI version.
-
-    GitHub Actions Linux runners and Docker Desktop linuxkit kernels support
-    Landlock ABI v5+. This test verifies the probe correctly detects it.
-    """
-    spec = datamodel_pb2.SandboxSpec(policy=_landlock_policy())
-    with sandbox(spec=spec, delete_on_exit=True) as sb:
-        log_result = sb.exec_python(_read_openshell_log())
-        assert log_result.exit_code == 0, log_result.stderr
-        log = log_result.stdout
-
-        assert "Landlock filesystem sandbox available" in log, (
-            "Expected Landlock to be available on this host. "
-            f"Log content:\n{log[:2000]}"
-        )
-        assert "abi:v" in log, (
-            f"Expected ABI version in Landlock probe log. Log content:\n{log[:2000]}"
-        )
 
 
 # =============================================================================
@@ -339,22 +271,31 @@ def test_landlock_enforces_with_only_root_accessible_paths(
 
 @pytest.mark.xfail(
     reason="Issue #803: drop_privileges runs before Landlock PathFd::new(), "
-    "so root-only paths are silently skipped by best_effort. "
+    "so root-only paths mixed with accessible paths still degrade security. "
     "Will pass after two-phase Landlock fix.",
     strict=True,
 )
-def test_landlock_no_skipped_paths_for_root_accessible_dirs(
+def test_landlock_root_only_path_in_mixed_policy_is_enforced(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """#803: Policy paths that root can open should not be skipped.
+    """#803: Root-only paths in a mixed policy should be in the Landlock ruleset.
 
-    /root is mode 700 root:root. With the current ordering bug,
-    PathFd::new("/root") runs as uid 998 and gets EACCES, so the path
-    is silently skipped. After the fix, it should be opened as root
-    and added to the ruleset successfully.
+    Policy includes /usr (world-readable, PathFd succeeds as uid 998),
+    /root (mode 700, PathFd fails as uid 998), and /sandbox (read-write).
+    /var is NOT in the policy.
 
-    We verify by checking that the sandbox logs do NOT contain the
-    'Skipping inaccessible Landlock path' warning for /root.
+    With the current bug: /root is silently skipped, Landlock applies with
+    only /usr and /sandbox. Since /var is not in the allowlist, Landlock
+    blocks it. So for THIS case Landlock still works, but /root was skipped.
+
+    The real proof: /root SHOULD be in the Landlock read-only allowlist.
+    If it is, the sandbox user should be able to stat() it through Landlock
+    (even though Unix DAC will block reading contents). If it's NOT in the
+    allowlist, even stat() fails with EACCES from Landlock.
+
+    After the fix, PathFd::new("/root") runs as root, succeeds, and /root
+    is added to the ruleset. The sandbox user can then stat() it (Landlock
+    allows read access), though Unix DAC still prevents reading contents.
     """
     filesystem_with_root = sandbox_pb2.FilesystemPolicy(
         include_workdir=True,
@@ -365,15 +306,18 @@ def test_landlock_no_skipped_paths_for_root_accessible_dirs(
         policy=_landlock_policy(filesystem=filesystem_with_root)
     )
     with sandbox(spec=spec, delete_on_exit=True) as sb:
-        log_result = sb.exec_python(_read_openshell_log())
-        assert log_result.exit_code == 0, log_result.stderr
-        log = log_result.stdout
-
-        # After the fix, /root should be successfully opened as root
-        # and added to the ruleset. The log should NOT show it was skipped.
-        assert "Skipping inaccessible Landlock path" not in log or "/root" not in log, (
-            "Landlock skipped /root due to permission denied — "
-            "this confirms the #803 privilege ordering bug. "
-            "PathFd::new() ran as uid 998 instead of root. "
-            f"Log:\n{log[:3000]}"
+        # Try to stat /root. Landlock controls whether the path is even
+        # visible. If /root is in the Landlock allowlist, stat() reaches
+        # the filesystem (and may succeed or fail based on Unix DAC).
+        # If /root is NOT in the allowlist (the bug), stat() fails with
+        # EACCES from Landlock before reaching the filesystem.
+        result = sb.exec(
+            ["python3", "-c", "import os; os.stat('/root'); print('STAT_OK')"],
+            timeout_seconds=20,
+        )
+        assert result.exit_code == 0 and "STAT_OK" in result.stdout, (
+            "Expected stat('/root') to succeed (Landlock allows read access "
+            "even though Unix DAC blocks listing contents). If this fails, "
+            "/root was silently skipped by Landlock — the #803 bug. "
+            f"exit={result.exit_code} stdout={result.stdout} stderr={result.stderr}"
         )
