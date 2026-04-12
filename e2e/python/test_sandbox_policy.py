@@ -694,8 +694,10 @@ def test_ssrf_log_shows_blocked_address(
 ) -> None:
     """SSRF-3: Proxy log includes block reason when SSRF check fires.
 
-    Loopback addresses are always-blocked even with implicit allowed_ips.
-    The log should show 'always-blocked' for 127.0.0.1.
+    Loopback addresses are always-blocked.  Since implicit_allowed_ips_for_ip_host
+    now skips always-blocked hosts, 127.0.0.1 falls through to the default
+    resolve_and_reject_internal path which blocks it as an internal address.
+    The shorthand log should include 'ssrf' and a '[reason:' tag for denied events.
     """
     policy = _base_policy(
         network_policies={
@@ -718,6 +720,10 @@ def test_ssrf_log_shows_blocked_address(
         # OCSF shorthand uses "engine:ssrf" for SSRF blocks
         assert "engine:ssrf" in log.lower() or "ssrf" in log.lower(), (
             f"Expected SSRF block indicator in proxy log, got:\n{log}"
+        )
+        # Shorthand for denied events should include [reason:...] tag
+        assert "[reason:" in log.lower(), (
+            f"Expected [reason:] tag in denied event shorthand, got:\n{log}"
         )
 
 
@@ -839,7 +845,13 @@ def test_ssrf_private_ip_allowed_with_literal_ip_host(
 def test_ssrf_loopback_blocked_even_with_allowed_ips(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """SSRF-7: Loopback always blocked even when allowed_ips covers 127.0.0.0/8."""
+    """SSRF-7: Loopback always blocked even when allowed_ips covers 127.0.0.0/8.
+
+    With always-blocked validation, parse_allowed_ips rejects 127.0.0.0/8 at
+    connection time (returns Err), so the proxy treats this as "invalid
+    allowed_ips in policy" and returns 403.  The end result is the same:
+    loopback is never reachable.
+    """
     policy = _base_policy(
         network_policies={
             "internal": sandbox_pb2.NetworkPolicyRule(

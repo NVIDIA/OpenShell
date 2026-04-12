@@ -10,6 +10,7 @@ use crate::opa::{NetworkAction, OpaEngine};
 use crate::policy::ProxyPolicy;
 use crate::secrets::{SecretResolver, rewrite_header_line};
 use miette::{IntoDiagnostic, Result};
+use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
     NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
@@ -1442,49 +1443,25 @@ fn query_tls_mode(
     }
 }
 
-/// Check if an IP address is internal (loopback, private RFC1918, link-local, or unspecified).
-///
-/// This is a defense-in-depth check to prevent SSRF via the CONNECT proxy.
-/// It covers:
-/// - IPv4 loopback (127.0.0.0/8), private (10/8, 172.16/12, 192.168/16), link-local (169.254/16), unspecified (`0.0.0.0`)
-/// - IPv6 loopback (`::1`), link-local (`fe80::/10`), ULA (`fc00::/7`), unspecified (`::`)
-/// - IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) are unwrapped and checked as IPv4
-fn is_internal_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() {
-                return true;
-            }
-            // fe80::/10 — IPv6 link-local
-            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
-                return true;
-            }
-            // fc00::/7 — IPv6 unique local addresses (ULA)
-            if (v6.segments()[0] & 0xfe00) == 0xfc00 {
-                return true;
-            }
-            // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified();
-            }
-            false
-        }
-    }
-}
-
 /// When the policy endpoint host is a literal IP address, the user has
 /// explicitly declared intent to allow that destination.  Synthesize an
 /// `allowed_ips` entry so the existing allowlist-validation path is used
-/// instead of the blanket internal-IP rejection.  Loopback and link-local
-/// addresses are still blocked by `resolve_and_check_allowed_ips`.
+/// instead of the blanket internal-IP rejection.
+///
+/// Always-blocked addresses (loopback, link-local, unspecified) are skipped
+/// — synthesizing an `allowed_ips` entry for them would be silently
+/// un-enforceable at runtime.
 fn implicit_allowed_ips_for_ip_host(host: &str) -> Vec<String> {
-    if host.parse::<IpAddr>().is_ok() {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_always_blocked_ip(ip) {
+            warn!(
+                host,
+                "Policy host is an always-blocked address; \
+                 implicit allowed_ips skipped — SSRF hardening prevents \
+                 traffic to this destination regardless of policy"
+            );
+            return vec![];
+        }
         vec![host.to_string()]
     } else {
         vec![]
@@ -1520,31 +1497,6 @@ async fn resolve_and_reject_internal(
     }
 
     Ok(addrs)
-}
-
-/// Check if an IP address is always blocked regardless of policy.
-///
-/// Loopback, link-local, and unspecified addresses are never allowed even when an endpoint
-/// has `allowed_ips` configured. This prevents proxy bypass (loopback) and
-/// cloud metadata SSRF (link-local 169.254.x.x).
-fn is_always_blocked_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local() || v4.is_unspecified(),
-        IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() {
-                return true;
-            }
-            // fe80::/10 — IPv6 link-local
-            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
-                return true;
-            }
-            // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback() || v4.is_link_local() || v4.is_unspecified();
-            }
-            false
-        }
-    }
 }
 
 /// Resolve DNS and validate resolved addresses against a CIDR/IP allowlist.
@@ -1616,11 +1568,15 @@ const BLOCKED_CONTROL_PLANE_PORTS: &[u16] = &[
 ];
 
 /// Parse CIDR/IP strings into `IpNet` values, rejecting invalid entries and
-/// entries that cover loopback or link-local ranges.
+/// entries that overlap always-blocked ranges (loopback, link-local,
+/// unspecified).
 ///
 /// Returns parsed networks on success, or an error describing which entries
-/// are invalid. Logs a warning for overly broad CIDRs.
+/// are invalid or always-blocked.  Logs a warning for overly broad CIDRs
+/// that are not outright blocked.
 fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, String> {
+    use openshell_core::net::is_always_blocked_net;
+
     let mut nets = Vec::with_capacity(raw.len());
     let mut errors = Vec::new();
 
@@ -1638,6 +1594,19 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
 
         match parsed {
             Ok(n) => {
+                // Reject entries that overlap always-blocked ranges — these
+                // would be silently denied at runtime by is_always_blocked_ip
+                // and cause confusing UX (accepted in policy, never works).
+                if is_always_blocked_net(n) {
+                    errors.push(format!(
+                        "allowed_ips entry {entry} falls within always-blocked range \
+                         (loopback/link-local/unspecified); remove this entry — \
+                         SSRF hardening prevents traffic to these destinations \
+                         regardless of policy"
+                    ));
+                    continue;
+                }
+
                 if n.prefix_len() < MIN_SAFE_PREFIX_LEN {
                     let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
                         .activity(ActivityId::Other)
@@ -2240,8 +2209,9 @@ async fn handle_forward_proxy(
                             )
                             .firewall_rule(policy_str, "ssrf")
                             .message(format!(
-                                "FORWARD blocked: allowed_ips check failed for {host_lc}:{port}: {reason}"
+                                "FORWARD blocked: allowed_ips check failed for {host_lc}:{port}"
                             ))
+                            .status_detail(&reason)
                             .build();
                         ocsf_emit!(event);
                     }
@@ -2278,8 +2248,9 @@ async fn handle_forward_proxy(
                         )
                         .firewall_rule(policy_str, "ssrf")
                         .message(format!(
-                            "FORWARD blocked: invalid allowed_ips in policy for {host_lc}:{port}: {reason}"
+                            "FORWARD blocked: invalid allowed_ips in policy for {host_lc}:{port}"
                         ))
+                        .status_detail(&reason)
                         .build();
                     ocsf_emit!(event);
                 }
@@ -2320,8 +2291,9 @@ async fn handle_forward_proxy(
                         )
                         .firewall_rule(policy_str, "ssrf")
                         .message(format!(
-                            "FORWARD blocked: internal IP without allowed_ips for {host_lc}:{port}: {reason}"
+                            "FORWARD blocked: internal IP without allowed_ips for {host_lc}:{port}"
                         ))
+                        .status_detail(&reason)
                         .build();
                     ocsf_emit!(event);
                 }
@@ -2895,7 +2867,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_check_allowed_ips_blocks_loopback() {
-        let nets = parse_allowed_ips(&["127.0.0.0/8".to_string()]).unwrap();
+        // Construct nets directly (parse_allowed_ips now rejects always-blocked).
+        let nets = vec!["127.0.0.0/8".parse::<ipnet::IpNet>().unwrap()];
         let result = resolve_and_check_allowed_ips("127.0.0.1", 80, &nets).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2907,7 +2880,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_check_allowed_ips_blocks_metadata() {
-        let nets = parse_allowed_ips(&["169.254.0.0/16".to_string()]).unwrap();
+        // Construct nets directly (parse_allowed_ips now rejects always-blocked).
+        let nets = vec!["169.254.0.0/16".parse::<ipnet::IpNet>().unwrap()];
         let result = resolve_and_check_allowed_ips("169.254.169.254", 80, &nets).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2919,7 +2893,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_check_allowed_ips_blocks_unspecified() {
-        let nets = parse_allowed_ips(&["0.0.0.0/0".to_string()]).unwrap();
+        // Construct nets directly (parse_allowed_ips now rejects always-blocked).
+        let nets = vec!["0.0.0.0/0".parse::<ipnet::IpNet>().unwrap()];
         let result = resolve_and_check_allowed_ips("0.0.0.0", 80, &nets).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2946,7 +2921,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_check_allowed_ips_blocks_control_plane_ports() {
-        let nets = parse_allowed_ips(&["0.0.0.0/0".to_string()]).unwrap();
+        // Use a public CIDR (parse_allowed_ips now rejects 0.0.0.0/0).
+        let nets = parse_allowed_ips(&["8.8.8.0/24".to_string()]).unwrap();
         // K8s API server port
         let result = resolve_and_check_allowed_ips("8.8.8.8", 6443, &nets).await;
         assert!(result.is_err());
@@ -2976,6 +2952,90 @@ mod tests {
         // Broad CIDRs are accepted (just warned about) -- design trade-off
         let result = parse_allowed_ips(&["10.0.0.0/8".to_string()]);
         assert!(result.is_ok());
+    }
+
+    // --- parse_allowed_ips: always-blocked rejection tests ---
+
+    #[test]
+    fn test_parse_allowed_ips_rejects_loopback_cidr() {
+        let result = parse_allowed_ips(&["127.0.0.0/8".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("always-blocked"));
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_rejects_link_local_cidr() {
+        let result = parse_allowed_ips(&["169.254.0.0/16".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("always-blocked"));
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_rejects_unspecified() {
+        let result = parse_allowed_ips(&["0.0.0.0".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("always-blocked"));
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_rejects_single_loopback_ip() {
+        let result = parse_allowed_ips(&["127.0.0.1".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("always-blocked"));
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_rejects_single_metadata_ip() {
+        let result = parse_allowed_ips(&["169.254.169.254".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("always-blocked"));
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_rejects_wildcard_cidr() {
+        let result = parse_allowed_ips(&["0.0.0.0/0".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("always-blocked"));
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_mixed_valid_and_blocked() {
+        // A blocked entry taints the whole batch.
+        let result = parse_allowed_ips(&["10.0.5.0/24".to_string(), "127.0.0.1".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("always-blocked"));
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_accepts_rfc1918() {
+        let result = parse_allowed_ips(&["10.0.5.0/24".to_string(), "192.168.1.0/24".to_string()]);
+        assert!(result.is_ok());
+    }
+
+    // --- implicit_allowed_ips_for_ip_host: always-blocked skip tests ---
+
+    #[test]
+    fn test_implicit_allowed_ips_skips_loopback() {
+        let result = implicit_allowed_ips_for_ip_host("127.0.0.1");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_implicit_allowed_ips_skips_link_local() {
+        let result = implicit_allowed_ips_for_ip_host("169.254.169.254");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_implicit_allowed_ips_skips_unspecified() {
+        let result = implicit_allowed_ips_for_ip_host("0.0.0.0");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_implicit_allowed_ips_allows_rfc1918() {
+        let result = implicit_allowed_ips_for_ip_host("10.0.5.20");
+        assert_eq!(result, vec!["10.0.5.20"]);
     }
 
     // --- extract_host_from_uri tests ---
@@ -3244,7 +3304,8 @@ mod tests {
     #[tokio::test]
     async fn test_forward_loopback_always_blocked_even_with_allowed_ips() {
         // Loopback addresses are always blocked, even if in allowed_ips.
-        let nets = parse_allowed_ips(&["127.0.0.0/8".to_string()]).unwrap();
+        // Construct nets directly (parse_allowed_ips now rejects always-blocked).
+        let nets = vec!["127.0.0.0/8".parse::<ipnet::IpNet>().unwrap()];
         let result = resolve_and_check_allowed_ips("127.0.0.1", 80, &nets).await;
         assert!(result.is_err(), "Loopback should be always blocked");
         let err = result.unwrap_err();
@@ -3257,7 +3318,8 @@ mod tests {
     #[tokio::test]
     async fn test_forward_link_local_always_blocked_even_with_allowed_ips() {
         // Link-local / cloud metadata addresses are always blocked.
-        let nets = parse_allowed_ips(&["169.254.0.0/16".to_string()]).unwrap();
+        // Construct nets directly (parse_allowed_ips now rejects always-blocked).
+        let nets = vec!["169.254.0.0/16".parse::<ipnet::IpNet>().unwrap()];
         let result = resolve_and_check_allowed_ips("169.254.169.254", 80, &nets).await;
         assert!(result.is_err(), "Link-local should be always blocked");
         let err = result.unwrap_err();
@@ -3276,9 +3338,10 @@ mod tests {
     }
 
     #[test]
-    fn test_implicit_allowed_ips_returns_ip_for_ipv6_literal() {
+    fn test_implicit_allowed_ips_skips_ipv6_loopback() {
+        // ::1 is always-blocked, so implicit allowed_ips should be empty.
         let result = implicit_allowed_ips_for_ip_host("::1");
-        assert_eq!(result, vec!["::1"]);
+        assert!(result.is_empty());
     }
 
     #[test]

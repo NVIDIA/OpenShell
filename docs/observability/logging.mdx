@@ -34,8 +34,8 @@ In the log file, OCSF events appear in a shorthand format with an `OCSF` level l
 2026-04-01T04:04:13.074Z INFO openshell_sandbox: Creating OPA engine from proto policy data
 2026-04-01T04:04:13.078Z OCSF CONFIG:VALIDATED [INFO] Validated 'sandbox' user exists in image
 2026-04-01T04:04:32.118Z OCSF NET:OPEN [INFO] ALLOWED /usr/bin/curl(58) -> api.github.com:443 [policy:github_api engine:opa]
-2026-04-01T04:04:32.190Z OCSF HTTP:GET [INFO] ALLOWED GET http://api.github.com/zen [policy:github_api]
-2026-04-01T04:04:32.690Z OCSF NET:OPEN [MED] DENIED /usr/bin/curl(64) -> httpbin.org:443 [policy:- engine:opa]
+2026-04-01T04:04:32.190Z OCSF HTTP:GET [INFO] ALLOWED GET http://api.github.com/zen [policy:github_api engine:opa]
+2026-04-01T04:04:32.690Z OCSF NET:OPEN [MED] DENIED /usr/bin/curl(64) -> httpbin.org:443 [policy:- engine:opa] [reason:no matching policy]
 ```
 
 The `OCSF` label at column 25 distinguishes structured events from standard `INFO` tracing at the same position. Both formats appear in the same file.
@@ -44,7 +44,7 @@ When viewed through the CLI or TUI, which receive logs via gRPC, the same distin
 
 ```text
 [1775014132.118] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/curl(58) -> api.github.com:443 [policy:github_api engine:opa]
-[1775014132.690] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(64) -> httpbin.org:443 [policy:- engine:opa]
+[1775014132.690] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(64) -> httpbin.org:443 [policy:- engine:opa] [reason:no matching policy]
 [1775014113.058] [sandbox] [INFO ] [openshell_sandbox] Starting sandbox
 ```
 
@@ -109,13 +109,19 @@ OCSF NET:OPEN [INFO] ALLOWED /usr/bin/curl(58) -> api.github.com:443 [policy:git
 An L7 read-only policy denying a POST:
 
 ```text
-OCSF HTTP:POST [MED] DENIED POST http://api.github.com/user/repos [policy:github_api]
+OCSF HTTP:POST [MED] DENIED POST http://api.github.com/user/repos [policy:github_api engine:opa]
 ```
 
 A connection denied because no policy matched:
 
 ```text
-OCSF NET:OPEN [MED] DENIED /usr/bin/curl(64) -> httpbin.org:443 [policy:- engine:opa]
+OCSF NET:OPEN [MED] DENIED /usr/bin/curl(64) -> httpbin.org:443 [policy:- engine:opa] [reason:no matching policy]
+```
+
+A connection denied because the destination resolves to an always-blocked address:
+
+```text
+OCSF NET:OPEN [MED] DENIED /usr/bin/curl(1618) -> 169.254.169.254:80 [policy:- engine:ssrf] [reason:resolves to always-blocked address]
 ```
 
 Proxy and SSH servers ready:

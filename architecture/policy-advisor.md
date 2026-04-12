@@ -53,15 +53,23 @@ The `mechanistic_mapper` module (`crates/openshell-sandbox/src/mechanistic_mappe
 1. Groups denial summaries by `(host, port, binary)` — one proposal per unique triple
 2. For each group, generates a `NetworkPolicyRule` allowing that endpoint for that binary
 3. Generates idempotent rule names via `generate_rule_name(host, port)` producing deterministic names like `allow_httpbin_org_443` — DB-level dedup handles uniqueness, no collision checking needed
-4. Resolves each host via DNS; if any resolved IP is private (RFC 1918, loopback, link-local), populates `allowed_ips` in the proposed endpoint for the SSRF override
-5. Computes confidence scores based on:
+4. **Filters always-blocked destinations.** Before DNS resolution, `is_always_blocked_destination(host)` checks if the host is a literal always-blocked IP (loopback, link-local, unspecified) or the hostname `localhost`. If so, the proposal is skipped with an info log and `continue`. This prevents an infinite TUI notification loop: the proxy denies these destinations regardless of policy, so they re-trigger denials every flush cycle without any possible fix. The helper lives in the mapper module and delegates to `openshell_core::net::is_always_blocked_ip` for literal IP addresses.
+5. Resolves each host via DNS; if any resolved IP is private (RFC 1918, loopback, link-local), populates `allowed_ips` in the proposed endpoint for the SSRF override. The `resolve_allowed_ips_if_private` function filters out always-blocked IPs from the resolved address list before populating `allowed_ips` — only RFC 1918/ULA addresses survive. If *all* resolved IPs are always-blocked (e.g., a host that resolves solely to `127.0.0.1`), the function returns an empty vec.
+6. Computes confidence scores based on:
    - Denial count (higher count = higher confidence)
    - Port recognition (well-known ports like 443, 5432 get a boost)
    - SSRF origin (SSRF denials get lower confidence)
-6. Generates security notes for private IPs, database ports, and ephemeral port ranges
-7. If L7 request samples are present, generates specific L7 rules (method + path) with `protocol: rest` (TLS termination is automatic — no `tls` field needed). Plumbed but not yet fed data — see issue #205.
+7. Generates security notes for private IPs, database ports, and ephemeral port ranges
+8. If L7 request samples are present, generates specific L7 rules (method + path) with `protocol: rest` (TLS termination is automatic — no `tls` field needed). Plumbed but not yet fed data — see issue #205.
 
 The mapper runs in `flush_proposals_to_gateway` after the aggregator drains. It produces `PolicyChunk` protos that are sent alongside the raw `DenialSummary` protos to the gateway.
+
+#### Shared IP Classification Helpers
+
+IP classification functions (`is_always_blocked_ip`, `is_always_blocked_net`, `is_internal_ip`) live in `openshell_core::net` (`crates/openshell-core/src/net.rs`). They are shared across the sandbox proxy (runtime SSRF enforcement), the mechanistic mapper (proposal filtering), and the gateway server (defense-in-depth validation on approval). The distinction between the two tiers:
+
+- **Always-blocked** (`is_always_blocked_ip`): loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`, `fe80::/10`), unspecified (`0.0.0.0`, `::`), and IPv4-mapped IPv6 equivalents. These are blocked unconditionally — no policy can override them.
+- **Internal** (`is_internal_ip`): a superset that adds RFC 1918 (`10/8`, `172.16/12`, `192.168/16`) and IPv6 ULA (`fc00::/7`). These are blocked by default but can be allowed via `allowed_ips` in policy rules.
 
 ### Gateway: Validate and Persist
 
@@ -74,6 +82,16 @@ The gateway's `SubmitPolicyAnalysis` handler (`crates/openshell-server/src/grpc.
 5. Notifies watchers so the TUI refreshes
 
 The gateway does not store denial summaries (they are included in the request for future audit trail use but not persisted today). It does not run the mapper or any analysis.
+
+#### Always-Blocked Validation on Approval
+
+`merge_chunk_into_policy` (`crates/openshell-server/src/grpc/policy.rs`) validates proposed rules before merging them into the active policy. The `validate_rule_not_always_blocked` function runs as a defense-in-depth gate, catching rules that the sandbox mapper should have filtered but didn't (e.g., proposals from an older sandbox version):
+
+- Rejects endpoint hosts that parse as always-blocked IPs (loopback, link-local, unspecified)
+- Rejects the literal hostname `localhost` (case-insensitive, with or without trailing dot)
+- Rejects `allowed_ips` entries that parse as always-blocked networks via `is_always_blocked_net`
+
+On failure, the function returns `Status::invalid_argument` with a message explaining that the proxy will deny traffic to the destination regardless of policy. This uses the same `openshell_core::net` helpers as the sandbox-side filtering.
 
 ### Persistence
 
@@ -200,6 +218,20 @@ Keybindings are state-aware:
 |---------------------|---------|-------------|
 | `OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS` | `10` | How often the aggregator flushes and submits proposals |
 | `OPENSHELL_POLICY_POLL_INTERVAL_SECS` | `10` | How often the sandbox polls for policy updates |
+
+## Known Behavior
+
+### Always-Blocked Destinations
+
+Destinations classified as always-blocked (loopback, link-local, unspecified, `localhost`) are filtered at three layers:
+
+1. **Sandbox mapper** — `generate_proposals` skips them before building a `PolicyChunk`
+2. **Sandbox mapper** — `resolve_allowed_ips_if_private` strips always-blocked IPs from `allowed_ips`, returning empty if none survive
+3. **Gateway approval** — `merge_chunk_into_policy` rejects them with `INVALID_ARGUMENT`
+
+If a sandbox process repeatedly attempts connections to these addresses, the proxy denies them every time and the denial aggregator accumulates counts. The mapper discards these summaries silently rather than forwarding un-fixable proposals. Before issue #814, these proposals would reach the TUI and reappear every flush cycle (default 10 seconds) since approving them would have no effect — the proxy blocks them regardless of policy.
+
+Existing `pending` rows for always-blocked destinations that were persisted before this filtering was added remain in the database. They are inert: attempting to approve them now fails at the gateway's `validate_rule_not_always_blocked` check. They can be rejected manually via `openshell rule reject` or left to age out.
 
 ## Future Work (Issue #205)
 

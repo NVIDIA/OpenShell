@@ -3054,6 +3054,7 @@ dependencies = [
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
+ "ipnet",
  "miette",
  "prost",
  "prost-types",
@@ -3191,6 +3192,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "ipnet",
  "k8s-openapi",
  "kube",
  "kube-runtime",

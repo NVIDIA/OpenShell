@@ -12,6 +12,7 @@
 //! The LLM-powered `PolicyAdvisor` (issue #205) wraps and enriches these
 //! mechanistic proposals with context-aware rationale and smarter grouping.
 
+use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use openshell_core::proto::{
     DenialSummary, L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
 };
@@ -99,6 +100,20 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
                     .entry((sample.method.clone(), sample.path.clone()))
                     .or_insert(0) += sample.count;
             }
+        }
+
+        // Skip proposals for always-blocked destinations (loopback,
+        // link-local, unspecified).  These would be denied at runtime by the
+        // proxy's is_always_blocked_ip check regardless of policy, producing
+        // an infinite proposal loop in the TUI.
+        if is_always_blocked_destination(host) {
+            tracing::info!(
+                host,
+                port,
+                "Skipped proposal for always-blocked destination \
+                 (SSRF hardening — loopback/link-local/unspecified)"
+            );
+            continue;
         }
 
         // Resolve the host and check if any IP is private. When a host
@@ -406,33 +421,19 @@ fn short_binary_name(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
-/// Check if an IP address is in private/internal space.
+/// Check if a destination host is always-blocked.
 ///
-/// Matches the same ranges as the proxy's `is_internal_ip`: loopback,
-/// RFC 1918 private, link-local (IPv4), plus loopback, link-local, and
-/// ULA (IPv6). IPv4-mapped IPv6 addresses are unwrapped and checked.
-fn is_internal_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        IpAddr::V6(v6) => {
-            if v6.is_loopback() {
-                return true;
-            }
-            // fe80::/10 — IPv6 link-local
-            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
-                return true;
-            }
-            // fc00::/7 — IPv6 unique local addresses (ULA)
-            if (v6.segments()[0] & 0xfe00) == 0xfc00 {
-                return true;
-            }
-            // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback() || v4.is_private() || v4.is_link_local();
-            }
-            false
-        }
+/// For literal IP hosts, checks against [`is_always_blocked_ip`].
+/// For hostnames like "localhost", checks well-known loopback names.
+/// For other hostnames, returns false (DNS may resolve to anything).
+fn is_always_blocked_destination(host: &str) -> bool {
+    // Check literal IP addresses
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return is_always_blocked_ip(ip);
     }
+    // Check well-known loopback hostnames
+    let host_lc = host.to_lowercase();
+    host_lc == "localhost" || host_lc == "localhost."
 }
 
 /// Resolve a hostname and return the IPs as `allowed_ips` strings only if any
@@ -478,10 +479,28 @@ async fn resolve_allowed_ips_if_private(host: &str, port: u32) -> Vec<String> {
         return Vec::new();
     }
 
-    // Host has private IPs — include all resolved IPs in allowed_ips.
-    let mut ips: Vec<String> = addrs.iter().map(|a| a.ip().to_string()).collect();
+    // Host has private IPs — include non-always-blocked resolved IPs in
+    // allowed_ips.  Always-blocked addresses (loopback, link-local,
+    // unspecified) are filtered out since the proxy will reject them
+    // regardless of policy.
+    let mut ips: Vec<String> = addrs
+        .iter()
+        .filter(|a| !is_always_blocked_ip(a.ip()))
+        .map(|a| a.ip().to_string())
+        .collect();
     ips.sort();
     ips.dedup();
+
+    if ips.is_empty() {
+        // All resolved IPs were always-blocked — no viable allowed_ips.
+        tracing::debug!(
+            host,
+            port,
+            "All resolved IPs are always-blocked; skipping allowed_ips"
+        );
+        return Vec::new();
+    }
+
     tracing::debug!(
         host,
         port,
@@ -688,6 +707,119 @@ mod tests {
         assert!(!is_internal_ip(IpAddr::V6(Ipv6Addr::new(
             0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
         ))));
+    }
+
+    // -- is_always_blocked_destination tests ------------------------------------
+
+    #[test]
+    fn test_always_blocked_destination_loopback_ip() {
+        assert!(is_always_blocked_destination("127.0.0.1"));
+    }
+
+    #[test]
+    fn test_always_blocked_destination_link_local_ip() {
+        assert!(is_always_blocked_destination("169.254.169.254"));
+    }
+
+    #[test]
+    fn test_always_blocked_destination_unspecified_ip() {
+        assert!(is_always_blocked_destination("0.0.0.0"));
+    }
+
+    #[test]
+    fn test_always_blocked_destination_localhost_hostname() {
+        assert!(is_always_blocked_destination("localhost"));
+        assert!(is_always_blocked_destination("LOCALHOST"));
+    }
+
+    #[test]
+    fn test_always_blocked_destination_allows_rfc1918() {
+        assert!(!is_always_blocked_destination("10.0.5.20"));
+        assert!(!is_always_blocked_destination("192.168.1.1"));
+    }
+
+    #[test]
+    fn test_always_blocked_destination_allows_public_hostname() {
+        assert!(!is_always_blocked_destination("api.github.com"));
+    }
+
+    // -- generate_proposals: always-blocked filtering tests --------------------
+
+    #[tokio::test]
+    async fn test_generate_proposals_skips_loopback_destination() {
+        let summaries = vec![DenialSummary {
+            host: "127.0.0.1".to_string(),
+            port: 80,
+            binary: "/usr/bin/curl".to_string(),
+            count: 5,
+            first_seen_ms: 1000,
+            last_seen_ms: 2000,
+            denial_stage: "ssrf".to_string(),
+            ..Default::default()
+        }];
+
+        let proposals = generate_proposals(&summaries).await;
+        assert!(
+            proposals.is_empty(),
+            "should skip proposals for loopback: {proposals:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_proposals_skips_link_local_destination() {
+        let summaries = vec![DenialSummary {
+            host: "169.254.169.254".to_string(),
+            port: 80,
+            binary: "/usr/bin/curl".to_string(),
+            count: 5,
+            first_seen_ms: 1000,
+            last_seen_ms: 2000,
+            denial_stage: "ssrf".to_string(),
+            ..Default::default()
+        }];
+
+        let proposals = generate_proposals(&summaries).await;
+        assert!(
+            proposals.is_empty(),
+            "should skip proposals for link-local: {proposals:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_proposals_skips_localhost_hostname() {
+        let summaries = vec![DenialSummary {
+            host: "localhost".to_string(),
+            port: 8080,
+            binary: "/usr/bin/curl".to_string(),
+            count: 3,
+            first_seen_ms: 1000,
+            last_seen_ms: 2000,
+            denial_stage: "ssrf".to_string(),
+            ..Default::default()
+        }];
+
+        let proposals = generate_proposals(&summaries).await;
+        assert!(
+            proposals.is_empty(),
+            "should skip proposals for localhost: {proposals:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_proposals_keeps_public_destination() {
+        let summaries = vec![DenialSummary {
+            host: "api.github.com".to_string(),
+            port: 443,
+            binary: "/usr/bin/curl".to_string(),
+            count: 5,
+            first_seen_ms: 1000,
+            last_seen_ms: 2000,
+            denial_stage: "connect".to_string(),
+            ..Default::default()
+        }];
+
+        let proposals = generate_proposals(&summaries).await;
+        assert_eq!(proposals.len(), 1, "should keep proposals for public host");
     }
 
     #[test]
