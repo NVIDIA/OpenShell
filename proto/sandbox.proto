@@ -85,6 +85,25 @@ message NetworkEndpoint {
   // If `port` is set and `ports` is empty, `port` is normalized to `ports: [port]`.
   // If both are set, `ports` takes precedence.
   repeated uint32 ports = 9;
+  // Explicit L7 deny rules. When present, requests matching any deny rule
+  // are blocked even if they match an allow rule or access preset.
+  // Deny rules take precedence over allow rules.
+  repeated L7DenyRule deny_rules = 10;
+}
+
+// An L7 deny rule that blocks specific requests.
+// Mirrors L7Allow — same fields, same matching semantics, inverted effect.
+// Deny rules are evaluated after allow rules and take precedence.
+message L7DenyRule {
+  // HTTP method (REST): GET, POST, etc. or "*" for any.
+  string method = 1;
+  // URL path glob pattern (REST): "/repos/*/pulls/*/reviews", "**" for any.
+  string path = 2;
+  // SQL command (SQL): SELECT, INSERT, etc. or "*" for any.
+  string command = 3;
+  // Query parameter matcher map (REST).
+  // Same semantics as L7Allow.query.
+  map<string, L7QueryMatcher> query = 4;
 }
 
 // An L7 policy rule (allow-only).

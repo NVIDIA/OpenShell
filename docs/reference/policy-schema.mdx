@@ -159,6 +159,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
 | `access` | string | No | HTTP access level. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. |
 | `rules` | list of rule objects | No | Fine-grained per-method, per-path allow rules. Mutually exclusive with `access`. |
+| `deny_rules` | list of deny rule objects | No | L7 deny rules that block specific requests even when allowed by `access` or `rules`. Deny rules take precedence over allow rules. |
 | `allowed_ips` | list of string | No | CIDR or IP allowlist for SSRF override. Entries overlapping loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), or unspecified (`0.0.0.0`) are rejected at load time. |
 
 #### Access Levels
@@ -196,6 +197,38 @@ rules:
       query:
         tag:
           any: ["v1.*", "v2.*"]
+```
+
+#### Deny Rule Object
+
+Blocks specific operations on endpoints that otherwise have broad access. Each deny rule
+matches a method and path (and optionally query parameters or SQL commands). Deny rules are
+evaluated after allow rules and take precedence -- if a request matches any deny rule, it is
+blocked regardless of what the allow rules or access preset permit.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `method` | string | No | HTTP method to deny (for example, `POST`, `DELETE`). `*` matches any method. |
+| `path` | string | No | URL path pattern. Same glob syntax as allow rules. |
+| `command` | string | No | SQL command to deny (`SELECT`, `INSERT`, etc.). For `protocol: sql` only. |
+| `query` | map | No | Query parameter matchers. Same syntax as allow rule `query`. |
+
+Example -- grant read-write access to GitHub but block admin operations:
+
+```yaml showLineNumbers={false}
+endpoints:
+  - host: api.github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    access: read-write
+    deny_rules:
+      - method: POST
+        path: "/repos/*/pulls/*/reviews"
+      - method: PUT
+        path: "/repos/*/branches/*/protection"
+      - method: "*"
+        path: "/repos/*/rulesets"
 ```
 
 ### Binary Object

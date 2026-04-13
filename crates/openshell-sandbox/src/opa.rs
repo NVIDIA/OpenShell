@@ -874,6 +874,43 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if !e.allowed_ips.is_empty() {
                         ep["allowed_ips"] = e.allowed_ips.clone().into();
                     }
+                    if !e.deny_rules.is_empty() {
+                        let deny_rules: Vec<serde_json::Value> = e
+                            .deny_rules
+                            .iter()
+                            .map(|d| {
+                                let mut deny = serde_json::json!({});
+                                if !d.method.is_empty() {
+                                    deny["method"] = d.method.clone().into();
+                                }
+                                if !d.path.is_empty() {
+                                    deny["path"] = d.path.clone().into();
+                                }
+                                if !d.command.is_empty() {
+                                    deny["command"] = d.command.clone().into();
+                                }
+                                let query: serde_json::Map<String, serde_json::Value> = d
+                                    .query
+                                    .iter()
+                                    .map(|(key, matcher)| {
+                                        let mut matcher_json = serde_json::json!({});
+                                        if !matcher.glob.is_empty() {
+                                            matcher_json["glob"] = matcher.glob.clone().into();
+                                        }
+                                        if !matcher.any.is_empty() {
+                                            matcher_json["any"] = matcher.any.clone().into();
+                                        }
+                                        (key.clone(), matcher_json)
+                                    })
+                                    .collect();
+                                if !query.is_empty() {
+                                    deny["query"] = query.into();
+                                }
+                                deny
+                            })
+                            .collect();
+                        ep["deny_rules"] = deny_rules.into();
+                    }
                     ep
                 })
                 .collect();
@@ -1932,6 +1969,242 @@ process:
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
         assert_eq!(val, regorus::Value::from(true));
+    }
+
+    // ========================================================================
+    // Deny rules tests
+    // ========================================================================
+
+    const L7_DENY_TEST_DATA: &str = r#"
+network_policies:
+  github_api:
+    name: github_api
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+        deny_rules:
+          - method: POST
+            path: "/repos/*/pulls/*/reviews"
+          - method: PUT
+            path: "/repos/*/branches/*/protection"
+          - method: "*"
+            path: "/repos/*/rulesets"
+    binaries:
+      - { path: /usr/bin/curl }
+  deny_with_query:
+    name: deny_with_query
+    endpoints:
+      - host: api.restricted.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: full
+        deny_rules:
+          - method: POST
+            path: "/admin/**"
+            query:
+              force: "true"
+    binaries:
+      - { path: /usr/bin/curl }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+
+    fn l7_deny_engine() -> OpaEngine {
+        OpaEngine::from_strings(TEST_POLICY, L7_DENY_TEST_DATA)
+            .expect("Failed to load deny test data")
+    }
+
+    #[test]
+    fn l7_deny_rule_blocks_allowed_method_path() {
+        let engine = l7_deny_engine();
+        // POST to reviews is allowed by read-write preset but denied by deny rule
+        let input = l7_input(
+            "api.github.com",
+            443,
+            "POST",
+            "/repos/myorg/pulls/123/reviews",
+        );
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .unwrap();
+        assert_eq!(
+            val,
+            regorus::Value::from(false),
+            "deny rule should block POST to reviews"
+        );
+    }
+
+    #[test]
+    fn l7_deny_rule_allows_non_matching_requests() {
+        let engine = l7_deny_engine();
+        // GET repos/issues is allowed and not denied
+        let input = l7_input("api.github.com", 443, "GET", "/repos/myorg/issues");
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .unwrap();
+        assert_eq!(
+            val,
+            regorus::Value::from(true),
+            "non-denied GET should be allowed"
+        );
+    }
+
+    #[test]
+    fn l7_deny_rule_allows_same_method_different_path() {
+        let engine = l7_deny_engine();
+        // POST to issues is allowed (deny only targets reviews)
+        let input = l7_input("api.github.com", 443, "POST", "/repos/myorg/issues");
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .unwrap();
+        assert_eq!(
+            val,
+            regorus::Value::from(true),
+            "POST to issues should be allowed"
+        );
+    }
+
+    #[test]
+    fn l7_deny_rule_blocks_wildcard_method() {
+        let engine = l7_deny_engine();
+        // GET /repos/myorg/rulesets should be denied (method: "*")
+        let input = l7_input("api.github.com", 443, "GET", "/repos/myorg/rulesets");
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .unwrap();
+        assert_eq!(
+            val,
+            regorus::Value::from(false),
+            "wildcard method deny should block GET"
+        );
+    }
+
+    #[test]
+    fn l7_deny_rule_blocks_put_protection() {
+        let engine = l7_deny_engine();
+        let input = l7_input(
+            "api.github.com",
+            443,
+            "PUT",
+            "/repos/myorg/branches/main/protection",
+        );
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .unwrap();
+        assert_eq!(
+            val,
+            regorus::Value::from(false),
+            "PUT to branch protection should be denied"
+        );
+    }
+
+    #[test]
+    fn l7_deny_reason_populated_when_deny_rule_matches() {
+        let engine = l7_deny_engine();
+        let input = l7_input(
+            "api.github.com",
+            443,
+            "POST",
+            "/repos/myorg/pulls/123/reviews",
+        );
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.openshell.sandbox.request_deny_reason".into())
+            .unwrap();
+        let reason = match val {
+            regorus::Value::String(s) => s.to_string(),
+            _ => String::new(),
+        };
+        assert!(
+            reason.contains("deny rule"),
+            "Expected deny rule reason, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn l7_deny_rule_with_query_blocks_matching_params() {
+        let engine = l7_deny_engine();
+        // POST /admin/settings with force=true should be denied
+        let input = l7_input_with_query(
+            "api.restricted.com",
+            443,
+            "POST",
+            "/admin/settings",
+            serde_json::json!({"force": ["true"]}),
+        );
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .unwrap();
+        assert_eq!(
+            val,
+            regorus::Value::from(false),
+            "deny with matching query should block"
+        );
+    }
+
+    #[test]
+    fn l7_deny_rule_with_query_allows_non_matching_params() {
+        let engine = l7_deny_engine();
+        // POST /admin/settings with force=false should be allowed (query doesn't match deny)
+        let input = l7_input_with_query(
+            "api.restricted.com",
+            443,
+            "POST",
+            "/admin/settings",
+            serde_json::json!({"force": ["false"]}),
+        );
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .unwrap();
+        assert_eq!(
+            val,
+            regorus::Value::from(true),
+            "deny with non-matching query should allow"
+        );
+    }
+
+    #[test]
+    fn l7_deny_rule_without_matching_query_key_allows() {
+        let engine = l7_deny_engine();
+        // POST /admin/settings with no query params -- deny rule has query.force=true,
+        // so no match (key not present) and request should be allowed
+        let input = l7_input("api.restricted.com", 443, "POST", "/admin/settings");
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .unwrap();
+        assert_eq!(
+            val,
+            regorus::Value::from(true),
+            "deny without matching query key should allow"
+        );
     }
 
     // ========================================================================

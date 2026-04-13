@@ -15,7 +15,7 @@ use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    FilesystemPolicy, L7Allow, L7QueryMatcher, L7Rule, LandlockPolicy, NetworkBinary,
+    FilesystemPolicy, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, LandlockPolicy, NetworkBinary,
     NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
@@ -100,6 +100,8 @@ struct NetworkEndpointDef {
     rules: Vec<L7RuleDef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_ips: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deny_rules: Vec<L7DenyRuleDef>,
 }
 
 fn is_zero(v: &u16) -> bool {
@@ -137,6 +139,19 @@ enum QueryMatcherDef {
 struct QueryAnyDef {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     any: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct L7DenyRuleDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    method: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    command: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    query: BTreeMap<String, QueryMatcherDef>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -214,6 +229,31 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 })
                                 .collect(),
                             allowed_ips: e.allowed_ips,
+                            deny_rules: e
+                                .deny_rules
+                                .into_iter()
+                                .map(|d| L7DenyRule {
+                                    method: d.method,
+                                    path: d.path,
+                                    command: d.command,
+                                    query: d
+                                        .query
+                                        .into_iter()
+                                        .map(|(key, matcher)| {
+                                            let proto = match matcher {
+                                                QueryMatcherDef::Glob(glob) => {
+                                                    L7QueryMatcher { glob, any: vec![] }
+                                                }
+                                                QueryMatcherDef::Any(any) => L7QueryMatcher {
+                                                    glob: String::new(),
+                                                    any: any.any,
+                                                },
+                                            };
+                                            (key, proto)
+                                        })
+                                        .collect(),
+                                })
+                                .collect(),
                         }
                     })
                     .collect(),
@@ -330,6 +370,29 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 })
                                 .collect(),
                             allowed_ips: e.allowed_ips.clone(),
+                            deny_rules: e
+                                .deny_rules
+                                .iter()
+                                .map(|d| L7DenyRuleDef {
+                                    method: d.method.clone(),
+                                    path: d.path.clone(),
+                                    command: d.command.clone(),
+                                    query: d
+                                        .query
+                                        .iter()
+                                        .map(|(key, matcher)| {
+                                            let yaml_matcher = if !matcher.any.is_empty() {
+                                                QueryMatcherDef::Any(QueryAnyDef {
+                                                    any: matcher.any.clone(),
+                                                })
+                                            } else {
+                                                QueryMatcherDef::Glob(matcher.glob.clone())
+                                            };
+                                            (key.clone(), yaml_matcher)
+                                        })
+                                        .collect(),
+                                })
+                                .collect(),
                         }
                     })
                     .collect(),
@@ -1321,6 +1384,113 @@ network_policies:
             proto1.network_policies["test"].endpoints[0].host,
             proto2.network_policies["test"].endpoints[0].host
         );
+    }
+
+    #[test]
+    fn parse_deny_rules_from_yaml() {
+        let yaml = r#"
+version: 1
+network_policies:
+  github:
+    name: github
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        access: read-write
+        deny_rules:
+          - method: POST
+            path: "/repos/*/pulls/*/reviews"
+          - method: PUT
+            path: "/repos/*/branches/*/protection"
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let ep = &proto.network_policies["github"].endpoints[0];
+        assert_eq!(ep.deny_rules.len(), 2);
+        assert_eq!(ep.deny_rules[0].method, "POST");
+        assert_eq!(ep.deny_rules[0].path, "/repos/*/pulls/*/reviews");
+        assert_eq!(ep.deny_rules[1].method, "PUT");
+        assert_eq!(ep.deny_rules[1].path, "/repos/*/branches/*/protection");
+    }
+
+    #[test]
+    fn round_trip_preserves_deny_rules() {
+        let yaml = r#"
+version: 1
+network_policies:
+  github:
+    name: github
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        access: full
+        deny_rules:
+          - method: POST
+            path: "/repos/*/pulls/*/reviews"
+          - method: DELETE
+            path: "/repos/*/branches/*/protection"
+            query:
+              force: "true"
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep1 = &proto1.network_policies["github"].endpoints[0];
+        let ep2 = &proto2.network_policies["github"].endpoints[0];
+        assert_eq!(ep1.deny_rules.len(), ep2.deny_rules.len());
+        assert_eq!(ep2.deny_rules[0].method, "POST");
+        assert_eq!(ep2.deny_rules[0].path, "/repos/*/pulls/*/reviews");
+        assert_eq!(ep2.deny_rules[1].method, "DELETE");
+        assert_eq!(ep2.deny_rules[1].query["force"].glob, "true");
+    }
+
+    #[test]
+    fn parse_deny_rules_with_query_any() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    name: test
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        access: full
+        deny_rules:
+          - method: POST
+            path: /action
+            query:
+              type:
+                any: ["admin-*", "root-*"]
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let deny = &proto.network_policies["test"].endpoints[0].deny_rules[0];
+        assert_eq!(deny.query["type"].any, vec!["admin-*", "root-*"]);
+    }
+
+    #[test]
+    fn parse_rejects_unknown_fields_in_deny_rule() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    endpoints:
+      - host: example.com
+        port: 443
+        deny_rules:
+          - method: POST
+            path: /foo
+            bogus: true
+"#;
+        assert!(parse_sandbox_policy(yaml).is_err());
     }
 
     #[test]

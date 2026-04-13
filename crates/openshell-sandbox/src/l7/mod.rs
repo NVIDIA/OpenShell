@@ -331,6 +331,114 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             // The old warning about missing `tls: terminate` is no longer needed
             // because TLS termination is now automatic.
 
+            // Validate deny_rules
+            let has_deny_rules = ep
+                .get("deny_rules")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty());
+            if has_deny_rules {
+                // deny_rules require L7 inspection
+                if protocol.is_empty() {
+                    errors.push(format!(
+                        "{loc}: deny_rules require protocol (L7 inspection must be enabled)"
+                    ));
+                }
+
+                // deny_rules require some allow base (access or rules)
+                if !has_rules && access.is_empty() {
+                    errors.push(format!(
+                        "{loc}: deny_rules require rules or access to define the base allow set"
+                    ));
+                }
+
+                if let Some(deny_rules) = ep.get("deny_rules").and_then(|v| v.as_array()) {
+                    for (deny_idx, deny_rule) in deny_rules.iter().enumerate() {
+                        let deny_loc = format!("{loc}.deny_rules[{deny_idx}]");
+
+                        // Validate method
+                        if let Some(method) = deny_rule.get("method").and_then(|m| m.as_str())
+                            && !method.is_empty()
+                            && protocol == "rest"
+                        {
+                            let valid_methods = [
+                                "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "*",
+                            ];
+                            if !valid_methods.contains(&method.to_ascii_uppercase().as_str()) {
+                                warnings.push(format!(
+                                    "{deny_loc}: Unknown HTTP method '{method}'. Standard methods: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS."
+                                ));
+                            }
+                        }
+
+                        // Validate path glob syntax
+                        if let Some(path) = deny_rule.get("path").and_then(|p| p.as_str()) {
+                            if let Some(warning) = check_glob_syntax(path) {
+                                warnings.push(format!("{deny_loc}.path: {warning}"));
+                            }
+                        }
+
+                        // Validate query matchers (same rules as allow query matchers)
+                        if let Some(query) = deny_rule.get("query").filter(|v| !v.is_null()) {
+                            if let Some(query_obj) = query.as_object() {
+                                for (param, matcher) in query_obj {
+                                    if let Some(glob_str) = matcher.as_str() {
+                                        if let Some(warning) = check_glob_syntax(glob_str) {
+                                            warnings.push(format!(
+                                                "{deny_loc}.query.{param}: {warning}"
+                                            ));
+                                        }
+                                        continue;
+                                    }
+                                    if let Some(matcher_obj) = matcher.as_object() {
+                                        let has_any = matcher_obj.get("any").is_some();
+                                        let has_glob = matcher_obj.get("glob").is_some();
+                                        let has_unknown =
+                                            matcher_obj.keys().any(|k| k != "any" && k != "glob");
+                                        if has_unknown {
+                                            errors.push(format!(
+                                                "{deny_loc}.query.{param}: unknown matcher keys; only `glob` or `any` are supported"
+                                            ));
+                                        } else if has_glob && has_any {
+                                            errors.push(format!(
+                                                "{deny_loc}.query.{param}: matcher cannot specify both `glob` and `any`"
+                                            ));
+                                        } else if !has_glob && !has_any {
+                                            errors.push(format!(
+                                                "{deny_loc}.query.{param}: object matcher requires `glob` string or non-empty `any` list"
+                                            ));
+                                        }
+                                    }
+                                }
+                            } else {
+                                errors.push(format!(
+                                    "{deny_loc}.query: expected map of query matchers"
+                                ));
+                            }
+                        }
+
+                        // SQL command validation
+                        if let Some(command) = deny_rule.get("command").and_then(|c| c.as_str()) {
+                            if !command.is_empty() && protocol == "rest" {
+                                warnings.push(format!(
+                                    "{deny_loc}: command is for SQL protocol, not REST"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Empty deny_rules list (explicitly set but empty)
+            if ep
+                .get("deny_rules")
+                .and_then(|v| v.as_array())
+                .is_some_and(Vec::is_empty)
+            {
+                errors.push(format!(
+                    "{loc}: deny_rules list cannot be empty (would have no effect). Remove it if no denials are needed."
+                ));
+            }
+
             // Validate HTTP methods in rules
             if has_rules && protocol == "rest" {
                 let valid_methods = [

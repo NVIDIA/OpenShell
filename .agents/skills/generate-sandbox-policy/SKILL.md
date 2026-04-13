@@ -266,6 +266,33 @@ network_policies:
       - { path: <binary_path> }
 ```
 
+### Deny Rules
+
+Use `deny_rules` to block specific dangerous operations while allowing broad access. Deny rules are evaluated after allow rules and take precedence. This is the inverse of the `rules` approach — instead of enumerating every allowed operation, you grant broad access and block a small set of dangerous ones.
+
+```yaml
+# Example: Allow full access to GitHub but block admin operations
+github_api:
+  name: github_api
+  endpoints:
+    - host: api.github.com
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-write
+      deny_rules:
+        - method: POST
+          path: "/repos/*/pulls/*/reviews"
+        - method: PUT
+          path: "/repos/*/branches/*/protection"
+        - method: "*"
+          path: "/repos/*/rulesets"
+  binaries:
+    - { path: /usr/bin/curl }
+```
+
+Deny rules support the same matching capabilities as allow rules: `method`, `path`, `command` (SQL), and `query` parameter matchers. When generating policies, prefer deny rules when the user needs broad access with a small set of blocked operations — it produces a shorter, more maintainable policy than enumerating 60+ allow rules.
+
 ### Private IP Destinations
 
 When the endpoint resolves to a private IP (RFC 1918), the proxy's SSRF protection blocks the connection by default. Use `allowed_ips` to selectively allow specific private IP ranges:

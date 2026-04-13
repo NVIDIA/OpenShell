@@ -183,19 +183,86 @@ _policy_allows_l7(policy) if {
 	request_allowed_for_endpoint(input.request, ep)
 }
 
-# L7 request allowed if any matching L4 policy also allows the L7 request.
+# L7 request allowed if any matching L4 policy also allows the L7 request
+# AND no deny rule blocks it. Deny rules take precedence over allow rules.
 allow_request if {
 	some name
 	policy := data.network_policies[name]
 	endpoint_allowed(policy, input.network)
 	binary_allowed(policy, input.exec)
 	_policy_allows_l7(policy)
+	not deny_request
+}
+
+# --- L7 deny rules ---
+#
+# Deny rules are evaluated after allow rules and take precedence.
+# If a request matches any deny rule on any matching endpoint, it is blocked
+# even if it would otherwise be allowed.
+
+default deny_request = false
+
+# Per-policy helper: true when this policy has at least one endpoint matching
+# the L4 request whose deny_rules also match the specific L7 request.
+_policy_denies_l7(policy) if {
+	some ep
+	ep := policy.endpoints[_]
+	endpoint_matches_request(ep, input.network)
+	request_denied_for_endpoint(input.request, ep)
+}
+
+deny_request if {
+	some name
+	policy := data.network_policies[name]
+	endpoint_allowed(policy, input.network)
+	binary_allowed(policy, input.exec)
+	_policy_denies_l7(policy)
+}
+
+# --- L7 deny rule matching: REST method + path + query ---
+
+request_denied_for_endpoint(request, endpoint) if {
+	some deny_rule
+	deny_rule := endpoint.deny_rules[_]
+	deny_rule.method
+	method_matches(request.method, deny_rule.method)
+	path_matches(request.path, deny_rule.path)
+	deny_query_params_match(request, deny_rule)
+}
+
+# --- L7 deny rule matching: SQL command ---
+
+request_denied_for_endpoint(request, endpoint) if {
+	some deny_rule
+	deny_rule := endpoint.deny_rules[_]
+	deny_rule.command
+	command_matches(request.command, deny_rule.command)
+}
+
+# Deny query matching: if no query rules on deny, match any query params.
+# If query rules present, all configured keys must match.
+deny_query_params_match(request, deny_rule) if {
+	deny_query_rules := object.get(deny_rule, "query", {})
+	not deny_query_mismatch(request, deny_query_rules)
+}
+
+deny_query_mismatch(request, query_rules) if {
+	some key
+	matcher := query_rules[key]
+	not query_key_matches(request, key, matcher)
 }
 
 # --- L7 deny reason ---
 
 request_deny_reason := reason if {
 	input.request
+	deny_request
+	reason := sprintf("%s %s blocked by deny rule", [input.request.method, input.request.path])
+}
+
+request_deny_reason := reason if {
+	input.request
+	not deny_request
 	not allow_request
 	reason := sprintf("%s %s not permitted by policy", [input.request.method, input.request.path])
 }
