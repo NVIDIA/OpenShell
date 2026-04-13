@@ -247,7 +247,7 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (policy, opa_engine) = load_policy(
+    let (policy, opa_engine, retained_proto) = load_policy(
         sandbox_id.clone(),
         sandbox,
         openshell_endpoint.clone(),
@@ -714,6 +714,66 @@ pub async fn run_sandbox(
             .build()
     );
 
+    // Spawn a task to resolve policy binary symlinks after the container
+    // filesystem becomes accessible via /proc/<pid>/root/. This expands
+    // symlinks like /usr/bin/python3 → /usr/bin/python3.11 in the OPA
+    // policy data so that either path matches at evaluation time.
+    //
+    // We cannot do this synchronously here because the child process has
+    // just been spawned and its mount namespace / procfs entries may not
+    // be fully populated yet. Instead, we probe with retries until
+    // /proc/<pid>/root/ is accessible or we exhaust attempts.
+    if let (Some(engine), Some(proto)) = (&opa_engine, &retained_proto) {
+        let resolve_engine = engine.clone();
+        let resolve_proto = proto.clone();
+        let resolve_pid = entrypoint_pid.clone();
+        tokio::spawn(async move {
+            let pid = resolve_pid.load(Ordering::Acquire);
+            let probe_path = format!("/proc/{pid}/root/");
+            // Retry up to 10 times with 500ms intervals (5s total).
+            // The child's mount namespace is typically ready within a
+            // few hundred ms of spawn.
+            for attempt in 1..=10 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if std::fs::metadata(&probe_path).is_ok() {
+                    info!(
+                        pid = pid,
+                        attempt = attempt,
+                        "Container filesystem accessible, resolving policy binary symlinks"
+                    );
+                    match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
+                        Ok(()) => {
+                            info!(
+                                pid = pid,
+                                "Policy binary symlink resolution complete \
+                                 (check logs above for per-binary results)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to rebuild OPA engine with symlink resolution \
+                                 (non-fatal, falling back to literal path matching): {e}"
+                            );
+                        }
+                    }
+                    return;
+                }
+                debug!(
+                    pid = pid,
+                    attempt = attempt,
+                    probe_path = %probe_path,
+                    "Container filesystem not yet accessible, retrying symlink resolution"
+                );
+            }
+            warn!(
+                "Container filesystem /proc/{pid}/root/ not accessible after 10 attempts (5s); \
+                 binary symlink resolution skipped. Policy binary paths will be matched literally. \
+                 If binaries are symlinks, use canonical paths in your policy \
+                 (run 'readlink -f <path>' inside the sandbox)"
+            );
+        });
+    }
+
     // Spawn background policy poll task (gRPC mode only).
     if let (Some(id), Some(endpoint), Some(engine)) =
         (&sandbox_id, &openshell_endpoint, &opa_engine)
@@ -722,6 +782,7 @@ pub async fn run_sandbox(
         let poll_endpoint = endpoint.clone();
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_enabled.clone();
+        let poll_pid = entrypoint_pid.clone();
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -732,6 +793,7 @@ pub async fn run_sandbox(
                 &poll_endpoint,
                 &poll_id,
                 &poll_engine,
+                &poll_pid,
                 poll_interval_secs,
                 &poll_ocsf_enabled,
             )
@@ -1426,13 +1488,21 @@ mod baseline_tests {
 /// 2. If `sandbox_id` and `openshell_endpoint` are provided, fetch via gRPC
 /// 3. If the server returns no policy, discover from disk or use restrictive default
 /// 4. Otherwise, return an error
+///
+/// Returns the policy, the OPA engine, and (for gRPC mode) the original proto
+/// policy. The proto is retained so the OPA engine can be rebuilt with symlink
+/// resolution after the container entrypoint starts.
 async fn load_policy(
     sandbox_id: Option<String>,
     sandbox: Option<String>,
     openshell_endpoint: Option<String>,
     policy_rules: Option<String>,
     policy_data: Option<String>,
-) -> Result<(SandboxPolicy, Option<Arc<OpaEngine>>)> {
+) -> Result<(
+    SandboxPolicy,
+    Option<Arc<OpaEngine>>,
+    Option<openshell_core::proto::SandboxPolicy>,
+)> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
         ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -1461,7 +1531,7 @@ async fn load_policy(
             process: config.process,
         };
         enrich_sandbox_baseline_paths(&mut policy);
-        return Ok((policy, Some(Arc::new(engine))));
+        return Ok((policy, Some(Arc::new(engine)), None));
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
@@ -1524,11 +1594,14 @@ async fn load_policy(
         // Build OPA engine from baked-in rules + typed proto data.
         // In cluster mode, proxy networking is always enabled so OPA is
         // always required for allow/deny decisions.
+        // The initial load uses pid=0 (no symlink resolution) because the
+        // container hasn't started yet. After the entrypoint spawns, the
+        // engine is rebuilt with the real PID for symlink resolution.
         info!("Creating OPA engine from proto policy data");
         let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto_policy)?));
 
-        let policy = SandboxPolicy::try_from(proto_policy)?;
-        return Ok((policy, opa_engine));
+        let policy = SandboxPolicy::try_from(proto_policy.clone())?;
+        return Ok((policy, opa_engine, Some(proto_policy)));
     }
 
     // No policy source available
@@ -1838,12 +1911,16 @@ async fn flush_proposals_to_gateway(
     Ok(())
 }
 
-/// `reload_from_proto()`. Reports load success/failure back to the server.
-/// On failure, the previous engine is untouched (LKG behavior).
+/// `reload_from_proto_with_pid()`. Reports load success/failure back to the
+/// server. On failure, the previous engine is untouched (LKG behavior).
+///
+/// When the entrypoint PID is available, policy reloads include symlink
+/// resolution for binary paths via the container filesystem.
 async fn run_policy_poll_loop(
     endpoint: &str,
     sandbox_id: &str,
     opa_engine: &Arc<OpaEngine>,
+    entrypoint_pid: &Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
@@ -1924,7 +2001,8 @@ async fn run_policy_poll_loop(
                 continue;
             };
 
-            match opa_engine.reload_from_proto(policy) {
+            let pid = entrypoint_pid.load(Ordering::Acquire);
+            match opa_engine.reload_from_proto_with_pid(policy, pid) {
                 Ok(()) => {
                     if result.global_policy_version > 0 {
                         ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())

@@ -617,6 +617,35 @@ mod tests {
     }
 
     #[test]
+    fn test_http_activity_shorthand_non_default_port() {
+        let event = OcsfEvent::HttpActivity(HttpActivityEvent {
+            base: base(4002, "HTTP Activity", 4, "Network Activity", 3, "Get"),
+            http_request: Some(HttpRequest::new(
+                "GET",
+                Url::new("http", "172.20.0.1", "/test", 9876),
+            )),
+            http_response: None,
+            src_endpoint: None,
+            dst_endpoint: None,
+            proxy_endpoint: None,
+            actor: Some(Actor {
+                process: Process::new("curl", 68),
+            }),
+            firewall_rule: Some(FirewallRule::new("allow_host_9876", "mechanistic")),
+            action: Some(ActionId::Allowed),
+            disposition: None,
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "HTTP:GET [INFO] ALLOWED curl(68) -> GET http://172.20.0.1:9876/test [policy:allow_host_9876]"
+        );
+    }
+
+    #[test]
     fn test_ssh_activity_shorthand() {
         let event = OcsfEvent::SshActivity(SshActivityEvent {
             base: base(4007, "SSH Activity", 4, "Network Activity", 1, "Open"),

@@ -898,6 +898,15 @@ fn spawn_pty_shell(
         cmd.current_dir(dir);
     }
 
+    // Probe Landlock availability from the parent process where tracing works.
+    #[cfg(target_os = "linux")]
+    sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
+
+    // Phase 1 (as root): Prepare Landlock ruleset before drop_privileges.
+    #[cfg(target_os = "linux")]
+    let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
+        .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+
     #[cfg(unix)]
     {
         unsafe_pty::install_pre_exec(
@@ -906,6 +915,8 @@ fn spawn_pty_shell(
             workdir.clone(),
             slave_fd,
             netns_fd,
+            #[cfg(target_os = "linux")]
+            prepared_sandbox,
         );
     }
 
@@ -1034,9 +1045,25 @@ fn spawn_pipe_exec(
         cmd.current_dir(dir);
     }
 
+    // Probe Landlock availability from the parent process where tracing works.
+    #[cfg(target_os = "linux")]
+    sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
+
+    // Phase 1 (as root): Prepare Landlock ruleset before drop_privileges.
+    #[cfg(target_os = "linux")]
+    let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
+        .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+
     #[cfg(unix)]
     {
-        unsafe_pty::install_pre_exec_no_pty(&mut cmd, policy.clone(), workdir.clone(), netns_fd);
+        unsafe_pty::install_pre_exec_no_pty(
+            &mut cmd,
+            policy.clone(),
+            workdir.clone(),
+            netns_fd,
+            #[cfg(target_os = "linux")]
+            prepared_sandbox,
+        );
     }
 
     let mut child = cmd.spawn()?;
@@ -1131,7 +1158,9 @@ fn spawn_pipe_exec(
 }
 
 mod unsafe_pty {
-    use super::{Command, RawFd, SandboxPolicy, Winsize, drop_privileges, sandbox, setsid};
+    #[cfg(not(target_os = "linux"))]
+    use super::sandbox;
+    use super::{Command, RawFd, SandboxPolicy, Winsize, drop_privileges, setsid};
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
 
@@ -1157,16 +1186,26 @@ mod unsafe_pty {
     pub fn install_pre_exec(
         cmd: &mut Command,
         policy: SandboxPolicy,
-        workdir: Option<String>,
+        _workdir: Option<String>,
         slave_fd: RawFd,
         netns_fd: Option<RawFd>,
+        #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
     ) {
+        // Wrap in Option so we can .take() it out of the FnMut closure.
+        // pre_exec is only called once (after fork, before exec).
+        #[cfg(target_os = "linux")]
+        let mut prepared = Some(prepared);
         unsafe {
             cmd.pre_exec(move || {
                 setsid().map_err(|err| std::io::Error::other(err.to_string()))?;
                 set_controlling_tty(slave_fd)?;
 
-                enter_netns_and_sandbox(netns_fd, &policy, workdir.as_deref())
+                enter_netns_and_sandbox(
+                    netns_fd,
+                    &policy,
+                    #[cfg(target_os = "linux")]
+                    prepared.take(),
+                )
             });
         }
     }
@@ -1178,18 +1217,28 @@ mod unsafe_pty {
     pub fn install_pre_exec_no_pty(
         cmd: &mut Command,
         policy: SandboxPolicy,
-        workdir: Option<String>,
+        _workdir: Option<String>,
         netns_fd: Option<RawFd>,
+        #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
     ) {
+        #[cfg(target_os = "linux")]
+        let mut prepared = Some(prepared);
         unsafe {
-            cmd.pre_exec(move || enter_netns_and_sandbox(netns_fd, &policy, workdir.as_deref()));
+            cmd.pre_exec(move || {
+                enter_netns_and_sandbox(
+                    netns_fd,
+                    &policy,
+                    #[cfg(target_os = "linux")]
+                    prepared.take(),
+                )
+            });
         }
     }
 
     fn enter_netns_and_sandbox(
         netns_fd: Option<RawFd>,
         policy: &SandboxPolicy,
-        workdir: Option<&str>,
+        #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
     ) -> std::io::Result<()> {
         // Enter network namespace before dropping privileges.
         // This ensures SSH shell processes are isolated to the same
@@ -1207,11 +1256,21 @@ mod unsafe_pty {
         #[cfg(not(target_os = "linux"))]
         let _ = netns_fd;
 
-        // Drop privileges before applying sandbox restrictions.
-        // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
-        // which may be blocked by Landlock.
+        // Drop privileges. initgroups/setgid/setuid need /etc/group and
+        // /etc/passwd which would be blocked if Landlock were already enforced.
         drop_privileges(policy).map_err(|err| std::io::Error::other(err.to_string()))?;
-        sandbox::apply(policy, workdir).map_err(|err| std::io::Error::other(err.to_string()))?;
+
+        // Phase 2: Enforce the prepared Landlock ruleset + seccomp.
+        // restrict_self() does not require root.
+        #[cfg(target_os = "linux")]
+        if let Some(prepared) = prepared {
+            crate::sandbox::linux::enforce(prepared)
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        sandbox::apply(policy, None).map_err(|err| std::io::Error::other(err.to_string()))?;
+
         Ok(())
     }
 }
