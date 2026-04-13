@@ -1259,6 +1259,8 @@ mod unsafe_pty {
         // Drop privileges. initgroups/setgid/setuid need /etc/group and
         // /etc/passwd which would be blocked if Landlock were already enforced.
         drop_privileges(policy).map_err(|err| std::io::Error::other(err.to_string()))?;
+        crate::process::harden_child_process()
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
 
         // Phase 2: Enforce the prepared Landlock ruleset + seccomp.
         // restrict_self() does not require root.

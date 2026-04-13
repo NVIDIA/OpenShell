@@ -185,7 +185,7 @@ The sandbox process runs as a non-root user after explicit privilege dropping.
 
 | Aspect | Detail |
 |---|---|
-| Default | `run_as_user: sandbox`, `run_as_group: sandbox`. The supervisor calls `setuid()`/`setgid()` with post-condition verification: confirms the effective UID/GID match the target and that `setuid(0)` fails (root cannot be re-acquired). |
+| Default | `run_as_user: sandbox`, `run_as_group: sandbox`. The supervisor calls `setuid()`/`setgid()` with post-condition verification, disables core dumps with `RLIMIT_CORE=0`, and on Linux sets `PR_SET_DUMPABLE=0`. |
 | What you can change | Set `run_as_user` and `run_as_group` in the `process` section. Validation rejects root (`root` or `0`). |
 | Risk if relaxed | Running as a higher-privilege user increases the impact of container escape vulnerabilities. |
 | Recommendation | Keep the `sandbox` user. Do not attempt to set root. |
@@ -208,8 +208,9 @@ This ordering is intentional: privilege dropping needs `/etc/group` and `/etc/pa
 
 1. Network namespace entry (`setns`).
 2. Privilege drop (`initgroups` + `setgid` + `setuid`).
-3. Landlock filesystem restrictions.
-4. Seccomp socket domain filters.
+3. Core-dump hardening (`RLIMIT_CORE=0`, plus `PR_SET_DUMPABLE=0` on Linux).
+4. Landlock filesystem restrictions.
+5. Seccomp socket domain filters.
 
 ## Inference Controls
 

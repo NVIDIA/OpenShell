@@ -34,6 +34,35 @@ fn scrub_sensitive_env(cmd: &mut Command) {
     cmd.env_remove(SSH_HANDSHAKE_SECRET_ENV);
 }
 
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn harden_child_process() -> Result<()> {
+    let core_limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &core_limit) };
+    if rc != 0 {
+        return Err(miette::miette!(
+            "Failed to disable core dumps: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+        if rc != 0 {
+            return Err(miette::miette!(
+                "Failed to set PR_SET_DUMPABLE=0: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Handle to a running process.
 pub struct ProcessHandle {
     child: Child,
@@ -200,6 +229,8 @@ impl ProcessHandle {
                     drop_privileges(&policy)
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
 
+                    harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
+
                     // Phase 2 (as unprivileged user): Enforce the prepared
                     // Landlock ruleset via restrict_self() + apply seccomp.
                     // restrict_self() does not require root.
@@ -291,6 +322,8 @@ impl ProcessHandle {
                     // which may be blocked by Landlock.
                     drop_privileges(&policy)
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
+
+                    harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
 
                     sandbox::apply(&policy, workdir.as_deref())
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -543,6 +576,12 @@ mod tests {
     use crate::policy::{
         FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
     };
+    #[cfg(unix)]
+    use nix::sys::wait::{WaitStatus, waitpid};
+    #[cfg(unix)]
+    use nix::unistd::{ForkResult, fork};
+    #[cfg(unix)]
+    use std::mem::size_of;
     use std::process::Stdio as StdStdio;
 
     /// Helper to create a minimal `SandboxPolicy` with the given process policy.
@@ -658,6 +697,91 @@ mod tests {
             msg.contains("not found"),
             "expected 'not found' in error: {msg}"
         );
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn probe_hardened_child(probe: unsafe fn() -> i64) -> i64 {
+        const HARDEN_FAILED: i64 = -2;
+
+        let mut fds = [0; 2];
+        let pipe_rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(
+            pipe_rc,
+            0,
+            "pipe failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        match unsafe { fork() }.expect("fork should succeed") {
+            ForkResult::Child => {
+                unsafe { libc::close(fds[0]) };
+                let value = match harden_child_process() {
+                    Ok(()) => unsafe { probe() },
+                    Err(_) => HARDEN_FAILED,
+                };
+                let bytes = value.to_ne_bytes();
+                let written = unsafe { libc::write(fds[1], bytes.as_ptr().cast(), bytes.len()) };
+                unsafe {
+                    libc::close(fds[1]);
+                    libc::_exit(if written == bytes.len() as isize {
+                        0
+                    } else {
+                        1
+                    });
+                }
+            }
+            ForkResult::Parent { child } => {
+                unsafe { libc::close(fds[1]) };
+                let mut bytes = [0u8; size_of::<i64>()];
+                let read = unsafe { libc::read(fds[0], bytes.as_mut_ptr().cast(), bytes.len()) };
+                unsafe { libc::close(fds[0]) };
+                assert_eq!(
+                    read as usize,
+                    bytes.len(),
+                    "expected {} probe bytes, got {}",
+                    bytes.len(),
+                    read
+                );
+
+                match waitpid(child, None).expect("waitpid should succeed") {
+                    WaitStatus::Exited(_, 0) => {}
+                    status => panic!("probe child exited unexpectedly: {status:?}"),
+                }
+
+                i64::from_ne_bytes(bytes)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    unsafe fn core_dump_limit_is_zero_probe() -> i64 {
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_CORE, limit.as_mut_ptr()) };
+        if rc != 0 {
+            return -1;
+        }
+        let limit = unsafe { limit.assume_init() };
+        i64::from(limit.rlim_cur == 0 && limit.rlim_max == 0)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn harden_child_process_disables_core_dumps() {
+        assert_eq!(probe_hardened_child(core_dump_limit_is_zero_probe), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    unsafe fn dumpable_flag_probe() -> i64 {
+        unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) as i64 }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn harden_child_process_marks_process_nondumpable() {
+        assert_eq!(probe_hardened_child(dumpable_flag_probe), 0);
     }
 
     #[tokio::test]

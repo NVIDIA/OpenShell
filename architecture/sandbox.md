@@ -1281,7 +1281,9 @@ Wraps `tokio::process::Child` + PID. Platform-specific `spawn()` methods delegat
 1. `setpgid(0, 0)` if non-interactive (create new process group)
 2. `setns(fd, CLONE_NEWNET)` to enter network namespace (Linux only)
 3. `drop_privileges(policy)`: `initgroups()` -> `setgid()` -> `setuid()`
-4. `sandbox::apply(policy, workdir)`: Landlock then seccomp
+4. Disable core dumps with `setrlimit(RLIMIT_CORE, 0)` on Unix
+5. Set `prctl(PR_SET_DUMPABLE, 0)` on Linux
+6. `sandbox::apply(policy, workdir)`: Landlock then seccomp
 
 ### `drop_privileges()`
 
@@ -1296,6 +1298,8 @@ Resolves user/group names from policy, then:
 The ordering is significant: `initgroups`/`setgid` must happen before `setuid` because switching user may drop the privileges needed for group manipulation. Similarly, privilege dropping must happen before Landlock because Landlock may block access to `/etc/passwd` and `/etc/group`.
 
 Steps 3, 5, and 6 are defense-in-depth post-condition checks (CWE-250 / CERT POS37-C). All three syscalls (`geteuid`, `getegid`, `setuid`) are async-signal-safe, so they are safe to call in the `pre_exec` context. The checks add negligible overhead while guarding against hypothetical kernel-level defects that could cause `setuid`/`setgid` to return success without actually changing the effective IDs.
+
+After the privilege drop, the child process also disables core dumps before Landlock and seccomp are applied. On all Unix targets it sets `RLIMIT_CORE=0`; on Linux it additionally sets `PR_SET_DUMPABLE=0`. This prevents crash artifacts from containing provider credentials, request payloads, or other sensitive in-memory data.
 
 ### `ProcessStatus`
 
