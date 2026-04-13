@@ -113,16 +113,15 @@ pub fn is_always_blocked_net(net: ipnet::IpNet) -> bool {
 /// or unspecified).
 ///
 /// This is a broader check than [`is_always_blocked_ip`] — it includes RFC 1918
-/// private ranges (`10/8`, `172.16/12`, `192.168/16`) and IPv6 ULA (`fc00::/7`)
-/// which are allowable via `allowed_ips` but blocked by default without one.
+/// private ranges (`10/8`, `172.16/12`, `192.168/16`), CGNAT (`100.64.0.0/10`,
+/// RFC 6598), other special-use ranges, and IPv6 ULA (`fc00::/7`) which are
+/// allowable via `allowed_ips` but blocked by default without one.
 ///
 /// Used by the proxy's default SSRF path and the mechanistic mapper to detect
 /// when `allowed_ips` should be populated in proposals.
 pub fn is_internal_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-        }
+        IpAddr::V4(v4) => is_internal_v4(&v4),
         IpAddr::V6(v6) => {
             if v6.is_loopback() || v6.is_unspecified() {
                 return true;
@@ -137,14 +136,42 @@ pub fn is_internal_ip(ip: IpAddr) -> bool {
             }
             // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified();
+                return is_internal_v4(&v4);
             }
             false
         }
     }
+}
+
+/// IPv4 internal address check covering RFC 1918, CGNAT (RFC 6598), and other
+/// special-use ranges that should never be reachable from sandbox egress.
+fn is_internal_v4(v4: &Ipv4Addr) -> bool {
+    if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() {
+        return true;
+    }
+    let octets = v4.octets();
+    // 100.64.0.0/10 — CGNAT / shared address space (RFC 6598). Commonly used by
+    // cloud VPC peering, Tailscale, and similar overlay networks.
+    if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
+        return true;
+    }
+    // 192.0.0.0/24 — IETF protocol assignments (RFC 6890)
+    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+        return true;
+    }
+    // 198.18.0.0/15 — benchmarking (RFC 2544)
+    if octets[0] == 198 && (octets[1] & 0xFE) == 18 {
+        return true;
+    }
+    // 198.51.100.0/24 — TEST-NET-2 (RFC 5737)
+    if octets[0] == 198 && octets[1] == 51 && octets[2] == 100 {
+        return true;
+    }
+    // 203.0.113.0/24 — TEST-NET-3 (RFC 5737)
+    if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -357,5 +384,39 @@ mod tests {
         assert!(is_internal_ip(IpAddr::V6(v6)));
         let v6_public = Ipv4Addr::new(8, 8, 8, 8).to_ipv6_mapped();
         assert!(!is_internal_ip(IpAddr::V6(v6_public)));
+    }
+
+    #[test]
+    fn test_internal_ip_cgnat() {
+        // 100.64.0.0/10 — CGNAT / shared address space (RFC 6598)
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 100, 50, 3))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(
+            100, 127, 255, 255
+        ))));
+        // Just outside the /10 boundary
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1))));
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(
+            100, 63, 255, 255
+        ))));
+    }
+
+    #[test]
+    fn test_internal_ip_special_use_ranges() {
+        // 192.0.0.0/24 — IETF protocol assignments
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 1))));
+        // 198.18.0.0/15 — benchmarking
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 19, 255, 255))));
+        // 198.51.100.0/24 — TEST-NET-2
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))));
+        // 203.0.113.0/24 — TEST-NET-3
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
+    }
+
+    #[test]
+    fn test_internal_ip_ipv6_mapped_cgnat() {
+        let v6 = Ipv4Addr::new(100, 64, 0, 1).to_ipv6_mapped();
+        assert!(is_internal_ip(IpAddr::V6(v6)));
     }
 }

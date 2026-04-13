@@ -51,6 +51,7 @@ struct ConnectDecision {
 ///
 /// Returned by [`handle_inference_interception`] so the call site can emit
 /// a structured CONNECT deny log when the connection is not successfully routed.
+#[derive(Debug)]
 enum InferenceOutcome {
     /// At least one request was successfully routed to a local inference backend.
     Routed,
@@ -1045,8 +1046,6 @@ async fn handle_inference_interception(
     tls_state: Option<&Arc<ProxyTlsState>>,
     inference_ctx: Option<&Arc<InferenceContext>>,
 ) -> Result<InferenceOutcome> {
-    use crate::l7::inference::{ParseResult, format_http_response, try_parse_http_request};
-
     let Some(ctx) = inference_ctx else {
         return Ok(InferenceOutcome::Denied {
             reason: "cluster inference context not configured".to_string(),
@@ -1069,15 +1068,28 @@ async fn handle_inference_interception(
         }
     };
 
-    // Read and process HTTP requests from the tunnel.
-    // Track whether any request was successfully routed so that a late denial
-    // on a keep-alive connection still counts as "routed".
+    process_inference_keepalive(&mut tls_client, ctx, port).await
+}
+
+/// Read and process HTTP requests from a TLS-terminated inference connection.
+///
+/// Each request is matched against inference patterns and routed locally.
+/// Any non-inference request is immediately denied and the connection is closed,
+/// even if previous requests on the same keep-alive connection were routed
+/// successfully.
+async fn process_inference_keepalive<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    ctx: &InferenceContext,
+    port: u16,
+) -> Result<InferenceOutcome> {
+    use crate::l7::inference::{ParseResult, format_http_response, try_parse_http_request};
+
     let mut buf = vec![0u8; INITIAL_INFERENCE_BUF];
     let mut used = 0usize;
     let mut routed_any = false;
 
     loop {
-        let n = match tls_client.read(&mut buf[used..]).await {
+        let n = match stream.read(&mut buf[used..]).await {
             Ok(n) => n,
             Err(e) => {
                 if routed_any {
@@ -1101,10 +1113,13 @@ async fn handle_inference_interception(
         // Try to parse a complete HTTP request
         match try_parse_http_request(&buf[..used]) {
             ParseResult::Complete(request, consumed) => {
-                let was_routed = route_inference_request(&request, ctx, &mut tls_client).await?;
+                let was_routed = route_inference_request(&request, ctx, stream).await?;
                 if was_routed {
                     routed_any = true;
-                } else if !routed_any {
+                } else {
+                    // Deny and close: a non-inference request must not be silently
+                    // ignored on a keep-alive connection that previously routed
+                    // inference traffic.
                     return Ok(InferenceOutcome::Denied {
                         reason: "connection not allowed by policy".to_string(),
                     });
@@ -1119,7 +1134,7 @@ async fn handle_inference_interception(
                 if used == buf.len() {
                     if buf.len() >= MAX_INFERENCE_BUF {
                         let response = format_http_response(413, &[], b"Payload Too Large");
-                        write_all(&mut tls_client, &response).await?;
+                        write_all(stream, &response).await?;
                         if routed_any {
                             break;
                         }
@@ -1145,7 +1160,7 @@ async fn handle_inference_interception(
                     ocsf_emit!(event);
                 }
                 let response = format_http_response(400, &[], b"Bad Request");
-                write_all(&mut tls_client, &response).await?;
+                write_all(stream, &response).await?;
                 return Ok(InferenceOutcome::Denied { reason });
             }
         }
@@ -2593,6 +2608,41 @@ mod tests {
     }
 
     #[test]
+    fn test_rejects_ipv4_cgnat() {
+        // 100.64.0.0/10 — CGNAT / shared address space (RFC 6598)
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 100, 50, 3))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(
+            100, 127, 255, 255
+        ))));
+        // Just outside the /10 boundary
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1))));
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(
+            100, 63, 255, 255
+        ))));
+    }
+
+    #[test]
+    fn test_rejects_ipv4_special_use_ranges() {
+        // 192.0.0.0/24 — IETF protocol assignments
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 1))));
+        // 198.18.0.0/15 — benchmarking
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 19, 255, 255))));
+        // 198.51.100.0/24 — TEST-NET-2
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))));
+        // 203.0.113.0/24 — TEST-NET-3
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
+    }
+
+    #[test]
+    fn test_rejects_ipv6_mapped_cgnat() {
+        // ::ffff:100.64.0.1 should be caught via IPv4-mapped unwrapping
+        let v6 = Ipv4Addr::new(100, 64, 0, 1).to_ipv6_mapped();
+        assert!(is_internal_ip(IpAddr::V6(v6)));
+    }
+
+    #[test]
     fn test_allows_ipv4_public() {
         assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
@@ -3479,6 +3529,87 @@ mod tests {
     fn test_implicit_allowed_ips_returns_empty_for_wildcard() {
         let result = implicit_allowed_ips_for_ip_host("*.example.com");
         assert!(result.is_empty());
+    }
+
+    /// Regression test: exercises the actual keep-alive interception loop to
+    /// verify that a non-inference request is denied even after a previous
+    /// inference request was successfully routed on the same connection.
+    ///
+    /// Before the fix, `handle_inference_interception` used
+    /// `else if !routed_any` which silently dropped denials once `routed_any`
+    /// was true, allowing non-inference HTTP requests to piggyback on a
+    /// keep-alive connection that had previously handled inference traffic.
+    /// Regression test: exercises the actual keep-alive interception loop to
+    /// verify that a non-inference request is denied even after a previous
+    /// inference request was successfully routed on the same connection.
+    ///
+    /// The server runs in a spawned task with empty routes (the inference
+    /// request gets a 503 "not configured" but is still recognized as
+    /// inference and returns Ok(true)). The client sends the inference
+    /// request, reads the 503 response, then sends a non-inference request
+    /// on the same connection. The server must return Denied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_keepalive_denies_non_inference_after_routed() {
+        use openshell_router::Router;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let router = Router::new().unwrap();
+        let patterns = crate::l7::inference::default_patterns();
+        // Empty routes: inference request gets 503 but returns Ok(true).
+        let ctx = InferenceContext::new(patterns, router, vec![], vec![]);
+
+        let body = r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#;
+        let inference_req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: inference.local\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        let non_inference_req = "GET /admin/config HTTP/1.1\r\nHost: inference.local\r\n\r\n";
+
+        let (client, mut server) = tokio::io::duplex(65536);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+
+        // Spawn the server task so it runs concurrently.
+        let server_task =
+            tokio::spawn(async move { process_inference_keepalive(&mut server, &ctx, 443).await });
+
+        // Client: send inference request, read response, send non-inference.
+        client_write
+            .write_all(inference_req.as_bytes())
+            .await
+            .unwrap();
+
+        // Read the 503 response so the server loops back to read.
+        let mut buf = vec![0u8; 4096];
+        let _ = client_read.read(&mut buf).await.unwrap();
+
+        // Send non-inference request on the same keep-alive connection.
+        client_write
+            .write_all(non_inference_req.as_bytes())
+            .await
+            .unwrap();
+        drop(client_write);
+
+        // Drain remaining response bytes.
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match client_read.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        });
+
+        let outcome = server_task.await.unwrap().unwrap();
+
+        assert!(
+            matches!(outcome, InferenceOutcome::Denied { .. }),
+            "expected Denied after non-inference request on keep-alive, got: {outcome:?}"
+        );
     }
 
     // -- build_json_error_response --
