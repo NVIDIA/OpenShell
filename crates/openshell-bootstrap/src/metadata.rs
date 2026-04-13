@@ -26,7 +26,8 @@ pub struct GatewayMetadata {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub resolved_host: Option<String>,
 
-    /// Auth mode: `None` or `"mtls"` = mTLS (default), `"cloudflare_jwt"` = CF JWT.
+    /// Auth mode: `None` or `"mtls"` = mTLS (default), `"plaintext"` = direct HTTP,
+    /// `"cloudflare_jwt"` = CF JWT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
 
@@ -132,7 +133,7 @@ pub fn create_gateway_metadata_with_host(
         gateway_port: port,
         remote_host,
         resolved_host,
-        auth_mode: None,
+        auth_mode: disable_tls.then(|| "plaintext".to_string()),
         edge_team_domain: None,
         edge_auth_url: None,
     }
@@ -514,6 +515,7 @@ mod tests {
     fn local_gateway_metadata_with_tls_disabled() {
         let meta = create_gateway_metadata_with_host("test", None, 8080, None, true);
         assert_eq!(meta.gateway_endpoint, "http://127.0.0.1:8080");
+        assert_eq!(meta.auth_mode.as_deref(), Some("plaintext"));
     }
 
     #[test]
@@ -526,6 +528,7 @@ mod tests {
             true,
         );
         assert_eq!(meta.gateway_endpoint, "http://host.docker.internal:8080");
+        assert_eq!(meta.auth_mode.as_deref(), Some("plaintext"));
     }
 
     // ── GatewayMetadata::gateway_host() ──────────────────────────────
@@ -590,6 +593,7 @@ mod tests {
         assert!(meta.is_remote);
         assert!(meta.gateway_endpoint.starts_with("http://"));
         assert!(!meta.gateway_endpoint.starts_with("https://"));
+        assert_eq!(meta.auth_mode.as_deref(), Some("plaintext"));
     }
 
     // ── last-sandbox persistence ──────────────────────────────────────

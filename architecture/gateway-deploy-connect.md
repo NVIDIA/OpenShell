@@ -11,11 +11,11 @@ This document describes how the CLI resolves a gateway and communicates with it 
 When any CLI command needs to talk to the gateway, it resolves the target through a priority chain (`crates/openshell-cli/src/main.rs` -- `resolve_gateway()`):
 
 1. `--gateway-endpoint <URL>` flag (direct URL, reusing stored metadata when the gateway is known).
-2. `--cluster <NAME>` / `-g <NAME>` flag.
+2. `--gateway <NAME>` / `-g <NAME>` flag.
 3. `OPENSHELL_GATEWAY` environment variable.
 4. Active gateway from `~/.config/openshell/active_gateway`.
 
-Resolution loads `ClusterMetadata` from disk to get the `gateway_endpoint` URL and `auth_mode`. When `--gateway-endpoint` is used, the CLI still tries to match the URL to stored metadata so edge auth tokens and TLS bundles continue to resolve by cluster name.
+Resolution loads `GatewayMetadata` from disk to get the `gateway_endpoint` URL and `auth_mode`. When `--gateway-endpoint` is used, the CLI still tries to match the URL to stored metadata so edge auth tokens and TLS bundles continue to resolve by gateway name.
 
 ### Connection modes
 
@@ -36,7 +36,7 @@ graph TD
 
     MODE -->|"null / mtls"| MTLS
     MODE -->|"cloudflare_jwt"| EDGE
-    MODE -->|"plaintext endpoint"| PLAIN
+    MODE -->|"plaintext"| PLAIN
 
     MTLS -->|"TLS + client cert"| GW
     EDGE -->|"WSS tunnel + JWT"| GW
@@ -47,11 +47,11 @@ graph TD
 
 **File**: `crates/openshell-cli/src/tls.rs` -- `build_channel()`
 
-The default mode for self-deployed gateways. The CLI loads three PEM files from `~/.config/openshell/clusters/<name>/mtls/`:
+The default mode for self-deployed gateways. The CLI loads three PEM files from `~/.config/openshell/gateways/<name>/mtls/`:
 
 | File      | Purpose                                                        |
 | --------- | -------------------------------------------------------------- |
-| `ca.crt`  | Cluster CA certificate -- verifies the gateway's server cert   |
+| `ca.crt`  | Gateway CA certificate -- verifies the gateway's server cert   |
 | `tls.crt` | Client certificate -- proves the CLI's identity to the gateway |
 | `tls.key` | Client private key                                             |
 
@@ -81,11 +81,19 @@ For gateways behind an edge proxy (e.g., Cloudflare Access), the CLI routes traf
 3. The gateway's `ws_tunnel.rs` handler upgrades the WebSocket and bridges it to an in-memory `MultiplexService` instance.
 4. The gRPC channel connects to `http://127.0.0.1:<local_port>` (plaintext HTTP/2 over the tunnel).
 
-Authentication uses a browser-based flow: `gateway add` opens the user's browser to the gateway's `/auth/connect` endpoint, which reads the `CF_Authorization` cookie and relays it back to a localhost callback server. The token is stored at `~/.config/openshell/clusters/<name>/edge_token`.
+Authentication uses a browser-based flow: `gateway add` opens the user's browser to the gateway's `/auth/connect` endpoint, which reads the `CF_Authorization` cookie and relays it back to a localhost callback server. The token is stored at `~/.config/openshell/gateways/<name>/edge_token`.
 
 ### Plaintext connection
 
 When the gateway is deployed with `--plaintext`, TLS is disabled entirely. The CLI connects over plain HTTP/2. This mode is intended for gateways behind a trusted reverse proxy or tunnel that handles TLS termination.
+
+The CLI also treats an explicit `http://...` registration as plaintext mode:
+
+```shell
+openshell gateway add http://127.0.0.1:8080 --local
+```
+
+This stores `auth_mode = "plaintext"`, skips mTLS certificate extraction, and bypasses the edge browser-auth flow.
 
 ## File System Layout
 
@@ -93,12 +101,12 @@ All connection artifacts are stored under `$XDG_CONFIG_HOME/openshell/` (default
 
 ```
 openshell/
-  active_cluster                          # plain text: active cluster name
-  clusters/
-    <name>_metadata.json                  # ClusterMetadata JSON
+  active_gateway                          # plain text: active gateway name
+  gateways/
     <name>/
+      metadata.json                       # GatewayMetadata JSON
       mtls/                               # mTLS bundle (when TLS enabled)
-        ca.crt                            # cluster CA certificate
+        ca.crt                            # gateway CA certificate
         tls.crt                           # client certificate
         tls.key                           # client private key
       edge_token                          # Edge auth JWT (when auth_mode=cloudflare_jwt)
@@ -127,6 +135,6 @@ sequenceDiagram
     GW-->>Browser: Relay page (extracts token, POSTs to localhost)
     Browser->>CLI: POST token to localhost callback
     CLI->>CLI: Store edge_token
-    CLI->>CLI: save_active_cluster
+    CLI->>CLI: save_active_gateway
     CLI-->>U: Gateway added and set as active
 ```

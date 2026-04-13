@@ -7,7 +7,7 @@ keywords: "Generative AI, Cybersecurity, Gateway, Authentication, mTLS, Edge Aut
 position: 1
 ---
 
-This page describes how the CLI resolves a gateway, authenticates with it, and where credentials are stored. For how to deploy or register gateways, refer to [Manage Sandboxes](/sandboxes/manage-sandboxes).
+This page describes how the CLI resolves a gateway, authenticates with it, and where credentials are stored. For how to deploy or register gateways, refer to [Gateways](/sandboxes/manage-gateways).
 
 ## Gateway Resolution
 
@@ -26,7 +26,7 @@ The CLI uses one of three connection modes depending on the gateway's authentica
 
 ### mTLS (local and remote gateways)
 
-The default mode for self-deployed gateways. When you run `gateway start` or `gateway add --local` / `gateway add --remote`, the CLI extracts mTLS certificates from the running container and stores them locally. Every subsequent request presents a client certificate to prove identity.
+The default mode for self-deployed gateways. When you run `gateway start` or `gateway add https://... --local` / `gateway add https://... --remote`, the CLI extracts mTLS certificates from the running container and stores them locally. Every subsequent request presents a client certificate to prove identity.
 
 The CLI loads three PEM files from `~/.config/openshell/gateways/<name>/mtls/`:
 
@@ -71,6 +71,14 @@ This is transparent to the user. All CLI commands work the same regardless of wh
 ### Plaintext
 
 When a gateway is deployed with `--plaintext`, TLS is disabled entirely. The CLI connects over plain HTTP/2. This mode is intended for gateways behind a trusted reverse proxy or tunnel that handles TLS termination externally.
+
+Register a plaintext gateway with an explicit `http://` endpoint:
+
+```shell
+openshell gateway add http://127.0.0.1:8080 --local
+```
+
+This stores the gateway with `auth_mode = plaintext`, skips mTLS certificate extraction, and does not open the browser login flow.
 
 ## File Layout
 

@@ -857,8 +857,12 @@ enum GatewayCommands {
     ///
     /// Registers a gateway endpoint so it appears in `openshell gateway select`.
     ///
-    /// Without extra flags the gateway is treated as an edge-authenticated
-    /// (cloud) gateway and a browser is opened for authentication.
+    /// An `http://...` endpoint is treated as a direct plaintext gateway and
+    /// skips both mTLS certificate extraction and browser authentication.
+    ///
+    /// Without extra flags, an `https://...` endpoint is treated as an
+    /// edge-authenticated (cloud) gateway and a browser is opened for
+    /// authentication.
     ///
     /// Pass `--remote <ssh-dest>` to register a remote mTLS gateway whose
     /// Docker daemon is reachable over SSH. Pass `--local` to register a
@@ -870,7 +874,8 @@ enum GatewayCommands {
     /// for `--remote user@host` with the endpoint derived from the URL.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Add {
-        /// Gateway endpoint URL (e.g., `https://10.0.0.5:8080` or `ssh://user@host:8080`).
+        /// Gateway endpoint URL (for example `http://127.0.0.1:8080`,
+        /// `https://10.0.0.5:8080`, or `ssh://user@host:8080`).
         endpoint: String,
 
         /// Gateway name (auto-derived from the endpoint hostname when omitted).
@@ -878,6 +883,7 @@ enum GatewayCommands {
         name: Option<String>,
 
         /// Register a remote mTLS gateway accessible via SSH.
+        /// With `http://...`, stores a remote plaintext registration instead.
         #[arg(long, conflicts_with = "local")]
         remote: Option<String>,
 
@@ -886,6 +892,7 @@ enum GatewayCommands {
         ssh_key: Option<String>,
 
         /// Register a local mTLS gateway running in Docker on this machine.
+        /// With `http://...`, stores a local plaintext registration instead.
         #[arg(long, conflicts_with = "remote")]
         local: bool,
     },
