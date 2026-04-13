@@ -641,7 +641,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "HTTP:GET [INFO] ALLOWED curl(68) -> GET http://172.20.0.1:9876/test [policy:allow_host_9876]"
+            "HTTP:GET [INFO] ALLOWED curl(68) -> GET http://172.20.0.1:9876/test [policy:allow_host_9876 engine:mechanistic]"
         );
     }
 
