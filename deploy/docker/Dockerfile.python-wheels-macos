@@ -13,6 +13,7 @@ FROM python:${PYTHON_VERSION}-slim AS builder
 
 ARG TARGETARCH
 ARG CARGO_TARGET_CACHE_SCOPE=default
+ARG Z3_RELEASE_TAG=z3-latest
 
 ENV PATH="/root/.cargo/bin:/usr/local/bin:/osxcross/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/osxcross/lib"
@@ -41,6 +42,15 @@ RUN rustup target add aarch64-apple-darwin
 RUN pip install --no-cache-dir maturin
 
 WORKDIR /build
+
+COPY tasks/scripts/z3/ tasks/scripts/z3/
+
+RUN mkdir -p /opt/prebuilt-z3 && \
+    sh tasks/scripts/z3/download-release-artifact.sh \
+      --target aarch64-apple-darwin \
+      --release-tag "${Z3_RELEASE_TAG}" \
+      --output-dir /opt/prebuilt-z3 >/dev/null && \
+    printf 'export PKG_CONFIG_ALLOW_CROSS=1\nexport PKG_CONFIG_PATH=/opt/prebuilt-z3/z3-aarch64-apple-darwin/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}\n' > /opt/prebuilt-z3/env.sh
 
 ENV CC_aarch64_apple_darwin=oa64-clang
 ENV CXX_aarch64_apple_darwin=oa64-clang++
@@ -87,7 +97,8 @@ RUN mkdir -p crates/openshell-cli/src crates/openshell-core/src crates/openshell
 RUN --mount=type=cache,id=cargo-registry-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-python-wheels-macos-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    cargo build --release --target aarch64-apple-darwin -p openshell-cli --features bundled-z3 2>/dev/null || true
+    . /opt/prebuilt-z3/env.sh && \
+    cargo build --release --target aarch64-apple-darwin -p openshell-cli 2>/dev/null || true
 
 # Copy actual source code and Python packaging files.
 COPY crates/ crates/
@@ -115,10 +126,11 @@ ARG OPENSHELL_IMAGE_TAG
 RUN --mount=type=cache,id=cargo-registry-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-python-wheels-macos-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
+    . /opt/prebuilt-z3/env.sh && \
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi && \
-    maturin build --release --target aarch64-apple-darwin --features bundled-z3 --out /wheels
+    maturin build --release --target aarch64-apple-darwin --out /wheels
 
 FROM scratch AS wheels
 COPY --from=builder /wheels/*.whl /

@@ -1,0 +1,225 @@
+name: Release Z3
+
+on:
+  workflow_dispatch:
+    inputs:
+      z3_version:
+        description: "Z3 version to build (e.g. 4.16.0)"
+        required: true
+        type: string
+      prune_existing_assets:
+        description: "Delete previously published z3-latest assets before upload"
+        required: false
+        default: true
+        type: boolean
+      notes:
+        description: "Optional additional release notes"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: read
+
+concurrency:
+  group: z3-latest-release
+  cancel-in-progress: false
+
+env:
+  Z3_RELEASE_TAG: z3-latest
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-z3-linux:
+    name: Build Z3 (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
+          - runner: build-amd64
+            target: x86_64-unknown-linux-musl
+            zig_target: x86_64-linux-musl
+            use_zig: true
+          - runner: build-arm64
+            target: aarch64-unknown-linux-musl
+            zig_target: aarch64-linux-musl
+            use_zig: true
+          - runner: build-amd64
+            target: x86_64-unknown-linux-gnu
+            use_zig: false
+          - runner: build-arm64
+            target: aarch64-unknown-linux-gnu
+            use_zig: false
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install tools
+        if: matrix.use_zig
+        run: mise install
+
+      - name: Set up zig wrappers
+        if: matrix.use_zig
+        run: |
+          set -euo pipefail
+          ZIG="$(mise which zig)"
+          mkdir -p /tmp/zig-z3
+          for tool in cc c++; do
+            printf '#!/bin/bash\nexec "%s" %s --target=%s "$@"\n' \
+              "$ZIG" "$tool" "${{ matrix.zig_target }}" > "/tmp/zig-z3/${tool}"
+            chmod +x "/tmp/zig-z3/${tool}"
+          done
+
+      - name: Build artifact
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [ "${{ matrix.use_zig }}" = "true" ]; then
+            export CC=/tmp/zig-z3/cc
+            export CXX=/tmp/zig-z3/c++
+          fi
+          sh tasks/scripts/z3/build-artifact.sh \
+            --target "${{ matrix.target }}" \
+            --z3-version "${{ inputs.z3_version }}" \
+            --output "artifacts/z3-${{ matrix.target }}.tar.gz"
+          ls -lh artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: z3-${{ matrix.target }}
+          path: artifacts/z3-${{ matrix.target }}.tar.gz
+          retention-days: 5
+
+  build-z3-macos:
+    name: Build Z3 (aarch64-apple-darwin)
+    runs-on: build-amd64
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/setup-buildx
+
+      - name: Build macOS artifact via Docker
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file deploy/docker/Dockerfile.z3-macos \
+            --build-arg Z3_VERSION="${{ inputs.z3_version }}" \
+            --target artifact \
+            --output type=local,dest=artifacts/ \
+            .
+          ls -lh artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: z3-aarch64-apple-darwin
+          path: artifacts/z3-aarch64-apple-darwin.tar.gz
+          retention-days: 5
+
+  release-z3:
+    name: Release Z3
+    needs: [build-z3-linux, build-z3-macos]
+    runs-on: build-amd64
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all Z3 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: z3-*
+          path: release/
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum z3-*.tar.gz > z3-checksums-sha256.txt
+          cat z3-checksums-sha256.txt
+
+      - name: Ensure z3-latest tag exists
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -fa "${Z3_RELEASE_TAG}" -m "OpenShell Z3 Latest" "${GITHUB_SHA}"
+          git push --force origin "${Z3_RELEASE_TAG}"
+
+      - name: Prune stale Z3 assets from z3-latest release
+        if: inputs.prune_existing_assets
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: 'z3-latest' });
+            } catch (err) {
+              if (err.status === 404) {
+                core.info('No existing z3-latest release; will create fresh.');
+                return;
+              }
+              throw err;
+            }
+            for (const asset of release.data.assets) {
+              if (asset.name.startsWith('z3-')) {
+                core.info(`Deleting stale asset: ${asset.name}`);
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
+              }
+            }
+
+      - name: Create / update z3-latest GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OpenShell Z3 Latest
+          prerelease: true
+          tag_name: ${{ env.Z3_RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            Rolling prebuilt static Z3 artifacts for OpenShell release packaging.
+
+            Z3 version: `${{ inputs.z3_version }}`
+
+            Supported assets:
+            - `z3-x86_64-unknown-linux-musl.tar.gz`
+            - `z3-aarch64-unknown-linux-musl.tar.gz`
+            - `z3-x86_64-unknown-linux-gnu.tar.gz`
+            - `z3-aarch64-unknown-linux-gnu.tar.gz`
+            - `z3-aarch64-apple-darwin.tar.gz`
+
+            ${{ inputs.notes }}
+          files: |
+            release/z3-x86_64-unknown-linux-musl.tar.gz
+            release/z3-aarch64-unknown-linux-musl.tar.gz
+            release/z3-x86_64-unknown-linux-gnu.tar.gz
+            release/z3-aarch64-unknown-linux-gnu.tar.gz
+            release/z3-aarch64-apple-darwin.tar.gz
+            release/z3-checksums-sha256.txt

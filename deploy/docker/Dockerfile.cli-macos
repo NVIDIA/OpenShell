@@ -19,6 +19,7 @@ FROM ${OSXCROSS_IMAGE} AS osxcross
 FROM python:3.12-slim AS builder
 
 ARG CARGO_TARGET_CACHE_SCOPE=default
+ARG Z3_RELEASE_TAG=z3-latest
 
 ENV PATH="/root/.cargo/bin:/usr/local/bin:/osxcross/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/osxcross/lib"
@@ -46,6 +47,15 @@ RUN ln -sf /osxcross/bin/arm64-apple-darwin25.1-ld /usr/local/bin/arm64-apple-ma
 RUN rustup target add aarch64-apple-darwin
 
 WORKDIR /build
+
+COPY tasks/scripts/z3/ tasks/scripts/z3/
+
+RUN mkdir -p /opt/prebuilt-z3 && \
+    sh tasks/scripts/z3/download-release-artifact.sh \
+      --target aarch64-apple-darwin \
+      --release-tag "${Z3_RELEASE_TAG}" \
+      --output-dir /opt/prebuilt-z3 >/dev/null && \
+    printf 'export PKG_CONFIG_ALLOW_CROSS=1\nexport PKG_CONFIG_PATH=/opt/prebuilt-z3/z3-aarch64-apple-darwin/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}\n' > /opt/prebuilt-z3/env.sh
 
 ENV CC_aarch64_apple_darwin=oa64-clang
 ENV CXX_aarch64_apple_darwin=oa64-clang++
@@ -96,7 +106,8 @@ RUN mkdir -p crates/openshell-cli/src \
 RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-cli-macos,sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-cli-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    cargo build --release --target aarch64-apple-darwin -p openshell-cli --features bundled-z3 2>/dev/null || true
+    . /opt/prebuilt-z3/env.sh && \
+    cargo build --release --target aarch64-apple-darwin -p openshell-cli 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Stage 2: real build
@@ -121,10 +132,11 @@ ARG OPENSHELL_IMAGE_TAG
 RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-cli-macos,sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-cli-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
+    . /opt/prebuilt-z3/env.sh && \
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi && \
-    cargo build --release --target aarch64-apple-darwin -p openshell-cli --features bundled-z3 && \
+    cargo build --release --target aarch64-apple-darwin -p openshell-cli && \
     cp target/aarch64-apple-darwin/release/openshell /openshell
 
 FROM scratch AS binary

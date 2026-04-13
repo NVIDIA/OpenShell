@@ -1,0 +1,54 @@
+# syntax=docker/dockerfile:1.6
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG OSXCROSS_IMAGE=crazymax/osxcross:latest
+
+FROM ${OSXCROSS_IMAGE} AS osxcross
+
+FROM python:3.12-slim AS builder
+
+ARG Z3_VERSION
+
+ENV PATH="/usr/local/bin:/osxcross/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/osxcross/lib"
+
+COPY --from=osxcross /osxcross /osxcross
+
+RUN SDKROOT="$(echo /osxcross/SDK/MacOSX*.sdk)" && ln -sfn "${SDKROOT}" /osxcross/SDK/MacOSX.sdk
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    clang \
+    cmake \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Match the linker alias used by the existing macOS release build.
+RUN ln -sf /osxcross/bin/arm64-apple-darwin25.1-ld /usr/local/bin/arm64-apple-macosx-ld
+
+WORKDIR /build
+
+COPY tasks/scripts/z3/ tasks/scripts/z3/
+
+ENV CC=oa64-clang
+ENV CXX=oa64-clang++
+ENV AR=aarch64-apple-darwin25.1-ar
+ENV SDKROOT=/osxcross/SDK/MacOSX.sdk
+ENV MACOSX_DEPLOYMENT_TARGET=13.3
+ENV CFLAGS=--target=arm64-apple-macosx\ -mmacosx-version-min=13.3
+ENV CXXFLAGS=--target=arm64-apple-macosx\ -mmacosx-version-min=13.3
+ENV LDFLAGS=--target=arm64-apple-macosx\ -mmacosx-version-min=13.3
+
+RUN mkdir -p /out && \
+    Z3_CMAKE_SYSTEM_NAME=Darwin \
+    Z3_CMAKE_SYSTEM_PROCESSOR=arm64 \
+    sh tasks/scripts/z3/build-artifact.sh \
+      --target aarch64-apple-darwin \
+      --z3-version "${Z3_VERSION}" \
+      --output /out/z3-aarch64-apple-darwin.tar.gz
+
+FROM scratch AS artifact
+COPY --from=builder /out/z3-aarch64-apple-darwin.tar.gz /z3-aarch64-apple-darwin.tar.gz
