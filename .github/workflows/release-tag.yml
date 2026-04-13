@@ -149,6 +149,13 @@ jobs:
       - name: Sync Python dependencies
         run: uv sync
 
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: python-wheel-linux-${{ matrix.arch }}
+          cache-directories: .cache/sccache
+          cache-targets: "true"
+
       - name: Build Python wheels
         run: |
           set -euo pipefail
