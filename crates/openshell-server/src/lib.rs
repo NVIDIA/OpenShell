@@ -10,12 +10,12 @@
 //! - mTLS support
 
 mod auth;
+mod compute;
 mod grpc;
 mod http;
 mod inference;
 mod multiplex;
 mod persistence;
-mod sandbox;
 mod sandbox_index;
 mod sandbox_watch;
 mod ssh_tunnel;
@@ -30,13 +30,14 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 
+use compute::ComputeRuntime;
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
+use openshell_driver_kubernetes::KubernetesComputeConfig;
 use persistence::Store;
-use sandbox::{SandboxClient, spawn_sandbox_watcher, spawn_store_reconciler};
 use sandbox_index::SandboxIndex;
-use sandbox_watch::{SandboxWatchBus, spawn_kube_event_tailer};
+use sandbox_watch::SandboxWatchBus;
 pub use tls::TlsAcceptor;
 use tracing_bus::TracingLogBus;
 
@@ -49,8 +50,8 @@ pub struct ServerState {
     /// Persistence store.
     pub store: Arc<Store>,
 
-    /// Kubernetes sandbox client.
-    pub sandbox_client: SandboxClient,
+    /// Compute orchestration over the configured driver.
+    pub compute: ComputeRuntime,
 
     /// In-memory sandbox correlation index.
     pub sandbox_index: SandboxIndex,
@@ -87,7 +88,7 @@ impl ServerState {
     pub fn new(
         config: Config,
         store: Arc<Store>,
-        sandbox_client: SandboxClient,
+        compute: ComputeRuntime,
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
@@ -95,7 +96,7 @@ impl ServerState {
         Self {
             config,
             store,
-            sandbox_client,
+            compute,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
@@ -124,48 +125,40 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
         ));
     }
 
-    let store = Store::connect(database_url).await?;
-    let sandbox_client = SandboxClient::new(
-        config.sandbox_namespace.clone(),
-        config.sandbox_image.clone(),
-        config.sandbox_image_pull_policy.clone(),
-        config.grpc_endpoint.clone(),
-        format!("0.0.0.0:{}", config.sandbox_ssh_port),
-        config.ssh_handshake_secret.clone(),
-        config.ssh_handshake_skew_secs,
-        config.client_tls_secret_name.clone(),
-        config.host_gateway_ip.clone(),
-    )
-    .await
-    .map_err(|e| Error::execution(format!("failed to create kubernetes client: {e}")))?;
-    let store = Arc::new(store);
+    let store = Arc::new(Store::connect(database_url).await?);
 
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
+    let compute = ComputeRuntime::new_kubernetes(
+        KubernetesComputeConfig {
+            namespace: config.sandbox_namespace.clone(),
+            default_image: config.sandbox_image.clone(),
+            image_pull_policy: config.sandbox_image_pull_policy.clone(),
+            grpc_endpoint: config.grpc_endpoint.clone(),
+            ssh_listen_addr: format!("0.0.0.0:{}", config.sandbox_ssh_port),
+            ssh_port: config.sandbox_ssh_port,
+            ssh_handshake_secret: config.ssh_handshake_secret.clone(),
+            ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
+            client_tls_secret_name: config.client_tls_secret_name.clone(),
+            host_gateway_ip: config.host_gateway_ip.clone(),
+        },
+        store.clone(),
+        sandbox_index.clone(),
+        sandbox_watch_bus.clone(),
+        tracing_log_bus.clone(),
+    )
+    .await
+    .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
     let state = Arc::new(ServerState::new(
         config.clone(),
         store.clone(),
-        sandbox_client,
+        compute,
         sandbox_index,
         sandbox_watch_bus,
         tracing_log_bus,
     ));
 
-    spawn_sandbox_watcher(
-        store.clone(),
-        state.sandbox_client.clone(),
-        state.sandbox_index.clone(),
-        state.sandbox_watch_bus.clone(),
-        state.tracing_log_bus.clone(),
-    );
-    spawn_store_reconciler(
-        store.clone(),
-        state.sandbox_client.clone(),
-        state.sandbox_index.clone(),
-        state.sandbox_watch_bus.clone(),
-        state.tracing_log_bus.clone(),
-    );
-    spawn_kube_event_tailer(state.clone());
+    state.compute.spawn_watchers();
     ssh_tunnel::spawn_session_reaper(store.clone(), std::time::Duration::from_secs(3600));
 
     // Create the multiplexed service

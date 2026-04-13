@@ -100,25 +100,18 @@ async fn ssh_connect(
         return StatusCode::PRECONDITION_FAILED.into_response();
     }
 
-    let connect_target = if let Some(status) = sandbox.status.as_ref()
-        && !status.agent_pod.is_empty()
-    {
-        match state.sandbox_client.agent_pod_ip(&status.agent_pod).await {
-            Ok(Some(ip)) => ConnectTarget::Ip(SocketAddr::new(ip, state.config.sandbox_ssh_port)),
-            Ok(None) => return StatusCode::BAD_GATEWAY.into_response(),
-            Err(err) => {
-                warn!(error = %err, "Failed to resolve agent pod IP");
-                return StatusCode::BAD_GATEWAY.into_response();
-            }
+    let connect_target = match state.compute.resolve_sandbox_endpoint(&sandbox).await {
+        Ok(crate::compute::ResolvedEndpoint::Ip(ip, port)) => {
+            ConnectTarget::Ip(SocketAddr::new(ip, port))
         }
-    } else if !sandbox.name.is_empty() {
-        let service_host = format!(
-            "{}.{}.svc.cluster.local",
-            sandbox.name, state.config.sandbox_namespace
-        );
-        ConnectTarget::Host(service_host, state.config.sandbox_ssh_port)
-    } else {
-        return StatusCode::PRECONDITION_FAILED.into_response();
+        Ok(crate::compute::ResolvedEndpoint::Host(host, port)) => ConnectTarget::Host(host, port),
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            return StatusCode::PRECONDITION_FAILED.into_response();
+        }
+        Err(err) => {
+            warn!(error = %err, "Failed to resolve sandbox endpoint");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
     };
     // Enforce per-token concurrent connection limit.
     {

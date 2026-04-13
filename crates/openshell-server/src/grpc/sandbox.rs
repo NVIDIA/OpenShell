@@ -70,18 +70,7 @@ pub(super) async fn handle_create_sandbox(
     let mut spec = spec;
     let template = spec.template.get_or_insert_with(SandboxTemplate::default);
     if template.image.is_empty() {
-        template.image = state.sandbox_client.default_image().to_string();
-    }
-
-    if spec.gpu {
-        state
-            .sandbox_client
-            .validate_gpu_support()
-            .await
-            .map_err(|status| {
-                warn!(error = %status, "Rejecting GPU sandbox request");
-                status
-            })?;
+        template.image = state.compute.default_image().to_string();
     }
 
     // Ensure process identity defaults to "sandbox" when missing or
@@ -109,61 +98,20 @@ pub(super) async fn handle_create_sandbox(
         ..Default::default()
     };
 
-    // Reject duplicate names early.
-    let existing = state
-        .store
-        .get_message_by_name::<Sandbox>(&name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
-    if existing.is_some() {
-        return Err(Status::already_exists(format!(
-            "sandbox '{name}' already exists"
-        )));
-    }
-
-    // Persist to the store FIRST so the sandbox watcher always finds
-    // the record with `spec` populated.
-    state.sandbox_index.update_from_sandbox(&sandbox);
-
     state
-        .store
-        .put_message(&sandbox)
+        .compute
+        .validate_sandbox_create(&sandbox)
         .await
-        .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
+        .map_err(|status| {
+            warn!(error = %status, "Rejecting sandbox create request");
+            status
+        })?;
 
-    // Now create the Kubernetes resource.
-    match state.sandbox_client.create(&sandbox).await {
-        Ok(_) => {}
-        Err(kube::Error::Api(err)) if err.code == 409 => {
-            let _ = state.store.delete("sandbox", &id).await;
-            state.sandbox_index.remove_sandbox(&id);
-            warn!(
-                sandbox_id = %id,
-                sandbox_name = %name,
-                "Sandbox already exists in Kubernetes"
-            );
-            return Err(Status::already_exists("sandbox already exists"));
-        }
-        Err(err) => {
-            let _ = state.store.delete("sandbox", &id).await;
-            state.sandbox_index.remove_sandbox(&id);
-            warn!(
-                sandbox_id = %id,
-                sandbox_name = %name,
-                error = %err,
-                "CreateSandbox request failed"
-            );
-            return Err(Status::internal(format!(
-                "create sandbox in kubernetes failed: {err}"
-            )));
-        }
-    }
-
-    state.sandbox_watch_bus.notify(&id);
+    let sandbox = state.compute.create_sandbox(sandbox).await?;
 
     info!(
-        sandbox_id = %id,
-        sandbox_name = %name,
+        sandbox_id = %sandbox.id,
+        sandbox_name = %sandbox.name,
         "CreateSandbox request completed successfully"
     );
     Ok(Response::new(SandboxResponse {
@@ -224,92 +172,8 @@ pub(super) async fn handle_delete_sandbox(
         return Err(Status::invalid_argument("name is required"));
     }
 
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
-
-    let Some(mut sandbox) = sandbox else {
-        return Err(Status::not_found("sandbox not found"));
-    };
-
-    let id = sandbox.id.clone();
-
-    sandbox.phase = SandboxPhase::Deleting as i32;
-    state
-        .store
-        .put_message(&sandbox)
-        .await
-        .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
-
-    state.sandbox_index.update_from_sandbox(&sandbox);
-    state.sandbox_watch_bus.notify(&id);
-
-    // Clean up SSH sessions associated with this sandbox.
-    if let Ok(records) = state.store.list(SshSession::object_type(), 1000, 0).await {
-        for record in records {
-            if let Ok(session) = SshSession::decode(record.payload.as_slice())
-                && session.sandbox_id == id
-                && let Err(e) = state
-                    .store
-                    .delete(SshSession::object_type(), &session.id)
-                    .await
-            {
-                warn!(
-                    session_id = %session.id,
-                    error = %e,
-                    "Failed to delete SSH session during sandbox cleanup"
-                );
-            }
-        }
-    }
-
-    // Clean up sandbox-scoped settings record.
-    if let Err(e) = state
-        .store
-        .delete(
-            super::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
-            &super::policy::sandbox_settings_id(&id),
-        )
-        .await
-    {
-        warn!(
-            sandbox_id = %id,
-            error = %e,
-            "Failed to delete sandbox settings during cleanup"
-        );
-    }
-
-    let deleted = match state.sandbox_client.delete(&sandbox.name).await {
-        Ok(deleted) => deleted,
-        Err(err) => {
-            warn!(
-                sandbox_id = %id,
-                sandbox_name = %sandbox.name,
-                error = %err,
-                "DeleteSandbox request failed"
-            );
-            return Err(Status::internal(format!(
-                "delete sandbox in kubernetes failed: {err}"
-            )));
-        }
-    };
-
-    if !deleted && let Err(e) = state.store.delete(Sandbox::object_type(), &id).await {
-        warn!(sandbox_id = %id, error = %e, "Failed to clean up store after delete");
-    }
-
-    // Clean up bus entries to prevent unbounded memory growth.
-    state.tracing_log_bus.remove(&id);
-    state.tracing_log_bus.platform_event_bus.remove(&id);
-    state.sandbox_watch_bus.remove(&id);
-
-    info!(
-        sandbox_id = %id,
-        sandbox_name = %sandbox.name,
-        "DeleteSandbox request completed successfully"
-    );
+    let deleted = state.compute.delete_sandbox(&name).await?;
+    info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
     Ok(Response::new(DeleteSandboxResponse { deleted }))
 }
 
@@ -724,37 +588,10 @@ async fn resolve_sandbox_exec_target(
     state: &ServerState,
     sandbox: &Sandbox,
 ) -> Result<(String, u16), Status> {
-    if let Some(status) = sandbox.status.as_ref()
-        && !status.agent_pod.is_empty()
-    {
-        match state.sandbox_client.agent_pod_ip(&status.agent_pod).await {
-            Ok(Some(ip)) => {
-                return Ok((ip.to_string(), state.config.sandbox_ssh_port));
-            }
-            Ok(None) => {
-                return Err(Status::failed_precondition(
-                    "sandbox agent pod IP is not available",
-                ));
-            }
-            Err(err) => {
-                return Err(Status::internal(format!(
-                    "failed to resolve agent pod IP: {err}"
-                )));
-            }
-        }
+    match state.compute.resolve_sandbox_endpoint(sandbox).await? {
+        crate::compute::ResolvedEndpoint::Ip(ip, port) => Ok((ip.to_string(), port)),
+        crate::compute::ResolvedEndpoint::Host(host, port) => Ok((host, port)),
     }
-
-    if sandbox.name.is_empty() {
-        return Err(Status::failed_precondition("sandbox has no name"));
-    }
-
-    Ok((
-        format!(
-            "{}.{}.svc.cluster.local",
-            sandbox.name, state.config.sandbox_namespace
-        ),
-        state.config.sandbox_ssh_port,
-    ))
 }
 
 /// Shell-escape a value for embedding in a POSIX shell command.

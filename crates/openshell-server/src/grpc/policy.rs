@@ -53,7 +53,7 @@ const GLOBAL_SETTINGS_OBJECT_TYPE: &str = "gateway_settings";
 const GLOBAL_SETTINGS_ID: &str = "gateway_settings:global";
 const GLOBAL_SETTINGS_NAME: &str = "global";
 /// Internal object type for durable sandbox-scoped settings.
-pub(super) const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
+pub(crate) const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
 /// Reserved settings key used to store global policy payload.
 const POLICY_SETTING_KEY: &str = "policy";
 /// Sentinel `sandbox_id` used to store global policy revisions.
@@ -1930,7 +1930,7 @@ pub(super) async fn save_global_settings(
 }
 
 /// Derive a distinct settings record ID from a sandbox UUID.
-pub(super) fn sandbox_settings_id(sandbox_id: &str) -> String {
+pub(crate) fn sandbox_settings_id(sandbox_id: &str) -> String {
     format!("settings:{sandbox_id}")
 }
 

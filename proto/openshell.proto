@@ -142,7 +142,7 @@ message HealthResponse {
 
 // Create sandbox request.
 message CreateSandboxRequest {
-  openshell.datamodel.v1.SandboxSpec spec = 1;
+  openshell.sandbox.v1.SandboxSpec spec = 1;
   // Optional user-supplied sandbox name. When empty the server generates one.
   string name = 2;
 }
@@ -167,12 +167,12 @@ message DeleteSandboxRequest {
 
 // Sandbox response.
 message SandboxResponse {
-  openshell.datamodel.v1.Sandbox sandbox = 1;
+  openshell.sandbox.v1.Sandbox sandbox = 1;
 }
 
 // List sandboxes response.
 message ListSandboxesResponse {
-  repeated openshell.datamodel.v1.Sandbox sandboxes = 1;
+  repeated openshell.sandbox.v1.Sandbox sandboxes = 1;
 }
 
 // Delete sandbox response.
@@ -336,11 +336,11 @@ message WatchSandboxRequest {
 message SandboxStreamEvent {
   oneof payload {
     // Latest sandbox snapshot.
-    openshell.datamodel.v1.Sandbox sandbox = 1;
+    openshell.sandbox.v1.Sandbox sandbox = 1;
     // One server log line/event.
     SandboxLogLine log = 2;
     // One platform event.
-    PlatformEvent event = 3;
+    openshell.sandbox.v1.PlatformEvent event = 3;
     // Warning from the server (e.g. missed messages due to lag).
     SandboxStreamWarning warning = 4;
     // Draft policy update notification.
@@ -360,22 +360,6 @@ message SandboxLogLine {
   string source = 6;
   // Structured key-value fields from the tracing event (e.g. dst_host, action).
   map<string, string> fields = 7;
-}
-
-// Platform event correlated to a sandbox.
-message PlatformEvent {
-  // Event timestamp in milliseconds since epoch.
-  int64 timestamp_ms = 1;
-  // Event source (e.g. "kubernetes", "docker", "process").
-  string source = 2;
-  // Event type/severity (e.g. "Normal", "Warning").
-  string type = 3;
-  // Short reason code (e.g. "Started", "Pulled", "Failed").
-  string reason = 4;
-  // Human-readable event message.
-  string message = 5;
-  // Optional metadata as key-value pairs.
-  map<string, string> metadata = 6;
 }
 
 message SandboxStreamWarning {

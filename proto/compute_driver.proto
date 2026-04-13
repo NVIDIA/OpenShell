@@ -1,0 +1,100 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.compute.v1;
+
+import "sandbox.proto";
+
+// Internal compute-driver contract used by the gateway.
+service ComputeDriver {
+  // Report driver capabilities and defaults.
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+
+  // Validate a sandbox before create-time provisioning.
+  rpc ValidateSandboxCreate(ValidateSandboxCreateRequest)
+      returns (ValidateSandboxCreateResponse);
+
+  // Provision platform resources for a sandbox.
+  rpc CreateSandbox(ComputeCreateSandboxRequest) returns (ComputeCreateSandboxResponse);
+
+  // Tear down platform resources for a sandbox.
+  rpc DeleteSandbox(ComputeDeleteSandboxRequest) returns (ComputeDeleteSandboxResponse);
+
+  // Resolve the current endpoint for sandbox exec/SSH transport.
+  rpc ResolveSandboxEndpoint(ResolveSandboxEndpointRequest)
+      returns (ResolveSandboxEndpointResponse);
+
+  // Stream sandbox observations from the platform.
+  rpc WatchSandboxes(WatchSandboxesRequest) returns (stream WatchSandboxesEvent);
+}
+
+message GetCapabilitiesRequest {}
+
+message GetCapabilitiesResponse {
+  string driver_name = 1;
+  string driver_version = 2;
+  string default_image = 3;
+  bool supports_gpu = 4;
+}
+
+message ValidateSandboxCreateRequest {
+  openshell.sandbox.v1.Sandbox sandbox = 1;
+}
+
+message ValidateSandboxCreateResponse {}
+
+message ComputeCreateSandboxRequest {
+  openshell.sandbox.v1.Sandbox sandbox = 1;
+}
+
+message ComputeCreateSandboxResponse {}
+
+message ComputeDeleteSandboxRequest {
+  string sandbox_id = 1;
+  string sandbox_name = 2;
+}
+
+message ComputeDeleteSandboxResponse {
+  bool deleted = 1;
+}
+
+message ResolveSandboxEndpointRequest {
+  openshell.sandbox.v1.Sandbox sandbox = 1;
+}
+
+message SandboxEndpoint {
+  oneof target {
+    string ip = 1;
+    string host = 2;
+  }
+  uint32 port = 3;
+}
+
+message ResolveSandboxEndpointResponse {
+  SandboxEndpoint endpoint = 1;
+}
+
+message WatchSandboxesRequest {}
+
+message WatchSandboxesSandboxEvent {
+  openshell.sandbox.v1.Sandbox sandbox = 1;
+}
+
+message WatchSandboxesDeletedEvent {
+  string sandbox_id = 1;
+}
+
+message WatchSandboxesPlatformEvent {
+  string sandbox_id = 1;
+  openshell.sandbox.v1.PlatformEvent event = 2;
+}
+
+message WatchSandboxesEvent {
+  oneof payload {
+    WatchSandboxesSandboxEvent sandbox = 1;
+    WatchSandboxesDeletedEvent deleted = 2;
+    WatchSandboxesPlatformEvent platform_event = 3;
+  }
+}

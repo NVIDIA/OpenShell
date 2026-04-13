@@ -6,17 +6,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use futures::{StreamExt, TryStreamExt};
-use k8s_openapi::api::core::v1::Event as KubeEventObj;
-use kube::Client;
-use kube::api::Api;
-use kube::runtime::watcher::{self, Event};
-use openshell_core::proto::{PlatformEvent, SandboxStreamEvent};
 use tokio::sync::broadcast;
 use tonic::Status;
-use tracing::{debug, warn};
-
-use crate::ServerState;
 
 /// Broadcast bus of sandbox updates keyed by sandbox id.
 ///
@@ -66,112 +57,6 @@ impl SandboxWatchBus {
         let mut inner = self.inner.lock().expect("sandbox watch bus lock poisoned");
         inner.remove(sandbox_id);
     }
-}
-
-/// Spawn a background Kubernetes Event tailer.
-///
-/// This tailer publishes platform events (sourced from Kubernetes) into per-sandbox broadcast streams.
-pub fn spawn_kube_event_tailer(state: Arc<ServerState>) {
-    tokio::spawn(async move {
-        let client = match Client::try_default().await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(error = %e, "Failed to create kube client for event tailer");
-                return;
-            }
-        };
-
-        let ns = state.config.sandbox_namespace.clone();
-        let api: Api<KubeEventObj> = Api::namespaced(client, &ns);
-
-        // We don't have a stable label to select Events by sandbox id.
-        // Instead, we watch all Events in the namespace and dispatch using the in-memory index.
-        // This is best-effort and efficient enough for typical sandbox counts.
-        let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
-
-        loop {
-            match stream.try_next().await {
-                Ok(Some(Event::Applied(obj))) => {
-                    if let Some((sandbox_id, evt)) = map_kube_event_to_platform(&state, &obj) {
-                        state
-                            .tracing_log_bus
-                            .platform_event_bus
-                            .publish(&sandbox_id, evt);
-                    }
-                }
-                Ok(Some(Event::Deleted(_))) => {}
-                Ok(Some(Event::Restarted(_))) => {
-                    debug!(namespace = %ns, "Kubernetes event watcher restarted");
-                }
-                Ok(None) => {
-                    warn!(namespace = %ns, "Kubernetes event watcher stream ended");
-                    break;
-                }
-                Err(err) => {
-                    warn!(namespace = %ns, error = %err, "Kubernetes event watcher error");
-                }
-            }
-        }
-    });
-}
-
-fn map_kube_event_to_platform(
-    state: &ServerState,
-    obj: &KubeEventObj,
-) -> Option<(String, SandboxStreamEvent)> {
-    let involved = obj.involved_object.clone();
-    let involved_kind = involved.kind.unwrap_or_default();
-    let involved_name = involved.name.unwrap_or_default();
-
-    let sandbox_id = match involved_kind.as_str() {
-        "Sandbox" => state
-            .sandbox_index
-            .sandbox_id_for_sandbox_name(&involved_name)?,
-        "Pod" => {
-            // The sandbox controller creates pods with the same name as the sandbox,
-            // so try looking up by sandbox name first, then fall back to agent_pod index.
-            state
-                .sandbox_index
-                .sandbox_id_for_sandbox_name(&involved_name)
-                .or_else(|| state.sandbox_index.sandbox_id_for_agent_pod(&involved_name))?
-        }
-        _ => return None,
-    };
-
-    let ts = obj
-        .last_timestamp
-        .as_ref()
-        .or(obj.first_timestamp.as_ref())
-        .map_or(0, |t| t.0.timestamp_millis());
-
-    // Build metadata map with Kubernetes-specific details
-    let mut metadata = HashMap::new();
-    metadata.insert("involved_kind".to_string(), involved_kind);
-    metadata.insert("involved_name".to_string(), involved_name);
-    if let Some(ns) = &obj.involved_object.namespace {
-        metadata.insert("namespace".to_string(), ns.clone());
-    }
-    if let Some(count) = obj.count {
-        metadata.insert("count".to_string(), count.to_string());
-    }
-
-    let evt = PlatformEvent {
-        timestamp_ms: ts,
-        source: "kubernetes".to_string(),
-        r#type: obj.type_.clone().unwrap_or_default(),
-        reason: obj.reason.clone().unwrap_or_default(),
-        message: obj.message.clone().unwrap_or_default(),
-        metadata,
-    };
-
-    Some((
-        sandbox_id,
-        SandboxStreamEvent {
-            payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Event(
-                evt,
-            )),
-        },
-    ))
 }
 
 #[cfg(test)]

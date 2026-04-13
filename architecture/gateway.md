@@ -70,9 +70,10 @@ graph TD
 | Persistence | `crates/openshell-server/src/persistence/mod.rs` | `Store` enum (SQLite/Postgres), generic object CRUD, protobuf codec |
 | Persistence: SQLite | `crates/openshell-server/src/persistence/sqlite.rs` | `SqliteStore` with sqlx |
 | Persistence: Postgres | `crates/openshell-server/src/persistence/postgres.rs` | `PostgresStore` with sqlx |
-| Sandbox K8s | `crates/openshell-server/src/sandbox/mod.rs` | `SandboxClient`, CRD creation/deletion, Kubernetes watcher, phase derivation |
+| Compute runtime | `crates/openshell-server/src/compute/mod.rs` | `ComputeRuntime`, gateway-owned sandbox lifecycle orchestration over a compute backend |
+| Compute driver: Kubernetes | `crates/openshell-driver-kubernetes/src/driver.rs` | Kubernetes CRD create/delete, endpoint resolution, watch stream, pod template translation |
 | Sandbox index | `crates/openshell-server/src/sandbox_index.rs` | `SandboxIndex` -- in-memory name/pod-to-id correlation |
-| Watch bus | `crates/openshell-server/src/sandbox_watch.rs` | `SandboxWatchBus`, `PlatformEventBus`, Kubernetes event tailer |
+| Watch bus | `crates/openshell-server/src/sandbox_watch.rs` | `SandboxWatchBus` -- in-memory broadcast for persisted sandbox updates |
 | Tracing bus | `crates/openshell-server/src/tracing_bus.rs` | `TracingLogBus` -- captures tracing events keyed by `sandbox_id` |
 
 Proto definitions consumed by the gateway:
@@ -80,9 +81,10 @@ Proto definitions consumed by the gateway:
 | Proto file | Package | Defines |
 |------------|---------|---------|
 | `proto/openshell.proto` | `openshell.v1` | `OpenShell` service, sandbox/provider/SSH/watch messages |
+| `proto/compute_driver.proto` | `openshell.compute.v1` | Internal `ComputeDriver` service, endpoint resolution, compute watch stream envelopes |
 | `proto/inference.proto` | `openshell.inference.v1` | `Inference` service: `SetClusterInference`, `GetClusterInference`, `GetInferenceBundle` |
-| `proto/datamodel.proto` | `openshell.datamodel.v1` | `Sandbox`, `SandboxSpec`, `SandboxStatus`, `Provider`, `SandboxPhase` |
-| `proto/sandbox.proto` | `openshell.sandbox.v1` | `SandboxPolicy`, `NetworkPolicyRule`, `SettingValue`, `EffectiveSetting`, `SettingScope`, `PolicySource`, `GetSandboxSettingsRequest/Response`, `GetGatewaySettingsRequest/Response` |
+| `proto/datamodel.proto` | `openshell.datamodel.v1` | `Provider` |
+| `proto/sandbox.proto` | `openshell.sandbox.v1` | Shared sandbox lifecycle types (`Sandbox`, `SandboxSpec`, `SandboxStatus`, `SandboxPhase`, `PlatformEvent`) plus policy/settings messages |
 
 ## Startup Sequence
 
@@ -94,11 +96,10 @@ The gateway boots in `main()` (`crates/openshell-server/src/main.rs`) and procee
 4. **Build `Config`** -- Assembles a `openshell_core::Config` from the parsed arguments.
 5. **Call `run_server()`** (`crates/openshell-server/src/lib.rs`):
    1. Connect to the persistence store (`Store::connect`), which auto-detects SQLite vs Postgres from the URL prefix and runs migrations.
-   2. Create `SandboxClient` (initializes a `kube::Client` from in-cluster or kubeconfig).
+   2. Create `ComputeRuntime` with the in-process Kubernetes compute backend (`KubernetesComputeDriver`).
    3. Build `ServerState` (shared via `Arc<ServerState>` across all handlers).
    4. **Spawn background tasks**:
-      - `spawn_sandbox_watcher` -- watches Kubernetes Sandbox CRDs and syncs state to the store.
-      - `spawn_kube_event_tailer` -- watches Kubernetes Events in the sandbox namespace and publishes them to the `PlatformEventBus`.
+      - `ComputeRuntime::spawn_watchers` -- consumes the compute-driver watch stream, updates persisted sandbox records, and republishes platform events.
    5. Create `MultiplexService`.
    6. Bind `TcpListener` on `config.bind_address`.
    7. Optionally create `TlsAcceptor` from cert/key files.
@@ -137,7 +138,7 @@ All handlers share an `Arc<ServerState>` (`crates/openshell-server/src/lib.rs`):
 pub struct ServerState {
     pub config: Config,
     pub store: Arc<Store>,
-    pub sandbox_client: SandboxClient,
+    pub compute: ComputeRuntime,
     pub sandbox_index: SandboxIndex,
     pub sandbox_watch_bus: SandboxWatchBus,
     pub tracing_log_bus: TracingLogBus,
@@ -148,10 +149,10 @@ pub struct ServerState {
 ```
 
 - **`store`** -- persistence backend (SQLite or Postgres) for all object types.
-- **`sandbox_client`** -- Kubernetes client scoped to the sandbox namespace; creates/deletes CRDs and resolves pod IPs.
-- **`sandbox_index`** -- in-memory bidirectional index mapping sandbox names and agent pod names to sandbox IDs. Used by the event tailer to correlate Kubernetes events.
+- **`compute`** -- gateway-owned compute orchestration. Persists sandbox lifecycle transitions, validates create requests through the compute backend, resolves exec/SSH endpoints, and consumes the backend watch stream.
+- **`sandbox_index`** -- in-memory bidirectional index mapping sandbox names and agent pod names to sandbox IDs. Updated from compute-driver sandbox snapshots.
 - **`sandbox_watch_bus`** -- `broadcast`-based notification bus keyed by sandbox ID. Producers call `notify(&id)` when the persisted sandbox record changes; consumers in `WatchSandbox` streams receive `()` signals and re-read the record.
-- **`tracing_log_bus`** -- captures `tracing` events that include a `sandbox_id` field and republishes them as `SandboxLogLine` messages. Maintains a per-sandbox tail buffer (default 200 entries). Also contains a nested `PlatformEventBus` for Kubernetes events.
+- **`tracing_log_bus`** -- captures `tracing` events that include a `sandbox_id` field and republishes them as `SandboxLogLine` messages. Maintains a per-sandbox tail buffer (default 200 entries). Also contains a nested `PlatformEventBus` for compute-driver platform events.
 - **`settings_mutex`** -- serializes settings mutations (global and sandbox) to prevent read-modify-write races. Held for the duration of any setting set/delete or global policy set/delete operation. See [Gateway Settings Channel](gateway-settings.md#global-policy-lifecycle).
 
 ## Protocol Multiplexing
@@ -499,15 +500,15 @@ The Helm chart template is at `deploy/helm/openshell/templates/statefulset.yaml`
 
 ### Sandbox CRD Management
 
-`SandboxClient` (`crates/openshell-server/src/sandbox/mod.rs`) manages `agents.x-k8s.io/v1alpha1/Sandbox` CRDs.
+`KubernetesComputeDriver` (`crates/openshell-driver-kubernetes/src/driver.rs`) manages `agents.x-k8s.io/v1alpha1/Sandbox` CRDs behind the gateway's compute interface.
 
-- **Create**: Translates a `Sandbox` proto into a Kubernetes `DynamicObject` with labels (`openshell.ai/sandbox-id`, `openshell.ai/managed-by: openshell`) and a spec that includes the pod template, environment variables, and gateway-required env vars (`OPENSHELL_SANDBOX_ID`, `OPENSHELL_ENDPOINT`, `OPENSHELL_SSH_LISTEN_ADDR`, etc.). When callers do not provide custom `volumeClaimTemplates`, the server injects a default `workspace` PVC and mounts it at `/sandbox` so the default sandbox home/workdir survives pod rescheduling.
+- **Create**: Translates a shared `openshell.sandbox.v1.Sandbox` message into a Kubernetes `DynamicObject` with labels (`openshell.ai/sandbox-id`, `openshell.ai/managed-by: openshell`) and a spec that includes the pod template, environment variables, and gateway-required env vars (`OPENSHELL_SANDBOX_ID`, `OPENSHELL_ENDPOINT`, `OPENSHELL_SSH_LISTEN_ADDR`, etc.). When callers do not provide custom `volumeClaimTemplates`, the driver injects a default `workspace` PVC and mounts it at `/sandbox` so the default sandbox home/workdir survives pod rescheduling.
 - **Delete**: Calls the Kubernetes API to delete the CRD by name. Returns `false` if already gone (404).
 - **Pod IP resolution**: `agent_pod_ip()` fetches the agent pod and reads `status.podIP`.
 
 ### Sandbox Watcher
 
-`spawn_sandbox_watcher()` (`crates/openshell-server/src/sandbox/mod.rs`) runs a Kubernetes watcher on `Sandbox` CRDs and processes three event types:
+The Kubernetes driver emits `WatchSandboxes` events through `proto/compute_driver.proto`. `ComputeRuntime` consumes that stream and applies the resulting snapshots to the store.
 
 - **Applied**: Extracts the sandbox ID from labels (or falls back to name prefix stripping), reads the CRD status, derives the phase, and upserts the sandbox record in the store. Notifies the watch bus.
 - **Deleted**: Removes the sandbox record from the store and the index. Notifies the watch bus.
@@ -530,7 +531,7 @@ All other `Ready=False` reasons are treated as terminal failures (`Error` phase)
 
 ### Kubernetes Event Tailer
 
-`spawn_kube_event_tailer()` (`crates/openshell-server/src/sandbox_watch.rs`) watches all Kubernetes `Event` objects in the sandbox namespace and correlates them to sandbox IDs using `SandboxIndex`:
+The Kubernetes driver also watches namespace-scoped Kubernetes `Event` objects and correlates them to sandbox IDs before emitting them as compute-driver platform events:
 
 - Events involving `kind: Sandbox` are correlated by sandbox name.
 - Events involving `kind: Pod` are correlated by agent pod name.

@@ -32,6 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/openshell.proto",
         "../../proto/datamodel.proto",
         "../../proto/sandbox.proto",
+        "../../proto/compute_driver.proto",
         "../../proto/inference.proto",
         "../../proto/test.proto",
     ];
