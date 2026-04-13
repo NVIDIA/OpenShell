@@ -109,14 +109,64 @@ jobs:
               "${REGISTRY}/${component}:${{ github.sha }}"
           done
 
-  build-python-wheels:
-    name: Stage Python Wheels
+  build-python-wheels-linux:
+    name: Build Python Wheels (Linux ${{ matrix.arch }})
+    needs: [compute-versions]
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: build-amd64
+            artifact: linux-amd64
+            task: python:build:linux:amd64
+            output_path: target/wheels/linux-amd64/*.whl
+          - arch: arm64
+            runner: build-arm64
+            artifact: linux-arm64
+            task: python:build:linux:arm64
+            output_path: target/wheels/linux-arm64/*.whl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
+      OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.semver }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Sync Python dependencies
+        run: uv sync
+
+      - name: Build Python wheels
+        run: |
+          set -euo pipefail
+          OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" mise run ${{ matrix.task }}
+          ls -la ${{ matrix.output_path }}
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheels-${{ matrix.artifact }}
+          path: ${{ matrix.output_path }}
+          retention-days: 5
+
+  build-python-wheel-macos:
+    name: Build Python Wheel (macOS)
     needs: [compute-versions]
     runs-on: build-amd64
     timeout-minutes: 120
-    outputs:
-      wheel_version: ${{ needs.compute-versions.outputs.python_version }}
-      wheel_filenames: ${{ steps.filenames.outputs.wheel_filenames }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -135,30 +185,47 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Set up Docker Buildx
-        uses: ./.github/actions/setup-buildx
-
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Sync Python dependencies
         run: uv sync
 
-      - name: Build Python wheels
+      - name: Build Python wheel
         run: |
           set -euo pipefail
-          OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" mise run python:build:multiarch
           OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" mise run python:build:macos
           ls -la target/wheels/*.whl
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheels-macos
+          path: target/wheels/*.whl
+          retention-days: 5
+
+  stage-python-wheels:
+    name: Stage Python Wheels
+    needs: [compute-versions, build-python-wheels-linux, build-python-wheel-macos]
+    runs-on: build-amd64
+    timeout-minutes: 15
+    outputs:
+      wheel_version: ${{ needs.compute-versions.outputs.python_version }}
+      wheel_filenames: ${{ steps.filenames.outputs.wheel_filenames }}
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-wheels-*
+          path: target/wheels/
+          merge-multiple: true
 
       - name: Capture wheel filenames
         id: filenames
         run: |
           set -euo pipefail
-          WHEEL_FILENAMES=$(ls target/wheels/*.whl | xargs -n1 basename | paste -sd, -)
+          ls -la target/wheels/*.whl
+          WHEEL_FILENAMES=$(ls target/wheels/*.whl | xargs -n1 basename | sort | paste -sd, -)
           echo "wheel_filenames=${WHEEL_FILENAMES}" >> "$GITHUB_OUTPUT"
 
       - name: Upload wheel artifacts
@@ -358,7 +425,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release:
     name: Release
-    needs: [compute-versions, build-cli-linux, build-cli-macos, build-python-wheels, tag-ghcr-release]
+    needs: [compute-versions, build-cli-linux, build-cli-macos, stage-python-wheels, tag-ghcr-release]
     runs-on: build-amd64
     timeout-minutes: 10
     steps:
@@ -437,7 +504,7 @@ jobs:
 
   trigger-wheel-publish:
     name: Trigger Wheel Publish
-    needs: [compute-versions, build-python-wheels, release]
+    needs: [compute-versions, stage-python-wheels, release]
     runs-on: [self-hosted, nv]
     timeout-minutes: 10
     steps:
@@ -447,7 +514,7 @@ jobs:
           GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
           RELEASE_VERSION: ${{ needs.compute-versions.outputs.python_version }}
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
-          WHEEL_FILENAMES: ${{ needs.build-python-wheels.outputs.wheel_filenames }}
+          WHEEL_FILENAMES: ${{ needs.stage-python-wheels.outputs.wheel_filenames }}
         run: |
           set -euo pipefail
           if [ -z "${WHEEL_FILENAMES}" ]; then
