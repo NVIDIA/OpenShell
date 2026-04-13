@@ -33,6 +33,12 @@ openshell sandbox create --from <name>
 
 This pulls `ghcr.io/nvidia/openshell-community/sandboxes/<name>:latest`.
 
+## CLI and Wheel Release Builds
+
+Standalone CLI archives and Python wheels do not compile Z3 from source during release packaging. A manually triggered GitHub Actions workflow, `release-z3.yml`, publishes target-specific static Z3 bundles to the rolling `z3-latest` GitHub release in `NVIDIA/OpenShell`.
+
+Release workflows and packaging Dockerfiles download the matching archive for their target, verify it against `z3-checksums-sha256.txt`, and expose the bundled `z3.pc` via `PKG_CONFIG_PATH` so `z3-sys` links against the prebuilt static library. Local development can still opt into source-built Z3 with the existing `bundled-z3` feature when needed.
+
 ## Local Development
 
 `mise run cluster` is the primary development command. It bootstraps a cluster if one doesn't exist, then performs incremental deploys for subsequent runs.
@@ -70,4 +76,3 @@ The harness runs isolated scenarios in temporary git worktrees, keeps its own st
 - auto-detection checks for gateway-only, supervisor-only, shared, Helm-only, unrelated, and explicit-target changes
 - cold vs warm rebuild comparisons for gateway and supervisor code changes
 - container-ID invalidation coverage to verify gateway + Helm are retriggered when the cluster container changes
-

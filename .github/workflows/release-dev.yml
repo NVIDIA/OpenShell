@@ -9,6 +9,9 @@ permissions:
   contents: write
   packages: write
 
+env:
+  Z3_RELEASE_TAG: z3-latest
+
 defaults:
   run:
     shell: bash
@@ -129,8 +132,12 @@ jobs:
       - name: Build Python wheels
         run: |
           set -euo pipefail
-          OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" mise run python:build:multiarch
-          OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" mise run python:build:macos
+          OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" \
+          OPENSHELL_Z3_RELEASE_TAG="${Z3_RELEASE_TAG}" \
+          mise run python:build:multiarch
+          OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" \
+          OPENSHELL_Z3_RELEASE_TAG="${Z3_RELEASE_TAG}" \
+          mise run python:build:macos
           ls -la target/wheels/*.whl
 
       - name: Capture wheel filenames
@@ -151,7 +158,8 @@ jobs:
   # Build CLI binaries (Linux musl — static, native on each arch)
   #
   # Builds run directly on the CI host (glibc Ubuntu).  Zig provides musl
-  # C/C++ toolchains for bundled-z3 and ring, and is also used as the linker.
+  # C/C++ toolchains for ring and the final musl linker. The downloaded Z3
+  # archives were also built with zig c++, so we keep libc++ for compatibility.
   # ---------------------------------------------------------------------------
   build-cli-linux:
     name: Build CLI (Linux ${{ matrix.arch }})
@@ -234,6 +242,16 @@ jobs:
           # Override z3-sys default (stdc++) so Rust links the matching runtime.
           echo "CXXSTDLIB=c++" >> "$GITHUB_ENV"
 
+      - name: Download prebuilt Z3
+        run: |
+          set -euo pipefail
+          Z3_ROOT="$(sh tasks/scripts/z3/download-release-artifact.sh \
+            --target "${{ matrix.target }}" \
+            --release-tag "${Z3_RELEASE_TAG}" \
+            --output-dir "${RUNNER_TEMP:-/tmp}/prebuilt-z3")"
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=${Z3_ROOT}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}" >> "$GITHUB_ENV"
+
       - name: Scope workspace to CLI crates
         run: |
           set -euo pipefail
@@ -246,7 +264,7 @@ jobs:
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
 
       - name: Build ${{ matrix.target }}
-        run: mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-cli --features bundled-z3
+        run: mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-cli
 
       - name: sccache stats
         if: always()
@@ -311,6 +329,7 @@ jobs:
             --build-arg OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" \
             --build-arg OPENSHELL_IMAGE_TAG=dev \
             --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
+            --build-arg Z3_RELEASE_TAG="${Z3_RELEASE_TAG}" \
             --target binary \
             --output type=local,dest=out/ \
             .
