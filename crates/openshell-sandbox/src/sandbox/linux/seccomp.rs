@@ -27,7 +27,8 @@ const SECCOMP_SET_MODE_FILTER: u64 = 1;
 
 pub fn apply(policy: &SandboxPolicy) -> Result<()> {
     let allow_inet = matches!(policy.network.mode, NetworkMode::Proxy | NetworkMode::Allow);
-    let filter = build_filter(allow_inet)?;
+    let main_filter = build_filter(allow_inet)?;
+    let clone3_filter = build_clone3_filter()?;
 
     // Required before applying seccomp filters.
     let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
@@ -38,18 +39,7 @@ pub fn apply(policy: &SandboxPolicy) -> Result<()> {
         ));
     }
 
-    apply_filter(&filter).into_diagnostic()?;
-
-    // Apply a separate filter for clone3 that returns ENOSYS instead of EPERM.
-    // seccomp BPF cannot dereference the `struct clone_args *` pointer that
-    // clone3 takes as arg 0, so we cannot selectively block CLONE_NEWUSER.
-    // Block clone3 unconditionally with ENOSYS: glibc's clone3 wrapper falls
-    // back to clone on ENOSYS (where we CAN filter flags), but treats EPERM
-    // as a hard failure. Using a separate filter with a different match_action
-    // gives us per-syscall errno control that SeccompFilter's global
-    // match_action cannot provide.
-    let clone3_filter = build_clone3_filter()?;
-    apply_filter(&clone3_filter).into_diagnostic()?;
+    apply_runtime_filters(&main_filter, &clone3_filter)?;
 
     Ok(())
 }
@@ -100,6 +90,22 @@ fn build_clone3_filter() -> Result<seccompiler::BpfProgram> {
     .into_diagnostic()?;
 
     filter.try_into().into_diagnostic()
+}
+
+/// Install the sandbox seccomp filters in the required order.
+///
+/// Order matters:
+/// 1. Install the dedicated clone3 filter first so it can still call
+///    `seccomp(SECCOMP_SET_MODE_FILTER)`.
+/// 2. Install the main filter second. It blocks further seccomp filter
+///    installation with `EPERM`, preserving the original hardening intent.
+fn apply_runtime_filters(
+    main_filter: seccompiler::BpfProgramRef,
+    clone3_filter: seccompiler::BpfProgramRef,
+) -> Result<()> {
+    apply_filter(clone3_filter).into_diagnostic()?;
+    apply_filter(main_filter).into_diagnostic()?;
+    Ok(())
 }
 
 fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
@@ -236,9 +242,8 @@ fn add_masked_arg_rule(
 mod tests {
     use super::*;
 
-    // These tests verify filter construction (rule map shape and BPF compilation).
-    // Behavioral verification (syscalls returning EPERM inside a sandbox) requires
-    // a running Linux sandbox and is covered by the e2e test suite.
+    // These tests cover both filter construction (rule map shape and BPF
+    // compilation) and selected runtime behavior on Linux via forked children.
 
     #[test]
     fn build_filter_proxy_mode_compiles() {
@@ -391,6 +396,18 @@ mod tests {
         );
     }
 
+    unsafe fn install_runtime_filters_in_child(
+        main_filter: &seccompiler::BpfProgram,
+        clone3_filter: &seccompiler::BpfProgram,
+    ) {
+        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        if let Err(err) = apply_runtime_filters(main_filter, clone3_filter) {
+            let msg = format!("failed to install runtime seccomp filters: {err}\n");
+            libc::write(2, msg.as_ptr().cast(), msg.len());
+            libc::_exit(1);
+        }
+    }
+
     #[test]
     fn behavioral_memfd_create_blocked() {
         let filter = build_filter(true).unwrap();
@@ -433,14 +450,12 @@ mod tests {
         // glibc falls back to clone.
         let main_filter = build_filter(true).unwrap();
         let clone3_filter = build_clone3_filter().unwrap();
-        // Apply in the same order as apply(): main first, clone3 second.
+        // Apply in the same order as apply(): clone3 filter first, main filter second.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             unsafe {
-                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                apply_filter(&main_filter).expect("main filter");
-                apply_filter(&clone3_filter).expect("clone3 filter");
+                install_runtime_filters_in_child(&main_filter, &clone3_filter);
                 let ret = libc::syscall(libc::SYS_clone3, 0 as libc::c_ulong, 0 as libc::c_ulong);
                 let errno = *libc::__errno_location();
                 if ret == -1 && errno == libc::ENOSYS {
@@ -457,6 +472,46 @@ mod tests {
         assert!(
             unsafe { libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 },
             "clone3 should be blocked with ENOSYS, not EPERM"
+        );
+    }
+
+    #[test]
+    fn behavioral_third_filter_install_blocked_after_startup() {
+        let main_filter = build_filter(true).unwrap();
+        let clone3_filter = build_clone3_filter().unwrap();
+        let third_filter = build_clone3_filter().unwrap();
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                install_runtime_filters_in_child(&main_filter, &clone3_filter);
+                match apply_filter(&third_filter) {
+                    Err(seccompiler::Error::Seccomp(e))
+                        if e.raw_os_error() == Some(libc::EPERM) =>
+                    {
+                        libc::_exit(0);
+                    }
+                    Err(err) => {
+                        let msg =
+                            format!("third filter install failed with unexpected error: {err}\n");
+                        libc::write(2, msg.as_ptr().cast(), msg.len());
+                        libc::_exit(1);
+                    }
+                    Ok(()) => {
+                        let msg = "third filter unexpectedly installed\n";
+                        libc::write(2, msg.as_ptr().cast(), msg.len());
+                        libc::_exit(1);
+                    }
+                }
+            }
+        }
+
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            unsafe { libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 },
+            "additional seccomp filter installation should be blocked after startup"
         );
     }
 }
