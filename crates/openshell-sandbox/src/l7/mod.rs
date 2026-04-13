@@ -377,42 +377,102 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                             }
                         }
 
-                        // Validate query matchers (same rules as allow query matchers)
+                        // Validate query matchers — mirrors allow-side validation exactly
                         if let Some(query) = deny_rule.get("query").filter(|v| !v.is_null()) {
-                            if let Some(query_obj) = query.as_object() {
-                                for (param, matcher) in query_obj {
-                                    if let Some(glob_str) = matcher.as_str() {
-                                        if let Some(warning) = check_glob_syntax(glob_str) {
-                                            warnings.push(format!(
-                                                "{deny_loc}.query.{param}: {warning}"
-                                            ));
-                                        }
-                                        continue;
-                                    }
-                                    if let Some(matcher_obj) = matcher.as_object() {
-                                        let has_any = matcher_obj.get("any").is_some();
-                                        let has_glob = matcher_obj.get("glob").is_some();
-                                        let has_unknown =
-                                            matcher_obj.keys().any(|k| k != "any" && k != "glob");
-                                        if has_unknown {
-                                            errors.push(format!(
-                                                "{deny_loc}.query.{param}: unknown matcher keys; only `glob` or `any` are supported"
-                                            ));
-                                        } else if has_glob && has_any {
-                                            errors.push(format!(
-                                                "{deny_loc}.query.{param}: matcher cannot specify both `glob` and `any`"
-                                            ));
-                                        } else if !has_glob && !has_any {
-                                            errors.push(format!(
-                                                "{deny_loc}.query.{param}: object matcher requires `glob` string or non-empty `any` list"
-                                            ));
-                                        }
-                                    }
-                                }
-                            } else {
+                            let Some(query_obj) = query.as_object() else {
                                 errors.push(format!(
                                     "{deny_loc}.query: expected map of query matchers"
                                 ));
+                                continue;
+                            };
+
+                            for (param, matcher) in query_obj {
+                                if let Some(glob_str) = matcher.as_str() {
+                                    if let Some(warning) = check_glob_syntax(glob_str) {
+                                        warnings
+                                            .push(format!("{deny_loc}.query.{param}: {warning}"));
+                                    }
+                                    continue;
+                                }
+
+                                let Some(matcher_obj) = matcher.as_object() else {
+                                    errors.push(format!(
+                                        "{deny_loc}.query.{param}: expected string glob or object with `any`"
+                                    ));
+                                    continue;
+                                };
+
+                                let has_any = matcher_obj.get("any").is_some();
+                                let has_glob = matcher_obj.get("glob").is_some();
+                                let has_unknown =
+                                    matcher_obj.keys().any(|k| k != "any" && k != "glob");
+                                if has_unknown {
+                                    errors.push(format!(
+                                        "{deny_loc}.query.{param}: unknown matcher keys; only `glob` or `any` are supported"
+                                    ));
+                                    continue;
+                                }
+
+                                if has_glob && has_any {
+                                    errors.push(format!(
+                                        "{deny_loc}.query.{param}: matcher cannot specify both `glob` and `any`"
+                                    ));
+                                    continue;
+                                }
+
+                                if !has_glob && !has_any {
+                                    errors.push(format!(
+                                        "{deny_loc}.query.{param}: object matcher requires `glob` string or non-empty `any` list"
+                                    ));
+                                    continue;
+                                }
+
+                                if has_glob {
+                                    match matcher_obj.get("glob").and_then(|v| v.as_str()) {
+                                        None => {
+                                            errors.push(format!(
+                                                "{deny_loc}.query.{param}.glob: expected glob string"
+                                            ));
+                                        }
+                                        Some(g) => {
+                                            if let Some(warning) = check_glob_syntax(g) {
+                                                warnings.push(format!(
+                                                    "{deny_loc}.query.{param}.glob: {warning}"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                let any = matcher_obj.get("any").and_then(|v| v.as_array());
+                                let Some(any) = any else {
+                                    errors.push(format!(
+                                        "{deny_loc}.query.{param}.any: expected array of glob strings"
+                                    ));
+                                    continue;
+                                };
+
+                                if any.is_empty() {
+                                    errors.push(format!(
+                                        "{deny_loc}.query.{param}.any: list must not be empty"
+                                    ));
+                                    continue;
+                                }
+
+                                if any.iter().any(|v| v.as_str().is_none()) {
+                                    errors.push(format!(
+                                        "{deny_loc}.query.{param}.any: all values must be strings"
+                                    ));
+                                }
+
+                                for item in any.iter().filter_map(|v| v.as_str()) {
+                                    if let Some(warning) = check_glob_syntax(item) {
+                                        warnings.push(format!(
+                                            "{deny_loc}.query.{param}.any: {warning}"
+                                        ));
+                                    }
+                                }
                             }
                         }
 
@@ -1267,6 +1327,195 @@ mod tests {
         assert!(
             errors.is_empty(),
             "valid query matcher shapes should not error: {errors:?}"
+        );
+    }
+
+    // --- Deny rules validation tests ---
+
+    #[test]
+    fn validate_deny_rules_require_protocol() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "deny_rules": [{ "method": "POST", "path": "/admin" }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("deny_rules require protocol")),
+            "should require protocol for deny_rules: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_deny_rules_require_allow_base() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "deny_rules": [{ "method": "POST", "path": "/admin" }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("deny_rules require rules or access")),
+            "should require rules or access for deny_rules: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_deny_rules_empty_list_rejected() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "access": "full",
+                        "deny_rules": []
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("deny_rules list cannot be empty")),
+            "should reject empty deny_rules: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_deny_rules_valid_config_accepted() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "access": "read-write",
+                        "deny_rules": [
+                            { "method": "POST", "path": "/repos/*/pulls/*/reviews" },
+                            { "method": "PUT", "path": "/repos/*/branches/*/protection" }
+                        ]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "valid deny_rules should not error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_deny_rules_query_empty_any_rejected() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "access": "full",
+                        "deny_rules": [{
+                            "method": "POST",
+                            "path": "/admin",
+                            "query": { "type": { "any": [] } }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("any: list must not be empty")),
+            "should reject empty any list in deny query: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_deny_rules_query_non_string_rejected() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "access": "full",
+                        "deny_rules": [{
+                            "method": "POST",
+                            "path": "/admin",
+                            "query": { "force": 123 }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("expected string glob or object")),
+            "should reject non-string/non-object matcher in deny query: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_deny_rules_query_valid_matchers_accepted() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "access": "full",
+                        "deny_rules": [{
+                            "method": "POST",
+                            "path": "/admin/**",
+                            "query": {
+                                "force": "true",
+                                "type": { "any": ["admin-*", "root-*"] },
+                                "scope": { "glob": "org-*" }
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "valid deny query matchers should not error: {errors:?}"
         );
     }
 }

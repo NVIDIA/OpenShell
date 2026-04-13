@@ -2190,6 +2190,31 @@ process:
     }
 
     #[test]
+    fn l7_deny_rule_with_query_blocks_when_any_value_matches() {
+        let engine = l7_deny_engine();
+        // POST /admin/settings with force=true&force=false should STILL be denied
+        // because at least one value ("true") matches the deny rule.
+        // This is fail-closed: any matching value triggers the deny.
+        let input = l7_input_with_query(
+            "api.restricted.com",
+            443,
+            "POST",
+            "/admin/settings",
+            serde_json::json!({"force": ["true", "false"]}),
+        );
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .unwrap();
+        assert_eq!(
+            val,
+            regorus::Value::from(false),
+            "deny should fire when ANY value matches, even with mixed values"
+        );
+    }
+
+    #[test]
     fn l7_deny_rule_without_matching_query_key_allows() {
         let engine = l7_deny_engine();
         // POST /admin/settings with no query params -- deny rule has query.force=true,

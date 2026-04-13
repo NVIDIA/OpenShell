@@ -239,17 +239,49 @@ request_denied_for_endpoint(request, endpoint) if {
 	command_matches(request.command, deny_rule.command)
 }
 
-# Deny query matching: if no query rules on deny, match any query params.
-# If query rules present, all configured keys must match.
+# Deny query matching: fail-closed semantics.
+# If no query rules on the deny rule, match unconditionally (any query params).
+# If query rules present, trigger the deny if ANY value for a configured key
+# matches the matcher. This is the inverse of allow-side semantics where ALL
+# values must match. For deny logic, a single matching value is enough to block.
 deny_query_params_match(request, deny_rule) if {
 	deny_query_rules := object.get(deny_rule, "query", {})
-	not deny_query_mismatch(request, deny_query_rules)
+	count(deny_query_rules) == 0
 }
 
-deny_query_mismatch(request, query_rules) if {
+deny_query_params_match(request, deny_rule) if {
+	deny_query_rules := object.get(deny_rule, "query", {})
+	count(deny_query_rules) > 0
+	not deny_query_key_missing(request, deny_query_rules)
+	not deny_query_value_mismatch_all(request, deny_query_rules)
+}
+
+# A configured deny query key is missing from the request entirely.
+# Missing key means the deny rule doesn't apply (fail-open on absence).
+deny_query_key_missing(request, query_rules) if {
+	some key
+	query_rules[key]
+	request_query := object.get(request, "query_params", {})
+	values := object.get(request_query, key, null)
+	values == null
+}
+
+# ALL values for a configured key fail to match the matcher.
+# If even one value matches, deny fires. This rule checks the opposite:
+# true when NO value matches (i.e., every value is a mismatch).
+deny_query_value_mismatch_all(request, query_rules) if {
 	some key
 	matcher := query_rules[key]
-	not query_key_matches(request, key, matcher)
+	request_query := object.get(request, "query_params", {})
+	values := object.get(request_query, key, [])
+	count(values) > 0
+	not deny_any_value_matches(values, matcher)
+}
+
+# True if at least one value in the list matches the matcher.
+deny_any_value_matches(values, matcher) if {
+	some i
+	query_value_matches(values[i], matcher)
 }
 
 # --- L7 deny reason ---
