@@ -195,37 +195,6 @@ jobs:
           path: target/wheels/*.whl
           retention-days: 5
 
-  stage-python-wheels:
-    name: Stage Python Wheels
-    needs: [compute-versions, build-python-wheels-linux, build-python-wheel-macos]
-    runs-on: build-amd64
-    timeout-minutes: 15
-    outputs:
-      wheel_version: ${{ needs.compute-versions.outputs.python_version }}
-      wheel_filenames: ${{ steps.filenames.outputs.wheel_filenames }}
-    steps:
-      - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: python-wheels-*
-          path: target/wheels/
-          merge-multiple: true
-
-      - name: Capture wheel filenames
-        id: filenames
-        run: |
-          set -euo pipefail
-          ls -la target/wheels/*.whl
-          WHEEL_FILENAMES=$(ls target/wheels/*.whl | xargs -n1 basename | sort | paste -sd, -)
-          echo "wheel_filenames=${WHEEL_FILENAMES}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: python-wheels
-          path: target/wheels/*.whl
-          retention-days: 5
-
   # ---------------------------------------------------------------------------
   # Build CLI binaries (Linux musl — static, native on each arch)
   #
@@ -414,9 +383,11 @@ jobs:
   # ---------------------------------------------------------------------------
   release-dev:
     name: Release Dev
-    needs: [build-cli-linux, build-cli-macos, stage-python-wheels]
+    needs: [compute-versions, build-cli-linux, build-cli-macos, build-python-wheels-linux, build-python-wheel-macos]
     runs-on: build-amd64
     timeout-minutes: 10
+    outputs:
+      wheel_filenames: ${{ steps.wheel_filenames.outputs.wheel_filenames }}
     steps:
       - uses: actions/checkout@v4
 
@@ -430,8 +401,17 @@ jobs:
       - name: Download wheel artifacts
         uses: actions/download-artifact@v4
         with:
-          name: python-wheels
+          pattern: python-wheels-*
           path: release/
+          merge-multiple: true
+
+      - name: Capture wheel filenames
+        id: wheel_filenames
+        run: |
+          set -euo pipefail
+          ls -la release/*.whl
+          WHEEL_FILENAMES=$(ls release/*.whl | xargs -n1 basename | sort | paste -sd, -)
+          echo "wheel_filenames=${WHEEL_FILENAMES}" >> "$GITHUB_OUTPUT"
 
       - name: Generate checksums
         run: |
@@ -443,7 +423,7 @@ jobs:
       - name: Prune stale wheel assets from dev release
         uses: actions/github-script@v7
         env:
-          WHEEL_VERSION: ${{ needs.stage-python-wheels.outputs.wheel_version }}
+          WHEEL_VERSION: ${{ needs.compute-versions.outputs.python_version }}
         with:
           script: |
             const wheelVersion = process.env.WHEEL_VERSION;
@@ -521,7 +501,7 @@ jobs:
 
   trigger-wheel-publish:
     name: Trigger Wheel Publish
-    needs: [compute-versions, stage-python-wheels, release-dev]
+    needs: [compute-versions, release-dev]
     runs-on: [self-hosted, nv]
     timeout-minutes: 10
     steps:
@@ -530,7 +510,7 @@ jobs:
           GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
           GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
           RELEASE_VERSION: ${{ needs.compute-versions.outputs.python_version }}
-          WHEEL_FILENAMES: ${{ needs.stage-python-wheels.outputs.wheel_filenames }}
+          WHEEL_FILENAMES: ${{ needs.release-dev.outputs.wheel_filenames }}
         run: |
           set -euo pipefail
           if [ -z "${WHEEL_FILENAMES}" ]; then

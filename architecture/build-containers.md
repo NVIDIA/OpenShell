@@ -26,9 +26,9 @@ The supervisor binary (`openshell-sandbox`) is built by the shared `supervisor-b
 OpenShell also publishes Python wheels for `linux/amd64`, `linux/arm64`, and macOS ARM64.
 
 - Linux wheels are built natively on matching Linux runners via `build:python:wheel:linux:amd64` and `build:python:wheel:linux:arm64` in `tasks/python.toml`.
-- There is no local Linux multiarch wheel build task. Release workflows own the per-arch Linux wheel production and stage the artifacts before publishing.
+- There is no local Linux multiarch wheel build task. Release workflows own the per-arch Linux wheel production.
 - The macOS ARM64 wheel is cross-compiled with `deploy/docker/Dockerfile.python-wheels-macos` via `build:python:wheel:macos`.
-- Release workflows mirror the CLI layout: a Linux matrix job for amd64/arm64, a separate macOS job, and a staging job that merges wheel artifacts for downstream release steps.
+- Release workflows mirror the CLI layout: a Linux matrix job for amd64/arm64, a separate macOS job, and release jobs that download the per-platform wheel artifacts directly before publishing.
 
 ## Sandbox Images
 
