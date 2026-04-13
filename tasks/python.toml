@@ -60,6 +60,11 @@ if [ "$HOST_ARCH" != "$EXPECTED_HOST_ARCH" ]; then
   exit 1
 fi
 
+if ! command -v patchelf >/dev/null 2>&1; then
+  echo "build:python:wheel:linux requires patchelf for maturin wheel repair on Linux" >&2
+  exit 1
+fi
+
 # Avoid failures when RUSTC_WRAPPER is set to an unresolved `sccache` binary.
 if command -v sccache >/dev/null 2>&1; then
   export RUSTC_WRAPPER="$(command -v sccache)"

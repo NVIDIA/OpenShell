@@ -125,6 +125,13 @@ jobs:
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Install patchelf
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends patchelf
+          rm -rf /var/lib/apt/lists/*
+
       - name: Sync Python dependencies
         run: uv sync
 
