@@ -12,12 +12,14 @@
 pub mod config;
 pub mod error;
 pub mod forward;
+pub mod image;
 pub mod inference;
+pub mod net;
 pub mod paths;
 pub mod proto;
 pub mod settings;
 
-pub use config::{Config, TlsConfig};
+pub use config::{ComputeDriverKind, Config, TlsConfig};
 pub use error::{Error, Result};
 
 /// Build version string derived from git metadata.

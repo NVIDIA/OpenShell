@@ -21,6 +21,15 @@ The cluster image is a single-container Kubernetes distribution that bundles the
 
 The supervisor binary (`openshell-sandbox`) is built by the shared `supervisor-builder` stage in `deploy/docker/Dockerfile.images` and placed at `/opt/openshell/bin/openshell-sandbox`. It is exposed to sandbox pods at runtime via a read-only `hostPath` volume mount — it is not baked into sandbox images.
 
+## Python Wheels
+
+OpenShell also publishes Python wheels for `linux/amd64`, `linux/arm64`, and macOS ARM64.
+
+- Linux wheels are built natively on matching Linux runners via `build:python:wheel:linux:amd64` and `build:python:wheel:linux:arm64` in `tasks/python.toml`.
+- There is no local Linux multiarch wheel build task. Release workflows own the per-arch Linux wheel production.
+- The macOS ARM64 wheel is cross-compiled with `deploy/docker/Dockerfile.python-wheels-macos` via `build:python:wheel:macos`.
+- Release workflows mirror the CLI layout: a Linux matrix job for amd64/arm64, a separate macOS job, and release jobs that download the per-platform wheel artifacts directly before publishing.
+
 ## Sandbox Images
 
 Sandbox images are **not built in this repository**. They are maintained in the [openshell-community](https://github.com/nvidia/openshell-community) repository and pulled from `ghcr.io/nvidia/openshell-community/sandboxes/` at runtime.
@@ -70,4 +79,3 @@ The harness runs isolated scenarios in temporary git worktrees, keeps its own st
 - auto-detection checks for gateway-only, supervisor-only, shared, Helm-only, unrelated, and explicit-target changes
 - cold vs warm rebuild comparisons for gateway and supervisor code changes
 - container-ID invalidation coverage to verify gateway + Helm are retriggered when the cluster container changes
-

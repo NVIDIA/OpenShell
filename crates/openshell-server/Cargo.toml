@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 openshell-core = { path = "../openshell-core" }
+openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-router = { path = "../openshell-router" }
 
@@ -63,9 +64,6 @@ serde_json = { workspace = true }
 tokio-stream = { workspace = true }
 sqlx = { workspace = true }
 reqwest = { workspace = true }
-kube = { workspace = true }
-kube-runtime = { workspace = true }
-k8s-openapi = { workspace = true }
 uuid = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
@@ -73,6 +71,7 @@ hex = "0.4"
 russh = "0.57"
 rand = "0.9"
 petname = "2"
+ipnet = "2"
 
 [features]
 dev-settings = ["openshell-core/dev-settings"]

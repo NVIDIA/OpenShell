@@ -3054,6 +3054,7 @@ dependencies = [
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
+ "ipnet",
  "miette",
  "prost",
  "prost-types",
@@ -3065,6 +3066,28 @@ dependencies = [
  "tonic",
  "tonic-build",
  "url",
+]
+
+[[package]]
+name = "openshell-driver-kubernetes"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "kube-runtime",
+ "miette",
+ "openshell-core",
+ "prost",
+ "prost-types",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3191,11 +3214,10 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "k8s-openapi",
- "kube",
- "kube-runtime",
+ "ipnet",
  "miette",
  "openshell-core",
+ "openshell-driver-kubernetes",
  "openshell-policy",
  "openshell-router",
  "petname",

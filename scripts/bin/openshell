@@ -42,6 +42,8 @@ else
         return 0 ;;
       crates/openshell-cli/*|crates/openshell-core/*|crates/openshell-bootstrap/*)
         return 0 ;;
+      crates/openshell-prover/*)
+        return 0 ;;
       crates/openshell-policy/*|crates/openshell-providers/*|crates/openshell-tui/*)
         return 0 ;;
       *)
@@ -89,7 +91,28 @@ fi
 
 if [[ "$needs_build" == "1" ]]; then
   echo "Recompiling openshell..." >&2
-  cargo build --package openshell-cli --quiet
+  build_args=(--package openshell-cli --quiet)
+  if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists z3 >/dev/null 2>&1; then
+    z3_prefix=""
+    if command -v brew >/dev/null 2>&1; then
+      z3_prefix=$(brew --prefix z3 2>/dev/null || true)
+    fi
+
+    for candidate in "$z3_prefix" /opt/homebrew/opt/z3 /usr/local/opt/z3; do
+      if [[ -n "$candidate" && -f "$candidate/include/z3.h" && -d "$candidate/lib" ]]; then
+        echo "Using local Z3 from ${candidate} for CLI build." >&2
+        export Z3_SYS_Z3_HEADER="${candidate}/include/z3.h"
+        export Z3_LIBRARY_PATH_OVERRIDE="${candidate}/lib"
+        break
+      fi
+    done
+
+    if [[ -z "${Z3_SYS_Z3_HEADER:-}" ]]; then
+      echo "Falling back to bundled Z3 for local CLI build." >&2
+      build_args+=(--features bundled-z3)
+    fi
+  fi
+  cargo build "${build_args[@]}"
   # Persist state after successful build
   mkdir -p "$(dirname "$STATE_FILE")"
   cd "$PROJECT_ROOT"
@@ -109,6 +132,8 @@ if [[ "$needs_build" == "1" ]]; then
       Cargo.toml|Cargo.lock|proto/*)
         return 0 ;;
       crates/openshell-cli/*|crates/openshell-core/*|crates/openshell-bootstrap/*)
+        return 0 ;;
+      crates/openshell-prover/*)
         return 0 ;;
       crates/openshell-policy/*|crates/openshell-providers/*|crates/openshell-tui/*)
         return 0 ;;

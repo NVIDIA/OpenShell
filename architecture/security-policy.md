@@ -443,7 +443,7 @@ Each endpoint defines a network destination and, optionally, L7 inspection behav
 | `enforcement`  | `string`   | `"audit"`       | L7 enforcement mode: `"enforce"` or `"audit"`                                                                       |
 | `access`       | `string`   | `""`            | Shorthand preset for common L7 rule sets. Mutually exclusive with `rules`.                                          |
 | `rules`        | `L7Rule[]` | `[]`            | Explicit L7 allow rules. Mutually exclusive with `access`.                                                          |
-| `allowed_ips`  | `string[]` | `[]`            | IP allowlist for SSRF override. See [Private IP Access via `allowed_ips`](#private-ip-access-via-allowed_ips).       |
+| `allowed_ips`  | `string[]` | `[]`            | IP allowlist for SSRF override. Entries overlapping always-blocked ranges (loopback, link-local, unspecified) are rejected at load time. See [Private IP Access via `allowed_ips`](#private-ip-access-via-allowed_ips). |
 
 #### `NetworkBinary`
 
@@ -993,6 +993,7 @@ The following validation rules are enforced during policy loading (both file mod
 | `rules: []` (empty list)                       | `rules list cannot be empty (would deny all traffic). Use access: full or remove rules.`   |
 | Host wildcard is bare `*` or `**`              | `host wildcard '*' matches all hosts; use specific patterns like '*.example.com'`          |
 | Host wildcard does not start with `*.` or `**.`| `host wildcard must start with '*.' or '**.' (e.g., '*.example.com'), got '{host}'`        |
+| `allowed_ips` entry overlaps always-blocked range | `allowed_ips entry {entry} falls within always-blocked range (loopback/link-local/unspecified)` |
 | Invalid HTTP method in REST rules              | _(warning, not error)_                                                                     |
 
 ### Errors (Live Update Rejection)
@@ -1004,6 +1005,16 @@ These errors are returned by the gateway's `UpdateSandboxPolicy` handler and rej
 | `filesystem_policy` differs from version 1 | `filesystem policy cannot be changed on a live sandbox (applied at startup)` |
 | `landlock` differs from version 1 | `landlock policy cannot be changed on a live sandbox (applied at startup)` |
 | `process` differs from version 1 | `process policy cannot be changed on a live sandbox (applied at startup)` |
+
+### Errors (Rule Merge Rejection)
+
+These errors are returned by the gateway's `merge_chunk_into_policy` when approving proposed rules. See `crates/openshell-server/src/grpc/policy.rs` -- `validate_rule_not_always_blocked()`.
+
+| Condition | Error Message |
+|-----------|---------------|
+| Proposed endpoint host is a literal always-blocked IP | `proposed rule endpoint host '{host}' is an always-blocked address (loopback/link-local/unspecified)` |
+| Proposed endpoint host is `localhost` | `proposed rule endpoint host 'localhost' is always blocked` |
+| Proposed `allowed_ips` entry overlaps always-blocked range | `proposed rule contains always-blocked allowed_ips entry '{entry}'` |
 
 ### Warnings (Log Only)
 
@@ -1032,9 +1043,13 @@ These IP ranges are **always blocked**, even when `allowed_ips` is configured on
 |-------|-------------|--------|
 | `127.0.0.0/8` | IPv4 loopback | Prevents proxy bypass via localhost |
 | `169.254.0.0/16` | IPv4 link-local | Prevents cloud metadata SSRF (`169.254.169.254`) |
+| `0.0.0.0` | IPv4 unspecified | Prevents binding/connecting to all interfaces |
 | `::1` | IPv6 loopback | Prevents proxy bypass via IPv6 localhost |
+| `::` | IPv6 unspecified | Prevents binding/connecting to all interfaces |
 | `fe80::/10` | IPv6 link-local | Prevents IPv6 link-local access |
 | `::ffff:0:0/96` (mapped) | IPv4-mapped IPv6 addresses are unwrapped and checked as IPv4 | |
+
+These ranges are enforced at multiple layers: load-time validation rejects `allowed_ips` entries that overlap these ranges (see [`parse_allowed_ips`](#implementation)), the server rejects proposed rules targeting them (see [Server-Side Defense-in-Depth](#server-side-defense-in-depth)), and the proxy runtime blocks resolved IPs that fall within them.
 
 ### Default-Blocked IP Ranges (Private)
 
@@ -1049,17 +1064,32 @@ These ranges are blocked by default but can be selectively allowed via the `allo
 
 ### Implementation
 
-Functions in `crates/openshell-sandbox/src/proxy.rs` implement the SSRF checks:
+IP classification helpers live in `crates/openshell-core/src/net.rs` and are shared across the sandbox proxy, the mechanistic mapper, and the gateway server:
 
-- **`is_internal_ip(ip: IpAddr) -> bool`**: Classifies an IP address as internal or public. Checks loopback, link-local, and RFC 1918 ranges. For IPv6, unwraps IPv4-mapped addresses (`::ffff:x.x.x.x`) via `to_ipv4_mapped()` and applies IPv4 checks. Used in the default (no `allowed_ips`) code path.
+- **`is_always_blocked_ip(ip: IpAddr) -> bool`**: Checks if an IP is always blocked regardless of policy — loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), and unspecified (`0.0.0.0`). For IPv6, unwraps IPv4-mapped addresses (`::ffff:x.x.x.x`) via `to_ipv4_mapped()` and applies IPv4 checks. Used in the `allowed_ips` code path and by `implicit_allowed_ips_for_ip_host` to enforce the hard block even when private IPs are permitted.
 
-- **`is_always_blocked_ip(ip: IpAddr) -> bool`**: Checks if an IP is always blocked regardless of policy — loopback and link-local only. Used in the `allowed_ips` code path to enforce the hard block on loopback and link-local even when private IPs are permitted.
+- **`is_always_blocked_net(net: IpNet) -> bool`**: Checks if a CIDR network overlaps any always-blocked range. Returns `true` if the network contains or overlaps loopback, link-local, or unspecified addresses. A CIDR like `0.0.0.0/0` is rejected because it contains always-blocked addresses. Used at policy load time by `parse_allowed_ips` and at server-side approval time by `validate_rule_not_always_blocked`.
+
+- **`is_internal_ip(ip: IpAddr) -> bool`**: Classifies an IP address as internal or public. Broader than `is_always_blocked_ip` — also includes RFC 1918 private ranges (`10/8`, `172.16/12`, `192.168/16`) and IPv6 ULA (`fc00::/7`). Used in the default (no `allowed_ips`) SSRF code path and by the mechanistic mapper to detect when `allowed_ips` should be populated in proposals.
+
+Runtime resolution and enforcement functions remain in `crates/openshell-sandbox/src/proxy.rs`:
 
 - **`resolve_and_reject_internal(host, port) -> Result<Vec<SocketAddr>, String>`**: Default SSRF check. Resolves DNS via `tokio::net::lookup_host()`, then checks every resolved address against `is_internal_ip()`. If any address is internal, the entire connection is rejected.
 
 - **`resolve_and_check_allowed_ips(host, port, allowed_ips) -> Result<Vec<SocketAddr>, String>`**: Allowlist-based SSRF check. Resolves DNS, rejects any always-blocked IPs, then verifies every resolved address matches at least one entry in the `allowed_ips` list.
 
-- **`parse_allowed_ips(raw) -> Result<Vec<IpNet>, String>`**: Parses CIDR/IP strings into typed `IpNet` values. Rejects entries that cover loopback or link-local ranges. Accepts both CIDR notation (`10.0.5.0/24`) and bare IPs (`10.0.5.20`, treated as `/32`).
+- **`parse_allowed_ips(raw) -> Result<Vec<IpNet>, String>`**: Parses CIDR/IP strings into typed `IpNet` values. **Rejects entries at load time** that overlap always-blocked ranges (loopback, link-local, unspecified) via `is_always_blocked_net`. Accepts both CIDR notation (`10.0.5.0/24`) and bare IPs (`10.0.5.20`, treated as `/32`). This prevents confusing UX where an entry is accepted in policy but silently denied at runtime.
+
+- **`implicit_allowed_ips_for_ip_host(host) -> Vec<String>`**: When a policy endpoint has a literal IP address as its host (e.g., `10.0.5.20`), synthesizes an `allowed_ips` entry so the allowlist-validation path is used instead of blanket internal-IP rejection. **Skips always-blocked addresses** — if the host is loopback, link-local, or unspecified, returns empty and logs a warning instead of synthesizing an un-enforceable entry.
+
+### Server-Side Defense-in-Depth
+
+The gateway server provides an additional validation layer when merging proposed rules into a sandbox's active policy. Before `merge_chunk_into_policy` applies a proposed rule, it calls `validate_rule_not_always_blocked` (in `crates/openshell-server/src/grpc/policy.rs`) which:
+
+1. Checks if the proposed endpoint host is a literal always-blocked IP (via `is_always_blocked_ip`) or `localhost`.
+2. Checks each `allowed_ips` entry for overlap with always-blocked ranges (via `is_always_blocked_net`).
+
+If either check fails, the merge returns `INVALID_ARGUMENT` and the proposed rule is not applied. This prevents always-blocked destinations from entering the active policy even if the sandbox's mechanistic mapper or an older sandbox version did not filter them.
 
 ### Placement in Proxy Flow
 
@@ -1075,8 +1105,11 @@ flowchart TD
     D --> E{Allowed?}
     E -- No --> F["403 Forbidden"]
     E -- Yes --> G{allowed_ips on endpoint?}
-    G -- Yes --> H["resolve_and_check_allowed_ips(host, port, nets)"]
-    H --> I{All IPs in allowlist<br/>and not loopback/link-local?}
+    G -- Yes --> VAL["parse_allowed_ips:<br/>validate no always-blocked entries"]
+    VAL --> VAL_OK{Valid?}
+    VAL_OK -- No --> J2["Connection rejected<br/>(always-blocked entry in allowed_ips)"]
+    VAL_OK -- Yes --> H["resolve_and_check_allowed_ips(host, port, nets)"]
+    H --> I{All IPs in allowlist<br/>and not always-blocked?}
     I -- No --> J["403 Forbidden + log warning"]
     I -- Yes --> K["TcpStream::connect(resolved addrs)"]
     G -- No --> L["resolve_and_reject_internal(host, port)"]
@@ -1086,7 +1119,8 @@ flowchart TD
     K --> N["200 Connection Established"]
 
     FP --> FP_OPA["OPA evaluation + require allowed_ips"]
-    FP_OPA --> FP_RESOLVE["resolve_and_check_allowed_ips"]
+    FP_OPA --> FP_VAL["parse_allowed_ips: validate"]
+    FP_VAL --> FP_RESOLVE["resolve_and_check_allowed_ips"]
     FP_RESOLVE --> FP_PRIVATE{All IPs private?}
     FP_PRIVATE -- No --> J
     FP_PRIVATE -- Yes --> FP_CONNECT["TCP connect + rewrite + relay"]
@@ -1094,7 +1128,11 @@ flowchart TD
 
 ### Private IP Access via `allowed_ips`
 
-The `allowed_ips` field on a `NetworkEndpoint` enables controlled access to private IP space. When present, the default SSRF internal-IP rejection is replaced by an allowlist check: resolved IPs must match at least one entry in `allowed_ips`, and loopback/link-local are still always blocked.
+The `allowed_ips` field on a `NetworkEndpoint` enables controlled access to private IP space. When present, the default SSRF internal-IP rejection is replaced by an allowlist check: resolved IPs must match at least one entry in `allowed_ips`, and always-blocked ranges (loopback, link-local, unspecified) are still rejected.
+
+**Load-time validation**: `parse_allowed_ips` rejects entries that overlap always-blocked ranges with a hard error at policy load time. This catches misconfigurations early — an entry like `127.0.0.0/8` or `0.0.0.0/0` in `allowed_ips` would be silently un-enforceable at runtime, so it is rejected before the policy is applied. The same validation runs in both file mode (sandbox startup) and gRPC mode (live policy updates via `OpaEngine::reload_from_proto`).
+
+**Implicit `allowed_ips` for IP hosts**: When a policy endpoint has a literal IP address as its host (e.g., `host: 10.0.5.20`), the proxy synthesizes an `allowed_ips` entry automatically via `implicit_allowed_ips_for_ip_host`. If the host is an always-blocked address (e.g., `127.0.0.1`, `169.254.169.254`, `0.0.0.0`), the function returns empty and logs a warning — no `allowed_ips` entry is synthesized, so the standard SSRF rejection applies.
 
 This supports three usage modes:
 
@@ -1110,7 +1148,7 @@ Entries can be:
 - **CIDR notation**: `10.0.5.0/24`, `172.16.0.0/12`, `192.168.1.0/24`
 - **Exact IP**: `10.0.5.20` (treated as `/32` for IPv4 or `/128` for IPv6)
 
-Entries that cover loopback (`127.0.0.0/8`) or link-local (`169.254.0.0/16`) ranges are rejected at parse time.
+Entries that overlap always-blocked ranges — loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), or unspecified (`0.0.0.0`) — are rejected at load time with a hard error. Broad CIDRs that contain always-blocked addresses (e.g., `0.0.0.0/0`) are also rejected.
 
 #### Hostless Endpoints (`allowed_ips` without `host`)
 

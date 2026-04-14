@@ -10,12 +10,12 @@
 //! - mTLS support
 
 mod auth;
+mod compute;
 mod grpc;
 mod http;
 mod inference;
 mod multiplex;
 mod persistence;
-mod sandbox;
 mod sandbox_index;
 mod sandbox_watch;
 mod ssh_tunnel;
@@ -23,20 +23,21 @@ mod tls;
 pub mod tracing_bus;
 mod ws_tunnel;
 
-use openshell_core::{Config, Error, Result};
+use openshell_core::{ComputeDriverKind, Config, Error, Result};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 
+use compute::ComputeRuntime;
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
+use openshell_driver_kubernetes::KubernetesComputeConfig;
 use persistence::Store;
-use sandbox::{SandboxClient, spawn_sandbox_watcher, spawn_store_reconciler};
 use sandbox_index::SandboxIndex;
-use sandbox_watch::{SandboxWatchBus, spawn_kube_event_tailer};
+use sandbox_watch::SandboxWatchBus;
 pub use tls::TlsAcceptor;
 use tracing_bus::TracingLogBus;
 
@@ -49,8 +50,8 @@ pub struct ServerState {
     /// Persistence store.
     pub store: Arc<Store>,
 
-    /// Kubernetes sandbox client.
-    pub sandbox_client: SandboxClient,
+    /// Compute orchestration over the configured driver.
+    pub compute: ComputeRuntime,
 
     /// In-memory sandbox correlation index.
     pub sandbox_index: SandboxIndex,
@@ -87,7 +88,7 @@ impl ServerState {
     pub fn new(
         config: Config,
         store: Arc<Store>,
-        sandbox_client: SandboxClient,
+        compute: ComputeRuntime,
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
@@ -95,7 +96,7 @@ impl ServerState {
         Self {
             config,
             store,
-            sandbox_client,
+            compute,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
@@ -124,48 +125,28 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
         ));
     }
 
-    let store = Store::connect(database_url).await?;
-    let sandbox_client = SandboxClient::new(
-        config.sandbox_namespace.clone(),
-        config.sandbox_image.clone(),
-        config.sandbox_image_pull_policy.clone(),
-        config.grpc_endpoint.clone(),
-        format!("0.0.0.0:{}", config.sandbox_ssh_port),
-        config.ssh_handshake_secret.clone(),
-        config.ssh_handshake_skew_secs,
-        config.client_tls_secret_name.clone(),
-        config.host_gateway_ip.clone(),
-    )
-    .await
-    .map_err(|e| Error::execution(format!("failed to create kubernetes client: {e}")))?;
-    let store = Arc::new(store);
+    let store = Arc::new(Store::connect(database_url).await?);
 
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
+    let compute = build_compute_runtime(
+        &config,
+        store.clone(),
+        sandbox_index.clone(),
+        sandbox_watch_bus.clone(),
+        tracing_log_bus.clone(),
+    )
+    .await?;
     let state = Arc::new(ServerState::new(
         config.clone(),
         store.clone(),
-        sandbox_client,
+        compute,
         sandbox_index,
         sandbox_watch_bus,
         tracing_log_bus,
     ));
 
-    spawn_sandbox_watcher(
-        store.clone(),
-        state.sandbox_client.clone(),
-        state.sandbox_index.clone(),
-        state.sandbox_watch_bus.clone(),
-        state.tracing_log_bus.clone(),
-    );
-    spawn_store_reconciler(
-        store.clone(),
-        state.sandbox_client.clone(),
-        state.sandbox_index.clone(),
-        state.sandbox_watch_bus.clone(),
-        state.tracing_log_bus.clone(),
-    );
-    spawn_kube_event_tailer(state.clone());
+    state.compute.spawn_watchers();
     ssh_tunnel::spawn_session_reaper(store.clone(), std::time::Duration::from_secs(3600));
 
     // Create the multiplexed service
@@ -231,9 +212,67 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
     }
 }
 
+async fn build_compute_runtime(
+    config: &Config,
+    store: Arc<Store>,
+    sandbox_index: SandboxIndex,
+    sandbox_watch_bus: SandboxWatchBus,
+    tracing_log_bus: TracingLogBus,
+) -> Result<ComputeRuntime> {
+    let driver = configured_compute_driver(config)?;
+    info!(driver = %driver, "Using compute driver");
+
+    match driver {
+        ComputeDriverKind::Kubernetes => ComputeRuntime::new_kubernetes(
+            KubernetesComputeConfig {
+                namespace: config.sandbox_namespace.clone(),
+                default_image: config.sandbox_image.clone(),
+                image_pull_policy: config.sandbox_image_pull_policy.clone(),
+                grpc_endpoint: config.grpc_endpoint.clone(),
+                ssh_listen_addr: format!("0.0.0.0:{}", config.sandbox_ssh_port),
+                ssh_port: config.sandbox_ssh_port,
+                ssh_handshake_secret: config.ssh_handshake_secret.clone(),
+                ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
+                client_tls_secret_name: config.client_tls_secret_name.clone(),
+                host_gateway_ip: config.host_gateway_ip.clone(),
+            },
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+        )
+        .await
+        .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
+        ComputeDriverKind::Podman => Err(Error::config(
+            "compute driver 'podman' is not implemented yet",
+        )),
+    }
+}
+
+fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
+    match config.compute_drivers.as_slice() {
+        [] => Err(Error::config(
+            "at least one compute driver must be configured",
+        )),
+        [driver @ ComputeDriverKind::Kubernetes] => Ok(*driver),
+        [ComputeDriverKind::Podman] => Err(Error::config(
+            "compute driver 'podman' is not implemented yet",
+        )),
+        drivers => Err(Error::config(format!(
+            "multiple compute drivers are not supported yet; configured drivers: {}",
+            drivers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_benign_tls_handshake_failure;
+    use super::{configured_compute_driver, is_benign_tls_handshake_failure};
+    use openshell_core::{ComputeDriverKind, Config};
     use std::io::{Error, ErrorKind};
 
     #[test]
@@ -254,5 +293,42 @@ mod tests {
             let error = Error::new(kind, "real tls failure");
             assert!(!is_benign_tls_handshake_failure(&error));
         }
+    }
+
+    #[test]
+    fn configured_compute_driver_defaults_to_kubernetes() {
+        assert_eq!(
+            configured_compute_driver(&Config::new(None)).unwrap(),
+            ComputeDriverKind::Kubernetes
+        );
+    }
+
+    #[test]
+    fn configured_compute_driver_requires_at_least_one_entry() {
+        let config = Config::new(None).with_compute_drivers([]);
+        let err = configured_compute_driver(&config).unwrap_err();
+        assert!(err.to_string().contains("at least one compute driver"));
+    }
+
+    #[test]
+    fn configured_compute_driver_rejects_multiple_entries() {
+        let config = Config::new(None)
+            .with_compute_drivers([ComputeDriverKind::Kubernetes, ComputeDriverKind::Podman]);
+        let err = configured_compute_driver(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("multiple compute drivers are not supported yet")
+        );
+        assert!(err.to_string().contains("kubernetes,podman"));
+    }
+
+    #[test]
+    fn configured_compute_driver_rejects_unimplemented_driver() {
+        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Podman]);
+        let err = configured_compute_driver(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("compute driver 'podman' is not implemented yet")
+        );
     }
 }

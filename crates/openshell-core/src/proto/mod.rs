@@ -49,6 +49,19 @@ pub mod sandbox {
     unused_qualifications,
     rust_2018_idioms
 )]
+pub mod compute {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/openshell.compute.v1.rs"));
+    }
+}
+
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery,
+    unused_qualifications,
+    rust_2018_idioms
+)]
 pub mod test {
     include!(concat!(env!("OUT_DIR"), "/openshell.test.v1.rs"));
 }

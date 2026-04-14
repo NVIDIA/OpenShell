@@ -47,7 +47,7 @@ deny_reason := reason if {
 		policy := data.network_policies[name]
 		endpoint_allowed(policy, input.network)
 		not binary_allowed(policy, input.exec)
-		r := sprintf("binary '%s' (ancestors: [%s], cmdline: [%s]) not allowed in policy '%s'", [input.exec.path, ancestors_str, cmdline_str, name])
+		r := sprintf("binary '%s' not allowed in policy '%s' (ancestors: [%s], cmdline: [%s]). SYMLINK HINT: the binary path is the kernel-resolved target from /proc/<pid>/exe, not the symlink. If your policy specifies a symlink (e.g., /usr/bin/python3) but the actual binary is /usr/bin/python3.11, either: (1) use the canonical path in your policy (run 'readlink -f /usr/bin/python3' inside the sandbox), or (2) ensure symlink resolution is working (check sandbox logs for 'Cannot access container filesystem')", [input.exec.path, name, ancestors_str, cmdline_str])
 	]
 	all_reasons := array.concat(endpoint_misses, binary_misses)
 	count(all_reasons) > 0

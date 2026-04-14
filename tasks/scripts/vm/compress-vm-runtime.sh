@@ -55,8 +55,57 @@ make_dylib_portable() {
 WORK_DIR="${ROOT}/target/vm-runtime"
 OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
 
+mkdir -p "$OUTPUT_DIR"
+
+# ── Fast path: compressed artifacts already present (e.g. from vm:setup) ──
+
+_check_compressed_artifacts() {
+    local dir="$1"
+    local platform
+    platform="$(uname -s)-$(uname -m)"
+    case "$platform" in
+        Darwin-arm64)
+            for f in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst; do
+                [ -f "${dir}/${f}" ] || return 1
+            done
+            ;;
+        Linux-*)
+            for f in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst; do
+                [ -f "${dir}/${f}" ] || return 1
+            done
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+if [ -z "${VM_RUNTIME_TARBALL:-}" ] && _check_compressed_artifacts "$OUTPUT_DIR"; then
+    echo "==> Compressed artifacts already present in ${OUTPUT_DIR} — skipping compression."
+    ls -lah "$OUTPUT_DIR"
+
+    # Decompress artifacts into WORK_DIR so bundle-vm-runtime.sh can find them.
+    echo ""
+    echo "==> Decompressing artifacts into ${WORK_DIR} for runtime bundle..."
+    rm -rf "$WORK_DIR"
+    mkdir -p "$WORK_DIR"
+    for f in "${OUTPUT_DIR}"/*.zst; do
+        [ -f "$f" ] || continue
+        name="$(basename "${f%.zst}")"
+        # Skip rootfs tarball — bundle-vm-runtime.sh doesn't need it
+        [[ "$name" == rootfs.tar ]] && continue
+        zstd -d "$f" -o "${WORK_DIR}/${name}" -f -q
+        chmod 0755 "${WORK_DIR}/${name}"
+    done
+    echo "    Decompressed files:"
+    ls -lah "$WORK_DIR"
+
+    echo ""
+    echo "Next step: cargo build -p openshell-vm"
+    exit 0
+fi
+
 rm -rf "$WORK_DIR"
-mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
+mkdir -p "$WORK_DIR"
 
 # ── Fast path: pre-built tarball from CI or download-kernel-runtime.sh ──
 

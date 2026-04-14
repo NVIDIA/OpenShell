@@ -24,6 +24,7 @@ pub struct HttpActivityBuilder<'a> {
     actor: Option<Actor>,
     firewall_rule: Option<FirewallRule>,
     message: Option<String>,
+    status_detail: Option<String>,
 }
 
 impl<'a> HttpActivityBuilder<'a> {
@@ -43,6 +44,7 @@ impl<'a> HttpActivityBuilder<'a> {
             actor: None,
             firewall_rule: None,
             message: None,
+            status_detail: None,
         }
     }
 
@@ -106,6 +108,11 @@ impl<'a> HttpActivityBuilder<'a> {
         self.message = Some(msg.into());
         self
     }
+    #[must_use]
+    pub fn status_detail(mut self, detail: impl Into<String>) -> Self {
+        self.status_detail = Some(detail.into());
+        self
+    }
 
     #[must_use]
     pub fn build(self) -> OcsfEvent {
@@ -126,6 +133,9 @@ impl<'a> HttpActivityBuilder<'a> {
         }
         if let Some(msg) = self.message {
             base.set_message(msg);
+        }
+        if let Some(detail) = self.status_detail {
+            base.set_status_detail(detail);
         }
         base.set_device(self.ctx.device());
         base.set_container(self.ctx.container());
@@ -174,5 +184,28 @@ mod tests {
         assert_eq!(json["activity_name"], "Get");
         assert_eq!(json["http_request"]["http_method"], "GET");
         assert_eq!(json["actor"]["process"]["name"], "curl");
+    }
+
+    #[test]
+    fn test_http_activity_builder_with_status_detail() {
+        let ctx = test_sandbox_context();
+        let event = HttpActivityBuilder::new(&ctx)
+            .activity(ActivityId::Other)
+            .action(ActionId::Denied)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .http_request(HttpRequest::new(
+                "PUT",
+                Url::new("http", "169.254.169.254", "/latest/api/token", 80),
+            ))
+            .firewall_rule("aws_iam", "ssrf")
+            .message("FORWARD blocked: allowed_ips check failed")
+            .status_detail("resolves to always-blocked address")
+            .build();
+
+        let json = event.to_json().unwrap();
+        assert_eq!(json["class_uid"], 4002);
+        assert_eq!(json["status_detail"], "resolves to always-blocked address");
+        assert_eq!(json["action_id"], 2); // Denied
     }
 }

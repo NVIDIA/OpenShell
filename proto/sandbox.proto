@@ -5,6 +5,14 @@ syntax = "proto3";
 
 package openshell.sandbox.v1;
 
+// Sandbox-supervisor configuration and policy messages.
+//
+// Conventions:
+// - This file owns messages exchanged between the gateway and the sandbox
+//   supervisor/runtime.
+// - Public sandbox resource types live in `openshell.proto`.
+// - Internal compute-driver sandbox observation types live in `compute_driver.proto`.
+
 // Sandbox security policy configuration.
 message SandboxPolicy {
   // Policy version.

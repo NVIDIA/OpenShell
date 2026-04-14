@@ -61,6 +61,15 @@ pub enum VmError {
     #[error("host setup failed: {0}")]
     HostSetup(String),
 
+    /// `/dev/kvm` is not accessible (Linux only).
+    #[error(
+        "cannot open /dev/kvm: {reason}\n\
+         KVM access is required to run microVMs on Linux.\n\
+         Fix: sudo usermod -aG kvm $USER  then log out and back in\n\
+         (or run: newgrp kvm)"
+    )]
+    KvmAccess { reason: String },
+
     /// `fork()` failed.
     #[error("fork() failed: {0}")]
     Fork(String),
@@ -1180,6 +1189,22 @@ fn path_to_cstring(path: &Path) -> Result<CString, VmError> {
     Ok(CString::new(s)?)
 }
 
+/// Check that `/dev/kvm` is readable before attempting to boot.
+///
+/// libkrun panics with an opaque Rust panic (instead of returning an error
+/// code) when `/dev/kvm` is inaccessible. This pre-check turns that into a
+/// clear, actionable error message.
+#[cfg(target_os = "linux")]
+fn check_kvm_access() -> Result<(), VmError> {
+    use std::fs::OpenOptions;
+    match OpenOptions::new().read(true).open("/dev/kvm") {
+        Ok(_) => Ok(()),
+        Err(e) => Err(VmError::KvmAccess {
+            reason: e.to_string(),
+        }),
+    }
+}
+
 // ── Launch ──────────────────────────────────────────────────────────────
 
 /// Configure and launch a libkrun microVM.
@@ -1204,6 +1229,13 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
             path: config.rootfs.display().to_string(),
         });
     }
+
+    // On Linux, libkrun uses KVM for hardware virtualization. Check access
+    // before starting so a missing kvm group membership produces a clear
+    // error instead of a cryptic panic inside krun_start_enter.
+    #[cfg(target_os = "linux")]
+    check_kvm_access()?;
+
     if config.exec_path == "/srv/openshell-vm-init.sh" {
         ensure_vm_not_running(&config.rootfs)?;
     }

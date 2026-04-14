@@ -10,6 +10,7 @@ pub use backend::{
     ValidationFailureKind, verify_backend_endpoint,
 };
 use config::{ResolvedRoute, RouterConfig};
+use std::time::Duration;
 use tracing::info;
 
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +38,7 @@ pub struct Router {
 impl Router {
     pub fn new() -> Result<Self, RouterError> {
         let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| RouterError::Internal(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {

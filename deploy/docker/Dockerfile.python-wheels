@@ -12,9 +12,11 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    cmake \
     curl \
     gcc \
     libc6-dev \
+    libclang-dev \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -46,11 +48,14 @@ COPY crates/openshell-router/Cargo.toml crates/openshell-router/Cargo.toml
 COPY crates/openshell-sandbox/Cargo.toml crates/openshell-sandbox/Cargo.toml
 COPY crates/openshell-server/Cargo.toml crates/openshell-server/Cargo.toml
 COPY crates/openshell-bootstrap/Cargo.toml crates/openshell-bootstrap/Cargo.toml
+COPY crates/openshell-policy/Cargo.toml crates/openshell-policy/Cargo.toml
+COPY crates/openshell-prover/Cargo.toml crates/openshell-prover/Cargo.toml
+COPY crates/openshell-tui/Cargo.toml crates/openshell-tui/Cargo.toml
 COPY crates/openshell-core/build.rs crates/openshell-core/build.rs
 COPY proto/ proto/
 
 # Create dummy source files to build dependencies.
-RUN mkdir -p crates/openshell-cli/src crates/openshell-core/src crates/openshell-ocsf/src crates/openshell-providers/src crates/openshell-router/src crates/openshell-sandbox/src crates/openshell-server/src crates/openshell-bootstrap/src && \
+RUN mkdir -p crates/openshell-cli/src crates/openshell-core/src crates/openshell-ocsf/src crates/openshell-policy/src crates/openshell-providers/src crates/openshell-prover/src crates/openshell-router/src crates/openshell-sandbox/src crates/openshell-server/src crates/openshell-bootstrap/src crates/openshell-tui/src && \
     echo "fn main() {}" > crates/openshell-cli/src/main.rs && \
     echo "fn main() {}" > crates/openshell-sandbox/src/main.rs && \
     echo "fn main() {}" > crates/openshell-server/src/main.rs && \
@@ -58,7 +63,10 @@ RUN mkdir -p crates/openshell-cli/src crates/openshell-core/src crates/openshell
     touch crates/openshell-ocsf/src/lib.rs && \
     touch crates/openshell-providers/src/lib.rs && \
     touch crates/openshell-router/src/lib.rs && \
-    touch crates/openshell-bootstrap/src/lib.rs
+    touch crates/openshell-bootstrap/src/lib.rs && \
+    touch crates/openshell-policy/src/lib.rs && \
+    touch crates/openshell-prover/src/lib.rs && \
+    touch crates/openshell-tui/src/lib.rs
 
 # Build dependencies only (cached unless Cargo.toml/lock changes).
 # sccache uses memcached in CI or the local disk cache mount for local dev.
@@ -67,7 +75,7 @@ RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=loc
     --mount=type=cache,id=cargo-git-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-python-wheels-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
     --mount=type=cache,id=sccache-python-wheels-${TARGETARCH},sharing=locked,target=/tmp/sccache \
-    . cross-build.sh && cargo_cross_build --release -p openshell-cli 2>/dev/null || true
+    . cross-build.sh && cargo_cross_build --release -p openshell-cli --features bundled-z3 2>/dev/null || true
 
 # Copy actual source code and Python packaging files.
 COPY crates/ crates/
@@ -101,7 +109,7 @@ RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=loc
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi && \
-    maturin build --release --target "${CARGO_BUILD_TARGET}" --out /wheels
+    maturin build --release --target "${CARGO_BUILD_TARGET}" --features bundled-z3 --out /wheels
 
 FROM scratch AS wheels
 COPY --from=builder /wheels/*.whl /

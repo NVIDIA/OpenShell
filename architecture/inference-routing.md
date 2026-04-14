@@ -28,9 +28,12 @@ sequenceDiagram
     Backend->>Router: Response headers + body stream
     Router->>Proxy: StreamingProxyResponse (headers first)
     Proxy->>Agent: HTTP/1.1 headers (chunked TE)
-    loop Each body chunk
+    loop Each body chunk (120s idle timeout per chunk)
         Router->>Proxy: chunk via next_chunk()
         Proxy->>Agent: Chunked-encoded frame
+    end
+    alt Stream truncated (idle timeout, byte limit, upstream error)
+        Proxy->>Agent: SSE error event (proxy_stream_error)
     end
     Proxy->>Agent: Chunk terminator (0\r\n\r\n)
 ```
@@ -102,7 +105,7 @@ Key messages:
 Files:
 
 - `crates/openshell-sandbox/src/proxy.rs` -- proxy interception, inference context, request routing
-- `crates/openshell-sandbox/src/l7/inference.rs` -- pattern detection, HTTP parsing, response formatting
+- `crates/openshell-sandbox/src/l7/inference.rs` -- pattern detection, HTTP parsing, response formatting, SSE error generation (`format_sse_error()`)
 - `crates/openshell-sandbox/src/lib.rs` -- inference context initialization, route refresh
 - `crates/openshell-sandbox/src/grpc_client.rs` -- `fetch_inference_bundle()`
 
@@ -156,7 +159,7 @@ If no pattern matches, the proxy returns `403 Forbidden` with `{"error": "connec
 Files:
 
 - `crates/openshell-router/src/lib.rs` -- `Router`, `proxy_with_candidates()`, `proxy_with_candidates_streaming()`
-- `crates/openshell-router/src/backend.rs` -- `proxy_to_backend()`, `proxy_to_backend_streaming()`, URL construction
+- `crates/openshell-router/src/backend.rs` -- `prepare_backend_request()`, `send_backend_request()`, `send_backend_request_streaming()`, `proxy_to_backend()`, `proxy_to_backend_streaming()`, URL construction
 - `crates/openshell-router/src/config.rs` -- `RouteConfig`, `ResolvedRoute`, YAML loading
 
 ### Route selection
@@ -165,7 +168,7 @@ Files:
 
 ### Request rewriting
 
-`proxy_to_backend()` rewrites outgoing requests:
+`prepare_backend_request()` (shared by both buffered and streaming paths) rewrites outgoing requests:
 
 1. **Auth injection**: Uses the route's `AuthHeader` -- either `Authorization: Bearer <key>` or a custom header (e.g. `x-api-key: <key>` for Anthropic).
 2. **Header stripping**: Removes `authorization`, `x-api-key`, `host`, and any header names that will be set from route defaults.
@@ -198,10 +201,31 @@ The sandbox proxy (`route_inference_request()` in `proxy.rs`) uses the streaming
 
 1. Calls `proxy_with_candidates_streaming()` to get headers immediately.
 2. Formats and sends the HTTP/1.1 response header with `Transfer-Encoding: chunked` via `format_http_response_header()`.
-3. Loops on `body.next_chunk()`, wrapping each fragment in HTTP chunked encoding via `format_chunk()`.
-4. Sends the chunk terminator (`0\r\n\r\n`) via `format_chunk_terminator()`.
+3. Wraps the TLS client stream in a `BufWriter` (16 KiB capacity) to coalesce small SSE chunks into fewer TLS records, reducing per-chunk flush overhead.
+4. Loops on `body.next_chunk()` with a per-chunk idle timeout (`CHUNK_IDLE_TIMEOUT`, 120 seconds), wrapping each fragment in HTTP chunked encoding via `format_chunk()`. The 120-second timeout accommodates reasoning models (e.g. nemotron-3-super, o1, o3) that pause 60+ seconds between thinking and output phases.
+5. Enforces a total streaming body cap (`MAX_STREAMING_BODY`, 32 MiB).
+6. On truncation (idle timeout, byte limit, or upstream read error), injects an SSE error event before the chunk terminator so clients can detect the truncation rather than silently losing data.
+7. Sends the chunk terminator (`0\r\n\r\n`) via `format_chunk_terminator()` and flushes the `BufWriter`.
 
 This eliminates full-body buffering for streaming responses (SSE). Time-to-first-byte is determined by the backend's first chunk latency rather than the full generation time.
+
+#### Truncation signaling
+
+When the proxy truncates a streaming response, it injects an SSE error event via `format_sse_error()` (in `crates/openshell-sandbox/src/l7/inference.rs`) before sending the HTTP chunked terminator:
+
+```
+data: {"error":{"message":"<reason>","type":"proxy_stream_error"}}
+```
+
+Three truncation paths exist:
+
+| Cause | SSE error message | OCSF severity |
+|-------|-------------------|---------------|
+| Per-chunk idle timeout (120s) | `response truncated: chunk idle timeout exceeded` | Medium |
+| Upstream read error | `response truncated: upstream read error` | Medium |
+| Streaming body exceeds 32 MiB | `response truncated: exceeded maximum streaming body size` | *(warn log only)* |
+
+The `reason` field in the SSE event is sanitized — it never contains internal URLs, hostnames, or credentials. Full details are captured server-side in the OCSF log.
 
 ### Mock routes
 
@@ -209,9 +233,15 @@ File: `crates/openshell-router/src/mock.rs`
 
 Routes with `mock://` scheme endpoints return canned responses without making HTTP requests. Mock responses are protocol-aware (OpenAI chat completion, OpenAI completion, Anthropic messages, or generic JSON). Mock routes include an `x-openshell-mock: true` response header.
 
-### Per-request timeout
+### Timeout model
 
-Each `ResolvedRoute` carries a `timeout` field (`Duration`). The `reqwest::Client` has no global timeout; instead, each outgoing request applies `.timeout(route.timeout)` on the request builder. When `timeout_secs` is `0` in the proto message, the default of 60 seconds is used (defined as `DEFAULT_ROUTE_TIMEOUT` in `config.rs`). Timeouts and connection failures map to `RouterError::UpstreamUnavailable`.
+The router uses a layered timeout strategy with separate handling for buffered and streaming responses.
+
+**Client connect timeout**: The `reqwest::Client` is built with a 30-second `connect_timeout` (in `crates/openshell-router/src/lib.rs` → `Router::new()`). This bounds TCP connection establishment and applies to all outgoing requests regardless of response mode.
+
+**Buffered responses** (`proxy_to_backend()` via `send_backend_request()`): Apply the route's `timeout` as a total request timeout covering the entire lifecycle (connect + headers + body). When `timeout_secs` is `0` in the proto message, the default of 60 seconds is used (defined as `DEFAULT_ROUTE_TIMEOUT` in `config.rs`). Timeouts and connection failures map to `RouterError::UpstreamUnavailable`.
+
+**Streaming responses** (`proxy_to_backend_streaming()` via `send_backend_request_streaming()`): Do **not** apply a total request timeout. The total duration of a streaming response is unbounded — liveness is enforced by the sandbox proxy's per-chunk idle timeout (`CHUNK_IDLE_TIMEOUT`, 120 seconds in `proxy.rs`) instead. This separation exists because streaming inference responses (especially from reasoning models) can legitimately take minutes to complete while still sending data. The `prepare_backend_request()` helper in `backend.rs` builds the request identically for both paths; the caller decides whether to chain `.timeout()` before sending.
 
 Timeout changes propagate dynamically to running sandboxes. The bundle revision hash includes `timeout_secs`, so when the timeout is updated via `openshell inference update --timeout`, the refresh loop detects the revision change and updates the route cache within one polling interval (5 seconds by default).
 

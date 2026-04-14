@@ -10,6 +10,7 @@ use crate::opa::{NetworkAction, OpaEngine};
 use crate::policy::ProxyPolicy;
 use crate::secrets::{SecretResolver, rewrite_header_line};
 use miette::{IntoDiagnostic, Result};
+use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
     NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
@@ -31,7 +32,11 @@ const INFERENCE_LOCAL_HOST: &str = "inference.local";
 const MAX_STREAMING_BODY: usize = 32 * 1024 * 1024;
 
 /// Idle timeout per chunk when relaying streaming inference responses.
-const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+///
+/// Reasoning models (e.g. nemotron-3-super, o1, o3) can pause for 60+ seconds
+/// between "thinking" and output phases. 120s provides headroom while still
+/// catching genuinely stuck streams.
+const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Result of a proxy CONNECT policy decision.
 struct ConnectDecision {
@@ -50,6 +55,7 @@ struct ConnectDecision {
 ///
 /// Returned by [`handle_inference_interception`] so the call site can emit
 /// a structured CONNECT deny log when the connection is not successfully routed.
+#[derive(Debug)]
 enum InferenceOutcome {
     /// At least one request was successfully routed to a local inference backend.
     Routed,
@@ -463,7 +469,16 @@ async fn handle_tcp_connection(
             &deny_reason,
             "connect",
         );
-        respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+        respond(
+            &mut client,
+            &build_json_error_response(
+                403,
+                "Forbidden",
+                "policy_denied",
+                &format!("CONNECT {host_lc}:{port} not permitted by policy"),
+            ),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -518,7 +533,16 @@ async fn handle_tcp_connection(
                         &reason,
                         "ssrf",
                     );
-                    respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                    respond(
+                        &mut client,
+                        &build_json_error_response(
+                            403,
+                            "Forbidden",
+                            "ssrf_denied",
+                            &format!("CONNECT {host_lc}:{port} blocked: allowed_ips check failed"),
+                        ),
+                    )
+                    .await?;
                     return Ok(());
                 }
             },
@@ -553,7 +577,16 @@ async fn handle_tcp_connection(
                     &reason,
                     "ssrf",
                 );
-                respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                respond(
+                    &mut client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!("CONNECT {host_lc}:{port} blocked: invalid allowed_ips in policy"),
+                    ),
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -594,7 +627,16 @@ async fn handle_tcp_connection(
                     &reason,
                     "ssrf",
                 );
-                respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                respond(
+                    &mut client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!("CONNECT {host_lc}:{port} blocked: internal address"),
+                    ),
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -1008,8 +1050,6 @@ async fn handle_inference_interception(
     tls_state: Option<&Arc<ProxyTlsState>>,
     inference_ctx: Option<&Arc<InferenceContext>>,
 ) -> Result<InferenceOutcome> {
-    use crate::l7::inference::{ParseResult, format_http_response, try_parse_http_request};
-
     let Some(ctx) = inference_ctx else {
         return Ok(InferenceOutcome::Denied {
             reason: "cluster inference context not configured".to_string(),
@@ -1032,15 +1072,28 @@ async fn handle_inference_interception(
         }
     };
 
-    // Read and process HTTP requests from the tunnel.
-    // Track whether any request was successfully routed so that a late denial
-    // on a keep-alive connection still counts as "routed".
+    process_inference_keepalive(&mut tls_client, ctx, port).await
+}
+
+/// Read and process HTTP requests from a TLS-terminated inference connection.
+///
+/// Each request is matched against inference patterns and routed locally.
+/// Any non-inference request is immediately denied and the connection is closed,
+/// even if previous requests on the same keep-alive connection were routed
+/// successfully.
+async fn process_inference_keepalive<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    ctx: &InferenceContext,
+    port: u16,
+) -> Result<InferenceOutcome> {
+    use crate::l7::inference::{ParseResult, format_http_response, try_parse_http_request};
+
     let mut buf = vec![0u8; INITIAL_INFERENCE_BUF];
     let mut used = 0usize;
     let mut routed_any = false;
 
     loop {
-        let n = match tls_client.read(&mut buf[used..]).await {
+        let n = match stream.read(&mut buf[used..]).await {
             Ok(n) => n,
             Err(e) => {
                 if routed_any {
@@ -1064,10 +1117,13 @@ async fn handle_inference_interception(
         // Try to parse a complete HTTP request
         match try_parse_http_request(&buf[..used]) {
             ParseResult::Complete(request, consumed) => {
-                let was_routed = route_inference_request(&request, ctx, &mut tls_client).await?;
+                let was_routed = route_inference_request(&request, ctx, stream).await?;
                 if was_routed {
                     routed_any = true;
-                } else if !routed_any {
+                } else {
+                    // Deny and close: a non-inference request must not be silently
+                    // ignored on a keep-alive connection that previously routed
+                    // inference traffic.
                     return Ok(InferenceOutcome::Denied {
                         reason: "connection not allowed by policy".to_string(),
                     });
@@ -1082,7 +1138,7 @@ async fn handle_inference_interception(
                 if used == buf.len() {
                     if buf.len() >= MAX_INFERENCE_BUF {
                         let response = format_http_response(413, &[], b"Payload Too Large");
-                        write_all(&mut tls_client, &response).await?;
+                        write_all(stream, &response).await?;
                         if routed_any {
                             break;
                         }
@@ -1108,7 +1164,7 @@ async fn handle_inference_interception(
                     ocsf_emit!(event);
                 }
                 let response = format_http_response(400, &[], b"Bad Request");
-                write_all(&mut tls_client, &response).await?;
+                write_all(stream, &response).await?;
                 return Ok(InferenceOutcome::Denied { reason });
             }
         }
@@ -1184,6 +1240,7 @@ async fn route_inference_request(
             Ok(mut resp) => {
                 use crate::l7::inference::{
                     format_chunk, format_chunk_terminator, format_http_response_header,
+                    format_sse_error,
                 };
 
                 let resp_headers = sanitize_inference_response_headers(
@@ -1195,6 +1252,13 @@ async fn route_inference_request(
                 write_all(tls_client, &header_bytes).await?;
 
                 // Stream body chunks with byte cap and idle timeout.
+                //
+                // Each upstream chunk is wrapped in HTTP chunked framing and
+                // flushed immediately so SSE events reach the client without
+                // delay. Unlike the previous per-byte write_all+flush, we
+                // coalesce the framing header + data + trailer into a single
+                // write_all call, reducing the number of TLS records per chunk
+                // from 3 to 1 while preserving incremental delivery.
                 let mut total_bytes: usize = 0;
                 loop {
                     match tokio::time::timeout(CHUNK_IDLE_TIMEOUT, resp.next_chunk()).await {
@@ -1206,6 +1270,10 @@ async fn route_inference_request(
                                     limit = MAX_STREAMING_BODY,
                                     "streaming response exceeded byte limit, truncating"
                                 );
+                                let err = format_sse_error(
+                                    "response truncated: exceeded maximum streaming body size",
+                                );
+                                let _ = write_all(tls_client, &format_chunk(&err)).await;
                                 break;
                             }
                             let encoded = format_chunk(&chunk);
@@ -1215,23 +1283,34 @@ async fn route_inference_request(
                         Ok(Err(e)) => {
                             let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
                                 .activity(ActivityId::Fail)
-                                .severity(SeverityId::Low)
+                                .severity(SeverityId::Medium)
                                 .status(StatusId::Failure)
                                 .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, 443))
-                                .message(format!("error reading upstream response chunk: {e}"))
+                                .message(format!(
+                                    "error reading upstream response chunk after \
+                                     {total_bytes} bytes: {e}"
+                                ))
                                 .build();
                             ocsf_emit!(event);
+                            let err = format_sse_error("response truncated: upstream read error");
+                            let _ = write_all(tls_client, &format_chunk(&err)).await;
                             break;
                         }
                         Err(_) => {
                             let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
                                 .activity(ActivityId::Fail)
-                                .severity(SeverityId::Low)
+                                .severity(SeverityId::Medium)
                                 .status(StatusId::Failure)
                                 .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, 443))
-                                .message("streaming response chunk idle timeout, closing")
+                                .message(format!(
+                                    "streaming response chunk idle timeout after \
+                                     {total_bytes} bytes, closing"
+                                ))
                                 .build();
                             ocsf_emit!(event);
+                            let err =
+                                format_sse_error("response truncated: chunk idle timeout exceeded");
+                            let _ = write_all(tls_client, &format_chunk(&err)).await;
                             break;
                         }
                     }
@@ -1442,49 +1521,25 @@ fn query_tls_mode(
     }
 }
 
-/// Check if an IP address is internal (loopback, private RFC1918, link-local, or unspecified).
-///
-/// This is a defense-in-depth check to prevent SSRF via the CONNECT proxy.
-/// It covers:
-/// - IPv4 loopback (127.0.0.0/8), private (10/8, 172.16/12, 192.168/16), link-local (169.254/16), unspecified (`0.0.0.0`)
-/// - IPv6 loopback (`::1`), link-local (`fe80::/10`), ULA (`fc00::/7`), unspecified (`::`)
-/// - IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) are unwrapped and checked as IPv4
-fn is_internal_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() {
-                return true;
-            }
-            // fe80::/10 — IPv6 link-local
-            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
-                return true;
-            }
-            // fc00::/7 — IPv6 unique local addresses (ULA)
-            if (v6.segments()[0] & 0xfe00) == 0xfc00 {
-                return true;
-            }
-            // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified();
-            }
-            false
-        }
-    }
-}
-
 /// When the policy endpoint host is a literal IP address, the user has
 /// explicitly declared intent to allow that destination.  Synthesize an
 /// `allowed_ips` entry so the existing allowlist-validation path is used
-/// instead of the blanket internal-IP rejection.  Loopback and link-local
-/// addresses are still blocked by `resolve_and_check_allowed_ips`.
+/// instead of the blanket internal-IP rejection.
+///
+/// Always-blocked addresses (loopback, link-local, unspecified) are skipped
+/// — synthesizing an `allowed_ips` entry for them would be silently
+/// un-enforceable at runtime.
 fn implicit_allowed_ips_for_ip_host(host: &str) -> Vec<String> {
-    if host.parse::<IpAddr>().is_ok() {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_always_blocked_ip(ip) {
+            warn!(
+                host,
+                "Policy host is an always-blocked address; \
+                 implicit allowed_ips skipped — SSRF hardening prevents \
+                 traffic to this destination regardless of policy"
+            );
+            return vec![];
+        }
         vec![host.to_string()]
     } else {
         vec![]
@@ -1520,31 +1575,6 @@ async fn resolve_and_reject_internal(
     }
 
     Ok(addrs)
-}
-
-/// Check if an IP address is always blocked regardless of policy.
-///
-/// Loopback, link-local, and unspecified addresses are never allowed even when an endpoint
-/// has `allowed_ips` configured. This prevents proxy bypass (loopback) and
-/// cloud metadata SSRF (link-local 169.254.x.x).
-fn is_always_blocked_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local() || v4.is_unspecified(),
-        IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() {
-                return true;
-            }
-            // fe80::/10 — IPv6 link-local
-            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
-                return true;
-            }
-            // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback() || v4.is_link_local() || v4.is_unspecified();
-            }
-            false
-        }
-    }
 }
 
 /// Resolve DNS and validate resolved addresses against a CIDR/IP allowlist.
@@ -1616,11 +1646,15 @@ const BLOCKED_CONTROL_PLANE_PORTS: &[u16] = &[
 ];
 
 /// Parse CIDR/IP strings into `IpNet` values, rejecting invalid entries and
-/// entries that cover loopback or link-local ranges.
+/// entries that overlap always-blocked ranges (loopback, link-local,
+/// unspecified).
 ///
 /// Returns parsed networks on success, or an error describing which entries
-/// are invalid. Logs a warning for overly broad CIDRs.
+/// are invalid or always-blocked.  Logs a warning for overly broad CIDRs
+/// that are not outright blocked.
 fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, String> {
+    use openshell_core::net::is_always_blocked_net;
+
     let mut nets = Vec::with_capacity(raw.len());
     let mut errors = Vec::new();
 
@@ -1638,6 +1672,19 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
 
         match parsed {
             Ok(n) => {
+                // Reject entries that overlap always-blocked ranges — these
+                // would be silently denied at runtime by is_always_blocked_ip
+                // and cause confusing UX (accepted in policy, never works).
+                if is_always_blocked_net(n) {
+                    errors.push(format!(
+                        "allowed_ips entry {entry} falls within always-blocked range \
+                         (loopback/link-local/unspecified); remove this entry — \
+                         SSRF hardening prevents traffic to these destinations \
+                         regardless of policy"
+                    ));
+                    continue;
+                }
+
                 if n.prefix_len() < MIN_SAFE_PREFIX_LEN {
                     let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
                         .activity(ActivityId::Other)
@@ -2071,7 +2118,16 @@ async fn handle_forward_proxy(
                 reason,
                 "forward",
             );
-            respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+            respond(
+                client,
+                &build_json_error_response(
+                    403,
+                    "Forbidden",
+                    "policy_denied",
+                    &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                ),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -2199,7 +2255,16 @@ async fn handle_forward_proxy(
                 &reason,
                 "forward-l7-deny",
             );
-            respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+            respond(
+                client,
+                &build_json_error_response(
+                    403,
+                    "Forbidden",
+                    "policy_denied",
+                    &format!("{method} {host_lc}:{port}{path} denied by L7 policy"),
+                ),
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -2240,8 +2305,9 @@ async fn handle_forward_proxy(
                             )
                             .firewall_rule(policy_str, "ssrf")
                             .message(format!(
-                                "FORWARD blocked: allowed_ips check failed for {host_lc}:{port}: {reason}"
+                                "FORWARD blocked: allowed_ips check failed for {host_lc}:{port}"
                             ))
+                            .status_detail(&reason)
                             .build();
                         ocsf_emit!(event);
                     }
@@ -2254,7 +2320,16 @@ async fn handle_forward_proxy(
                         &reason,
                         "ssrf",
                     );
-                    respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                    respond(
+                        client,
+                        &build_json_error_response(
+                            403,
+                            "Forbidden",
+                            "ssrf_denied",
+                            &format!("{method} {host_lc}:{port} blocked: allowed_ips check failed"),
+                        ),
+                    )
+                    .await?;
                     return Ok(());
                 }
             },
@@ -2278,8 +2353,9 @@ async fn handle_forward_proxy(
                         )
                         .firewall_rule(policy_str, "ssrf")
                         .message(format!(
-                            "FORWARD blocked: invalid allowed_ips in policy for {host_lc}:{port}: {reason}"
+                            "FORWARD blocked: invalid allowed_ips in policy for {host_lc}:{port}"
                         ))
+                        .status_detail(&reason)
                         .build();
                     ocsf_emit!(event);
                 }
@@ -2292,7 +2368,18 @@ async fn handle_forward_proxy(
                     &reason,
                     "ssrf",
                 );
-                respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!(
+                            "{method} {host_lc}:{port} blocked: invalid allowed_ips in policy"
+                        ),
+                    ),
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -2320,8 +2407,9 @@ async fn handle_forward_proxy(
                         )
                         .firewall_rule(policy_str, "ssrf")
                         .message(format!(
-                            "FORWARD blocked: internal IP without allowed_ips for {host_lc}:{port}: {reason}"
+                            "FORWARD blocked: internal IP without allowed_ips for {host_lc}:{port}"
                         ))
+                        .status_detail(&reason)
                         .build();
                     ocsf_emit!(event);
                 }
@@ -2334,7 +2422,16 @@ async fn handle_forward_proxy(
                     &reason,
                     "ssrf",
                 );
-                respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!("{method} {host_lc}:{port} blocked: internal address"),
+                    ),
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -2363,7 +2460,16 @@ async fn handle_forward_proxy(
                 ))
                 .build();
             ocsf_emit!(event);
-            respond(client, b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
+            respond(
+                client,
+                &build_json_error_response(
+                    502,
+                    "Bad Gateway",
+                    "upstream_unreachable",
+                    &format!("connection to {host_lc}:{port} failed"),
+                ),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -2402,7 +2508,16 @@ async fn handle_forward_proxy(
                 error = %e,
                 "credential injection failed in forward proxy"
             );
-            respond(client, b"HTTP/1.1 500 Internal Server Error\r\n\r\n").await?;
+            respond(
+                client,
+                &build_json_error_response(
+                    500,
+                    "Internal Server Error",
+                    "credential_injection_failed",
+                    "unresolved credential placeholder in request",
+                ),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -2429,6 +2544,30 @@ fn parse_target(target: &str) -> Result<(String, u16)> {
 async fn respond(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     client.write_all(bytes).await.into_diagnostic()?;
     Ok(())
+}
+
+/// Build an HTTP error response with a JSON body.
+///
+/// Returns bytes ready to write to the client socket.  The body is a JSON
+/// object with `error` and `detail` fields, matching the format used by the
+/// L7 deny path in `l7/rest.rs`.
+fn build_json_error_response(status: u16, status_text: &str, error: &str, detail: &str) -> Vec<u8> {
+    let body = serde_json::json!({
+        "error": error,
+        "detail": detail,
+    });
+    let body_str = body.to_string();
+    format!(
+        "HTTP/1.1 {status} {status_text}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body_str.len(),
+        body_str,
+    )
+    .into_bytes()
 }
 
 /// Check if a miette error represents a benign connection close.
@@ -2493,6 +2632,41 @@ mod tests {
     #[test]
     fn test_rejects_ipv4_unspecified() {
         assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+    }
+
+    #[test]
+    fn test_rejects_ipv4_cgnat() {
+        // 100.64.0.0/10 — CGNAT / shared address space (RFC 6598)
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 100, 50, 3))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(
+            100, 127, 255, 255
+        ))));
+        // Just outside the /10 boundary
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1))));
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(
+            100, 63, 255, 255
+        ))));
+    }
+
+    #[test]
+    fn test_rejects_ipv4_special_use_ranges() {
+        // 192.0.0.0/24 — IETF protocol assignments
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 1))));
+        // 198.18.0.0/15 — benchmarking
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 19, 255, 255))));
+        // 198.51.100.0/24 — TEST-NET-2
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))));
+        // 203.0.113.0/24 — TEST-NET-3
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
+    }
+
+    #[test]
+    fn test_rejects_ipv6_mapped_cgnat() {
+        // ::ffff:100.64.0.1 should be caught via IPv4-mapped unwrapping
+        let v6 = Ipv4Addr::new(100, 64, 0, 1).to_ipv6_mapped();
+        assert!(is_internal_ip(IpAddr::V6(v6)));
     }
 
     #[test]
@@ -2895,7 +3069,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_check_allowed_ips_blocks_loopback() {
-        let nets = parse_allowed_ips(&["127.0.0.0/8".to_string()]).unwrap();
+        // Construct nets directly (parse_allowed_ips now rejects always-blocked).
+        let nets = vec!["127.0.0.0/8".parse::<ipnet::IpNet>().unwrap()];
         let result = resolve_and_check_allowed_ips("127.0.0.1", 80, &nets).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2907,7 +3082,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_check_allowed_ips_blocks_metadata() {
-        let nets = parse_allowed_ips(&["169.254.0.0/16".to_string()]).unwrap();
+        // Construct nets directly (parse_allowed_ips now rejects always-blocked).
+        let nets = vec!["169.254.0.0/16".parse::<ipnet::IpNet>().unwrap()];
         let result = resolve_and_check_allowed_ips("169.254.169.254", 80, &nets).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2919,7 +3095,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_check_allowed_ips_blocks_unspecified() {
-        let nets = parse_allowed_ips(&["0.0.0.0/0".to_string()]).unwrap();
+        // Construct nets directly (parse_allowed_ips now rejects always-blocked).
+        let nets = vec!["0.0.0.0/0".parse::<ipnet::IpNet>().unwrap()];
         let result = resolve_and_check_allowed_ips("0.0.0.0", 80, &nets).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2946,7 +3123,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_check_allowed_ips_blocks_control_plane_ports() {
-        let nets = parse_allowed_ips(&["0.0.0.0/0".to_string()]).unwrap();
+        // Use a public CIDR (parse_allowed_ips now rejects 0.0.0.0/0).
+        let nets = parse_allowed_ips(&["8.8.8.0/24".to_string()]).unwrap();
         // K8s API server port
         let result = resolve_and_check_allowed_ips("8.8.8.8", 6443, &nets).await;
         assert!(result.is_err());
@@ -2976,6 +3154,90 @@ mod tests {
         // Broad CIDRs are accepted (just warned about) -- design trade-off
         let result = parse_allowed_ips(&["10.0.0.0/8".to_string()]);
         assert!(result.is_ok());
+    }
+
+    // --- parse_allowed_ips: always-blocked rejection tests ---
+
+    #[test]
+    fn test_parse_allowed_ips_rejects_loopback_cidr() {
+        let result = parse_allowed_ips(&["127.0.0.0/8".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("always-blocked"));
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_rejects_link_local_cidr() {
+        let result = parse_allowed_ips(&["169.254.0.0/16".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("always-blocked"));
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_rejects_unspecified() {
+        let result = parse_allowed_ips(&["0.0.0.0".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("always-blocked"));
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_rejects_single_loopback_ip() {
+        let result = parse_allowed_ips(&["127.0.0.1".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("always-blocked"));
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_rejects_single_metadata_ip() {
+        let result = parse_allowed_ips(&["169.254.169.254".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("always-blocked"));
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_rejects_wildcard_cidr() {
+        let result = parse_allowed_ips(&["0.0.0.0/0".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("always-blocked"));
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_mixed_valid_and_blocked() {
+        // A blocked entry taints the whole batch.
+        let result = parse_allowed_ips(&["10.0.5.0/24".to_string(), "127.0.0.1".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("always-blocked"));
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_accepts_rfc1918() {
+        let result = parse_allowed_ips(&["10.0.5.0/24".to_string(), "192.168.1.0/24".to_string()]);
+        assert!(result.is_ok());
+    }
+
+    // --- implicit_allowed_ips_for_ip_host: always-blocked skip tests ---
+
+    #[test]
+    fn test_implicit_allowed_ips_skips_loopback() {
+        let result = implicit_allowed_ips_for_ip_host("127.0.0.1");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_implicit_allowed_ips_skips_link_local() {
+        let result = implicit_allowed_ips_for_ip_host("169.254.169.254");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_implicit_allowed_ips_skips_unspecified() {
+        let result = implicit_allowed_ips_for_ip_host("0.0.0.0");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_implicit_allowed_ips_allows_rfc1918() {
+        let result = implicit_allowed_ips_for_ip_host("10.0.5.20");
+        assert_eq!(result, vec!["10.0.5.20"]);
     }
 
     // --- extract_host_from_uri tests ---
@@ -3244,7 +3506,8 @@ mod tests {
     #[tokio::test]
     async fn test_forward_loopback_always_blocked_even_with_allowed_ips() {
         // Loopback addresses are always blocked, even if in allowed_ips.
-        let nets = parse_allowed_ips(&["127.0.0.0/8".to_string()]).unwrap();
+        // Construct nets directly (parse_allowed_ips now rejects always-blocked).
+        let nets = vec!["127.0.0.0/8".parse::<ipnet::IpNet>().unwrap()];
         let result = resolve_and_check_allowed_ips("127.0.0.1", 80, &nets).await;
         assert!(result.is_err(), "Loopback should be always blocked");
         let err = result.unwrap_err();
@@ -3257,7 +3520,8 @@ mod tests {
     #[tokio::test]
     async fn test_forward_link_local_always_blocked_even_with_allowed_ips() {
         // Link-local / cloud metadata addresses are always blocked.
-        let nets = parse_allowed_ips(&["169.254.0.0/16".to_string()]).unwrap();
+        // Construct nets directly (parse_allowed_ips now rejects always-blocked).
+        let nets = vec!["169.254.0.0/16".parse::<ipnet::IpNet>().unwrap()];
         let result = resolve_and_check_allowed_ips("169.254.169.254", 80, &nets).await;
         assert!(result.is_err(), "Link-local should be always blocked");
         let err = result.unwrap_err();
@@ -3276,9 +3540,10 @@ mod tests {
     }
 
     #[test]
-    fn test_implicit_allowed_ips_returns_ip_for_ipv6_literal() {
+    fn test_implicit_allowed_ips_skips_ipv6_loopback() {
+        // ::1 is always-blocked, so implicit allowed_ips should be empty.
         let result = implicit_allowed_ips_for_ip_host("::1");
-        assert_eq!(result, vec!["::1"]);
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -3291,5 +3556,147 @@ mod tests {
     fn test_implicit_allowed_ips_returns_empty_for_wildcard() {
         let result = implicit_allowed_ips_for_ip_host("*.example.com");
         assert!(result.is_empty());
+    }
+
+    /// Regression test: exercises the actual keep-alive interception loop to
+    /// verify that a non-inference request is denied even after a previous
+    /// inference request was successfully routed on the same connection.
+    ///
+    /// Before the fix, `handle_inference_interception` used
+    /// `else if !routed_any` which silently dropped denials once `routed_any`
+    /// was true, allowing non-inference HTTP requests to piggyback on a
+    /// keep-alive connection that had previously handled inference traffic.
+    /// Regression test: exercises the actual keep-alive interception loop to
+    /// verify that a non-inference request is denied even after a previous
+    /// inference request was successfully routed on the same connection.
+    ///
+    /// The server runs in a spawned task with empty routes (the inference
+    /// request gets a 503 "not configured" but is still recognized as
+    /// inference and returns Ok(true)). The client sends the inference
+    /// request, reads the 503 response, then sends a non-inference request
+    /// on the same connection. The server must return Denied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_keepalive_denies_non_inference_after_routed() {
+        use openshell_router::Router;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let router = Router::new().unwrap();
+        let patterns = crate::l7::inference::default_patterns();
+        // Empty routes: inference request gets 503 but returns Ok(true).
+        let ctx = InferenceContext::new(patterns, router, vec![], vec![]);
+
+        let body = r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#;
+        let inference_req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: inference.local\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        let non_inference_req = "GET /admin/config HTTP/1.1\r\nHost: inference.local\r\n\r\n";
+
+        let (client, mut server) = tokio::io::duplex(65536);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+
+        // Spawn the server task so it runs concurrently.
+        let server_task =
+            tokio::spawn(async move { process_inference_keepalive(&mut server, &ctx, 443).await });
+
+        // Client: send inference request, read response, send non-inference.
+        client_write
+            .write_all(inference_req.as_bytes())
+            .await
+            .unwrap();
+
+        // Read the 503 response so the server loops back to read.
+        let mut buf = vec![0u8; 4096];
+        let _ = client_read.read(&mut buf).await.unwrap();
+
+        // Send non-inference request on the same keep-alive connection.
+        client_write
+            .write_all(non_inference_req.as_bytes())
+            .await
+            .unwrap();
+        drop(client_write);
+
+        // Drain remaining response bytes.
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match client_read.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        });
+
+        let outcome = server_task.await.unwrap().unwrap();
+
+        assert!(
+            matches!(outcome, InferenceOutcome::Denied { .. }),
+            "expected Denied after non-inference request on keep-alive, got: {outcome:?}"
+        );
+    }
+
+    // -- build_json_error_response --
+
+    #[test]
+    fn test_json_error_response_403() {
+        let resp = build_json_error_response(
+            403,
+            "Forbidden",
+            "policy_denied",
+            "CONNECT api.example.com:443 not permitted by policy",
+        );
+        let resp_str = String::from_utf8(resp).unwrap();
+
+        assert!(resp_str.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+        assert!(resp_str.contains("Content-Type: application/json\r\n"));
+        assert!(resp_str.contains("Connection: close\r\n"));
+
+        // Extract body after \r\n\r\n
+        let body_start = resp_str.find("\r\n\r\n").unwrap() + 4;
+        let body: serde_json::Value = serde_json::from_str(&resp_str[body_start..]).unwrap();
+        assert_eq!(body["error"], "policy_denied");
+        assert_eq!(
+            body["detail"],
+            "CONNECT api.example.com:443 not permitted by policy"
+        );
+    }
+
+    #[test]
+    fn test_json_error_response_502() {
+        let resp = build_json_error_response(
+            502,
+            "Bad Gateway",
+            "upstream_unreachable",
+            "connection to api.example.com:443 failed",
+        );
+        let resp_str = String::from_utf8(resp).unwrap();
+
+        assert!(resp_str.starts_with("HTTP/1.1 502 Bad Gateway\r\n"));
+
+        let body_start = resp_str.find("\r\n\r\n").unwrap() + 4;
+        let body: serde_json::Value = serde_json::from_str(&resp_str[body_start..]).unwrap();
+        assert_eq!(body["error"], "upstream_unreachable");
+        assert_eq!(body["detail"], "connection to api.example.com:443 failed");
+    }
+
+    #[test]
+    fn test_json_error_response_content_length_matches() {
+        let resp = build_json_error_response(403, "Forbidden", "test", "detail");
+        let resp_str = String::from_utf8(resp).unwrap();
+
+        // Extract Content-Length value
+        let cl_line = resp_str
+            .lines()
+            .find(|l| l.starts_with("Content-Length:"))
+            .unwrap();
+        let cl: usize = cl_line.split(": ").nth(1).unwrap().trim().parse().unwrap();
+
+        // Verify body length matches
+        let body_start = resp_str.find("\r\n\r\n").unwrap() + 4;
+        assert_eq!(resp_str[body_start..].len(), cl);
     }
 }

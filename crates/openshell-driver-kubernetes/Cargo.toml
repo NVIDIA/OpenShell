@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-driver-kubernetes"
+description = "Kubernetes compute driver for OpenShell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openshell-driver-kubernetes"
+path = "src/main.rs"
+
+[dependencies]
+openshell-core = { path = "../openshell-core" }
+
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["transport"] }
+prost = { workspace = true }
+prost-types = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+kube = { workspace = true }
+kube-runtime = { workspace = true }
+k8s-openapi = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+miette = { workspace = true }
+
+[lints]
+workspace = true

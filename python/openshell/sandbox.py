@@ -16,7 +16,6 @@ from urllib.parse import urlparse
 import grpc
 
 from ._proto import (
-    datamodel_pb2,
     inference_pb2,
     inference_pb2_grpc,
     openshell_pb2,
@@ -187,7 +186,7 @@ class SandboxClient:
     def create(
         self,
         *,
-        spec: datamodel_pb2.SandboxSpec | None = None,
+        spec: openshell_pb2.SandboxSpec | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
         response = self._stub.CreateSandbox(
@@ -201,7 +200,7 @@ class SandboxClient:
     def create_session(
         self,
         *,
-        spec: datamodel_pb2.SandboxSpec | None = None,
+        spec: openshell_pb2.SandboxSpec | None = None,
     ) -> SandboxSession:
         return SandboxSession(self, self.create(spec=spec))
 
@@ -253,9 +252,9 @@ class SandboxClient:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             sandbox = self.get(sandbox_name)
-            if sandbox.phase == datamodel_pb2.SANDBOX_PHASE_READY:
+            if sandbox.phase == openshell_pb2.SANDBOX_PHASE_READY:
                 return sandbox
-            if sandbox.phase == datamodel_pb2.SANDBOX_PHASE_ERROR:
+            if sandbox.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
                 raise SandboxError(f"sandbox {sandbox_name} entered error phase")
             time.sleep(1)
         raise SandboxError(f"sandbox {sandbox_name} was not ready within timeout")
@@ -435,7 +434,7 @@ class Sandbox:
         cluster: str | None = None,
         sandbox: str | SandboxRef | None = None,
         delete_on_exit: bool = True,
-        spec: datamodel_pb2.SandboxSpec | None = None,
+        spec: openshell_pb2.SandboxSpec | None = None,
         timeout: float = 30.0,
         ready_timeout_seconds: float = 120.0,
     ) -> None:
@@ -576,7 +575,7 @@ def _serialize_python_callable(
     return base64.b64encode(payload).decode("ascii")
 
 
-def _sandbox_ref(sandbox: datamodel_pb2.Sandbox) -> SandboxRef:
+def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
     return SandboxRef(
         id=sandbox.id,
         name=sandbox.name,
@@ -585,13 +584,13 @@ def _sandbox_ref(sandbox: datamodel_pb2.Sandbox) -> SandboxRef:
     )
 
 
-def _default_spec() -> datamodel_pb2.SandboxSpec:
+def _default_spec() -> openshell_pb2.SandboxSpec:
     # Omit the policy field so the sandbox container discovers its policy
     # from /etc/openshell/policy.yaml (baked into the image at build time).
     # This avoids duplicating policy defaults between the SDK and the
     # container image and ensures sandboxes get the full dev-sandbox-policy
     # (including network_policies) out of the box.
-    return datamodel_pb2.SandboxSpec()
+    return openshell_pb2.SandboxSpec()
 
 
 def _xdg_config_home() -> pathlib.Path:

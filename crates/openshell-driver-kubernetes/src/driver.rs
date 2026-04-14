@@ -1,24 +1,53 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Kubernetes sandbox integration.
+//! Kubernetes compute driver.
 
-use crate::persistence::{ObjectId, ObjectName, ObjectType, Store};
-use futures::{StreamExt, TryStreamExt};
-use k8s_openapi::api::core::v1::{Node, Pod};
+use crate::config::KubernetesComputeConfig;
+use futures::{Stream, StreamExt, TryStreamExt};
+use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node, Pod};
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
-use openshell_core::proto::{
-    Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus, SandboxTemplate,
+use openshell_core::proto::compute::v1::{
+    DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
+    DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
+    DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
+    GetCapabilitiesResponse, ResolveSandboxEndpointResponse, SandboxEndpoint,
+    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
+    WatchSandboxesSandboxEvent, sandbox_endpoint, watch_sandboxes_event,
 };
 use std::collections::BTreeMap;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::pin::Pin;
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
+
+pub type WatchStream =
+    Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, KubernetesDriverError>> + Send>>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum KubernetesDriverError {
+    #[error("sandbox already exists")]
+    AlreadyExists,
+    #[error("{0}")]
+    Precondition(String),
+    #[error("{0}")]
+    Message(String),
+}
+
+impl KubernetesDriverError {
+    fn from_kube(err: KubeError) -> Self {
+        match err {
+            KubeError::Api(api) if api.code == 409 => Self::AlreadyExists,
+            other => Self::Message(other.to_string()),
+        }
+    }
+}
 
 /// Timeout for individual Kubernetes API calls (create, delete, get).
 /// This prevents gRPC handlers from blocking indefinitely when the k8s
@@ -73,120 +102,177 @@ const WORKSPACE_DEFAULT_STORAGE: &str = "2Gi";
 const WORKSPACE_SENTINEL: &str = ".workspace-initialized";
 
 #[derive(Clone)]
-pub struct SandboxClient {
+pub struct KubernetesComputeDriver {
     client: Client,
-    namespace: String,
-    default_image: String,
-    /// Kubernetes `imagePullPolicy` for sandbox containers.  When empty the
-    /// field is omitted from the pod spec and Kubernetes applies its default.
-    image_pull_policy: String,
-    grpc_endpoint: String,
-    ssh_listen_addr: String,
-    ssh_handshake_secret: String,
-    ssh_handshake_skew_secs: u64,
-    /// When non-empty, sandbox pods get this K8s secret mounted for mTLS to the server.
-    client_tls_secret_name: String,
-    /// When non-empty, sandbox pods get `hostAliases` entries mapping
-    /// `host.docker.internal` and `host.openshell.internal` to this IP.
-    host_gateway_ip: String,
+    config: KubernetesComputeConfig,
 }
 
-impl std::fmt::Debug for SandboxClient {
+impl std::fmt::Debug for KubernetesComputeDriver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SandboxClient")
-            .field("namespace", &self.namespace)
-            .field("default_image", &self.default_image)
-            .field("grpc_endpoint", &self.grpc_endpoint)
+        f.debug_struct("KubernetesComputeDriver")
+            .field("namespace", &self.config.namespace)
+            .field("default_image", &self.config.default_image)
+            .field("grpc_endpoint", &self.config.grpc_endpoint)
             .finish()
     }
 }
 
-impl SandboxClient {
-    pub async fn new(
-        namespace: String,
-        default_image: String,
-        image_pull_policy: String,
-        grpc_endpoint: String,
-        ssh_listen_addr: String,
-        ssh_handshake_secret: String,
-        ssh_handshake_skew_secs: u64,
-        client_tls_secret_name: String,
-        host_gateway_ip: String,
-    ) -> Result<Self, KubeError> {
-        let mut config = match kube::Config::incluster() {
+impl KubernetesComputeDriver {
+    pub async fn new(config: KubernetesComputeConfig) -> Result<Self, KubeError> {
+        let mut kube_config = match kube::Config::incluster() {
             Ok(c) => c,
             Err(_) => kube::Config::infer()
                 .await
                 .map_err(kube::Error::InferConfig)?,
         };
-        config.connect_timeout = Some(Duration::from_secs(10));
-        config.read_timeout = Some(Duration::from_secs(30));
-        config.write_timeout = Some(Duration::from_secs(30));
-        let client = Client::try_from(config)?;
-        Ok(Self {
-            client,
-            namespace,
-            default_image,
-            image_pull_policy,
-            grpc_endpoint,
-            ssh_listen_addr,
-            ssh_handshake_secret,
-            ssh_handshake_skew_secs,
-            client_tls_secret_name,
-            host_gateway_ip,
+        kube_config.connect_timeout = Some(Duration::from_secs(10));
+        kube_config.read_timeout = Some(Duration::from_secs(30));
+        kube_config.write_timeout = Some(Duration::from_secs(30));
+        let client = Client::try_from(kube_config)?;
+        Ok(Self { client, config })
+    }
+
+    pub async fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
+        Ok(GetCapabilitiesResponse {
+            driver_name: "kubernetes".to_string(),
+            driver_version: openshell_core::VERSION.to_string(),
+            default_image: self.config.default_image.clone(),
+            supports_gpu: self.has_gpu_capacity().await.unwrap_or(false),
         })
     }
 
     pub fn default_image(&self) -> &str {
-        &self.default_image
+        &self.config.default_image
     }
 
     pub fn namespace(&self) -> &str {
-        &self.namespace
+        &self.config.namespace
     }
 
     pub fn ssh_listen_addr(&self) -> &str {
-        &self.ssh_listen_addr
-    }
-
-    pub fn ssh_handshake_secret(&self) -> &str {
-        &self.ssh_handshake_secret
+        &self.config.ssh_listen_addr
     }
 
     pub const fn ssh_handshake_skew_secs(&self) -> u64 {
-        self.ssh_handshake_skew_secs
+        self.config.ssh_handshake_skew_secs
     }
 
-    pub fn api(&self) -> Api<DynamicObject> {
+    fn api(&self) -> Api<DynamicObject> {
         let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, SANDBOX_VERSION, SANDBOX_KIND);
         let resource = ApiResource::from_gvk(&gvk);
-        Api::namespaced_with(self.client.clone(), &self.namespace, &resource)
+        Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource)
     }
 
-    pub async fn validate_gpu_support(&self) -> Result<(), tonic::Status> {
+    async fn has_gpu_capacity(&self) -> Result<bool, KubeError> {
         let nodes: Api<Node> = Api::all(self.client.clone());
-        let node_list = nodes.list(&ListParams::default()).await.map_err(|err| {
-            tonic::Status::internal(format!("check GPU node capacity failed: {err}"))
-        })?;
-
-        let has_gpu_capacity = node_list.items.into_iter().any(|node| {
+        let node_list = nodes.list(&ListParams::default()).await?;
+        Ok(node_list.items.into_iter().any(|node| {
             node.status
                 .and_then(|status| status.allocatable)
                 .and_then(|allocatable| allocatable.get(GPU_RESOURCE_NAME).cloned())
                 .is_some_and(|quantity| quantity.0 != "0")
-        });
+        }))
+    }
 
-        if !has_gpu_capacity {
+    pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
+        let gpu_requested = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu);
+        if gpu_requested
+            && !self.has_gpu_capacity().await.map_err(|err| {
+                tonic::Status::internal(format!("check GPU node capacity failed: {err}"))
+            })?
+        {
             return Err(tonic::Status::failed_precondition(
                 "GPU sandbox requested, but the active gateway has no allocatable GPUs. Please refer to documentation and use `openshell doctor` commands to inspect GPU support and gateway configuration.",
             ));
         }
-
         Ok(())
     }
 
-    pub async fn agent_pod_ip(&self, pod_name: &str) -> Result<Option<IpAddr>, KubeError> {
-        let api: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+    pub async fn get_sandbox(&self, name: &str) -> Result<Option<Sandbox>, String> {
+        info!(
+            sandbox_name = %name,
+            namespace = %self.config.namespace,
+            "Fetching sandbox from Kubernetes"
+        );
+
+        let api = self.api();
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(name)).await {
+            Ok(Ok(obj)) => sandbox_from_object(&self.config.namespace, obj).map(Some),
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => {
+                debug!(sandbox_name = %name, "Sandbox not found in Kubernetes");
+                Ok(None)
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    sandbox_name = %name,
+                    error = %err,
+                    "Failed to fetch sandbox from Kubernetes"
+                );
+                Err(err.to_string())
+            }
+            Err(_elapsed) => {
+                warn!(
+                    sandbox_name = %name,
+                    timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                    "Timed out fetching sandbox from Kubernetes"
+                );
+                Err(format!(
+                    "timed out after {}s waiting for Kubernetes API",
+                    KUBE_API_TIMEOUT.as_secs()
+                ))
+            }
+        }
+    }
+
+    pub async fn list_sandboxes(&self) -> Result<Vec<Sandbox>, String> {
+        info!(
+            namespace = %self.config.namespace,
+            "Listing sandboxes from Kubernetes"
+        );
+
+        let api = self.api();
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.list(&ListParams::default())).await {
+            Ok(Ok(list)) => {
+                let mut sandboxes = list
+                    .items
+                    .into_iter()
+                    .map(|obj| sandbox_from_object(&self.config.namespace, obj))
+                    .collect::<Result<Vec<_>, _>>()?;
+                sandboxes.sort_by(|left, right| {
+                    left.name
+                        .cmp(&right.name)
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                Ok(sandboxes)
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    namespace = %self.config.namespace,
+                    error = %err,
+                    "Failed to list sandboxes from Kubernetes"
+                );
+                Err(err.to_string())
+            }
+            Err(_elapsed) => {
+                warn!(
+                    namespace = %self.config.namespace,
+                    timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                    "Timed out listing sandboxes from Kubernetes"
+                );
+                Err(format!(
+                    "timed out after {}s waiting for Kubernetes API",
+                    KUBE_API_TIMEOUT.as_secs()
+                ))
+            }
+        }
+    }
+
+    fn ssh_handshake_secret(&self) -> &str {
+        &self.config.ssh_handshake_secret
+    }
+
+    async fn agent_pod_ip(&self, pod_name: &str) -> Result<Option<IpAddr>, KubeError> {
+        let api: Api<Pod> = Api::namespaced(self.client.clone(), &self.config.namespace);
         match api.get(pod_name).await {
             Ok(pod) => {
                 let ip = pod
@@ -200,12 +286,12 @@ impl SandboxClient {
         }
     }
 
-    pub async fn create(&self, sandbox: &Sandbox) -> Result<DynamicObject, KubeError> {
+    pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
         let name = sandbox.name.as_str();
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %name,
-            namespace = %self.namespace,
+            namespace = %self.config.namespace,
             "Creating sandbox in Kubernetes"
         );
 
@@ -214,34 +300,34 @@ impl SandboxClient {
         let mut obj = DynamicObject::new(name, &resource);
         obj.metadata = ObjectMeta {
             name: Some(name.to_string()),
-            namespace: Some(self.namespace.clone()),
+            namespace: Some(self.config.namespace.clone()),
             labels: Some(sandbox_labels(sandbox)),
             ..Default::default()
         };
         obj.data = sandbox_to_k8s_spec(
             sandbox.spec.as_ref(),
-            &self.default_image,
-            &self.image_pull_policy,
+            &self.config.default_image,
+            &self.config.image_pull_policy,
             &sandbox.id,
             &sandbox.name,
-            &self.grpc_endpoint,
+            &self.config.grpc_endpoint,
             self.ssh_listen_addr(),
             self.ssh_handshake_secret(),
             self.ssh_handshake_skew_secs(),
-            &self.client_tls_secret_name,
-            &self.host_gateway_ip,
+            &self.config.client_tls_secret_name,
+            &self.config.host_gateway_ip,
         );
         let api = self.api();
 
         match tokio::time::timeout(KUBE_API_TIMEOUT, api.create(&PostParams::default(), &obj)).await
         {
-            Ok(Ok(result)) => {
+            Ok(Ok(_result)) => {
                 info!(
                     sandbox_id = %sandbox.id,
                     sandbox_name = %name,
                     "Sandbox created in Kubernetes successfully"
                 );
-                Ok(result)
+                Ok(())
             }
             Ok(Err(err)) => {
                 warn!(
@@ -250,7 +336,7 @@ impl SandboxClient {
                     error = %err,
                     "Failed to create sandbox in Kubernetes"
                 );
-                Err(err)
+                Err(KubernetesDriverError::from_kube(err))
             }
             Err(_elapsed) => {
                 warn!(
@@ -259,23 +345,18 @@ impl SandboxClient {
                     timeout_secs = KUBE_API_TIMEOUT.as_secs(),
                     "Timed out creating sandbox in Kubernetes"
                 );
-                Err(KubeError::Api(kube::core::ErrorResponse {
-                    status: "Failure".to_string(),
-                    message: format!(
-                        "timed out after {}s waiting for Kubernetes API",
-                        KUBE_API_TIMEOUT.as_secs()
-                    ),
-                    reason: "Timeout".to_string(),
-                    code: 504,
-                }))
+                Err(KubernetesDriverError::Message(format!(
+                    "timed out after {}s waiting for Kubernetes API",
+                    KUBE_API_TIMEOUT.as_secs()
+                )))
             }
         }
     }
 
-    pub async fn delete(&self, name: &str) -> Result<bool, KubeError> {
+    pub async fn delete_sandbox(&self, name: &str) -> Result<bool, String> {
         info!(
             sandbox_name = %name,
-            namespace = %self.namespace,
+            namespace = %self.config.namespace,
             "Deleting sandbox from Kubernetes"
         );
 
@@ -297,7 +378,7 @@ impl SandboxClient {
                     error = %err,
                     "Failed to delete sandbox from Kubernetes"
                 );
-                Err(err)
+                Err(err.to_string())
             }
             Err(_elapsed) => {
                 warn!(
@@ -305,339 +386,199 @@ impl SandboxClient {
                     timeout_secs = KUBE_API_TIMEOUT.as_secs(),
                     "Timed out deleting sandbox from Kubernetes"
                 );
-                Err(KubeError::Api(kube::core::ErrorResponse {
-                    status: "Failure".to_string(),
-                    message: format!(
-                        "timed out after {}s waiting for Kubernetes API",
-                        KUBE_API_TIMEOUT.as_secs()
-                    ),
-                    reason: "Timeout".to_string(),
-                    code: 504,
-                }))
+                Err(format!(
+                    "timed out after {}s waiting for Kubernetes API",
+                    KUBE_API_TIMEOUT.as_secs()
+                ))
             }
         }
     }
-}
 
-impl ObjectType for Sandbox {
-    fn object_type() -> &'static str {
-        "sandbox"
+    pub async fn sandbox_exists(&self, name: &str) -> Result<bool, String> {
+        let api = self.api();
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(name)).await {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(false),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_elapsed) => Err(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )),
+        }
     }
-}
 
-impl ObjectId for Sandbox {
-    fn object_id(&self) -> &str {
-        &self.id
-    }
-}
-
-impl ObjectName for Sandbox {
-    fn object_name(&self) -> &str {
-        &self.name
-    }
-}
-
-pub fn spawn_sandbox_watcher(
-    store: Arc<Store>,
-    client: SandboxClient,
-    index: crate::sandbox_index::SandboxIndex,
-    watch_bus: crate::sandbox_watch::SandboxWatchBus,
-    tracing_log_bus: crate::tracing_bus::TracingLogBus,
-) {
-    let namespace = client.namespace().to_string();
-    info!(namespace = %namespace, "Starting sandbox watcher");
-
-    tokio::spawn(async move {
-        let api = client.api();
-        let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
-
-        loop {
-            match stream.try_next().await {
-                Ok(Some(event)) => match event {
-                    Event::Applied(obj) => {
-                        let obj_name = obj.metadata.name.clone().unwrap_or_default();
-                        debug!(sandbox_name = %obj_name, "Received Applied event from Kubernetes");
-                        if let Err(err) =
-                            handle_applied(&store, &client, &index, &watch_bus, obj).await
-                        {
-                            warn!(sandbox_name = %obj_name, error = %err, "Failed to apply sandbox update");
-                        }
-                    }
-                    Event::Deleted(obj) => {
-                        let obj_name = obj.metadata.name.clone().unwrap_or_default();
-                        debug!(sandbox_name = %obj_name, "Received Deleted event from Kubernetes");
-                        if let Err(err) =
-                            handle_deleted(&store, &index, &watch_bus, &tracing_log_bus, obj).await
-                        {
-                            warn!(sandbox_name = %obj_name, error = %err, "Failed to delete sandbox record");
-                        }
-                    }
-                    Event::Restarted(objs) => {
-                        info!(
-                            count = objs.len(),
-                            "Sandbox watcher restarted, re-syncing sandboxes"
-                        );
-                        for obj in objs {
-                            let obj_name = obj.metadata.name.clone().unwrap_or_default();
-                            if let Err(err) =
-                                handle_applied(&store, &client, &index, &watch_bus, obj).await
-                            {
-                                warn!(sandbox_name = %obj_name, error = %err, "Failed to apply sandbox update during resync");
-                            }
-                        }
-                    }
-                },
+    pub async fn resolve_sandbox_endpoint(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<ResolveSandboxEndpointResponse, KubernetesDriverError> {
+        if let Some(status) = sandbox.status.as_ref()
+            && !status.instance_id.is_empty()
+        {
+            match self.agent_pod_ip(&status.instance_id).await {
+                Ok(Some(ip)) => {
+                    return Ok(ResolveSandboxEndpointResponse {
+                        endpoint: Some(SandboxEndpoint {
+                            target: Some(sandbox_endpoint::Target::Ip(ip.to_string())),
+                            port: u32::from(self.config.ssh_port),
+                        }),
+                    });
+                }
                 Ok(None) => {
-                    warn!("Sandbox watcher stream ended unexpectedly");
-                    break;
+                    return Err(KubernetesDriverError::Precondition(
+                        "sandbox agent pod IP is not available".to_string(),
+                    ));
                 }
                 Err(err) => {
-                    warn!(error = %err, "Sandbox watcher error");
+                    return Err(KubernetesDriverError::Message(format!(
+                        "failed to resolve agent pod IP: {err}"
+                    )));
                 }
             }
         }
-    });
-}
 
-/// Interval between store-vs-k8s reconciliation sweeps.
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
-
-/// How long a sandbox can stay in `Provisioning` in the store without a
-/// corresponding Kubernetes resource before it is considered orphaned and
-/// removed.
-const ORPHAN_GRACE_PERIOD: Duration = Duration::from_secs(300);
-
-/// Periodically reconcile the store against Kubernetes to clean up orphaned
-/// sandbox records.  A record is orphaned when it exists in the store but
-/// has no corresponding Kubernetes `Sandbox` CR — typically because the
-/// k8s create timed out or the gRPC handler was cancelled.
-pub fn spawn_store_reconciler(
-    store: Arc<Store>,
-    client: SandboxClient,
-    index: crate::sandbox_index::SandboxIndex,
-    watch_bus: crate::sandbox_watch::SandboxWatchBus,
-    tracing_log_bus: crate::tracing_bus::TracingLogBus,
-) {
-    tokio::spawn(async move {
-        // Wait for initial startup to settle before running the first sweep.
-        tokio::time::sleep(RECONCILE_INTERVAL).await;
-
-        loop {
-            if let Err(e) =
-                reconcile_orphaned_sandboxes(&store, &client, &index, &watch_bus, &tracing_log_bus)
-                    .await
-            {
-                warn!(error = %e, "Store reconciliation sweep failed");
-            }
-            tokio::time::sleep(RECONCILE_INTERVAL).await;
-        }
-    });
-}
-
-/// Single reconciliation sweep: list all sandboxes in the store that are
-/// still `Provisioning`, check if they have a corresponding k8s resource,
-/// and remove any that have been orphaned beyond the grace period.
-async fn reconcile_orphaned_sandboxes(
-    store: &Store,
-    client: &SandboxClient,
-    index: &crate::sandbox_index::SandboxIndex,
-    watch_bus: &crate::sandbox_watch::SandboxWatchBus,
-    tracing_log_bus: &crate::tracing_bus::TracingLogBus,
-) -> Result<(), String> {
-    let records = store
-        .list(Sandbox::object_type(), 500, 0)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let api = client.api();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-
-    for record in records {
-        let sandbox: Sandbox = match prost::Message::decode(record.payload.as_slice()) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, "Failed to decode sandbox record during reconciliation");
-                continue;
-            }
-        };
-
-        // Only check sandboxes that are still provisioning — these are the
-        // ones at risk of being orphaned.
-        if sandbox.phase != SandboxPhase::Provisioning as i32 {
-            continue;
+        if sandbox.name.is_empty() {
+            return Err(KubernetesDriverError::Precondition(
+                "sandbox has no name".to_string(),
+            ));
         }
 
-        // Check how old this record is using the store's created_at_ms.
-        let age_ms = now_ms.saturating_sub(record.created_at_ms);
-        if age_ms < ORPHAN_GRACE_PERIOD.as_millis() as i64 {
-            continue;
-        }
+        Ok(ResolveSandboxEndpointResponse {
+            endpoint: Some(SandboxEndpoint {
+                target: Some(sandbox_endpoint::Target::Host(format!(
+                    "{}.{}.svc.cluster.local",
+                    sandbox.name, self.config.namespace
+                ))),
+                port: u32::from(self.config.ssh_port),
+            }),
+        })
+    }
 
-        // Check if a corresponding k8s resource exists.
-        match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(&sandbox.name)).await {
-            Ok(Ok(_)) => {
-                // k8s resource exists — not orphaned.
-                continue;
-            }
-            Ok(Err(KubeError::Api(err))) if err.code == 404 => {
-                // k8s resource does not exist — orphaned store entry.
-                info!(
-                    sandbox_id = %sandbox.id,
-                    sandbox_name = %sandbox.name,
-                    age_secs = age_ms / 1000,
-                    "Removing orphaned sandbox from store (no corresponding k8s resource)"
-                );
-                if let Err(e) = store.delete(Sandbox::object_type(), &sandbox.id).await {
-                    warn!(sandbox_id = %sandbox.id, error = %e, "Failed to remove orphaned sandbox");
+    pub async fn watch_sandboxes(&self) -> Result<WatchStream, String> {
+        let namespace = self.config.namespace.clone();
+        let sandbox_api = self.api();
+        let event_api: Api<KubeEventObj> = Api::namespaced(self.client.clone(), &namespace);
+        let mut sandbox_stream = watcher::watcher(sandbox_api, watcher::Config::default()).boxed();
+        let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
+        let (tx, rx) = mpsc::channel(256);
+
+        tokio::spawn(async move {
+            let mut sandbox_name_to_id = std::collections::HashMap::<String, String>::new();
+            let mut agent_pod_to_id = std::collections::HashMap::<String, String>::new();
+
+            loop {
+                tokio::select! {
+                    result = sandbox_stream.try_next() => match result {
+                        Ok(Some(Event::Applied(obj))) => {
+                            match sandbox_from_object(&namespace, obj) {
+                                Ok(sandbox) => {
+                                    update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox);
+                                    let event = WatchSandboxesEvent {
+                                        payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                                            WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
+                                        )),
+                                    };
+                                    if tx.send(Ok(event)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(err) => {
+                                    if tx.send(Err(KubernetesDriverError::Message(err))).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Some(Event::Deleted(obj))) => {
+                            match sandbox_id_from_object(&obj) {
+                                Ok(sandbox_id) => {
+                                    remove_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox_id);
+                                    let event = WatchSandboxesEvent {
+                                        payload: Some(watch_sandboxes_event::Payload::Deleted(
+                                            WatchSandboxesDeletedEvent { sandbox_id }
+                                        )),
+                                    };
+                                    if tx.send(Ok(event)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(err) => {
+                                    if tx.send(Err(KubernetesDriverError::Message(err))).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Some(Event::Restarted(objs))) => {
+                            for obj in objs {
+                                match sandbox_from_object(&namespace, obj) {
+                                    Ok(sandbox) => {
+                                        update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox);
+                                        let event = WatchSandboxesEvent {
+                                            payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                                                WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
+                                            )),
+                                        };
+                                        if tx.send(Ok(event)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        if tx.send(Err(KubernetesDriverError::Message(err))).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = tx.send(Err(KubernetesDriverError::Message(
+                                "sandbox watcher stream ended unexpectedly".to_string()
+                            ))).await;
+                            break;
+                        }
+                        Err(err) => {
+                            let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
+                            break;
+                        }
+                    },
+                    result = event_stream.try_next() => match result {
+                        Ok(Some(Event::Applied(obj))) => {
+                            if let Some((sandbox_id, event)) = map_kube_event_to_platform(
+                                &sandbox_name_to_id,
+                                &agent_pod_to_id,
+                                &obj,
+                            ) {
+                                let event = WatchSandboxesEvent {
+                                    payload: Some(watch_sandboxes_event::Payload::PlatformEvent(
+                                        WatchSandboxesPlatformEvent { sandbox_id, event: Some(event) }
+                                    )),
+                                };
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Some(Event::Deleted(_))) => {}
+                        Ok(Some(Event::Restarted(_))) => {
+                            debug!(namespace = %namespace, "Kubernetes event watcher restarted");
+                        }
+                        Ok(None) => {
+                            let _ = tx.send(Err(KubernetesDriverError::Message(
+                                "kubernetes event watcher stream ended".to_string()
+                            ))).await;
+                            break;
+                        }
+                        Err(err) => {
+                            let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
+                            break;
+                        }
+                    }
                 }
-                index.remove_sandbox(&sandbox.id);
-                watch_bus.notify(&sandbox.id);
-                tracing_log_bus.remove(&sandbox.id);
-                tracing_log_bus.platform_event_bus.remove(&sandbox.id);
-                watch_bus.remove(&sandbox.id);
             }
-            Ok(Err(err)) => {
-                // k8s API error — skip this record and try again next cycle.
-                debug!(
-                    sandbox_id = %sandbox.id,
-                    error = %err,
-                    "Skipping orphan check due to k8s API error"
-                );
-            }
-            Err(_elapsed) => {
-                debug!(
-                    sandbox_id = %sandbox.id,
-                    "Skipping orphan check due to k8s API timeout"
-                );
-            }
-        }
+        });
+
+        Ok(Box::pin(ReceiverStream::new(rx)))
     }
-
-    Ok(())
-}
-
-async fn handle_applied(
-    store: &Store,
-    client: &SandboxClient,
-    index: &crate::sandbox_index::SandboxIndex,
-    watch_bus: &crate::sandbox_watch::SandboxWatchBus,
-    obj: DynamicObject,
-) -> Result<(), String> {
-    let id = sandbox_id_from_object(&obj)?;
-    let name = obj.metadata.name.clone().unwrap_or_default();
-    let namespace = obj
-        .metadata
-        .namespace
-        .clone()
-        .unwrap_or_else(|| client.namespace().to_string());
-    let deletion_timestamp = obj.metadata.deletion_timestamp.is_some();
-
-    let existing = store
-        .get_message::<Sandbox>(&id)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let mut status = status_from_object(&obj);
-    rewrite_user_facing_conditions(
-        &mut status,
-        existing.as_ref().and_then(|sandbox| sandbox.spec.as_ref()),
-    );
-    let phase = derive_phase(&status, deletion_timestamp);
-
-    // If the record doesn't exist yet, the `create_sandbox` handler may
-    // still be in-flight (it creates the k8s resource first, then writes
-    // to the store).  Build a minimal placeholder but never overwrite an
-    // existing record's `spec` — only the `create_sandbox` handler sets it.
-    let mut sandbox = existing.unwrap_or_else(|| Sandbox {
-        id: id.clone(),
-        name: name.clone(),
-        namespace,
-        spec: None,
-        status: None,
-        phase: SandboxPhase::Unknown as i32,
-        ..Default::default()
-    });
-
-    // Log phase transitions
-    let old_phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
-    if old_phase != phase {
-        info!(
-            sandbox_id = %id,
-            sandbox_name = %name,
-            old_phase = ?old_phase,
-            new_phase = ?phase,
-            "Sandbox phase changed"
-        );
-    }
-
-    // Log error conditions with details
-    if phase == SandboxPhase::Error
-        && let Some(ref status) = status
-    {
-        for condition in &status.conditions {
-            if condition.r#type == "Ready"
-                && condition.status.eq_ignore_ascii_case("false")
-                && is_terminal_failure_condition(condition)
-            {
-                warn!(
-                    sandbox_id = %id,
-                    sandbox_name = %name,
-                    reason = %condition.reason,
-                    message = %condition.message,
-                    "Sandbox failed to become ready"
-                );
-            }
-        }
-    }
-
-    // Log when sandbox becomes ready
-    if phase == SandboxPhase::Ready && old_phase != SandboxPhase::Ready {
-        info!(
-            sandbox_id = %id,
-            sandbox_name = %name,
-            "Sandbox is now ready"
-        );
-    }
-
-    sandbox.status = status;
-    sandbox.phase = phase as i32;
-
-    index.update_from_sandbox(&sandbox);
-
-    store
-        .put_message(&sandbox)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    watch_bus.notify(&id);
-    Ok(())
-}
-
-async fn handle_deleted(
-    store: &Store,
-    index: &crate::sandbox_index::SandboxIndex,
-    watch_bus: &crate::sandbox_watch::SandboxWatchBus,
-    tracing_log_bus: &crate::tracing_bus::TracingLogBus,
-    obj: DynamicObject,
-) -> Result<(), String> {
-    let id = sandbox_id_from_object(&obj)?;
-    let deleted = store
-        .delete(Sandbox::object_type(), &id)
-        .await
-        .map_err(|e| e.to_string())?;
-    debug!(sandbox_id = %id, deleted, "Deleted sandbox record");
-    index.remove_sandbox(&id);
-    watch_bus.notify(&id);
-
-    // Clean up bus entries to prevent unbounded memory growth.
-    tracing_log_bus.remove(&id);
-    tracing_log_bus.platform_event_bus.remove(&id);
-    watch_bus.remove(&id);
-
-    Ok(())
 }
 
 fn sandbox_labels(sandbox: &Sandbox) -> BTreeMap<String, String> {
@@ -663,6 +604,97 @@ fn sandbox_id_from_object(obj: &DynamicObject) -> Result<String, String> {
     }
 
     Err("sandbox id not found on object".to_string())
+}
+
+fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<Sandbox, String> {
+    let id = sandbox_id_from_object(&obj)?;
+    let name = obj.metadata.name.clone().unwrap_or_default();
+    let namespace = obj
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| namespace.to_string());
+    let status = status_from_object(&obj);
+
+    Ok(Sandbox {
+        id,
+        name,
+        namespace,
+        spec: None,
+        status,
+        ..Default::default()
+    })
+}
+
+fn update_indexes(
+    sandbox_name_to_id: &mut std::collections::HashMap<String, String>,
+    agent_pod_to_id: &mut std::collections::HashMap<String, String>,
+    sandbox: &Sandbox,
+) {
+    if !sandbox.name.is_empty() {
+        sandbox_name_to_id.insert(sandbox.name.clone(), sandbox.id.clone());
+    }
+    if let Some(status) = sandbox.status.as_ref()
+        && !status.instance_id.is_empty()
+    {
+        agent_pod_to_id.insert(status.instance_id.clone(), sandbox.id.clone());
+    }
+}
+
+fn remove_indexes(
+    sandbox_name_to_id: &mut std::collections::HashMap<String, String>,
+    agent_pod_to_id: &mut std::collections::HashMap<String, String>,
+    sandbox_id: &str,
+) {
+    sandbox_name_to_id.retain(|_, value| value != sandbox_id);
+    agent_pod_to_id.retain(|_, value| value != sandbox_id);
+}
+
+fn map_kube_event_to_platform(
+    sandbox_name_to_id: &std::collections::HashMap<String, String>,
+    agent_pod_to_id: &std::collections::HashMap<String, String>,
+    obj: &KubeEventObj,
+) -> Option<(String, PlatformEvent)> {
+    let involved = obj.involved_object.clone();
+    let involved_kind = involved.kind.unwrap_or_default();
+    let involved_name = involved.name.unwrap_or_default();
+
+    let sandbox_id = match involved_kind.as_str() {
+        "Sandbox" => sandbox_name_to_id.get(&involved_name).cloned()?,
+        "Pod" => sandbox_name_to_id
+            .get(&involved_name)
+            .cloned()
+            .or_else(|| agent_pod_to_id.get(&involved_name).cloned())?,
+        _ => return None,
+    };
+
+    let ts = obj
+        .last_timestamp
+        .as_ref()
+        .or(obj.first_timestamp.as_ref())
+        .map_or(0, |t| t.0.timestamp_millis());
+
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("involved_kind".to_string(), involved_kind);
+    metadata.insert("involved_name".to_string(), involved_name);
+    if let Some(ns) = &obj.involved_object.namespace {
+        metadata.insert("namespace".to_string(), ns.clone());
+    }
+    if let Some(count) = obj.count {
+        metadata.insert("count".to_string(), count.to_string());
+    }
+
+    Some((
+        sandbox_id,
+        PlatformEvent {
+            timestamp_ms: ts,
+            source: "kubernetes".to_string(),
+            r#type: obj.type_.clone().unwrap_or_default(),
+            reason: obj.reason.clone().unwrap_or_default(),
+            message: obj.message.clone().unwrap_or_default(),
+            metadata,
+        },
+    ))
 }
 
 /// Path where the supervisor binary is mounted inside the agent container.
@@ -908,7 +940,7 @@ fn sandbox_to_k8s_spec(
     // transforms are applied inside sandbox_template_to_k8s.
     let user_has_vct = spec
         .and_then(|s| s.template.as_ref())
-        .and_then(|t| struct_to_json(&t.volume_claim_templates))
+        .and_then(|t| platform_config_struct(t, "volume_claim_templates"))
         .is_some();
     let inject_workspace = !user_has_vct;
 
@@ -942,13 +974,15 @@ fn sandbox_to_k8s_spec(
                     inject_workspace,
                 ),
             );
-            if !template.agent_socket.is_empty() {
+            if !template.agent_socket_path.is_empty() {
                 root.insert(
                     "agentSocket".to_string(),
-                    serde_json::json!(template.agent_socket),
+                    serde_json::json!(template.agent_socket_path),
                 );
             }
-            if let Some(volume_templates) = struct_to_json(&template.volume_claim_templates) {
+            if let Some(volume_templates) =
+                platform_config_struct(template, "volume_claim_templates")
+            {
                 root.insert("volumeClaimTemplates".to_string(), volume_templates);
             }
         }
@@ -1017,18 +1051,15 @@ fn sandbox_template_to_k8s(
     if !template.labels.is_empty() {
         metadata.insert("labels".to_string(), serde_json::json!(template.labels));
     }
-    if !template.annotations.is_empty() {
-        metadata.insert(
-            "annotations".to_string(),
-            serde_json::json!(template.annotations),
-        );
+    if let Some(annotations) = platform_config_struct(template, "annotations") {
+        metadata.insert("annotations".to_string(), annotations);
     }
 
     let mut spec = serde_json::Map::new();
-    if !template.runtime_class_name.is_empty() {
+    if let Some(runtime_class) = platform_config_string(template, "runtime_class_name") {
         spec.insert(
             "runtimeClassName".to_string(),
-            serde_json::json!(template.runtime_class_name),
+            serde_json::json!(runtime_class),
         );
     }
 
@@ -1146,8 +1177,27 @@ fn sandbox_template_to_k8s(
 }
 
 fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_json::Value> {
+    // Start from the raw resources passthrough in platform_config (preserves
+    // custom resource types like GPU limits that users set via the public API
+    // Struct), then overlay the typed DriverResourceRequirements on top.
     let mut resources =
-        struct_to_json(&template.resources).unwrap_or_else(|| serde_json::json!({}));
+        platform_config_struct(template, "resources_raw").unwrap_or_else(|| serde_json::json!({}));
+
+    // Overlay typed CPU/memory from DriverResourceRequirements.
+    if let Some(ref req) = template.resources {
+        let obj = resources.as_object_mut().unwrap();
+        let mut apply = |section: &str, key: &str, value: &str| {
+            if !value.is_empty() {
+                let sec = obj.entry(section).or_insert_with(|| serde_json::json!({}));
+                sec[key] = serde_json::json!(value);
+            }
+        };
+        apply("requests", "cpu", &req.cpu_request);
+        apply("requests", "memory", &req.memory_request);
+        apply("limits", "cpu", &req.cpu_limit);
+        apply("limits", "memory", &req.memory_limit);
+    }
+
     if gpu {
         apply_gpu_limit(&mut resources);
     }
@@ -1271,13 +1321,29 @@ fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
     env.push(serde_json::json!({"name": name, "value": value}));
 }
 
-fn struct_to_json(input: &Option<prost_types::Struct>) -> Option<serde_json::Value> {
-    let input = input.as_ref()?;
-    let mut map = serde_json::Map::new();
-    for (key, value) in &input.fields {
-        map.insert(key.clone(), proto_value_to_json(value));
+/// Extract a string value from the template's `platform_config` Struct.
+fn platform_config_string(template: &SandboxTemplate, key: &str) -> Option<String> {
+    let config = template.platform_config.as_ref()?;
+    let value = config.fields.get(key)?;
+    match value.kind.as_ref() {
+        Some(prost_types::value::Kind::StringValue(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
     }
-    Some(serde_json::Value::Object(map))
+}
+
+/// Extract a nested Struct value from the template's `platform_config`,
+/// converting it to `serde_json::Value`.
+fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde_json::Value> {
+    let config = template.platform_config.as_ref()?;
+    let value = config.fields.get(key)?;
+    let json = proto_value_to_json(value);
+    // Return None for null/empty objects so callers can distinguish
+    // "field absent" from "field present but empty".
+    match &json {
+        serde_json::Value::Null => None,
+        serde_json::Value::Object(m) if m.is_empty() => None,
+        _ => Some(json),
+    }
 }
 
 fn proto_value_to_json(value: &prost_types::Value) -> serde_json::Value {
@@ -1322,7 +1388,7 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
             .and_then(|val| val.as_str())
             .unwrap_or_default()
             .to_string(),
-        agent_pod: status_obj
+        instance_id: status_obj
             .get("agentPod")
             .and_then(|val| val.as_str())
             .unwrap_or_default()
@@ -1338,6 +1404,7 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
             .unwrap_or_default()
             .to_string(),
         conditions,
+        deleting: obj.metadata.deletion_timestamp.is_some(),
     })
 }
 
@@ -1364,263 +1431,10 @@ fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
     })
 }
 
-fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Option<&SandboxSpec>) {
-    let gpu_requested = spec.is_some_and(|sandbox_spec| sandbox_spec.gpu);
-    if !gpu_requested {
-        return;
-    }
-
-    if let Some(status) = status {
-        for condition in &mut status.conditions {
-            if condition.r#type == "Ready"
-                && condition.status.eq_ignore_ascii_case("false")
-                && condition.reason.eq_ignore_ascii_case("Unschedulable")
-            {
-                condition.message = "GPU sandbox could not be scheduled on the active gateway. Another GPU sandbox may already be using the available GPU, or the gateway may not currently be able to satisfy GPU placement. Please refer to documentation and use `openshell doctor` commands to inspect GPU support and gateway configuration.".to_string();
-            }
-        }
-    }
-}
-
-fn derive_phase(status: &Option<SandboxStatus>, deleting: bool) -> SandboxPhase {
-    if deleting {
-        return SandboxPhase::Deleting;
-    }
-
-    if let Some(status) = status {
-        for condition in &status.conditions {
-            if condition.r#type == "Ready" {
-                return if condition.status.eq_ignore_ascii_case("true") {
-                    SandboxPhase::Ready
-                } else if condition.status.eq_ignore_ascii_case("false") {
-                    if is_terminal_failure_condition(condition) {
-                        SandboxPhase::Error
-                    } else {
-                        SandboxPhase::Provisioning
-                    }
-                } else {
-                    SandboxPhase::Provisioning
-                };
-            }
-        }
-        return SandboxPhase::Provisioning;
-    }
-
-    SandboxPhase::Unknown
-}
-
-fn is_terminal_failure_condition(condition: &SandboxCondition) -> bool {
-    let reason = condition.reason.to_ascii_lowercase();
-
-    // These are transient conditions from the sandbox controller that indicate
-    // the sandbox is still being provisioned and may become ready:
-    //
-    // - ReconcilerError: Controller-level transient error, will be retried
-    // - DependenciesNotReady: Pod/Service not ready yet, normal during provisioning
-    //
-    // Any other Ready=False condition is considered terminal (e.g., the controller
-    // determined a permanent failure like ImagePullBackOff, Unschedulable, etc.)
-    let transient_reasons = ["reconcilererror", "dependenciesnotready"];
-
-    !transient_reasons.contains(&reason.as_str())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use prost_types::{Struct, Value, value::Kind};
-
-    fn make_condition(reason: &str, message: &str) -> SandboxCondition {
-        SandboxCondition {
-            r#type: "Ready".to_string(),
-            status: "False".to_string(),
-            reason: reason.to_string(),
-            message: message.to_string(),
-            last_transition_time: String::new(),
-        }
-    }
-
-    #[test]
-    fn terminal_failure_treats_unknown_reasons_as_terminal() {
-        // Any Ready=False condition with an unknown reason is terminal.
-        // We trust the sandbox controller's assessment.
-        let terminal_cases = [
-            ("Failed", "Something went wrong"),
-            ("CrashLoopBackOff", "Container keeps crashing"),
-            ("ImagePullBackOff", "Failed to pull image"),
-            ("ErrImagePull", "Error pulling image"),
-            ("Unschedulable", "No nodes match"),
-            ("SomeOtherReason", "Any other reason is terminal"),
-        ];
-
-        for (reason, message) in terminal_cases {
-            let condition = make_condition(reason, message);
-            assert!(
-                is_terminal_failure_condition(&condition),
-                "Expected terminal failure for reason={reason}, message={message}"
-            );
-        }
-    }
-
-    #[test]
-    fn terminal_failure_ignores_transient_reasons() {
-        // These reasons are transient - the sandbox may still become ready:
-        // - ReconcilerError: controller will retry
-        // - DependenciesNotReady: pod/service still being created
-        let transient_cases = [
-            (
-                "ReconcilerError",
-                "Error seen: failed to update pod: Operation cannot be fulfilled",
-            ),
-            ("reconcilererror", "lowercase also works"),
-            ("RECONCILERERROR", "uppercase also works"),
-            (
-                "DependenciesNotReady",
-                "Pod exists with phase: Pending; Service Exists",
-            ),
-            ("dependenciesnotready", "lowercase also works"),
-        ];
-
-        for (reason, message) in transient_cases {
-            let condition = make_condition(reason, message);
-            assert!(
-                !is_terminal_failure_condition(&condition),
-                "Expected transient (non-terminal) for reason={reason}, message={message}"
-            );
-        }
-    }
-
-    #[test]
-    fn derive_phase_returns_provisioning_for_transient_conditions() {
-        // Transient conditions (ReconcilerError, DependenciesNotReady) should
-        // result in Provisioning phase, not Error.
-        let transient_conditions = [
-            ("ReconcilerError", "Error seen: failed to update pod"),
-            (
-                "DependenciesNotReady",
-                "Pod exists with phase: Pending; Service Exists",
-            ),
-        ];
-
-        for (reason, message) in transient_conditions {
-            let status = Some(SandboxStatus {
-                sandbox_name: "test".to_string(),
-                agent_pod: "test-pod".to_string(),
-                agent_fd: String::new(),
-                sandbox_fd: String::new(),
-                conditions: vec![SandboxCondition {
-                    r#type: "Ready".to_string(),
-                    status: "False".to_string(),
-                    reason: reason.to_string(),
-                    message: message.to_string(),
-                    last_transition_time: String::new(),
-                }],
-            });
-
-            assert_eq!(
-                derive_phase(&status, false),
-                SandboxPhase::Provisioning,
-                "Expected Provisioning for transient reason={reason}"
-            );
-        }
-    }
-
-    #[test]
-    fn derive_phase_returns_error_for_terminal_ready_false() {
-        let status = Some(SandboxStatus {
-            sandbox_name: "test".to_string(),
-            agent_pod: "test-pod".to_string(),
-            agent_fd: String::new(),
-            sandbox_fd: String::new(),
-            conditions: vec![SandboxCondition {
-                r#type: "Ready".to_string(),
-                status: "False".to_string(),
-                reason: "ImagePullBackOff".to_string(),
-                message: "Failed to pull image".to_string(),
-                last_transition_time: String::new(),
-            }],
-        });
-
-        assert_eq!(derive_phase(&status, false), SandboxPhase::Error);
-    }
-
-    #[test]
-    fn rewrite_user_facing_conditions_rewrites_gpu_unschedulable_message() {
-        let mut status = Some(SandboxStatus {
-            sandbox_name: "test".to_string(),
-            agent_pod: "test-pod".to_string(),
-            agent_fd: String::new(),
-            sandbox_fd: String::new(),
-            conditions: vec![SandboxCondition {
-                r#type: "Ready".to_string(),
-                status: "False".to_string(),
-                reason: "Unschedulable".to_string(),
-                message: "0/1 nodes are available: 1 Insufficient nvidia.com/gpu.".to_string(),
-                last_transition_time: String::new(),
-            }],
-        });
-
-        rewrite_user_facing_conditions(
-            &mut status,
-            Some(&SandboxSpec {
-                gpu: true,
-                ..Default::default()
-            }),
-        );
-
-        let message = &status.unwrap().conditions[0].message;
-        assert_eq!(
-            message,
-            "GPU sandbox could not be scheduled on the active gateway. Another GPU sandbox may already be using the available GPU, or the gateway may not currently be able to satisfy GPU placement. Please refer to documentation and use `openshell doctor` commands to inspect GPU support and gateway configuration."
-        );
-    }
-
-    #[test]
-    fn rewrite_user_facing_conditions_leaves_non_gpu_unschedulable_message_unchanged() {
-        let original = "0/1 nodes are available: 1 Insufficient cpu.";
-        let mut status = Some(SandboxStatus {
-            sandbox_name: "test".to_string(),
-            agent_pod: "test-pod".to_string(),
-            agent_fd: String::new(),
-            sandbox_fd: String::new(),
-            conditions: vec![SandboxCondition {
-                r#type: "Ready".to_string(),
-                status: "False".to_string(),
-                reason: "Unschedulable".to_string(),
-                message: original.to_string(),
-                last_transition_time: String::new(),
-            }],
-        });
-
-        rewrite_user_facing_conditions(
-            &mut status,
-            Some(&SandboxSpec {
-                gpu: false,
-                ..Default::default()
-            }),
-        );
-
-        assert_eq!(status.unwrap().conditions[0].message, original);
-    }
-
-    #[test]
-    fn derive_phase_returns_ready_for_ready_true() {
-        let status = Some(SandboxStatus {
-            sandbox_name: "test".to_string(),
-            agent_pod: "test-pod".to_string(),
-            agent_fd: String::new(),
-            sandbox_fd: String::new(),
-            conditions: vec![SandboxCondition {
-                r#type: "Ready".to_string(),
-                status: "True".to_string(),
-                reason: "DependenciesReady".to_string(),
-                message: "Pod is Ready; Service Exists".to_string(),
-                last_transition_time: String::new(),
-            }],
-        });
-
-        assert_eq!(derive_phase(&status, false), SandboxPhase::Ready);
-    }
 
     #[test]
     fn apply_required_env_always_injects_ssh_handshake_secret() {
@@ -1792,12 +1606,6 @@ mod tests {
         );
     }
 
-    fn string_value(value: &str) -> Value {
-        Value {
-            kind: Some(Kind::StringValue(value.to_string())),
-        }
-    }
-
     #[test]
     fn gpu_sandbox_adds_runtime_class_and_gpu_limit() {
         let pod_template = sandbox_template_to_k8s(
@@ -1830,7 +1638,16 @@ mod tests {
     #[test]
     fn gpu_sandbox_uses_template_runtime_class_name_when_set() {
         let template = SandboxTemplate {
-            runtime_class_name: "kata-containers".to_string(),
+            platform_config: Some(Struct {
+                fields: [(
+                    "runtime_class_name".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("kata-containers".to_string())),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
             ..SandboxTemplate::default()
         };
 
@@ -1860,7 +1677,16 @@ mod tests {
     #[test]
     fn non_gpu_sandbox_uses_template_runtime_class_name_when_set() {
         let template = SandboxTemplate {
-            runtime_class_name: "kata-containers".to_string(),
+            platform_config: Some(Struct {
+                fields: [(
+                    "runtime_class_name".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("kata-containers".to_string())),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
             ..SandboxTemplate::default()
         };
 
@@ -1889,20 +1715,11 @@ mod tests {
 
     #[test]
     fn gpu_sandbox_preserves_existing_resource_limits() {
+        use openshell_core::proto::compute::v1::DriverResourceRequirements;
         let template = SandboxTemplate {
-            resources: Some(Struct {
-                fields: [(
-                    "limits".to_string(),
-                    Value {
-                        kind: Some(Kind::StructValue(Struct {
-                            fields: [("cpu".to_string(), string_value("2"))]
-                                .into_iter()
-                                .collect(),
-                        })),
-                    },
-                )]
-                .into_iter()
-                .collect(),
+            resources: Some(DriverResourceRequirements {
+                cpu_limit: "2".to_string(),
+                ..Default::default()
             }),
             ..SandboxTemplate::default()
         };

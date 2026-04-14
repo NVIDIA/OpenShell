@@ -249,6 +249,15 @@ async fn edge_tunnel_addr(server: &str, token: &str) -> Result<SocketAddr> {
 }
 
 pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
+    if server.starts_with("http://") {
+        let endpoint = Endpoint::from_shared(server.to_string())
+            .into_diagnostic()?
+            .connect_timeout(Duration::from_secs(10))
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .keep_alive_while_idle(true);
+        return endpoint.connect().await.into_diagnostic();
+    }
+
     // When edge bearer auth is active and the server is HTTPS,
     // route traffic through a local WebSocket tunnel proxy instead.
     if tls.is_bearer_auth() && server.starts_with("https://") {

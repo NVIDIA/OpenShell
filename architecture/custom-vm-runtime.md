@@ -122,11 +122,10 @@ graph LR
 
     subgraph Linux["Linux CI (build-libkrun.sh)"]
         BUILD_L["Build kernel + libkrunfw.so + libkrun.so"]
-        KERNELC["kernel.c\nKernel as C byte array"]
     end
 
     subgraph macOS["macOS CI (build-libkrun-macos.sh)"]
-        BUILD_M["Compile kernel.c -> libkrunfw.dylib\nBuild libkrun.dylib"]
+        BUILD_M["Build libkrunfw.dylib + libkrun.dylib"]
     end
 
     subgraph Output["target/libkrun-build/"]
@@ -136,8 +135,7 @@ graph LR
 
     KCONF --> BUILD_L
     BUILD_L --> LIB_SO
-    BUILD_L --> KERNELC
-    KERNELC --> BUILD_M
+    KCONF --> BUILD_M
     BUILD_M --> LIB_DY
 ```
 
@@ -228,18 +226,15 @@ supported platforms. Runs on-demand or when the kernel config / pinned versions 
 
 | Platform | Runner | Build Method |
 |----------|--------|-------------|
-| Linux ARM64 | `build-arm64` (self-hosted) | Native `build-libkrun.sh` (also exports kernel.c) |
+| Linux ARM64 | `build-arm64` (self-hosted) | Native `build-libkrun.sh` |
 | Linux x86_64 | `build-amd64` (self-hosted) | Native `build-libkrun.sh` |
-| macOS ARM64 | `macos-latest-xlarge` (GitHub-hosted) | `build-libkrun-macos.sh --kernel-dir` (uses pre-built kernel.c from ARM64) |
+| macOS ARM64 | `macos-latest-xlarge` (GitHub-hosted) | `build-libkrun-macos.sh` |
 
 Artifacts: `vm-runtime-{platform}.tar.zst` containing libkrun, libkrunfw, gvproxy, and
 provenance metadata.
 
-The aarch64 Linux kernel is compiled once on the Linux ARM64 runner. The resulting
-`kernel.c` (a C source file containing the kernel as a byte array) is passed to the
-macOS job, which compiles it into `libkrunfw.dylib` with Apple's `cc`. This eliminates
-the need for krunvm/Fedora VM and cuts macOS CI from ~45 min to ~5 min. The kernel
-inside libkrunfw is always Linux regardless of host platform.
+Each platform builds its own libkrunfw and libkrun natively. The kernel inside
+libkrunfw is always Linux regardless of host platform.
 
 ### VM Binary (`release-vm-dev.yml`)
 

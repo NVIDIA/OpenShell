@@ -5,6 +5,7 @@
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
+use openshell_core::ComputeDriverKind;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::info;
@@ -41,6 +42,21 @@ struct Args {
     /// Database URL for persistence.
     #[arg(long, env = "OPENSHELL_DB_URL", required = true)]
     db_url: String,
+
+    /// Compute drivers configured for this gateway.
+    ///
+    /// Accepts a comma-delimited list such as `kubernetes` or
+    /// `kubernetes,podman`. The configuration format is future-proofed for
+    /// multiple drivers, but the gateway currently requires exactly one.
+    #[arg(
+        long,
+        alias = "driver",
+        env = "OPENSHELL_DRIVERS",
+        value_delimiter = ',',
+        default_value = "kubernetes",
+        value_parser = parse_compute_driver
+    )]
+    drivers: Vec<ComputeDriverKind>,
 
     /// Kubernetes namespace for sandboxes.
     #[arg(long, env = "OPENSHELL_SANDBOX_NAMESPACE", default_value = "default")]
@@ -157,6 +173,7 @@ async fn main() -> Result<()> {
 
     config = config
         .with_database_url(args.db_url)
+        .with_compute_drivers(args.drivers)
         .with_sandbox_namespace(args.sandbox_namespace)
         .with_ssh_gateway_host(args.ssh_gateway_host)
         .with_ssh_gateway_port(args.ssh_gateway_port)
@@ -197,4 +214,8 @@ async fn main() -> Result<()> {
     info!(bind = %config.bind_address, "Starting OpenShell server");
 
     run_server(config, tracing_log_bus).await.into_diagnostic()
+}
+
+fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, String> {
+    value.parse()
 }
