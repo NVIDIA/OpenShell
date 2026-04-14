@@ -1099,8 +1099,8 @@ pub(crate) fn bundle_to_resolved_routes(
         .routes
         .iter()
         .map(|r| {
-            let (auth, default_headers) =
-                openshell_core::inference::auth_for_provider_type(&r.provider_type);
+            let (auth, default_headers, passthrough_headers) =
+                openshell_core::inference::route_headers_for_provider_type(&r.provider_type);
             let timeout = if r.timeout_secs == 0 {
                 openshell_router::config::DEFAULT_ROUTE_TIMEOUT
             } else {
@@ -1114,6 +1114,7 @@ pub(crate) fn bundle_to_resolved_routes(
                 protocols: r.protocols.clone(),
                 auth,
                 default_headers,
+                passthrough_headers,
                 timeout,
             }
         })
@@ -2272,6 +2273,7 @@ mod tests {
                 protocols: vec!["openai_chat_completions".to_string()],
                 auth: openshell_core::inference::AuthHeader::Bearer,
                 default_headers: vec![],
+                passthrough_headers: vec![],
                 timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
             },
             openshell_router::config::ResolvedRoute {
@@ -2282,6 +2284,7 @@ mod tests {
                 protocols: vec!["anthropic_messages".to_string()],
                 auth: openshell_core::inference::AuthHeader::Custom("x-api-key"),
                 default_headers: vec![],
+                passthrough_headers: vec![],
                 timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
             },
         ];
@@ -2571,6 +2574,7 @@ filesystem_policy:
             auth: openshell_core::inference::AuthHeader::Bearer,
             protocols: vec!["openai_chat_completions".to_string()],
             default_headers: vec![],
+            passthrough_headers: vec![],
             timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         }];
 

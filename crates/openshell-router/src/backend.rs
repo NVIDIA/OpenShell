@@ -4,6 +4,7 @@
 use crate::RouterError;
 use crate::config::{AuthHeader, ResolvedRoute};
 use crate::mock;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedEndpoint {
@@ -62,6 +63,9 @@ enum StreamingBody {
     Buffered(Option<bytes::Bytes>),
 }
 
+const COMMON_INFERENCE_REQUEST_HEADERS: [&str; 4] =
+    ["content-type", "accept", "accept-encoding", "user-agent"];
+
 impl StreamingProxyResponse {
     /// Create from a fully-buffered [`ProxyResponse`] (for mock routes).
     pub fn from_buffered(resp: ProxyResponse) -> Self {
@@ -83,7 +87,64 @@ impl StreamingProxyResponse {
     }
 }
 
-/// Build an HTTP request to the backend configured in `route`.
+fn sanitize_request_headers(
+    route: &ResolvedRoute,
+    headers: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut allowed = HashSet::new();
+    allowed.extend(
+        COMMON_INFERENCE_REQUEST_HEADERS
+            .iter()
+            .map(|name| (*name).to_string()),
+    );
+    allowed.extend(
+        route
+            .passthrough_headers
+            .iter()
+            .map(|name| name.to_ascii_lowercase()),
+    );
+    allowed.extend(
+        route
+            .default_headers
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase()),
+    );
+
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name_lc = name.to_ascii_lowercase();
+            if should_strip_request_header(&name_lc) || !allowed.contains(&name_lc) {
+                return None;
+            }
+            Some((name.clone(), value.clone()))
+        })
+        .collect()
+}
+
+fn should_strip_request_header(name: &str) -> bool {
+    matches!(
+        name,
+        "authorization" | "x-api-key" | "host" | "content-length"
+    ) || is_hop_by_hop_header(name)
+}
+
+fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+/// Build and send an HTTP request to the backend configured in `route`.
 ///
 /// Returns the prepared [`reqwest::RequestBuilder`] with auth, headers, model
 /// rewrite, and body applied. The caller decides whether to apply a total
@@ -97,6 +158,7 @@ fn prepare_backend_request(
     body: bytes::Bytes,
 ) -> Result<(reqwest::RequestBuilder, String), RouterError> {
     let url = build_backend_url(&route.endpoint, path);
+    let headers = sanitize_request_headers(route, &headers);
 
     let reqwest_method: reqwest::Method = method
         .parse()
@@ -113,17 +175,7 @@ fn prepare_backend_request(
             builder = builder.header(*header_name, &route.api_key);
         }
     }
-
-    // Strip auth and host headers — auth is re-injected above from the route
-    // config, and host must match the upstream.
-    let strip_headers: [&str; 3] = ["authorization", "x-api-key", "host"];
-
-    // Forward non-sensitive headers.
-    for (name, value) in headers {
-        let name_lc = name.to_ascii_lowercase();
-        if strip_headers.contains(&name_lc.as_str()) {
-            continue;
-        }
+    for (name, value) in &headers {
         builder = builder.header(name.as_str(), value.as_str());
     }
 
@@ -510,8 +562,93 @@ mod tests {
             protocols: protocols.iter().map(|p| (*p).to_string()).collect(),
             auth,
             default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+            passthrough_headers: vec![
+                "anthropic-version".to_string(),
+                "anthropic-beta".to_string(),
+            ],
             timeout: crate::config::DEFAULT_ROUTE_TIMEOUT,
         }
+    }
+
+    #[test]
+    fn sanitize_request_headers_drops_unknown_sensitive_headers() {
+        let route = ResolvedRoute {
+            name: "inference.local".to_string(),
+            endpoint: "https://api.example.com/v1".to_string(),
+            model: "test-model".to_string(),
+            api_key: "sk-test".to_string(),
+            protocols: vec!["openai_chat_completions".to_string()],
+            auth: AuthHeader::Bearer,
+            default_headers: Vec::new(),
+            passthrough_headers: vec!["openai-organization".to_string()],
+            timeout: crate::config::DEFAULT_ROUTE_TIMEOUT,
+        };
+
+        let kept = super::sanitize_request_headers(
+            &route,
+            &[
+                ("content-type".to_string(), "application/json".to_string()),
+                ("authorization".to_string(), "Bearer client".to_string()),
+                ("cookie".to_string(), "session=1".to_string()),
+                ("x-amz-security-token".to_string(), "token".to_string()),
+                ("openai-organization".to_string(), "org_123".to_string()),
+            ],
+        );
+
+        assert!(
+            kept.iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        );
+        assert!(
+            kept.iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("openai-organization"))
+        );
+        assert!(
+            kept.iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
+        );
+        assert!(
+            kept.iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("cookie"))
+        );
+        assert!(
+            kept.iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("x-amz-security-token"))
+        );
+    }
+
+    #[test]
+    fn sanitize_request_headers_preserves_allowed_provider_headers() {
+        let route = test_route(
+            "https://api.anthropic.com/v1",
+            &["anthropic_messages"],
+            AuthHeader::Custom("x-api-key"),
+        );
+
+        let kept = super::sanitize_request_headers(
+            &route,
+            &[
+                ("anthropic-version".to_string(), "2024-10-22".to_string()),
+                (
+                    "anthropic-beta".to_string(),
+                    "tool-use-2024-10-22".to_string(),
+                ),
+                ("x-api-key".to_string(), "client-key".to_string()),
+            ],
+        );
+
+        assert!(kept.iter().any(
+            |(name, value)| name.eq_ignore_ascii_case("anthropic-version") && value == "2024-10-22"
+        ));
+        assert!(
+            kept.iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("anthropic-beta")
+                    && value == "tool-use-2024-10-22")
+        );
+        assert!(
+            kept.iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("x-api-key"))
+        );
     }
 
     #[tokio::test]

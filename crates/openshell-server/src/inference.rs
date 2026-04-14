@@ -276,6 +276,11 @@ fn resolve_provider_route(provider: &Provider) -> Result<ResolvedProviderRoute, 
                 .iter()
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
                 .collect(),
+            passthrough_headers: profile
+                .passthrough_headers
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         },
     })

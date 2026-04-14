@@ -20,6 +20,7 @@ fn make_system_route() -> ResolvedRoute {
         protocols: vec!["openai_chat_completions".to_string()],
         auth: AuthHeader::Bearer,
         default_headers: Vec::new(),
+        passthrough_headers: Vec::new(),
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }
 }
@@ -33,6 +34,7 @@ fn make_user_route() -> ResolvedRoute {
         protocols: vec!["openai_chat_completions".to_string()],
         auth: AuthHeader::Bearer,
         default_headers: Vec::new(),
+        passthrough_headers: Vec::new(),
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }
 }
@@ -126,6 +128,10 @@ async fn system_inference_with_anthropic_protocol() {
         protocols: vec!["anthropic_messages".to_string()],
         auth: AuthHeader::Custom("x-api-key"),
         default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+        passthrough_headers: vec![
+            "anthropic-version".to_string(),
+            "anthropic-beta".to_string(),
+        ],
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     };
 

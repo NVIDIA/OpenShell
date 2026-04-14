@@ -28,7 +28,8 @@ pub enum AuthHeader {
 ///
 /// This is the single source of truth for provider-specific inference knowledge:
 /// default endpoint, supported protocols, credential key lookup order, auth
-/// header style, and default headers.
+/// header style, default headers, and allowed client-supplied passthrough
+/// headers.
 ///
 /// This is separate from [`openshell_providers::ProviderPlugin`] which handles
 /// credential *discovery* (scanning env vars). `InferenceProviderProfile` handles
@@ -45,6 +46,10 @@ pub struct InferenceProviderProfile {
     pub auth: AuthHeader,
     /// Default headers injected on every outgoing request.
     pub default_headers: &'static [(&'static str, &'static str)],
+    /// Client-supplied headers that may be forwarded to the upstream backend.
+    ///
+    /// Header names must be lowercase and must not include auth headers.
+    pub passthrough_headers: &'static [&'static str],
 }
 
 const OPENAI_PROTOCOLS: &[&str] = &[
@@ -64,6 +69,7 @@ static OPENAI_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     base_url_config_keys: &["OPENAI_BASE_URL"],
     auth: AuthHeader::Bearer,
     default_headers: &[],
+    passthrough_headers: &["openai-organization", "x-model-id"],
 };
 
 static ANTHROPIC_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
@@ -74,6 +80,7 @@ static ANTHROPIC_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     base_url_config_keys: &["ANTHROPIC_BASE_URL"],
     auth: AuthHeader::Custom("x-api-key"),
     default_headers: &[("anthropic-version", "2023-06-01")],
+    passthrough_headers: &["anthropic-version", "anthropic-beta"],
 };
 
 static NVIDIA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
@@ -84,6 +91,7 @@ static NVIDIA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     base_url_config_keys: &["NVIDIA_BASE_URL"],
     auth: AuthHeader::Bearer,
     default_headers: &[],
+    passthrough_headers: &["x-model-id"],
 };
 
 /// Look up the inference provider profile for a given provider type.
@@ -105,6 +113,17 @@ pub fn profile_for(provider_type: &str) -> Option<&'static InferenceProviderProf
 /// need the auth/header information (e.g. the sandbox bundle-to-route
 /// conversion).
 pub fn auth_for_provider_type(provider_type: &str) -> (AuthHeader, Vec<(String, String)>) {
+    let (auth, headers, _) = route_headers_for_provider_type(provider_type);
+    (auth, headers)
+}
+
+/// Derive routing header policy for a provider type string.
+///
+/// Returns the auth injection mode, route-level default headers, and the
+/// allowed client-supplied passthrough headers for `inference.local`.
+pub fn route_headers_for_provider_type(
+    provider_type: &str,
+) -> (AuthHeader, Vec<(String, String)>, Vec<String>) {
     match profile_for(provider_type) {
         Some(profile) => {
             let headers = profile
@@ -112,9 +131,14 @@ pub fn auth_for_provider_type(provider_type: &str) -> (AuthHeader, Vec<(String, 
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect();
-            (profile.auth.clone(), headers)
+            let passthrough_headers = profile
+                .passthrough_headers
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect();
+            (profile.auth.clone(), headers, passthrough_headers)
         }
-        None => (AuthHeader::Bearer, Vec::new()),
+        None => (AuthHeader::Bearer, Vec::new(), Vec::new()),
     }
 }
 
@@ -194,6 +218,32 @@ mod tests {
     }
 
     #[test]
+    fn route_headers_for_openai_include_passthrough_headers() {
+        let (_, _, passthrough_headers) = route_headers_for_provider_type("openai");
+        assert!(
+            passthrough_headers
+                .iter()
+                .any(|name| name == "openai-organization")
+        );
+        assert!(passthrough_headers.iter().any(|name| name == "x-model-id"));
+    }
+
+    #[test]
+    fn route_headers_for_anthropic_include_passthrough_headers() {
+        let (_, _, passthrough_headers) = route_headers_for_provider_type("anthropic");
+        assert!(
+            passthrough_headers
+                .iter()
+                .any(|name| name == "anthropic-version")
+        );
+        assert!(
+            passthrough_headers
+                .iter()
+                .any(|name| name == "anthropic-beta")
+        );
+    }
+
+    #[test]
     fn auth_for_openai_uses_bearer() {
         let (auth, headers) = auth_for_provider_type("openai");
         assert_eq!(auth, AuthHeader::Bearer);
@@ -205,5 +255,13 @@ mod tests {
         let (auth, headers) = auth_for_provider_type("unknown");
         assert_eq!(auth, AuthHeader::Bearer);
         assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn route_headers_for_unknown_are_empty() {
+        let (auth, headers, passthrough_headers) = route_headers_for_provider_type("unknown");
+        assert_eq!(auth, AuthHeader::Bearer);
+        assert!(headers.is_empty());
+        assert!(passthrough_headers.is_empty());
     }
 }

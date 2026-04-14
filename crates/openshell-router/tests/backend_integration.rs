@@ -15,6 +15,7 @@ fn mock_candidates(base_url: &str) -> Vec<ResolvedRoute> {
         protocols: vec!["openai_chat_completions".to_string()],
         auth: AuthHeader::Bearer,
         default_headers: Vec::new(),
+        passthrough_headers: vec!["openai-organization".to_string(), "x-model-id".to_string()],
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }]
 }
@@ -118,6 +119,7 @@ async fn proxy_no_compatible_route_returns_error() {
         protocols: vec!["anthropic_messages".to_string()],
         auth: AuthHeader::Custom("x-api-key"),
         default_headers: Vec::new(),
+        passthrough_headers: Vec::new(),
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
@@ -170,6 +172,39 @@ async fn proxy_strips_auth_header() {
 }
 
 #[tokio::test]
+async fn proxy_forwards_openai_organization_header() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(bearer_token("test-api-key"))
+        .and(header("openai-organization", "org_123"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = mock_candidates(&mock_server.uri());
+
+    let response = router
+        .proxy_with_candidates(
+            "openai_chat_completions",
+            "POST",
+            "/v1/chat/completions",
+            vec![
+                ("openai-organization".to_string(), "org_123".to_string()),
+                ("cookie".to_string(), "session=abc".to_string()),
+            ],
+            bytes::Bytes::new(),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+}
+
+#[tokio::test]
 async fn proxy_mock_route_returns_canned_response() {
     let router = Router::new().unwrap();
     let candidates = vec![ResolvedRoute {
@@ -180,6 +215,7 @@ async fn proxy_mock_route_returns_canned_response() {
         protocols: vec!["openai_chat_completions".to_string()],
         auth: AuthHeader::Bearer,
         default_headers: Vec::new(),
+        passthrough_headers: Vec::new(),
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
@@ -315,6 +351,10 @@ async fn proxy_uses_x_api_key_for_anthropic_route() {
         protocols: vec!["anthropic_messages".to_string()],
         auth: AuthHeader::Custom("x-api-key"),
         default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+        passthrough_headers: vec![
+            "anthropic-version".to_string(),
+            "anthropic-beta".to_string(),
+        ],
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
@@ -374,6 +414,10 @@ async fn proxy_anthropic_does_not_send_bearer_auth() {
         protocols: vec!["anthropic_messages".to_string()],
         auth: AuthHeader::Custom("x-api-key"),
         default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+        passthrough_headers: vec![
+            "anthropic-version".to_string(),
+            "anthropic-beta".to_string(),
+        ],
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
@@ -419,6 +463,10 @@ async fn proxy_forwards_client_anthropic_version_header() {
         protocols: vec!["anthropic_messages".to_string()],
         auth: AuthHeader::Custom("x-api-key"),
         default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+        passthrough_headers: vec![
+            "anthropic-version".to_string(),
+            "anthropic-beta".to_string(),
+        ],
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
@@ -509,6 +557,7 @@ async fn streaming_proxy_completes_despite_exceeding_route_timeout() {
         protocols: vec!["openai_chat_completions".to_string()],
         auth: AuthHeader::Bearer,
         default_headers: Vec::new(),
+        passthrough_headers: Vec::new(),
         // Route timeout shorter than the backend delay — streaming must
         // NOT be constrained by this.
         timeout: Duration::from_secs(1),
@@ -572,6 +621,7 @@ async fn buffered_proxy_enforces_route_timeout() {
         protocols: vec!["openai_chat_completions".to_string()],
         auth: AuthHeader::Bearer,
         default_headers: Vec::new(),
+        passthrough_headers: Vec::new(),
         timeout: Duration::from_secs(1),
     }];
 

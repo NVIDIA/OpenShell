@@ -171,16 +171,17 @@ Files:
 `prepare_backend_request()` (shared by both buffered and streaming paths) rewrites outgoing requests:
 
 1. **Auth injection**: Uses the route's `AuthHeader` -- either `Authorization: Bearer <key>` or a custom header (e.g. `x-api-key: <key>` for Anthropic).
-2. **Header stripping**: Removes `authorization`, `x-api-key`, `host`, and any header names that will be set from route defaults.
-3. **Default headers**: Applies route-level default headers (e.g. `anthropic-version: 2023-06-01`) unless the client already sent them.
-4. **Model rewrite**: Parses the request body as JSON and replaces the `model` field with the route's configured model. Non-JSON bodies are forwarded unchanged.
-5. **URL construction**: `build_backend_url()` appends the request path to the route endpoint. If the endpoint already ends with `/v1` and the request path starts with `/v1/`, the duplicate prefix is deduplicated.
+2. **Header allowlist**: Keeps only explicitly approved request headers: common inference headers (`content-type`, `accept`, `accept-encoding`, `user-agent`), route-specific passthrough headers (for example `openai-organization`, `x-model-id`, `anthropic-version`, `anthropic-beta`), and any route default header names.
+3. **Header stripping**: Removes `authorization`, `x-api-key`, `host`, `content-length`, hop-by-hop headers, and any non-allowlisted request headers.
+4. **Default headers**: Applies route-level default headers (e.g. `anthropic-version: 2023-06-01`) unless the client already sent them.
+5. **Model rewrite**: Parses the request body as JSON and replaces the `model` field with the route's configured model. Non-JSON bodies are forwarded unchanged.
+6. **URL construction**: `build_backend_url()` appends the request path to the route endpoint. If the endpoint already ends with `/v1` and the request path starts with `/v1/`, the duplicate prefix is deduplicated.
 
 ### Header sanitization
 
-Before forwarding inference requests, the proxy strips sensitive and hop-by-hop headers from both requests and responses:
+Before forwarding inference requests, the router enforces a route-aware request allowlist and strips sensitive/framing headers. Response sanitization remains framing-only:
 
-- **Request**: `authorization`, `x-api-key`, `host`, `content-length`, and hop-by-hop headers (`connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`).
+- **Request**: forwards only common inference headers plus route-specific passthrough headers and route default header names. Always strips `authorization`, `x-api-key`, `host`, `content-length`, unknown headers such as `cookie`, and hop-by-hop headers (`connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`).
 - **Response**: `content-length` and hop-by-hop headers.
 
 ### Response streaming

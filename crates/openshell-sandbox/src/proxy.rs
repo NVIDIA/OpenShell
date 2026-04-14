@@ -1205,9 +1205,6 @@ async fn route_inference_request(
             ocsf_emit!(event);
         }
 
-        // Strip credential + framing/hop-by-hop headers.
-        let filtered_headers = sanitize_inference_request_headers(&request.headers);
-
         let routes = ctx.routes.read().await;
 
         if routes.is_empty() {
@@ -1231,7 +1228,7 @@ async fn route_inference_request(
                 &pattern.protocol,
                 &request.method,
                 &normalized_path,
-                filtered_headers,
+                request.headers.clone(),
                 bytes::Bytes::from(request.body.clone()),
                 &routes,
             )
@@ -1393,27 +1390,11 @@ fn router_error_to_http(err: &openshell_router::RouterError) -> (u16, String) {
     }
 }
 
-fn sanitize_inference_request_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .filter(|(name, _)| !should_strip_request_header(name))
-        .cloned()
-        .collect()
-}
-
 fn sanitize_inference_response_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
     headers
         .into_iter()
         .filter(|(name, _)| !should_strip_response_header(name))
         .collect()
-}
-
-fn should_strip_request_header(name: &str) -> bool {
-    let name_lc = name.to_ascii_lowercase();
-    matches!(
-        name_lc.as_str(),
-        "authorization" | "x-api-key" | "host" | "content-length"
-    ) || is_hop_by_hop_header(&name_lc)
 }
 
 fn should_strip_response_header(name: &str) -> bool {
@@ -2792,48 +2773,102 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sanitize_request_headers_strips_auth_and_framing() {
-        let headers = vec![
-            ("authorization".to_string(), "Bearer test".to_string()),
-            ("x-api-key".to_string(), "secret".to_string()),
-            ("transfer-encoding".to_string(), "chunked".to_string()),
-            ("content-length".to_string(), "42".to_string()),
-            ("content-type".to_string(), "application/json".to_string()),
-            ("accept".to_string(), "text/event-stream".to_string()),
-        ];
+    #[tokio::test]
+    async fn inference_interception_applies_router_header_allowlist() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
-        let kept = sanitize_inference_request_headers(&headers);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            use crate::l7::inference::{ParseResult, try_parse_http_request};
 
-        assert!(
-            kept.iter()
-                .all(|(k, _)| !k.eq_ignore_ascii_case("authorization")),
-            "authorization should be stripped"
+            let (mut upstream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+
+            loop {
+                let n = upstream.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "upstream request closed before request completed");
+                buf.extend_from_slice(&chunk[..n]);
+
+                match try_parse_http_request(&buf) {
+                    ParseResult::Complete(_, consumed) => {
+                        upstream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await
+                            .unwrap();
+                        return String::from_utf8_lossy(&buf[..consumed]).to_string();
+                    }
+                    ParseResult::Incomplete => continue,
+                    ParseResult::Invalid(reason) => {
+                        panic!("forwarded request should parse cleanly: {reason}");
+                    }
+                }
+            }
+        });
+
+        let router = openshell_router::Router::new().unwrap();
+        let patterns = crate::l7::inference::default_patterns();
+        let ctx = InferenceContext::new(
+            patterns,
+            router,
+            vec![openshell_router::config::ResolvedRoute {
+                name: "inference.local".to_string(),
+                endpoint: format!("http://{upstream_addr}"),
+                model: "meta/llama-3.1-8b-instruct".to_string(),
+                api_key: "test-api-key".to_string(),
+                protocols: vec!["openai_chat_completions".to_string()],
+                auth: openshell_router::config::AuthHeader::Bearer,
+                default_headers: vec![],
+                passthrough_headers: vec![
+                    "openai-organization".to_string(),
+                    "x-model-id".to_string(),
+                ],
+                timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+            }],
+            vec![],
         );
-        assert!(
-            kept.iter()
-                .all(|(k, _)| !k.eq_ignore_ascii_case("x-api-key")),
-            "x-api-key should be stripped"
+
+        let body = r#"{"model":"ignored","messages":[{"role":"user","content":"hi"}]}"#;
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: inference.local\r\n\
+             Content-Type: application/json\r\n\
+             OpenAI-Organization: org_123\r\n\
+             Authorization: Bearer client-key\r\n\
+             Cookie: session=abc\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body,
         );
+
+        let (client, mut server) = tokio::io::duplex(65536);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+
+        let server_task =
+            tokio::spawn(async move { process_inference_keepalive(&mut server, &ctx, 443).await });
+
+        client_write.write_all(request.as_bytes()).await.unwrap();
+        client_write.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client_read.read_to_end(&mut response).await.unwrap();
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 200"));
+
+        let outcome = server_task.await.unwrap().unwrap();
         assert!(
-            kept.iter()
-                .all(|(k, _)| !k.eq_ignore_ascii_case("transfer-encoding")),
-            "transfer-encoding should be stripped"
+            matches!(outcome, InferenceOutcome::Routed),
+            "expected Routed outcome, got: {outcome:?}"
         );
-        assert!(
-            kept.iter()
-                .all(|(k, _)| !k.eq_ignore_ascii_case("content-length")),
-            "content-length should be stripped"
-        );
-        assert!(
-            kept.iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("content-type")),
-            "content-type should be preserved"
-        );
-        assert!(
-            kept.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept")),
-            "accept should be preserved"
-        );
+
+        let forwarded = upstream_task.await.unwrap();
+        let forwarded_lc = forwarded.to_ascii_lowercase();
+        assert!(forwarded_lc.contains("openai-organization: org_123"));
+        assert!(forwarded_lc.contains("authorization: bearer test-api-key"));
+        assert!(!forwarded_lc.contains("authorization: bearer client-key"));
+        assert!(!forwarded_lc.contains("cookie:"));
     }
 
     // -- router_error_to_http --
