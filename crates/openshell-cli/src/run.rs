@@ -4148,17 +4148,12 @@ pub async fn sandbox_policy_set_global(
     server: &str,
     policy_path: &str,
     yes: bool,
-    wait: bool,
-    _timeout_secs: u64,
+    dry_run: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
-    if wait {
-        return Err(miette::miette!(
-            "--wait is only supported for sandbox-scoped policy updates"
-        ));
+    if !dry_run {
+        confirm_global_setting_takeover("policy", yes)?;
     }
-
-    confirm_global_setting_takeover("policy", yes)?;
 
     let policy = load_sandbox_policy(Some(policy_path))?
         .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
@@ -4172,19 +4167,47 @@ pub async fn sandbox_policy_set_global(
             setting_value: None,
             delete_setting: false,
             global: true,
+            dry_run,
         })
         .await
         .into_diagnostic()?
         .into_inner();
 
+    let hash_display = if response.policy_hash.len() >= 12 {
+        &response.policy_hash[..12]
+    } else {
+        &response.policy_hash
+    };
+
+    if response.dry_run {
+        eprintln!(
+            "{} Dry-run: global policy would be configured (hash: {}, settings revision: {})",
+            "✓".green().bold(),
+            hash_display,
+            response.settings_revision,
+        );
+        if !response.added_network_rules.is_empty() {
+            eprintln!("  Network rules to add:");
+            for rule in &response.added_network_rules {
+                eprintln!("    + {rule}");
+            }
+        }
+        if !response.removed_network_rules.is_empty() {
+            eprintln!("  Network rules to remove:");
+            for rule in &response.removed_network_rules {
+                eprintln!("    - {rule}");
+            }
+        }
+        if response.added_network_rules.is_empty() && response.removed_network_rules.is_empty() {
+            eprintln!("  No network rule changes");
+        }
+        return Ok(());
+    }
+
     eprintln!(
         "{} Global policy configured (hash: {}, settings revision: {})",
         "✓".green().bold(),
-        if response.policy_hash.len() >= 12 {
-            &response.policy_hash[..12]
-        } else {
-            &response.policy_hash
-        },
+        hash_display,
         response.settings_revision,
     );
     Ok(())
@@ -4371,6 +4394,7 @@ pub async fn gateway_setting_set(
             setting_value: Some(setting_value),
             delete_setting: false,
             global: true,
+            dry_run: false,
         })
         .await
         .into_diagnostic()?
@@ -4404,6 +4428,7 @@ pub async fn sandbox_setting_set(
             setting_value: Some(setting_value),
             delete_setting: false,
             global: false,
+            dry_run: false,
         })
         .await
         .into_diagnostic()?
@@ -4437,6 +4462,7 @@ pub async fn gateway_setting_delete(
             setting_value: None,
             delete_setting: true,
             global: true,
+            dry_run: false,
         })
         .await
         .into_diagnostic()?
@@ -4470,6 +4496,7 @@ pub async fn sandbox_setting_delete(
             setting_value: None,
             delete_setting: true,
             global: false,
+            dry_run: false,
         })
         .await
         .into_diagnostic()?
@@ -4500,6 +4527,7 @@ pub async fn sandbox_policy_set(
     policy_path: &str,
     wait: bool,
     timeout_secs: u64,
+    dry_run: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
     let policy = load_sandbox_policy(Some(policy_path))?
@@ -4527,11 +4555,48 @@ pub async fn sandbox_policy_set(
             setting_value: None,
             delete_setting: false,
             global: false,
+            dry_run,
         })
         .await
         .into_diagnostic()?;
 
     let resp = response.into_inner();
+
+    if resp.dry_run {
+        if resp.version == current_version {
+            eprintln!(
+                "{} Dry-run: policy unchanged (version {}, hash: {})",
+                "·".dimmed(),
+                resp.version,
+                &resp.policy_hash[..12]
+            );
+            return Ok(());
+        }
+
+        eprintln!(
+            "{} Dry-run: policy would become version {} (hash: {})",
+            "✓".green().bold(),
+            resp.version,
+            &resp.policy_hash[..12]
+        );
+
+        if !resp.added_network_rules.is_empty() {
+            eprintln!("  Network rules to add:");
+            for rule in &resp.added_network_rules {
+                eprintln!("    + {rule}");
+            }
+        }
+        if !resp.removed_network_rules.is_empty() {
+            eprintln!("  Network rules to remove:");
+            for rule in &resp.removed_network_rules {
+                eprintln!("    - {rule}");
+            }
+        }
+        if resp.added_network_rules.is_empty() && resp.removed_network_rules.is_empty() {
+            eprintln!("  No network rule changes");
+        }
+        return Ok(());
+    }
 
     if resp.version == current_version {
         eprintln!(

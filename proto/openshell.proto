@@ -574,6 +574,11 @@ message UpdateConfigRequest {
   bool delete_setting = 5;
   // Apply mutation at gateway-global scope.
   bool global = 6;
+  // Validate the update without persisting or notifying the sandbox.
+  // When true, the gateway runs all validation checks and returns what
+  // the response would look like, but does not write to the database
+  // or trigger a sandbox reload.
+  bool dry_run = 7;
 }
 
 // Update sandbox policy response.
@@ -586,6 +591,12 @@ message UpdateConfigResponse {
   uint64 settings_revision = 3;
   // True when a setting delete operation removed an existing key.
   bool deleted = 4;
+  // True when this was a dry-run (validation only, no side effects).
+  bool dry_run = 5;
+  // Network policy rules added relative to the current policy (dry-run only).
+  repeated string added_network_rules = 6;
+  // Network policy rules removed relative to the current policy (dry-run only).
+  repeated string removed_network_rules = 7;
 }
 
 // Get sandbox policy status request.

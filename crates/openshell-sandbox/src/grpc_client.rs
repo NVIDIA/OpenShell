@@ -133,6 +133,7 @@ async fn sync_policy_with_client(
             setting_value: None,
             delete_setting: false,
             global: false,
+            dry_run: false,
         })
         .await
         .into_diagnostic()

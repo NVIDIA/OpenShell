@@ -16,6 +16,7 @@ pub mod image;
 pub mod inference;
 pub mod net;
 pub mod paths;
+pub mod policy_diff;
 pub mod proto;
 pub mod settings;
 

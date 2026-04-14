@@ -403,6 +403,22 @@ openshell policy set --global --policy policy.yaml --yes
 
 The `--wait` flag is rejected for global policy updates with: `"--wait is not supported for global policies; global policies are effective immediately"`. See `crates/openshell-cli/src/main.rs`.
 
+### `policy set --dry-run`
+
+Validate a policy update without applying it. Runs all validation checks (safety, static field immutability, global policy lock) and returns a diff of network rule changes, but does not persist the revision or notify the sandbox.
+
+```bash
+openshell policy set demo --policy policy.yaml --dry-run
+openshell policy set --global --policy policy.yaml --dry-run
+```
+
+The response shows:
+- The version number and hash the policy would receive
+- Added network rules (rules present in the new policy but not the current one)
+- Removed network rules (rules present in the current policy but not the new one)
+
+The `--wait` flag is incompatible with `--dry-run` (dry-run does not apply the policy, so there is nothing to wait for).
+
 ### `policy delete --global [--yes]`
 
 Delete the gateway-global policy, restoring sandbox-level policy control. Removes the `policy` key from the `gateway_settings` blob and supersedes all `__global__` revisions.

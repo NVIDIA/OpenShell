@@ -135,6 +135,14 @@ The following steps outline the hot-reload policy update workflow.
    openshell policy set <name> --policy current-policy.yaml --wait
    ```
 
+You can preview the effects of a policy update before applying it:
+
+```shell
+openshell policy set <name> --policy current-policy.yaml --dry-run
+```
+
+`--dry-run` runs validation checks and shows which network rules would be added or removed, but does not apply the policy or notify the sandbox. The `--wait` flag is incompatible with `--dry-run`.
+
 6. Verify the new revision. If status is `loaded`, repeat from step 2 as needed; if `failed`, fix the policy and repeat from step 4.
 
    ```shell

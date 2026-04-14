@@ -1436,6 +1436,11 @@ enum PolicyCommands {
         /// Timeout for --wait in seconds.
         #[arg(long, default_value_t = 60)]
         timeout: u64,
+
+        /// Validate the policy without applying it. Shows validation results
+        /// and a diff of network rules that would change.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Show current active policy for a sandbox or the global policy.
@@ -1965,6 +1970,7 @@ async fn main() -> Result<()> {
                     yes,
                     wait,
                     timeout,
+                    dry_run,
                 } => {
                     if global {
                         if wait {
@@ -1973,19 +1979,26 @@ async fn main() -> Result<()> {
                                  global policies are effective immediately"
                             ));
                         }
-                        run::sandbox_policy_set_global(
+                        run::sandbox_policy_set_global(&ctx.endpoint, &policy, yes, dry_run, &tls)
+                            .await?;
+                    } else {
+                        if dry_run && wait {
+                            return Err(miette::miette!(
+                                "--wait is not supported with --dry-run; \
+                                 dry-run does not apply the policy"
+                            ));
+                        }
+                        let name = resolve_sandbox_name(name, &ctx.name)?;
+                        run::sandbox_policy_set(
                             &ctx.endpoint,
+                            &name,
                             &policy,
-                            yes,
                             wait,
                             timeout,
+                            dry_run,
                             &tls,
                         )
                         .await?;
-                    } else {
-                        let name = resolve_sandbox_name(name, &ctx.name)?;
-                        run::sandbox_policy_set(&ctx.endpoint, &name, &policy, wait, timeout, &tls)
-                            .await?;
                     }
                 }
                 PolicyCommands::Get {

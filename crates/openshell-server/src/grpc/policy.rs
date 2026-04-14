@@ -12,6 +12,7 @@
 
 use crate::ServerState;
 use crate::persistence::{DraftChunkRecord, PolicyRecord, Store};
+use openshell_core::policy_diff::PolicyDiff;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
@@ -283,25 +284,51 @@ pub(super) async fn handle_update_config(
                 && current.status == "loaded"
             {
                 let mut global_settings = load_global_settings(state.store.as_ref()).await?;
-                let stored_value = StoredSettingValue::Bytes(hex::encode(&payload));
-                let changed = upsert_setting_value(
-                    &mut global_settings.settings,
-                    POLICY_SETTING_KEY,
-                    stored_value,
-                );
-                if changed {
-                    global_settings.revision = global_settings.revision.wrapping_add(1);
-                    save_global_settings(state.store.as_ref(), &global_settings).await?;
+                if !req.dry_run {
+                    let stored_value = StoredSettingValue::Bytes(hex::encode(&payload));
+                    let changed = upsert_setting_value(
+                        &mut global_settings.settings,
+                        POLICY_SETTING_KEY,
+                        stored_value,
+                    );
+                    if changed {
+                        global_settings.revision = global_settings.revision.wrapping_add(1);
+                        save_global_settings(state.store.as_ref(), &global_settings).await?;
+                    }
                 }
                 return Ok(Response::new(UpdateConfigResponse {
                     version: u32::try_from(current.version).unwrap_or(0),
                     policy_hash: hash,
                     settings_revision: global_settings.revision,
                     deleted: false,
+                    dry_run: req.dry_run,
+                    added_network_rules: Vec::new(),
+                    removed_network_rules: Vec::new(),
                 }));
             }
 
-            let next_version = latest.map_or(1, |r| r.version + 1);
+            let next_version = latest.as_ref().map_or(1, |r| r.version + 1);
+
+            // Compute network rule diff for global policy updates.
+            let current_policy = latest
+                .as_ref()
+                .and_then(|r| ProtoSandboxPolicy::decode(r.policy_payload.as_slice()).ok())
+                .unwrap_or_default();
+            let diff = PolicyDiff::diff(&current_policy, &new_policy);
+
+            if req.dry_run {
+                let global_settings = load_global_settings(state.store.as_ref()).await?;
+                return Ok(Response::new(UpdateConfigResponse {
+                    version: u32::try_from(next_version).unwrap_or(0),
+                    policy_hash: hash,
+                    settings_revision: global_settings.revision,
+                    deleted: false,
+                    dry_run: true,
+                    added_network_rules: diff.added_network_rules,
+                    removed_network_rules: diff.removed_network_rules,
+                }));
+            }
+
             let policy_id = uuid::Uuid::new_v4().to_string();
 
             state
@@ -353,6 +380,9 @@ pub(super) async fn handle_update_config(
                 policy_hash: hash,
                 settings_revision: global_settings.revision,
                 deleted: false,
+                dry_run: false,
+                added_network_rules: diff.added_network_rules,
+                removed_network_rules: diff.removed_network_rules,
             }));
         }
 
@@ -401,6 +431,9 @@ pub(super) async fn handle_update_config(
             policy_hash: String::new(),
             settings_revision: global_settings.revision,
             deleted: req.delete_setting && changed,
+            dry_run: false,
+            added_network_rules: Vec::new(),
+            removed_network_rules: Vec::new(),
         }));
     }
 
@@ -457,6 +490,9 @@ pub(super) async fn handle_update_config(
                 policy_hash: String::new(),
                 settings_revision: sandbox_settings.revision,
                 deleted: removed,
+                dry_run: false,
+                added_network_rules: Vec::new(),
+                removed_network_rules: Vec::new(),
             }));
         }
 
@@ -490,6 +526,9 @@ pub(super) async fn handle_update_config(
             policy_hash: String::new(),
             settings_revision: sandbox_settings.revision,
             deleted: false,
+            dry_run: false,
+            added_network_rules: Vec::new(),
+            removed_network_rules: Vec::new(),
         }));
     }
 
@@ -515,7 +554,7 @@ pub(super) async fn handle_update_config(
     if let Some(baseline_policy) = spec.policy.as_ref() {
         validate_static_fields_unchanged(baseline_policy, &new_policy)?;
         validate_policy_safety(&new_policy)?;
-    } else {
+    } else if !req.dry_run {
         let mut sandbox = sandbox;
         if let Some(ref mut spec) = sandbox.spec {
             spec.policy = Some(new_policy.clone());
@@ -537,8 +576,8 @@ pub(super) async fn handle_update_config(
         .await
         .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
 
-    let payload = new_policy.encode_to_vec();
     let hash = deterministic_policy_hash(&new_policy);
+    let next_version = latest.as_ref().map_or(1, |r| r.version + 1);
 
     if let Some(ref current) = latest
         && current.policy_hash == hash
@@ -548,10 +587,32 @@ pub(super) async fn handle_update_config(
             policy_hash: hash,
             settings_revision: 0,
             deleted: false,
+            dry_run: req.dry_run,
+            added_network_rules: Vec::new(),
+            removed_network_rules: Vec::new(),
         }));
     }
 
-    let next_version = latest.map_or(1, |r| r.version + 1);
+    // Compute network rule diff for both dry-run and normal responses.
+    let current_policy = latest
+        .as_ref()
+        .and_then(|r| ProtoSandboxPolicy::decode(r.policy_payload.as_slice()).ok())
+        .unwrap_or_default();
+    let diff = PolicyDiff::diff(&current_policy, &new_policy);
+
+    if req.dry_run {
+        return Ok(Response::new(UpdateConfigResponse {
+            version: u32::try_from(next_version).unwrap_or(0),
+            policy_hash: hash,
+            settings_revision: 0,
+            deleted: false,
+            dry_run: true,
+            added_network_rules: diff.added_network_rules,
+            removed_network_rules: diff.removed_network_rules,
+        }));
+    }
+
+    let payload = new_policy.encode_to_vec();
     let policy_id = uuid::Uuid::new_v4().to_string();
 
     state
@@ -579,6 +640,9 @@ pub(super) async fn handle_update_config(
         policy_hash: hash,
         settings_revision: 0,
         deleted: false,
+        dry_run: false,
+        added_network_rules: diff.added_network_rules,
+        removed_network_rules: diff.removed_network_rules,
     }))
 }
 
