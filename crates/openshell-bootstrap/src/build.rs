@@ -16,6 +16,7 @@ use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
 
 use crate::constants::container_name;
+use crate::docker::connect_local_docker_extended_timeout;
 use crate::push::push_local_images;
 
 /// Build a container image from a Dockerfile and push it into the gateway.
@@ -39,16 +40,22 @@ pub async fn build_and_push_image(
         "Building image {tag} from {}",
         dockerfile_path.display()
     ));
-    build_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
+    let local_docker = connect_local_docker_extended_timeout()?;
+    build_image(
+        &local_docker,
+        dockerfile_path,
+        tag,
+        context_dir,
+        build_args,
+        on_log,
+    )
+    .await?;
     on_log(format!("Built image {tag}"));
 
     // 2. Push into the gateway.
     on_log(format!(
         "Pushing image {tag} into gateway \"{gateway_name}\""
     ));
-    let local_docker = Docker::connect_with_local_defaults()
-        .into_diagnostic()
-        .wrap_err("failed to connect to local Docker daemon")?;
     let container = container_name(gateway_name);
     let images: Vec<&str> = vec![tag];
     push_local_images(&local_docker, &local_docker, &container, &images, on_log).await?;
@@ -62,16 +69,13 @@ pub async fn build_and_push_image(
 /// Creates a tar archive of `context_dir`, sends it to Docker with the
 /// specified Dockerfile path and tag, and streams build output to `on_log`.
 async fn build_image(
+    docker: &Docker,
     dockerfile_path: &Path,
     tag: &str,
     context_dir: &Path,
     build_args: &HashMap<String, String>,
     on_log: &mut impl FnMut(String),
 ) -> Result<()> {
-    let docker = Docker::connect_with_local_defaults()
-        .into_diagnostic()
-        .wrap_err("failed to connect to local Docker daemon")?;
-
     // Compute the relative path of the Dockerfile within the context.
     let dockerfile_relative = dockerfile_path
         .strip_prefix(context_dir)

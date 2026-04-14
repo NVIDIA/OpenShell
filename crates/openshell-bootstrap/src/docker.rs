@@ -173,6 +173,26 @@ pub async fn check_docker_available() -> Result<DockerPreflight> {
     Ok(DockerPreflight { docker, version })
 }
 
+/// Connect to the local Docker daemon with a long HTTP read/write timeout.
+///
+/// Bollard's [`Docker::connect_with_local_defaults`] uses a **120 second** per-read/write
+/// timeout. Streaming [`Docker::export_images`] (used when pushing images into the gateway)
+/// can legitimately go idle longer than that on large images or slow disks, which surfaces as
+/// `failed to read image export stream` / `Timeout error`.
+///
+/// Override seconds with `OPENSHELL_DOCKER_API_TIMEOUT_SECS` (must be a positive integer).
+pub(crate) fn connect_local_docker_extended_timeout() -> Result<Docker> {
+    let timeout_secs = std::env::var("OPENSHELL_DOCKER_API_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(3600);
+    Docker::connect_with_local_defaults()
+        .map(|docker| docker.with_timeout(std::time::Duration::from_secs(timeout_secs)))
+        .into_diagnostic()
+        .wrap_err("failed to connect to local Docker daemon")
+}
+
 /// Build a rich, user-friendly error when Docker is not reachable.
 fn docker_not_reachable_error(raw_err: &str, summary: &str) -> miette::Report {
     let docker_host = std::env::var("DOCKER_HOST").ok();

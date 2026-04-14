@@ -31,8 +31,9 @@ use crate::constants::{
 };
 use crate::docker::{
     check_existing_gateway, check_port_conflicts, cleanup_gateway_container,
-    destroy_gateway_resources, ensure_container, ensure_image, ensure_network, ensure_volume,
-    resolve_gpu_device_ids, start_container, stop_container,
+    connect_local_docker_extended_timeout, destroy_gateway_resources, ensure_container,
+    ensure_image, ensure_network, ensure_volume, resolve_gpu_device_ids, start_container,
+    stop_container,
 };
 use crate::metadata::{
     create_gateway_metadata, create_gateway_metadata_with_host, local_gateway_host,
@@ -521,7 +522,7 @@ where
                 .collect();
             if !images.is_empty() {
                 log("[status] Deploying components".to_string());
-                let local_docker = Docker::connect_with_local_defaults().into_diagnostic()?;
+                let local_docker = connect_local_docker_extended_timeout()?;
                 let container = container_name(&name);
                 let on_log_ref = Arc::clone(&on_log);
                 let mut push_log = move |msg: String| {
