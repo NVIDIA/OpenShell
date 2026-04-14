@@ -8,7 +8,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use openshell_core::VERSION;
-use openshell_core::proto::compute_driver_server::ComputeDriverServer;
+use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
     ComputeDriverService, KubernetesComputeConfig, KubernetesComputeDriver,
 };

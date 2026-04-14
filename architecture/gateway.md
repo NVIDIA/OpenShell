@@ -80,11 +80,11 @@ Proto definitions consumed by the gateway:
 
 | Proto file | Package | Defines |
 |------------|---------|---------|
-| `proto/openshell.proto` | `openshell.v1` | `OpenShell` service, sandbox/provider/SSH/watch messages |
-| `proto/compute_driver.proto` | `openshell.compute.v1` | Internal `ComputeDriver` service, endpoint resolution, compute watch stream envelopes |
+| `proto/openshell.proto` | `openshell.v1` | `OpenShell` service, public sandbox resource model, provider/SSH/watch messages |
+| `proto/compute_driver.proto` | `openshell.compute.v1` | Internal `ComputeDriver` service, driver-native sandbox observations, endpoint resolution, compute watch stream envelopes |
 | `proto/inference.proto` | `openshell.inference.v1` | `Inference` service: `SetClusterInference`, `GetClusterInference`, `GetInferenceBundle` |
 | `proto/datamodel.proto` | `openshell.datamodel.v1` | `Provider` |
-| `proto/sandbox.proto` | `openshell.sandbox.v1` | Shared sandbox lifecycle types (`Sandbox`, `SandboxSpec`, `SandboxStatus`, `SandboxPhase`, `PlatformEvent`) plus policy/settings messages |
+| `proto/sandbox.proto` | `openshell.sandbox.v1` | Sandbox supervisor policy, settings, and config messages |
 
 ## Startup Sequence
 
@@ -502,25 +502,28 @@ The Helm chart template is at `deploy/helm/openshell/templates/statefulset.yaml`
 
 `KubernetesComputeDriver` (`crates/openshell-driver-kubernetes/src/driver.rs`) manages `agents.x-k8s.io/v1alpha1/Sandbox` CRDs behind the gateway's compute interface.
 
-- **Create**: Translates a shared `openshell.sandbox.v1.Sandbox` message into a Kubernetes `DynamicObject` with labels (`openshell.ai/sandbox-id`, `openshell.ai/managed-by: openshell`) and a spec that includes the pod template, environment variables, and gateway-required env vars (`OPENSHELL_SANDBOX_ID`, `OPENSHELL_ENDPOINT`, `OPENSHELL_SSH_LISTEN_ADDR`, etc.). When callers do not provide custom `volumeClaimTemplates`, the driver injects a default `workspace` PVC and mounts it at `/sandbox` so the default sandbox home/workdir survives pod rescheduling.
+- **Get**: `GetSandbox` looks up a sandbox CRD by name and returns a driver-native platform observation (`openshell.compute.v1.DriverSandbox`) with raw status and condition data from the object.
+- **List**: `ListSandboxes` enumerates sandbox CRDs and returns driver-native platform observations for each, sorted by name for stable results.
+- **Create**: Translates an internal `openshell.compute.v1.DriverSandbox` message into a Kubernetes `DynamicObject` with labels (`openshell.ai/sandbox-id`, `openshell.ai/managed-by: openshell`) and a spec that includes the pod template, environment variables, and gateway-required env vars (`OPENSHELL_SANDBOX_ID`, `OPENSHELL_ENDPOINT`, `OPENSHELL_SSH_LISTEN_ADDR`, etc.). When callers do not provide custom `volumeClaimTemplates`, the driver injects a default `workspace` PVC and mounts it at `/sandbox` so the default sandbox home/workdir survives pod rescheduling.
 - **Delete**: Calls the Kubernetes API to delete the CRD by name. Returns `false` if already gone (404).
+- **Stop**: `proto/compute_driver.proto` now reserves `StopSandbox` for a non-destructive lifecycle transition. Resume is intentionally not a dedicated compute-driver RPC; the gateway is expected to auto-resume a stopped sandbox when a client connects or executes into it.
 - **Pod IP resolution**: `agent_pod_ip()` fetches the agent pod and reads `status.podIP`.
 
 ### Sandbox Watcher
 
-The Kubernetes driver emits `WatchSandboxes` events through `proto/compute_driver.proto`. `ComputeRuntime` consumes that stream and applies the resulting snapshots to the store.
+The Kubernetes driver emits `WatchSandboxes` events through `proto/compute_driver.proto`. `ComputeRuntime` consumes that stream, translates the driver-native snapshots into public `openshell.v1.Sandbox` resources, derives the public phase, and applies the results to the store.
 
-- **Applied**: Extracts the sandbox ID from labels (or falls back to name prefix stripping), reads the CRD status, derives the phase, and upserts the sandbox record in the store. Notifies the watch bus.
+- **Applied**: Extracts the sandbox ID from labels (or falls back to name prefix stripping), reads the CRD status, emits a driver-native snapshot, and lets the gateway translate that into the stored public sandbox record. Notifies the watch bus.
 - **Deleted**: Removes the sandbox record from the store and the index. Notifies the watch bus.
 - **Restarted**: Re-processes all objects (full resync).
 
-### Phase Derivation
+### Gateway Phase Derivation
 
-`derive_phase()` maps Kubernetes condition state to `SandboxPhase`:
+`ComputeRuntime::derive_phase()` (`crates/openshell-server/src/compute/mod.rs`) maps driver-native compute status to the public `SandboxPhase` exposed by `proto/openshell.proto`:
 
 | Condition | Phase |
 |-----------|-------|
-| `deletionTimestamp` is set | `Deleting` |
+| Driver status `deleting=true` | `Deleting` |
 | Ready condition `status=True` | `Ready` |
 | Ready condition `status=False`, terminal reason | `Error` |
 | Ready condition `status=False`, transient reason | `Provisioning` |

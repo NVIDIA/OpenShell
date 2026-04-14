@@ -79,7 +79,6 @@ pub mod inference {
     }
 }
 
-pub use compute::v1::*;
 pub use datamodel::v1::*;
 pub use inference::v1::*;
 pub use openshell::*;

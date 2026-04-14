@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use futures::{Stream, StreamExt};
-use openshell_core::proto::compute_driver_server::ComputeDriver;
-use openshell_core::proto::{
-    ComputeCreateSandboxRequest, ComputeCreateSandboxResponse, ComputeDeleteSandboxRequest,
-    ComputeDeleteSandboxResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    ResolveSandboxEndpointRequest, ResolveSandboxEndpointResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
+use openshell_core::proto::compute::v1::{
+    CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, ResolveSandboxEndpointRequest,
+    ResolveSandboxEndpointResponse, StopSandboxRequest, StopSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
+    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -51,10 +52,49 @@ impl ComputeDriver for ComputeDriverService {
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
+    async fn get_sandbox(
+        &self,
+        request: Request<GetSandboxRequest>,
+    ) -> Result<Response<GetSandboxResponse>, Status> {
+        let request = request.into_inner();
+        if request.sandbox_name.is_empty() {
+            return Err(Status::invalid_argument("sandbox_name is required"));
+        }
+
+        let sandbox = self
+            .driver
+            .get_sandbox(&request.sandbox_name)
+            .await
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+        if !request.sandbox_id.is_empty() && request.sandbox_id != sandbox.id {
+            return Err(Status::failed_precondition(
+                "sandbox_id did not match the fetched sandbox",
+            ));
+        }
+
+        Ok(Response::new(GetSandboxResponse {
+            sandbox: Some(sandbox),
+        }))
+    }
+
+    async fn list_sandboxes(
+        &self,
+        _request: Request<ListSandboxesRequest>,
+    ) -> Result<Response<ListSandboxesResponse>, Status> {
+        let sandboxes = self
+            .driver
+            .list_sandboxes()
+            .await
+            .map_err(Status::internal)?;
+        Ok(Response::new(ListSandboxesResponse { sandboxes }))
+    }
+
     async fn create_sandbox(
         &self,
-        request: Request<ComputeCreateSandboxRequest>,
-    ) -> Result<Response<ComputeCreateSandboxResponse>, Status> {
+        request: Request<CreateSandboxRequest>,
+    ) -> Result<Response<CreateSandboxResponse>, Status> {
         let sandbox = request
             .into_inner()
             .sandbox
@@ -63,20 +103,29 @@ impl ComputeDriver for ComputeDriverService {
             .create_sandbox(&sandbox)
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
-        Ok(Response::new(ComputeCreateSandboxResponse {}))
+        Ok(Response::new(CreateSandboxResponse {}))
+    }
+
+    async fn stop_sandbox(
+        &self,
+        _request: Request<StopSandboxRequest>,
+    ) -> Result<Response<StopSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "stop sandbox is not implemented by the kubernetes compute driver",
+        ))
     }
 
     async fn delete_sandbox(
         &self,
-        request: Request<ComputeDeleteSandboxRequest>,
-    ) -> Result<Response<ComputeDeleteSandboxResponse>, Status> {
+        request: Request<DeleteSandboxRequest>,
+    ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let request = request.into_inner();
         let deleted = self
             .driver
             .delete_sandbox(&request.sandbox_name)
             .await
             .map_err(Status::internal)?;
-        Ok(Response::new(ComputeDeleteSandboxResponse { deleted }))
+        Ok(Response::new(DeleteSandboxResponse { deleted }))
     }
 
     async fn resolve_sandbox_endpoint(

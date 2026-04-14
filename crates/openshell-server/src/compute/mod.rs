@@ -9,9 +9,14 @@ use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
+use openshell_core::proto::compute::v1::{
+    DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
+    DriverSandboxTemplate, ResolveSandboxEndpointResponse, WatchSandboxesEvent, sandbox_endpoint,
+    watch_sandboxes_event,
+};
 use openshell_core::proto::{
-    ResolveSandboxEndpointResponse, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec,
-    SandboxStatus, SshSession, WatchSandboxesEvent,
+    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
+    SandboxTemplate, SshSession,
 };
 use openshell_driver_kubernetes::{
     KubernetesComputeConfig, KubernetesComputeDriver, KubernetesDriverError,
@@ -56,12 +61,12 @@ pub enum ResolvedEndpoint {
 #[tonic::async_trait]
 pub trait ComputeBackend: fmt::Debug + Send + Sync {
     fn default_image(&self) -> &str;
-    async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status>;
-    async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), ComputeError>;
+    async fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), Status>;
+    async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), ComputeError>;
     async fn delete_sandbox(&self, sandbox_name: &str) -> Result<bool, ComputeError>;
     async fn resolve_sandbox_endpoint(
         &self,
-        sandbox: &Sandbox,
+        sandbox: &DriverSandbox,
     ) -> Result<ResolvedEndpoint, ComputeError>;
     async fn watch_sandboxes(&self) -> Result<ComputeWatchStream, ComputeError>;
 }
@@ -84,11 +89,11 @@ impl ComputeBackend for InProcessKubernetesBackend {
         self.driver.default_image()
     }
 
-    async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
+    async fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
         self.driver.validate_sandbox_create(sandbox).await
     }
 
-    async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), ComputeError> {
+    async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), ComputeError> {
         self.driver
             .create_sandbox(sandbox)
             .await
@@ -104,7 +109,7 @@ impl ComputeBackend for InProcessKubernetesBackend {
 
     async fn resolve_sandbox_endpoint(
         &self,
-        sandbox: &Sandbox,
+        sandbox: &DriverSandbox,
     ) -> Result<ResolvedEndpoint, ComputeError> {
         let response = self
             .driver
@@ -165,7 +170,8 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        self.backend.validate_sandbox_create(sandbox).await
+        let driver_sandbox = driver_sandbox_from_public(sandbox);
+        self.backend.validate_sandbox_create(&driver_sandbox).await
     }
 
     pub async fn create_sandbox(&self, sandbox: Sandbox) -> Result<Sandbox, Status> {
@@ -187,7 +193,8 @@ impl ComputeRuntime {
             .await
             .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
 
-        match self.backend.create_sandbox(&sandbox).await {
+        let driver_sandbox = driver_sandbox_from_public(&sandbox);
+        match self.backend.create_sandbox(&driver_sandbox).await {
             Ok(()) => {
                 self.sandbox_watch_bus.notify(&sandbox.id);
                 Ok(sandbox)
@@ -278,8 +285,9 @@ impl ComputeRuntime {
         &self,
         sandbox: &Sandbox,
     ) -> Result<ResolvedEndpoint, Status> {
+        let driver_sandbox = driver_sandbox_from_public(sandbox);
         self.backend
-            .resolve_sandbox_endpoint(sandbox)
+            .resolve_sandbox_endpoint(&driver_sandbox)
             .await
             .map_err(|err| match err {
                 ComputeError::Precondition(message) => Status::failed_precondition(message),
@@ -329,24 +337,24 @@ impl ComputeRuntime {
     }
 
     async fn apply_watch_event(&self, event: WatchSandboxesEvent) -> Result<(), String> {
-        use openshell_core::proto::watch_sandboxes_event::Payload;
-
         match event.payload {
-            Some(Payload::Sandbox(sandbox)) => {
+            Some(watch_sandboxes_event::Payload::Sandbox(sandbox)) => {
                 if let Some(sandbox) = sandbox.sandbox {
                     self.apply_sandbox_update(sandbox).await?;
                 }
             }
-            Some(Payload::Deleted(deleted)) => {
+            Some(watch_sandboxes_event::Payload::Deleted(deleted)) => {
                 self.apply_deleted(&deleted.sandbox_id).await?;
             }
-            Some(Payload::PlatformEvent(platform_event)) => {
+            Some(watch_sandboxes_event::Payload::PlatformEvent(platform_event)) => {
                 if let Some(event) = platform_event.event {
                     self.tracing_log_bus.platform_event_bus.publish(
                         &platform_event.sandbox_id,
                         openshell_core::proto::SandboxStreamEvent {
                             payload: Some(
-                                openshell_core::proto::sandbox_stream_event::Payload::Event(event),
+                                openshell_core::proto::sandbox_stream_event::Payload::Event(
+                                    public_platform_event_from_driver(&event),
+                                ),
                             ),
                         },
                     );
@@ -357,20 +365,20 @@ impl ComputeRuntime {
         Ok(())
     }
 
-    async fn apply_sandbox_update(&self, incoming: Sandbox) -> Result<(), String> {
+    async fn apply_sandbox_update(&self, incoming: DriverSandbox) -> Result<(), String> {
         let existing = self
             .store
             .get_message::<Sandbox>(&incoming.id)
             .await
             .map_err(|e| e.to_string())?;
 
-        let mut status = incoming.status.clone();
+        let mut status = incoming.status.as_ref().map(public_status_from_driver);
         rewrite_user_facing_conditions(
             &mut status,
             existing.as_ref().and_then(|sandbox| sandbox.spec.as_ref()),
         );
 
-        let phase = SandboxPhase::try_from(incoming.phase).unwrap_or(SandboxPhase::Unknown);
+        let mut phase = derive_phase(incoming.status.as_ref());
         let mut sandbox = existing.unwrap_or_else(|| Sandbox {
             id: incoming.id.clone(),
             name: incoming.name.clone(),
@@ -382,6 +390,9 @@ impl ComputeRuntime {
         });
 
         let old_phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+        if old_phase == SandboxPhase::Deleting && phase != SandboxPhase::Error {
+            phase = SandboxPhase::Deleting;
+        }
         if old_phase != phase {
             info!(
                 sandbox_id = %incoming.id,
@@ -398,7 +409,7 @@ impl ComputeRuntime {
             for condition in &status.conditions {
                 if condition.r#type == "Ready"
                     && condition.status.eq_ignore_ascii_case("false")
-                    && is_terminal_failure_condition(condition)
+                    && is_terminal_failure_reason(&condition.reason)
                 {
                     warn!(
                         sandbox_id = %incoming.id,
@@ -444,6 +455,69 @@ impl ComputeRuntime {
     }
 }
 
+fn driver_sandbox_from_public(sandbox: &Sandbox) -> DriverSandbox {
+    DriverSandbox {
+        id: sandbox.id.clone(),
+        name: sandbox.name.clone(),
+        namespace: sandbox.namespace.clone(),
+        spec: sandbox.spec.as_ref().map(driver_sandbox_spec_from_public),
+        status: sandbox
+            .status
+            .as_ref()
+            .map(|status| driver_status_from_public(status, sandbox.phase)),
+    }
+}
+
+fn driver_sandbox_spec_from_public(spec: &SandboxSpec) -> DriverSandboxSpec {
+    DriverSandboxSpec {
+        log_level: spec.log_level.clone(),
+        environment: spec.environment.clone(),
+        template: spec
+            .template
+            .as_ref()
+            .map(driver_sandbox_template_from_public),
+        gpu: spec.gpu,
+    }
+}
+
+fn driver_sandbox_template_from_public(template: &SandboxTemplate) -> DriverSandboxTemplate {
+    DriverSandboxTemplate {
+        image: template.image.clone(),
+        runtime_class_name: template.runtime_class_name.clone(),
+        agent_socket: template.agent_socket.clone(),
+        labels: template.labels.clone(),
+        annotations: template.annotations.clone(),
+        environment: template.environment.clone(),
+        resources: template.resources.clone(),
+        volume_claim_templates: template.volume_claim_templates.clone(),
+    }
+}
+
+fn driver_status_from_public(status: &SandboxStatus, phase: i32) -> DriverSandboxStatus {
+    DriverSandboxStatus {
+        sandbox_name: status.sandbox_name.clone(),
+        agent_pod: status.agent_pod.clone(),
+        agent_fd: status.agent_fd.clone(),
+        sandbox_fd: status.sandbox_fd.clone(),
+        conditions: status
+            .conditions
+            .iter()
+            .map(driver_condition_from_public)
+            .collect(),
+        deleting: SandboxPhase::try_from(phase) == Ok(SandboxPhase::Deleting),
+    }
+}
+
+fn driver_condition_from_public(condition: &SandboxCondition) -> DriverCondition {
+    DriverCondition {
+        r#type: condition.r#type.clone(),
+        status: condition.status.clone(),
+        reason: condition.reason.clone(),
+        message: condition.message.clone(),
+        last_transition_time: condition.last_transition_time.clone(),
+    }
+}
+
 impl ObjectType for Sandbox {
     fn object_type() -> &'static str {
         "sandbox"
@@ -473,17 +547,79 @@ fn resolved_endpoint_from_response(
         .map_err(|_| ComputeError::Message("compute driver returned invalid port".to_string()))?;
 
     match endpoint.target.as_ref() {
-        Some(openshell_core::proto::sandbox_endpoint::Target::Ip(ip)) => ip
+        Some(sandbox_endpoint::Target::Ip(ip)) => ip
             .parse()
             .map(|ip| ResolvedEndpoint::Ip(ip, port))
             .map_err(|e| ComputeError::Message(format!("invalid endpoint IP: {e}"))),
-        Some(openshell_core::proto::sandbox_endpoint::Target::Host(host)) => {
+        Some(sandbox_endpoint::Target::Host(host)) => {
             Ok(ResolvedEndpoint::Host(host.clone(), port))
         }
         None => Err(ComputeError::Message(
             "compute driver returned endpoint without target".to_string(),
         )),
     }
+}
+
+fn public_status_from_driver(status: &DriverSandboxStatus) -> SandboxStatus {
+    SandboxStatus {
+        sandbox_name: status.sandbox_name.clone(),
+        agent_pod: status.agent_pod.clone(),
+        agent_fd: status.agent_fd.clone(),
+        sandbox_fd: status.sandbox_fd.clone(),
+        conditions: status
+            .conditions
+            .iter()
+            .map(public_condition_from_driver)
+            .collect(),
+    }
+}
+
+fn public_condition_from_driver(condition: &DriverCondition) -> SandboxCondition {
+    SandboxCondition {
+        r#type: condition.r#type.clone(),
+        status: condition.status.clone(),
+        reason: condition.reason.clone(),
+        message: condition.message.clone(),
+        last_transition_time: condition.last_transition_time.clone(),
+    }
+}
+
+fn public_platform_event_from_driver(event: &DriverPlatformEvent) -> PlatformEvent {
+    PlatformEvent {
+        timestamp_ms: event.timestamp_ms,
+        source: event.source.clone(),
+        r#type: event.r#type.clone(),
+        reason: event.reason.clone(),
+        message: event.message.clone(),
+        metadata: event.metadata.clone(),
+    }
+}
+
+fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
+    if let Some(status) = status {
+        if status.deleting {
+            return SandboxPhase::Deleting;
+        }
+
+        for condition in &status.conditions {
+            if condition.r#type == "Ready" {
+                return if condition.status.eq_ignore_ascii_case("true") {
+                    SandboxPhase::Ready
+                } else if condition.status.eq_ignore_ascii_case("false") {
+                    if is_terminal_failure_reason(&condition.reason) {
+                        SandboxPhase::Error
+                    } else {
+                        SandboxPhase::Provisioning
+                    }
+                } else {
+                    SandboxPhase::Provisioning
+                };
+            }
+        }
+        return SandboxPhase::Provisioning;
+    }
+
+    SandboxPhase::Unknown
 }
 
 fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Option<&SandboxSpec>) {
@@ -504,8 +640,200 @@ fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Opti
     }
 }
 
-fn is_terminal_failure_condition(condition: &SandboxCondition) -> bool {
-    let reason = condition.reason.to_ascii_lowercase();
+fn is_terminal_failure_reason(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
     let transient_reasons = ["reconcilererror", "dependenciesnotready"];
     !transient_reasons.contains(&reason.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_driver_condition(reason: &str, message: &str) -> DriverCondition {
+        DriverCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: reason.to_string(),
+            message: message.to_string(),
+            last_transition_time: String::new(),
+        }
+    }
+
+    fn make_driver_status(condition: DriverCondition) -> DriverSandboxStatus {
+        DriverSandboxStatus {
+            sandbox_name: "test".to_string(),
+            agent_pod: "test-pod".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![condition],
+            deleting: false,
+        }
+    }
+
+    #[test]
+    fn terminal_failure_treats_unknown_reasons_as_terminal() {
+        let terminal_cases = [
+            ("Failed", "Something went wrong"),
+            ("CrashLoopBackOff", "Container keeps crashing"),
+            ("ImagePullBackOff", "Failed to pull image"),
+            ("ErrImagePull", "Error pulling image"),
+            ("Unschedulable", "No nodes match"),
+            ("SomeOtherReason", "Any other reason is terminal"),
+        ];
+
+        for (reason, message) in terminal_cases {
+            assert!(
+                is_terminal_failure_reason(reason),
+                "Expected terminal failure for reason={reason}, message={message}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_failure_ignores_transient_reasons() {
+        let transient_cases = [
+            (
+                "ReconcilerError",
+                "Error seen: failed to update pod: Operation cannot be fulfilled",
+            ),
+            ("reconcilererror", "lowercase also works"),
+            ("RECONCILERERROR", "uppercase also works"),
+            (
+                "DependenciesNotReady",
+                "Pod exists with phase: Pending; Service Exists",
+            ),
+            ("dependenciesnotready", "lowercase also works"),
+        ];
+
+        for (reason, message) in transient_cases {
+            assert!(
+                !is_terminal_failure_reason(reason),
+                "Expected transient (non-terminal) for reason={reason}, message={message}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_phase_returns_unknown_without_status() {
+        assert_eq!(derive_phase(None), SandboxPhase::Unknown);
+    }
+
+    #[test]
+    fn derive_phase_returns_deleting_when_driver_marks_deleting() {
+        let status = DriverSandboxStatus {
+            deleting: true,
+            ..make_driver_status(make_driver_condition(
+                "DependenciesNotReady",
+                "Pod still pending",
+            ))
+        };
+
+        assert_eq!(derive_phase(Some(&status)), SandboxPhase::Deleting);
+    }
+
+    #[test]
+    fn derive_phase_returns_provisioning_for_transient_conditions() {
+        let transient_conditions = [
+            ("ReconcilerError", "Error seen: failed to update pod"),
+            (
+                "DependenciesNotReady",
+                "Pod exists with phase: Pending; Service Exists",
+            ),
+        ];
+
+        for (reason, message) in transient_conditions {
+            let status = make_driver_status(make_driver_condition(reason, message));
+            assert_eq!(
+                derive_phase(Some(&status)),
+                SandboxPhase::Provisioning,
+                "Expected Provisioning for transient reason={reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_phase_returns_error_for_terminal_ready_false() {
+        let status = make_driver_status(make_driver_condition(
+            "ImagePullBackOff",
+            "Failed to pull image",
+        ));
+
+        assert_eq!(derive_phase(Some(&status)), SandboxPhase::Error);
+    }
+
+    #[test]
+    fn derive_phase_returns_ready_for_ready_true() {
+        let status = DriverSandboxStatus {
+            conditions: vec![DriverCondition {
+                r#type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: "DependenciesReady".to_string(),
+                message: "Pod is Ready; Service Exists".to_string(),
+                last_transition_time: String::new(),
+            }],
+            ..make_driver_status(make_driver_condition("", ""))
+        };
+
+        assert_eq!(derive_phase(Some(&status)), SandboxPhase::Ready);
+    }
+
+    #[test]
+    fn rewrite_user_facing_conditions_rewrites_gpu_unschedulable_message() {
+        let mut status = Some(SandboxStatus {
+            sandbox_name: "test".to_string(),
+            agent_pod: "test-pod".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "Unschedulable".to_string(),
+                message: "0/1 nodes are available: 1 Insufficient nvidia.com/gpu.".to_string(),
+                last_transition_time: String::new(),
+            }],
+        });
+
+        rewrite_user_facing_conditions(
+            &mut status,
+            Some(&SandboxSpec {
+                gpu: true,
+                ..Default::default()
+            }),
+        );
+
+        let message = &status.unwrap().conditions[0].message;
+        assert_eq!(
+            message,
+            "GPU sandbox could not be scheduled on the active gateway. Another GPU sandbox may already be using the available GPU, or the gateway may not currently be able to satisfy GPU placement. Please refer to documentation and use `openshell doctor` commands to inspect GPU support and gateway configuration."
+        );
+    }
+
+    #[test]
+    fn rewrite_user_facing_conditions_leaves_non_gpu_unschedulable_message_unchanged() {
+        let original = "0/1 nodes are available: 1 Insufficient cpu.";
+        let mut status = Some(SandboxStatus {
+            sandbox_name: "test".to_string(),
+            agent_pod: "test-pod".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "Unschedulable".to_string(),
+                message: original.to_string(),
+                last_transition_time: String::new(),
+            }],
+        });
+
+        rewrite_user_facing_conditions(
+            &mut status,
+            Some(&SandboxSpec {
+                gpu: false,
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(status.unwrap().conditions[0].message, original);
+    }
 }
