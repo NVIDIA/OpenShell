@@ -980,7 +980,8 @@ fn sandbox_to_k8s_spec(
                     serde_json::json!(template.agent_socket_path),
                 );
             }
-            if let Some(volume_templates) = platform_config_struct(template, "volume_claim_templates")
+            if let Some(volume_templates) =
+                platform_config_struct(template, "volume_claim_templates")
             {
                 root.insert("volumeClaimTemplates".to_string(), volume_templates);
             }
@@ -1179,17 +1180,15 @@ fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_js
     // Start from the raw resources passthrough in platform_config (preserves
     // custom resource types like GPU limits that users set via the public API
     // Struct), then overlay the typed DriverResourceRequirements on top.
-    let mut resources = platform_config_struct(template, "resources_raw")
-        .unwrap_or_else(|| serde_json::json!({}));
+    let mut resources =
+        platform_config_struct(template, "resources_raw").unwrap_or_else(|| serde_json::json!({}));
 
     // Overlay typed CPU/memory from DriverResourceRequirements.
     if let Some(ref req) = template.resources {
         let obj = resources.as_object_mut().unwrap();
         let mut apply = |section: &str, key: &str, value: &str| {
             if !value.is_empty() {
-                let sec = obj
-                    .entry(section)
-                    .or_insert_with(|| serde_json::json!({}));
+                let sec = obj.entry(section).or_insert_with(|| serde_json::json!({}));
                 sec[key] = serde_json::json!(value);
             }
         };

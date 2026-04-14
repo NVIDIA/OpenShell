@@ -11,9 +11,8 @@ use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     DriverCondition, DriverPlatformEvent, DriverResourceRequirements, DriverSandbox,
-    DriverSandboxSpec, DriverSandboxStatus, DriverSandboxTemplate,
-    ResolveSandboxEndpointResponse, WatchSandboxesEvent, sandbox_endpoint,
-    watch_sandboxes_event,
+    DriverSandboxSpec, DriverSandboxStatus, DriverSandboxTemplate, ResolveSandboxEndpointResponse,
+    WatchSandboxesEvent, sandbox_endpoint, watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
