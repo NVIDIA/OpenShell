@@ -91,23 +91,44 @@ message DriverSandboxSpec {
 }
 
 // Driver-owned runtime template consumed by the compute platform.
+//
+// This message describes the sandbox workload in backend-neutral terms.
+// Platform-specific knobs (Kubernetes runtimeClassName, annotations,
+// volumeClaimTemplates, etc.) belong in `platform_config`.
 message DriverSandboxTemplate {
   // Fully-qualified OCI image reference used to boot the sandbox.
   string image = 1;
-  // Optional runtime class name requested from the compute platform.
-  string runtime_class_name = 2;
-  // Optional agent socket path exposed to the workload.
-  string agent_socket = 3;
-  // Labels applied to compute-platform resources.
+  // Socket path inside the sandbox where the agent service listens.
+  string agent_socket_path = 3;
+  // Metadata labels applied to compute-platform resources.
+  // Drivers map these to the platform's native tagging mechanism
+  // (Kubernetes labels, cloud instance tags, etc.).
   map<string, string> labels = 4;
-  // Annotations applied to compute-platform resources.
-  map<string, string> annotations = 5;
-  // Additional environment variables injected by the template.
+  // Additional environment variables injected into the sandbox runtime.
   map<string, string> environment = 6;
-  // Platform-specific compute resource requirements and limits.
-  google.protobuf.Struct resources = 7;
-  // Optional platform-specific volume claim templates.
-  google.protobuf.Struct volume_claim_templates = 9;
+  // Typed compute-resource requirements for the sandbox workload.
+  DriverResourceRequirements resources = 10;
+  // Opaque, platform-specific configuration passed through to the driver.
+  // The gateway does not inspect this; each driver defines its own schema.
+  // For the Kubernetes driver this carries fields such as runtimeClassName,
+  // annotations, and volumeClaimTemplates.
+  google.protobuf.Struct platform_config = 11;
+}
+
+// Typed compute-resource requirements.
+//
+// Values use Kubernetes-style quantity strings (e.g. "500m", "2", "4Gi")
+// because they are a well-known, widely-adopted notation. Drivers for
+// non-Kubernetes platforms must parse these strings into their native units.
+message DriverResourceRequirements {
+  // Minimum CPU cores requested (e.g. "500m", "2").
+  string cpu_request = 1;
+  // Maximum CPU cores allowed (e.g. "500m", "4").
+  string cpu_limit = 2;
+  // Minimum memory requested (e.g. "256Mi", "4Gi").
+  string memory_request = 3;
+  // Maximum memory allowed (e.g. "512Mi", "8Gi").
+  string memory_limit = 4;
 }
 
 // Raw status observed directly from the compute platform.
@@ -117,11 +138,15 @@ message DriverSandboxTemplate {
 message DriverSandboxStatus {
   // Compute-platform sandbox object name.
   string sandbox_name = 1;
-  // Name of the agent pod or equivalent runtime instance.
-  string agent_pod = 2;
-  // File descriptor or endpoint for reaching the agent service, when available.
+  // Platform-assigned instance identifier for the compute unit running the
+  // sandbox agent (e.g. Kubernetes pod name, VM instance ID, hostname).
+  // The gateway uses this to correlate incoming connections back to a sandbox.
+  string instance_id = 2;
+  // File descriptor or address for reaching the agent service inside the
+  // sandbox, when available.
   string agent_fd = 3;
-  // File descriptor or endpoint for reaching the sandbox service, when available.
+  // File descriptor or address for reaching the sandbox supervisor service,
+  // when available.
   string sandbox_fd = 4;
   // Raw readiness and lifecycle conditions reported by the platform.
   repeated DriverCondition conditions = 5;

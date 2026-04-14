@@ -393,14 +393,28 @@ impl KubernetesComputeDriver {
             }
         }
     }
+
+    pub async fn sandbox_exists(&self, name: &str) -> Result<bool, String> {
+        let api = self.api();
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(name)).await {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(false),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_elapsed) => Err(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
     pub async fn resolve_sandbox_endpoint(
         &self,
         sandbox: &Sandbox,
-    ) -> Result<ResolveSandboxEndpointResponse, String> {
+    ) -> Result<ResolveSandboxEndpointResponse, KubernetesDriverError> {
         if let Some(status) = sandbox.status.as_ref()
-            && !status.agent_pod.is_empty()
+            && !status.instance_id.is_empty()
         {
-            match self.agent_pod_ip(&status.agent_pod).await {
+            match self.agent_pod_ip(&status.instance_id).await {
                 Ok(Some(ip)) => {
                     return Ok(ResolveSandboxEndpointResponse {
                         endpoint: Some(SandboxEndpoint {
@@ -410,16 +424,22 @@ impl KubernetesComputeDriver {
                     });
                 }
                 Ok(None) => {
-                    return Err("sandbox agent pod IP is not available".to_string());
+                    return Err(KubernetesDriverError::Precondition(
+                        "sandbox agent pod IP is not available".to_string(),
+                    ));
                 }
                 Err(err) => {
-                    return Err(format!("failed to resolve agent pod IP: {err}"));
+                    return Err(KubernetesDriverError::Message(format!(
+                        "failed to resolve agent pod IP: {err}"
+                    )));
                 }
             }
         }
 
         if sandbox.name.is_empty() {
-            return Err("sandbox has no name".to_string());
+            return Err(KubernetesDriverError::Precondition(
+                "sandbox has no name".to_string(),
+            ));
         }
 
         Ok(ResolveSandboxEndpointResponse {
@@ -615,9 +635,9 @@ fn update_indexes(
         sandbox_name_to_id.insert(sandbox.name.clone(), sandbox.id.clone());
     }
     if let Some(status) = sandbox.status.as_ref()
-        && !status.agent_pod.is_empty()
+        && !status.instance_id.is_empty()
     {
-        agent_pod_to_id.insert(status.agent_pod.clone(), sandbox.id.clone());
+        agent_pod_to_id.insert(status.instance_id.clone(), sandbox.id.clone());
     }
 }
 
@@ -920,7 +940,7 @@ fn sandbox_to_k8s_spec(
     // transforms are applied inside sandbox_template_to_k8s.
     let user_has_vct = spec
         .and_then(|s| s.template.as_ref())
-        .and_then(|t| struct_to_json(&t.volume_claim_templates))
+        .and_then(|t| platform_config_struct(t, "volume_claim_templates"))
         .is_some();
     let inject_workspace = !user_has_vct;
 
@@ -954,13 +974,14 @@ fn sandbox_to_k8s_spec(
                     inject_workspace,
                 ),
             );
-            if !template.agent_socket.is_empty() {
+            if !template.agent_socket_path.is_empty() {
                 root.insert(
                     "agentSocket".to_string(),
-                    serde_json::json!(template.agent_socket),
+                    serde_json::json!(template.agent_socket_path),
                 );
             }
-            if let Some(volume_templates) = struct_to_json(&template.volume_claim_templates) {
+            if let Some(volume_templates) = platform_config_struct(template, "volume_claim_templates")
+            {
                 root.insert("volumeClaimTemplates".to_string(), volume_templates);
             }
         }
@@ -1029,18 +1050,15 @@ fn sandbox_template_to_k8s(
     if !template.labels.is_empty() {
         metadata.insert("labels".to_string(), serde_json::json!(template.labels));
     }
-    if !template.annotations.is_empty() {
-        metadata.insert(
-            "annotations".to_string(),
-            serde_json::json!(template.annotations),
-        );
+    if let Some(annotations) = platform_config_struct(template, "annotations") {
+        metadata.insert("annotations".to_string(), annotations);
     }
 
     let mut spec = serde_json::Map::new();
-    if !template.runtime_class_name.is_empty() {
+    if let Some(runtime_class) = platform_config_string(template, "runtime_class_name") {
         spec.insert(
             "runtimeClassName".to_string(),
-            serde_json::json!(template.runtime_class_name),
+            serde_json::json!(runtime_class),
         );
     }
 
@@ -1158,8 +1176,29 @@ fn sandbox_template_to_k8s(
 }
 
 fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_json::Value> {
-    let mut resources =
-        struct_to_json(&template.resources).unwrap_or_else(|| serde_json::json!({}));
+    // Start from the raw resources passthrough in platform_config (preserves
+    // custom resource types like GPU limits that users set via the public API
+    // Struct), then overlay the typed DriverResourceRequirements on top.
+    let mut resources = platform_config_struct(template, "resources_raw")
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    // Overlay typed CPU/memory from DriverResourceRequirements.
+    if let Some(ref req) = template.resources {
+        let obj = resources.as_object_mut().unwrap();
+        let mut apply = |section: &str, key: &str, value: &str| {
+            if !value.is_empty() {
+                let sec = obj
+                    .entry(section)
+                    .or_insert_with(|| serde_json::json!({}));
+                sec[key] = serde_json::json!(value);
+            }
+        };
+        apply("requests", "cpu", &req.cpu_request);
+        apply("requests", "memory", &req.memory_request);
+        apply("limits", "cpu", &req.cpu_limit);
+        apply("limits", "memory", &req.memory_limit);
+    }
+
     if gpu {
         apply_gpu_limit(&mut resources);
     }
@@ -1283,13 +1322,29 @@ fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
     env.push(serde_json::json!({"name": name, "value": value}));
 }
 
-fn struct_to_json(input: &Option<prost_types::Struct>) -> Option<serde_json::Value> {
-    let input = input.as_ref()?;
-    let mut map = serde_json::Map::new();
-    for (key, value) in &input.fields {
-        map.insert(key.clone(), proto_value_to_json(value));
+/// Extract a string value from the template's `platform_config` Struct.
+fn platform_config_string(template: &SandboxTemplate, key: &str) -> Option<String> {
+    let config = template.platform_config.as_ref()?;
+    let value = config.fields.get(key)?;
+    match value.kind.as_ref() {
+        Some(prost_types::value::Kind::StringValue(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
     }
-    Some(serde_json::Value::Object(map))
+}
+
+/// Extract a nested Struct value from the template's `platform_config`,
+/// converting it to `serde_json::Value`.
+fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde_json::Value> {
+    let config = template.platform_config.as_ref()?;
+    let value = config.fields.get(key)?;
+    let json = proto_value_to_json(value);
+    // Return None for null/empty objects so callers can distinguish
+    // "field absent" from "field present but empty".
+    match &json {
+        serde_json::Value::Null => None,
+        serde_json::Value::Object(m) if m.is_empty() => None,
+        _ => Some(json),
+    }
 }
 
 fn proto_value_to_json(value: &prost_types::Value) -> serde_json::Value {
@@ -1334,7 +1389,7 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
             .and_then(|val| val.as_str())
             .unwrap_or_default()
             .to_string(),
-        agent_pod: status_obj
+        instance_id: status_obj
             .get("agentPod")
             .and_then(|val| val.as_str())
             .unwrap_or_default()
@@ -1552,12 +1607,6 @@ mod tests {
         );
     }
 
-    fn string_value(value: &str) -> Value {
-        Value {
-            kind: Some(Kind::StringValue(value.to_string())),
-        }
-    }
-
     #[test]
     fn gpu_sandbox_adds_runtime_class_and_gpu_limit() {
         let pod_template = sandbox_template_to_k8s(
@@ -1590,7 +1639,16 @@ mod tests {
     #[test]
     fn gpu_sandbox_uses_template_runtime_class_name_when_set() {
         let template = SandboxTemplate {
-            runtime_class_name: "kata-containers".to_string(),
+            platform_config: Some(Struct {
+                fields: [(
+                    "runtime_class_name".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("kata-containers".to_string())),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
             ..SandboxTemplate::default()
         };
 
@@ -1620,7 +1678,16 @@ mod tests {
     #[test]
     fn non_gpu_sandbox_uses_template_runtime_class_name_when_set() {
         let template = SandboxTemplate {
-            runtime_class_name: "kata-containers".to_string(),
+            platform_config: Some(Struct {
+                fields: [(
+                    "runtime_class_name".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("kata-containers".to_string())),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
             ..SandboxTemplate::default()
         };
 
@@ -1649,20 +1716,11 @@ mod tests {
 
     #[test]
     fn gpu_sandbox_preserves_existing_resource_limits() {
+        use openshell_core::proto::compute::v1::DriverResourceRequirements;
         let template = SandboxTemplate {
-            resources: Some(Struct {
-                fields: [(
-                    "limits".to_string(),
-                    Value {
-                        kind: Some(Kind::StructValue(Struct {
-                            fields: [("cpu".to_string(), string_value("2"))]
-                                .into_iter()
-                                .collect(),
-                        })),
-                    },
-                )]
-                .into_iter()
-                .collect(),
+            resources: Some(DriverResourceRequirements {
+                cpu_limit: "2".to_string(),
+                ..Default::default()
             }),
             ..SandboxTemplate::default()
         };

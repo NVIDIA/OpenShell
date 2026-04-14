@@ -13,7 +13,7 @@ use openshell_core::proto::compute::v1::{
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
 
-use crate::KubernetesComputeDriver;
+use crate::{KubernetesComputeDriver, KubernetesDriverError};
 
 #[derive(Debug, Clone)]
 pub struct ComputeDriverService {
@@ -140,7 +140,7 @@ impl ComputeDriver for ComputeDriverService {
             .resolve_sandbox_endpoint(&sandbox)
             .await
             .map(Response::new)
-            .map_err(Status::internal)
+            .map_err(status_from_driver_error)
     }
 
     type WatchSandboxesStream =
@@ -157,5 +157,28 @@ impl ComputeDriver for ComputeDriverService {
             .map_err(Status::internal)?;
         let stream = stream.map(|item| item.map_err(|err| Status::internal(err.to_string())));
         Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+fn status_from_driver_error(err: KubernetesDriverError) -> Status {
+    match err {
+        KubernetesDriverError::AlreadyExists => Status::already_exists("sandbox already exists"),
+        KubernetesDriverError::Precondition(message) => Status::failed_precondition(message),
+        KubernetesDriverError::Message(message) => Status::internal(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn precondition_driver_errors_map_to_failed_precondition_status() {
+        let status = status_from_driver_error(KubernetesDriverError::Precondition(
+            "sandbox agent pod IP is not available".to_string(),
+        ));
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status.message(), "sandbox agent pod IP is not available");
     }
 }
