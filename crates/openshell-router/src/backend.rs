@@ -83,18 +83,19 @@ impl StreamingProxyResponse {
     }
 }
 
-/// Build and send an HTTP request to the backend configured in `route`.
+/// Build an HTTP request to the backend configured in `route`.
 ///
-/// Returns the [`reqwest::Response`] with status, headers, and an un-consumed
-/// body stream. Shared by both the buffered and streaming public APIs.
-async fn send_backend_request(
+/// Returns the prepared [`reqwest::RequestBuilder`] with auth, headers, model
+/// rewrite, and body applied. The caller decides whether to apply a total
+/// request timeout before sending.
+fn prepare_backend_request(
     client: &reqwest::Client,
     route: &ResolvedRoute,
     method: &str,
     path: &str,
-    headers: Vec<(String, String)>,
+    headers: &[(String, String)],
     body: bytes::Bytes,
-) -> Result<reqwest::Response, RouterError> {
+) -> Result<(reqwest::RequestBuilder, String), RouterError> {
     let url = build_backend_url(&route.endpoint, path);
 
     let reqwest_method: reqwest::Method = method
@@ -118,7 +119,7 @@ async fn send_backend_request(
     let strip_headers: [&str; 3] = ["authorization", "x-api-key", "host"];
 
     // Forward non-sensitive headers.
-    for (name, value) in &headers {
+    for (name, value) in headers {
         let name_lc = name.to_ascii_lowercase();
         if strip_headers.contains(&name_lc.as_str()) {
             continue;
@@ -149,17 +150,57 @@ async fn send_backend_request(
         }
         Err(_) => body,
     };
-    builder = builder.body(body).timeout(route.timeout);
+    builder = builder.body(body);
 
-    builder.send().await.map_err(|e| {
-        if e.is_timeout() {
-            RouterError::UpstreamUnavailable(format!("request to {url} timed out"))
-        } else if e.is_connect() {
-            RouterError::UpstreamUnavailable(format!("failed to connect to {url}: {e}"))
-        } else {
-            RouterError::Internal(format!("HTTP request failed: {e}"))
-        }
-    })
+    Ok((builder, url))
+}
+
+/// Send an error-mapped request, shared by both buffered and streaming paths.
+fn map_send_error(e: reqwest::Error, url: &str) -> RouterError {
+    if e.is_timeout() {
+        RouterError::UpstreamUnavailable(format!("request to {url} timed out"))
+    } else if e.is_connect() {
+        RouterError::UpstreamUnavailable(format!("failed to connect to {url}: {e}"))
+    } else {
+        RouterError::Internal(format!("HTTP request failed: {e}"))
+    }
+}
+
+/// Build and send an HTTP request to the backend with a total request timeout.
+///
+/// The timeout covers the entire request lifecycle (connect + headers + body).
+/// Suitable for non-streaming responses where the body is buffered completely.
+async fn send_backend_request(
+    client: &reqwest::Client,
+    route: &ResolvedRoute,
+    method: &str,
+    path: &str,
+    headers: Vec<(String, String)>,
+    body: bytes::Bytes,
+) -> Result<reqwest::Response, RouterError> {
+    let (builder, url) = prepare_backend_request(client, route, method, path, &headers, body)?;
+    builder
+        .timeout(route.timeout)
+        .send()
+        .await
+        .map_err(|e| map_send_error(e, &url))
+}
+
+/// Build and send an HTTP request without a total request timeout.
+///
+/// For streaming responses, the total duration is unbounded — liveness is
+/// enforced by the caller's per-chunk idle timeout instead. Connection
+/// establishment is still bounded by the client-level `connect_timeout`.
+async fn send_backend_request_streaming(
+    client: &reqwest::Client,
+    route: &ResolvedRoute,
+    method: &str,
+    path: &str,
+    headers: Vec<(String, String)>,
+    body: bytes::Bytes,
+) -> Result<reqwest::Response, RouterError> {
+    let (builder, url) = prepare_backend_request(client, route, method, path, &headers, body)?;
+    builder.send().await.map_err(|e| map_send_error(e, &url))
 }
 
 fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, ValidationFailure> {
@@ -408,7 +449,8 @@ pub async fn proxy_to_backend_streaming(
     headers: Vec<(String, String)>,
     body: bytes::Bytes,
 ) -> Result<StreamingProxyResponse, RouterError> {
-    let response = send_backend_request(client, route, method, path, headers, body).await?;
+    let response =
+        send_backend_request_streaming(client, route, method, path, headers, body).await?;
     let (status, resp_headers) = extract_response_metadata(&response);
 
     Ok(StreamingProxyResponse {

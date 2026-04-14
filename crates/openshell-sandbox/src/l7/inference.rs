@@ -352,6 +352,21 @@ pub fn format_chunk_terminator() -> &'static [u8] {
     b"0\r\n\r\n"
 }
 
+/// Format an SSE error event for injection into a streaming response.
+///
+/// Sent just before the chunked terminator when the proxy truncates a stream
+/// due to timeout, byte limit, or upstream error. Clients parsing SSE events
+/// can detect this and surface the error instead of silently losing data.
+///
+/// The `reason` must NOT contain internal URLs, hostnames, or credentials —
+/// the OCSF log captures full detail server-side.
+pub fn format_sse_error(reason: &str) -> Vec<u8> {
+    // Escape any quotes in the reason to produce valid JSON.
+    let escaped = reason.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("data: {{\"error\":{{\"message\":\"{escaped}\",\"type\":\"proxy_stream_error\"}}}}\n\n")
+        .into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,5 +679,34 @@ mod tests {
             ),
             "Must reject request with both TE and CL"
         );
+    }
+
+    #[test]
+    fn format_sse_error_produces_valid_sse_json() {
+        let output = format_sse_error("chunk idle timeout exceeded");
+        let text = std::str::from_utf8(&output).expect("should be valid utf8");
+
+        // Must start with "data: " (SSE format)
+        assert!(text.starts_with("data: "), "must be an SSE data line");
+
+        // Must end with double newline (SSE event boundary)
+        assert!(text.ends_with("\n\n"), "must end with SSE event boundary");
+
+        // The JSON payload between "data: " and "\n\n" must parse
+        let json_str = text.trim_start_matches("data: ").trim_end();
+        let parsed: serde_json::Value = serde_json::from_str(json_str).expect("must be valid JSON");
+
+        assert_eq!(parsed["error"]["type"], "proxy_stream_error");
+        assert_eq!(parsed["error"]["message"], "chunk idle timeout exceeded");
+    }
+
+    #[test]
+    fn format_sse_error_escapes_quotes_in_reason() {
+        let output = format_sse_error("error: \"bad\" response");
+        let text = std::str::from_utf8(&output).unwrap();
+        let json_str = text.trim_start_matches("data: ").trim_end();
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("must produce valid JSON with escaped quotes");
+        assert_eq!(parsed["error"]["message"], "error: \"bad\" response");
     }
 }
