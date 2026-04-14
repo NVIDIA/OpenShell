@@ -1242,7 +1242,6 @@ async fn route_inference_request(
                     format_chunk, format_chunk_terminator, format_http_response_header,
                     format_sse_error,
                 };
-                use tokio::io::AsyncWriteExt;
 
                 let resp_headers = sanitize_inference_response_headers(
                     std::mem::take(&mut resp.headers).into_iter().collect(),
@@ -1252,12 +1251,14 @@ async fn route_inference_request(
                 let header_bytes = format_http_response_header(resp.status, &resp_headers);
                 write_all(tls_client, &header_bytes).await?;
 
-                // Wrap in a BufWriter to coalesce small SSE chunks into fewer
-                // TLS records, reducing per-chunk flush overhead.
-                let mut buf_writer =
-                    tokio::io::BufWriter::with_capacity(16 * 1024, &mut *tls_client);
-
                 // Stream body chunks with byte cap and idle timeout.
+                //
+                // Each upstream chunk is wrapped in HTTP chunked framing and
+                // flushed immediately so SSE events reach the client without
+                // delay. Unlike the previous per-byte write_all+flush, we
+                // coalesce the framing header + data + trailer into a single
+                // write_all call, reducing the number of TLS records per chunk
+                // from 3 to 1 while preserving incremental delivery.
                 let mut total_bytes: usize = 0;
                 loop {
                     match tokio::time::timeout(CHUNK_IDLE_TIMEOUT, resp.next_chunk()).await {
@@ -1272,11 +1273,11 @@ async fn route_inference_request(
                                 let err = format_sse_error(
                                     "response truncated: exceeded maximum streaming body size",
                                 );
-                                let _ = buf_writer.write_all(&format_chunk(&err)).await;
+                                let _ = write_all(tls_client, &format_chunk(&err)).await;
                                 break;
                             }
                             let encoded = format_chunk(&chunk);
-                            buf_writer.write_all(&encoded).await.into_diagnostic()?;
+                            write_all(tls_client, &encoded).await?;
                         }
                         Ok(Ok(None)) => break,
                         Ok(Err(e)) => {
@@ -1292,7 +1293,7 @@ async fn route_inference_request(
                                 .build();
                             ocsf_emit!(event);
                             let err = format_sse_error("response truncated: upstream read error");
-                            let _ = buf_writer.write_all(&format_chunk(&err)).await;
+                            let _ = write_all(tls_client, &format_chunk(&err)).await;
                             break;
                         }
                         Err(_) => {
@@ -1309,18 +1310,14 @@ async fn route_inference_request(
                             ocsf_emit!(event);
                             let err =
                                 format_sse_error("response truncated: chunk idle timeout exceeded");
-                            let _ = buf_writer.write_all(&format_chunk(&err)).await;
+                            let _ = write_all(tls_client, &format_chunk(&err)).await;
                             break;
                         }
                     }
                 }
 
-                // Terminate the chunked stream and flush remaining buffered data.
-                buf_writer
-                    .write_all(format_chunk_terminator())
-                    .await
-                    .into_diagnostic()?;
-                buf_writer.flush().await.into_diagnostic()?;
+                // Terminate the chunked stream.
+                write_all(tls_client, format_chunk_terminator()).await?;
             }
             Err(e) => {
                 {

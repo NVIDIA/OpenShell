@@ -471,26 +471,23 @@ fn config_resolves_routes_with_protocol() {
 
 /// Streaming proxy must not apply a total request timeout to the body stream.
 ///
-/// This test simulates a slow-generating model: the backend sends response
-/// headers immediately but then delivers body chunks with deliberate delays.
-/// The total wall-clock time exceeds the route timeout, but the streaming path
-/// must complete successfully because it relies on per-chunk idle timeouts
-/// (enforced by the sandbox relay loop) rather than a total request timeout.
+/// The backend delays its response longer than the route timeout. With the old
+/// code this would fail (reqwest's total `.timeout()` fires), but the streaming
+/// path now omits that timeout — only the client-level `connect_timeout` and
+/// the sandbox idle timeout govern liveness.
 #[tokio::test]
 async fn streaming_proxy_completes_despite_exceeding_route_timeout() {
     use std::time::Duration;
 
     let mock_server = MockServer::start().await;
 
-    // Build an SSE body with deliberate inter-chunk pauses.
-    // Each chunk arrives within idle-timeout bounds, but total time
-    // exceeds the route timeout (set to 2s below).
     let sse_body = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
         "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n",
         "data: [DONE]\n\n",
     );
 
+    // Delay the response 3s — longer than the 1s route timeout.
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(bearer_token("test-api-key"))
@@ -498,8 +495,7 @@ async fn streaming_proxy_completes_despite_exceeding_route_timeout() {
             ResponseTemplate::new(200)
                 .append_header("content-type", "text/event-stream")
                 .set_body_string(sse_body)
-                // Each chunk is delayed — total time will exceed route timeout.
-                .set_body_string(sse_body),
+                .set_delay(Duration::from_secs(3)),
         )
         .mount(&mock_server)
         .await;
@@ -513,8 +509,9 @@ async fn streaming_proxy_completes_despite_exceeding_route_timeout() {
         protocols: vec!["openai_chat_completions".to_string()],
         auth: AuthHeader::Bearer,
         default_headers: Vec::new(),
-        // Very short route timeout — streaming must NOT be constrained by this.
-        timeout: Duration::from_secs(2),
+        // Route timeout shorter than the backend delay — streaming must
+        // NOT be constrained by this.
+        timeout: Duration::from_secs(1),
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -524,7 +521,8 @@ async fn streaming_proxy_completes_despite_exceeding_route_timeout() {
     }))
     .unwrap();
 
-    // The streaming path should succeed — no total timeout applied.
+    // The streaming path should succeed despite the 3s delay exceeding
+    // the 1s route timeout.
     let mut resp = router
         .proxy_with_candidates_streaming(
             "openai_chat_completions",
@@ -535,7 +533,7 @@ async fn streaming_proxy_completes_despite_exceeding_route_timeout() {
             &candidates,
         )
         .await
-        .expect("streaming proxy should not fail");
+        .expect("streaming proxy should not be killed by route timeout");
 
     assert_eq!(resp.status, 200);
 
