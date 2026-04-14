@@ -9,6 +9,39 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+// ── Public default constants ────────────────────────────────────────────
+//
+// Canonical source for default values used across multiple crates.
+// Clap `default_value_t` annotations and runtime fallbacks should
+// reference these constants instead of hardcoding literals.
+
+/// Default SSH port inside sandbox containers.
+pub const DEFAULT_SSH_PORT: u16 = 2222;
+
+/// Default server / SSH gateway port.
+pub const DEFAULT_SERVER_PORT: u16 = 8080;
+
+/// Default container stop timeout in seconds (SIGTERM → SIGKILL).
+pub const DEFAULT_STOP_TIMEOUT_SECS: u32 = 10;
+
+/// Default allowed clock skew for SSH handshake validation, in seconds.
+pub const DEFAULT_SSH_HANDSHAKE_SKEW_SECS: u64 = 300;
+
+/// Default Podman bridge network name.
+pub const DEFAULT_NETWORK_NAME: &str = "openshell";
+
+/// Default OCI image for the openshell-sandbox supervisor binary.
+pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
+
+/// Default image pull policy for sandbox images.
+pub const DEFAULT_IMAGE_PULL_POLICY: &str = "missing";
+
+/// Default Kubernetes namespace for sandbox resources.
+pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
+
+/// CDI device identifier for requesting all NVIDIA GPUs.
+pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
+
 /// Compute backends the gateway can orchestrate sandboxes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,7 +125,7 @@ pub struct Config {
     pub sandbox_namespace: String,
 
     /// Default container image for sandboxes.
-    #[serde(default)]
+    #[serde(default = "default_sandbox_image")]
     pub sandbox_image: String,
 
     /// Kubernetes `imagePullPolicy` for sandbox pods (e.g. `Always`,
@@ -118,6 +151,10 @@ pub struct Config {
     /// Path for SSH CONNECT/upgrade requests.
     #[serde(default = "default_ssh_connect_path")]
     pub ssh_connect_path: String,
+
+    /// SSH listen port inside sandbox containers that expose a TCP endpoint.
+    #[serde(default = "default_sandbox_ssh_port")]
+    pub sandbox_ssh_port: u16,
 
     /// Filesystem path where the sandbox supervisor binds its SSH Unix
     /// socket. The supervisor is passed this path via
@@ -195,12 +232,13 @@ impl Config {
             database_url: String::new(),
             compute_drivers: default_compute_drivers(),
             sandbox_namespace: default_sandbox_namespace(),
-            sandbox_image: String::new(),
+            sandbox_image: default_sandbox_image(),
             sandbox_image_pull_policy: String::new(),
             grpc_endpoint: String::new(),
             ssh_gateway_host: default_ssh_gateway_host(),
             ssh_gateway_port: default_ssh_gateway_port(),
             ssh_connect_path: default_ssh_connect_path(),
+            sandbox_ssh_port: default_sandbox_ssh_port(),
             sandbox_ssh_socket_path: default_sandbox_ssh_socket_path(),
             ssh_handshake_secret: String::new(),
             ssh_handshake_skew_secs: default_ssh_handshake_skew_secs(),
@@ -302,6 +340,13 @@ impl Config {
         self
     }
 
+    /// Create a new configuration with the sandbox SSH port.
+    #[must_use]
+    pub const fn with_sandbox_ssh_port(mut self, port: u16) -> Self {
+        self.sandbox_ssh_port = port;
+        self
+    }
+
     /// Create a new configuration with the SSH handshake secret.
     #[must_use]
     pub fn with_ssh_handshake_secret(mut self, secret: impl Into<String>) -> Self {
@@ -350,6 +395,10 @@ fn default_sandbox_namespace() -> String {
     "default".to_string()
 }
 
+fn default_sandbox_image() -> String {
+    format!("{}/base:latest", crate::image::DEFAULT_COMMUNITY_REGISTRY)
+}
+
 fn default_compute_drivers() -> Vec<ComputeDriverKind> {
     vec![ComputeDriverKind::Kubernetes]
 }
@@ -359,7 +408,7 @@ fn default_ssh_gateway_host() -> String {
 }
 
 const fn default_ssh_gateway_port() -> u16 {
-    8080
+    DEFAULT_SERVER_PORT
 }
 
 fn default_ssh_connect_path() -> String {
@@ -370,8 +419,12 @@ fn default_sandbox_ssh_socket_path() -> String {
     "/run/openshell/ssh.sock".to_string()
 }
 
+const fn default_sandbox_ssh_port() -> u16 {
+    DEFAULT_SSH_PORT
+}
+
 const fn default_ssh_handshake_skew_secs() -> u64 {
-    300
+    DEFAULT_SSH_HANDSHAKE_SKEW_SECS
 }
 
 const fn default_ssh_session_ttl_secs() -> u64 {

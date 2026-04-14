@@ -8,6 +8,8 @@ description = "Build all Docker images"
 depends = [
   "build:docker:gateway",
   "build:docker:cluster",
+  "build:docker:supervisor",
+  "build:docker:supervisor-sideload",
 ]
 hide = true
 
@@ -22,8 +24,13 @@ run = "tasks/scripts/docker-build-image.sh gateway"
 hide = true
 
 ["build:docker:supervisor"]
-description = "Build the supervisor Docker image"
+description = "Build the standalone supervisor Docker image (Ubuntu-based, for K8s pods)"
 run = "tasks/scripts/docker-build-image.sh supervisor"
+hide = true
+
+["build:docker:supervisor-sideload"]
+description = "Build the supervisor sideload image (FROM scratch, for Podman image-volume mount)"
+run = "tasks/scripts/docker-build-image.sh supervisor-output"
 hide = true
 
 ["build:docker:cluster"]
@@ -36,6 +43,16 @@ description = "Alias for build:docker:gateway"
 depends = ["build:docker:gateway"]
 hide = true
 
+["docker:build:supervisor"]
+description = "Alias for build:docker:supervisor"
+depends = ["build:docker:supervisor"]
+hide = true
+
+["docker:build:supervisor-sideload"]
+description = "Alias for build:docker:supervisor-sideload"
+depends = ["build:docker:supervisor-sideload"]
+hide = true
+
 ["docker:build:cluster"]
 description = "Alias for build:docker:cluster"
 depends = ["build:docker:cluster"]
@@ -44,6 +61,11 @@ hide = true
 ["build:docker:cluster:multiarch"]
 description = "Build multi-arch cluster image and push to a registry"
 run = "tasks/scripts/docker-publish-multiarch.sh"
+hide = true
+
+["docker:build:cluster:multiarch"]
+description = "Alias for build:docker:cluster:multiarch"
+depends = ["build:docker:cluster:multiarch"]
 hide = true
 
 ["docker:cleanup"]

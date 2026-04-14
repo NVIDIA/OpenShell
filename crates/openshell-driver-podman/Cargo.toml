@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-driver-podman"
+description = "Podman compute driver for OpenShell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openshell-driver-podman"
+path = "src/main.rs"
+
+[dependencies]
+openshell-core = { path = "../openshell-core" }
+
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["transport"] }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+nix = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+miette = { workspace = true }
+
+[lints]
+workspace = true

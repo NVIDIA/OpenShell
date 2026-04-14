@@ -1445,4 +1445,73 @@ mod tests {
             .unwrap();
         assert_eq!(rx_b.recv().unwrap(), b"still-alive");
     }
+
+    /// `install_pre_exec_no_pty` runs drop_privileges and succeeds when the
+    /// current user/group is already the configured one (no actual uid change).
+    ///
+    /// This exercises the pre_exec hook end-to-end without needing root: a policy
+    /// with no run_as_user/group is a no-op when the process is already unprivileged.
+    #[cfg(unix)]
+    #[test]
+    fn pre_exec_always_calls_drop_privileges() {
+        use crate::policy::{
+            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
+        };
+
+        // No user/group configured and not running as root → drop_privileges is
+        // a no-op, so spawn succeeds regardless of the effective UID.
+        let policy = SandboxPolicy {
+            version: 0,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: None,
+                run_as_group: None,
+            },
+        };
+
+        // Skip if running as root: drop_privileges would try to switch to
+        // "sandbox" which may not exist in the test environment.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+
+        let mut cmd = Command::new("echo");
+        cmd.arg("drop-privileges-ok");
+        cmd.stdout(Stdio::piped());
+
+        unsafe_pty::install_pre_exec_no_pty(
+            &mut cmd,
+            policy,
+            None,
+            None, // no netns fd
+            #[cfg(target_os = "linux")]
+            crate::sandbox::linux::prepare(
+                &SandboxPolicy {
+                    version: 0,
+                    filesystem: FilesystemPolicy::default(),
+                    network: NetworkPolicy::default(),
+                    landlock: LandlockPolicy::default(),
+                    process: ProcessPolicy {
+                        run_as_user: None,
+                        run_as_group: None,
+                    },
+                },
+                None,
+            )
+            .expect("prepare should succeed in test environment"),
+        );
+
+        let output = cmd
+            .spawn()
+            .expect("spawn must succeed")
+            .wait_with_output()
+            .expect("wait_with_output");
+        assert!(output.status.success(), "echo should exit 0");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("drop-privileges-ok"),
+            "echo output should contain 'drop-privileges-ok'"
+        );
+    }
 }

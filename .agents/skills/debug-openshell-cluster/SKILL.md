@@ -7,16 +7,16 @@ description: Debug why a openshell cluster failed to start or is unhealthy. Use 
 
 Diagnose why a openshell cluster failed to start after `openshell gateway start`.
 
-Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor logs`, `openshell doctor exec`) to inspect and fix the cluster. Do **not** use raw `docker`, `ssh`, or `kubectl` commands directly — always go through the `openshell doctor` interface. The CLI auto-resolves local vs remote gateways, so the same commands work everywhere.
+Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor logs`, `openshell doctor exec`) to inspect and fix the cluster. Do **not** use raw `docker`, `podman`, `ssh`, or `kubectl` commands directly — always go through the `openshell doctor` interface. The CLI auto-resolves local vs remote gateways, so the same commands work everywhere.
 
 ## Overview
 
-`openshell gateway start` creates a Docker container running k3s with the OpenShell server deployed via Helm. The deployment stages, in order, are:
+`openshell gateway start` creates a container (via Docker or Podman) running k3s with the OpenShell server deployed via Helm. The build and deploy scripts use a container-engine abstraction layer (`tasks/scripts/container-engine.sh`) that auto-detects Docker or Podman and provides a unified `ce` command interface. Set `CONTAINER_ENGINE=docker` or `CONTAINER_ENGINE=podman` to override auto-detection. The deployment stages, in order, are:
 
 1. **Pre-deploy check**: `openshell gateway start` in interactive mode prompts to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start). `mise run cluster` always recreates before deploy.
 2. Ensure cluster image is available (local build or remote pull)
-3. Create Docker network (`openshell-cluster`) and volume (`openshell-cluster-{name}`)
-4. Create and start a privileged Docker container (`openshell-cluster-{name}`)
+3. Create container network (`openshell-cluster`) and volume (`openshell-cluster-{name}`)
+4. Create and start a privileged container (`openshell-cluster-{name}`)
 5. Wait for k3s to generate kubeconfig (up to 60s)
 6. **Clean stale nodes**: Remove any `NotReady` k3s nodes left over from previous container instances that reused the same persistent volume
 7. **Prepare local images** (if `OPENSHELL_PUSH_IMAGES` is set): In `internal` registry mode, bootstrap waits for the in-cluster registry and pushes tagged images there. In `external` mode, bootstrap uses legacy `ctr -n k8s.io images import` push-mode behavior.
@@ -28,10 +28,11 @@ Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor log
     - TLS secrets `openshell-server-tls` and `openshell-client-tls` exist in `openshell` namespace
     - Sandbox supervisor binary exists at `/opt/openshell/bin/openshell-sandbox` (emits `HEALTHCHECK_MISSING_SUPERVISOR` marker if absent)
 
-For local deploys, metadata endpoint selection now depends on Docker connectivity:
+For local deploys, metadata endpoint selection depends on the container engine and its connectivity:
 
 - default local Docker socket (`unix:///var/run/docker.sock`): `https://127.0.0.1:{port}` (default port 8080)
 - TCP Docker daemon (`DOCKER_HOST=tcp://<host>:<port>`): `https://<host>:{port}` for non-loopback hosts
+- Podman (rootless): `https://127.0.0.1:{port}` via `host.containers.internal` (the Podman equivalent of `host.docker.internal`)
 
 The host port is configurable via `--port` on `openshell gateway start` (default 8080) and is stored in `ClusterMetadata.gateway_port`.
 
@@ -41,7 +42,8 @@ The default cluster name is `openshell`. The container is `openshell-cluster-{na
 
 ## Prerequisites
 
-- Docker must be running (locally or on the remote host)
+- Docker or Podman must be running (locally or on the remote host). The build system auto-detects which engine is available; set `CONTAINER_ENGINE=docker` or `CONTAINER_ENGINE=podman` to override.
+- For rootless Podman: ensure the Podman socket is active (`systemctl --user start podman.socket`) and subuid/subgid ranges are configured (`sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami)`)
 - The `openshell` CLI must be available
 - For remote clusters: SSH access to the remote host
 
@@ -320,6 +322,8 @@ The entrypoint script selects DNS resolvers in this priority:
 3. Host gateway IP (Docker Desktop only, `192.168.*`)
 4. Fallback to `8.8.8.8` / `8.8.4.4`
 
+**Podman note:** Rootless Podman uses pasta (or slirp4netns) for network connectivity, which has different DNS behavior than Docker's built-in DNS at `127.0.0.11`. DNS resolution inside Podman containers typically inherits the host's `/etc/resolv.conf` directly. If DNS fails inside a Podman-managed cluster container, check the host's DNS configuration first.
+
 If DNS is broken, all image pulls from the distribution registry will fail, as will pods that need external network access.
 
 ## Common Failure Patterns
@@ -329,7 +333,7 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | `tls handshake eof` from `openshell status` | Server not running or mTLS credentials missing/mismatched | Check StatefulSet replicas (Step 3) and mTLS files (Step 6) |
 | StatefulSet `0/0` replicas | StatefulSet scaled to zero (failed deploy, manual scale-down, or Helm misconfiguration) | `openshell doctor exec -- kubectl -n openshell scale statefulset openshell --replicas=1` |
 | Local mTLS files missing | Deploy was interrupted before credentials were persisted | Extract from cluster secret `openshell-client-tls` (Step 6) |
-| Container not found | Image not built | `mise run docker:build:cluster` (local) or re-deploy (remote) |
+| Container not found | Image not built | `mise run docker:build:cluster` (local, works with both Docker and Podman) or re-deploy (remote) |
 | Container exited, OOMKilled | Insufficient memory | Increase host memory or reduce workload |
 | Container exited, non-zero exit | k3s crash, port conflict, privilege issue | Check `openshell doctor logs` for details |
 | `/readyz` fails | k3s still starting or crashed | Wait longer or check container logs for k3s errors |
@@ -343,6 +347,10 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | mTLS mismatch after redeploy | PKI rotated but workload not restarted, or rollout failed | Check that all three TLS secrets exist and that the openshell pod restarted after cert rotation (Step 6) |
 | Helm install job failed | Chart values error or dependency issue | `openshell doctor exec -- kubectl -n kube-system logs -l job-name=helm-install-openshell` |
 | NFD/GFD DaemonSets present (`node-feature-discovery`, `gpu-feature-discovery`) | Cluster was deployed before NFD/GFD were disabled (pre-simplify-device-plugin change) | These are harmless but add overhead. Clean up: `openshell doctor exec -- kubectl delete daemonset -n nvidia-device-plugin -l app.kubernetes.io/name=node-feature-discovery` and similarly for GFD. The `nvidia.com/gpu.present` node label is no longer applied; device plugin scheduling no longer requires it. |
+| Podman socket not found | Rootless Podman service not started | `systemctl --user start podman.socket` and verify with `podman info` |
+| Container creation fails with subuid/subgid error (Podman) | Missing user namespace ID mappings | `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami)` then `podman system migrate` |
+| Cgroups v1 detected (Podman) | Podman driver requires unified cgroup hierarchy | Set `systemd.unified_cgroup_hierarchy=1` kernel parameter and reboot |
+| `--restart=always` ignored (Podman rootless) | Rootless Podman does not support `--restart=always` for containers | Use a systemd user service instead: `loginctl enable-linger $(whoami)` then create a `~/.config/systemd/user/` unit |
 | Architecture mismatch (remote) | Built on arm64, deploying to amd64 | Cross-build the image for the target architecture |
 | Port conflict | Another service on the configured gateway host port (default 8080) | Stop conflicting service or use `--port` on `openshell gateway start` to pick a different host port |
 | gRPC connect refused to `127.0.0.1:443` in CI | Docker daemon is remote (`DOCKER_HOST=tcp://...`) but metadata still points to loopback | Verify metadata endpoint host matches `DOCKER_HOST` and includes non-loopback host |

@@ -8,9 +8,13 @@ Sandbox connect provides secure remote access into running sandbox environments.
 2. **Command execution** (`sandbox create -- <cmd>`) -- runs a command over SSH with stdout/stderr piped back
 3. **File sync** (`sandbox create --upload`) -- uploads local files into the sandbox before command execution
 
-Gateway connectivity is **supervisor-initiated**: the gateway never dials the sandbox pod. On startup, each sandbox's supervisor opens a long-lived bidirectional gRPC stream (`ConnectSupervisor`) to the gateway and holds it for the sandbox's lifetime. When a client asks the gateway for SSH, the gateway sends a `RelayOpen` message over that stream; the supervisor responds by initiating a `RelayStream` gRPC call that rides the same TCP+TLS+HTTP/2 connection as a new multiplexed stream. The supervisor bridges the bytes of that stream into a root-owned Unix socket where the embedded SSH daemon listens.
+Gateway connectivity is **supervisor-initiated**: the gateway never dials the sandbox pod. On startup, each sandbox's supervisor opens a long-lived bidirectional gRPC stream (`ConnectSupervisor`) to the gateway and holds it for the sandbox's lifetime. **`CreateSshSession` → HTTP CONNECT and `ExecSandbox` both depend on that registration**: `open_relay` blocks until a live `ConnectSupervisor` entry exists for the `sandbox_id`; if the supervisor never registers (wrong endpoint, bad env, crash loop), the client hits the supervisor-session wait timeout instead of getting a relay. When a client asks the gateway for SSH, the gateway sends a `RelayOpen` message over that stream; the supervisor responds by initiating a `RelayStream` gRPC call that rides the same TCP+TLS+HTTP/2 connection as a new multiplexed stream. The supervisor bridges the bytes of that stream into a root-owned Unix socket where the embedded SSH daemon listens. **The in-container sshd is reached only on that local Unix socket** — the supervisor `UnixStream::connect`s to it. Do not assume the relay path terminates at a container-exposed TCP listener for sshd; any optional TCP surface is separate from the gateway relay bridge.
 
 There is also a gateway-side `ExecSandbox` gRPC RPC that executes commands inside sandboxes without requiring an external SSH client. It uses the same relay mechanism.
+
+### Podman and relay environment
+
+The **Podman** compute driver (`crates/openshell-driver-podman/src/container.rs`, `build_env` / `build_container_spec`) must inject the same **relay-critical** environment variables into the container as the Kubernetes driver: `OPENSHELL_ENDPOINT` (gateway gRPC), `OPENSHELL_SANDBOX_ID`, and `OPENSHELL_SSH_SOCKET_PATH` (Unix path the embedded sshd binds and the supervisor dials). Without `OPENSHELL_SSH_SOCKET_PATH`, the in-container `openshell-sandbox` process does not know where to create the socket; without `OPENSHELL_ENDPOINT` / `OPENSHELL_SANDBOX_ID`, the supervisor cannot complete `ConnectSupervisor`, so the gateway never has a session to target with `RelayOpen`. Driver-owned keys overwrite user spec/template env so these cannot be overridden. **Podman container readiness** (libpod `HealthConfig` in `build_container_spec`) treats the sandbox as ready when a sentinel file exists, **or** `test -S` passes on the configured `sandbox_ssh_socket_path` (**supervisor / Unix-socket path**), **or** a legacy TCP listen check on the published SSH port — so the `Ready` phase used by `CreateSshSession` and the SSH tunnel can reflect Unix-socket–based startup, not only a TCP listener.
 
 ## Two-Plane Architecture
 
@@ -619,11 +623,11 @@ The sandbox SSH daemon's exit thread waits for the reader thread to finish forwa
 
 ### Sandbox environment variables
 
-These are injected into sandbox pods by the Kubernetes driver (`crates/openshell-driver-kubernetes/src/driver.rs`):
+These are injected into compute-backed sandboxes by the **Kubernetes** driver (`crates/openshell-driver-kubernetes/src/driver.rs`) and the **Podman** driver (`crates/openshell-driver-podman/src/container.rs`). Together they are required for **persistent `ConnectSupervisor` registration and relay** (see [Podman and relay environment](#podman-and-relay-environment) for the Podman-specific fix):
 
 | Variable | Description |
 |---|---|
-| `OPENSHELL_SSH_SOCKET_PATH` | Filesystem path for the embedded SSH server's Unix socket (default `/run/openshell/ssh.sock`) |
+| `OPENSHELL_SSH_SOCKET_PATH` | Filesystem path for the embedded SSH server's Unix socket (default `/run/openshell/ssh.sock`); must align with gateway `sandbox_ssh_socket_path` |
 | `OPENSHELL_ENDPOINT` | Gateway gRPC endpoint; the supervisor uses this to open `ConnectSupervisor` |
 | `OPENSHELL_SANDBOX_ID` | Identifier reported in `SupervisorHello` |
 

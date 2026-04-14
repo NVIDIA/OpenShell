@@ -49,6 +49,7 @@ COPY crates/openshell-bootstrap/Cargo.toml crates/openshell-bootstrap/Cargo.toml
 COPY crates/openshell-cli/Cargo.toml crates/openshell-cli/Cargo.toml
 COPY crates/openshell-core/Cargo.toml crates/openshell-core/Cargo.toml
 COPY crates/openshell-driver-kubernetes/Cargo.toml crates/openshell-driver-kubernetes/Cargo.toml
+COPY crates/openshell-driver-podman/Cargo.toml crates/openshell-driver-podman/Cargo.toml
 COPY crates/openshell-ocsf/Cargo.toml crates/openshell-ocsf/Cargo.toml
 COPY crates/openshell-policy/Cargo.toml crates/openshell-policy/Cargo.toml
 COPY crates/openshell-providers/Cargo.toml crates/openshell-providers/Cargo.toml
@@ -66,6 +67,7 @@ RUN mkdir -p \
       crates/openshell-cli/src \
       crates/openshell-core/src \
       crates/openshell-driver-kubernetes/src \
+      crates/openshell-driver-podman/src \
       crates/openshell-ocsf/src \
       crates/openshell-policy/src \
       crates/openshell-providers/src \
@@ -80,6 +82,8 @@ RUN mkdir -p \
     touch crates/openshell-core/src/lib.rs && \
     touch crates/openshell-driver-kubernetes/src/lib.rs && \
     printf 'fn main() {}\n' > crates/openshell-driver-kubernetes/src/main.rs && \
+    touch crates/openshell-driver-podman/src/lib.rs && \
+    printf 'fn main() {}\n' > crates/openshell-driver-podman/src/main.rs && \
     touch crates/openshell-ocsf/src/lib.rs && \
     touch crates/openshell-policy/src/lib.rs && \
     touch crates/openshell-providers/src/lib.rs && \
@@ -115,6 +119,7 @@ ARG OPENSHELL_CARGO_VERSION
 
 COPY crates/openshell-core/ crates/openshell-core/
 COPY crates/openshell-driver-kubernetes/ crates/openshell-driver-kubernetes/
+COPY crates/openshell-driver-podman/ crates/openshell-driver-podman/
 COPY crates/openshell-ocsf/ crates/openshell-ocsf/
 COPY crates/openshell-policy/ crates/openshell-policy/
 COPY crates/openshell-providers/ crates/openshell-providers/

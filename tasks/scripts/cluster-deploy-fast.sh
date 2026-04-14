@@ -5,6 +5,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/container-engine.sh"
+
 # Normalize cluster name: lowercase, replace invalid chars with hyphens
 normalize_name() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
@@ -30,7 +33,7 @@ log_duration() {
   echo "${label} took $((end - start))s"
 }
 
-if ! docker ps -q --filter "name=^${CONTAINER_NAME}$" --filter "health=healthy" | grep -q .; then
+if ! ce ps -q --filter "name=^${CONTAINER_NAME}$" --filter "health=healthy" | grep -q .; then
   echo "Error: Cluster container '${CONTAINER_NAME}' is not running or not healthy."
   echo "Start the cluster first with: mise run cluster"
   exit 1
@@ -38,7 +41,7 @@ fi
 
 # Run a command inside the cluster container with KUBECONFIG pre-configured.
 cluster_exec() {
-  docker exec "${CONTAINER_NAME}" sh -c "KUBECONFIG=/etc/rancher/k3s/k3s.yaml $*"
+  ce exec "${CONTAINER_NAME}" sh -c "KUBECONFIG=/etc/rancher/k3s/k3s.yaml $*"
 }
 
 # Path inside the container where the chart is copied for helm upgrades.
@@ -102,7 +105,7 @@ log_duration "Change detection" "${detect_start}" "${detect_end}"
 # recreated (e.g. via bootstrap).  A new container means the k3s state is
 # fresh and all images must be rebuilt and pushed regardless of source
 # fingerprints.
-current_container_id=$(docker inspect --format '{{.Id}}' "${CONTAINER_NAME}" 2>/dev/null || true)
+current_container_id=$(ce inspect --format '{{.Id}}' "${CONTAINER_NAME}" 2>/dev/null || true)
 
 if [[ -f "${DEPLOY_FAST_STATE_FILE}" ]]; then
   while IFS='=' read -r key value; do
@@ -315,11 +318,11 @@ if [[ "${build_supervisor}" == "1" ]]; then
   # Detect the cluster container's architecture so we cross-compile correctly.
   # Container objects lack an Architecture field (the Go template emits a
   # stray newline before erroring), so inspect the container's *image* instead.
-  _cluster_image=$(docker inspect --format '{{.Config.Image}}' "${CONTAINER_NAME}" 2>/dev/null)
-  CLUSTER_ARCH=$(docker image inspect --format '{{.Architecture}}' "${_cluster_image}" 2>/dev/null || echo "amd64")
+  _cluster_image=$(ce inspect --format '{{.Config.Image}}' "${CONTAINER_NAME}" 2>/dev/null)
+  CLUSTER_ARCH=$(ce image inspect --format '{{.Architecture}}' "${_cluster_image}" 2>/dev/null || echo "amd64")
 
-  # Detect the host (build) architecture in Docker's naming convention.
-  HOST_ARCH=$(docker info --format '{{.Architecture}}' 2>/dev/null || echo "amd64")
+  # Detect the host (build) architecture in the container engine's naming convention.
+  HOST_ARCH=$(ce_info_arch)
   # Normalize: Docker reports "aarch64" on ARM hosts but uses "arm64" elsewhere.
   case "${HOST_ARCH}" in
     aarch64) HOST_ARCH=arm64 ;;
@@ -353,10 +356,10 @@ if [[ "${build_supervisor}" == "1" ]]; then
     tasks/scripts/docker-build-image.sh supervisor-output
 
   # Copy the built binary into the running k3s container
-  docker exec "${CONTAINER_NAME}" mkdir -p /opt/openshell/bin
-  docker cp "${SUPERVISOR_BUILD_DIR}/openshell-sandbox" \
+  ce exec "${CONTAINER_NAME}" mkdir -p /opt/openshell/bin
+  ce cp "${SUPERVISOR_BUILD_DIR}/openshell-sandbox" \
     "${CONTAINER_NAME}:/opt/openshell/bin/openshell-sandbox"
-  docker exec "${CONTAINER_NAME}" chmod 755 /opt/openshell/bin/openshell-sandbox
+  ce exec "${CONTAINER_NAME}" chmod 755 /opt/openshell/bin/openshell-sandbox
 
   built_components+=("supervisor")
   supervisor_end=$(date +%s)
@@ -370,7 +373,7 @@ log_duration "Builds" "${build_start}" "${build_end}"
 declare -a pushed_images=()
 
 if [[ "${build_gateway}" == "1" ]]; then
-  docker tag "openshell/gateway:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}" 2>/dev/null || true
+  ce tag "openshell/gateway:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}" 2>/dev/null || true
   pushed_images+=("${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}")
   built_components+=("gateway")
 fi
@@ -379,7 +382,7 @@ if [[ "${#pushed_images[@]}" -gt 0 ]]; then
   push_start=$(date +%s)
   echo "Pushing updated images to local registry..."
   for image_ref in "${pushed_images[@]}"; do
-    docker push "${image_ref}"
+    ce push "${image_ref}"
   done
   push_end=$(date +%s)
   log_duration "Image push" "${push_start}" "${push_end}"
@@ -389,7 +392,7 @@ fi
 # the updated image from the registry.
 if [[ "${build_gateway}" == "1" ]]; then
   echo "Evicting stale gateway image from k3s..."
-  docker exec "${CONTAINER_NAME}" crictl rmi "${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}" >/dev/null 2>&1 || true
+  ce exec "${CONTAINER_NAME}" crictl rmi "${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}" >/dev/null 2>&1 || true
 fi
 
 if [[ "${needs_helm_upgrade}" == "1" ]]; then
@@ -401,8 +404,8 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
   fi
 
   # Copy the local chart source into the container so helm can read it.
-  docker exec "${CONTAINER_NAME}" rm -rf "${CONTAINER_CHART_DIR}"
-  docker cp deploy/helm/openshell "${CONTAINER_NAME}:${CONTAINER_CHART_DIR}"
+  ce exec "${CONTAINER_NAME}" rm -rf "${CONTAINER_CHART_DIR}"
+  ce cp deploy/helm/openshell "${CONTAINER_NAME}:${CONTAINER_CHART_DIR}"
 
   # grpcEndpoint must be explicitly set to https:// because the chart always
   # terminates mTLS (there is no server.tls.enabled toggle). Without this,

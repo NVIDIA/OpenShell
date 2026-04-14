@@ -678,14 +678,26 @@ fn run_ip(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Run an `ip netns exec` command inside a namespace.
+/// Run an `ip` command inside a network namespace via `nsenter --net=`.
+///
+/// We use `nsenter` instead of `ip netns exec` because `ip netns exec`
+/// remounts `/sys` to reflect the target namespace's sysfs entries. That
+/// sysfs remount requires real `CAP_SYS_ADMIN` in the host user namespace,
+/// which is unavailable in rootless container runtimes (e.g. rootless
+/// Podman). `nsenter --net=` enters only the network namespace without
+/// changing the mount namespace, avoiding the sysfs remount entirely.
+/// The supervisor's operations (addr add, link set, route add) are all
+/// netlink-based and do not need sysfs access.
 fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
-    let mut full_args = vec!["netns", "exec", netns, "ip"];
+    let ns_path = format!("/var/run/netns/{netns}");
+    let net_flag = format!("--net={ns_path}");
+
+    let mut full_args = vec![net_flag.as_str(), "--", "ip"];
     full_args.extend(args);
 
-    debug!(command = %format!("ip {}", full_args.join(" ")), "Running ip netns exec command");
+    debug!(command = %format!("nsenter {}", full_args.join(" ")), "Running ip in namespace via nsenter");
 
-    let output = Command::new("ip")
+    let output = Command::new("nsenter")
         .args(&full_args)
         .output()
         .into_diagnostic()?;
@@ -693,8 +705,8 @@ fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(miette::miette!(
-            "ip netns exec {} ip {} failed: {}",
-            netns,
+            "nsenter --net={} ip {} failed: {}",
+            ns_path,
             args.join(" "),
             stderr.trim()
         ));
@@ -703,17 +715,23 @@ fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Run an iptables command inside a network namespace.
+/// Run an iptables command inside a network namespace via `nsenter --net=`.
+///
+/// Uses `nsenter` instead of `ip netns exec` to avoid the sysfs remount
+/// that fails in rootless container runtimes. See `run_ip_netns` for details.
 fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<()> {
-    let mut full_args = vec!["netns", "exec", netns, iptables_cmd];
+    let ns_path = format!("/var/run/netns/{netns}");
+    let net_flag = format!("--net={ns_path}");
+
+    let mut full_args = vec![net_flag.as_str(), "--", iptables_cmd];
     full_args.extend(args);
 
     debug!(
-        command = %format!("ip {}", full_args.join(" ")),
-        "Running iptables in namespace"
+        command = %format!("nsenter {}", full_args.join(" ")),
+        "Running iptables in namespace via nsenter"
     );
 
-    let output = Command::new("ip")
+    let output = Command::new("nsenter")
         .args(&full_args)
         .output()
         .into_diagnostic()?;
@@ -721,8 +739,8 @@ fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(miette::miette!(
-            "ip netns exec {} {} failed: {}",
-            netns,
+            "nsenter --net={} {} failed: {}",
+            ns_path,
             iptables_cmd,
             stderr.trim()
         ));

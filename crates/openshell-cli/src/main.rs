@@ -1085,7 +1085,7 @@ enum SandboxCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Optional sandbox name (auto-generated when omitted).
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
         /// Sandbox source: a community sandbox name (e.g., `openclaw`), a path
@@ -1198,7 +1198,7 @@ enum SandboxCommands {
         no_auto_providers: bool,
 
         /// Command to run after "--" (defaults to an interactive shell).
-        #[arg(trailing_var_arg = true)]
+        #[arg(last = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
 
@@ -1688,6 +1688,23 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
         )
         .init();
+
+    // Propagate verbosity to the OpenSSH LogLevel used by SSH subprocesses.
+    // Only set the env var when it hasn't been explicitly overridden by the
+    // user, so `OPENSHELL_SSH_LOG_LEVEL=DEBUG openshell ...` still wins.
+    if std::env::var("OPENSHELL_SSH_LOG_LEVEL").is_err() {
+        let ssh_log_level = match cli.verbose {
+            0 => "ERROR",
+            1 => "INFO",
+            _ => "DEBUG",
+        };
+        // SAFETY: Called early in main() before spawning async tasks that
+        // read the environment, so no concurrent readers exist.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("OPENSHELL_SSH_LOG_LEVEL", ssh_log_level);
+        }
+    }
 
     match cli.command {
         // -----------------------------------------------------------
@@ -3355,6 +3372,58 @@ mod tests {
                 assert!(yes);
             }
             other => panic!("expected settings delete command, got: {other:?}"),
+        }
+    }
+
+    // ── sandbox create arg-shape tests ───────────────────────────────────
+
+    /// Verify that `sandbox create --name <value>` still parses as a named
+    /// option rather than a positional argument.  The `ArgValueCompleter`
+    /// attribute must be combined with `long` on the `name` field; without
+    /// `long`, clap treats the field as positional and `--name` is rejected.
+    #[test]
+    fn sandbox_create_name_is_a_named_flag() {
+        // Build the CLI app and try to parse `sandbox create --name foo`.
+        // `try_parse_from` returns Err if clap rejects the arguments.
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--name", "my-sb"]);
+        assert!(
+            result.is_ok(),
+            "sandbox create --name should parse as a named flag: {:?}",
+            result.err()
+        );
+        if let Ok(cli) = result {
+            if let Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { name, .. }),
+                ..
+            }) = cli.command
+            {
+                assert_eq!(name.as_deref(), Some("my-sb"));
+            } else {
+                panic!("expected SandboxCommands::Create");
+            }
+        }
+    }
+
+    /// Verify that `sandbox create` without `--name` still works (name is
+    /// optional and auto-generated when omitted).
+    #[test]
+    fn sandbox_create_name_is_optional() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create"]);
+        assert!(
+            result.is_ok(),
+            "sandbox create without --name should be accepted: {:?}",
+            result.err()
+        );
+        if let Ok(cli) = result {
+            if let Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { name, .. }),
+                ..
+            }) = cli.command
+            {
+                assert_eq!(name, None);
+            } else {
+                panic!("expected SandboxCommands::Create");
+            }
         }
     }
 

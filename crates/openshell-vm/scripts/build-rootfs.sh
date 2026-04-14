@@ -33,6 +33,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Source container engine abstraction (provides ce, ce_build, etc.)
+_CE_SEARCH="${SCRIPT_DIR}/../../../tasks/scripts/container-engine.sh"
+if [ -f "${_CE_SEARCH}" ]; then
+    source "${_CE_SEARCH}"
+else
+    # Fallback: if run from a different working directory, try repo root.
+    source "$(cd "${SCRIPT_DIR}/../../.." && pwd)/tasks/scripts/container-engine.sh"
+fi
+
 # Source pinned dependency versions (digests, checksums, commit SHAs).
 # Environment variables override pins — see pins.env for details.
 PINS_FILE="${SCRIPT_DIR}/../pins.env"
@@ -282,10 +291,10 @@ fi
 # ── Build base image with dependencies ─────────────────────────────────
 
 # Clean up any previous run
-docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+ce rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 
 echo "==> Building base image..."
-docker build --platform "${DOCKER_PLATFORM}" -t "${BASE_IMAGE_TAG}" \
+ce build --platform "${DOCKER_PLATFORM}" -t "${BASE_IMAGE_TAG}" \
     --build-arg "BASE_IMAGE=${VM_BASE_IMAGE}" -f - . <<'DOCKERFILE'
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
@@ -309,7 +318,7 @@ DOCKERFILE
 
 # Create a container and export the filesystem
 echo "==> Creating container..."
-docker create --platform "${DOCKER_PLATFORM}" --name "${CONTAINER_NAME}" "${BASE_IMAGE_TAG}" /bin/true
+ce create --platform "${DOCKER_PLATFORM}" --name "${CONTAINER_NAME}" "${BASE_IMAGE_TAG}" /bin/true
 
 echo "==> Exporting filesystem..."
 # Previous builds may leave overlayfs work/ dirs with permissions that
@@ -319,9 +328,9 @@ if [ -d "${ROOTFS_DIR}" ]; then
     rm -rf "${ROOTFS_DIR}"
 fi
 mkdir -p "${ROOTFS_DIR}"
-docker export "${CONTAINER_NAME}" | tar -C "${ROOTFS_DIR}" -xf -
+ce export "${CONTAINER_NAME}" | tar -C "${ROOTFS_DIR}" -xf -
 
-docker rm "${CONTAINER_NAME}"
+ce rm "${CONTAINER_NAME}"
 
 # ── Inject k3s binary ────────────────────────────────────────────────
 
@@ -505,9 +514,9 @@ pull_and_save() {
     # Try to pull; if the registry is unavailable, fall back to the
     # local Docker image cache (image may exist from a previous pull).
     echo "    pulling: ${image}..."
-    if ! docker pull --platform "${DOCKER_PLATFORM}" "${image}" --quiet 2>/dev/null; then
-        echo "    pull failed, checking local Docker cache..."
-        if ! docker image inspect "${image}" >/dev/null 2>&1; then
+    if ! ce pull --platform "${DOCKER_PLATFORM}" "${image}" --quiet 2>/dev/null; then
+        echo "    pull failed, checking local image cache..."
+        if ! ce image inspect "${image}" >/dev/null 2>&1; then
             echo "ERROR: image ${image} not available locally or from registry"
             exit 1
         fi
@@ -518,7 +527,7 @@ pull_and_save() {
     # Pipe through zstd for faster decompression and smaller tarballs.
     # k3s auto-imports .tar.zst files from the airgap images directory.
     # -T0 uses all CPU cores; -3 is a good speed/ratio tradeoff.
-    docker save "${image}" | zstd -T0 -3 -o "${output}"
+    ce save "${image}" | zstd -T0 -3 -o "${output}"
     # Cache for next rebuild.
     cp "${output}" "${cache}"
 }

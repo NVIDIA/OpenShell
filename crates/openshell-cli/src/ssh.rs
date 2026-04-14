@@ -134,6 +134,11 @@ async fn ssh_session_config(
 }
 
 fn ssh_base_command(proxy_command: &str) -> Command {
+    // SSH log level follows the program's verbosity.  main() maps the `-v`
+    // count to OPENSHELL_SSH_LOG_LEVEL; an explicit env-var override wins.
+    let ssh_log_level =
+        std::env::var("OPENSHELL_SSH_LOG_LEVEL").unwrap_or_else(|_| "ERROR".to_string());
+
     let mut command = Command::new("ssh");
     command
         .arg("-o")
@@ -145,7 +150,7 @@ fn ssh_base_command(proxy_command: &str) -> Command {
         .arg("-o")
         .arg("GlobalKnownHostsFile=/dev/null")
         .arg("-o")
-        .arg("LogLevel=ERROR")
+        .arg(format!("LogLevel={ssh_log_level}"))
         // Detect a dead relay within ~45s. The relay rides on a TCP connection
         // that the client has no way to observe silently dropping (gateway
         // restart, supervisor restart, cluster failover), so fall back to

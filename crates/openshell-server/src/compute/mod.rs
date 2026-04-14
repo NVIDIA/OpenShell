@@ -29,6 +29,9 @@ use openshell_core::proto::{
 use openshell_driver_kubernetes::{
     ComputeDriverService, KubernetesComputeConfig, KubernetesComputeDriver,
 };
+use openshell_driver_podman::{
+    ComputeDriverService as PodmanDriverService, PodmanComputeConfig, PodmanComputeDriver,
+};
 use prost::Message;
 use std::fmt;
 use std::pin::Pin;
@@ -50,15 +53,9 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 /// corresponding backend resource before it is considered orphaned.
 const ORPHAN_GRACE_PERIOD: Duration = Duration::from_secs(300);
 
-#[derive(Debug, thiserror::Error)]
-pub enum ComputeError {
-    #[error("sandbox already exists")]
-    AlreadyExists,
-    #[error("{0}")]
-    Precondition(String),
-    #[error("{0}")]
-    Message(String),
-}
+// Re-export the shared error type under the name used by this module.
+pub use openshell_core::ComputeDriverError as ComputeError;
+
 #[derive(Debug)]
 pub(crate) struct ManagedDriverProcess {
     child: std::sync::Mutex<Option<tokio::process::Child>>,
@@ -191,6 +188,14 @@ pub struct ComputeRuntime {
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
     sync_lock: Arc<Mutex<()>>,
+    /// Whether the compute driver legitimately produces loopback endpoints
+    /// (e.g. `127.0.0.1`) for sandbox SSH targets.  When `true`, the SSRF
+    /// checks in the SSH tunnel and exec proxy paths permit loopback addresses.
+    /// Link-local (`169.254.0.0/16`) is always blocked regardless of this flag
+    /// to prevent metadata-service access via DNS rebinding.  Podman and VM
+    /// drivers set this to `true`; Kubernetes uses pod/cluster IPs and sets
+    /// `false`.
+    allows_loopback_endpoints: bool,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -208,6 +213,7 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
+        allows_loopback_endpoints: bool,
     ) -> Result<Self, ComputeError> {
         let default_image = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
@@ -225,6 +231,7 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
             sync_lock: Arc::new(Mutex::new(())),
+            allows_loopback_endpoints,
         })
     }
 
@@ -248,6 +255,7 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            false,
         )
         .await
     }
@@ -262,6 +270,9 @@ impl ComputeRuntime {
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
         let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
+        // The VM driver resolves sandbox SSH endpoints to 127.0.0.1
+        // (gvproxy forwards host-side ports into the guest), so loopback
+        // targets are legitimate and must be allowed through the SSRF check.
         Self::from_driver(
             driver,
             driver_process,
@@ -270,6 +281,32 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            true,
+        )
+        .await
+    }
+
+    pub async fn new_podman(
+        config: PodmanComputeConfig,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    ) -> Result<Self, ComputeError> {
+        let driver = PodmanComputeDriver::new(config)
+            .await
+            .map_err(|err| ComputeError::Message(err.to_string()))?;
+        let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
+        Self::from_driver(
+            driver,
+            None,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+            true,
         )
         .await
     }
@@ -277,6 +314,13 @@ impl ComputeRuntime {
     #[must_use]
     pub fn default_image(&self) -> &str {
         &self.default_image
+    }
+
+    /// Whether the compute driver legitimately produces loopback/link-local
+    /// endpoints for sandbox SSH targets (e.g. rootless Podman).
+    #[must_use]
+    pub fn allows_loopback_endpoints(&self) -> bool {
+        self.allows_loopback_endpoints
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
@@ -1147,7 +1191,14 @@ fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Opti
 
 fn is_terminal_failure_reason(reason: &str) -> bool {
     let reason = reason.to_ascii_lowercase();
-    let transient_reasons = ["reconcilererror", "dependenciesnotready", "starting"];
+    let transient_reasons = [
+        "reconcilererror",
+        "dependenciesnotready",
+        "starting",
+        "containerstarting",
+        "healthcheckstarting",
+        "inspectfailed",
+    ];
     !transient_reasons.contains(&reason.as_str())
 }
 
@@ -1278,6 +1329,7 @@ mod tests {
             tracing_log_bus: TracingLogBus::new(),
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
             sync_lock: Arc::new(Mutex::new(())),
+            allows_loopback_endpoints: false,
         }
     }
 
