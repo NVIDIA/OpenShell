@@ -1610,6 +1610,62 @@ fn generate_security_notes(host: &str, port: u16) -> String {
     notes.join(" ")
 }
 
+/// Reject proposed rules whose endpoints or `allowed_ips` target
+/// always-blocked addresses (loopback, link-local, unspecified).
+///
+/// This is defense-in-depth: the proxy blocks these at runtime, so
+/// merging them into the active policy would be silently un-enforceable.
+fn validate_rule_not_always_blocked(
+    rule: &openshell_core::proto::NetworkPolicyRule,
+) -> Result<(), Status> {
+    use openshell_core::net::{is_always_blocked_ip, is_always_blocked_net};
+    use std::net::IpAddr;
+
+    for ep in &rule.endpoints {
+        // Check if the endpoint host is a literal always-blocked IP.
+        if let Ok(ip) = ep.host.parse::<IpAddr>() {
+            if is_always_blocked_ip(ip) {
+                return Err(Status::invalid_argument(format!(
+                    "proposed rule endpoint host '{}' is an always-blocked address \
+                     (loopback/link-local/unspecified); the proxy will deny traffic \
+                     to this destination regardless of policy",
+                    ep.host
+                )));
+            }
+        }
+        let host_lc = ep.host.to_lowercase();
+        if host_lc == "localhost" || host_lc == "localhost." {
+            return Err(Status::invalid_argument(
+                "proposed rule endpoint host 'localhost' is always blocked; \
+                 the proxy will deny traffic to loopback regardless of policy"
+                    .to_string(),
+            ));
+        }
+
+        // Check allowed_ips entries.
+        for entry in &ep.allowed_ips {
+            let parsed = entry.parse::<ipnet::IpNet>().or_else(|_| {
+                entry.parse::<IpAddr>().map(|ip| match ip {
+                    IpAddr::V4(v4) => ipnet::IpNet::V4(ipnet::Ipv4Net::from(v4)),
+                    IpAddr::V6(v6) => ipnet::IpNet::V6(ipnet::Ipv6Net::from(v6)),
+                })
+            });
+            if let Ok(net) = parsed {
+                if is_always_blocked_net(net) {
+                    return Err(Status::invalid_argument(format!(
+                        "proposed rule contains always-blocked allowed_ips entry '{entry}'; \
+                         SSRF hardening prevents traffic to these destinations \
+                         regardless of policy"
+                    )));
+                }
+            }
+            // Invalid entries are not our concern here — the sandbox's
+            // parse_allowed_ips handles syntax validation.
+        }
+    }
+    Ok(())
+}
+
 async fn require_no_global_policy(state: &ServerState) -> Result<(), Status> {
     let global = load_global_settings(state.store.as_ref()).await?;
     if global.settings.contains_key(POLICY_SETTING_KEY) {
@@ -1630,6 +1686,11 @@ pub(super) async fn merge_chunk_into_policy(
 
     let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
         .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
+
+    // Defense-in-depth: reject proposed rules targeting always-blocked
+    // destinations.  Even if the sandbox mapper didn't filter these (e.g.,
+    // an older sandbox version), the proxy will deny them at runtime.
+    validate_rule_not_always_blocked(&rule)?;
 
     for attempt in 1..=MERGE_RETRY_LIMIT {
         let latest = store
@@ -2425,6 +2486,119 @@ mod tests {
         assert_eq!(policy.network_policies.len(), 2);
         assert!(policy.network_policies.contains_key("existing_rule"));
         assert!(policy.network_policies.contains_key("allow_10_0_0_5_8080"));
+    }
+
+    // ---- validate_rule_not_always_blocked ----
+
+    #[test]
+    fn validate_rule_rejects_loopback_allowed_ips() {
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+
+        let rule = NetworkPolicyRule {
+            name: "bad".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 80,
+                allowed_ips: vec!["127.0.0.1".to_string()],
+                ..Default::default()
+            }],
+            binaries: vec![],
+        };
+        let result = validate_rule_not_always_blocked(&rule);
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("always-blocked"));
+    }
+
+    #[test]
+    fn validate_rule_rejects_link_local_allowed_ips() {
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+
+        let rule = NetworkPolicyRule {
+            name: "bad".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 80,
+                allowed_ips: vec!["169.254.169.254".to_string()],
+                ..Default::default()
+            }],
+            binaries: vec![],
+        };
+        let result = validate_rule_not_always_blocked(&rule);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message().contains("always-blocked"));
+    }
+
+    #[test]
+    fn validate_rule_rejects_always_blocked_host() {
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+
+        let rule = NetworkPolicyRule {
+            name: "bad".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 80,
+                ..Default::default()
+            }],
+            binaries: vec![],
+        };
+        let result = validate_rule_not_always_blocked(&rule);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message().contains("always-blocked"));
+    }
+
+    #[test]
+    fn validate_rule_rejects_localhost_host() {
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+
+        let rule = NetworkPolicyRule {
+            name: "bad".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "localhost".to_string(),
+                port: 8080,
+                ..Default::default()
+            }],
+            binaries: vec![],
+        };
+        let result = validate_rule_not_always_blocked(&rule);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message().contains("always blocked"));
+    }
+
+    #[test]
+    fn validate_rule_accepts_rfc1918_allowed_ips() {
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+
+        let rule = NetworkPolicyRule {
+            name: "good".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "internal.corp".to_string(),
+                port: 443,
+                allowed_ips: vec!["10.0.5.0/24".to_string()],
+                ..Default::default()
+            }],
+            binaries: vec![],
+        };
+        let result = validate_rule_not_always_blocked(&rule);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_rule_accepts_public_host() {
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+
+        let rule = NetworkPolicyRule {
+            name: "good".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![],
+        };
+        let result = validate_rule_not_always_blocked(&rule);
+        assert!(result.is_ok());
     }
 
     // ---- Settings tests ----

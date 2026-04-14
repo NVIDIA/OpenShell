@@ -843,7 +843,61 @@ fn gateway_type_label(gateway: &GatewayMetadata) -> &'static str {
 }
 
 fn gateway_auth_label(gateway: &GatewayMetadata) -> &str {
-    gateway.auth_mode.as_deref().unwrap_or("unknown")
+    match gateway.auth_mode.as_deref() {
+        Some(auth_mode) => auth_mode,
+        None if gateway.gateway_endpoint.starts_with("http://") => "plaintext",
+        None => "mtls",
+    }
+}
+
+fn is_loopback_gateway_endpoint(endpoint: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(endpoint) else {
+        return false;
+    };
+
+    match parsed.host() {
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+fn plaintext_gateway_is_remote(endpoint: &str, remote: Option<&str>, local: bool) -> bool {
+    if local {
+        return false;
+    }
+    if remote.is_some() {
+        return true;
+    }
+    !is_loopback_gateway_endpoint(endpoint)
+}
+
+fn plaintext_gateway_metadata(
+    name: &str,
+    endpoint: &str,
+    remote: Option<&str>,
+    local: bool,
+) -> GatewayMetadata {
+    let (remote_host, resolved_host) = if let Some(dest) = remote {
+        let ssh_host = extract_host_from_ssh_destination(dest);
+        let resolved = resolve_ssh_hostname(&ssh_host);
+        (Some(dest.to_string()), Some(resolved))
+    } else {
+        (None, None)
+    };
+
+    GatewayMetadata {
+        name: name.to_string(),
+        gateway_endpoint: endpoint.to_string(),
+        is_remote: plaintext_gateway_is_remote(endpoint, remote, local),
+        gateway_port: 0,
+        remote_host,
+        resolved_host,
+        auth_mode: Some("plaintext".to_string()),
+        edge_team_domain: None,
+        edge_auth_url: None,
+    }
 }
 
 fn gateway_select_with<F>(
@@ -889,8 +943,12 @@ where
 
 /// Register an existing gateway.
 ///
-/// Without extra flags the gateway is treated as an edge-authenticated (cloud)
-/// gateway and a browser is opened for authentication.
+/// An `http://...` endpoint is registered as a direct plaintext gateway with
+/// no mTLS extraction or browser authentication.
+///
+/// Without extra flags, an `https://...` endpoint is treated as an
+/// edge-authenticated (cloud) gateway and a browser is opened for
+/// authentication.
 ///
 /// Pass `remote` (SSH destination) to register a remote mTLS gateway, or
 /// `local = true` for a local mTLS gateway. In both cases the CLI extracts
@@ -983,6 +1041,26 @@ pub async fn gateway_add(
             name,
             name,
         ));
+    }
+
+    if endpoint.starts_with("http://") {
+        let metadata = plaintext_gateway_metadata(name, &endpoint, remote, local);
+        let gateway_type = gateway_type_label(&metadata);
+        let gateway_auth = gateway_auth_label(&metadata);
+
+        store_gateway_metadata(name, &metadata)?;
+        save_active_gateway(name)?;
+
+        eprintln!(
+            "{} Gateway '{}' added and set as active",
+            "✓".green().bold(),
+            name,
+        );
+        eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint);
+        eprintln!("  {} {}", "Type:".dimmed(), gateway_type);
+        eprintln!("  {} {}", "Auth:".dimmed(), gateway_auth);
+
+        return Ok(());
     }
 
     if remote.is_some() || local {
@@ -5119,15 +5197,16 @@ fn format_timestamp_ms(ms: i64) -> String {
 mod tests {
     use super::{
         GatewayControlTarget, TlsOptions, format_gateway_select_header,
-        format_gateway_select_items, gateway_auth_label, gateway_select_with, gateway_type_label,
-        git_sync_files, http_health_check, image_requests_gpu, inferred_provider_type,
-        parse_cli_setting_value, parse_credential_pairs, provisioning_timeout_message,
-        ready_false_condition_message, resolve_gateway_control_target_from, sandbox_should_persist,
-        shell_escape, source_requests_gpu, validate_gateway_name, validate_ssh_host,
+        format_gateway_select_items, gateway_add, gateway_auth_label, gateway_select_with,
+        gateway_type_label, git_sync_files, http_health_check, image_requests_gpu,
+        inferred_provider_type, parse_cli_setting_value, parse_credential_pairs,
+        plaintext_gateway_is_remote, provisioning_timeout_message, ready_false_condition_message,
+        resolve_gateway_control_target_from, sandbox_should_persist, shell_escape,
+        source_requests_gpu, validate_gateway_name, validate_ssh_host,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
-    use openshell_bootstrap::{load_active_gateway, store_gateway_metadata};
+    use openshell_bootstrap::{load_active_gateway, load_gateway_metadata, store_gateway_metadata};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -5597,7 +5676,7 @@ mod tests {
         assert_eq!(gateway_type_label(&gateways[0]), "cloud");
         assert_eq!(gateway_type_label(&gateways[1]), "local");
         assert_eq!(gateway_auth_label(&gateways[0]), "cloudflare_jwt");
-        assert_eq!(gateway_auth_label(&gateways[1]), "unknown");
+        assert_eq!(gateway_auth_label(&gateways[1]), "plaintext");
         assert!(header.contains("NAME"));
         assert!(header.contains("ENDPOINT"));
         assert!(header.contains("TYPE"));
@@ -5607,8 +5686,102 @@ mod tests {
         assert!(items[0].contains("cloud"));
         assert!(items[0].contains("cloudflare_jwt"));
         assert!(items[1].contains("local"));
-        assert!(items[1].contains("unknown"));
+        assert!(items[1].contains("plaintext"));
         assert!(items[1].contains("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn gateway_auth_label_defaults_https_gateways_to_mtls() {
+        let gateway = GatewayMetadata {
+            name: "local".to_string(),
+            gateway_endpoint: "https://127.0.0.1:8080".to_string(),
+            is_remote: false,
+            gateway_port: 8080,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: None,
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+
+        assert_eq!(gateway_auth_label(&gateway), "mtls");
+    }
+
+    #[test]
+    fn plaintext_gateway_locality_infers_loopback_endpoints_as_local() {
+        assert!(!plaintext_gateway_is_remote(
+            "http://127.0.0.1:8080",
+            None,
+            false,
+        ));
+        assert!(!plaintext_gateway_is_remote(
+            "http://localhost:8080",
+            None,
+            false,
+        ));
+        assert!(!plaintext_gateway_is_remote(
+            "http://[::1]:8080",
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn plaintext_gateway_locality_treats_non_loopback_endpoints_as_remote_without_local_flag() {
+        assert!(plaintext_gateway_is_remote(
+            "http://gateway.example.com:8080",
+            None,
+            false,
+        ));
+        assert!(plaintext_gateway_is_remote(
+            "http://10.0.0.5:8080",
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn gateway_add_registers_plaintext_loopback_gateway_without_local_flag() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        with_tmp_xdg(tmpdir.path(), || {
+            let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+            runtime.block_on(async {
+                gateway_add("http://127.0.0.1:8080", None, None, None, false)
+                    .await
+                    .expect("register plaintext gateway");
+            });
+
+            let metadata = load_gateway_metadata("127.0.0.1").expect("load stored gateway");
+            assert_eq!(metadata.auth_mode.as_deref(), Some("plaintext"));
+            assert!(!metadata.is_remote);
+            assert_eq!(metadata.gateway_endpoint, "http://127.0.0.1:8080");
+            assert_eq!(load_active_gateway().as_deref(), Some("127.0.0.1"));
+        });
+    }
+
+    #[test]
+    fn gateway_add_respects_local_flag_for_plaintext_registrations() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        with_tmp_xdg(tmpdir.path(), || {
+            let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+            runtime.block_on(async {
+                gateway_add(
+                    "http://gateway.example.com:8080",
+                    Some("dev-http"),
+                    None,
+                    None,
+                    true,
+                )
+                .await
+                .expect("register plaintext gateway");
+            });
+
+            let metadata = load_gateway_metadata("dev-http").expect("load stored gateway");
+            assert_eq!(metadata.auth_mode.as_deref(), Some("plaintext"));
+            assert!(!metadata.is_remote);
+            assert_eq!(metadata.gateway_endpoint, "http://gateway.example.com:8080");
+            assert_eq!(load_active_gateway().as_deref(), Some("dev-http"));
+        });
     }
 
     #[tokio::test]

@@ -12,7 +12,97 @@ use miette::{IntoDiagnostic, Result};
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
-pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
+/// Result of probing the kernel for Landlock support.
+#[derive(Debug)]
+pub enum LandlockAvailability {
+    /// Landlock is available with the given ABI version.
+    Available { abi: i32 },
+    /// Kernel does not implement Landlock (ENOSYS).
+    NotImplemented,
+    /// Landlock is compiled in but not enabled at boot (EOPNOTSUPP).
+    NotEnabled,
+    /// Landlock syscall is blocked, likely by a container seccomp profile (EPERM).
+    Blocked,
+    /// Unexpected error from the probe syscall.
+    Unknown(i32),
+}
+
+impl std::fmt::Display for LandlockAvailability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Available { abi } => write!(f, "available (ABI v{abi})"),
+            Self::NotImplemented => {
+                write!(f, "not implemented (kernel lacks CONFIG_SECURITY_LANDLOCK)")
+            }
+            Self::NotEnabled => write!(
+                f,
+                "not enabled (Landlock built into kernel but not in active LSM list)"
+            ),
+            Self::Blocked => write!(
+                f,
+                "blocked (container seccomp profile denies Landlock syscalls)"
+            ),
+            Self::Unknown(errno) => write!(f, "unexpected probe error (errno {errno})"),
+        }
+    }
+}
+
+/// Probe the kernel for Landlock support by issuing the `landlock_create_ruleset`
+/// syscall with the version-check flag.
+///
+/// This is safe to call from the parent process and does not create any file
+/// descriptors or modify process state.
+pub fn probe_availability() -> LandlockAvailability {
+    // landlock_create_ruleset syscall number (same on x86_64 and aarch64).
+    const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+    // Flag: return the highest supported ABI version instead of creating a ruleset.
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1 << 0;
+
+    // SAFETY: landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)
+    // is a read-only probe that returns the ABI version or an error code.
+    // It does not allocate file descriptors or modify process state.
+    #[allow(unsafe_code)]
+    let ret = unsafe {
+        libc::syscall(
+            SYS_LANDLOCK_CREATE_RULESET,
+            std::ptr::null::<libc::c_void>(),
+            0_usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+
+    if ret >= 0 {
+        #[allow(clippy::cast_possible_truncation)]
+        LandlockAvailability::Available { abi: ret as i32 }
+    } else {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        match errno {
+            libc::ENOSYS => LandlockAvailability::NotImplemented,
+            libc::EOPNOTSUPP => LandlockAvailability::NotEnabled,
+            libc::EPERM => LandlockAvailability::Blocked,
+            other => LandlockAvailability::Unknown(other),
+        }
+    }
+}
+
+/// A prepared Landlock ruleset ready to be enforced via `restrict_self()`.
+///
+/// Created by [`prepare`] while running as root (so `PathFd::new()` can open
+/// any path regardless of DAC permissions). Enforced by [`enforce`] after
+/// `drop_privileges()` — `restrict_self()` does not require elevated privileges.
+pub struct PreparedRuleset {
+    ruleset: landlock::RulesetCreated,
+    compatibility: LandlockCompatibility,
+}
+
+/// Phase 1: Open PathFds and build the Landlock ruleset **as root**.
+///
+/// This must run before `drop_privileges()` so that `PathFd::new()` can open
+/// paths that are only accessible to root (e.g. mode 700 directories).
+///
+/// Returns `None` if there are no filesystem paths to restrict (no-op).
+/// Returns `Some(PreparedRuleset)` on success, or an error.
+pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<PreparedRuleset>> {
     let read_only = policy.filesystem.read_only.clone();
     let mut read_write = policy.filesystem.read_write.clone();
 
@@ -26,7 +116,7 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
     }
 
     if read_only.is_empty() && read_write.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let total_paths = read_only.len() + read_write.len();
@@ -47,7 +137,7 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
 
     let compatibility = &policy.landlock.compatibility;
 
-    let result: Result<()> = (|| {
+    let result: Result<PreparedRuleset> = (|| {
         let access_all = AccessFs::from_all(abi);
         let access_read = AccessFs::from_read(abi);
 
@@ -100,12 +190,56 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
                 .build()
         );
 
-        ruleset.restrict_self().into_diagnostic()?;
-        Ok(())
+        Ok(PreparedRuleset {
+            ruleset,
+            compatibility: compatibility.clone(),
+        })
     })();
 
+    match result {
+        Ok(prepared) => Ok(Some(prepared)),
+        Err(err) => {
+            if matches!(compatibility, LandlockCompatibility::BestEffort) {
+                openshell_ocsf::ocsf_emit!(
+                    openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
+                        .activity(openshell_ocsf::ActivityId::Open)
+                        .severity(openshell_ocsf::SeverityId::High)
+                        .confidence(openshell_ocsf::ConfidenceId::High)
+                        .is_alert(true)
+                        .finding_info(
+                            openshell_ocsf::FindingInfo::new(
+                                "landlock-unavailable",
+                                "Landlock Filesystem Sandbox Unavailable",
+                            )
+                            .with_desc(&format!(
+                                "Running WITHOUT filesystem restrictions: {err}. \
+                                 Set landlock.compatibility to 'hard_requirement' to make this fatal."
+                            )),
+                        )
+                        .message(format!("Landlock filesystem sandbox unavailable: {err}"))
+                        .build()
+                );
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Phase 2: Enforce a prepared Landlock ruleset by calling `restrict_self()`.
+///
+/// This runs **after** `drop_privileges()`. The `restrict_self()` syscall does
+/// not require root — it only restricts the calling thread (and its future
+/// children), which is always permitted.
+///
+/// Respects the same `best_effort` / `hard_requirement` compatibility as
+/// [`prepare`]: if `restrict_self()` fails and the policy is `best_effort`,
+/// the error is logged and the sandbox continues without Landlock.
+pub fn enforce(prepared: PreparedRuleset) -> Result<()> {
+    let result = prepared.ruleset.restrict_self().into_diagnostic();
     if let Err(err) = result {
-        if matches!(compatibility, LandlockCompatibility::BestEffort) {
+        if matches!(prepared.compatibility, LandlockCompatibility::BestEffort) {
             openshell_ocsf::ocsf_emit!(
                 openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
                     .activity(openshell_ocsf::ActivityId::Open)
@@ -114,22 +248,34 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
                     .is_alert(true)
                     .finding_info(
                         openshell_ocsf::FindingInfo::new(
-                            "landlock-unavailable",
-                            "Landlock Filesystem Sandbox Unavailable",
+                            "landlock-enforce-failed",
+                            "Landlock restrict_self Failed",
                         )
                         .with_desc(&format!(
-                            "Running WITHOUT filesystem restrictions: {err}. \
+                            "Ruleset was prepared but restrict_self() failed: {err}. \
+                             Running WITHOUT filesystem restrictions. \
                              Set landlock.compatibility to 'hard_requirement' to make this fatal."
                         )),
                     )
-                    .message(format!("Landlock filesystem sandbox unavailable: {err}"))
+                    .message(format!(
+                        "Landlock restrict_self failed (best_effort): {err}"
+                    ))
                     .build()
             );
             return Ok(());
         }
         return Err(err);
     }
+    Ok(())
+}
 
+/// Legacy single-phase apply. Kept for non-Linux platforms and tests.
+/// On Linux, callers should use [`prepare`] + [`enforce`] for correct
+/// privilege ordering.
+pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
+    if let Some(prepared) = prepare(policy, workdir)? {
+        enforce(prepared)?;
+    }
     Ok(())
 }
 
@@ -310,5 +456,24 @@ mod tests {
         // (the OpenCall variant is #[non_exhaustive] and can't be constructed directly).
         let err = PathFd::new("/nonexistent/openshell/classify/test").unwrap_err();
         assert_eq!(classify_path_fd_error(&err), "path does not exist");
+    }
+
+    #[test]
+    fn probe_availability_returns_a_result() {
+        // The probe should not panic regardless of whether Landlock is available.
+        // On Linux hosts with Landlock, this returns Available; on Docker Desktop
+        // linuxkit or older kernels, it returns NotImplemented/NotEnabled/Blocked.
+        let result = probe_availability();
+        let display = format!("{result}");
+        assert!(
+            !display.is_empty(),
+            "probe_availability Display should produce output"
+        );
+        // Verify the Debug impl works too.
+        let debug = format!("{result:?}");
+        assert!(
+            !debug.is_empty(),
+            "probe_availability Debug should produce output"
+        );
     }
 }

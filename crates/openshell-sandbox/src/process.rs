@@ -154,6 +154,19 @@ impl ProcessHandle {
             }
         }
 
+        // Probe Landlock availability and emit OCSF logs from the parent
+        // process where the tracing subscriber is functional. The child's
+        // pre_exec context cannot reliably emit structured logs.
+        #[cfg(target_os = "linux")]
+        sandbox::linux::log_sandbox_readiness(policy, workdir);
+
+        // Phase 1 (as root): Prepare Landlock ruleset by opening PathFds.
+        // This MUST happen before drop_privileges() so that root-only paths
+        // (e.g. mode 700 directories) can be opened. See issue #803.
+        #[cfg(target_os = "linux")]
+        let prepared_sandbox = sandbox::linux::prepare(policy, workdir)
+            .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
+
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
@@ -161,7 +174,10 @@ impl ProcessHandle {
         // setpgid and setns are async-signal-safe and safe to call in this context.
         {
             let policy = policy.clone();
-            let workdir = workdir.map(str::to_string);
+            // Wrap in Option so we can .take() it out of the FnMut closure.
+            // pre_exec is only called once (after fork, before exec).
+            #[cfg(target_os = "linux")]
+            let mut prepared_sandbox = Some(prepared_sandbox);
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
@@ -178,14 +194,20 @@ impl ProcessHandle {
                         }
                     }
 
-                    // Drop privileges before applying sandbox restrictions.
-                    // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
-                    // which may be blocked by Landlock.
+                    // Drop privileges. initgroups/setgid/setuid need access to
+                    // /etc/group and /etc/passwd which would be blocked if
+                    // Landlock were already enforced.
                     drop_privileges(&policy)
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
 
-                    sandbox::apply(&policy, workdir.as_deref())
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    // Phase 2 (as unprivileged user): Enforce the prepared
+                    // Landlock ruleset via restrict_self() + apply seccomp.
+                    // restrict_self() does not require root.
+                    #[cfg(target_os = "linux")]
+                    if let Some(prepared) = prepared_sandbox.take() {
+                        sandbox::linux::enforce(prepared)
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    }
 
                     Ok(())
                 });
@@ -566,10 +588,31 @@ mod tests {
     }
 
     #[test]
+    fn drop_privileges_succeeds_for_current_group() {
+        // Set only run_as_group (no run_as_user) so that initgroups() is not
+        // called.  initgroups(3) requires CAP_SETGID/root even when the target
+        // is the current user, so it cannot be exercised without elevated
+        // privileges.  This test covers the setgid() + GID post-condition
+        // verification path without needing root.
+        let current_group = Group::from_gid(nix::unistd::getegid())
+            .expect("getgrgid")
+            .expect("current group entry");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: Some(current_group.name),
+        });
+
+        assert!(drop_privileges(&policy).is_ok());
+    }
+
+    #[test]
+    #[ignore = "initgroups(3) requires CAP_SETGID; run as root: sudo cargo test -- --ignored"]
     fn drop_privileges_succeeds_for_current_user() {
-        // Resolve the current user's name so we can ask drop_privileges to
-        // "switch" to the user we're already running as.  This exercises the
-        // full verification path (getegid/geteuid checks) without needing root.
+        // Exercises the full privilege-drop path including initgroups(),
+        // setgid(), setuid(), and the root-reacquisition check.  Requires
+        // CAP_SETGID (root) because initgroups(3) calls setgroups(2)
+        // internally.  Fixes: https://github.com/NVIDIA/OpenShell/issues/622
         let current_user = User::from_uid(nix::unistd::geteuid())
             .expect("getpwuid")
             .expect("current user entry");

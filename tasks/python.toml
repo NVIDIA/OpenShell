@@ -20,99 +20,86 @@ description = "Alias for build:python:wheel"
 depends = ["build:python:wheel"]
 hide = true
 
-["build:python:wheel:multiarch"]
-description = "Build Python wheels for Linux amd64/arm64 with buildx"
+["build:python:wheel:linux"]
+description = "Build a Linux Python wheel natively on the current host"
 depends = ["python:proto"]
-run = """
+run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 
-sha256_16() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print substr($1, 1, 16)}'
-  else
-    shasum -a 256 "$1" | awk '{print substr($1, 1, 16)}'
+WHEEL_OUTPUT_DIR=${WHEEL_OUTPUT_DIR:?Set WHEEL_OUTPUT_DIR to a per-platform wheel output directory}
+EXPECTED_HOST_ARCH=${EXPECTED_HOST_ARCH:?Set EXPECTED_HOST_ARCH to amd64 or arm64}
+ORIGINAL_CARGO_TOML=""
+
+normalize_arch() {
+  case "$1" in
+    x86_64|amd64) echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    *) echo "$1" ;;
+  esac
+}
+
+cleanup() {
+  if [ -n "$ORIGINAL_CARGO_TOML" ] && [ -f "$ORIGINAL_CARGO_TOML" ]; then
+    cp "$ORIGINAL_CARGO_TOML" Cargo.toml
+    rm -f "$ORIGINAL_CARGO_TOML"
   fi
 }
 
-sha256_16_stdin() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum | awk '{print substr($1, 1, 16)}'
-  else
-    shasum -a 256 | awk '{print substr($1, 1, 16)}'
-  fi
-}
+trap cleanup EXIT
 
-PLATFORMS=${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}
-CARGO_VERSION=${OPENSHELL_CARGO_VERSION:-}
-if [ -z "$CARGO_VERSION" ] && [ -n "${CI:-}" ]; then
-  CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
+if [ "$(uname -s)" != "Linux" ]; then
+  echo "build:python:wheel:linux requires a Linux host" >&2
+  exit 1
 fi
 
-LOCK_HASH=$(sha256_16 Cargo.lock)
-RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-rustup-stable}
-CACHE_SCOPE_INPUT="v1|python-wheels|base|${LOCK_HASH}|${RUST_SCOPE}"
-CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "$CACHE_SCOPE_INPUT" | sha256_16_stdin)
-
-VERSION_ARGS=(
-  --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}"
-  ${OPENSHELL_IMAGE_TAG:+--build-arg "OPENSHELL_IMAGE_TAG=${OPENSHELL_IMAGE_TAG}"}
-)
-
-if [ -n "$CARGO_VERSION" ]; then
-  VERSION_ARGS+=(--build-arg "OPENSHELL_CARGO_VERSION=${CARGO_VERSION}")
+HOST_ARCH=$(normalize_arch "$(uname -m)")
+EXPECTED_HOST_ARCH=$(normalize_arch "$EXPECTED_HOST_ARCH")
+if [ "$HOST_ARCH" != "$EXPECTED_HOST_ARCH" ]; then
+  echo "build:python:wheel:linux expected ${EXPECTED_HOST_ARCH} host, got ${HOST_ARCH}" >&2
+  exit 1
 fi
 
-if ! docker buildx inspect multiarch >/dev/null 2>&1; then
-  echo "Creating multi-platform buildx builder..."
-  docker buildx create --name multiarch --use --bootstrap
+# Avoid failures when RUSTC_WRAPPER is set to an unresolved `sccache` binary.
+if command -v sccache >/dev/null 2>&1; then
+  export RUSTC_WRAPPER="$(command -v sccache)"
 else
-  docker buildx use multiarch
+  unset RUSTC_WRAPPER || true
 fi
 
-mkdir -p target/wheels
-
-USE_LOCAL_CACHE=0
-if [ -z "${CI:-}" ] && docker buildx inspect multiarch 2>/dev/null | grep -q "Driver: docker-container"; then
-  USE_LOCAL_CACHE=1
+if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then
+  ORIGINAL_CARGO_TOML=$(mktemp)
+  cp Cargo.toml "$ORIGINAL_CARGO_TOML"
+  sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml
 fi
 
-DOCKER_BUILD_CACHE_DIR=${DOCKER_BUILD_CACHE_DIR:-.cache/buildkit/python-wheels}
-if [ "$USE_LOCAL_CACHE" -eq 1 ]; then
-  mkdir -p "$DOCKER_BUILD_CACHE_DIR"
-fi
+rm -rf "$WHEEL_OUTPUT_DIR"
+mkdir -p "$WHEEL_OUTPUT_DIR"
 
-for platform in ${PLATFORMS//,/ }; do
-  echo "Building wheel for ${platform}..."
-  CACHE_ARGS=()
-  if [ "$USE_LOCAL_CACHE" -eq 1 ]; then
-    PLATFORM_CACHE_KEY=$(printf '%s' "$platform" | tr '/' '-')
-    PLATFORM_CACHE_PATH="${DOCKER_BUILD_CACHE_DIR}/${PLATFORM_CACHE_KEY}"
-    mkdir -p "$PLATFORM_CACHE_PATH"
-    CACHE_ARGS=(
-      --cache-from "type=local,src=${PLATFORM_CACHE_PATH}"
-      --cache-to "type=local,dest=${PLATFORM_CACHE_PATH},mode=max"
-    )
-  fi
+uv run maturin build --release --features bundled-z3 --out "$WHEEL_OUTPUT_DIR"
 
-  docker buildx build \
-    --builder multiarch \
-    --platform "${platform}" \
-    "${CACHE_ARGS[@]}" \
-    -f deploy/docker/Dockerfile.python-wheels \
-    --target wheels \
-    "${VERSION_ARGS[@]}" \
-    --output type=local,dest=target/wheels \
-    .
-done
-
-ls -la target/wheels/*.whl
-"""
+ls -la "$WHEEL_OUTPUT_DIR"/*.whl
+'''
 hide = true
 
-["python:build:multiarch"]
-description = "Alias for build:python:wheel:multiarch"
-depends = ["build:python:wheel:multiarch"]
+["build:python:wheel:linux:amd64"]
+description = "Build Python wheel for Linux amd64 natively"
+depends = ["EXPECTED_HOST_ARCH=amd64 WHEEL_OUTPUT_DIR=target/wheels/linux-amd64 build:python:wheel:linux"]
+hide = true
+
+["python:build:linux:amd64"]
+description = "Alias for build:python:wheel:linux:amd64"
+depends = ["build:python:wheel:linux:amd64"]
+hide = true
+
+["build:python:wheel:linux:arm64"]
+description = "Build Python wheel for Linux arm64 natively"
+depends = ["EXPECTED_HOST_ARCH=arm64 WHEEL_OUTPUT_DIR=target/wheels/linux-arm64 build:python:wheel:linux"]
+hide = true
+
+["python:build:linux:arm64"]
+description = "Alias for build:python:wheel:linux:arm64"
+depends = ["build:python:wheel:linux:arm64"]
 hide = true
 
 ["build:python:wheel:macos"]
@@ -204,16 +191,6 @@ description = "Alias for build:python:wheel:macos:docker"
 depends = ["build:python:wheel:macos:docker"]
 hide = true
 
-["build:python:wheel:all"]
-description = "Build Python wheels for Linux and macOS"
-depends = ["build:python:wheel", "build:python:wheel:multiarch", "build:python:wheel:macos"]
-hide = true
-
-["python:build:all"]
-description = "Alias for build:python:wheel:all"
-depends = ["build:python:wheel:all"]
-hide = true
-
 ["python:lint"]
 description = "Lint Python code with ruff"
 depends = ["python:proto"]
@@ -235,30 +212,6 @@ hide = true
 description = "Type check Python code with ty"
 depends = ["python:proto"]
 run = "uv run ty check {{vars.python_paths}}"
-hide = true
-
-["python:publish"]
-description = "Build and publish Python wheels"
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-VERSION=$(uv run python tasks/scripts/release.py get-version --python)
-CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run build:python:wheel:all
-uv run python tasks/scripts/release.py python-publish --version "$VERSION"
-"""
-hide = true
-
-["python:publish:macos"]
-description = "Build and publish macOS arm64 Python wheel"
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-VERSION=$(uv run python tasks/scripts/release.py get-version --python)
-CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
-uv run python tasks/scripts/release.py python-publish --version "$VERSION" --wheel-glob "*macosx*arm64.whl"
-"""
 hide = true
 
 ["python:proto"]

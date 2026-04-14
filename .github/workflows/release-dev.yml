@@ -89,14 +89,70 @@ jobs:
               "${REGISTRY}/${component}:${{ github.sha }}"
           done
 
-  build-python-wheels:
-    name: Stage Python Wheels
+  build-python-wheels-linux:
+    name: Build Python Wheels (Linux ${{ matrix.arch }})
+    needs: [compute-versions]
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: build-amd64
+            artifact: linux-amd64
+            task: python:build:linux:amd64
+            output_path: target/wheels/linux-amd64/*.whl
+          - arch: arm64
+            runner: build-arm64
+            artifact: linux-arm64
+            task: python:build:linux:arm64
+            output_path: target/wheels/linux-arm64/*.whl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
+      OPENSHELL_IMAGE_TAG: dev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Sync Python dependencies
+        run: uv sync
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: python-wheel-linux-${{ matrix.arch }}
+          cache-directories: .cache/sccache
+          cache-targets: "true"
+
+      - name: Build Python wheels
+        run: |
+          set -euo pipefail
+          OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" mise run ${{ matrix.task }}
+          ls -la ${{ matrix.output_path }}
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheels-${{ matrix.artifact }}
+          path: ${{ matrix.output_path }}
+          retention-days: 5
+
+  build-python-wheel-macos:
+    name: Build Python Wheel (macOS)
     needs: [compute-versions]
     runs-on: build-amd64
     timeout-minutes: 120
-    outputs:
-      wheel_version: ${{ needs.compute-versions.outputs.python_version }}
-      wheel_filenames: ${{ steps.filenames.outputs.wheel_filenames }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -126,24 +182,16 @@ jobs:
       - name: Sync Python dependencies
         run: uv sync
 
-      - name: Build Python wheels
+      - name: Build Python wheel
         run: |
           set -euo pipefail
-          OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" mise run python:build:multiarch
           OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" mise run python:build:macos
           ls -la target/wheels/*.whl
-
-      - name: Capture wheel filenames
-        id: filenames
-        run: |
-          set -euo pipefail
-          WHEEL_FILENAMES=$(ls target/wheels/*.whl | xargs -n1 basename | paste -sd, -)
-          echo "wheel_filenames=${WHEEL_FILENAMES}" >> "$GITHUB_OUTPUT"
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: python-wheels
+          name: python-wheels-macos
           path: target/wheels/*.whl
           retention-days: 5
 
@@ -335,9 +383,11 @@ jobs:
   # ---------------------------------------------------------------------------
   release-dev:
     name: Release Dev
-    needs: [build-cli-linux, build-cli-macos, build-python-wheels]
+    needs: [compute-versions, build-cli-linux, build-cli-macos, build-python-wheels-linux, build-python-wheel-macos]
     runs-on: build-amd64
     timeout-minutes: 10
+    outputs:
+      wheel_filenames: ${{ steps.wheel_filenames.outputs.wheel_filenames }}
     steps:
       - uses: actions/checkout@v4
 
@@ -351,8 +401,17 @@ jobs:
       - name: Download wheel artifacts
         uses: actions/download-artifact@v4
         with:
-          name: python-wheels
+          pattern: python-wheels-*
           path: release/
+          merge-multiple: true
+
+      - name: Capture wheel filenames
+        id: wheel_filenames
+        run: |
+          set -euo pipefail
+          ls -la release/*.whl
+          WHEEL_FILENAMES=$(ls release/*.whl | xargs -n1 basename | sort | paste -sd, -)
+          echo "wheel_filenames=${WHEEL_FILENAMES}" >> "$GITHUB_OUTPUT"
 
       - name: Generate checksums
         run: |
@@ -364,7 +423,7 @@ jobs:
       - name: Prune stale wheel assets from dev release
         uses: actions/github-script@v7
         env:
-          WHEEL_VERSION: ${{ needs.build-python-wheels.outputs.wheel_version }}
+          WHEEL_VERSION: ${{ needs.compute-versions.outputs.python_version }}
         with:
           script: |
             const wheelVersion = process.env.WHEEL_VERSION;
@@ -442,7 +501,7 @@ jobs:
 
   trigger-wheel-publish:
     name: Trigger Wheel Publish
-    needs: [compute-versions, build-python-wheels, release-dev]
+    needs: [compute-versions, release-dev]
     runs-on: [self-hosted, nv]
     timeout-minutes: 10
     steps:
@@ -451,7 +510,7 @@ jobs:
           GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
           GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
           RELEASE_VERSION: ${{ needs.compute-versions.outputs.python_version }}
-          WHEEL_FILENAMES: ${{ needs.build-python-wheels.outputs.wheel_filenames }}
+          WHEEL_FILENAMES: ${{ needs.release-dev.outputs.wheel_filenames }}
         run: |
           set -euo pipefail
           if [ -z "${WHEEL_FILENAMES}" ]; then

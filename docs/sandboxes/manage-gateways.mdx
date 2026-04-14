@@ -113,11 +113,19 @@ openshell gateway add ssh://user@remote-host:8080
 
 ### Local Gateway
 
-Register a gateway running locally that was started outside the CLI:
+Register a local mTLS gateway:
 
 ```shell
 openshell gateway add https://127.0.0.1:8080 --local
 ```
+
+Register a local plaintext gateway with no auth:
+
+```shell
+openshell gateway add http://127.0.0.1:8080 --local
+```
+
+When the endpoint uses `http://`, the CLI stores a direct plaintext registration. It does not extract mTLS certificates and it does not open the browser auth flow.
 
 ## Manage Multiple Gateways
 

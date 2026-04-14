@@ -19,6 +19,7 @@ miette = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
+ipnet = "2"
 
 [features]
 ## Include test-only settings (dummy_bool, dummy_int) in the registry.
