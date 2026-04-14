@@ -88,7 +88,7 @@ flowchart TD
 
 3. **Binary identity cache**: If OPA engine is active, create `Arc<BinaryIdentityCache::new()>` for SHA256 TOFU enforcement.
 
-4. **Filesystem preparation** (`prepare_filesystem()`): For each path in `filesystem.read_write`, create the directory if it does not exist and `chown` to the configured `run_as_user`/`run_as_group`. Runs as the supervisor (root) before forking.
+4. **Filesystem preparation** (`prepare_filesystem()`): For each path in `filesystem.read_write`, reject symlinks, create the directory if it does not exist, and `chown` only newly-created paths to the configured `run_as_user`/`run_as_group`. Pre-existing paths keep the image-defined ownership. Runs as the supervisor (root) before forking.
 
 5. **TLS state for L7 inspection** (proxy mode only):
    - Generate ephemeral CA via `SandboxCa::generate()` using `rcgen`

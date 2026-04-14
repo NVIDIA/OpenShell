@@ -1764,11 +1764,44 @@ fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
     Ok(())
 }
 
+/// Prepare a `read_write` path for the sandboxed process.
+///
+/// Returns `true` when the path was created by the supervisor and therefore
+/// still needs to be chowned to the sandbox user/group. Existing paths keep
+/// their image-defined ownership.
+#[cfg(unix)]
+fn prepare_read_write_path(path: &std::path::Path) -> Result<bool> {
+    // SECURITY: use symlink_metadata (lstat) to inspect each path *before*
+    // calling chown. chown follows symlinks, so a malicious container image
+    // could place a symlink (e.g. /sandbox -> /etc/shadow) to trick the
+    // root supervisor into transferring ownership of arbitrary files.
+    // The TOCTOU window between lstat and chown is not exploitable because
+    // no untrusted process is running yet (the child has not been forked).
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(miette::miette!(
+                "read_write path '{}' is a symlink — refusing to chown (potential privilege escalation)",
+                path.display()
+            ));
+        }
+
+        debug!(
+            path = %path.display(),
+            "Preserving ownership for existing read_write path"
+        );
+        Ok(false)
+    } else {
+        debug!(path = %path.display(), "Creating read_write directory");
+        std::fs::create_dir_all(path).into_diagnostic()?;
+        Ok(true)
+    }
+}
+
 /// Prepare filesystem for the sandboxed process.
 ///
 /// Creates `read_write` directories if they don't exist and sets ownership
-/// to the configured sandbox user/group. This runs as the supervisor (root)
-/// before forking the child process.
+/// on newly-created paths to the configured sandbox user/group. This runs as
+/// the supervisor (root) before forking the child process.
 #[cfg(unix)]
 fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     use nix::unistd::{Group, User, chown};
@@ -1810,31 +1843,17 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
         None
     };
 
-    // Create and chown each read_write path.
-    //
-    // SECURITY: use symlink_metadata (lstat) to inspect each path *before*
-    // calling chown.  chown follows symlinks, so a malicious container image
-    // could place a symlink (e.g. /sandbox -> /etc/shadow) to trick the
-    // root supervisor into transferring ownership of arbitrary files.
-    // The TOCTOU window between lstat and chown is not exploitable because
-    // no untrusted process is running yet (the child has not been forked).
+    // Create missing read_write paths and only chown the ones we created.
     for path in &policy.filesystem.read_write {
-        // Check for symlinks before touching the path.  Character/block devices
-        // (e.g. /dev/null) are legitimate read_write entries and must be allowed.
-        if let Ok(meta) = std::fs::symlink_metadata(path) {
-            if meta.file_type().is_symlink() {
-                return Err(miette::miette!(
-                    "read_write path '{}' is a symlink — refusing to chown (potential privilege escalation)",
-                    path.display()
-                ));
-            }
-        } else {
-            debug!(path = %path.display(), "Creating read_write directory");
-            std::fs::create_dir_all(path).into_diagnostic()?;
+        if prepare_read_write_path(path)? {
+            debug!(
+                path = %path.display(),
+                ?uid,
+                ?gid,
+                "Setting ownership on newly created read_write path"
+            );
+            chown(path, uid, gid).into_diagnostic()?;
         }
-
-        debug!(path = %path.display(), ?uid, ?gid, "Setting ownership on read_write directory");
-        chown(path, uid, gid).into_diagnostic()?;
     }
 
     Ok(())
@@ -2163,6 +2182,11 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
+    #[cfg(unix)]
+    use nix::unistd::{Group, User};
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, symlink};
     use temp_env::with_vars;
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -2582,5 +2606,101 @@ filesystem_policy:
         let read = cache.read().await;
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].model, "original-model");
+    }
+
+    #[cfg(unix)]
+    fn sandbox_policy_with_read_write(
+        path: std::path::PathBuf,
+        run_as_user: Option<String>,
+        run_as_group: Option<String>,
+    ) -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy {
+                read_only: vec![],
+                read_write: vec![path],
+                include_workdir: false,
+            },
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user,
+                run_as_group,
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_read_write_path_creates_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing").join("nested");
+
+        assert!(prepare_read_write_path(&missing).unwrap());
+        assert!(missing.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_read_write_path_preserves_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+
+        assert!(!prepare_read_write_path(&existing).unwrap());
+        assert!(existing.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_read_write_path_rejects_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = prepare_read_write_path(&link).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("is a symlink — refusing to chown"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_filesystem_skips_chown_for_existing_read_write_paths() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+
+        let current_user = User::from_uid(nix::unistd::geteuid())
+            .unwrap()
+            .expect("current user entry");
+        let restricted_group = Group::from_gid(nix::unistd::Gid::from_raw(0))
+            .unwrap()
+            .expect("gid 0 group entry");
+        if restricted_group.gid == nix::unistd::getegid() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let before = std::fs::metadata(&existing).unwrap();
+
+        let policy = sandbox_policy_with_read_write(
+            existing.clone(),
+            Some(current_user.name),
+            Some(restricted_group.name),
+        );
+
+        prepare_filesystem(&policy).expect("existing path should not be re-owned");
+
+        let after = std::fs::metadata(&existing).unwrap();
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
     }
 }

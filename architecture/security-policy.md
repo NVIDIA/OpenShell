@@ -322,7 +322,7 @@ Controls which filesystem paths the sandboxed process can access. Enforced via L
 
 **Enforcement mapping**: Each path becomes a Landlock `PathBeneath` rule. Read-only paths receive `AccessFs::from_read(ABI::V2)` permissions. Read-write paths receive `AccessFs::from_all(ABI::V2)` permissions (read, write, execute, create, delete, rename). All other paths are denied by the Landlock ruleset.
 
-**Filesystem preparation**: Before the child process spawns, the supervisor creates any `read_write` directories that do not exist and sets their ownership to `process.run_as_user`:`process.run_as_group` via `chown()`. See `crates/openshell-sandbox/src/lib.rs` -- `prepare_filesystem()`.
+**Filesystem preparation**: Before the child process spawns, the supervisor rejects symlinked `read_write` paths, creates any missing `read_write` directories, and sets ownership via `chown()` only on paths it created. Pre-existing image paths keep their existing ownership. See `crates/openshell-sandbox/src/lib.rs` -- `prepare_filesystem()`.
 
 **Working directory**: When `include_workdir` is `true` and a `--workdir` is specified, the working directory path is appended to `read_write` if not already present. See `crates/openshell-sandbox/src/sandbox/linux/landlock.rs` -- `apply()`.
 
