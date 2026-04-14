@@ -42,9 +42,16 @@ pub fn resolve_community_image(value: &str) -> String {
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn bare_name_expands_to_community_registry() {
+        let _guard = env_lock().lock().unwrap();
         let result = resolve_community_image("base");
         assert_eq!(
             result,
@@ -54,6 +61,7 @@ mod tests {
 
     #[test]
     fn bare_name_with_env_override() {
+        let _guard = env_lock().lock().unwrap();
         // Use a temp env override. Safety: test-only, and these env-var tests
         // are not run concurrently with other tests reading the same var.
         let key = "OPENSHELL_COMMUNITY_REGISTRY";
@@ -71,24 +79,28 @@ mod tests {
 
     #[test]
     fn full_reference_with_slash_passes_through() {
+        let _guard = env_lock().lock().unwrap();
         let input = "ghcr.io/myorg/myimage:v1";
         assert_eq!(resolve_community_image(input), input);
     }
 
     #[test]
     fn reference_with_colon_passes_through() {
+        let _guard = env_lock().lock().unwrap();
         let input = "myimage:latest";
         assert_eq!(resolve_community_image(input), input);
     }
 
     #[test]
     fn reference_with_dot_passes_through() {
+        let _guard = env_lock().lock().unwrap();
         let input = "registry.example.com";
         assert_eq!(resolve_community_image(input), input);
     }
 
     #[test]
     fn trailing_slash_in_env_is_trimmed() {
+        let _guard = env_lock().lock().unwrap();
         let key = "OPENSHELL_COMMUNITY_REGISTRY";
         let prev = std::env::var(key).ok();
         // SAFETY: single-threaded test context; no other thread reads this var.

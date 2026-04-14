@@ -4,8 +4,48 @@
 //! Configuration management for OpenShell components.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
+
+/// Compute backends the gateway can orchestrate sandboxes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeDriverKind {
+    Kubernetes,
+    Podman,
+}
+
+impl ComputeDriverKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Kubernetes => "kubernetes",
+            Self::Podman => "podman",
+        }
+    }
+}
+
+impl fmt::Display for ComputeDriverKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ComputeDriverKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "kubernetes" => Ok(Self::Kubernetes),
+            "podman" => Ok(Self::Podman),
+            other => Err(format!(
+                "unsupported compute driver '{other}'. expected one of: kubernetes, podman"
+            )),
+        }
+    }
+}
 
 /// Server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +63,14 @@ pub struct Config {
 
     /// Database URL for persistence.
     pub database_url: String,
+
+    /// Compute drivers configured for the gateway.
+    ///
+    /// The config shape allows multiple drivers so the gateway can evolve
+    /// toward multi-backend routing. Current releases require exactly one
+    /// configured driver.
+    #[serde(default = "default_compute_drivers")]
+    pub compute_drivers: Vec<ComputeDriverKind>,
 
     /// Kubernetes namespace for sandboxes.
     #[serde(default = "default_sandbox_namespace")]
@@ -120,6 +168,7 @@ impl Config {
             log_level: default_log_level(),
             tls,
             database_url: String::new(),
+            compute_drivers: default_compute_drivers(),
             sandbox_namespace: default_sandbox_namespace(),
             sandbox_image: String::new(),
             sandbox_image_pull_policy: String::new(),
@@ -154,6 +203,16 @@ impl Config {
     #[must_use]
     pub fn with_database_url(mut self, url: impl Into<String>) -> Self {
         self.database_url = url.into();
+        self
+    }
+
+    /// Create a new configuration with the configured compute drivers.
+    #[must_use]
+    pub fn with_compute_drivers<I>(mut self, drivers: I) -> Self
+    where
+        I: IntoIterator<Item = ComputeDriverKind>,
+    {
+        self.compute_drivers = drivers.into_iter().collect();
         self
     }
 
@@ -261,6 +320,10 @@ fn default_sandbox_namespace() -> String {
     "default".to_string()
 }
 
+fn default_compute_drivers() -> Vec<ComputeDriverKind> {
+    vec![ComputeDriverKind::Kubernetes]
+}
+
 fn default_ssh_gateway_host() -> String {
     "127.0.0.1".to_string()
 }
@@ -283,4 +346,35 @@ const fn default_ssh_handshake_skew_secs() -> u64 {
 
 const fn default_ssh_session_ttl_secs() -> u64 {
     86400 // 24 hours
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ComputeDriverKind, Config};
+
+    #[test]
+    fn compute_driver_kind_parses_supported_values() {
+        assert_eq!(
+            "kubernetes".parse::<ComputeDriverKind>().unwrap(),
+            ComputeDriverKind::Kubernetes
+        );
+        assert_eq!(
+            "podman".parse::<ComputeDriverKind>().unwrap(),
+            ComputeDriverKind::Podman
+        );
+    }
+
+    #[test]
+    fn compute_driver_kind_rejects_unknown_values() {
+        let err = "docker".parse::<ComputeDriverKind>().unwrap_err();
+        assert!(err.contains("unsupported compute driver 'docker'"));
+    }
+
+    #[test]
+    fn config_defaults_to_kubernetes_driver() {
+        assert_eq!(
+            Config::new(None).compute_drivers,
+            vec![ComputeDriverKind::Kubernetes]
+        );
+    }
 }
