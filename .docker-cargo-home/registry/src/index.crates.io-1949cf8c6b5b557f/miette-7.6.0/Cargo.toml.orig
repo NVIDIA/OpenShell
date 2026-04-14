@@ -1,0 +1,77 @@
+[package]
+name = "miette"
+version = "7.6.0"
+authors = ["Kat Marchán <kzm@zkat.tech>"]
+description = "Fancy diagnostic reporting library and protocol for us mere mortals who aren't compiler hackers."
+categories = ["rust-patterns"]
+repository = "https://github.com/zkat/miette"
+documentation = "https://docs.rs/miette"
+license = "Apache-2.0"
+readme = "README.md"
+edition = "2018"
+rust-version = "1.70.0"
+exclude = ["images/", "tests/", "miette-derive/"]
+
+[dependencies]
+miette-derive = { path = "miette-derive", version = "=7.6.0", optional = true }
+unicode-width = "0.1.11"
+cfg-if = "1.0.0"
+
+owo-colors = { version = "4.0.0", optional = true }
+textwrap = { version = "0.16.0", default-features = false, features = ["unicode-linebreak", "unicode-width"], optional = true }
+supports-hyperlinks = { version = "3.0.0", optional = true }
+supports-color = { version = "3.0.0", optional = true }
+supports-unicode = { version = "3.0.0", optional = true }
+backtrace = { version = "0.3.69", optional = true }
+terminal_size = { version = "0.4.0", optional = true }
+backtrace-ext = { version = "0.2.1", optional = true }
+serde = { version = "1.0.196", features = ["derive"], optional = true }
+syntect = { version = "5.1.0", optional = true }
+
+[dev-dependencies]
+thiserror = "2.0.11"
+semver = "1.0.21"
+
+# Eyre devdeps
+futures = { version = "0.3", default-features = false }
+indenter = "0.3.3"
+rustversion = "1.0"
+trybuild = { version = "1.0.89", features = ["diff"] }
+syn = { version = "2.0.87", features = ["full"] }
+regex = "1.10"
+lazy_static = "1.4"
+
+serde = { version = "1.0.196", features = ["derive"] }
+serde_json = "1.0.113"
+strip-ansi-escapes = "0.2.0"
+
+[features]
+default = ["derive"]
+derive = ["dep:miette-derive"]
+no-format-args-capture = []
+fancy-base = [
+    "dep:owo-colors",
+    "dep:textwrap",
+]
+fancy-no-syscall = [
+    "fancy-base",
+]
+fancy-no-backtrace = [
+    "fancy-base",
+    "dep:terminal_size",
+    "dep:supports-hyperlinks",
+    "dep:supports-color",
+    "dep:supports-unicode",
+]
+fancy = ["fancy-no-backtrace", "dep:backtrace", "dep:backtrace-ext"]
+syntect-highlighter = ["fancy-no-backtrace", "dep:syntect"]
+
+[workspace]
+members = ["miette-derive"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[[example]]
+name = "serde_json"
+required-features = ["fancy"]

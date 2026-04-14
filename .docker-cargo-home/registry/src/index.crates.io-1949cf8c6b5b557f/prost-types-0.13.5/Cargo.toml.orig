@@ -1,0 +1,28 @@
+[package]
+name = "prost-types"
+readme = "README.md"
+description = "Prost definitions of Protocol Buffers well known types."
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+default = ["std"]
+std = ["prost/std"]
+arbitrary = ["dep:arbitrary"]
+
+[dependencies]
+prost = { version = "0.13.5", path = "../prost", default-features = false, features = ["prost-derive"] }
+arbitrary = { version = "1.4", features = ["derive"], optional = true }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

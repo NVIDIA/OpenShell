@@ -1,0 +1,42 @@
+[package]
+name = "z3-sys"
+rust-version = "1.85.0"
+version = "0.10.9"
+authors = ["Graydon Hoare <graydon@pobox.com>", "Bruce Mitchener <bruce.mitchener@gmail.com>", "Nick Fitzgerald <fitzgen@gmail.com>", "Mark DenHoed <mark.denhoed@cs.ox.ac.uk>"]
+build = "build.rs"
+edition = "2024"
+
+description = "Low-level bindings for the Z3 SMT solver from Microsoft Research"
+license = "MIT"
+links = "z3"
+keywords = ["FFI", "SMT", "satisfiability", "solver"]
+categories = ["external-ffi-bindings", "no-std", "no-std::no-alloc"]
+readme = "README.md"
+documentation = "https://docs.rs/z3-sys/"
+homepage = "https://github.com/prove-rs/z3.rs"
+repository = "https://github.com/prove-rs/z3.rs.git"
+
+[build-dependencies]
+bindgen = { version = "0.72", default-features = false, features = ["runtime"] }
+cmake = { version = "0.1.54", optional = true }
+zip = { version = "8.2", optional = true }
+pkg-config = "0.3.32"
+reqwest = { version = "0.12.22", default-features = false, features = ["blocking"], optional = true }
+serde_json = { version = "1.0.140", optional = true }
+vcpkg = { version = "0.2.15", optional = true }
+
+[features]
+# Default features: enable reqwest's rusttls-tls implementation by default.
+# By omitting default features, you can use the `default-tls` impl,
+# and by specifying `reqwest-native-tls-vendored` you can use the vendored OpenSSL version
+default = ["reqwest-rustls"]
+reqwest-native-tls-vendored = ["reqwest/native-tls-vendored"]
+reqwest-rustls = ["reqwest/rustls-tls"]
+
+bundled = ["dep:reqwest", "dep:serde_json", "dep:zip", "dep:cmake"] # Build Z3 via our bundled submodule.
+vcpkg = ["dep:vcpkg"] # Build Z3 via vcpkg.
+gh-release = ["dep:reqwest", "dep:serde_json", "dep:zip"] # Download pre-compiled Z3 lib from GitHub release for supported platforms.
+
+# Legacy feature for short term compatibility
+static-link-z3 = ["bundled", "deprecated-static-link-z3"]
+deprecated-static-link-z3 = []

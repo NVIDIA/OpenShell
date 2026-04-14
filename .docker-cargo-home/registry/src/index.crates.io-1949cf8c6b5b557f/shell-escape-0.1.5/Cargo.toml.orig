@@ -1,0 +1,9 @@
+[package]
+name = "shell-escape"
+version = "0.1.5"
+authors = ["Steven Fackler <sfackler@gmail.com>"]
+license = "MIT/Apache-2.0"
+repository = "https://github.com/sfackler/shell-escape"
+description = "Escape characters that may have a special meaning in a shell"
+
+[dependencies]

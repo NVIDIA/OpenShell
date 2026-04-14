@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+
+# for `cargo flamegraph`
+/perf.data
+/perf.data.old
+/*.svg

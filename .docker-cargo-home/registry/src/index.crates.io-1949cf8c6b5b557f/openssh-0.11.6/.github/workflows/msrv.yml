@@ -1,0 +1,41 @@
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - 'build_doc.sh'
+      - 'check.sh'
+      - 'run_ci_tests.sh'
+      - 'start_sshd.sh'
+      - 'stop_sshd.sh'
+  pull_request:
+    paths-ignore:
+      - 'build_doc.sh'
+      - 'check.sh'
+      - 'run_ci_tests.sh'
+      - 'start_sshd.sh'
+      - 'stop_sshd.sh'
+name: Minimum Supported Rust Version
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install toolchain
+        run: |
+          rustup toolchain install 1.63 --no-self-update --profile minimal
+          rustup toolchain install nightly --no-self-update --profile minimal
+          rustup override set 1.63
+          rustup default 1.63
+      - uses: actions/checkout@v4
+
+      - name: cargo update -Zminimal-versions
+        run: cargo +nightly -Zminimal-versions update
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo +1.63.0 check
+        run: |
+          cargo +1.63 check

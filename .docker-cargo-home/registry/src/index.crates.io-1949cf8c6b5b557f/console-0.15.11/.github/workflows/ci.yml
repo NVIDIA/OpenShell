@@ -1,0 +1,153 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  build-msrv:
+    name: Build on MSRV (1.66)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rust: 1.66.0
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            rust: 1.66.0
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.rust }}
+          target: ${{ matrix.target }}
+          override: true
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Check
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: make check
+
+  test:
+    name: Tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            rust: stable
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rust: 1.66.0
+          - os: ubuntu-latest
+            target: i686-unknown-linux-gnu
+            rust: 1.66.0
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            rust: 1.66.0
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rust: 1.66.0
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rust: stable
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rust: beta
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.rust }}
+          target: ${{ matrix.target }}
+          override: true
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install linker
+        if: matrix.target == 'i686-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install gcc-multilib
+      - name: Copy MSRV Lock
+        run: make msrv-lock
+      - name: Test
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: make test
+  wasm-check:
+    name: WASM Check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: wasm32-unknown-unknown
+            os: ubuntu-latest
+          - target: wasm32-unknown-emscripten
+            os: ubuntu-latest
+          - target: wasm32-unknown-emscripten
+            os: windows-latest
+          - target: wasm32-unknown-emscripten
+            os: macos-latest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Check
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: make check
+  wasi:
+    name: WASI
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm32-wasip1]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install WasmTime
+        run: |
+          curl https://wasmtime.dev/install.sh -sSf | bash
+          curl -LO https://github.com/bytecodealliance/wasmtime/releases/download/v4.0.0/wasmtime-v4.0.0-x86_64-linux.tar.xz
+          tar xvf wasmtime-v4.0.0-x86_64-linux.tar.xz
+          echo `pwd`/wasmtime-v4.0.0-x86_64-linux >> $GITHUB_PATH
+      - name: Test
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: make test
+  nightly:
+    name: Nightly Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          override: true
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Test
+        run: make test

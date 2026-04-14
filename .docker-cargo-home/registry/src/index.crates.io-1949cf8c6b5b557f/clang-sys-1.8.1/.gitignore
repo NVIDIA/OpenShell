@@ -1,0 +1,5 @@
+.docs/
+bindgen-test/target/
+target/
+
+Cargo.lock

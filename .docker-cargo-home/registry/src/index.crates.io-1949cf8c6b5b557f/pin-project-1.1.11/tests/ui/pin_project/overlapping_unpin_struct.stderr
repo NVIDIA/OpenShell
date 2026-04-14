@@ -1,0 +1,26 @@
+error[E0277]: `PhantomPinned` cannot be unpinned
+  --> tests/ui/pin_project/overlapping_unpin_struct.rs:20:16
+   |
+20 |     is_unpin::<S<PhantomPinned>>(); //~ ERROR E0277
+   |                ^^^^^^^^^^^^^^^^ within `_::__S<'_, PhantomPinned>`, the trait `Unpin` is not implemented for `PhantomPinned`
+   |
+   = note: consider using the `pin!` macro
+           consider using `Box::pin` if you need to access the pinned value outside of the current scope
+note: required because it appears within the type `_::__S<'_, PhantomPinned>`
+  --> tests/ui/pin_project/overlapping_unpin_struct.rs:8:8
+   |
+ 8 | struct S<T> {
+   |        ^
+note: required for `S<PhantomPinned>` to implement `Unpin`
+  --> tests/ui/pin_project/overlapping_unpin_struct.rs:8:8
+   |
+ 7 | #[pin_project]
+   | -------------- type parameter would need to implement `Unpin`
+ 8 | struct S<T> {
+   |        ^^^^
+   = help: consider manually implementing `Unpin` to avoid undesired bounds
+note: required by a bound in `is_unpin`
+  --> tests/ui/pin_project/overlapping_unpin_struct.rs:17:16
+   |
+17 | fn is_unpin<T: Unpin>() {}
+   |                ^^^^^ required by this bound in `is_unpin`

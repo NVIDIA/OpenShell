@@ -1,0 +1,37 @@
+[package]
+name = "terminal-trx"
+description = "Provides a handle to the terminal of the current process"
+readme = "readme.md"
+repository = "https://github.com/tautropfli/terminal-trx"
+categories = ["command-line-interface"]
+license = "MIT OR Apache-2.0"
+version = "0.2.6"
+edition = "2021"
+rust-version = "1.74.0"
+exclude = [".github", ".gitignore", "*.sh"]
+
+[dependencies]
+cfg-if = "1.0.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.152"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Storage_FileSystem", "Win32_Foundation"] }
+
+[dev-dependencies]
+static_assertions = "1.1.0"
+
+[lints.rust]
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(terminal_trx_test_unsupported)"] }
+
+[lints.clippy]
+unimplemented = "warn"
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "warn"
+exhaustive_enums = "warn"
+exhaustive_structs = "warn"
+unwrap_used = "deny"
+use_debug = "warn"

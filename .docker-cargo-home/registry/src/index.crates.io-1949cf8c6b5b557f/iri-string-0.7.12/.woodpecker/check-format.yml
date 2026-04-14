@@ -1,0 +1,42 @@
+---
+# Checks if the sources are properly formatted.
+
+when:
+  - event: [manual, push, tag]
+
+variables:
+  rust_image: &rust_image 'library/rust:1.89.0-slim'
+  format_cmds: &format_cmds
+    - cp .woodpecker/cargo-config.toml $${CARGO_HOME}/config.toml
+    - rustup update --no-self-update $${RUST_CHANNEL} && rustup default $${RUST_CHANNEL}
+    - rustc --version && cargo --version
+    - rustup component add rustfmt
+    - cargo fmt --all -- --check
+
+clone:
+  git:
+    image: woodpeckerci/plugin-git
+    settings:
+      # Custom root CA certificate will be used in some local networks.
+      # The global environment variable WP_GIT_SKIP_VERIFY will be
+      # set to `true` in such environment.
+      skip-verify: ${WP_GIT_SKIP_VERIFY:-false}
+      lfs: false
+
+steps:
+  - name: rust format stable
+    image: *rust_image
+    commands:
+      - <<: *format_cmds
+    environment:
+      RUST_CHANNEL: stable
+    depends_on: []
+
+  - name: rust format beta
+    failure: ignore
+    image: *rust_image
+    commands:
+      - <<: *format_cmds
+    environment:
+      RUST_CHANNEL: beta
+    depends_on: []

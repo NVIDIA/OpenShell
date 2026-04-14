@@ -1,0 +1,24 @@
+[package]
+name = "stability"
+version = "0.2.1"
+description = "Rust API stability attributes for the rest of us."
+authors = ["Stephen M. Coakley <me@stephencoakley.com>"]
+license = "MIT"
+repository = "https://github.com/sagebind/stability"
+documentation = "https://docs.rs/stability/"
+readme = "README.md"
+edition = "2021"
+rust-version = "1.60"
+
+[dependencies]
+quote = "1"
+
+[dependencies.syn]
+version = "2"
+features = ["derive", "full"]
+
+[lib]
+proc-macro = true
+
+[workspace]
+members = ["example"]

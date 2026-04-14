@@ -1,0 +1,53 @@
+[package]
+name = "rustls-pki-types"
+version = "1.14.0"
+edition = "2021"
+rust-version = "1.60"
+license = "MIT OR Apache-2.0"
+description = "Shared types for the rustls PKI ecosystem"
+documentation = "https://docs.rs/rustls-pki-types"
+homepage = "https://github.com/rustls/pki-types"
+repository = "https://github.com/rustls/pki-types"
+categories = ["network-programming", "data-structures", "cryptography"]
+include = ["Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT", "src/**/*.rs", "README.md", "src/data/*.der"]
+
+[features]
+default = ["alloc"]
+alloc = ["dep:zeroize"]
+std = ["alloc"]
+web = ["web-time"]
+
+[dependencies]
+zeroize = { version = "1", optional = true }
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
+crabgrind = "=0.1.9" # compatible with valgrind package on GHA ubuntu-latest
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+web-time = { version = "1", optional = true }
+
+[lints.rust]
+elided_lifetimes_in_paths = "warn"
+trivial_numeric_casts = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(rustls_pki_types_docsrs)"] }
+unnameable_types = "warn"
+unreachable_pub = "warn"
+unused_extern_crates = "warn"
+unused_import_braces = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+alloc_instead_of_core = "warn"
+cloned_instead_of_copied = "warn"
+manual_let_else = "warn"
+or_fun_call = "warn"
+std_instead_of_core = "warn"
+upper_case_acronyms = "warn"
+use_self = "warn"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "rustls_pki_types_docsrs"]
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = ["zeroize::Zeroize"]

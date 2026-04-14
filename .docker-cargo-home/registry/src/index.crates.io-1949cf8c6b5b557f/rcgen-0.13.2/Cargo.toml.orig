@@ -1,0 +1,63 @@
+[package]
+name = "rcgen"
+version = "0.13.2"
+documentation = "https://docs.rs/rcgen"
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+license.workspace = true
+edition.workspace = true
+keywords.workspace = true
+
+[[example]]
+name = "rsa-irc"
+required-features = ["pem"]
+
+[[example]]
+name = "rsa-irc-openssl"
+required-features = ["pem"]
+
+[[example]]
+name = "sign-leaf-with-ca"
+required-features = ["pem", "x509-parser"]
+
+[[example]]
+name = "simple"
+required-features = ["crypto", "pem"]
+
+[dependencies]
+aws-lc-rs = { workspace = true, optional = true }
+yasna = { version = "0.5.2", features = ["time", "std"] }
+ring = { workspace = true, optional = true }
+pem = { workspace = true, optional = true }
+pki-types = { workspace = true }
+time = { version = "0.3.6", default-features = false }
+x509-parser = { workspace = true, features = ["verify"], optional = true }
+zeroize = { version = "1.2", optional = true }
+
+[features]
+default = ["crypto", "pem", "ring"]
+crypto = []
+aws_lc_rs = ["crypto", "dep:aws-lc-rs", "aws-lc-rs/aws-lc-sys"]
+ring = ["crypto", "dep:ring"]
+fips = ["crypto", "dep:aws-lc-rs", "aws-lc-rs/fips"]
+
+[package.metadata.docs.rs]
+features = ["x509-parser"]
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    "time::offset_date_time::OffsetDateTime",
+    "zeroize::Zeroize",
+    "rustls_pki_types::*",
+]
+
+[dev-dependencies]
+openssl = "0.10"
+pki-types = { package = "rustls-pki-types", version = "1" }
+x509-parser = { workspace = true, features = ["verify"] }
+rustls-webpki = { version = "0.102", features = ["std"] }
+botan = { version = "0.10", features = ["vendored"] }
+rand = { workspace = true }
+rsa = "0.9"
+ring = { workspace = true }

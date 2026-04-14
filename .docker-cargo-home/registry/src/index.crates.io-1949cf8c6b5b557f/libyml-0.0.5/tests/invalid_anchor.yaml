@@ -1,0 +1,5 @@
+
+    anchor1: &a1 value1
+    anchor2: &a2 value2
+    invalid_alias: *a3  # This alias doesn't exist
+    

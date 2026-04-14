@@ -1,0 +1,398 @@
+{
+  "include": [
+    {
+      "rust": "1.59",
+      "target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly-2021-08-21",
+      "target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "rust": "1.56",
+      "target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "rust": "stable",
+      "target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "rust": "beta",
+      "target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "x86_64-unknown-linux-gnu",
+      "flags": "-C panic=abort -Z panic_abort_tests"
+    },
+    {
+      "rust": "nightly",
+      "target": "x86_64-unknown-linux-gnu",
+      "flags": "-Z codegen-backend=cranelift"
+    },
+    {
+      "rust": "nightly",
+      "target": "x86_64-unknown-linux-gnu",
+      "flags": "-Z codegen-backend=gcc"
+    },
+    {
+      "rust": "nightly",
+      "target": "x86_64-apple-darwin",
+      "os": "macos-15-intel"
+    },
+    {
+      "rust": "nightly",
+      "target": "x86_64-apple-darwin",
+      "os": "macos-latest"
+    },
+    {
+      "rust": "1.59",
+      "target": "x86_64-pc-windows-msvc",
+      "os": "windows-latest"
+    },
+    {
+      "rust": "nightly-2021-08-21",
+      "target": "x86_64-pc-windows-msvc",
+      "os": "windows-latest"
+    },
+    {
+      "rust": "1.56",
+      "target": "x86_64-pc-windows-msvc",
+      "os": "windows-latest"
+    },
+    {
+      "rust": "stable",
+      "target": "x86_64-pc-windows-msvc",
+      "os": "windows-latest"
+    },
+    {
+      "rust": "beta",
+      "target": "x86_64-pc-windows-msvc",
+      "os": "windows-latest"
+    },
+    {
+      "rust": "nightly",
+      "target": "x86_64-pc-windows-msvc",
+      "os": "windows-latest"
+    },
+    {
+      "rust": "nightly-x86_64-pc-windows-gnu",
+      "target": "x86_64-pc-windows-gnu",
+      "os": "windows-latest"
+    },
+    {
+      "rust": "nightly",
+      "target": "i586-unknown-linux-gnu"
+    },
+    {
+      "rust": "1.59",
+      "target": "i686-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly-2021-08-21",
+      "target": "i686-unknown-linux-gnu"
+    },
+    {
+      "rust": "stable",
+      "target": "i686-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "i686-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly-i686-pc-windows-msvc",
+      "target": "i686-pc-windows-msvc",
+      "os": "windows-latest"
+    },
+    {
+      "rust": "nightly-i686-pc-windows-gnu",
+      "target": "i686-pc-windows-gnu",
+      "os": "windows-latest"
+    },
+    {
+      "rust": "1.59",
+      "target": "aarch64-unknown-linux-gnu",
+      "os": "ubuntu-24.04-arm"
+    },
+    {
+      "rust": "nightly-2021-08-21",
+      "target": "aarch64-unknown-linux-gnu",
+      "os": "ubuntu-24.04-arm"
+    },
+    {
+      "rust": "stable",
+      "target": "aarch64-unknown-linux-gnu",
+      "os": "ubuntu-24.04-arm"
+    },
+    {
+      "rust": "beta",
+      "target": "aarch64-unknown-linux-gnu",
+      "os": "ubuntu-24.04-arm"
+    },
+    {
+      "rust": "nightly",
+      "target": "aarch64-unknown-linux-gnu",
+      "os": "ubuntu-24.04-arm"
+    },
+    {
+      "rust": "nightly",
+      "target": "aarch64-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "aarch64-unknown-linux-gnu",
+      "os": "ubuntu-24.04-arm",
+      "flags": "-Z codegen-backend=cranelift"
+    },
+    {
+      "rust": "1.59",
+      "target": "aarch64-apple-darwin",
+      "os": "macos-latest"
+    },
+    {
+      "rust": "nightly-2021-08-21",
+      "target": "aarch64-apple-darwin",
+      "os": "macos-latest"
+    },
+    {
+      "rust": "stable",
+      "target": "aarch64-apple-darwin",
+      "os": "macos-latest"
+    },
+    {
+      "rust": "beta",
+      "target": "aarch64-apple-darwin",
+      "os": "macos-latest"
+    },
+    {
+      "rust": "nightly",
+      "target": "aarch64-apple-darwin",
+      "os": "macos-latest"
+    },
+    {
+      "rust": "nightly",
+      "target": "aarch64-apple-ios-macabi",
+      "os": "macos-latest"
+    },
+    {
+      "rust": "nightly",
+      "target": "aarch64-pc-windows-msvc",
+      "os": "windows-11-arm"
+    },
+    {
+      "rust": "nightly",
+      "target": "aarch64-pc-windows-gnullvm",
+      "os": "windows-11-arm"
+    },
+    {
+      "rust": "stable",
+      "target": "aarch64-unknown-linux-musl"
+    },
+    {
+      "rust": "nightly",
+      "target": "aarch64-unknown-linux-musl"
+    },
+    {
+      "rust": "stable",
+      "target": "aarch64-unknown-linux-musl",
+      "flags": "-C target-feature=-crt-static"
+    },
+    {
+      "rust": "nightly",
+      "target": "aarch64-unknown-linux-musl",
+      "flags": "-C target-feature=-crt-static"
+    },
+    {
+      "rust": "stable",
+      "target": "aarch64-linux-android"
+    },
+    {
+      "rust": "nightly",
+      "target": "aarch64-linux-android"
+    },
+    {
+      "rust": "nightly-2024-07-31",
+      "target": "aarch64_be-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "aarch64_be-unknown-linux-gnu"
+    },
+    {
+      "rust": "1.84",
+      "target": "arm64ec-pc-windows-msvc",
+      "os": "windows-11-arm"
+    },
+    {
+      "rust": "stable",
+      "target": "arm64ec-pc-windows-msvc",
+      "os": "windows-11-arm"
+    },
+    {
+      "rust": "nightly",
+      "target": "arm64ec-pc-windows-msvc",
+      "os": "windows-11-arm"
+    },
+    {
+      "rust": "1.59",
+      "target": "armv5te-unknown-linux-gnueabi"
+    },
+    {
+      "rust": "nightly-2021-08-21",
+      "target": "armv5te-unknown-linux-gnueabi"
+    },
+    {
+      "rust": "stable",
+      "target": "armv5te-unknown-linux-gnueabi"
+    },
+    {
+      "rust": "nightly",
+      "target": "armv5te-unknown-linux-gnueabi"
+    },
+    {
+      "rust": "nightly",
+      "target": "arm-unknown-linux-gnueabi"
+    },
+    {
+      "rust": "nightly",
+      "target": "armv7-unknown-linux-gnueabi"
+    },
+    {
+      "rust": "nightly",
+      "target": "armv7-unknown-linux-gnueabihf",
+      "os": "ubuntu-24.04-arm"
+    },
+    {
+      "rust": "nightly",
+      "target": "armv7-unknown-linux-gnueabihf"
+    },
+    {
+      "rust": "nightly",
+      "target": "thumbv7neon-unknown-linux-gnueabihf",
+      "os": "ubuntu-24.04-arm"
+    },
+    {
+      "rust": "nightly",
+      "target": "thumbv7neon-unknown-linux-gnueabihf"
+    },
+    {
+      "rust": "nightly",
+      "target": "armeb-unknown-linux-gnueabi",
+      "os": "ubuntu-22.04"
+    },
+    {
+      "rust": "nightly-2024-08-30",
+      "target": "arm-linux-androideabi"
+    },
+    {
+      "rust": "nightly",
+      "target": "loongarch64-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "mips-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "mipsel-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "mips64-unknown-linux-gnuabi64"
+    },
+    {
+      "rust": "nightly",
+      "target": "mips64el-unknown-linux-gnuabi64"
+    },
+    {
+      "rust": "nightly",
+      "target": "mipsisa32r6-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "mipsisa32r6el-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "mipsisa64r6-unknown-linux-gnuabi64"
+    },
+    {
+      "rust": "nightly",
+      "target": "mipsisa64r6el-unknown-linux-gnuabi64"
+    },
+    {
+      "rust": "nightly",
+      "target": "powerpc-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly-2022-02-13",
+      "target": "powerpc64-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "powerpc64-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly-2022-02-13",
+      "target": "powerpc64le-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "powerpc64le-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly-2022-08-12",
+      "target": "riscv32gc-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "riscv32gc-unknown-linux-gnu"
+    },
+    {
+      "rust": "1.59",
+      "target": "riscv64gc-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly-2021-08-21",
+      "target": "riscv64gc-unknown-linux-gnu"
+    },
+    {
+      "rust": "stable",
+      "target": "riscv64gc-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "riscv64gc-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "riscv64gc-unknown-linux-gnu",
+      "flags": "-Z codegen-backend=cranelift"
+    },
+    {
+      "rust": "1.84",
+      "target": "s390x-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly-2023-05-09",
+      "target": "s390x-unknown-linux-gnu"
+    },
+    {
+      "rust": "stable",
+      "target": "s390x-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "s390x-unknown-linux-gnu"
+    },
+    {
+      "rust": "nightly",
+      "target": "sparc64-unknown-linux-gnu"
+    }
+  ]
+}

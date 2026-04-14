@@ -1,0 +1,101 @@
+name: CI
+
+on: [push, pull_request]
+
+env:
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  fmt_and_docs:
+    name: Check fmt & build docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Install cargo-readme
+        run: cargo install cargo-readme
+      - name: Check doc consistency
+        shell: bash
+        run: diff -q README.md <(cargo readme)
+            || { echo "::error::Update lib.rs then use cargo-readme to update README.md"; exit 1; }
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: docs
+        run: cargo doc --no-deps
+
+  build_and_test:
+    name: Build & Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        features: [fancy, syntect-highlighter]
+        rust: [1.70.0, stable]
+        os: [ubuntu-latest, macOS-latest, windows-latest]
+        exclude:
+          - features: syntect-highlighter
+            rust: 1.70.0
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --all -- -D warnings
+      - name: Run tests
+        if: matrix.rust == 'stable'
+        run: cargo test --all --verbose --features ${{matrix.features}}
+      - name: Run tests
+        if: matrix.rust == '1.70.0'
+        run: cargo test --all --verbose --features ${{matrix.features}} no-format-args-capture
+
+  wasm:
+    name: Check Wasm build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - name: Check wasm target
+        run: cargo check --target wasm32-unknown-unknown --features fancy-no-syscall
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: miri,rust-src
+      - name: Run tests with miri
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance
+        run: cargo miri test --all --verbose --features fancy
+
+  minimal_versions:
+    name: Minimal versions check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macOS-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      - name: Run minimal version build
+        run: cargo build -Z direct-minimal-versions --features fancy,no-format-args-capture

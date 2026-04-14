@@ -1,0 +1,15 @@
+[package]
+name = "autotools"
+version = "0.2.7"
+authors = ["Luca Barbato <lu_zero@gentoo.org>"]
+license = "MIT"
+keywords = ["build-dependencies"]
+repository = "https://github.com/lu-zero/autotools-rs"
+homepage = "https://github.com/lu-zero/autotools-rs"
+description = """
+A build dependency to build native libraries that use configure&make-style build systems
+"""
+readme = "README.md"
+
+[dependencies]
+cc = "1.0.3"

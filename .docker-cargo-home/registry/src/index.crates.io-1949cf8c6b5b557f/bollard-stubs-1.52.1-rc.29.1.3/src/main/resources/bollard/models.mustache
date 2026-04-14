@@ -1,0 +1,273 @@
+#![allow(
+    unused_imports,
+    unused_qualifications,
+    unused_extern_crates,
+    clippy::all
+)]
+
+#[cfg(feature = "buildkit")]
+use prost::Message;
+use serde::de::{DeserializeOwned, Deserializer};
+use serde::ser::{Serializer, SerializeMap};
+use serde::{Deserialize, Serialize};
+use serde_repr::{Serialize_repr, Deserialize_repr};
+
+use std::cmp::Eq;
+use std::collections::HashMap;
+use std::default::Default;
+use std::hash::Hash;
+
+use crate::serde_ext;
+
+fn deserialize_nonoptional_vec<'de, D: Deserializer<'de>, T: DeserializeOwned>(
+    d: D,
+) -> Result<Vec<T>, D::Error> {
+    serde::Deserialize::deserialize(d).map(|x: Option<_>| x.unwrap_or(Vec::new()))
+}
+
+fn deserialize_nonoptional_map<'de, D: Deserializer<'de>, T: DeserializeOwned>(
+    d: D,
+) -> Result<HashMap<String, T>, D::Error> {
+    serde::Deserialize::deserialize(d).map(|x: Option<_>| x.unwrap_or(HashMap::new()))
+}
+
+#[cfg(feature = "time")]
+pub type BollardDate = time::OffsetDateTime;
+#[cfg(all(feature = "chrono", not(feature = "time")))]
+pub type BollardDate = chrono::DateTime<chrono::Utc>;
+#[cfg(not(any(feature = "chrono", feature = "time")))]
+pub type BollardDate = String;
+
+#[cfg(feature = "time")]
+fn deserialize_timestamp<'de, D: Deserializer<'de>>(
+    d: D
+) -> Result<Option<BollardDate>, D::Error> {
+    let opt: Option<String> = serde::Deserialize::deserialize(d)?;
+    if let Some(s) = opt {
+        Ok(Some(
+            time::OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339)
+                .map_err(|e| serde::de::Error::custom(format!("{:?}", e)))?,
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(not(feature = "time"))]
+fn deserialize_timestamp<'de, D: Deserializer<'de>>(
+    d: D
+) -> Result<Option<BollardDate>, D::Error> {
+    serde::Deserialize::deserialize(d)
+}
+
+#[cfg(feature = "time")]
+fn serialize_timestamp<S: Serializer>(date: &Option<BollardDate>, s: S) -> Result<S::Ok, S::Error> {
+    match date {
+        Some(inner) => Ok(s.serialize_str(&inner.format(&time::format_description::well_known::Rfc3339)
+                                          .map_err(|e| serde::ser::Error::custom(format!("{:?}", e)))?)?),
+        None => Ok(s.serialize_str("")?)
+    }
+}
+
+#[cfg(not(feature = "time"))]
+fn serialize_timestamp<S: Serializer>(date: &Option<BollardDate>, s: S) -> Result<S::Ok, S::Error> {
+    match date {
+        Some(inner) => s.serialize_some(inner),
+        None => s.serialize_none()
+    }
+}
+
+#[cfg(feature = "buildkit")]
+fn deserialize_buildinfo_aux<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<crate::moby::buildkit::v1::StatusResponse, D::Error> {
+    let aux: String = serde::Deserialize::deserialize(d)?;
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &aux)
+        .map_err(|e| serde::de::Error::custom(format!("{:?}", e)))?;
+    let buf = bytes::BytesMut::from(&raw[..]);
+
+    let res = crate::moby::buildkit::v1::StatusResponse::decode(buf)
+        .map_err(|e| serde::de::Error::custom(format!("{:?}", e)))?;
+    Ok(res)
+}
+
+pub fn serialize_hashmap_string_hashmap_empty<S: Serializer>(
+    opt: &Option<Vec<String>>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    if let Some(vec) = opt {
+        let mut map = s.serialize_map(Some(vec.len()))?;
+        for entry in vec {
+            map.serialize_entry(entry, &HashMap::<(), ()>::new())?;
+        }
+        map.end()
+    } else {
+        let mut map = s.serialize_map(Some(0))?;
+        map.end()
+    }
+}
+
+pub fn deserialize_hashmap_string_hashmap_empty<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    match serde::Deserialize::deserialize(d) {
+        Ok::<Option<HashMap<String, HashMap<(), ()>>>, D::Error>(Some(mut hsh)) => {
+            let mut res = vec![];
+            for (key, _) in hsh.drain() {
+                res.push(key);
+            }
+            Ok(Some(res))
+        }
+        Ok(None) => Ok(Some(vec![])),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(feature = "buildkit")]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum BuildInfoAux {
+    #[serde(deserialize_with = "deserialize_buildinfo_aux")]
+    BuildKit(crate::moby::buildkit::v1::StatusResponse),
+    Default(ImageId)
+}
+
+{{#models}}{{#model}}
+{{#description}}/// {{{description}}}
+{{/description}}{{#isEnum}}/// Enumeration of values.
+/// Since this enum's variants do not hold data, we can easily define them them as `#[repr(C)]`
+/// which helps with FFI.
+#[allow(non_camel_case_types)]{{#vendorExtensions.x-rustgen-numeric-enum}}
+#[repr({{dataType}})]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize_repr, Deserialize_repr, Eq, Ord)]{{#xmlName}}
+#[serde(rename = "{{xmlName}}")]{{/xmlName}}
+pub enum {{classname}} { {{#allowableValues}}{{#enumVars}}
+    {{name}} = {{value}},{{/enumVars}}{{/allowableValues}}
+}{{/vendorExtensions.x-rustgen-numeric-enum}}{{^vendorExtensions.x-rustgen-numeric-enum}}
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize, Eq, Ord)]{{#xmlName}}
+#[serde(rename = "{{xmlName}}")]{{/xmlName}}
+pub enum {{classname}} { {{#allowableValues}}{{#enumVars}}
+    #[serde(rename = {{{value}}})]
+    {{name}},{{/enumVars}}{{/allowableValues}}
+}{{/vendorExtensions.x-rustgen-numeric-enum}}
+
+impl ::std::fmt::Display for {{classname}} {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        match *self { {{#allowableValues}}{{#enumVars}}
+            {{classname}}::{{name}} => write!(f, "{}", {{{value}}}),{{/enumVars}}{{/allowableValues}}
+        }
+    }
+}{{^vendorExtensions.x-rustgen-numeric-enum}}
+
+impl ::std::str::FromStr for {{classname}} {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+{{#allowableValues}}{{#enumVars}}            {{{value}}} => Ok({{classname}}::{{name}}),
+{{/enumVars}}{{/allowableValues}}            _ => Err(()),
+        }
+    }
+}{{/vendorExtensions.x-rustgen-numeric-enum}}
+
+impl std::default::Default for {{classname}}{{enumName}} {
+    fn default() -> Self { {{#allowableValues}}{{#enumVars.0}}
+        {{classname}}{{enumName}}::{{name}}{{/enumVars.0}}{{/allowableValues}}
+    }
+}
+{{/isEnum}}{{^isEnum}}{{^dataType}}{{#arrayModelType}}{{! vec}}
+pub type {{classname}} = Vec<{{{arrayModelType}}}>;
+{{/arrayModelType}}{{^arrayModelType}}{{#emptyVars}}// special-casing PortMap, cos swagger-codegen doesn't figure out this type
+pub type {{classname}} = HashMap<String, Option<Vec<PortBinding>>>;
+{{/emptyVars}}{{^emptyVars}}{{! general struct}}#[derive(Debug, Clone, Default, PartialEq, {{^vendorExtensions.x-rustgen-grpc-aux}}Serialize, {{/vendorExtensions.x-rustgen-grpc-aux}}Deserialize)]{{#xmlName}}
+#[serde(rename = "{{xmlName}}")]{{/xmlName}}
+pub struct {{classname}} {
+{{#vars}}{{#description}}    /// {{{description}}}
+{{/description}}    {{#vendorExtensions.x-rustgen-grpc-aux}}#[serde(rename = "aux")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg(feature = "buildkit")]
+    pub aux: Option<BuildInfoAux>,
+
+    #[serde(rename = "aux")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg(not(feature = "buildkit"))]
+    pub aux: Option<ImageId>,
+    {{/vendorExtensions.x-rustgen-grpc-aux}}{{^vendorExtensions.x-rustgen-grpc-aux}}{{#vendorExtensions.x-rustgen-upper-case}}#[serde(alias = "{{.}}")]
+    {{/vendorExtensions.x-rustgen-upper-case}}{{^vendorExtensions.x-rustgen-upper-case}}#[serde(rename = "{{baseName}}")]{{/vendorExtensions.x-rustgen-upper-case}}{{#required}}{{#isContainer}}{{^isListContainer}}
+    #[serde(deserialize_with = "deserialize_nonoptional_map")]{{/isListContainer}}{{#isListContainer}}
+    #[serde(deserialize_with = "deserialize_nonoptional_vec")]{{/isListContainer}}{{/isContainer}}{{#isEnum}}
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(with = "serde_ext::none_as_empty_string")]{{/isEnum}}{{#vendorExtensions.x-rustgen-is-hashmap-string-hashmap-empty}}
+    #[serde(deserialize_with = "deserialize_hashmap_string_hashmap_empty", serialize_with = "serialize_hashmap_string_hashmap_empty", default)]{{/vendorExtensions.x-rustgen-is-hashmap-string-hashmap-empty}}{{#vendorExtensions.x-rustgen-is-datetime}}
+    #[serde(
+        default,
+        deserialize_with = "deserialize_timestamp",
+        serialize_with = "serialize_timestamp"
+    )]{{/vendorExtensions.x-rustgen-is-datetime}}
+    pub {{name}}: {{#isEnum}}Option<{{classname}}{{enumName}}>{{/isEnum}}{{^isEnum}}{{#isListContainer}}Vec<{{#items}}{{{datatype}}}{{/items}}>{{/isListContainer}}{{^isListContainer}}{{#isContainer}}HashMap<String, {{#items}}{{{datatype}}}{{/items}}>{{/isContainer}}{{^isContainer}}{{{datatype}}}{{/isContainer}}{{/isListContainer}}{{/isEnum}}{{#vendorExtensions}}{{/vendorExtensions}},
+{{/required}}{{^required}}
+    #[serde(skip_serializing_if = "Option::is_none")]{{#vendorExtensions.x-rustgen-is-hashmap-string-hashmap-empty}}
+    #[serde(deserialize_with = "deserialize_hashmap_string_hashmap_empty", serialize_with = "serialize_hashmap_string_hashmap_empty", default)]{{/vendorExtensions.x-rustgen-is-hashmap-string-hashmap-empty}}{{#vendorExtensions.x-rustgen-is-datetime}}
+    #[serde(
+        default,
+        deserialize_with = "deserialize_timestamp",
+        serialize_with = "serialize_timestamp"
+    )]{{/vendorExtensions.x-rustgen-is-datetime}}
+    pub {{name}}: Option<{{#isEnum}}{{classname}}{{enumName}}{{/isEnum}}{{^isEnum}}{{#isListContainer}}Vec<{{#items}}{{{datatype}}}{{/items}}>{{/isListContainer}}{{^isListContainer}}{{#isContainer}}HashMap<String, {{#items}}{{{datatype}}}{{/items}}>{{/isContainer}}{{^isContainer}}{{{datatype}}}{{/isContainer}}{{/isListContainer}}{{/isEnum}}{{#vendorExtensions}}{{/vendorExtensions}}>,
+{{/required}}{{/vendorExtensions.x-rustgen-grpc-aux}}
+{{/vars}}
+}
+{{#vars}}{{#isEnum}}
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize, Eq, Ord)]{{#xmlName}}
+#[serde(rename = "{{xmlName}}")]{{/xmlName}}
+pub enum {{classname}}{{enumName}} { {{#vendorExtensions}}{{^x-rustgen-has-empty-enum}}
+    #[serde(rename = "")]
+    EMPTY,{{/x-rustgen-has-empty-enum}}{{/vendorExtensions}}{{#allowableValues}}{{#enumVars}}
+    #[serde(rename = {{{value}}})]
+    {{name}},{{/enumVars}}{{/allowableValues}}{{#vendorExtensions}}{{#x-rustgen-additional-enum-values}}
+    #[serde(rename = {{{value}}})]
+    {{name}},{{/x-rustgen-additional-enum-values}}{{/vendorExtensions}}
+}
+
+impl ::std::fmt::Display for {{classname}}{{enumName}} {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        match *self { {{#vendorExtensions}}{{^x-rustgen-has-empty-enum}}
+            {{classname}}{{enumName}}::EMPTY => write!(f, ""),{{/x-rustgen-has-empty-enum}}{{/vendorExtensions}}{{#allowableValues}}{{#enumVars}}
+            {{classname}}{{enumName}}::{{name}} => write!(f, "{}", {{{value}}}),{{/enumVars}}{{/allowableValues}}{{#vendorExtensions}}{{#x-rustgen-additional-enum-values}}
+            {{classname}}{{enumName}}::{{name}} => write!(f, "{}", {{{value}}}),{{/x-rustgen-additional-enum-values}}{{/vendorExtensions}}
+
+        }
+    }
+}
+
+impl ::std::str::FromStr for {{classname}}{{enumName}} {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s { {{#vendorExtensions}}{{^x-rustgen-has-empty-enum}}
+            "" => Ok({{classname}}{{enumName}}::EMPTY),{{/x-rustgen-has-empty-enum}}{{/vendorExtensions}}
+{{#allowableValues}}{{#enumVars}}            {{{value}}} => Ok({{classname}}{{enumName}}::{{name}}),
+{{/enumVars}}{{/allowableValues}}{{#vendorExtensions}}{{#x-rustgen-additional-enum-values}}            {{{value}}} => Ok({{classname}}{{enumName}}::{{name}}),
+{{/x-rustgen-additional-enum-values}}{{/vendorExtensions}}            x => Err(format!("Invalid enum type: {}", x)),
+        }
+    }
+}
+
+impl ::std::convert::AsRef<str> for {{classname}}{{enumName}} {
+    fn as_ref(&self) -> &str {
+        match self { {{#vendorExtensions}}{{^x-rustgen-has-empty-enum}}
+            {{classname}}{{enumName}}::EMPTY => "",{{/x-rustgen-has-empty-enum}}{{/vendorExtensions}}{{#allowableValues}}{{#enumVars}}
+            {{classname}}{{enumName}}::{{name}} => {{{value}}},{{/enumVars}}{{/allowableValues}}{{#vendorExtensions}}{{#x-rustgen-additional-enum-values}}
+            {{classname}}{{enumName}}::{{name}} => {{{value}}},{{/x-rustgen-additional-enum-values}}{{/vendorExtensions}}
+        }
+    }
+}
+{{/isEnum}}{{/vars}}{{/emptyVars}}{{/arrayModelType}}{{/dataType}}{{/isEnum}}{{/model}}{{/models}}{{#usesXmlNamespaces}}
+//XML namespaces
+pub mod namespaces {
+    lazy_static!{
+        {{#models}}{{#model}}{{#xmlNamespace}}pub static ref {{#vendorExtensions}}{{upperCaseName}}{{/vendorExtensions}}: String = "{{xmlNamespace}}".to_string();
+        {{/xmlNamespace}}{{/model}}{{/models}}
+    }
+}
+{{/usesXmlNamespaces}}

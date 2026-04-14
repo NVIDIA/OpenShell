@@ -1,0 +1,42 @@
+# Build only pushed (merged) master or any pull request. This avoids the
+# pull request to be build twice.
+branches:
+  only:
+    - master
+
+language: rust
+
+rust:
+  - stable
+  - nightly
+
+os:
+  - linux
+  - windows
+  - osx
+
+git:
+  depth: 1
+  quiet: true
+
+matrix:
+  allow_failures:
+    - rust: nightly
+
+before_script:
+  - export PATH=$PATH:/home/travis/.cargo/bin
+  - rustup component add rustfmt
+  - rustup component add clippy
+
+script:
+  - cargo fmt --version
+  - rustup --version
+  - rustc --version
+  - if [ "$TRAVIS_RUST_VERSION" = "stable" ]; then cargo fmt --all -- --check; fi
+  - cargo clippy -- -D clippy::all
+  - cargo build
+  - cargo test --lib -- --nocapture --test-threads 1
+  - cargo test --lib --features serde -- --nocapture --test-threads 1
+  - cargo test --lib --features event-stream -- --nocapture --test-threads 1
+  - cargo test --all-features -- --nocapture --test-threads 1
+  - if [ "$TRAVIS_RUST_VERSION" = "stable" ]; then cargo package; fi

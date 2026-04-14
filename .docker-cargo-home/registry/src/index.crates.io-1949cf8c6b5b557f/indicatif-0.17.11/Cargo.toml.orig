@@ -1,0 +1,45 @@
+[package]
+name = "indicatif"
+version = "0.17.11"
+edition = "2021"
+rust-version = "1.70"
+description = "A progress bar and cli reporting library for Rust"
+keywords = ["cli", "progress", "pb", "colors", "progressbar"]
+categories = ["command-line-interface"]
+license = "MIT"
+repository = "https://github.com/console-rs/indicatif"
+documentation = "https://docs.rs/indicatif"
+readme = "README.md"
+exclude = ["screenshots/*"]
+
+[dependencies]
+console = { version = "0.15", default-features = false, features = ["ansi-parsing"] }
+futures-core = { version = "0.3", default-features = false, optional = true }
+number_prefix = "0.4"
+portable-atomic = "1.0.0"
+rayon = { version = "1.1", optional = true }
+tokio = { version = "1", optional = true, features = ["io-util"] }
+unicode-segmentation = { version = "1", optional = true }
+unicode-width = { version = "0.2", optional = true }
+vt100 = { version = "0.15.1", optional = true }
+
+[dev-dependencies]
+clap = { version = "4", features = ["color", "derive"] }
+once_cell = "1"
+rand = "0.9"
+tokio = { version = "1", features = ["fs", "time", "rt"] }
+futures = "0.3" # so the doctest for wrap_stream is nice
+pretty_assertions = "1.4.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1.1.0"
+
+[features]
+default = ["unicode-width", "console/unicode-width"]
+improved_unicode = ["unicode-segmentation", "unicode-width", "console/unicode-width"]
+in_memory = ["vt100"]
+futures = ["dep:futures-core"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

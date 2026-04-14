@@ -1,0 +1,150 @@
+name: Rust semver-checks
+
+on:
+    pull_request_target:
+        branches:
+            - master
+    workflow_dispatch:
+        inputs:
+            base:
+                description: 'Base branch or tag to run the semver checks against.'
+                required: true
+                default: 'master'
+
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+
+jobs:
+  semver-checks:
+    name: semver-checks 🦀
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          path: PR_BRANCH
+      - name: Checkout baseline
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.inputs.base }}
+          path: BASELINE_BRANCH
+      - uses: mozilla-actions/sccache-action@v0.0.6
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Install a prebuilt binary of cargo-semver-checks
+      - uses: cargo-bins/cargo-binstall@main
+      - name: Install cargo-semver-checks
+        run: cargo binstall -y cargo-semver-checks
+
+      # Abort if the crate has build errors, without posting/deleting the comment.
+      - name: Check for build errors
+        id: build
+        run: |
+            cd PR_BRANCH
+            cargo check
+
+      # Run cargo-semver-checks against the PR's target branch.
+      - name: Check for public API changes
+        id: check-changes
+        run: |
+          # Don't fail the workflow when semver-checks returns a non-zero exit code.
+          set +e
+
+          cd PR_BRANCH
+          cargo semver-checks --color never --baseline-root ../BASELINE_BRANCH > diagnostic.txt
+          if [ "$?" -ne 0 ]; then
+            echo "breaking=true" >> $GITHUB_OUTPUT
+          else
+            echo "breaking=false" >> $GITHUB_OUTPUT
+          fi
+
+          {
+            echo 'semver_checks_diagnostic<<EOF'
+            cat diagnostic.txt
+            echo
+            echo EOF
+          } >> $GITHUB_OUTPUT
+
+          echo "semver-checks diagnostic:\n"
+          cat diagnostic.txt
+      
+      # Check if the PR title contains a breaking change flag in its title,
+      # according to the conventional commits specification.
+      #
+      # When the PR is flagged as breaking we only post an informative comment
+      # instead of failing the workflow.
+      - name: Check for breaking change flag
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
+        id: breaking-pr
+        run: |
+          if [[ "${PR_TITLE}" =~ ^.*\!:.*$ ]]; then
+            echo "breaking=true" >> $GITHUB_OUTPUT
+          else
+            echo "breaking=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+
+      # Debug step
+      - run: |
+          echo "breaking: ${{ steps.check-changes.outputs.breaking }}"
+          echo "breaking-pr: ${{ steps.breaking-pr.outputs.breaking }}"
+
+      # Post a diagnostics comment if there are breaking changes and the PR has been marked as breaking.
+      - name: Post a comment about the breaking changes. PR marked as breaking.
+        if: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && steps.check-changes.outputs.breaking == 'true' && steps.breaking-pr.outputs.breaking == 'true' }}
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: rs-semver-checks
+          message: |
+            This PR contains breaking changes to the public Rust API.
+
+            <details>
+              <summary>cargo-semver-checks summary</summary>
+              
+              ```
+              ${{ steps.check-changes.outputs.semver_checks_diagnostic }}
+              ```
+              
+            </details>
+          GITHUB_TOKEN: ${{ env.GITHUB_TOKEN }}
+
+      # Post a help comment if there are breaking changes, and the PR hasn't been marked as breaking.
+      - name: Post a comment about the breaking changes. PR *not* marked as breaking.
+        if: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && steps.check-changes.outputs.breaking == 'true' && steps.breaking-pr.outputs.breaking == 'false' }}
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: rs-semver-checks
+          message: |
+            This PR contains breaking changes to the public Rust API.
+            Please deprecate the old API instead (if possible), or mark the PR with a `!`
+            following the [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/)
+            format to indicate a breaking change.
+
+            <details>
+              <summary>cargo-semver-checks summary</summary>
+              
+              ```
+              ${{ steps.check-changes.outputs.semver_checks_diagnostic }}
+              ```
+              
+            </details>
+          GITHUB_TOKEN: ${{ env.GITHUB_TOKEN }}
+      - name: Fail if there are undeclared breaking changes
+        if: ${{ steps.check-changes.outputs.breaking == 'true' && steps.breaking-pr.outputs.breaking == 'false' }}
+        run: exit 1
+
+      # Delete previous comments when the issues have been resolved
+      # This step doesn't run if any of the previous checks fails.
+      - name: Delete previous comments
+        uses: marocchino/sticky-pull-request-comment@v2
+        if: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && steps.check-changes.outputs.breaking == 'false' }}
+        with:
+          header: rs-semver-checks
+          delete: true
+          GITHUB_TOKEN: ${{ env.GITHUB_TOKEN }}

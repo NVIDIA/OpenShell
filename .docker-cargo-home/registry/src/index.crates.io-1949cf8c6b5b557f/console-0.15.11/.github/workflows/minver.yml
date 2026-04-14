@@ -1,0 +1,21 @@
+name: Check minimal version resolution
+
+on: [push]
+
+jobs:
+  check-minver:
+    name: Test with minimal version resolution
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          profile: minimal
+          override: true
+      - uses: taiki-e/install-action@cargo-hack
+      - uses: taiki-e/install-action@cargo-minimal-versions
+      - name: Test
+        run: make check-minver

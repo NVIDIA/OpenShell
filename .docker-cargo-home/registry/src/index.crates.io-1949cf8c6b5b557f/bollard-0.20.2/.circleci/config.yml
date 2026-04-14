@@ -1,0 +1,181 @@
+version: 2
+
+jobs:
+  test_ssl:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker create -v /certs --name certs alpine:3 /bin/true
+      - run: docker run --rm -e SSL_SUBJECT=test.example.com -e SSL_DNS=test.example.com --volumes-from certs paulczar/omgwtfssl
+      - run: docker run -h test.example.com --volumes-from certs -d --privileged --name test-docker-daemon docker:stable-dind --storage-driver=overlay --tlsverify --tlscacert=/certs/ca.pem --tlscert=/certs/cert.pem --tlskey=/certs/key.pem
+      - run: docker run --rm --volumes-from certs --privileged --rm --entrypoint=chmod docker:stable-dind 644 /certs/key.pem /certs/ca-key.pem
+      - run: docker build -t bollard .
+      - run: docker run -ti -e DOCKER_CERT_PATH=/certs -e DOCKER_HOST='tcp://test.example.com:2376' --volumes-from certs --rm --link test-docker-daemon:docker bollard cargo test --features test_ssl,ssl -- --test test_version_ssl
+      - run: docker run -ti -e DOCKER_CERT_PATH=/certs -e DOCKER_HOST='tcp://test.example.com:2376' --volumes-from certs --rm --link test-docker-daemon:docker bollard cargo test --features test_ssl,aws-lc-rs -- --test test_version_ssl
+      - run: docker run -ti -e DOCKER_CERT_PATH=/certs -e DOCKER_HOST='tcp://test.example.com:2376' -e DOCKER_TLS_VERIFY=1 --volumes-from certs --rm --link test-docker-daemon:docker bollard cargo test --features test_ssl,ssl -- --test test_connect_with_defaults
+      - run: docker run -ti -e DOCKER_CERT_PATH=/certs -e DOCKER_HOST='tcp://test.example.com:2376' -e DOCKER_TLS_VERIFY=1 --volumes-from certs --rm --link test-docker-daemon:docker bollard cargo test --features test_ssl,aws-lc-rs -- --test test_connect_with_defaults
+      - run: docker run -ti -e DOCKER_CERT_PATH=/certs -e DOCKER_HOST='https://test.example.com:2376' --volumes-from certs --rm --link test-docker-daemon:docker bollard cargo test --features test_ssl,ssl -- --test test_connect_with_defaults
+      - run: docker run -ti -e DOCKER_CERT_PATH=/certs -e DOCKER_HOST='https://test.example.com:2376' --volumes-from certs --rm --link test-docker-daemon:docker bollard cargo test --features test_ssl,aws-lc-rs -- --test test_connect_with_defaults
+  test_http:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker run -e DOCKER_TLS_CERTDIR="" --rm -h test.example.com -d --privileged --name test-docker-daemon docker:stable-dind --storage-driver=overlay
+      - run: docker build -t bollard .
+      - run: docker run -ti -e DOCKER_HOST='tcp://test.example.com:2375' --rm --link test-docker-daemon:docker bollard cargo test --features test_http -- --test test_version_http
+      - run: docker run -ti -e DOCKER_HOST='tcp://test.example.com:2375' --rm --link test-docker-daemon:docker bollard cargo test -- --test test_connect_with_defaults
+  test_ssh:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker run --rm -h test.example.com -d --privileged --name test-docker-daemon -v ssh:/root/.ssh docker:stable-dind --storage-driver=overlay
+      - run: docker build -t bollard .
+      - run: |
+          docker exec -i test-docker-daemon sh -eux << 'EOD'
+          apk add --no-cache openssh-client openssh-server
+          ssh-keygen -A
+          echo 'PermitUserEnvironment yes' >> /etc/ssh/sshd_config
+          /usr/sbin/sshd
+
+          passwd -u root
+          ssh-keygen -f /root/.ssh/id_ed25519 -N '' -t ed25519
+          cp /root/.ssh/id_ed25519.pub /root/.ssh/authorized_keys
+          ssh-keyscan test.example.com | tee /root/.ssh/known_hosts
+          echo "PATH=$(printenv PATH)" | tee /root/.ssh/environment
+          EOD
+      - run: docker run -ti -e DOCKER_HOST='ssh://test.example.com' --rm -v ssh:/root/.ssh --link test-docker-daemon:docker bollard cargo test --features test_ssh -- --test test_version_ssh
+      - run: docker run -ti -e DOCKER_HOST='ssh://test.example.com' --rm -v ssh:/root/.ssh --link test-docker-daemon:docker bollard cargo test --features test_ssh -- --test test_connect_with_defaults
+  test_unix:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker build -t bollard .
+      - run: resources/dockerfiles/bin/run_integration_tests.sh --tests
+      - run: docker run -ti -e DOCKER_HOST='unix:///var/run/docker.sock' -v /var/run/docker.sock:/var/run/docker.sock --rm bollard cargo test -- --test test_connect_with_defaults
+  test_buildkit:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker build -t bollard .
+      - run: resources/dockerfiles/bin/run_integration_tests.sh --features buildkit,chrono --tests
+  test_chrono:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker build -t bollard .
+      - run: resources/dockerfiles/bin/run_integration_tests.sh --features chrono --tests
+  test_time:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker build -t bollard .
+      - run: resources/dockerfiles/bin/run_integration_tests.sh --features time --tests
+  test_swarm:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker build -t bollard .
+      - run: docker run -ti -e DOCKER_HOST='unix:///var/run/docker.sock' -v /var/run/docker.sock:/var/run/docker.sock --rm bollard cargo test --features test_swarm test_swarm
+  test_race:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker run -e DOCKER_TLS_CERTDIR="" --rm -h test.example.com -d --privileged --name test-docker-daemon docker:stable-dind --storage-driver=overlay
+      - run: docker build -t bollard .
+      - run: docker run -ti -e DOCKER_HOST='tcp://test.example.com:2375' --rm --link test-docker-daemon:docker bollard cargo test --features test_http test_runtime
+      - run: docker run -ti -e DOCKER_HOST='unix:///var/run/docker.sock' -v /var/run/docker.sock:/var/run/docker.sock --rm bollard cargo test test_runtime
+  test_doc:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker build -t bollard .
+      - run: docker run -ti --rm bollard cargo test --all-features --target x86_64-unknown-linux-gnu --doc
+  test_crypto_provider:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker build -t bollard .
+      - run: docker run -ti --rm bollard bash -c "cargo check --no-default-features --features ssl"
+      - run: docker run -ti --rm bollard bash -c "cargo check --no-default-features --features aws-lc-rs"
+      - run: docker run -ti --rm bollard bash -c "cargo check --no-default-features --features ssl_providerless"
+  test_clippy:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker build -t bollard .
+      - run: docker run -ti --rm bollard bash -c "rustup component add clippy && cargo clippy --all-targets -- -Dwarnings"
+  test_audit:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker build -t bollard .
+        # RUSTSEC-2020-0159 https://github.com/chronotope/chrono/issues/602
+        # RUSTSEC-2024-0436 https://github.com/aws/aws-lc-rs/issues/722
+      - run: docker run -ti --rm bollard bash -c "cargo install cargo-audit && cargo audit --deny warnings --ignore=RUSTSEC-2020-0071 --ignore=RUSTSEC-2024-0436"
+  test_fmt:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker build -t bollard .
+      - run: docker run -ti --rm bollard bash -c "rustup component add rustfmt && cargo fmt -p bollard -- --check --verbose"
+  test_sshforward:
+    docker:
+      - image: docker:27.3
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: docker create -v /auth --name auth alpine:3.4 /bin/true
+      - run: |
+          docker run --rm -v auth:/auth alpine:3.4 touch /auth/authorized_keys
+          docker run --publish-all -d --rm --name git -v git-repositories:/srv/git -v auth:/home/git/.ssh -p 2222:22 rockstorm/git-server /usr/sbin/sshd -D -e
+          docker run --rm -v ssh-agent:/.ssh-agent -d --name ssh-agent nuodb/ssh-agent
+          docker run --rm -v auth:/auth --link git:git -v ssh-agent:/.ssh-agent --entrypoint=bash ubuntu -c "apt-get update && apt-get install -y openssh-client && ssh-keygen -t ecdsa -N \"\" -C \"test@example.com\" -f id_ecdsa && cat id_ecdsa.pub > /auth/authorized_keys && SSH_AUTH_SOCK=/.ssh-agent/socket ssh-add id_ecdsa && mkdir -p -m 0600 ~/.ssh && ssh-keyscan -t ecdsa -p 22 git >> ~/.ssh/known_hosts && SSH_AUTH_SOCK=/.ssh-agent/socket ssh -A -v -i id_ecdsa git@git -p 22 \"git-init --bare /srv/git/config.git\""
+      - run: docker build -t bollard .
+      - run: DOCKER_PARAMETERS="-e GIT_HTTP_HOST=172.17.0.3 -e GIT_HTTP_PORT=22 -e SSH_AUTH_SOCK=/.ssh-agent/socket --link git:git -v ssh-agent:/.ssh-agent" resources/dockerfiles/bin/run_integration_tests.sh  --features buildkit,chrono,test_sshforward --verbose integration_test_build_buildkit_ssh 
+workflows:
+  version: 2
+  test-image:
+    jobs:
+      - test_ssl
+      - test_http
+      - test_ssh
+      - test_unix
+      - test_buildkit
+      - test_chrono
+      - test_time
+      - test_doc
+      - test_crypto_provider
+      - test_clippy
+      - test_audit
+      - test_fmt
+      - test_race
+      - test_sshforward
+      - test_swarm

@@ -1,0 +1,42 @@
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - 'build_doc.sh'
+      - 'check.sh'
+      - 'run_ci_tests.sh'
+      - 'start_sshd.sh'
+      - 'stop_sshd.sh'
+  pull_request:
+    paths-ignore:
+      - 'build_doc.sh'
+      - 'check.sh'
+      - 'run_ci_tests.sh'
+      - 'start_sshd.sh'
+      - 'stop_sshd.sh'
+name: os check
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  os-check:
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    steps:
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --no-self-update --profile minimal
+      - uses: actions/checkout@v4
+
+      - name: Create Cargo.lock for caching
+        run: cargo update
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --all-features --all-targets

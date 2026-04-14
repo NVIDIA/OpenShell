@@ -1,0 +1,46 @@
+---
+# Checks if doc comments have no errors.
+
+when:
+  - event: [manual, push, tag]
+
+variables:
+  # Docker image of the latest stable Rust.
+  rust_image: &rust_image 'library/rust:slim'
+  configure_toolchain_cmds: &configure_toolchain_cmds
+    - cp .woodpecker/cargo-config.toml $${CARGO_HOME}/config.toml
+      # Use the Rust toolchain(s) cached in the CI workspace directory.
+    - export RUSTUP_HOME=$${CI_WORKSPACE}/.tmp-rustup-home && test -d $${RUSTUP_HOME}
+    - rustc --version && cargo --version
+
+clone:
+  git:
+    image: woodpeckerci/plugin-git
+    settings:
+      # Custom root CA certificate will be used in some local networks.
+      # The global environment variable WP_GIT_SKIP_VERIFY will be
+      # set to `true` in such environment.
+      skip-verify: ${WP_GIT_SKIP_VERIFY:-false}
+      lfs: false
+
+steps:
+  - name: install Rust toolchain
+    image: *rust_image
+    commands:
+      - .woodpecker/scripts/prepare-toolchain.sh $${RUST_CHANNEL}
+    environment:
+      RUST_CHANNEL: stable
+
+  - name: doc
+    image: *rust_image
+    commands:
+      - <<: *configure_toolchain_cmds
+      - export RUSTDOCFLAGS="-D warnings"
+      - cargo doc --workspace --no-deps --no-default-features ${OPT_FEATURES}
+
+  - name: doc private-items
+    image: *rust_image
+    commands:
+      - <<: *configure_toolchain_cmds
+      - export RUSTDOCFLAGS="-D warnings"
+      - cargo doc --workspace --no-deps --no-default-features ${OPT_FEATURES} --document-private-items

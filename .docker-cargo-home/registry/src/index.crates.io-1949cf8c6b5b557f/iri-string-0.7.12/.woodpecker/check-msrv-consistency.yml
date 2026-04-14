@@ -1,0 +1,24 @@
+---
+# Checks if MSRV is consistent with the toplevel `Cargo.toml`.
+
+when:
+  - event: [manual, push, tag]
+
+variables:
+  base_image: &base_image 'library/debian:12-slim'
+
+clone:
+  git:
+    image: woodpeckerci/plugin-git
+    settings:
+      # Custom root CA certificate will be used in some local networks.
+      # The global environment variable WP_GIT_SKIP_VERIFY will be
+      # set to `true` in such environment.
+      skip-verify: ${WP_GIT_SKIP_VERIFY:-false}
+      lfs: false
+
+steps:
+  - name: check
+    image: *base_image
+    commands:
+      - .woodpecker/scripts/check-msrv-consistency.sh

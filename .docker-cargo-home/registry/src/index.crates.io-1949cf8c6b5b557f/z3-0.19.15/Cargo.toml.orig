@@ -1,0 +1,49 @@
+[package]
+name = "z3"
+rust-version = "1.85.0"
+version = "0.19.15"
+authors = ["Graydon Hoare <graydon@pobox.com>", "Bruce Mitchener <bruce.mitchener@gmail.com>", "Nick Fitzgerald <fitzgen@gmail.com>", "Mark DenHoed <mark.denhoed@cs.ox.ac.uk>"]
+
+description = "High-level rust bindings for the Z3 SMT solver from Microsoft Research"
+license = "MIT"
+keywords = ["FFI", "SMT", "satisfiability", "solver"]
+categories = ["api-bindings"]
+readme = "README.md"
+documentation = "https://docs.rs/z3/"
+homepage = "https://github.com/prove-rs/z3.rs"
+repository = "https://github.com/prove-rs/z3.rs.git"
+edition = "2024"
+
+
+[features]
+default = ["z3_4_8_15"]
+bundled = ["z3-sys/bundled"]
+vcpkg = ["z3-sys/vcpkg"]
+gh-release = ["z3-sys/gh-release"]
+
+# This is a legacy feature here for short term compatibility.
+static-link-z3 = ["z3-sys/bundled", "z3-sys/deprecated-static-link-z3"]
+
+# Features requiring a minimum Z3 version.
+# By default we use features present in 4.8.13 and up, but these features
+# allow for turning off these bindings.
+# Once ubuntu stops distributing 4.8.12, we can remove this for convenience.
+z3_4_8_15 = ["z3_4_8_14"]
+z3_4_8_14 = ["z3_4_8_13"]
+z3_4_8_13 = []
+
+[dependencies]
+log = "0.4"
+
+# optional dependencies
+num = "0.4"
+
+[dev-dependencies]
+env_logger = "0.11"
+semver = "1"
+rayon = "1.10.0"
+
+[dependencies.z3-sys]
+path = "../z3-sys"
+version = "0.10.9"
+

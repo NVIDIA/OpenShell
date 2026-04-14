@@ -1,0 +1,81 @@
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - 'build_doc.sh'
+      - 'check.sh'
+      - 'run_ci_tests.sh'
+      - 'start_sshd.sh'
+      - 'stop_sshd.sh'
+  pull_request:
+    paths-ignore:
+      - 'build_doc.sh'
+      - 'check.sh'
+      - 'run_ci_tests.sh'
+      - 'start_sshd.sh'
+      - 'stop_sshd.sh'
+name: cargo test
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  # makes all the ignored tests not ignored
+  RUSTFLAGS: --cfg=ci
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: ${{ matrix.toolchain }}
+    strategy:
+      matrix:
+        toolchain: [stable, beta, nightly]
+    steps:
+      - name: Install toolchain
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }} --no-self-update --profile minimal
+          rustup override set ${{ matrix.toolchain }}
+          rustup default ${{ matrix.toolchain }}
+      - uses: actions/checkout@v4
+
+      - name: Create Cargo.lock for caching
+        run: cargo update
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile tests
+        run: cargo test --all-features --workspace --no-run
+
+      - run: |
+          # Wait for startup of openssh-server
+          timeout 15 ./wait_for_sshd_start_up.sh
+          chmod 600 .test-key
+          mkdir /tmp/openssh-rs
+          ssh -i .test-key -v -p 2222 -l test-user 127.0.0.1 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/openssh-rs/known_hosts whoami
+        name: Test ssh connectivity
+      - run: |
+          eval $(ssh-agent)
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> $GITHUB_ENV
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> $GITHUB_ENV
+          cat .test-key | ssh-add -
+        name: Set up ssh-agent
+      - run: cargo test --all-features
+        env:
+          XDG_RUNTIME_DIR: /tmp
+      - run: docker logs $(docker ps | grep openssh-server | awk '{print $1}')
+        name: ssh container log
+        if: ${{ failure() }}
+      - run: docker exec $(docker ps | grep openssh-server | awk '{print $1}') ls -R /config/logs/
+        if: ${{ failure() }}
+      - run: docker exec $(docker ps | grep openssh-server | awk '{print $1}') cat /config/logs/openssh/current
+        name: ssh server log
+        if: ${{ failure() }}
+    services:
+      openssh:
+        image: linuxserver/openssh-server:amd64-latest
+        ports:
+          - 2222:2222
+        env:
+          USER_NAME: test-user
+          PUBLIC_KEY: |-
+            ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGzHvK2pKtSlZXP9tPYOOBb/xn0IiC9iLMS355AYUPC7
+          DOCKER_MODS: linuxserver/mods:openssh-server-ssh-tunnel

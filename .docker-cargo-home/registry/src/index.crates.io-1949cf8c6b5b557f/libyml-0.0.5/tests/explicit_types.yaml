@@ -1,0 +1,3 @@
+integer: !!int 42
+float: !!float 3.14
+string: !!str value

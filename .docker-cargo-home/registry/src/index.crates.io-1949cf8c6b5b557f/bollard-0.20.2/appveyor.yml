@@ -1,0 +1,58 @@
+image: Visual Studio 2017
+
+install:
+  - docker version
+  - ps: Start-FileDownload "https://static.rust-lang.org/rustup/dist/i686-pc-windows-gnu/rustup-init.exe"
+  - rustup-init.exe -y --default-host i686-pc-windows-msvc
+  - SET PATH=%PATH%;C:\Users\appveyor\.cargo\bin
+  - SET PATH=%PATH%;C:\MinGW\bin
+  - rustc -V
+  - cargo -V
+
+build_script:
+  - ver
+  - ps: systeminfo /fo csv | ConvertFrom-Csv | select OS*, System*, Hotfix* | Format-List
+  - ps: Get-VMNetworkAdapter -VMName *
+  - ps: Get-VMNetworkAdapter -All
+  - ps: Get-NetAdapter
+  - ps: |
+      $ipv4 = (Test-Connection -ComputerName $env:ComputerName -Count 1).IPV4Address.IPAddressToString
+      Set-Item -path env:HOST_IP -value $ipv4
+  - ipconfig
+  - echo %HOST_IP%
+  - ps: |
+      cd resources/dockerfiles/windows/registry
+      docker build -t stefanscherer/registry-windows -f Dockerfile .
+      cd ../../../
+  - docker run -d -p 5000:5000 --restart=always --name registry stefanscherer/registry-windows
+  - sleep 4
+  - docker pull hello-world:nanoserver-sac2016
+  - docker pull nanoserver/iis
+  - ps: |
+      $ErrorActionPreference = 'Stop'
+      $cnt = 0
+      while ($cnt -lt 5) {
+        $cnt++
+        try {
+          docker pull mcr.microsoft.com/windows/nanoserver@sha256:8f78a4a7da4464973a5cd239732626141aec97e69ba3e4023357628630bc1ee2
+          break
+        } catch {
+          Start-Sleep 3
+          Write-Verbose("Retrying docker pull command")
+        }
+      }
+  - docker tag hello-world:nanoserver-sac2016 localhost:5000/hello-world:nanoserver
+  - docker tag nanoserver/iis localhost:5000/nanoserver/iis
+  - docker tag mcr.microsoft.com/windows/nanoserver@sha256:8f78a4a7da4464973a5cd239732626141aec97e69ba3e4023357628630bc1ee2 localhost:5000/microsoft/nanoserver
+  - docker push localhost:5000/hello-world:nanoserver
+  - docker push localhost:5000/nanoserver/iis
+  - docker push localhost:5000/microsoft/nanoserver
+  - cargo build --features buildkit,chrono --verbose
+
+test_script:
+  - ps: Set-Item -path env:RUST_BACKTRACE -value 1
+  - ps: Set-Item -path env:RUST_LOG -value "hyper=trace,bollard=debug"
+  - ps: Set-Item -path env:REGISTRY_HTTP_ADDR -value localhost:5000
+  - cargo test --verbose --tests -- --nocapture --test-threads 1
+  - ps: Set-Item -path env:DOCKER_HOST -value npipe:////./pipe/docker_engine
+  - cargo test --verbose --tests -- --nocapture --test-threads 1 --test test_connect_with_defaults

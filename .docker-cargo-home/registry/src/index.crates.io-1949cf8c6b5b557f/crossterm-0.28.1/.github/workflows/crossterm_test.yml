@@ -1,0 +1,79 @@
+name: Crossterm Test
+
+on:
+  # Build master branch only
+  push:
+    branches:
+      - master
+  # Build pull requests targeting master branch only
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  test:
+    name: ${{matrix.rust}} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-2019, macOS-latest]
+        rust: [stable, nightly]
+        # Allow failures on nightly, it's just informative
+        include:
+          - rust: stable
+            can-fail: false
+          - rust: nightly
+            can-fail: true
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v1
+      with:
+        fetch-depth: 1
+    - name: Install Rust
+      uses: hecrj/setup-rust-action@master
+      with:
+        rust-version: ${{ matrix.rust }}
+        components: rustfmt,clippy
+    - name: Toolchain Information
+      run: |
+        rustc --version
+        rustfmt --version
+        rustup --version
+        cargo --version
+    - name: Check Formatting
+      if: matrix.rust == 'stable'
+      run: cargo fmt --all -- --check
+      continue-on-error: ${{ matrix.can-fail }}
+    - name: Clippy
+      run: cargo clippy -- -D clippy::all
+      continue-on-error: ${{ matrix.can-fail }}
+    - name: Test Build
+      run: cargo build
+      continue-on-error: ${{ matrix.can-fail }}
+    - name: Test default features
+      run: cargo test --lib -- --nocapture --test-threads 1
+      continue-on-error: ${{ matrix.can-fail }}
+    - name: Test serde feature
+      run: cargo test --lib --features serde -- --nocapture --test-threads 1
+      continue-on-error: ${{ matrix.can-fail }}
+    - name: Test event-stream feature
+      run: cargo test --lib --features "event-stream,events" -- --nocapture --test-threads 1
+      continue-on-error: ${{ matrix.can-fail }}
+    - name: Test all features
+      run: cargo test --all-features -- --nocapture --test-threads 1
+      continue-on-error: ${{ matrix.can-fail }}
+    - name: Test no default features
+      if: matrix.os != 'windows-2019'
+      run: cargo test --no-default-features -- --nocapture --test-threads 1
+      continue-on-error: ${{ matrix.can-fail }}
+    - name: Test no default features with use-dev-tty feature enabled
+      if: matrix.os != 'windows-2019'
+      run: cargo test --no-default-features --features "use-dev-tty events bracketed-paste" -- --nocapture --test-threads 1
+      continue-on-error: ${{ matrix.can-fail }}
+    - name: Test no default features with windows feature enabled
+      if: matrix.os == 'windows-2019'
+      run: cargo test --no-default-features --features "windows" -- --nocapture --test-threads 1
+    - name: Test Packaging
+      if: matrix.rust == 'stable'
+      run: cargo package
+      continue-on-error: ${{ matrix.can-fail }}

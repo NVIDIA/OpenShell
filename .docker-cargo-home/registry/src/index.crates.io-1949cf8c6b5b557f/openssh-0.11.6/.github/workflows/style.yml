@@ -1,0 +1,65 @@
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - 'build_doc.sh'
+      - 'check.sh'
+      - 'run_ci_tests.sh'
+      - 'start_sshd.sh'
+      - 'stop_sshd.sh'
+  pull_request:
+    paths-ignore:
+      - 'build_doc.sh'
+      - 'check.sh'
+      - 'run_ci_tests.sh'
+      - 'start_sshd.sh'
+      - 'stop_sshd.sh'
+name: lint
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  style:
+    runs-on: ubuntu-latest
+    name: ${{ matrix.toolchain }}
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, beta]
+    steps:
+      - name: Install toolchain
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }} --no-self-update --profile minimal --component rustfmt,clippy
+          rustup override set ${{ matrix.toolchain }}
+          rustup default ${{ matrix.toolchain }}
+      - uses: actions/checkout@v4
+
+      - name: Create Cargo.lock for caching
+        run: cargo update
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --check
+      - name: cargo clippy
+        uses: actions-rs/clippy-check@v1
+        if: always()
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+  doc:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: --cfg docsrs
+    steps:
+      - name: Install toolchain
+        run: |
+          rustup toolchain install nightly --no-self-update --profile minimal
+          rustup override set nightly
+          rustup default nightly
+      - uses: actions/checkout@v4
+
+      - name: Create Cargo.lock for caching
+        run: cargo update
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo +nightly doc --no-deps --all-features

@@ -1,0 +1,17 @@
+[package]
+name = "backtrace-ext"
+description = "minor conveniences on top of the backtrace crate"
+version = "0.2.1"
+edition = "2018"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gankra/backtrace-ext"
+rust-version = "1.56"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+backtrace = "0.3.61"
+
+[dev-dependencies]
+miette = { version = "5.6.0", features = ["fancy"] }
+thiserror = "1.0.40"

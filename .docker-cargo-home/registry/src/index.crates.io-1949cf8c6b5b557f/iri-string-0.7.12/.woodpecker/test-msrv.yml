@@ -1,0 +1,220 @@
+---
+# Lint, build, and test.
+# Clippy lint will make the subsequent build faster, and the result of the build
+# is necessary for the test.
+
+when:
+  - event: [manual, push, tag]
+
+variables:
+  msrv_channel: &msrv_channel '1.60.0'
+  # Docker image of the MSRV.
+  rust_msrv_image: &rust_image 'library/rust:1.60.0-slim'
+  rust_nightly_image: &rust_nightly_image 'rustlang/rust:nightly-slim'
+  configure_toolchain_cmds: &configure_toolchain_cmds
+    - cp .woodpecker/cargo-config.toml $${CARGO_HOME}/config.toml
+      # Use the Rust toolchain(s) cached in the CI workspace directory.
+    - export RUSTUP_HOME=$${CI_WORKSPACE}/.tmp-rustup-home && test -d $${RUSTUP_HOME}
+    - rustc --version && cargo --version
+
+matrix:
+  BUILD_PROFILE:
+    - dev # equivalent to no --release flag (debug build)
+    - release # equivalent to --release flag
+  OPT_FEATURES:
+    - --features= # no features
+    - --features=default
+    - --all-features
+    - --features=alloc
+    - --features=std
+    - --features=alloc,serde
+  # `minimal`: minimal dependency versions
+  # `direct-minimal`: minimal direct dependency versions
+  # `default`: default dependency versions (just ensures `Cargo.lock` exists)
+  # `updated`: explicitly updated dependency versions (cargo update)
+  RUST_DEP_VERSIONS:
+    - direct-minimal
+    - default
+    - updated
+
+clone:
+  git:
+    image: woodpeckerci/plugin-git
+    settings:
+      # Custom root CA certificate will be used in some local networks.
+      # The global environment variable WP_GIT_SKIP_VERIFY will be
+      # set to `true` in such environment.
+      skip-verify: ${WP_GIT_SKIP_VERIFY:-false}
+      lfs: false
+
+steps:
+  - name: install Rust toolchain
+    image: *rust_image
+    commands:
+      - .woodpecker/scripts/prepare-toolchain.sh $${RUST_CHANNEL}
+    environment:
+      RUST_CHANNEL: *msrv_channel
+
+  - name: prepare deps
+    image: *rust_image
+    commands:
+      # Ensure `Cargo.lock` exists.
+      - if [ ! -f Cargo.lock ] ; then echo "Cargo.lock is missing" >&2 ; exit 1 ; fi
+    when:
+      - matrix:
+          RUST_DEP_VERSIONS: default
+
+  - name: prepare deps
+    image: *rust_image
+    commands:
+      - <<: *configure_toolchain_cmds
+      - cargo update
+    when:
+      - matrix:
+          RUST_DEP_VERSIONS: updated
+
+  - name: prepare deps
+    image: *rust_nightly_image
+    commands:
+      - rustc --version && cargo --version
+      - cargo update --workspace -Zminimal-versions
+    when:
+      - matrix:
+          RUST_DEP_VERSIONS: minimal
+
+  - name: prepare deps
+    image: *rust_nightly_image
+    commands:
+      - rustc --version && cargo --version
+      - cargo update -Zdirect-minimal-versions
+    when:
+      - matrix:
+          RUST_DEP_VERSIONS: direct-minimal
+
+  - name: fetch deps
+    image: *rust_image
+    commands:
+      - <<: *configure_toolchain_cmds
+      - cargo fetch --locked
+      - mkdir -p .cargo
+      - cargo vendor --color=always --locked >> .cargo/config.toml
+
+  - name: clippy (allow warning)
+    image: *rust_image
+    commands:
+      - <<: *configure_toolchain_cmds
+      - rustup component add clippy
+      - cargo clippy --version
+      # TODO: Deny warnings for all the workspace members once the MSRV and deps are bumped.
+      #- cargo clippy --color=always --frozen --workspace --all-targets --no-deps --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES} -- --deny warnings
+      - cargo clippy --color=always --frozen --all-targets --no-deps --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES}
+    when:
+      - matrix:
+          RUST_DEP_VERSIONS: minimal
+      - matrix:
+          RUST_DEP_VERSIONS: default
+
+  - name: clippy (allow warning, allow failure)
+    image: *rust_image
+    commands:
+      - <<: *configure_toolchain_cmds
+      - rustup component add clippy
+      - cargo clippy --version
+      # TODO: Deny warnings for all the workspace members once the MSRV and deps are bumped.
+      #- cargo clippy --color=always --frozen --workspace --all-targets --no-deps --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES} -- --deny warnings
+      - cargo clippy --color=always --frozen --all-targets --no-deps --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES}
+    # Build may fail because updated crates will have higher MSRV.
+    failure: ignore
+    when:
+      - matrix:
+          RUST_DEP_VERSIONS: direct-minimal
+      - matrix:
+          RUST_DEP_VERSIONS: updated
+
+  - name: build (allow failure)
+    image: *rust_image
+    commands:
+      - <<: *configure_toolchain_cmds
+      # TODO: Build all the workspace members once the MSRV and deps are bumped.
+      #- cargo build --color=always --frozen --workspace --all-targets --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES}
+      - cargo build --color=always --frozen --all-targets --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES}
+    # Build may fail because updated crates will have higher MSRV.
+    failure: ignore
+    when:
+      - matrix:
+          RUST_DEP_VERSIONS: direct-minimal
+      - matrix:
+          RUST_DEP_VERSIONS: updated
+
+  - name: build
+    image: *rust_image
+    commands:
+      - <<: *configure_toolchain_cmds
+      # TODO: Build all the workspace members once the MSRV and deps are bumped.
+      #- cargo build --color=always --frozen --workspace --all-targets --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES}
+      - cargo build --color=always --frozen --all-targets --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES}
+    when:
+      - matrix:
+          RUST_DEP_VERSIONS: minimal
+      - matrix:
+          RUST_DEP_VERSIONS: default
+
+  - name: run tests (allow failure)
+    image: *rust_image
+    commands:
+      - <<: *configure_toolchain_cmds
+      - export RUST_BACKTRACE=1
+      # TODO: Test all the workspace members once the MSRV and deps are bumped.
+      #- cargo test --color=always --frozen --workspace --all-targets --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES}
+      - cargo test --color=always --frozen --all-targets --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES}
+    # Build may fail because updated crates will have higher MSRV.
+    failure: ignore
+    when:
+      - matrix:
+          RUST_DEP_VERSIONS: direct-minimal
+      - matrix:
+          RUST_DEP_VERSIONS: updated
+
+  - name: run tests
+    image: *rust_image
+    commands:
+      - <<: *configure_toolchain_cmds
+      - export RUST_BACKTRACE=1
+      # TODO: Test all the workspace members once the MSRV and deps are bumped.
+      #- cargo test --color=always --frozen --workspace --all-targets --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES}
+      - cargo test --color=always --frozen --all-targets --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES}
+    when:
+      - matrix:
+          RUST_DEP_VERSIONS: minimal
+      - matrix:
+          RUST_DEP_VERSIONS: default
+
+  - name: run doctests (allow failure)
+    image: *rust_image
+    commands:
+      - <<: *configure_toolchain_cmds
+      - export RUST_BACKTRACE=1
+      # TODO: Test all the workspace members once the MSRV and deps are bumped.
+      #- cargo test --color=always --frozen --workspace --doc --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES}
+      - cargo test --color=always --frozen --doc --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES}
+    # Build may fail because updated crates will have higher MSRV.
+    failure: ignore
+    when:
+      - matrix:
+          RUST_DEP_VERSIONS: direct-minimal
+      - matrix:
+          RUST_DEP_VERSIONS: updated
+
+  - name: run doctests
+    image: *rust_image
+    commands:
+      - <<: *configure_toolchain_cmds
+      - export RUST_BACKTRACE=1
+      # TODO: Test all the workspace members once the MSRV and deps are bumped.
+      #- cargo test --color=always --frozen --workspace --doc --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES}
+      - cargo test --color=always --frozen --doc --profile=${BUILD_PROFILE} --no-default-features ${OPT_FEATURES}
+    when:
+      - matrix:
+          RUST_DEP_VERSIONS: minimal
+      - matrix:
+          RUST_DEP_VERSIONS: default

@@ -1,0 +1,12 @@
+[package]
+name = "supports-unicode"
+version = "3.0.0"
+authors = ["Kat Marchán <kzm@zkat.tech>"]
+description = "Detects whether a terminal supports unicode."
+categories = ["command-line-interface"]
+repository = "https://github.com/zkat/supports-unicode"
+documentation = "https://docs.rs/supports-unicode"
+license = "Apache-2.0"
+readme = "README.md"
+edition = "2018"
+rust-version = "1.70.0"

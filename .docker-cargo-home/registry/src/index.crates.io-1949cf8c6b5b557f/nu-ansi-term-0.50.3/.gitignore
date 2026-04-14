@@ -1,0 +1,17 @@
+target
+
+# JetBrains' IDE items
+.idea/*
+
+# VSCode's IDE items
+.vscode/*
+
+# Helix configuration folder
+.helix/*
+.helix
+
+# Visual Studio
+.vs/*
+*.rsproj
+*.rsproj.user
+*.sln

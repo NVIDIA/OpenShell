@@ -1,0 +1,15 @@
+language: rust
+cache: cargo
+rust:
+  - stable
+  - beta
+  - nightly
+
+before_install:
+  - git submodule update --init --recursive
+
+script:
+  # build and test the crate
+  - cargo test --verbose
+  # build the example
+  - cargo build --verbose --manifest-path=examples/xmp-sys/Cargo.toml

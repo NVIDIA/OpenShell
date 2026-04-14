@@ -1,0 +1,11 @@
+.DS_Store
+.git
+Cargo.lock
+/target
+/codegen/target/generated-sources/target
+doc
+main.rs
+**/workspace
+**/.settings
+**/.project
+**/.factorypath

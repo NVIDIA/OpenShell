@@ -1,0 +1,99 @@
+name: Rustdoc PR Preview
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [closed]
+
+jobs:
+  rustdoc-preview:
+    # Only run on issue_comment, not on PR close
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '/rustdoc-preview')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if commenter is a collaborator
+        id: collaborator-check
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const commenter = context.payload.comment.user.login;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            try {
+              await github.rest.repos.checkCollaborator({
+                owner,
+                repo,
+                username: commenter
+              });
+              return true;
+            } catch (e) {
+              return false;
+            }
+        # Only continue if the check passes
+      - name: Fail if not collaborator
+        if: steps.collaborator-check.outputs.result != 'true'
+        run: |
+          echo "Commenter is not a collaborator. Skipping preview build."
+          exit 1
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v6
+        with:
+          # Check out the PR's branch
+          ref: refs/pull/${{ github.event.issue.number }}/head
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Build rustdoc
+        run: cargo rustdoc --features full -- --cfg docsrs
+
+      - name: Deploy rustdoc to gh-pages/pr-<PR_NUMBER>
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./target/doc
+          # Publish to pr-<PR_NUMBER> subdir
+          destination_dir: pr-${{ github.event.issue.number }}
+          keep_files: true
+
+      - name: Comment preview link on PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr_number = context.issue.number;
+            const repo = context.repo.repo;
+            const owner = context.repo.owner;
+            const url = `https://${owner}.github.io/${repo}/pr-${pr_number}/hyper_util/`;
+            github.rest.issues.createComment({
+              issue_number: pr_number,
+              owner,
+              repo,
+              body: `📝 Rustdoc preview for this PR: [View docs](${url})`
+            });
+
+  rustdoc-preview-cleanup:
+    # Only run on PR close/merge
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gh-pages branch
+        uses: actions/checkout@v6
+        with:
+          ref: gh-pages
+          persist-credentials: true
+
+      - name: Remove PR preview directory
+        run: |
+          rm -rf pr-${{ github.event.pull_request.number }}
+
+      - name: Commit and push removal
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add .
+          git commit -m "Remove rustdoc preview for PR #${{ github.event.pull_request.number }}" || echo "Nothing to commit"
+          git push

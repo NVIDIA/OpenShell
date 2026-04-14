@@ -1,0 +1,2 @@
+This configuration serves to bootstrap the docker Registry with an
+authenticated user for integration testing purposes.

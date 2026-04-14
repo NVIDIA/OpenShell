@@ -1,0 +1,37 @@
+[package]
+name = "ipnet"
+version = "2.12.0" # Remember to update html_root_url
+authors = ["Kris Price <kris@krisprice.nz>"]
+description = "Provides types and useful methods for working with IPv4 and IPv6 network addresses, commonly called IP prefixes. The new `IpNet`, `Ipv4Net`, and `Ipv6Net` types build on the existing `IpAddr`, `Ipv4Addr`, and `Ipv6Addr` types already provided in Rust's standard library and align to their design to stay consistent. The module also provides useful traits that extend `Ipv4Addr` and `Ipv6Addr` with methods for `Add`, `Sub`, `BitAnd`, and `BitOr` operations. The module only uses stable feature so it is guaranteed to compile using the stable toolchain."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/krisprice/ipnet"
+keywords = ["IP", "CIDR", "network", "prefix", "subnet"]
+categories = ["network-programming"]
+readme = "README.md"
+documentation = "https://docs.rs/ipnet"
+edition = "2018"
+
+[features]
+default = ["std"]
+std = []
+serde = ["dep:serde"] # Implements "Serialize" and "Deserialize" using "serde@1.*".
+heapless = ["dep:heapless", "serde"] # Avoids dynamic allocations during serialization using "heapless@0.*". Also implies "serde".
+schemars08 = ["dep:schemars08"] # Implements "JsonSchema" using "schemars@0.8.*"
+schemars1 = ["dep:schemars1"] # Implements "JsonSchema" using "schemars@1.*"
+
+# Legacy features:
+json = ["schemars08", "serde"] # Alias for "schemars08" and "serde" kept for backwards compatibility. To be removed in "ipnet@3".
+schemars = ["schemars08"] # Alias for "schemars08" kept for backwards compatibility. To be removed in "ipnet@3".
+ser_as_str = ["dep:heapless"] # Avoids dynamic allocations during serialization using "heapless@0.*". Only active when feature "serde" is active as well, but does not imply it due to compatibility reasons. To be removed in "ipnet@3".
+
+[dependencies]
+serde = { package = "serde", version = "1", features = ["derive"], optional = true, default-features = false }
+schemars08 = { package = "schemars", version = "0.8", optional = true, default-features = false }
+schemars1 = { package = "schemars", version = "1", optional = true, default-features = false }
+heapless = { version = "0", optional = true }
+
+[dev-dependencies]
+serde_test = "1"
+
+[badges]
+travis-ci = { repository = "krisprice/ipnet" }

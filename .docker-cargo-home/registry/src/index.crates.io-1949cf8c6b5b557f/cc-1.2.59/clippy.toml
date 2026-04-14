@@ -1,0 +1,7 @@
+disallowed-methods = [
+    { path = "std::env::var_os", reason = "Please use Build::getenv" },
+    { path = "std::env::var", reason = "Please use Build::getenv" },
+    { path = "std::env::set_var", reason = "use `GlobalEnv::lock().set`" },
+    { path = "std::env::remove_var", reason = "use `GlobalEnv::lock().remove`" },
+]
+doc-valid-idents = ["AppleClang", "OpenBSD", ".."]

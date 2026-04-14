@@ -1,0 +1,11 @@
+.DS_Store
+Cargo.lock
+doc
+main.rs
+.classpath
+.settings/
+.factorypath
+.project
+target/maven-status/
+target/classes/
+target/generated-sources/target/package/

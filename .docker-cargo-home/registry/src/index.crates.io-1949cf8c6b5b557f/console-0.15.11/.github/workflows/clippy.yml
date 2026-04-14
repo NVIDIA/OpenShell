@@ -1,0 +1,21 @@
+name: Clippy
+
+on: [push]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        target: [ubuntu-latest, windows-latest, macos-latest]
+
+    runs-on: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          components: clippy, rustfmt
+          override: true
+      - name: Run clippy
+        run: make lint

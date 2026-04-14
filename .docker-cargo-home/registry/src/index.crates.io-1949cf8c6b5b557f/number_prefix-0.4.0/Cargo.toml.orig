@@ -1,0 +1,24 @@
+[package]
+name = "number_prefix"
+description = "Library for numeric prefixes (kilo, giga, kibi)."
+version = "0.4.0"
+
+authors = [ "Benjamin Sago <ogham@bsago.me>" ]
+categories = ["algorithms", "no-std"]
+documentation = "https://docs.rs/number_prefix"
+exclude = ["/README.md", "/LICENCE", "/.rustfmt.toml", "/.travis.yml"]
+repository = "https://github.com/ogham/rust-number-prefix"
+keywords = ["mathematics", "numerics"]
+license = "MIT"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = []
+
+[package.metadata.docs.rs]
+features = ["std"]
+
+[[example]]
+name = "conversions"
+required-features = ["std"]

@@ -1,0 +1,178 @@
+//! Method, error and parameter types for the {{classname}} endpoint.
+#![allow(
+    clippy::all,
+    deprecated
+)]
+
+use serde::{Serialize, Deserialize};
+use serde_repr::Serialize_repr;
+
+use std::collections::HashMap;
+use std::hash::Hash;
+
+pub(crate) fn serialize_as_json<T, S>(t: &T, s: S) -> Result<S::Ok, S::Error>
+where
+    T: Serialize,
+    S: serde::Serializer,
+{
+    s.serialize_str(
+        &serde_json::to_string(t).map_err(|e| serde::ser::Error::custom(format!("{e}")))?,
+    )
+}
+
+pub(crate) fn serialize_join_newlines<S>(t: &[String], s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    s.serialize_str(&t.join("\n"))
+}
+
+#[cfg(feature = "buildkit")]
+/// The exporter to use (see [Docker Docs](https://docs.docker.com/reference/cli/docker/buildx/build/#output))
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImageBuildOutput
+{
+    /// The local export type writes all result files to a directory on the client.
+    /// The new files will be owned by the current user.
+    /// On multi-platform builds, all results will be put in subdirectories by their platform.
+    /// It takes the destination directory as a first argument.
+    Tar(String),
+    /// The tar export type writes all result files as a single tarball on the client.
+    /// On multi-platform builds all results will be put in subdirectories by their platform.
+    /// It takes the destination directory as a first argument.
+    ///
+    /// **Notice**: The implementation of the underlying `fsutil` protocol is not complete.
+    /// Therefore, special files, permissions, etc. are ignored or not handled correctly.
+    Local(String),
+}
+
+#[cfg(feature = "buildkit")]
+impl Serialize for ImageBuildOutput
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            ImageBuildOutput::Tar(_) => serializer.serialize_str(r#"[{"type": "tar"}]"#),
+            ImageBuildOutput::Local(_) => serializer.serialize_str(r#"[{"type": "local"}]"#),
+        }
+    }
+}
+
+/// Builder Version to use
+#[derive(Clone, Copy, Debug, PartialEq, Serialize_repr)]
+#[repr(u8)]
+#[derive(Default)]
+pub enum BuilderVersion {
+    /// BuilderV1 is the first generation builder in docker daemon
+    #[default]
+    BuilderV1 = 1,
+    /// BuilderBuildKit is builder based on moby/buildkit project
+    BuilderBuildKit = 2,
+}
+
+{{#apiInfo}}{{#apis}}{{#operations}}
+{{#operation}}{{#hasQueryParams}}{{#vendorExtensions.x-codegen-query-param-legacy-name}}/// Builder for the `{{operationId}}` API query parameter.
+///
+/// {{{summary}}}.
+///
+/// ## Examples
+///
+/// ```rust
+/// use bollard_stubs::query_parameters::{{{.}}}Builder;
+///
+/// let params = {{{.}}}Builder::new(){{#queryParams}}
+/// //  .{{paramName}}(/* ... */){{/queryParams}}
+///     .build();
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct {{{.}}}Builder {
+    inner: {{{.}}},
+}
+
+impl {{{.}}}Builder {
+    /// Construct a builder of query parameters for {{{.}}} using defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+    {{#queryParams}}
+
+{{#unescapedDescription}}{{{.}}}{{/unescapedDescription}}
+{{#vendorExtensions.x-codegen-query-param-is-buildkit}}    #[cfg(feature = "buildkit")]
+{{/vendorExtensions.x-codegen-query-param-is-buildkit}}    pub fn {{paramName}}(mut self, {{paramName}}: {{#isString}}&str{{/isString}}{{^isString}}{{{dataType}}}{{/isString}}) -> Self {
+        {{#isMapContainer}}
+        let mut inner_{{paramName}} = HashMap::new();
+        for (key, value) in {{paramName}} {
+            inner_{{paramName}}.insert(
+                Into::<String>::into(key.clone()),{{#isListContainer}}
+                value
+                    .into_iter()
+                    .map(|v| Into::<String>::into(v.clone()))
+                    .collect(),{{/isListContainer}}{{^isListContainer}}
+                Into::<String>::into(value.clone()),{{/isListContainer}}
+            );
+        }
+        self.inner.{{paramName}} = {{^required}}{{^defaultValue}}Some({{/defaultValue}}{{/required}}inner_{{paramName}}{{^required}}{{^defaultValue}}){{/defaultValue}}{{/required}};
+        {{/isMapContainer}}
+        {{^isMapContainer}}
+        {{#isContainer}}
+        self.inner.{{paramName}} = {{^required}}{{^defaultValue}}Some({{/defaultValue}}{{/required}}{{paramName}}
+            .into_iter()
+            .map(|v| Into::<String>::into(v.clone()))
+            .collect(){{^required}}{{^defaultValue}}){{/defaultValue}}{{/required}};
+        {{/isContainer}}
+        {{^isContainer}}
+        self.inner.{{paramName}} = {{^required}}{{^defaultValue}}Some({{/defaultValue}}{{/required}}{{paramName}}{{#isString}}.into(){{/isString}}{{^required}}{{^defaultValue}}){{/defaultValue}}{{/required}};
+        {{/isContainer}}
+        {{/isMapContainer}}
+        self
+    }
+    {{/queryParams}}
+
+    /// Consume this builder and use the `{{{.}}}` as parameter to the
+    /// `{{operationId}}` API
+    pub fn build(self) -> {{{.}}} {
+        self.inner
+    }
+}
+
+/// Internal struct used in the `{{{operationId}}}` API
+/// 
+/// Use a [{{{.}}}Builder] to instantiate this struct.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct {{{.}}}
+{ {{#queryParams}}
+    {{^required}}{{^defaultValue}}#[serde(skip_serializing_if = "Option::is_none")]
+    {{/defaultValue}}{{/required}}{{#vendorExtensions.x-codegen-query-param-rename}}#[serde(rename = "{{{.}}}")]
+    {{/vendorExtensions.x-codegen-query-param-rename}}{{#vendorExtensions.x-codegen-query-param-serialize-as-json}}#[serde(serialize_with = "serialize_as_json")]
+    {{/vendorExtensions.x-codegen-query-param-serialize-as-json}}{{#vendorExtensions.x-codegen-query-param-serialize-join-newlines}}#[serde(serialize_with = "serialize_join_newlines", skip_serializing_if = "Vec::is_empty")]
+    {{/vendorExtensions.x-codegen-query-param-serialize-join-newlines}}{{#vendorExtensions.x-codegen-query-param-is-buildkit}}#[cfg(feature = "buildkit")]
+    {{/vendorExtensions.x-codegen-query-param-is-buildkit}}pub {{paramName}}: {{^required}}{{^defaultValue}}Option<{{/defaultValue}}{{/required}}{{#vendorExtensions.x-codegen-query-param-struct-type}}{{{.}}}{{/vendorExtensions.x-codegen-query-param-struct-type}}{{^vendorExtensions.x-codegen-query-param-struct-type}}{{{dataType}}}{{/vendorExtensions.x-codegen-query-param-struct-type}}{{^required}}{{^defaultValue}}>{{/defaultValue}}{{/required}}, {{/queryParams}}
+}
+
+impl Default for {{{.}}}
+{
+    fn default() -> Self {
+        Self {
+            {{#queryParams}}
+            {{#vendorExtensions.x-codegen-query-param-is-buildkit}}#[cfg(feature = "buildkit")]
+            {{/vendorExtensions.x-codegen-query-param-is-buildkit}}{{paramName}}: {{^required}}{{^defaultValue}}None{{/defaultValue}}{{{defaultValue}}}{{/required}}{{#required}}{{^defaultValue}}Default::default(){{/defaultValue}}{{{defaultValue}}}{{/required}},
+            {{/queryParams}}
+        }
+    }
+}
+
+{{/vendorExtensions.x-codegen-query-param-legacy-name}}
+{{/hasQueryParams}}
+{{/operation}}{{/operations}}
+
+{{#operations}}{{#operation}}{{#hasQueryParams}}{{^vendorExtensions.x-codegen-query-param-legacy-name}}
+// Filtered out: {{operationIdCamelCase}}
+// {{{summary}}}
+{{#queryParams}}
+//   - {{paramName}}
+{{/queryParams}}
+{{/vendorExtensions.x-codegen-query-param-legacy-name}}
+{{/hasQueryParams}}
+{{/operation}}{{/operations}}{{/apis}}{{/apiInfo}}

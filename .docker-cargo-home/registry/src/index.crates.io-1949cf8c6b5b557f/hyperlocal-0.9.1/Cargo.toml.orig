@@ -1,0 +1,54 @@
+[package]
+name = "hyperlocal"
+version = "0.9.1"
+authors = ["softprops <d.tangren@gmail.com>"]
+description = "Hyper bindings for Unix domain sockets"
+homepage = "https://github.com/softprops/hyperlocal"
+repository = "https://github.com/softprops/hyperlocal"
+keywords = ["hyper", "unix", "sockets", "http"]
+license = "MIT"
+readme = "README.md"
+edition = "2021"
+
+[dependencies]
+hex = "0.4"
+http-body-util = { version = "0.1", optional = true }
+hyper = "1.3"
+hyper-util = { version = "0.1.2", optional = true }
+tokio = { version = "1.35", default-features = false, features = ["net"] }
+tower-service = { version = "0.3", optional = true }
+pin-project-lite = "0.2"
+
+[dev-dependencies]
+thiserror = "1.0"
+tokio = { version = "1.35", features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "rt-multi-thread",
+] }
+
+[features]
+default = ["client", "server"]
+client = [
+    "http-body-util",
+    "hyper/client",
+    "hyper/http1",
+    "hyper-util/client-legacy",
+    "hyper-util/http1",
+    "hyper-util/tokio",
+    "tower-service",
+]
+server = ["hyper/http1", "hyper/server", "hyper-util/tokio"]
+
+[[example]]
+name = "client"
+required-features = ["client"]
+
+[[example]]
+name = "server"
+required-features = ["server"]
+
+[[test]]
+name = "server_client"
+required-features = ["client", "server"]

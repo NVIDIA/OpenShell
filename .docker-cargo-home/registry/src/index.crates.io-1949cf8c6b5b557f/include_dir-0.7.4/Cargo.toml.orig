@@ -1,0 +1,27 @@
+[package]
+name = "include_dir"
+description = "Embed the contents of a directory in your binary"
+keywords = ["assets", "include", "embed", "dir"]
+categories = ["development-tools", "web-programming", "game-engines"]
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+glob = { version = "0.3", optional = true }
+include_dir_macros = { version = "^0.7.4", path = "../macros" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+nightly = ["include_dir_macros/nightly"]
+metadata = ["include_dir_macros/metadata"]
+
+[package.metadata.docs.rs]
+all-features = true

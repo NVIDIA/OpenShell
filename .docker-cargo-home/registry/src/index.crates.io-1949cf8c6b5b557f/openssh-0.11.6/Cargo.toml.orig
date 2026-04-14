@@ -1,0 +1,65 @@
+[package]
+name = "openssh"
+version = "0.11.6"
+authors = ["Jon Gjengset <jon@thesquareplanet.com>"]
+edition = "2021"
+rust-version = "1.63.0"
+license = "MIT OR Apache-2.0"
+
+readme = "README.md"
+description = "SSH through OpenSSH"
+repository = "https://github.com/openssh-rust/openssh.git"
+documentation = "https://docs.rs/openssh"
+
+keywords = ["ssh","remote","openssh","orchestration"]
+categories = ["network-programming", "api-bindings"]
+
+exclude = ["ci-target", "*.sh"]
+
+[badges]
+azure-devops = { project = "jonhoo/jonhoo", pipeline = "openssh", build = "23" }
+codecov = { repository = "jonhoo/openssh-rs", branch = "master", service = "github" }
+maintenance = { status = "experimental" }
+
+# docs.rs-specific configuration, shamelessly copied from
+# https://stackoverflow.com/a/61417700/8375400.
+#
+# To test locally, use ` ./build_doc.sh`
+[package.metadata.docs.rs]
+# document all features
+all-features = true
+# defines the configuration attribute `docsrs`
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["process-mux"]
+process-mux = []
+native-mux = ["openssh-mux-client"]
+
+[dependencies]
+tempfile = "3.9.0"
+shell-escape = "0.1.5"
+thiserror = "2.0.0"
+
+tokio = { version = "1.36.0", features = [ "process", "io-util", "macros", "net" ] }
+
+once_cell = "1.8.0"
+
+openssh-mux-client = { version = "0.17.6", optional = true }
+
+libc = "0.2.137"
+
+tracing = { version = "0.1", optional = true }
+
+[dev-dependencies]
+regex = "1"
+tokio = { version = "1", features = [ "full" ] }
+openssh-sftp-client = "0.15.0"
+
+[[example]]
+name = "native-mux_tsp"
+required-features = ["native-mux"]
+
+[[example]]
+name = "tsp"
+required-features = ["process-mux"]

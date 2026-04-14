@@ -1,0 +1,156 @@
+[package]
+# Metadata about the package
+authors = ["LibYML Contributors"]
+categories = ["encoding", "parser-implementations", "no-std"]
+description = "A safe and efficient Rust library for parsing, emitting, and manipulating YAML data."
+documentation = "https://docs.rs/libyml"
+edition = "2021"
+exclude = ["/.git/*", "/.github/*", "/.gitignore", "/.vscode/*"]
+homepage = "https://libyml.com"
+keywords = ["yaml", "serde", "serialization"]
+license = "MIT"
+name = "libyml"
+readme = "README.md"
+repository = "https://github.com/sebastienrousseau/libyml"
+rust-version = "1.56.0"
+version = "0.0.5"
+
+# Specify which files to include in the package
+include = [
+    "/CONTRIBUTING.md",
+    "/LICENSE-MIT",
+    "/benches/**",
+    "/build.rs",
+    "/Cargo.toml",
+    "/examples/**",
+    "/README.md",
+    "/src/**",
+    "/tests/**",
+]
+
+[dependencies]
+# General dependencies for the package
+anyhow = "1.0.86" # Rust library for reporting multiple error types through a single type.
+
+[build-dependencies]
+# Dependencies specifically for build scripts
+version_check = "0.9.5" # Check the Rust version used to compile the package.
+
+[dev-dependencies]
+# Dependencies used during development and testing
+pretty_assertions = "1.4.0" # Pretty assertions for tests.
+libyml-test-suite = { path = "tests/data" } # Local dependency for test suite.
+
+[features]
+# Define optional features for the package
+default = [] # No default features
+test-utils = [] # Feature for test utilities
+
+[lib]
+# Library configuration options
+crate-type = ["lib"]
+name = "libyml"
+path = "src/lib.rs"
+doc-scrape-examples = false # Disable scraping of examples for documentation
+
+[package.metadata.docs.rs]
+# Metadata for generating documentation on docs.rs
+targets = ["x86_64-unknown-linux-gnu"]
+rustdoc-args = ["--generate-link-to-definition"]
+
+# Linting configuration
+[lints.rust]
+
+## Warn
+box_pointers = "warn" # Warn on usage of heap-allocated pointers
+missing_copy_implementations = "warn" # Warn if a `Copy` implementation is missing
+missing_docs = "warn" # Warn if documentation is missing
+unstable_features = "warn" # Warn on unstable features
+unused_extern_crates = "warn" # Warn on unused external crates
+unused_results = "warn" # Warn if the result of a function is unused
+
+## Allow
+bare_trait_objects = "allow" # Allow usage of bare trait objects
+elided_lifetimes_in_paths = "allow" # Allow omitted lifetimes in paths
+non_camel_case_types = "allow" # Allow types not in camel case
+non_upper_case_globals = "allow" # Allow global variables not in upper case
+trivial_bounds = "allow" # Allow trivial bounds in trait declarations
+unused_crate_dependencies = "allow" # Allow unused crate dependencies
+unsafe_code = "allow" # Allow usage of unsafe code
+
+## Forbid
+missing_debug_implementations = "forbid" # Forbid missing Debug implementations
+non_ascii_idents = "forbid" # Forbid non-ASCII identifiers
+unreachable_pub = "forbid" # Forbid unreachable public items
+
+## Deny
+dead_code = "deny" # Deny dead code
+deprecated_in_future = "deny" # Deny features deprecated in future Rust versions
+ellipsis_inclusive_range_patterns = "deny" # Deny ellipsis in inclusive range patterns
+explicit_outlives_requirements = "deny" # Deny unnecessary lifetime bounds
+future_incompatible = { level = "deny", priority = -1 } # Deny future-incompatible changes
+keyword_idents = { level = "deny", priority = -1 } # Deny keywords used as identifiers
+macro_use_extern_crate = "deny" # Deny `extern crate` with `macro_use`
+meta_variable_misuse = "deny" # Deny misuse of macro variables
+missing_fragment_specifier = "deny" # Deny missing fragment specifiers in macros
+noop_method_call = "deny" # Deny no-op method calls
+rust_2018_idioms = { level = "deny", priority = -1 } # Deny idioms from the 2018 edition
+rust_2021_compatibility = { level = "deny", priority = -1 } # Deny issues with Rust 2021 edition
+single_use_lifetimes = "deny" # Deny single-use lifetimes
+trivial_casts = "deny" # Deny trivial casts
+trivial_numeric_casts = "deny" # Deny trivial numeric casts
+unused = { level = "deny", priority = -1 } # Deny unused code
+unused_features = "deny" # Deny unused features
+unused_import_braces = "deny" # Deny unused import braces
+unused_labels = "deny" # Deny unused labels
+unused_lifetimes = "deny" # Deny unused lifetimes
+unused_macro_rules = "deny" # Deny unused macro rules
+unused_qualifications = "deny" # Deny unused qualifications
+variant_size_differences = "deny" # Deny variant size differences
+
+[package.metadata.clippy]
+# Clippy linting configuration
+warn-lints = [
+    "clippy::all",
+    "clippy::pedantic",
+    "clippy::cargo",
+    "clippy::nursery",
+]
+
+[profile.dev]
+# Profile settings for development builds
+codegen-units = 256
+debug = true
+debug-assertions = true
+incremental = true
+lto = false
+opt-level = 0
+overflow-checks = true
+panic = 'unwind'
+rpath = false
+strip = false
+
+[profile.release]
+# Profile settings for release builds
+codegen-units = 1
+debug = false
+debug-assertions = false
+incremental = false
+lto = true
+opt-level = "s"
+overflow-checks = false
+panic = "abort"
+rpath = false
+strip = "symbols"
+
+[profile.test]
+# Profile settings for test builds
+codegen-units = 256
+debug = true
+debug-assertions = true
+incremental = true
+lto = false
+opt-level = 0
+overflow-checks = true
+rpath = false
+strip = false

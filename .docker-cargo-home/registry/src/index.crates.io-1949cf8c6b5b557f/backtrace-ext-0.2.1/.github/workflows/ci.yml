@@ -1,0 +1,88 @@
+# The "Normal" CI for tests and linters and whatnot
+name: Rust CI
+
+# Ci should be run on...
+on:
+  # Every pull request (will need approval for new contributors)
+  pull_request:
+  # Every push to...
+  push:
+    branches:
+      # The main branch
+      - main
+
+# We want all these checks to fail if they spit out warnings
+env:
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  # Check that rustfmt is a no-op
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v1
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          components: rustfmt
+          override: true
+      - uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+
+
+  # Make sure the docs build without warnings
+  docs:
+   runs-on: ubuntu-latest
+   env:
+     RUSTDOCFLAGS: -Dwarnings
+   steps:
+     - uses: actions/checkout@master
+     - uses: actions-rs/toolchain@v1
+       with:
+         toolchain: stable
+         profile: minimal
+         components: rust-docs
+         override: true
+     - uses: swatinem/rust-cache@v1
+     - uses: actions-rs/cargo@v1
+       with:
+         command: doc
+         args: --workspace --no-deps
+
+  # Build and run tests/doctests/examples on all platforms
+  # FIXME: look into `cargo-hack` which lets you more aggressively
+  # probe all your features and rust versions (see tracing's ci)
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Test the cross-product of these platforms+toolchains
+      matrix:
+        os: [ubuntu-latest, windows-latest, macOS-latest]
+        rust: [stable, nightly, "1.56"]
+        feature-flags: [""]
+    steps:
+      # Setup tools
+      - uses: actions/checkout@master
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          profile: minimal
+          override: true
+      - uses: swatinem/rust-cache@v1
+      # Run the tests/doctests
+      - uses: actions-rs/cargo@v1
+        env:
+          PWD: ${{ env.GITHUB_WORKSPACE }}
+        with:
+          command: test
+          args: --workspace ${{ matrix.feature-flags }}
+      # Test the examples
+      - uses: actions-rs/cargo@v1
+        env:
+          PWD: ${{ env.GITHUB_WORKSPACE }}
+        with:
+          command: test
+          args: --workspace ${{ matrix.feature-flags }} --examples --bins

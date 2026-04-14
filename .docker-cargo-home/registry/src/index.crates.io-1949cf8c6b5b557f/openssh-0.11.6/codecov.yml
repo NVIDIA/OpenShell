@@ -1,0 +1,18 @@
+# Hold ourselves to a high bar
+coverage:
+  range: 85..100
+  round: down
+  precision: 2
+  status:
+    project:
+      default:
+        threshold: 1%
+
+# Tests aren't important for coverage
+ignore:
+  - "tests"
+
+# Make less noisy comments
+comment:
+  layout: "files"
+  require_changes: yes

@@ -1,0 +1,9 @@
+.DS_Store
+Cargo.lock
+**/target
+doc
+main.rs
+.metals
+**/.idea
+.vscode/
+**/.swagger-codegen

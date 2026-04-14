@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: ['main']
+  pull_request:
+  schedule:
+    - cron: "43 6 * * 5"
+
+env:
+  CLICOLOR_FORCE: 1
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable]
+        features: [--all-features]
+        target: [""]
+        include:
+          - os: ubuntu-latest
+            rust: stable
+            features: ""
+          - os: ubuntu-latest
+            rust: beta
+            features: --all-features
+          - os: ubuntu-latest
+            rust: stable
+            features: --all-features
+            target: --target armv5te-unknown-linux-gnueabi
+            use-cross: true
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - run: cargo test ${{ matrix.features }}
+
+  cross:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        target: [armv5te-unknown-linux-gnueabi]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+      - uses: taiki-e/install-action@cross
+      - run: cross build --target ${{ matrix.target }} --all-features
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.70"
+      - run: cargo check --lib --all-features
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: doc
+        run: cargo doc --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: EmbarkStudios/cargo-deny-action@v2

@@ -1,0 +1,11 @@
+[env]
+# To disable this, simply export the variable with the value 0 or give cargo
+# `--config=env.RUST_BACKTRACE=\'0\'` option.
+# Note that the value should have a string type, not an integer.
+RUST_BACKTRACE = '1'
+
+[term]
+quiet = false
+verbose = true
+color = 'always'
+progress.when = 'never'

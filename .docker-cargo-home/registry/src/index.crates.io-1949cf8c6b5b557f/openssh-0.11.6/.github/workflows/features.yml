@@ -1,0 +1,43 @@
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - 'build_doc.sh'
+      - 'check.sh'
+      - 'run_ci_tests.sh'
+      - 'start_sshd.sh'
+      - 'stop_sshd.sh'
+  pull_request:
+    paths-ignore:
+      - 'build_doc.sh'
+      - 'check.sh'
+      - 'run_ci_tests.sh'
+      - 'start_sshd.sh'
+      - 'stop_sshd.sh'
+name: cargo hack
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  # makes all the ignored tests not ignored
+  RUSTFLAGS: --cfg=ci
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --no-self-update --profile minimal
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@cargo-hack
+      - name: Create Cargo.lock for caching
+        run: cargo update
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo hack
+        run: |
+          cargo hack --feature-powerset check --all-targets
