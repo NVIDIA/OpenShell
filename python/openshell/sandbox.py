@@ -16,7 +16,6 @@ from urllib.parse import urlparse
 import grpc
 
 from ._proto import (
-    datamodel_pb2,
     inference_pb2,
     inference_pb2_grpc,
     openshell_pb2,
