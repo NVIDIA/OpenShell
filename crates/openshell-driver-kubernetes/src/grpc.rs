@@ -102,7 +102,7 @@ impl ComputeDriver for ComputeDriverService {
         self.driver
             .create_sandbox(&sandbox)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(status_from_driver_error)?;
         Ok(Response::new(CreateSandboxResponse {}))
     }
 
@@ -180,5 +180,13 @@ mod tests {
 
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert_eq!(status.message(), "sandbox agent pod IP is not available");
+    }
+
+    #[test]
+    fn already_exists_driver_errors_map_to_already_exists_status() {
+        let status = status_from_driver_error(KubernetesDriverError::AlreadyExists);
+
+        assert_eq!(status.code(), tonic::Code::AlreadyExists);
+        assert_eq!(status.message(), "sandbox already exists");
     }
 }
