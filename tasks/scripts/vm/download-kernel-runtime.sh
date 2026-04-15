@@ -81,11 +81,11 @@ DOWNLOAD_DIR="${ROOT}/target/vm-runtime-download"
 mkdir -p "$DOWNLOAD_DIR" "$OUTPUT_DIR"
 
 echo "==> Downloading ${TARBALL_NAME} from ${RELEASE_TAG}..."
+rm -f "${DOWNLOAD_DIR}/${TARBALL_NAME}"
 gh release download "${RELEASE_TAG}" \
     --repo "${REPO}" \
     --pattern "${TARBALL_NAME}" \
-    --dir "${DOWNLOAD_DIR}" \
-    --clobber
+    --dir "${DOWNLOAD_DIR}"
 
 if [ ! -f "${DOWNLOAD_DIR}/${TARBALL_NAME}" ]; then
     echo "Error: Download failed — ${TARBALL_NAME} not found." >&2

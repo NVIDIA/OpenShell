@@ -115,6 +115,10 @@ CONFIG_CGROUP_DEVICE=y
 CONFIG_CGROUP_CPUACCT=y
 CONFIG_CGROUP_PIDS=y
 CONFIG_MEMCG=y
+CONFIG_CGROUP_SCHED=y
+CONFIG_FAIR_GROUP_SCHED=y
+CONFIG_CFS_BANDWIDTH=y
+CONFIG_CGROUP_FREEZER=y
 
 # ── Disable kernel headers archive (avoids cpio issues in CI) ──────────
 # CONFIG_IKHEADERS is not set
@@ -126,3 +130,29 @@ CONFIG_POSIX_MQUEUE_SYSCTL=y
 # ── Security features required by the sandbox runtime ───────────────────
 CONFIG_SECURITY_LANDLOCK=y
 CONFIG_SECCOMP_FILTER=y
+
+# ── PCI / GPU passthrough (harmless for non-GPU boots) ──────────────────
+CONFIG_PCI=y
+CONFIG_PCI_MSI=y
+CONFIG_DRM=y
+CONFIG_MODULES=y
+CONFIG_MODULE_UNLOAD=y
+
+# ── cloud-hypervisor support ────────────────────────────────────────────
+# CHV uses virtio-PCI transport (libkrun uses virtio-MMIO). Both drivers
+# coexist safely — the kernel probes whichever transport the hypervisor
+# provides.
+CONFIG_VIRTIO_PCI=y
+
+# Serial console for cloud-hypervisor (8250/16550 UART). libkrun uses
+# virtio-console which is already enabled in the base config.
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+
+# ACPI support for cloud-hypervisor power management. Required for
+# `poweroff -f` to trigger a clean ACPI shutdown that CHV detects.
+CONFIG_ACPI=y
+
+# x2APIC support — Cloud Hypervisor uses x2APIC MADT entries for
+# multi-vCPU VMs. Without this, only the bootstrap CPU is activated.
+CONFIG_X86_X2APIC=y

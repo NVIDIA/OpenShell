@@ -21,6 +21,7 @@ openshell-policy = { path = "../openshell-policy" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-prover = { path = "../openshell-prover" }
 openshell-tui = { path = "../openshell-tui" }
+openshell-vm = { path = "../openshell-vm" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 prost-types = { workspace = true }

@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# HelmChart CR for auto-deploying the NVIDIA k8s-device-plugin via k3s Helm controller.
+#
+# This manifest is copied into /var/lib/rancher/k3s/server/manifests/ by the
+# VM init script when GPU_ENABLED=true. It is the VM-specific equivalent of
+# deploy/kube/gpu-manifests/nvidia-device-plugin-helmchart.yaml used by the
+# Docker-based gateway.
+#
+# The chart installs:
+#   - NVIDIA device plugin DaemonSet (advertises nvidia.com/gpu resources)
+#
+# NFD and GFD are disabled; the device plugin's default nodeAffinity
+# (which requires nvidia.com/gpu.present=true) is overridden to empty
+# so it schedules on any node without requiring NFD/GFD labels.
+#
+# CDI injection mode: the device plugin uses deviceListStrategy=cdi-cri so that
+# devices are injected via CDI hooks before container start. Sandbox pods only
+# need the nvidia.com/gpu resource request — no runtimeClassName is required.
+#
+# k3s auto-detects nvidia-container-runtime on PATH and registers the "nvidia"
+# RuntimeClass automatically, so no manual RuntimeClass manifest is needed.
+
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: nvidia-device-plugin
+  namespace: kube-system
+spec:
+  repo: https://nvidia.github.io/k8s-device-plugin
+  chart: nvidia-device-plugin
+  version: "0.18.2"
+  targetNamespace: nvidia-device-plugin
+  createNamespace: true
+  valuesContent: |-
+    runtimeClassName: nvidia
+    deviceListStrategy: cdi-cri
+    deviceIDStrategy: index
+    cdi:
+      nvidiaHookPath: /usr/bin/nvidia-cdi-hook
+    nvidiaDriverRoot: "/"
+    gfd:
+      enabled: false
+    nfd:
+      enabled: false
+    affinity: null

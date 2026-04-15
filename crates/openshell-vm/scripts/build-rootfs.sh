@@ -18,11 +18,16 @@
 # - NO pre-initialized k3s state (cold start on first boot)
 # First boot will be slower (~30-60s) as k3s initializes and pulls images.
 #
+# With --gpu, installs NVIDIA driver packages and the nvidia-container-toolkit
+# into the rootfs, producing a GPU-capable variant. The launcher selects this
+# rootfs when `--gpu` is passed. Only supported on x86_64 (NVIDIA does not
+# publish aarch64 data-center drivers for Ubuntu in this packaging form).
+#
 # Supports aarch64 and x86_64 guest architectures. The target architecture
 # is auto-detected from the host but can be overridden with --arch.
 #
 # Usage:
-#   ./build-rootfs.sh [--base] [--arch aarch64|x86_64] [output_dir]
+#   ./build-rootfs.sh [--base] [--gpu] [--arch aarch64|x86_64] [output_dir]
 #
 # If output_dir is omitted, the rootfs is built under target/rootfs-build.
 #
@@ -43,12 +48,15 @@ fi
 
 # ── Argument parsing ───────────────────────────────────────────────────
 BASE_ONLY=false
+GPU_BUILD=false
 GUEST_ARCH=""
 POSITIONAL_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --base)
             BASE_ONLY=true; shift ;;
+        --gpu)
+            GPU_BUILD=true; shift ;;
         --arch)
             GUEST_ARCH="$2"; shift 2 ;;
         *)
@@ -90,6 +98,14 @@ case "$GUEST_ARCH" in
         ;;
 esac
 
+# GPU builds are only supported on x86_64 — NVIDIA does not publish
+# aarch64 data-center driver packages in the same APT repository.
+if [ "$GPU_BUILD" = true ] && [ "$GUEST_ARCH" != "x86_64" ]; then
+    echo "ERROR: --gpu is only supported for x86_64 guest architecture." >&2
+    echo "       Current arch: ${GUEST_ARCH}" >&2
+    exit 1
+fi
+
 # Project root (two levels up from crates/openshell-vm/scripts/)
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 DEFAULT_ROOTFS="${PROJECT_ROOT}/target/rootfs-build"
@@ -125,6 +141,9 @@ if [ "$BASE_ONLY" = true ]; then
     echo "    k3s version: ${K3S_VERSION}"
     echo "    Output:      ${ROOTFS_DIR}"
     echo "    Mode:        base (no pre-loaded images, cold start)"
+    if [ "$GPU_BUILD" = true ]; then
+        echo "    GPU:         yes (NVIDIA driver ${NVIDIA_DRIVER_VERSION}, toolkit ${NVIDIA_CONTAINER_TOOLKIT_VERSION})"
+    fi
 else
     echo "==> Building openshell-vm rootfs"
     echo "    Guest arch:  ${GUEST_ARCH}"
@@ -132,6 +151,9 @@ else
     echo "    Images:      ${SERVER_IMAGE}, ${COMMUNITY_SANDBOX_IMAGE}"
     echo "    Output:      ${ROOTFS_DIR}"
     echo "    Mode:        full (pre-loaded images, pre-initialized)"
+    if [ "$GPU_BUILD" = true ]; then
+        echo "    GPU:         yes (NVIDIA driver ${NVIDIA_DRIVER_VERSION}, toolkit ${NVIDIA_CONTAINER_TOOLKIT_VERSION})"
+    fi
 fi
 echo ""
 
@@ -222,8 +244,55 @@ fi
 docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 
 echo "==> Building base image..."
-docker build --platform "${DOCKER_PLATFORM}" -t "${BASE_IMAGE_TAG}" \
-    --build-arg "BASE_IMAGE=${VM_BASE_IMAGE}" -f - . <<'DOCKERFILE'
+if [ "$GPU_BUILD" = true ]; then
+    docker build --platform "${DOCKER_PLATFORM}" -t "${BASE_IMAGE_TAG}" \
+        --build-arg "BASE_IMAGE=${VM_BASE_IMAGE}" \
+        --build-arg "NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION}" \
+        --build-arg "NVIDIA_CONTAINER_TOOLKIT_VERSION=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" \
+        -f - . <<'DOCKERFILE'
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG NVIDIA_DRIVER_VERSION
+ARG NVIDIA_CONTAINER_TOOLKIT_VERSION
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        e2fsprogs \
+        iptables \
+        iproute2 \
+        python3 \
+        busybox-static \
+        sqlite3 \
+        util-linux \
+        zstd \
+        gnupg \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+# busybox-static provides udhcpc for DHCP inside the VM.
+RUN mkdir -p /usr/share/udhcpc && \
+    ln -sf /bin/busybox /sbin/udhcpc
+RUN mkdir -p /var/lib/rancher/k3s /etc/rancher/k3s
+# ── NVIDIA driver and container toolkit ──────────────────────────────
+# Add the NVIDIA package repository and install the open kernel module
+# flavour of the driver plus nvidia-container-toolkit. The open modules
+# are required for data-center GPUs (Turing+ / compute capability >= 7.0).
+RUN curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+        | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+    && curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+        | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+        > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        nvidia-headless-${NVIDIA_DRIVER_VERSION}-open \
+        nvidia-utils-${NVIDIA_DRIVER_VERSION} \
+        nvidia-container-toolkit=${NVIDIA_CONTAINER_TOOLKIT_VERSION}-1 \
+    && rm -rf /var/lib/apt/lists/*
+# Configure the NVIDIA container runtime as the default for containerd.
+RUN nvidia-ctk runtime configure --runtime=containerd --set-as-default
+DOCKERFILE
+else
+    docker build --platform "${DOCKER_PLATFORM}" -t "${BASE_IMAGE_TAG}" \
+        --build-arg "BASE_IMAGE=${VM_BASE_IMAGE}" -f - . <<'DOCKERFILE'
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 RUN apt-get update && \
@@ -243,6 +312,7 @@ RUN mkdir -p /usr/share/udhcpc && \
     ln -sf /bin/busybox /sbin/udhcpc
 RUN mkdir -p /var/lib/rancher/k3s /etc/rancher/k3s
 DOCKERFILE
+fi
 
 # Create a container and export the filesystem
 echo "==> Creating container..."
@@ -363,6 +433,28 @@ for manifest in openshell-helmchart.yaml agent-sandbox.yaml; do
     fi
 done
 
+# ── Inject GPU manifests (when building GPU rootfs) ───────────────────
+# These are deployed by openshell-vm-init.sh when GPU_ENABLED=true.
+GPU_MANIFEST_SRC="${SCRIPT_DIR}/gpu-manifests"
+GPU_MANIFEST_DEST="${ROOTFS_DIR}/opt/openshell/gpu-manifests"
+if [ "$GPU_BUILD" = true ] && [ -d "${GPU_MANIFEST_SRC}" ]; then
+    echo "==> Injecting GPU manifests..."
+    mkdir -p "${GPU_MANIFEST_DEST}"
+    GPU_MANIFEST_COPIED=0
+    for manifest in "${GPU_MANIFEST_SRC}"/*.yaml; do
+        [ -f "$manifest" ] || continue
+        cp "$manifest" "${GPU_MANIFEST_DEST}/"
+        echo "    $(basename "$manifest")"
+        GPU_MANIFEST_COPIED=$((GPU_MANIFEST_COPIED + 1))
+    done
+    # Sentinel only when at least one manifest was staged (empty glob must not create it).
+    if [ "$GPU_MANIFEST_COPIED" -gt 0 ]; then
+        echo "gpu" > "${ROOTFS_DIR}/opt/openshell/.rootfs-gpu"
+    else
+        echo "WARNING: No GPU manifests (*.yaml) found in ${GPU_MANIFEST_SRC}; not writing .rootfs-gpu sentinel." >&2
+    fi
+fi
+
 # ── Base mode: mark rootfs type and skip pre-loading ───────────────────
 
 if [ "$BASE_ONLY" = true ]; then
@@ -384,10 +476,33 @@ if [ "$BASE_ONLY" = true ]; then
         exit 1
     fi
 
+    if [ "$GPU_BUILD" = true ]; then
+        echo "==> Verifying GPU components in rootfs..."
+        if [ ! -f "${ROOTFS_DIR}/usr/bin/nvidia-smi" ]; then
+            echo "ERROR: nvidia-smi not found in rootfs."
+            exit 1
+        fi
+        if [ ! -f "${ROOTFS_DIR}/opt/openshell/.rootfs-gpu" ]; then
+            echo "ERROR: GPU sentinel file not found in rootfs."
+            exit 1
+        fi
+        echo "    nvidia-smi: found"
+        # nvidia-container-runtime is installed via nvidia-container-toolkit.
+        if ls "${ROOTFS_DIR}"/usr/bin/nvidia-container-runtime* >/dev/null 2>&1; then
+            echo "    nvidia-container-runtime: found"
+        else
+            echo "WARNING: nvidia-container-runtime not found — GPU pods may not work."
+        fi
+    fi
+
     echo ""
     echo "==> Base rootfs ready at: ${ROOTFS_DIR}"
     echo "    Size: $(du -sh "${ROOTFS_DIR}" | cut -f1)"
-    echo "    Type: base (cold start, images pulled on demand)"
+    if [ "$GPU_BUILD" = true ]; then
+        echo "    Type: base + GPU (cold start, NVIDIA driver ${NVIDIA_DRIVER_VERSION})"
+    else
+        echo "    Type: base (cold start, images pulled on demand)"
+    fi
     echo ""
     echo "Note: First boot will take ~30-60s as k3s initializes."
     echo "      Container images will be pulled from registries on first use."
@@ -474,6 +589,15 @@ for manifest in "${MANIFEST_DEST}"/*.yaml; do
     [ -f "$manifest" ] || continue
     cp "$manifest" "${INIT_MANIFESTS}/"
 done
+
+# GPU manifests: same pre-init path as other auto-deploy manifests so k3s
+# sees them during cluster bake (not only under /opt/openshell/gpu-manifests).
+if [ "$GPU_BUILD" = true ] && [ -d "${GPU_MANIFEST_DEST}" ]; then
+    for manifest in "${GPU_MANIFEST_DEST}"/*.yaml; do
+        [ -f "$manifest" ] || continue
+        cp "$manifest" "${INIT_MANIFESTS}/"
+    done
+fi
 
 # Patch HelmChart for local images and VM settings.
 HELMCHART="${INIT_MANIFESTS}/openshell-helmchart.yaml"
@@ -741,10 +865,28 @@ if [ ! -x "${ROOTFS_DIR}/opt/openshell/bin/openshell-sandbox" ]; then
     exit 1
 fi
 
+# ── GPU verification (full mode) ──────────────────────────────────────
+if [ "$GPU_BUILD" = true ]; then
+    echo "==> Verifying GPU components in rootfs..."
+    if [ ! -f "${ROOTFS_DIR}/usr/bin/nvidia-smi" ]; then
+        echo "ERROR: nvidia-smi not found in rootfs."
+        exit 1
+    fi
+    echo "    nvidia-smi: found"
+    if ls "${ROOTFS_DIR}"/usr/bin/nvidia-container-runtime* >/dev/null 2>&1; then
+        echo "    nvidia-container-runtime: found"
+    else
+        echo "WARNING: nvidia-container-runtime not found — GPU pods may not work."
+    fi
+fi
+
 echo ""
 echo "==> Rootfs ready at: ${ROOTFS_DIR}"
 echo "    Size: $(du -sh "${ROOTFS_DIR}" | cut -f1)"
 echo "    Pre-initialized: $(cat "${ROOTFS_DIR}/opt/openshell/.initialized" 2>/dev/null || echo 'no')"
+if [ "$GPU_BUILD" = true ]; then
+    echo "    GPU: NVIDIA driver ${NVIDIA_DRIVER_VERSION}, toolkit ${NVIDIA_CONTAINER_TOOLKIT_VERSION}"
+fi
 
 # Show k3s data size
 K3S_DATA="${ROOTFS_DIR}/var/lib/rancher/k3s"

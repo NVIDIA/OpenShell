@@ -807,18 +807,21 @@ enum GatewayCommands {
         #[arg(long, env = "OPENSHELL_REGISTRY_TOKEN")]
         registry_token: Option<String>,
 
-        /// Enable NVIDIA GPU passthrough.
+        /// Enable NVIDIA GPU support for the gateway cluster.
         ///
-        /// Passes all host GPUs into the cluster container and deploys the
-        /// NVIDIA k8s-device-plugin so Kubernetes workloads can request
-        /// `nvidia.com/gpu` resources. Requires NVIDIA drivers and the
-        /// NVIDIA Container Toolkit on the host.
+        /// **Docker path (default):** passes GPUs into the gateway container via
+        /// the NVIDIA Container Toolkit — CDI when the daemon supports it, else
+        /// Docker's `--gpus all` — and deploys the NVIDIA device plugin. Use
+        /// `--gpu` or `--gpu auto` only; PCI addresses are not valid CDI device
+        /// names on this path.
         ///
-        /// When enabled, OpenShell auto-selects CDI when the Docker daemon has
-        /// CDI enabled and falls back to Docker's NVIDIA GPU request path
-        /// (`--gpus all`) otherwise.
-        #[arg(long)]
-        gpu: bool,
+        /// **MicroVM path:** set `OPENSHELL_GATEWAY_BACKEND=vm` for deployments
+        /// that use the VM gateway. Then you may pass `--gpu` / `--gpu auto` for
+        /// VFIO auto-select, or `--gpu 0000:41:00.0` (PCI BDF) for a specific GPU.
+        /// Requires IOMMU and the GPU bound to `vfio-pci`. See
+        /// `architecture/vm-gpu-passthrough.md`.
+        #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
+        gpu: Option<String>,
     },
 
     /// Stop the gateway (preserves state).
@@ -1129,10 +1132,9 @@ enum SandboxCommands {
         /// Request GPU resources for the sandbox.
         ///
         /// When no gateway is running, auto-bootstrap starts a GPU-enabled
-        /// gateway using the same automatic injection selection as
-        /// `openshell gateway start --gpu`. GPU intent is also inferred
-        /// automatically for known GPU-designated image names such as
-        /// `nvidia-gpu`.
+        /// gateway using the Docker NVIDIA path (`--gpu auto`), same as
+        /// `openshell gateway start --gpu` without the microVM backend. GPU
+        /// intent is also inferred for known GPU image names (e.g. `nvidia-gpu`).
         #[arg(long)]
         gpu: bool,
 
@@ -1655,12 +1657,11 @@ async fn main() -> Result<()> {
                 registry_token,
                 gpu,
             } => {
-                let gpu = if gpu {
-                    vec!["auto".to_string()]
-                } else {
-                    vec![]
+                let gpu = match gpu {
+                    Some(val) => vec![val],
+                    None => vec![],
                 };
-                run::gateway_admin_deploy(
+                let _gpu_guard = run::gateway_admin_deploy(
                     &name,
                     remote.as_deref(),
                     ssh_key.as_deref(),
