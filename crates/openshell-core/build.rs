@@ -63,8 +63,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Returns `None` when git is unavailable or the repo has no matching tags.
 fn git_version() -> Option<String> {
+    // Match numeric release tags only (e.g. `v0.0.29`). The bare glob `v*`
+    // also matches non-release tags like `vm-dev` or `vm-prod`; when one of
+    // those lands on the same commit as a release tag, `git describe` picks
+    // it and the resulting version string collapses to `m-dev` after the
+    // leading `v` is stripped below. Requiring a digit after `v` excludes
+    // those development tags without losing any release tag.
     let output = std::process::Command::new("git")
-        .args(["describe", "--tags", "--long", "--match", "v*"])
+        .args(["describe", "--tags", "--long", "--match", "v[0-9]*"])
         .output()
         .ok()?;
 
