@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Sandbox image for Python-based AI agents (Hermes, custom agents, etc.).
+# Build:  docker build -t python-agent-sandbox:latest -f Dockerfile.python-agent .
+# Usage:  openshell sandbox create --from python-agent-sandbox:latest -- python -m my_agent
+
+FROM python:3.13-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl iproute2 iptables git openssh-client ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install your agent here.  Replace with your agent's package name.
+# RUN pip install --no-cache-dir hermes-ai
+
+RUN groupadd -g 1000 sandbox && \
+    useradd -m -u 1000 -g sandbox -s /bin/bash sandbox
+
+WORKDIR /sandbox

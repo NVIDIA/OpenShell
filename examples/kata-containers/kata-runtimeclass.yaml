@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# RuntimeClass for Kata Containers.
+# Apply only if kata-deploy did not create it automatically.
+#
+#   kubectl apply -f kata-runtimeclass.yaml
+#   kubectl get runtimeclass
+
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-containers
+handler: kata

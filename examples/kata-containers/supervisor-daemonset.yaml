@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# DaemonSet that installs the openshell-sandbox supervisor binary on every
+# node.  The Kubernetes driver side-loads this binary into sandbox pods via
+# a hostPath volume at /opt/openshell/bin/openshell-sandbox.
+#
+# For the built-in k3s cluster the binary is already in the cluster image.
+# Use this DaemonSet when deploying OpenShell onto an existing Kubernetes
+# cluster (EKS, GKE, AKS, bare-metal, etc.).
+#
+#   kubectl apply -f supervisor-daemonset.yaml
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: openshell-supervisor-installer
+  namespace: openshell
+  labels:
+    app.kubernetes.io/name: openshell-supervisor-installer
+    app.kubernetes.io/component: supervisor
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openshell-supervisor-installer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openshell-supervisor-installer
+    spec:
+      initContainers:
+        - name: install-supervisor
+          image: ghcr.io/nvidia/openshell/cluster:latest
+          command:
+            - cp
+            - /opt/openshell/bin/openshell-sandbox
+            - /host-bin/openshell-sandbox
+          volumeMounts:
+            - name: host-bin
+              mountPath: /host-bin
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: 1m
+              memory: 4Mi
+            limits:
+              cpu: 1m
+              memory: 4Mi
+      volumes:
+        - name: host-bin
+          hostPath:
+            path: /opt/openshell/bin
+            type: DirectoryOrCreate
