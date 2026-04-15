@@ -19,17 +19,43 @@ use tracing::debug;
 /// `/proc/{pid}/cmdline` because `argv[0]` is trivially spoofable by any
 /// process and must not be used as a trusted identity source.
 ///
-/// If this fails, ensure the proxy process has permission to read
-/// `/proc/<pid>/exe` (e.g. same user, or `CAP_SYS_PTRACE`).
+/// ### Unlinked binaries (`(deleted)` suffix)
+///
+/// When a running binary is unlinked from its filesystem path — the common
+/// case is a `docker cp` hot-swap of `/opt/openshell/bin/openshell-sandbox`
+/// during a `cluster-deploy-fast` dev upgrade — the kernel appends the
+/// literal string `" (deleted)"` to the `/proc/<pid>/exe` readlink target.
+/// The raw tainted path (e.g. `"/opt/openshell/bin/openshell-sandbox (deleted)"`)
+/// is not a real filesystem path: any downstream `stat()` fails with `ENOENT`.
+///
+/// We strip the suffix so callers see a clean, grep-friendly path suitable
+/// for cache keys and log messages. This does NOT claim the file at the
+/// stripped path is the same binary that the process is executing — the
+/// on-disk inode may now be arbitrary. Callers that need to verify the
+/// running binary's *contents* (for integrity checking) should read the
+/// magic `/proc/<pid>/exe` symlink directly via `File::open`, which procfs
+/// resolves to the live in-memory executable even when the original inode
+/// has been unlinked.
+///
+/// If the readlink itself fails, ensure the proxy process has permission
+/// to read `/proc/<pid>/exe` (e.g. same user, or `CAP_SYS_PTRACE`).
 #[cfg(target_os = "linux")]
 pub fn binary_path(pid: i32) -> Result<PathBuf> {
-    std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|e| {
+    let link = format!("/proc/{pid}/exe");
+    let target = std::fs::read_link(&link).map_err(|e| {
         miette::miette!(
             "Failed to read /proc/{pid}/exe: {e}. \
              Cannot determine binary identity — denying request. \
              Hint: the proxy may need CAP_SYS_PTRACE or to run as the same user."
         )
-    })
+    })?;
+
+    // Strip the " (deleted)" suffix the kernel appends for unlinked binaries.
+    // See the doc comment above for the full rationale.
+    if let Some(stripped) = target.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        return Ok(PathBuf::from(stripped));
+    }
+    Ok(target)
 }
 
 /// Resolve the binary path of the TCP peer inside a sandbox network namespace.
@@ -389,6 +415,59 @@ mod tests {
         let path = binary_path(pid).unwrap();
         // Should resolve to the test runner binary
         assert!(path.exists());
+    }
+
+    /// Verify that an unlinked binary's path is returned without the
+    /// kernel's " (deleted)" suffix. This is the common case during a
+    /// `docker cp` hot-swap of the supervisor binary — before this strip,
+    /// callers that `stat()` the returned path get `ENOENT` and the
+    /// ancestor integrity check in the CONNECT proxy denies every request.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn binary_path_strips_deleted_suffix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Copy /bin/sleep to a temp path we control so we can unlink it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let exe_path = tmp.path().join("deleted-sleep");
+        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Spawn a child from the temp binary, then unlink it while the
+        // child is still running. The child keeps the exec mapping via
+        // `/proc/<pid>/exe`, but readlink will now return the tainted
+        // "<path> (deleted)" string.
+        let mut child = std::process::Command::new(&exe_path)
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let pid: i32 = child.id().cast_signed();
+        std::fs::remove_file(&exe_path).unwrap();
+
+        // Sanity check: the raw readlink should contain " (deleted)".
+        let raw = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            raw.ends_with(" (deleted)"),
+            "kernel should append ' (deleted)' to unlinked exe readlink; got {raw:?}"
+        );
+
+        // The public API should return the stripped path, not the tainted one.
+        let resolved = binary_path(pid).expect("binary_path should succeed for deleted binary");
+        assert_eq!(
+            resolved, exe_path,
+            "binary_path should strip the ' (deleted)' suffix"
+        );
+        let resolved_str = resolved.to_string_lossy();
+        assert!(
+            !resolved_str.contains("(deleted)"),
+            "stripped path must not contain '(deleted)'; got {resolved_str:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[cfg(target_os = "linux")]
