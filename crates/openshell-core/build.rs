@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Returns `None` when git is unavailable or the repo has no matching tags.
 fn git_version() -> Option<String> {
     let output = std::process::Command::new("git")
-        .args(["describe", "--tags", "--long", "--match", "v*"])
+        .args(["describe", "--tags", "--long", "--match", "v[0-9]*"])
         .output()
         .ok()?;
 
