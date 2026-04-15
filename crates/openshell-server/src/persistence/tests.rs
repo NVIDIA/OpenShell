@@ -23,6 +23,16 @@ async fn sqlite_put_get_round_trip() {
 }
 
 #[tokio::test]
+async fn sqlite_connect_runs_embedded_migrations() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    let records = store.list("sandbox", 10, 0).await.unwrap();
+    assert!(records.is_empty());
+}
+
+#[tokio::test]
 async fn sqlite_updates_timestamp() {
     let store = Store::connect("sqlite::memory:?cache=shared")
         .await

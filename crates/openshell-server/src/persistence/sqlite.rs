@@ -7,8 +7,9 @@ use super::{
 use openshell_core::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
-use std::path::PathBuf;
 use std::str::FromStr;
+
+static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
@@ -38,13 +39,7 @@ impl SqliteStore {
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("migrations")
-            .join("sqlite");
-        let migrator = sqlx::migrate::Migrator::new(path)
-            .await
-            .map_err(|e| map_migrate_error(&e))?;
-        migrator
+        SQLITE_MIGRATOR
             .run(&self.pool)
             .await
             .map_err(|e| map_migrate_error(&e))

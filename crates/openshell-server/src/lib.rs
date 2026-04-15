@@ -10,6 +10,7 @@
 //! - mTLS support
 
 mod auth;
+pub mod cli;
 mod compute;
 mod grpc;
 mod http;

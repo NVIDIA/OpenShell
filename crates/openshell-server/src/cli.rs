@@ -1,0 +1,256 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Shared CLI entrypoint for the gateway binaries.
+
+use clap::{Command, CommandFactory, FromArgMatches, Parser};
+use miette::{IntoDiagnostic, Result};
+use openshell_core::ComputeDriverKind;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+
+use crate::{run_server, tracing_bus::TracingLogBus};
+
+/// `OpenShell` gateway process - gRPC and HTTP server with protocol multiplexing.
+#[derive(Parser, Debug)]
+#[command(version = openshell_core::VERSION)]
+#[command(about = "OpenShell gRPC/HTTP server", long_about = None)]
+struct Args {
+    /// Port to bind the server to (all interfaces).
+    #[arg(long, default_value_t = 8080, env = "OPENSHELL_SERVER_PORT")]
+    port: u16,
+
+    /// Log level (trace, debug, info, warn, error).
+    #[arg(long, default_value = "info", env = "OPENSHELL_LOG_LEVEL")]
+    log_level: String,
+
+    /// Path to TLS certificate file (required unless --disable-tls).
+    #[arg(long, env = "OPENSHELL_TLS_CERT")]
+    tls_cert: Option<PathBuf>,
+
+    /// Path to TLS private key file (required unless --disable-tls).
+    #[arg(long, env = "OPENSHELL_TLS_KEY")]
+    tls_key: Option<PathBuf>,
+
+    /// Path to CA certificate for client certificate verification (mTLS).
+    #[arg(long, env = "OPENSHELL_TLS_CLIENT_CA")]
+    tls_client_ca: Option<PathBuf>,
+
+    /// Database URL for persistence.
+    #[arg(long, env = "OPENSHELL_DB_URL", required = true)]
+    db_url: String,
+
+    /// Compute drivers configured for this gateway.
+    ///
+    /// Accepts a comma-delimited list such as `kubernetes` or
+    /// `kubernetes,podman`. The configuration format is future-proofed for
+    /// multiple drivers, but the gateway currently requires exactly one.
+    #[arg(
+        long,
+        alias = "driver",
+        env = "OPENSHELL_DRIVERS",
+        value_delimiter = ',',
+        default_value = "kubernetes",
+        value_parser = parse_compute_driver
+    )]
+    drivers: Vec<ComputeDriverKind>,
+
+    /// Kubernetes namespace for sandboxes.
+    #[arg(long, env = "OPENSHELL_SANDBOX_NAMESPACE", default_value = "default")]
+    sandbox_namespace: String,
+
+    /// Default container image for sandboxes.
+    #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE")]
+    sandbox_image: Option<String>,
+
+    /// Kubernetes imagePullPolicy for sandbox pods (Always, IfNotPresent, Never).
+    #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY")]
+    sandbox_image_pull_policy: Option<String>,
+
+    /// gRPC endpoint for sandboxes to callback to `OpenShell`.
+    /// This should be reachable from within the Kubernetes cluster.
+    #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
+    grpc_endpoint: Option<String>,
+
+    /// Public host for the SSH gateway.
+    #[arg(long, env = "OPENSHELL_SSH_GATEWAY_HOST", default_value = "127.0.0.1")]
+    ssh_gateway_host: String,
+
+    /// Public port for the SSH gateway.
+    #[arg(long, env = "OPENSHELL_SSH_GATEWAY_PORT", default_value_t = 8080)]
+    ssh_gateway_port: u16,
+
+    /// HTTP path for SSH CONNECT/upgrade.
+    #[arg(
+        long,
+        env = "OPENSHELL_SSH_CONNECT_PATH",
+        default_value = "/connect/ssh"
+    )]
+    ssh_connect_path: String,
+
+    /// SSH port inside sandbox pods.
+    #[arg(long, env = "OPENSHELL_SANDBOX_SSH_PORT", default_value_t = 2222)]
+    sandbox_ssh_port: u16,
+
+    /// Shared secret for gateway-to-sandbox SSH handshake.
+    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
+    ssh_handshake_secret: Option<String>,
+
+    /// Allowed clock skew in seconds for SSH handshake.
+    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS", default_value_t = 300)]
+    ssh_handshake_skew_secs: u64,
+
+    /// Kubernetes secret name containing client TLS materials for sandbox pods.
+    #[arg(long, env = "OPENSHELL_CLIENT_TLS_SECRET_NAME")]
+    client_tls_secret_name: Option<String>,
+
+    /// Host gateway IP for sandbox pod hostAliases.
+    /// When set, sandbox pods get hostAliases entries mapping
+    /// host.docker.internal and host.openshell.internal to this IP.
+    #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
+    host_gateway_ip: Option<String>,
+
+    /// Disable TLS entirely — listen on plaintext HTTP.
+    /// Use this when the gateway sits behind a reverse proxy or tunnel
+    /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
+    #[arg(long, env = "OPENSHELL_DISABLE_TLS")]
+    disable_tls: bool,
+
+    /// Disable gateway authentication (mTLS client certificate requirement).
+    /// When set, the TLS handshake accepts connections without a client
+    /// certificate. Ignored when --disable-tls is set.
+    #[arg(long, env = "OPENSHELL_DISABLE_GATEWAY_AUTH")]
+    disable_gateway_auth: bool,
+}
+
+pub fn command(program_name: &'static str) -> Command {
+    Args::command().name(program_name).bin_name(program_name)
+}
+
+pub async fn run_cli(program_name: &'static str) -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
+
+    let args =
+        Args::from_arg_matches(&command(program_name).get_matches()).expect("clap validated args");
+
+    run_from_args(args).await
+}
+
+async fn run_from_args(args: Args) -> Result<()> {
+    let tracing_log_bus = TracingLogBus::new();
+    tracing_log_bus.install_subscriber(
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+    );
+
+    let bind = SocketAddr::from(([0, 0, 0, 0], args.port));
+
+    let tls = if args.disable_tls {
+        None
+    } else {
+        let cert_path = args.tls_cert.ok_or_else(|| {
+            miette::miette!(
+                "--tls-cert is required when TLS is enabled (use --disable-tls to skip)"
+            )
+        })?;
+        let key_path = args.tls_key.ok_or_else(|| {
+            miette::miette!("--tls-key is required when TLS is enabled (use --disable-tls to skip)")
+        })?;
+        let client_ca_path = args.tls_client_ca.ok_or_else(|| {
+            miette::miette!(
+                "--tls-client-ca is required when TLS is enabled (use --disable-tls to skip)"
+            )
+        })?;
+        Some(openshell_core::TlsConfig {
+            cert_path,
+            key_path,
+            client_ca_path,
+            allow_unauthenticated: args.disable_gateway_auth,
+        })
+    };
+
+    let mut config = openshell_core::Config::new(tls)
+        .with_bind_address(bind)
+        .with_log_level(&args.log_level);
+
+    config = config
+        .with_database_url(args.db_url)
+        .with_compute_drivers(args.drivers)
+        .with_sandbox_namespace(args.sandbox_namespace)
+        .with_ssh_gateway_host(args.ssh_gateway_host)
+        .with_ssh_gateway_port(args.ssh_gateway_port)
+        .with_ssh_connect_path(args.ssh_connect_path)
+        .with_sandbox_ssh_port(args.sandbox_ssh_port)
+        .with_ssh_handshake_skew_secs(args.ssh_handshake_skew_secs);
+
+    if let Some(image) = args.sandbox_image {
+        config = config.with_sandbox_image(image);
+    }
+
+    if let Some(policy) = args.sandbox_image_pull_policy {
+        config = config.with_sandbox_image_pull_policy(policy);
+    }
+
+    if let Some(endpoint) = args.grpc_endpoint {
+        config = config.with_grpc_endpoint(endpoint);
+    }
+
+    if let Some(secret) = args.ssh_handshake_secret {
+        config = config.with_ssh_handshake_secret(secret);
+    }
+
+    if let Some(name) = args.client_tls_secret_name {
+        config = config.with_client_tls_secret_name(name);
+    }
+
+    if let Some(ip) = args.host_gateway_ip {
+        config = config.with_host_gateway_ip(ip);
+    }
+
+    if args.disable_tls {
+        info!("TLS disabled — listening on plaintext HTTP");
+    } else if args.disable_gateway_auth {
+        info!("Gateway auth disabled — accepting connections without client certificates");
+    }
+
+    info!(bind = %config.bind_address, "Starting OpenShell server");
+
+    run_server(config, tracing_log_bus).await.into_diagnostic()
+}
+
+fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, String> {
+    value.parse()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command;
+
+    #[test]
+    fn command_uses_requested_binary_name() {
+        let mut server_help = Vec::new();
+        command("openshell-server")
+            .write_long_help(&mut server_help)
+            .unwrap();
+        let server_help = String::from_utf8(server_help).unwrap();
+        assert!(server_help.contains("openshell-server"));
+
+        let mut gateway_help = Vec::new();
+        command("openshell-gateway")
+            .write_long_help(&mut gateway_help)
+            .unwrap();
+        let gateway_help = String::from_utf8(gateway_help).unwrap();
+        assert!(gateway_help.contains("openshell-gateway"));
+        assert!(!gateway_help.contains("openshell-server"));
+    }
+
+    #[test]
+    fn command_exposes_version() {
+        let gateway_command = command("openshell-gateway");
+        let version = gateway_command.get_version().unwrap();
+        assert_eq!(version.to_string(), openshell_core::VERSION);
+    }
+}
