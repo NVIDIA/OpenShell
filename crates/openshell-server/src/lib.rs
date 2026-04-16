@@ -154,6 +154,7 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
 
     state.compute.spawn_watchers();
     ssh_tunnel::spawn_session_reaper(store.clone(), std::time::Duration::from_secs(3600));
+    supervisor_session::spawn_relay_reaper(state.clone(), std::time::Duration::from_secs(30));
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());

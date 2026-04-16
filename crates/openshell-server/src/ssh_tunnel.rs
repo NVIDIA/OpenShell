@@ -96,12 +96,14 @@ async fn ssh_connect(
         return StatusCode::PRECONDITION_FAILED.into_response();
     }
 
-    // Open a relay channel through the supervisor session. The session may
-    // not be established yet right after the sandbox reports Ready, so wait
-    // briefly for it to appear.
+    // Open a relay channel through the supervisor session. Use a generous
+    // 30s session-wait timeout because `/connect/ssh` is typically called
+    // immediately after `sandbox create`, so we need to cover the supervisor's
+    // initial TLS + gRPC handshake on a cold-started pod. The old
+    // direct-connect path tolerated ~34s here for similar reasons.
     let (channel_id, relay_rx) = match state
         .supervisor_sessions
-        .open_relay_with_wait(&sandbox_id, Duration::from_secs(15))
+        .open_relay(&sandbox_id, Duration::from_secs(30))
         .await
     {
         Ok(pair) => pair,
