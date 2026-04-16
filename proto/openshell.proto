@@ -91,6 +91,14 @@ service OpenShell {
   // Push sandbox supervisor logs to the server (client-streaming).
   rpc PushSandboxLogs(stream PushSandboxLogsRequest) returns (PushSandboxLogsResponse);
 
+  // Persistent supervisor-to-gateway session (bidirectional streaming).
+  //
+  // The supervisor opens this stream at startup and keeps it alive for the
+  // sandbox lifetime. The gateway uses it to coordinate relay channels for
+  // SSH connect and ExecSandbox. SSH bytes flow over separate reverse HTTP
+  // CONNECT tunnels, not over this stream.
+  rpc ConnectSupervisor(stream SupervisorMessage) returns (stream GatewayMessage);
+
   // Watch a sandbox and stream updates.
   //
   // This stream can include:
@@ -702,6 +710,87 @@ message GetSandboxLogsResponse {
   repeated SandboxLogLine logs = 1;
   // Total number of lines in the server's buffer for this sandbox.
   uint32 buffer_total = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor session messages
+// ---------------------------------------------------------------------------
+
+// Envelope for supervisor-to-gateway messages on the ConnectSupervisor stream.
+message SupervisorMessage {
+  oneof payload {
+    SupervisorHello hello = 1;
+    SupervisorHeartbeat heartbeat = 2;
+    RelayOpenResult relay_open_result = 3;
+    RelayClose relay_close = 4;
+  }
+}
+
+// Envelope for gateway-to-supervisor messages on the ConnectSupervisor stream.
+message GatewayMessage {
+  oneof payload {
+    SessionAccepted session_accepted = 1;
+    SessionRejected session_rejected = 2;
+    GatewayHeartbeat heartbeat = 3;
+    RelayOpen relay_open = 4;
+    RelayClose relay_close = 5;
+  }
+}
+
+// Supervisor identifies itself and the sandbox it manages.
+message SupervisorHello {
+  // Sandbox ID this supervisor manages.
+  string sandbox_id = 1;
+  // Supervisor instance ID (e.g. boot id or process epoch).
+  string instance_id = 2;
+}
+
+// Gateway accepts the supervisor session.
+message SessionAccepted {
+  // Gateway-assigned session ID for this connection.
+  string session_id = 1;
+  // Recommended heartbeat interval in seconds.
+  uint32 heartbeat_interval_secs = 2;
+}
+
+// Gateway rejects the supervisor session.
+message SessionRejected {
+  // Human-readable rejection reason.
+  string reason = 1;
+}
+
+// Supervisor heartbeat.
+message SupervisorHeartbeat {}
+
+// Gateway heartbeat.
+message GatewayHeartbeat {}
+
+// Gateway requests the supervisor to open a relay channel.
+//
+// On receiving this, the supervisor should open a reverse HTTP CONNECT
+// to the gateway's /relay/{channel_id} endpoint and bridge it to the
+// local SSH daemon.
+message RelayOpen {
+  // Gateway-allocated channel identifier (UUID).
+  string channel_id = 1;
+}
+
+// Supervisor reports the result of a relay open request.
+message RelayOpenResult {
+  // Channel identifier from the RelayOpen request.
+  string channel_id = 1;
+  // True if the relay was successfully established.
+  bool success = 2;
+  // Error message if success is false.
+  string error = 3;
+}
+
+// Either side requests closure of a relay channel.
+message RelayClose {
+  // Channel identifier to close.
+  string channel_id = 1;
+  // Optional reason for closure.
+  string reason = 2;
 }
 
 // ---------------------------------------------------------------------------

@@ -200,6 +200,9 @@ impl OpenShell for TestOpenShell {
     >;
     type ExecSandboxStream =
         tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    type ConnectSupervisorStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::GatewayMessage, Status>,
+    >;
 
     async fn watch_sandbox(
         &self,
@@ -323,6 +326,13 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
     ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn connect_supervisor(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::SupervisorMessage>>,
+    ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 }

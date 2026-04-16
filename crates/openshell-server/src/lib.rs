@@ -16,9 +16,11 @@ mod http;
 mod inference;
 mod multiplex;
 mod persistence;
+mod relay;
 mod sandbox_index;
 mod sandbox_watch;
 mod ssh_tunnel;
+pub(crate) mod supervisor_session;
 mod tls;
 pub mod tracing_bus;
 mod ws_tunnel;
@@ -73,6 +75,9 @@ pub struct ServerState {
     /// set/delete operation, including the precedence check on sandbox
     /// mutations that reads global state.
     pub settings_mutex: tokio::sync::Mutex<()>,
+
+    /// Registry of active supervisor sessions and pending relay channels.
+    pub supervisor_sessions: supervisor_session::SupervisorSessionRegistry,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -103,6 +108,7 @@ impl ServerState {
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
+            supervisor_sessions: supervisor_session::SupervisorSessionRegistry::new(),
         }
     }
 }

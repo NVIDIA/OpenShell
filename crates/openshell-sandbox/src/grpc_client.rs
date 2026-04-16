@@ -74,6 +74,11 @@ async fn connect_channel(endpoint: &str) -> Result<Channel> {
         .wrap_err("failed to connect to OpenShell server")
 }
 
+/// Create a channel to the OpenShell server (public for use by supervisor_session).
+pub async fn connect_channel_pub(endpoint: &str) -> Result<Channel> {
+    connect_channel(endpoint).await
+}
+
 /// Connect to the OpenShell server (mTLS or plaintext based on endpoint scheme).
 async fn connect(endpoint: &str) -> Result<OpenShellClient<Channel>> {
     let channel = connect_channel(endpoint).await?;

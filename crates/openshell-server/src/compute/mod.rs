@@ -13,9 +13,8 @@ use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
     DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest, ListSandboxesRequest,
-    ResolveSandboxEndpointRequest, ResolveSandboxEndpointResponse, ValidateSandboxCreateRequest,
-    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_server::ComputeDriver,
-    sandbox_endpoint, watch_sandboxes_event,
+    ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -26,7 +25,6 @@ use openshell_driver_kubernetes::{
 };
 use prost::Message;
 use std::fmt;
-use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,12 +51,6 @@ pub enum ComputeError {
     Precondition(String),
     #[error("{0}")]
     Message(String),
-}
-
-#[derive(Debug)]
-pub enum ResolvedEndpoint {
-    Ip(IpAddr, u16),
-    Host(String, u16),
 }
 
 #[derive(Clone)]
@@ -241,29 +233,6 @@ impl ComputeRuntime {
 
         self.cleanup_sandbox_state(&id);
         Ok(deleted)
-    }
-
-    pub async fn resolve_sandbox_endpoint(
-        &self,
-        sandbox: &Sandbox,
-    ) -> Result<ResolvedEndpoint, Status> {
-        let driver_sandbox = driver_sandbox_from_public(sandbox);
-        self.driver
-            .resolve_sandbox_endpoint(Request::new(ResolveSandboxEndpointRequest {
-                sandbox: Some(driver_sandbox),
-            }))
-            .await
-            .map(|response| response.into_inner())
-            .map_err(|status| match status.code() {
-                Code::FailedPrecondition => {
-                    Status::failed_precondition(status.message().to_string())
-                }
-                _ => Status::internal(status.message().to_string()),
-            })
-            .and_then(|response| {
-                resolved_endpoint_from_response(&response)
-                    .map_err(|err| Status::internal(err.to_string()))
-            })
     }
 
     pub fn spawn_watchers(&self) {
@@ -813,30 +782,6 @@ fn decode_sandbox_record(record: &ObjectRecord) -> Result<Sandbox, String> {
     Sandbox::decode(record.payload.as_slice()).map_err(|e| e.to_string())
 }
 
-fn resolved_endpoint_from_response(
-    response: &ResolveSandboxEndpointResponse,
-) -> Result<ResolvedEndpoint, ComputeError> {
-    let endpoint = response
-        .endpoint
-        .as_ref()
-        .ok_or_else(|| ComputeError::Message("compute driver returned no endpoint".to_string()))?;
-    let port = u16::try_from(endpoint.port)
-        .map_err(|_| ComputeError::Message("compute driver returned invalid port".to_string()))?;
-
-    match endpoint.target.as_ref() {
-        Some(sandbox_endpoint::Target::Ip(ip)) => ip
-            .parse()
-            .map(|ip| ResolvedEndpoint::Ip(ip, port))
-            .map_err(|e| ComputeError::Message(format!("invalid endpoint IP: {e}"))),
-        Some(sandbox_endpoint::Target::Host(host)) => {
-            Ok(ResolvedEndpoint::Host(host.clone(), port))
-        }
-        None => Err(ComputeError::Message(
-            "compute driver returned endpoint without target".to_string(),
-        )),
-    }
-}
-
 fn public_status_from_driver(status: &DriverSandboxStatus) -> SandboxStatus {
     SandboxStatus {
         sandbox_name: status.sandbox_name.clone(),
@@ -929,8 +874,7 @@ mod tests {
     use futures::stream;
     use openshell_core::proto::compute::v1::{
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
-        GetSandboxResponse, ResolveSandboxEndpointResponse, SandboxEndpoint, StopSandboxRequest,
-        StopSandboxResponse, ValidateSandboxCreateResponse, sandbox_endpoint,
+        GetSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateResponse,
     };
     use std::sync::Arc;
 
@@ -938,7 +882,6 @@ mod tests {
     struct TestDriver {
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
-        resolve_precondition: Option<String>,
     }
 
     #[tonic::async_trait]
@@ -1028,24 +971,6 @@ mod tests {
         ) -> Result<tonic::Response<DeleteSandboxResponse>, Status> {
             Ok(tonic::Response::new(DeleteSandboxResponse {
                 deleted: true,
-            }))
-        }
-
-        async fn resolve_sandbox_endpoint(
-            &self,
-            _request: Request<ResolveSandboxEndpointRequest>,
-        ) -> Result<tonic::Response<ResolveSandboxEndpointResponse>, Status> {
-            if let Some(message) = &self.resolve_precondition {
-                return Err(Status::failed_precondition(message.clone()));
-            }
-
-            Ok(tonic::Response::new(ResolveSandboxEndpointResponse {
-                endpoint: Some(SandboxEndpoint {
-                    target: Some(sandbox_endpoint::Target::Host(
-                        "sandbox.default.svc.cluster.local".to_string(),
-                    )),
-                    port: 2222,
-                }),
             }))
         }
 
@@ -1320,23 +1245,6 @@ mod tests {
             SandboxPhase::try_from(stored.phase).unwrap(),
             SandboxPhase::Ready
         );
-    }
-
-    #[tokio::test]
-    async fn resolve_sandbox_endpoint_preserves_precondition_errors() {
-        let runtime = test_runtime(Arc::new(TestDriver {
-            resolve_precondition: Some("sandbox agent pod IP is not available".to_string()),
-            ..Default::default()
-        }))
-        .await;
-
-        let err = runtime
-            .resolve_sandbox_endpoint(&sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready))
-            .await
-            .expect_err("endpoint resolution should preserve failed-precondition errors");
-
-        assert_eq!(err.code(), Code::FailedPrecondition);
-        assert_eq!(err.message(), "sandbox agent pod IP is not available");
     }
 
     #[tokio::test]

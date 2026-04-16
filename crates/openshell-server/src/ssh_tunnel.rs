@@ -6,15 +6,12 @@
 use axum::{Router, extract::State, http::Method, response::IntoResponse, routing::any};
 use http::StatusCode;
 use hyper::Request;
-use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use openshell_core::proto::{Sandbox, SandboxPhase, SshSession};
 use prost::Message;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -23,7 +20,6 @@ use crate::persistence::{ObjectId, ObjectName, ObjectType, Store};
 
 const HEADER_SANDBOX_ID: &str = "x-sandbox-id";
 const HEADER_TOKEN: &str = "x-sandbox-token";
-const PREFACE_MAGIC: &str = "NSSH1";
 
 /// Maximum concurrent SSH tunnel connections per session token.
 const MAX_CONNECTIONS_PER_TOKEN: u32 = 3;
@@ -100,19 +96,15 @@ async fn ssh_connect(
         return StatusCode::PRECONDITION_FAILED.into_response();
     }
 
-    let connect_target = match state.compute.resolve_sandbox_endpoint(&sandbox).await {
-        Ok(crate::compute::ResolvedEndpoint::Ip(ip, port)) => {
-            ConnectTarget::Ip(SocketAddr::new(ip, port))
-        }
-        Ok(crate::compute::ResolvedEndpoint::Host(host, port)) => ConnectTarget::Host(host, port),
-        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
-            return StatusCode::PRECONDITION_FAILED.into_response();
-        }
-        Err(err) => {
-            warn!(error = %err, "Failed to resolve sandbox endpoint");
+    // Open a relay channel through the supervisor session.
+    let (channel_id, relay_rx) = match state.supervisor_sessions.open_relay(&sandbox_id).await {
+        Ok(pair) => pair,
+        Err(status) => {
+            warn!(sandbox_id = %sandbox_id, error = %status.message(), "SSH tunnel: supervisor session not available");
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
+
     // Enforce per-token concurrent connection limit.
     {
         let mut counts = state.ssh_connections_by_token.lock().unwrap();
@@ -150,19 +142,96 @@ async fn ssh_connect(
 
     let upgrade = hyper::upgrade::on(req);
     tokio::spawn(async move {
-        match upgrade.await {
-            Ok(mut upgraded) => {
-                if let Err(err) = handle_tunnel(
-                    &mut upgraded,
-                    connect_target,
-                    &token_clone,
-                    &handshake_secret,
+        // Wait for the supervisor's reverse CONNECT to arrive and claim the relay.
+        let relay_stream = match tokio::time::timeout(Duration::from_secs(10), relay_rx).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(_)) => {
+                warn!(sandbox_id = %sandbox_id_clone, channel_id = %channel_id, "SSH tunnel: relay channel dropped");
+                decrement_connection_count(&state_clone.ssh_connections_by_token, &token_clone);
+                decrement_connection_count(
+                    &state_clone.ssh_connections_by_sandbox,
                     &sandbox_id_clone,
-                )
-                .await
-                {
-                    warn!(error = %err, "SSH tunnel failure");
+                );
+                return;
+            }
+            Err(_) => {
+                warn!(sandbox_id = %sandbox_id_clone, channel_id = %channel_id, "SSH tunnel: relay open timed out");
+                decrement_connection_count(&state_clone.ssh_connections_by_token, &token_clone);
+                decrement_connection_count(
+                    &state_clone.ssh_connections_by_sandbox,
+                    &sandbox_id_clone,
+                );
+                return;
+            }
+        };
+
+        // Send NSSH1 handshake through the relay to the SSH daemon before
+        // bridging the client's SSH bytes. The relay carries bytes to the
+        // supervisor which bridges them to the local SSH daemon on loopback.
+        let (mut relay_read, mut relay_write) = tokio::io::split(relay_stream);
+        let preface = match build_preface(&token_clone, &handshake_secret) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "SSH tunnel: failed to build NSSH1 preface");
+                decrement_connection_count(&state_clone.ssh_connections_by_token, &token_clone);
+                decrement_connection_count(
+                    &state_clone.ssh_connections_by_sandbox,
+                    &sandbox_id_clone,
+                );
+                return;
+            }
+        };
+        if let Err(e) = relay_write.write_all(preface.as_bytes()).await {
+            warn!(error = %e, "SSH tunnel: failed to send NSSH1 preface through relay");
+            decrement_connection_count(&state_clone.ssh_connections_by_token, &token_clone);
+            decrement_connection_count(&state_clone.ssh_connections_by_sandbox, &sandbox_id_clone);
+            return;
+        }
+
+        // Read handshake response from the SSH daemon through the relay.
+        let mut response_buf = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            match relay_read.read(&mut byte).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    response_buf.push(byte[0]);
+                    if response_buf.len() > 1024 {
+                        break;
+                    }
                 }
+                Err(e) => {
+                    warn!(error = %e, "SSH tunnel: failed to read NSSH1 response from relay");
+                    decrement_connection_count(&state_clone.ssh_connections_by_token, &token_clone);
+                    decrement_connection_count(
+                        &state_clone.ssh_connections_by_sandbox,
+                        &sandbox_id_clone,
+                    );
+                    return;
+                }
+            }
+        }
+        let response = String::from_utf8_lossy(&response_buf);
+        if response.trim() != "OK" {
+            warn!(response = %response.trim(), "SSH tunnel: NSSH1 handshake rejected by sandbox");
+            decrement_connection_count(&state_clone.ssh_connections_by_token, &token_clone);
+            decrement_connection_count(&state_clone.ssh_connections_by_sandbox, &sandbox_id_clone);
+            return;
+        }
+
+        info!(sandbox_id = %sandbox_id_clone, channel_id = %channel_id, "SSH tunnel: NSSH1 handshake OK, bridging client");
+
+        // Reunite the split relay halves and bridge with the client's upgraded stream.
+        let mut relay = relay_read.unsplit(relay_write);
+
+        match upgrade.await {
+            Ok(upgraded) => {
+                let mut upgraded = TokioIo::new(upgraded);
+                let _ = tokio::io::copy_bidirectional(&mut upgraded, &mut relay).await;
+                let _ = AsyncWriteExt::shutdown(&mut upgraded).await;
             }
             Err(err) => {
                 warn!(error = %err, "SSH upgrade failed");
@@ -175,90 +244,6 @@ async fn ssh_connect(
     });
 
     StatusCode::OK.into_response()
-}
-
-async fn handle_tunnel(
-    upgraded: &mut Upgraded,
-    target: ConnectTarget,
-    token: &str,
-    secret: &str,
-    sandbox_id: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // The sandbox pod may not be network-reachable immediately after the CRD
-    // reports Ready (DNS propagation, pod IP assignment, SSH server startup).
-    // Retry the TCP connection with exponential backoff.
-    let mut upstream = None;
-    let mut last_err = None;
-    let delays = [
-        Duration::from_millis(100),
-        Duration::from_millis(250),
-        Duration::from_millis(500),
-        Duration::from_secs(1),
-        Duration::from_secs(2),
-        Duration::from_secs(5),
-        Duration::from_secs(10),
-        Duration::from_secs(15),
-    ];
-    let target_desc = match &target {
-        ConnectTarget::Ip(addr) => format!("{addr}"),
-        ConnectTarget::Host(host, port) => format!("{host}:{port}"),
-    };
-    info!(sandbox_id = %sandbox_id, target = %target_desc, "SSH tunnel: connecting to sandbox");
-    for (attempt, delay) in std::iter::once(&Duration::ZERO)
-        .chain(delays.iter())
-        .enumerate()
-    {
-        if !delay.is_zero() {
-            info!(sandbox_id = %sandbox_id, attempt = attempt + 1, delay_ms = delay.as_millis() as u64, "SSH tunnel: retrying TCP connect");
-            tokio::time::sleep(*delay).await;
-        }
-        let result = match &target {
-            ConnectTarget::Ip(addr) => TcpStream::connect(addr).await,
-            ConnectTarget::Host(host, port) => TcpStream::connect((host.as_str(), *port)).await,
-        };
-        match result {
-            Ok(stream) => {
-                info!(
-                    sandbox_id = %sandbox_id,
-                    attempts = attempt + 1,
-                    "SSH tunnel: TCP connected to sandbox"
-                );
-                upstream = Some(stream);
-                break;
-            }
-            Err(err) => {
-                info!(sandbox_id = %sandbox_id, attempt = attempt + 1, error = %err, "SSH tunnel: TCP connect failed");
-                last_err = Some(err);
-            }
-        }
-    }
-    let mut upstream = upstream.ok_or_else(|| {
-        let err = last_err.unwrap();
-        format!("failed to connect to sandbox after retries: {err}")
-    })?;
-    upstream.set_nodelay(true)?;
-    info!(sandbox_id = %sandbox_id, "SSH tunnel: sending NSSH1 handshake preface");
-    let preface = build_preface(token, secret)?;
-    upstream.write_all(preface.as_bytes()).await?;
-
-    info!(sandbox_id = %sandbox_id, "SSH tunnel: waiting for handshake response");
-    let mut response = String::new();
-    read_line(&mut upstream, &mut response).await?;
-    info!(sandbox_id = %sandbox_id, response = %response.trim(), "SSH tunnel: handshake response received");
-    if response.trim() != "OK" {
-        return Err("sandbox handshake rejected".into());
-    }
-
-    info!(sandbox_id = %sandbox_id, "SSH tunnel established");
-    let mut upgraded = TokioIo::new(upgraded);
-    // Discard the result entirely – connection-close errors are expected when
-    // the SSH session ends and do not represent a failure worth propagating.
-    let _ = tokio::io::copy_bidirectional(&mut upgraded, &mut upstream).await;
-    // Gracefully shut down the write-half of the upgraded connection so the
-    // client receives a clean EOF instead of a TCP RST.  This gives SSH time
-    // to read any remaining protocol data (e.g. exit-status) from its buffer.
-    let _ = AsyncWriteExt::shutdown(&mut upgraded).await;
-    Ok(())
 }
 
 fn header_value(headers: &http::HeaderMap, name: &str) -> Result<String, StatusCode> {
@@ -274,6 +259,8 @@ fn header_value(headers: &http::HeaderMap, name: &str) -> Result<String, StatusC
     }
     Ok(value)
 }
+
+const PREFACE_MAGIC: &str = "NSSH1";
 
 fn build_preface(
     token: &str,
@@ -292,29 +279,6 @@ fn build_preface(
     Ok(format!(
         "{PREFACE_MAGIC} {token} {timestamp} {nonce} {signature}\n"
     ))
-}
-
-async fn read_line(
-    stream: &mut TcpStream,
-    buf: &mut String,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut bytes = Vec::new();
-    loop {
-        let mut byte = [0u8; 1];
-        let n = stream.read(&mut byte).await?;
-        if n == 0 {
-            break;
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        bytes.push(byte[0]);
-        if bytes.len() > 1024 {
-            break;
-        }
-    }
-    *buf = String::from_utf8_lossy(&bytes).to_string();
-    Ok(())
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
@@ -343,11 +307,6 @@ impl ObjectName for SshSession {
     fn object_name(&self) -> &str {
         &self.name
     }
-}
-
-enum ConnectTarget {
-    Ip(SocketAddr),
-    Host(String, u16),
 }
 
 /// Decrement a connection count entry, removing it if it reaches zero.

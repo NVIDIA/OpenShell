@@ -21,6 +21,7 @@ pub mod proxy;
 mod sandbox;
 mod secrets;
 mod ssh;
+mod supervisor_session;
 
 use miette::{IntoDiagnostic, Result};
 #[cfg(target_os = "linux")]
@@ -674,6 +675,21 @@ pub async fn run_sandbox(
                 ));
             }
         }
+    }
+
+    // Spawn the persistent supervisor session if we have a gateway endpoint
+    // and sandbox identity. The session provides relay channels for SSH
+    // connect and ExecSandbox through the gateway.
+    if let (Some(endpoint), Some(id)) = (openshell_endpoint.as_ref(), sandbox_id.as_ref()) {
+        // The SSH listen address was consumed above, so we use the configured
+        // SSH port (default 2222) for loopback connections from the relay.
+        let ssh_port = std::env::var("OPENSHELL_SSH_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(2222);
+
+        supervisor_session::spawn(endpoint.clone(), id.clone(), ssh_port);
+        info!("supervisor session task spawned");
     }
 
     #[cfg(target_os = "linux")]
