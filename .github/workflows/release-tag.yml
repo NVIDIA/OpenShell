@@ -636,10 +636,6 @@ jobs:
             curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_VERSION=${{ env.RELEASE_TAG }} sh
             ```
 
-            ### Standalone gateway binary
-
-            Manual-download `openshell-gateway` tarballs are attached for Linux amd64/arm64 and macOS ARM64. This release track does not yet include a gateway installer.
-
           files: |
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz
