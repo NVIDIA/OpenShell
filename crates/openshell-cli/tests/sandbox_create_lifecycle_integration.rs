@@ -413,7 +413,6 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
-
     type RelayStreamStream = tokio_stream::wrappers::ReceiverStream<
         Result<openshell_core::proto::RelayChunk, tonic::Status>,
     >;
