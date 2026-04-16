@@ -12,8 +12,10 @@
 
 use crate::ServerState;
 use crate::persistence::{DraftChunkRecord, PolicyRecord, Store};
+use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
+    AddAllowRules as ProtoAddAllowRules, AddDenyRules as ProtoAddDenyRules,
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
     ApproveDraftChunkResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
     DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse, EffectiveSetting,
@@ -22,15 +24,16 @@ use openshell_core::proto::{
     GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
     GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
-    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, PolicyChunk, PolicySource,
-    PolicyStatus, PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
-    RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, UndoDraftChunkRequest, UndoDraftChunkResponse,
-    UpdateConfigRequest, UpdateConfigResponse,
+    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, PolicyChunk, PolicyMergeOperation,
+    PolicySource, PolicyStatus, PushSandboxLogsRequest, PushSandboxLogsResponse,
+    RejectDraftChunkRequest, RejectDraftChunkResponse, ReportPolicyStatusRequest,
+    ReportPolicyStatusResponse, SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
+    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
 };
 use openshell_core::proto::{Sandbox, SandboxPolicy as ProtoSandboxPolicy};
 use openshell_core::settings::{self, SettingValueKind};
+use openshell_policy::{PolicyMergeOp, merge_policy};
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -242,20 +245,31 @@ pub(super) async fn handle_update_config(
     let key = req.setting_key.trim();
     let has_policy = req.policy.is_some();
     let has_setting = !key.is_empty();
+    let has_merge_ops = !req.merge_operations.is_empty();
+    let mut mutation_count = 0_u8;
+    mutation_count += u8::from(has_policy);
+    mutation_count += u8::from(has_setting);
+    mutation_count += u8::from(has_merge_ops);
 
-    if has_policy && has_setting {
+    if mutation_count > 1 {
         return Err(Status::invalid_argument(
-            "policy and setting_key cannot be set in the same request",
+            "policy, setting_key, and merge_operations are mutually exclusive",
         ));
     }
-    if !has_policy && !has_setting {
+    if mutation_count == 0 {
         return Err(Status::invalid_argument(
-            "either policy or setting_key must be provided",
+            "one of policy, setting_key, or merge_operations must be provided",
         ));
     }
 
     if req.global {
         let _settings_guard = state.settings_mutex.lock().await;
+
+        if has_merge_ops {
+            return Err(Status::invalid_argument(
+                "merge_operations are not supported for global policy updates",
+            ));
+        }
 
         if has_policy {
             if req.delete_setting {
@@ -489,6 +503,45 @@ pub(super) async fn handle_update_config(
             version: 0,
             policy_hash: String::new(),
             settings_revision: sandbox_settings.revision,
+            deleted: false,
+        }));
+    }
+
+    if has_merge_ops {
+        let global_settings = load_global_settings(state.store.as_ref()).await?;
+        if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
+            return Err(Status::failed_precondition(
+                "policy is managed globally; delete global policy before sandbox policy update",
+            ));
+        }
+
+        let spec = sandbox
+            .spec
+            .as_ref()
+            .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+        let merge_ops = parse_merge_operations(&req.merge_operations)?;
+        validate_merge_operations_for_server(&merge_ops)?;
+        let (version, hash) = apply_merge_operations_with_retry(
+            state.store.as_ref(),
+            &sandbox_id,
+            spec.policy.as_ref(),
+            &merge_ops,
+        )
+        .await?;
+
+        state.sandbox_watch_bus.notify(&sandbox_id);
+        info!(
+            sandbox_id = %sandbox_id,
+            version,
+            policy_hash = %hash,
+            operation_count = merge_ops.len(),
+            "UpdateConfig: merged incremental policy operations"
+        );
+
+        return Ok(Response::new(UpdateConfigResponse {
+            version: u32::try_from(version).unwrap_or(0),
+            policy_hash: hash,
+            settings_revision: 0,
             deleted: false,
         }));
     }
@@ -1677,90 +1730,203 @@ async fn require_no_global_policy(state: &ServerState) -> Result<(), Status> {
     Ok(())
 }
 
-pub(super) async fn merge_chunk_into_policy(
+fn parse_merge_operations(
+    proto_ops: &[PolicyMergeOperation],
+) -> Result<Vec<PolicyMergeOp>, Status> {
+    proto_ops
+        .iter()
+        .enumerate()
+        .map(|(index, operation)| {
+            let Some(operation) = operation.operation.as_ref() else {
+                return Err(Status::invalid_argument(format!(
+                    "merge_operations[{index}] is missing an operation"
+                )));
+            };
+
+            match operation {
+                policy_merge_operation::Operation::AddRule(add_rule) => {
+                    let rule_name = add_rule.rule_name.trim();
+                    if rule_name.is_empty() {
+                        return Err(Status::invalid_argument(format!(
+                            "merge_operations[{index}].add_rule.rule_name is required"
+                        )));
+                    }
+                    if add_rule.rule.as_ref().is_none_or(|rule| rule.endpoints.is_empty()) {
+                        return Err(Status::invalid_argument(format!(
+                            "merge_operations[{index}].add_rule.rule must contain at least one endpoint"
+                        )));
+                    }
+                    Ok(PolicyMergeOp::AddRule {
+                        rule_name: rule_name.to_string(),
+                        rule: add_rule.rule.clone().unwrap_or_default(),
+                    })
+                }
+                policy_merge_operation::Operation::RemoveEndpoint(remove_endpoint) => {
+                    if remove_endpoint.host.trim().is_empty() || remove_endpoint.port == 0 {
+                        return Err(Status::invalid_argument(format!(
+                            "merge_operations[{index}].remove_endpoint requires host and non-zero port"
+                        )));
+                    }
+                    let rule_name = if remove_endpoint.rule_name.trim().is_empty() {
+                        None
+                    } else {
+                        Some(remove_endpoint.rule_name.trim().to_string())
+                    };
+                    Ok(PolicyMergeOp::RemoveEndpoint {
+                        rule_name,
+                        host: remove_endpoint.host.trim().to_string(),
+                        port: remove_endpoint.port,
+                    })
+                }
+                policy_merge_operation::Operation::RemoveRule(remove_rule) => {
+                    let rule_name = remove_rule.rule_name.trim();
+                    if rule_name.is_empty() {
+                        return Err(Status::invalid_argument(format!(
+                            "merge_operations[{index}].remove_rule.rule_name is required"
+                        )));
+                    }
+                    Ok(PolicyMergeOp::RemoveRule {
+                        rule_name: rule_name.to_string(),
+                    })
+                }
+                policy_merge_operation::Operation::AddDenyRules(add_deny_rules) => {
+                    parse_proto_add_deny_rules(index, add_deny_rules)
+                }
+                policy_merge_operation::Operation::AddAllowRules(add_allow_rules) => {
+                    parse_proto_add_allow_rules(index, add_allow_rules)
+                }
+                policy_merge_operation::Operation::RemoveBinary(remove_binary) => {
+                    let rule_name = remove_binary.rule_name.trim();
+                    let binary_path = remove_binary.binary_path.trim();
+                    if rule_name.is_empty() || binary_path.is_empty() {
+                        return Err(Status::invalid_argument(format!(
+                            "merge_operations[{index}].remove_binary requires rule_name and binary_path"
+                        )));
+                    }
+                    Ok(PolicyMergeOp::RemoveBinary {
+                        rule_name: rule_name.to_string(),
+                        binary_path: binary_path.to_string(),
+                    })
+                }
+            }
+        })
+        .collect()
+}
+
+fn parse_proto_add_deny_rules(
+    index: usize,
+    add_deny_rules: &ProtoAddDenyRules,
+) -> Result<PolicyMergeOp, Status> {
+    if add_deny_rules.host.trim().is_empty()
+        || add_deny_rules.port == 0
+        || add_deny_rules.deny_rules.is_empty()
+    {
+        return Err(Status::invalid_argument(format!(
+            "merge_operations[{index}].add_deny_rules requires host, non-zero port, and at least one deny rule"
+        )));
+    }
+
+    Ok(PolicyMergeOp::AddDenyRules {
+        host: add_deny_rules.host.trim().to_string(),
+        port: add_deny_rules.port,
+        deny_rules: add_deny_rules.deny_rules.clone(),
+    })
+}
+
+fn parse_proto_add_allow_rules(
+    index: usize,
+    add_allow_rules: &ProtoAddAllowRules,
+) -> Result<PolicyMergeOp, Status> {
+    if add_allow_rules.host.trim().is_empty()
+        || add_allow_rules.port == 0
+        || add_allow_rules.rules.is_empty()
+    {
+        return Err(Status::invalid_argument(format!(
+            "merge_operations[{index}].add_allow_rules requires host, non-zero port, and at least one allow rule"
+        )));
+    }
+    if add_allow_rules
+        .rules
+        .iter()
+        .any(|rule| rule.allow.as_ref().is_none())
+    {
+        return Err(Status::invalid_argument(format!(
+            "merge_operations[{index}].add_allow_rules rules must include allow payloads"
+        )));
+    }
+
+    Ok(PolicyMergeOp::AddAllowRules {
+        host: add_allow_rules.host.trim().to_string(),
+        port: add_allow_rules.port,
+        rules: add_allow_rules.rules.clone(),
+    })
+}
+
+fn validate_merge_operations_for_server(operations: &[PolicyMergeOp]) -> Result<(), Status> {
+    for operation in operations {
+        if let PolicyMergeOp::AddRule { rule, .. } = operation {
+            validate_rule_not_always_blocked(rule)?;
+        }
+    }
+    Ok(())
+}
+
+fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
+    match error {
+        openshell_policy::PolicyMergeError::MissingRuleNameForAddRule
+        | openshell_policy::PolicyMergeError::InvalidEndpointReference { .. }
+        | openshell_policy::PolicyMergeError::UnsupportedAccessPreset { .. } => {
+            Status::invalid_argument(error.to_string())
+        }
+        openshell_policy::PolicyMergeError::EndpointNotFound { .. }
+        | openshell_policy::PolicyMergeError::EndpointHasNoL7Inspection { .. }
+        | openshell_policy::PolicyMergeError::UnsupportedEndpointProtocol { .. }
+        | openshell_policy::PolicyMergeError::EndpointHasNoAllowBase { .. } => {
+            Status::failed_precondition(error.to_string())
+        }
+    }
+}
+
+async fn apply_merge_operations_with_retry(
     store: &Store,
     sandbox_id: &str,
-    chunk: &DraftChunkRecord,
+    baseline_policy: Option<&ProtoSandboxPolicy>,
+    operations: &[PolicyMergeOp],
 ) -> Result<(i64, String), Status> {
-    use openshell_core::proto::NetworkPolicyRule;
-
-    let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
-        .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
-
-    // Defense-in-depth: reject proposed rules targeting always-blocked
-    // destinations.  Even if the sandbox mapper didn't filter these (e.g.,
-    // an older sandbox version), the proxy will deny them at runtime.
-    validate_rule_not_always_blocked(&rule)?;
-
     for attempt in 1..=MERGE_RETRY_LIMIT {
         let latest = store
             .get_latest_policy(sandbox_id)
             .await
             .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
 
-        let mut policy = if let Some(ref record) = latest {
+        let current_policy = if let Some(ref record) = latest {
             ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
                 .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?
         } else {
-            ProtoSandboxPolicy::default()
+            baseline_policy.cloned().unwrap_or_default()
         };
 
-        let base_version = latest.as_ref().map_or(0, |r| r.version);
+        let merged = merge_policy(current_policy, operations).map_err(map_policy_merge_error)?;
+        let new_policy = merged.policy;
+        let hash = deterministic_policy_hash(&new_policy);
 
-        let chunk_host_lc = chunk.host.to_lowercase();
-        let chunk_port = chunk.port as u32;
+        if let Some(baseline_policy) = baseline_policy {
+            validate_static_fields_unchanged(baseline_policy, &new_policy)?;
+        }
+        validate_policy_safety(&new_policy)?;
 
-        let merge_key = if policy.network_policies.contains_key(&chunk.rule_name) {
-            Some(chunk.rule_name.clone())
-        } else {
-            policy
-                .network_policies
-                .iter()
-                .find_map(|(key, existing_rule)| {
-                    let has_match = existing_rule.endpoints.iter().any(|ep| {
-                        let host_match = ep.host.to_lowercase() == chunk_host_lc;
-                        let port_match = if ep.ports.is_empty() {
-                            ep.port == chunk_port
-                        } else {
-                            ep.ports.contains(&chunk_port)
-                        };
-                        host_match && port_match
-                    });
-                    has_match.then(|| key.clone())
-                })
-        };
-
-        if let Some(key) = merge_key {
-            let existing = policy.network_policies.get_mut(&key).unwrap();
-            for b in &rule.binaries {
-                if !existing.binaries.iter().any(|eb| eb.path == b.path) {
-                    existing.binaries.push(b.clone());
-                }
-            }
-            for ep in &rule.endpoints {
-                if let Some(existing_ep) = existing.endpoints.iter_mut().find(|e| {
-                    e.host.to_lowercase() == ep.host.to_lowercase()
-                        && (e.port == ep.port
-                            || (!e.ports.is_empty() && e.ports.contains(&ep.port)))
-                }) {
-                    for ip in &ep.allowed_ips {
-                        if !existing_ep.allowed_ips.contains(ip) {
-                            existing_ep.allowed_ips.push(ip.clone());
-                        }
-                    }
-                } else {
-                    existing.endpoints.push(ep.clone());
-                }
-            }
-        } else {
-            policy
-                .network_policies
-                .insert(chunk.rule_name.clone(), rule.clone());
+        if let Some(ref current) = latest
+            && current.policy_hash == hash
+        {
+            return Ok((current.version, hash));
         }
 
-        let payload = policy.encode_to_vec();
-        let hash = deterministic_policy_hash(&policy);
-        let next_version = base_version + 1;
+        if latest.is_none() && !merged.changed {
+            return Ok((0, hash));
+        }
+
+        let payload = new_policy.encode_to_vec();
+        let next_version = latest.as_ref().map_or(1, |record| record.version + 1);
         let policy_id = uuid::Uuid::new_v4().to_string();
 
         match store
@@ -1775,10 +1941,10 @@ pub(super) async fn merge_chunk_into_policy(
                 if attempt > 1 {
                     info!(
                         sandbox_id = %sandbox_id,
-                        rule_name = %chunk.rule_name,
                         attempt,
                         version = next_version,
-                        "merge_chunk_into_policy: succeeded after version conflict retry"
+                        operation_count = operations.len(),
+                        "apply_merge_operations_with_retry: succeeded after version conflict retry"
                     );
                 }
 
@@ -1789,10 +1955,10 @@ pub(super) async fn merge_chunk_into_policy(
                 if msg.contains("UNIQUE") || msg.contains("unique") || msg.contains("duplicate") {
                     warn!(
                         sandbox_id = %sandbox_id,
-                        rule_name = %chunk.rule_name,
                         attempt,
                         conflicting_version = next_version,
-                        "merge_chunk_into_policy: version conflict, retrying"
+                        operation_count = operations.len(),
+                        "apply_merge_operations_with_retry: version conflict, retrying"
                     );
                     tokio::task::yield_now().await;
                     continue;
@@ -1805,9 +1971,27 @@ pub(super) async fn merge_chunk_into_policy(
     }
 
     Err(Status::aborted(format!(
-        "merge_chunk_into_policy: gave up after {} version conflict retries for rule '{}'",
-        MERGE_RETRY_LIMIT, chunk.rule_name
+        "apply_merge_operations_with_retry: gave up after {MERGE_RETRY_LIMIT} version conflict retries"
     )))
+}
+
+pub(super) async fn merge_chunk_into_policy(
+    store: &Store,
+    sandbox_id: &str,
+    chunk: &DraftChunkRecord,
+) -> Result<(i64, String), Status> {
+    let rule = openshell_core::proto::NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
+        .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
+    apply_merge_operations_with_retry(
+        store,
+        sandbox_id,
+        None,
+        &[PolicyMergeOp::AddRule {
+            rule_name: chunk.rule_name.clone(),
+            rule,
+        }],
+    )
+    .await
 }
 
 async fn remove_chunk_from_policy(
@@ -1815,80 +1999,16 @@ async fn remove_chunk_from_policy(
     sandbox_id: &str,
     chunk: &DraftChunkRecord,
 ) -> Result<(i64, String), Status> {
-    for attempt in 1..=MERGE_RETRY_LIMIT {
-        let latest = state
-            .store
-            .get_latest_policy(sandbox_id)
-            .await
-            .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
-            .ok_or_else(|| Status::internal("no active policy to undo from"))?;
-
-        let mut policy = ProtoSandboxPolicy::decode(latest.policy_payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?;
-
-        let should_remove =
-            if let Some(existing) = policy.network_policies.get_mut(&chunk.rule_name) {
-                existing.binaries.retain(|b| b.path != chunk.binary);
-                existing.binaries.is_empty()
-            } else {
-                false
-            };
-        if should_remove {
-            policy.network_policies.remove(&chunk.rule_name);
-        }
-
-        let payload = policy.encode_to_vec();
-        let hash = deterministic_policy_hash(&policy);
-        let next_version = latest.version + 1;
-        let policy_id = uuid::Uuid::new_v4().to_string();
-
-        match state
-            .store
-            .put_policy_revision(&policy_id, sandbox_id, next_version, &payload, &hash)
-            .await
-        {
-            Ok(()) => {
-                let _ = state
-                    .store
-                    .supersede_older_policies(sandbox_id, next_version)
-                    .await;
-
-                if attempt > 1 {
-                    info!(
-                        sandbox_id = %sandbox_id,
-                        rule_name = %chunk.rule_name,
-                        attempt,
-                        version = next_version,
-                        "remove_chunk_from_policy: succeeded after version conflict retry"
-                    );
-                }
-
-                return Ok((next_version, hash));
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("UNIQUE") || msg.contains("unique") || msg.contains("duplicate") {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        rule_name = %chunk.rule_name,
-                        attempt,
-                        conflicting_version = next_version,
-                        "remove_chunk_from_policy: version conflict, retrying"
-                    );
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                return Err(Status::internal(format!(
-                    "persist policy revision failed: {e}"
-                )));
-            }
-        }
-    }
-
-    Err(Status::aborted(format!(
-        "remove_chunk_from_policy: gave up after {} version conflict retries for rule '{}'",
-        MERGE_RETRY_LIMIT, chunk.rule_name
-    )))
+    apply_merge_operations_with_retry(
+        state.store.as_ref(),
+        sandbox_id,
+        None,
+        &[PolicyMergeOp::RemoveBinary {
+            rule_name: chunk.rule_name.clone(),
+            binary_path: chunk.binary.clone(),
+        }],
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2151,6 +2271,7 @@ mod tests {
     use super::*;
     use crate::persistence::Store;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use tonic::Code;
 
     // ---- Sandbox without policy ----
@@ -2184,9 +2305,7 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_policy_backfill_on_update_when_no_baseline() {
-        use openshell_core::proto::{
-            FilesystemPolicy, LandlockPolicy, ProcessPolicy, SandboxPhase, SandboxSpec,
-        };
+        use openshell_core::proto::{FilesystemPolicy, LandlockPolicy, SandboxPhase, SandboxSpec};
 
         let store = Store::connect("sqlite::memory:").await.unwrap();
 
@@ -2488,6 +2607,89 @@ mod tests {
         assert!(policy.network_policies.contains_key("allow_10_0_0_5_8080"));
     }
 
+    #[tokio::test]
+    async fn concurrent_merge_batches_preserve_both_updates() {
+        use openshell_core::proto::{
+            L7Allow, L7DenyRule, L7Rule, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
+        };
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let sandbox_id = "sb-concurrent-merge";
+
+        let initial_policy = SandboxPolicy {
+            network_policies: [(
+                "github".to_string(),
+                NetworkPolicyRule {
+                    name: "github".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.github.com".to_string(),
+                        port: 443,
+                        ports: vec![443],
+                        protocol: "rest".to_string(),
+                        access: "read-only".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        store
+            .put_policy_revision(
+                "p-seed",
+                sandbox_id,
+                1,
+                &initial_policy.encode_to_vec(),
+                "seed-hash",
+            )
+            .await
+            .unwrap();
+
+        let add_allow = [PolicyMergeOp::AddAllowRules {
+            host: "api.github.com".to_string(),
+            port: 443,
+            rules: vec![L7Rule {
+                allow: Some(L7Allow {
+                    method: "POST".to_string(),
+                    path: "/repos/*/issues".to_string(),
+                    command: String::new(),
+                    query: HashMap::new(),
+                }),
+            }],
+        }];
+        let add_deny = [PolicyMergeOp::AddDenyRules {
+            host: "api.github.com".to_string(),
+            port: 443,
+            deny_rules: vec![L7DenyRule {
+                method: "POST".to_string(),
+                path: "/admin".to_string(),
+                query: HashMap::new(),
+                ..Default::default()
+            }],
+        }];
+
+        let (left, right) = tokio::join!(
+            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_allow),
+            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_deny),
+        );
+
+        let mut versions = vec![left.unwrap().0, right.unwrap().0];
+        versions.sort_unstable();
+        assert_eq!(versions, vec![2, 3]);
+
+        let latest = store.get_latest_policy(sandbox_id).await.unwrap().unwrap();
+        assert_eq!(latest.version, 3);
+
+        let policy = SandboxPolicy::decode(latest.policy_payload.as_slice()).unwrap();
+        let endpoint = &policy.network_policies["github"].endpoints[0];
+        assert!(endpoint.access.is_empty());
+        assert_eq!(endpoint.rules.len(), 4);
+        assert_eq!(endpoint.deny_rules.len(), 1);
+        assert_eq!(endpoint.deny_rules[0].path, "/admin");
+    }
+
     // ---- validate_rule_not_always_blocked ----
 
     #[test]
@@ -2608,7 +2810,7 @@ mod tests {
         let global = StoredSettings::default();
         let sandbox = StoredSettings::default();
         let merged = merge_effective_settings(&global, &sandbox).unwrap();
-        for registered in openshell_core::settings::REGISTERED_SETTINGS {
+        for registered in settings::REGISTERED_SETTINGS {
             let setting = merged
                 .get(registered.key)
                 .unwrap_or_else(|| panic!("missing registered key {}", registered.key));
@@ -2625,7 +2827,7 @@ mod tests {
     fn materialize_global_settings_includes_unset_registered_keys() {
         let global = StoredSettings::default();
         let materialized = materialize_global_settings(&global).unwrap();
-        for registered in openshell_core::settings::REGISTERED_SETTINGS {
+        for registered in settings::REGISTERED_SETTINGS {
             let setting = materialized
                 .get(registered.key)
                 .unwrap_or_else(|| panic!("missing registered key {}", registered.key));
@@ -2785,7 +2987,7 @@ mod tests {
         let global = StoredSettings::default();
         let sandbox = StoredSettings::default();
         let merged = merge_effective_settings(&global, &sandbox).unwrap();
-        for registered in openshell_core::settings::REGISTERED_SETTINGS {
+        for registered in settings::REGISTERED_SETTINGS {
             let setting = merged.get(registered.key).unwrap();
             assert_eq!(setting.scope, SettingScope::Unspecified as i32);
             assert!(setting.value.is_none());
@@ -3066,12 +3268,12 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_global_setting_mutations_are_serialized() {
-        let store = std::sync::Arc::new(
+        let store = Arc::new(
             Store::connect("sqlite::memory:?cache=shared")
                 .await
                 .unwrap(),
         );
-        let mutex = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let mutex = Arc::new(tokio::sync::Mutex::new(()));
 
         let n = 50;
         let mut handles = Vec::with_capacity(n);
@@ -3101,7 +3303,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_global_setting_mutations_without_lock_can_lose_writes() {
-        let store = std::sync::Arc::new(
+        let store = Arc::new(
             Store::connect("sqlite::memory:?cache=shared")
                 .await
                 .unwrap(),

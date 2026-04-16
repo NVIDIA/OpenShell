@@ -3,6 +3,7 @@
 
 //! CLI command implementations.
 
+use crate::policy_update::build_policy_update_plan;
 use crate::tls::{
     TlsOptions, build_rustls_config, grpc_client, grpc_inference_client, require_tls_materials,
 };
@@ -27,7 +28,7 @@ use openshell_core::proto::{
     ExecSandboxRequest, GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
     GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider,
+    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource, PolicyStatus, Provider,
     RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
     SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
     UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
@@ -4144,6 +4145,16 @@ fn format_setting_value(value: Option<&SettingValue>) -> String {
     }
 }
 
+fn short_hash(hash: &str) -> &str {
+    if hash.len() >= 12 { &hash[..12] } else { hash }
+}
+
+fn print_policy_merge_warnings(warnings: &[openshell_policy::PolicyMergeWarning]) {
+    for warning in warnings {
+        eprintln!("{} {}", "!".yellow().bold(), warning);
+    }
+}
+
 pub async fn sandbox_policy_set_global(
     server: &str,
     policy_path: &str,
@@ -4172,6 +4183,7 @@ pub async fn sandbox_policy_set_global(
             setting_value: None,
             delete_setting: false,
             global: true,
+            merge_operations: vec![],
         })
         .await
         .into_diagnostic()?
@@ -4221,12 +4233,11 @@ pub async fn sandbox_settings_get(
         return Ok(());
     }
 
-    let policy_source =
-        if response.policy_source == openshell_core::proto::PolicySource::Global as i32 {
-            "global"
-        } else {
-            "sandbox"
-        };
+    let policy_source = if response.policy_source == PolicySource::Global as i32 {
+        "global"
+    } else {
+        "sandbox"
+    };
 
     println!("Sandbox:       {}", name);
     println!("Config Rev:    {}", response.config_revision);
@@ -4297,12 +4308,11 @@ fn settings_to_json_sandbox(
     name: &str,
     response: &openshell_core::proto::GetSandboxConfigResponse,
 ) -> serde_json::Value {
-    let policy_source =
-        if response.policy_source == openshell_core::proto::PolicySource::Global as i32 {
-            "global"
-        } else {
-            "sandbox"
-        };
+    let policy_source = if response.policy_source == PolicySource::Global as i32 {
+        "global"
+    } else {
+        "sandbox"
+    };
 
     let mut settings = serde_json::Map::new();
     let mut keys: Vec<_> = response.settings.keys().cloned().collect();
@@ -4371,6 +4381,7 @@ pub async fn gateway_setting_set(
             setting_value: Some(setting_value),
             delete_setting: false,
             global: true,
+            merge_operations: vec![],
         })
         .await
         .into_diagnostic()?
@@ -4404,6 +4415,7 @@ pub async fn sandbox_setting_set(
             setting_value: Some(setting_value),
             delete_setting: false,
             global: false,
+            merge_operations: vec![],
         })
         .await
         .into_diagnostic()?
@@ -4437,6 +4449,7 @@ pub async fn gateway_setting_delete(
             setting_value: None,
             delete_setting: true,
             global: true,
+            merge_operations: vec![],
         })
         .await
         .into_diagnostic()?
@@ -4470,6 +4483,7 @@ pub async fn sandbox_setting_delete(
             setting_value: None,
             delete_setting: true,
             global: false,
+            merge_operations: vec![],
         })
         .await
         .into_diagnostic()?
@@ -4527,6 +4541,7 @@ pub async fn sandbox_policy_set(
             setting_value: None,
             delete_setting: false,
             global: false,
+            merge_operations: vec![],
         })
         .await
         .into_diagnostic()?;
@@ -4609,6 +4624,176 @@ pub async fn sandbox_policy_set(
                     return Ok(());
                 }
                 _ => {} // still pending, keep polling
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn sandbox_policy_update(
+    server: &str,
+    name: &str,
+    add_endpoints: &[String],
+    remove_endpoints: &[String],
+    add_deny: &[String],
+    add_allow: &[String],
+    remove_rules: &[String],
+    binaries: &[String],
+    rule_name: Option<&str>,
+    dry_run: bool,
+    wait: bool,
+    timeout_secs: u64,
+    tls: &TlsOptions,
+) -> Result<()> {
+    if dry_run && wait {
+        return Err(miette!("--wait cannot be combined with --dry-run"));
+    }
+
+    let plan = build_policy_update_plan(
+        add_endpoints,
+        remove_endpoints,
+        add_deny,
+        add_allow,
+        remove_rules,
+        binaries,
+        rule_name,
+    )?;
+
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("sandbox not found"))?;
+
+    let current = client
+        .get_sandbox_config(GetSandboxConfigRequest {
+            sandbox_id: sandbox.id.clone(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if current.policy_source == PolicySource::Global as i32 {
+        return Err(miette!(
+            "policy is managed globally; delete the global policy before using `openshell policy update`"
+        ));
+    }
+
+    let merged = openshell_policy::merge_policy(
+        current.policy.clone().unwrap_or_default(),
+        &plan.preview_operations,
+    )
+    .map_err(|error| miette!("{error}"))?;
+
+    if dry_run {
+        eprintln!(
+            "{} Dry run preview for {} incremental policy operation(s)",
+            "✓".green().bold(),
+            plan.preview_operations.len()
+        );
+        print_policy_merge_warnings(&merged.warnings);
+        print_sandbox_policy(&merged.policy);
+        return Ok(());
+    }
+
+    let current_version = current.version;
+    let current_hash = current.policy_hash.clone();
+    let response = client
+        .update_config(UpdateConfigRequest {
+            name: name.to_string(),
+            policy: None,
+            setting_key: String::new(),
+            setting_value: None,
+            delete_setting: false,
+            global: false,
+            merge_operations: plan.merge_operations,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    print_policy_merge_warnings(&merged.warnings);
+
+    if response.version == current_version && response.policy_hash == current_hash {
+        eprintln!(
+            "{} Policy unchanged (version {}, hash: {})",
+            "·".dimmed(),
+            response.version,
+            short_hash(&response.policy_hash)
+        );
+        return Ok(());
+    }
+
+    eprintln!(
+        "{} Policy version {} submitted (hash: {})",
+        "✓".green().bold(),
+        response.version,
+        short_hash(&response.policy_hash)
+    );
+
+    if !wait {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        if Instant::now() > deadline {
+            eprintln!(
+                "{} Timeout waiting for policy version {} to load",
+                "✗".red().bold(),
+                response.version
+            );
+            std::process::exit(124);
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let status_resp = client
+            .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
+                name: name.to_string(),
+                version: response.version,
+                global: false,
+            })
+            .await
+            .into_diagnostic()?;
+
+        let inner = status_resp.into_inner();
+        if let Some(rev) = &inner.revision {
+            let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
+            match status {
+                PolicyStatus::Loaded => {
+                    eprintln!(
+                        "{} Policy version {} loaded (active version: {})",
+                        "✓".green().bold(),
+                        rev.version,
+                        inner.active_version
+                    );
+                    return Ok(());
+                }
+                PolicyStatus::Failed => {
+                    eprintln!(
+                        "{} Policy version {} failed to load: {}",
+                        "✗".red().bold(),
+                        rev.version,
+                        rev.load_error
+                    );
+                    std::process::exit(1);
+                }
+                PolicyStatus::Superseded => {
+                    eprintln!(
+                        "{} Policy version {} was superseded (active version: {})",
+                        "⚠".yellow().bold(),
+                        rev.version,
+                        inner.active_version
+                    );
+                    return Ok(());
+                }
+                _ => {}
             }
         }
     }

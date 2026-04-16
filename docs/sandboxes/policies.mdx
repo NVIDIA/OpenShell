@@ -121,21 +121,36 @@ The following steps outline the hot-reload policy update workflow.
    openshell logs <name> --tail --source sandbox
    ```
 
-3. Pull the current policy. Strip the metadata header (Version, Hash, Status) before reusing the file.
+3. For additive network changes, use `openshell policy update`. This is the fastest path for adding endpoints, binaries, or REST allow/deny rules without replacing the full policy.
+
+   ```shell
+   openshell policy update <name> \
+     --add-endpoint api.github.com:443:read-only:rest:enforce \
+     --binary /usr/bin/gh \
+     --wait
+
+   openshell policy update <name> \
+     --add-allow api.github.com:443:POST:/repos/*/issues \
+     --wait
+   ```
+
+   `--add-allow` and `--add-deny` currently target existing `protocol: rest` endpoints only. If you pass multiple update flags in one command, OpenShell applies them as one atomic merge batch and persists at most one new revision.
+
+4. For larger edits, pull the current policy and edit the YAML directly. Strip the metadata header (Version, Hash, Status) before reusing the file.
 
    ```shell
    openshell policy get <name> --full > current-policy.yaml
    ```
 
-4. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, or `rules`.
+5. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, or `rules`.
 
-5. Push the updated policy. Exit codes: 0 = loaded, 1 = validation failed, 124 = timeout.
+6. Push the updated policy when you need a full replacement. Exit codes: 0 = loaded, 1 = validation failed, 124 = timeout.
 
    ```shell
    openshell policy set <name> --policy current-policy.yaml --wait
    ```
 
-6. Verify the new revision. If status is `loaded`, repeat from step 2 as needed; if `failed`, fix the policy and repeat from step 4.
+7. Verify the new revision. If status is `loaded`, repeat from step 2 as needed; if `failed`, fix the policy and repeat from step 4.
 
    ```shell
    openshell policy list <name>
@@ -178,9 +193,15 @@ When triaging denied requests, check:
 
 Then push the updated policy as described above.
 
+For small changes, prefer `openshell policy update` over rewriting the full YAML:
+
+```shell
+openshell policy update <name> --add-allow api.github.com:443:GET:/repos/** --wait
+```
+
 ## Examples
 
-Add these blocks to the `network_policies` section of your sandbox policy. Apply with `openshell policy set <name> --policy <file> --wait`.
+Add these blocks to the `network_policies` section of your sandbox policy. Apply with `openshell policy update` for incremental additions or `openshell policy set <name> --policy <file> --wait` for full replacement.
 Use **Simple endpoint** for host-level allowlists and **Granular rules** for method/path control.
 
 <Tabs>

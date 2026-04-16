@@ -574,6 +574,51 @@ message UpdateConfigRequest {
   bool delete_setting = 5;
   // Apply mutation at gateway-global scope.
   bool global = 6;
+  // Batched incremental policy merge operations. Sandbox-scoped only.
+  repeated PolicyMergeOperation merge_operations = 7;
+}
+
+message PolicyMergeOperation {
+  oneof operation {
+    AddNetworkRule add_rule = 1;
+    RemoveNetworkEndpoint remove_endpoint = 2;
+    RemoveNetworkRule remove_rule = 3;
+    AddDenyRules add_deny_rules = 4;
+    AddAllowRules add_allow_rules = 5;
+    RemoveNetworkBinary remove_binary = 6;
+  }
+}
+
+message AddNetworkRule {
+  string rule_name = 1;
+  openshell.sandbox.v1.NetworkPolicyRule rule = 2;
+}
+
+message RemoveNetworkEndpoint {
+  string rule_name = 1;
+  string host = 2;
+  uint32 port = 3;
+}
+
+message RemoveNetworkRule {
+  string rule_name = 1;
+}
+
+message AddDenyRules {
+  string host = 1;
+  uint32 port = 2;
+  repeated openshell.sandbox.v1.L7DenyRule deny_rules = 3;
+}
+
+message AddAllowRules {
+  string host = 1;
+  uint32 port = 2;
+  repeated openshell.sandbox.v1.L7Rule rules = 3;
+}
+
+message RemoveNetworkBinary {
+  string rule_name = 1;
+  string binary_path = 2;
 }
 
 // Update sandbox policy response.

@@ -1960,6 +1960,7 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             setting_value: Some(SettingValue { value: Some(value) }),
             delete_setting: false,
             global: true,
+            merge_operations: vec![],
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -1994,6 +1995,7 @@ fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             setting_value: None,
             delete_setting: true,
             global: true,
+            merge_operations: vec![],
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2062,6 +2064,7 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             setting_value: Some(SettingValue { value: Some(value) }),
             delete_setting: false,
             global: false,
+            merge_operations: vec![],
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2100,6 +2103,7 @@ fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             setting_value: None,
             delete_setting: true,
             global: false,
+            merge_operations: vec![],
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;

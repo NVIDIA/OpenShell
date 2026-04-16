@@ -24,11 +24,11 @@ If you use [NemoClaw](https://github.com/NVIDIA/NemoClaw) to run OpenClaw assist
 
 OpenShell applies security controls at two enforcement points.
 OpenShell locks static controls at sandbox creation and requires destroying and recreating the sandbox to change them.
-You can update dynamic controls on a running sandbox with `openshell policy set`.
+You can update dynamic controls on a running sandbox with `openshell policy update` or `openshell policy set`.
 
 | Layer | What it protects | Enforcement point | Changeable at runtime |
 | --- | --- | --- | --- |
-| Network | Unauthorized outbound connections and data exfiltration. | CONNECT proxy + OPA policy engine | Yes. Use `openshell policy set` or operator approval in the TUI. |
+| Network | Unauthorized outbound connections and data exfiltration. | CONNECT proxy + OPA policy engine | Yes. Use `openshell policy update`, `openshell policy set`, or operator approval in the TUI. |
 | Filesystem | System binary tampering, credential theft, config manipulation. | Landlock LSM (kernel level) | No. Requires sandbox re-creation. |
 | Process | Privilege escalation, fork bombs, dangerous syscalls. | Seccomp BPF + privilege drop (`setuid`/`setgid`) | No. Requires sandbox re-creation. |
 | Inference | Credential exposure, unauthorized model access. | Proxy intercept of `inference.local` | Yes. Use `openshell inference set`. |
@@ -46,7 +46,7 @@ If no `network_policies` entry matches the destination host, port, and calling b
 | Aspect | Detail |
 |---|---|
 | Default | All egress denied. Only endpoints listed in `network_policies` can receive traffic. |
-| What you can change | Add entries to `network_policies` in the policy YAML. Apply statically at creation (`--policy`) or dynamically (`openshell policy set`). |
+| What you can change | Add entries to `network_policies` in the policy YAML. Apply statically at creation (`--policy`) or dynamically (`openshell policy update` for incremental changes, `openshell policy set` for full replacement). |
 | Risk if relaxed | Each allowed endpoint is a potential data exfiltration path. The agent can send workspace content, credentials, or conversation history to any reachable host. |
 | Recommendation | Add only endpoints the agent needs for its task. Start with a minimal policy and use denied-request logs (`openshell logs <name> --source sandbox`) to identify missing endpoints. |
 
