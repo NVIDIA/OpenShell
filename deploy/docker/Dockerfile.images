@@ -73,6 +73,7 @@ RUN mkdir -p \
       crates/openshell-router/src \
       crates/openshell-sandbox/src \
       crates/openshell-server/src \
+      crates/openshell-server/src/bin \
       crates/openshell-tui/src \
       crates/openshell-vm/src && \
     touch crates/openshell-bootstrap/src/lib.rs && \
@@ -89,6 +90,7 @@ RUN mkdir -p \
     printf 'fn main() {}\n' > crates/openshell-sandbox/src/main.rs && \
     touch crates/openshell-server/src/lib.rs && \
     printf 'fn main() {}\n' > crates/openshell-server/src/main.rs && \
+    printf 'fn main() {}\n' > crates/openshell-server/src/bin/openshell-gateway.rs && \
     touch crates/openshell-tui/src/lib.rs && \
     touch crates/openshell-vm/src/lib.rs && \
     printf 'fn main() {}\n' > crates/openshell-vm/src/main.rs
@@ -123,6 +125,7 @@ COPY crates/openshell-server/ crates/openshell-server/
 RUN touch \
     crates/openshell-core/build.rs \
     crates/openshell-server/src/main.rs \
+    crates/openshell-server/src/bin/openshell-gateway.rs \
     proto/*.proto && \
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
