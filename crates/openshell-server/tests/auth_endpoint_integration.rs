@@ -673,6 +673,17 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     ) -> Result<tonic::Response<Self::ConnectSupervisorStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("not implemented in test"))
     }
+
+    type RelayStreamStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::RelayChunk, tonic::Status>,
+    >;
+
+    async fn relay_stream(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayChunk>>,
+    ) -> Result<tonic::Response<Self::RelayStreamStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
 }
 
 /// Test 7: Plaintext server (no TLS) accepts both gRPC and HTTP.

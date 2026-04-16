@@ -51,10 +51,6 @@ rcgen = { workspace = true }
 webpki-roots = { workspace = true }
 
 # HTTP
-hyper = { workspace = true }
-hyper-util = { workspace = true }
-http = "1"
-http-body-util = "0.1"
 bytes = { workspace = true }
 
 # UUID

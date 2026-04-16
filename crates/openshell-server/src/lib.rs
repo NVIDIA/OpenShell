@@ -16,7 +16,6 @@ mod http;
 mod inference;
 mod multiplex;
 mod persistence;
-mod relay;
 mod sandbox_index;
 mod sandbox_watch;
 mod ssh_tunnel;

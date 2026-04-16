@@ -335,6 +335,18 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
+
+
+    type RelayStreamStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::RelayChunk, tonic::Status>,
+    >;
+
+    async fn relay_stream(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayChunk>>,
+    ) -> Result<tonic::Response<Self::RelayStreamStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
 }
 
 fn build_ca() -> (Certificate, KeyPair) {

@@ -4,19 +4,22 @@
 //! Persistent supervisor-to-gateway session.
 //!
 //! Maintains a long-lived `ConnectSupervisor` bidirectional gRPC stream to the
-//! gateway. When the gateway sends `RelayOpen`, the supervisor opens a reverse
-//! HTTP CONNECT tunnel back to the gateway and bridges it to the local SSH
+//! gateway. When the gateway sends `RelayOpen`, the supervisor initiates a
+//! `RelayStream` gRPC call (a new HTTP/2 stream multiplexed over the same
+//! TCP+TLS connection as the control stream) and bridges it to the local SSH
 //! daemon. The supervisor is a dumb byte bridge — it has no protocol awareness
-//! of the SSH or NSSH1 bytes flowing through the tunnel.
+//! of the SSH or NSSH1 bytes flowing through.
 
 use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    GatewayMessage, SupervisorHeartbeat, SupervisorHello, SupervisorMessage, gateway_message,
-    supervisor_message,
+    GatewayMessage, RelayChunk, SupervisorHeartbeat, SupervisorHello, SupervisorMessage,
+    gateway_message, supervisor_message,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 use tracing::{info, warn};
 
@@ -24,6 +27,11 @@ use crate::grpc_client;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Size of chunks read from the local SSH socket when forwarding bytes back
+/// to the gateway over the gRPC response stream. 16 KiB matches the default
+/// HTTP/2 frame size so each `RelayChunk` fits in one frame.
+const RELAY_CHUNK_SIZE: usize = 16 * 1024;
 
 /// Spawn the supervisor session task.
 ///
@@ -69,7 +77,10 @@ async fn run_single_session(
     sandbox_id: &str,
     ssh_listen_port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Connect to the gateway.
+    // Connect to the gateway. The same `Channel` is used for both the
+    // long-lived control stream and all data-plane `RelayStream` calls, so
+    // every relay rides the same TCP+TLS+HTTP/2 connection — no new TLS
+    // handshake per relay.
     let channel = grpc_client::connect_channel_pub(endpoint)
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
@@ -131,7 +142,6 @@ async fn run_single_session(
                         handle_gateway_message(
                             &msg,
                             sandbox_id,
-                            &endpoint,
                             ssh_listen_port,
                             &channel,
                         ).await;
@@ -162,9 +172,8 @@ async fn run_single_session(
 async fn handle_gateway_message(
     msg: &GatewayMessage,
     sandbox_id: &str,
-    endpoint: &str,
     ssh_listen_port: u16,
-    _channel: &Channel,
+    channel: &Channel,
 ) {
     match &msg.payload {
         Some(gateway_message::Payload::Heartbeat(_)) => {
@@ -172,8 +181,8 @@ async fn handle_gateway_message(
         }
         Some(gateway_message::Payload::RelayOpen(open)) => {
             let channel_id = open.channel_id.clone();
-            let endpoint = endpoint.to_string();
             let sandbox_id = sandbox_id.to_string();
+            let channel = channel.clone();
 
             info!(
                 sandbox_id = %sandbox_id,
@@ -182,7 +191,7 @@ async fn handle_gateway_message(
             );
 
             tokio::spawn(async move {
-                if let Err(e) = handle_relay_open(&channel_id, &endpoint, ssh_listen_port).await {
+                if let Err(e) = handle_relay_open(&channel_id, ssh_listen_port, channel).await {
                     warn!(
                         sandbox_id = %sandbox_id,
                         channel_id = %channel_id,
@@ -206,146 +215,95 @@ async fn handle_gateway_message(
     }
 }
 
-/// Handle a RelayOpen by opening a reverse HTTP CONNECT to the gateway and
-/// bridging it to the local SSH daemon.
+/// Handle a `RelayOpen` by initiating a `RelayStream` RPC on the gateway and
+/// bridging that stream to the local SSH daemon.
+///
+/// This opens a new HTTP/2 stream on the existing `Channel` — no new TCP or
+/// TLS handshake. The first `RelayChunk` we send identifies the channel via
+/// `channel_id`; subsequent chunks carry raw SSH bytes.
 async fn handle_relay_open(
     channel_id: &str,
-    endpoint: &str,
     ssh_listen_port: u16,
+    channel: Channel,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Build the relay URL from the gateway endpoint.
-    // The endpoint is like "https://gateway:8080" or "http://gateway:8080".
-    let relay_url = format!("{endpoint}/relay/{channel_id}");
+    let mut client = OpenShellClient::new(channel);
 
-    // Open a reverse HTTP CONNECT to the gateway's relay endpoint.
-    let mut relay_stream = open_reverse_connect(&relay_url).await?;
+    // Outbound chunks to the gateway.
+    let (out_tx, out_rx) = mpsc::channel::<RelayChunk>(16);
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(out_rx);
+
+    // First frame: identify the channel. No payload on this frame.
+    out_tx
+        .send(RelayChunk {
+            channel_id: channel_id.to_string(),
+            data: Vec::new(),
+        })
+        .await
+        .map_err(|_| "outbound channel closed before init")?;
+
+    // Initiate the RPC. This rides the existing HTTP/2 connection.
+    let response = client
+        .relay_stream(outbound)
+        .await
+        .map_err(|e| format!("relay_stream RPC failed: {e}"))?;
+    let mut inbound = response.into_inner();
 
     // Connect to the local SSH daemon on loopback.
-    let mut ssh_conn = tokio::net::TcpStream::connect(("127.0.0.1", ssh_listen_port)).await?;
+    let ssh = tokio::net::TcpStream::connect(("127.0.0.1", ssh_listen_port)).await?;
+    let (mut ssh_r, mut ssh_w) = ssh.into_split();
 
-    info!(channel_id = %channel_id, "relay bridge: connected to local SSH daemon, bridging");
+    info!(channel_id = %channel_id, "relay bridge: connected to local SSH daemon");
 
-    // Bridge the relay stream to the local SSH connection.
-    // The gateway sends NSSH1 preface + SSH bytes through the relay.
-    // The SSH daemon receives them as if the gateway connected directly.
-    let _ = tokio::io::copy_bidirectional(&mut relay_stream, &mut ssh_conn).await;
-
-    Ok(())
-}
-
-/// Open an HTTP CONNECT tunnel to the given URL and return the upgraded stream.
-///
-/// This uses a raw hyper HTTP/1.1 client to send a CONNECT request and upgrade
-/// the connection to a raw byte stream.
-async fn open_reverse_connect(
-    url: &str,
-) -> Result<
-    hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>,
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    let uri: http::Uri = url.parse()?;
-    let host = uri.host().ok_or("missing host")?;
-    let port = uri
-        .port_u16()
-        .unwrap_or(if uri.scheme_str() == Some("https") {
-            443
-        } else {
-            80
-        });
-    let authority = format!("{host}:{port}");
-    let path = uri.path().to_string();
-    let use_tls = uri.scheme_str() == Some("https");
-
-    // Connect TCP.
-    let tcp = tokio::net::TcpStream::connect(&authority).await?;
-    tcp.set_nodelay(true)?;
-
-    if use_tls {
-        // Build TLS connector using the same env-var certs as the gRPC client.
-        let tls_stream = connect_tls(tcp, host).await?;
-        send_connect_request(tls_stream, &authority, &path).await
-    } else {
-        send_connect_request(tcp, &authority, &path).await
-    }
-}
-
-async fn send_connect_request<IO>(
-    io: IO,
-    authority: &str,
-    path: &str,
-) -> Result<
-    hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>,
-    Box<dyn std::error::Error + Send + Sync>,
->
-where
-    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    use http::Method;
-
-    let (mut sender, conn) =
-        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io)).await?;
-
-    // Spawn the connection driver.
-    tokio::spawn(async move {
-        if let Err(e) = conn.with_upgrades().await {
-            warn!(error = %e, "relay CONNECT connection driver error");
+    // SSH → gRPC (out_tx): read local SSH, forward as `RelayChunk`s.
+    let out_tx_writer = out_tx.clone();
+    let ssh_to_grpc = tokio::spawn(async move {
+        let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
+        loop {
+            match ssh_r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = RelayChunk {
+                        channel_id: String::new(),
+                        data: buf[..n].to_vec(),
+                    };
+                    if out_tx_writer.send(chunk).await.is_err() {
+                        break;
+                    }
+                }
+            }
         }
     });
 
-    let req = http::Request::builder()
-        .method(Method::CONNECT)
-        .uri(path)
-        .header(http::header::HOST, authority)
-        .body(http_body_util::Empty::<bytes::Bytes>::new())?;
-
-    let resp = sender.send_request(req).await?;
-
-    if resp.status() != http::StatusCode::OK
-        && resp.status() != http::StatusCode::SWITCHING_PROTOCOLS
-    {
-        return Err(format!("relay CONNECT failed: {}", resp.status()).into());
+    // gRPC (inbound) → SSH: drain inbound chunks into the local SSH socket.
+    let mut inbound_err: Option<String> = None;
+    while let Some(next) = inbound.next().await {
+        match next {
+            Ok(chunk) => {
+                if chunk.data.is_empty() {
+                    continue;
+                }
+                if let Err(e) = ssh_w.write_all(&chunk.data).await {
+                    inbound_err = Some(format!("write to ssh failed: {e}"));
+                    break;
+                }
+            }
+            Err(e) => {
+                inbound_err = Some(format!("relay inbound errored: {e}"));
+                break;
+            }
+        }
     }
 
-    let upgraded = hyper::upgrade::on(resp).await?;
-    Ok(hyper_util::rt::TokioIo::new(upgraded))
-}
+    // Half-close the SSH socket's write side so the daemon sees EOF.
+    let _ = ssh_w.shutdown().await;
 
-/// Connect TLS using the same cert env vars as the gRPC client.
-async fn connect_tls(
-    tcp: tokio::net::TcpStream,
-    host: &str,
-) -> Result<
-    tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    use rustls::pki_types::ServerName;
-    use std::sync::Arc;
+    // Dropping out_tx closes the outbound gRPC stream, letting the gateway
+    // observe EOF on its side too.
+    drop(out_tx);
+    let _ = ssh_to_grpc.await;
 
-    let ca_path = std::env::var("OPENSHELL_TLS_CA")?;
-    let cert_path = std::env::var("OPENSHELL_TLS_CERT")?;
-    let key_path = std::env::var("OPENSHELL_TLS_KEY")?;
-
-    let ca_pem = std::fs::read(&ca_path)?;
-    let cert_pem = std::fs::read(&cert_path)?;
-    let key_pem = std::fs::read(&key_path)?;
-
-    let mut root_store = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_pem.as_slice()) {
-        root_store.add(cert?)?;
+    if let Some(e) = inbound_err {
+        return Err(e.into());
     }
-
-    let certs: Vec<_> =
-        rustls_pemfile::certs(&mut cert_pem.as_slice()).collect::<Result<_, _>>()?;
-    let key =
-        rustls_pemfile::private_key(&mut key_pem.as_slice())?.ok_or("no private key found")?;
-
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(certs, key)?;
-
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let server_name = ServerName::try_from(host.to_string())?;
-    let tls_stream = connector.connect(server_name, tcp).await?;
-
-    Ok(tls_stream)
+    Ok(())
 }
