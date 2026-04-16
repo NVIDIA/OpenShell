@@ -41,6 +41,11 @@ description = "Build the supervisor Docker image"
 run = "tasks/scripts/docker-build-image.sh supervisor"
 hide = true
 
+["docker:build:supervisor"]
+description = "Alias for build:docker:supervisor"
+depends = ["build:docker:supervisor"]
+hide = true
+
 ["build:docker:cluster"]
 description = "Build the k3s cluster image (component images pulled at runtime from registry)"
 run = "tasks/scripts/docker-build-image.sh cluster"

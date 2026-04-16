@@ -461,14 +461,14 @@ jobs:
       - name: Build ${{ matrix.target }}
         run: |
           set -euo pipefail
-          mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-server --bin openshell-server
+          mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-server --bin openshell-gateway
 
       - name: Verify packaged binary
         run: |
           set -euo pipefail
-          OUTPUT="$(target/${{ matrix.target }}/release/openshell-server --version)"
+          OUTPUT="$(target/${{ matrix.target }}/release/openshell-gateway --version)"
           echo "$OUTPUT"
-          grep -q '^openshell-server ' <<<"$OUTPUT"
+          grep -q '^openshell-gateway ' <<<"$OUTPUT"
 
       - name: sccache stats
         if: always()
@@ -478,8 +478,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          tar -czf artifacts/openshell-server-${{ matrix.target }}.tar.gz \
-            -C target/${{ matrix.target }}/release openshell-server
+          tar -czf artifacts/openshell-gateway-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release openshell-gateway
           ls -lh artifacts/
 
       - name: Upload artifact
@@ -615,7 +615,7 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx build \
-            --file deploy/docker/Dockerfile.server-macos \
+            --file deploy/docker/Dockerfile.gateway-macos \
             --build-arg OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" \
             --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
             --target binary \
@@ -625,14 +625,14 @@ jobs:
       - name: Verify packaged binary shape
         run: |
           set -euo pipefail
-          test -x out/openshell-server
+          test -x out/openshell-gateway
 
       - name: Package binary
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          tar -czf artifacts/openshell-server-aarch64-apple-darwin.tar.gz \
-            -C out openshell-server
+          tar -czf artifacts/openshell-gateway-aarch64-apple-darwin.tar.gz \
+            -C out openshell-gateway
           ls -lh artifacts/
 
       - name: Upload artifact
@@ -704,10 +704,10 @@ jobs:
             *.whl > openshell-checksums-sha256.txt
           cat openshell-checksums-sha256.txt
           sha256sum \
-            openshell-server-x86_64-unknown-linux-gnu.tar.gz \
-            openshell-server-aarch64-unknown-linux-gnu.tar.gz \
-            openshell-server-aarch64-apple-darwin.tar.gz > openshell-server-checksums-sha256.txt
-          cat openshell-server-checksums-sha256.txt
+            openshell-gateway-x86_64-unknown-linux-gnu.tar.gz \
+            openshell-gateway-aarch64-unknown-linux-gnu.tar.gz \
+            openshell-gateway-aarch64-apple-darwin.tar.gz > openshell-gateway-checksums-sha256.txt
+          cat openshell-gateway-checksums-sha256.txt
           sha256sum \
             openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz \
             openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz > openshell-sandbox-checksums-sha256.txt
@@ -733,14 +733,14 @@ jobs:
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-apple-darwin.tar.gz
-            release/openshell-server-x86_64-unknown-linux-gnu.tar.gz
-            release/openshell-server-aarch64-unknown-linux-gnu.tar.gz
-            release/openshell-server-aarch64-apple-darwin.tar.gz
+            release/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-gateway-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-gateway-aarch64-apple-darwin.tar.gz
             release/openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz
             release/*.whl
             release/openshell-checksums-sha256.txt
-            release/openshell-server-checksums-sha256.txt
+            release/openshell-gateway-checksums-sha256.txt
             release/openshell-sandbox-checksums-sha256.txt
 
   publish-fern-docs:

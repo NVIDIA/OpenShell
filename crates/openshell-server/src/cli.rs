@@ -125,18 +125,17 @@ struct Args {
     disable_gateway_auth: bool,
 }
 
-pub fn command() -> Command {
-    Args::command()
-        .name("openshell-server")
-        .bin_name("openshell-server")
+pub fn command(program_name: &'static str) -> Command {
+    Args::command().name(program_name).bin_name(program_name)
 }
 
-pub async fn run_cli() -> Result<()> {
+pub async fn run_cli(program_name: &'static str) -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
 
-    let args = Args::from_arg_matches(&command().get_matches()).expect("clap validated args");
+    let args =
+        Args::from_arg_matches(&command(program_name).get_matches()).expect("clap validated args");
 
     run_from_args(args).await
 }
@@ -231,17 +230,27 @@ mod tests {
     use super::command;
 
     #[test]
-    fn command_uses_server_binary_name() {
-        let mut help = Vec::new();
-        command().write_long_help(&mut help).unwrap();
-        let help = String::from_utf8(help).unwrap();
-        assert!(help.contains("openshell-server"));
+    fn command_uses_requested_binary_name() {
+        let mut server_help = Vec::new();
+        command("openshell-server")
+            .write_long_help(&mut server_help)
+            .unwrap();
+        let server_help = String::from_utf8(server_help).unwrap();
+        assert!(server_help.contains("openshell-server"));
+
+        let mut gateway_help = Vec::new();
+        command("openshell-gateway")
+            .write_long_help(&mut gateway_help)
+            .unwrap();
+        let gateway_help = String::from_utf8(gateway_help).unwrap();
+        assert!(gateway_help.contains("openshell-gateway"));
+        assert!(!gateway_help.contains("openshell-server"));
     }
 
     #[test]
     fn command_exposes_version() {
-        let cmd = command();
-        let version = cmd.get_version().unwrap();
+        let gateway_command = command("openshell-gateway");
+        let version = gateway_command.get_version().unwrap();
         assert_eq!(version.to_string(), openshell_core::VERSION);
     }
 }

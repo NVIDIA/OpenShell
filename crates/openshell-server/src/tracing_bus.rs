@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn platform_event_bus_tail_returns_buffered_events() {
-        use openshell_core::proto::{sandbox_stream_event, PlatformEvent};
+        use openshell_core::proto::{PlatformEvent, sandbox_stream_event};
 
         let bus = PlatformEventBus::new();
         let sandbox_id = "sb-6";
