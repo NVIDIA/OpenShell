@@ -14,10 +14,6 @@ repository.workspace = true
 name = "openshell-server"
 path = "src/main.rs"
 
-[[bin]]
-name = "openshell-gateway"
-path = "src/bin/openshell-gateway.rs"
-
 [dependencies]
 openshell-core = { path = "../openshell-core" }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }

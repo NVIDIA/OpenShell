@@ -7,5 +7,5 @@ use miette::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    openshell_server::cli::run_cli("openshell-server").await
+    openshell_server::cli::run_cli().await
 }
