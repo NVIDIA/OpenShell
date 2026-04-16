@@ -96,8 +96,14 @@ async fn ssh_connect(
         return StatusCode::PRECONDITION_FAILED.into_response();
     }
 
-    // Open a relay channel through the supervisor session.
-    let (channel_id, relay_rx) = match state.supervisor_sessions.open_relay(&sandbox_id).await {
+    // Open a relay channel through the supervisor session. The session may
+    // not be established yet right after the sandbox reports Ready, so wait
+    // briefly for it to appear.
+    let (channel_id, relay_rx) = match state
+        .supervisor_sessions
+        .open_relay_with_wait(&sandbox_id, Duration::from_secs(15))
+        .await
+    {
         Ok(pair) => pair,
         Err(status) => {
             warn!(sandbox_id = %sandbox_id, error = %status.message(), "SSH tunnel: supervisor session not available");

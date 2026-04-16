@@ -436,10 +436,12 @@ pub(super) async fn handle_exec_sandbox(
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
-    // Open a relay channel through the supervisor session.
+    // Open a relay channel through the supervisor session. The session may
+    // not be established yet right after the sandbox reports Ready, so wait
+    // briefly for it to appear.
     let (channel_id, relay_rx) = state
         .supervisor_sessions
-        .open_relay(&sandbox.id)
+        .open_relay_with_wait(&sandbox.id, std::time::Duration::from_secs(15))
         .await
         .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 

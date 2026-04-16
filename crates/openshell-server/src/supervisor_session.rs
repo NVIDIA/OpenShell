@@ -94,6 +94,34 @@ impl SupervisorSessionRegistry {
         self.sessions.lock().unwrap().remove(sandbox_id);
     }
 
+    /// Open a relay channel, waiting for the supervisor session to appear.
+    ///
+    /// The supervisor session may not be established yet when the sandbox first
+    /// reports Ready (race between K8s readiness and gRPC session handshake).
+    /// This method retries the session lookup with short backoff before failing.
+    pub async fn open_relay_with_wait(
+        &self,
+        sandbox_id: &str,
+        timeout: Duration,
+    ) -> Result<(String, oneshot::Receiver<tokio::io::DuplexStream>), Status> {
+        let deadline = Instant::now() + timeout;
+        let mut backoff = Duration::from_millis(100);
+
+        loop {
+            match self.open_relay(sandbox_id).await {
+                Ok(result) => return Ok(result),
+                Err(status) if status.code() == tonic::Code::Unavailable => {
+                    if Instant::now() + backoff > deadline {
+                        return Err(status);
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(2));
+                }
+                Err(status) => return Err(status),
+            }
+        }
+    }
+
     /// Open a relay channel: sends RelayOpen to the supervisor and returns a
     /// stream that will be connected once the supervisor's reverse HTTP CONNECT
     /// arrives.
