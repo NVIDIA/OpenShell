@@ -436,7 +436,7 @@ jobs:
       - name: Build ${{ matrix.target }}
         run: |
           set -euo pipefail
-          mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-server --bin openshell-gateway
+          mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-server
 
       - name: Verify packaged binary
         run: |

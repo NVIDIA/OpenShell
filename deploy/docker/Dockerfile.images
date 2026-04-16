@@ -9,7 +9,7 @@
 #   gateway             Final gateway image
 #   supervisor          Final supervisor image
 #   cluster             Final cluster image
-#   gateway-builder     Release openshell-server binary
+#   gateway-builder     Release openshell-gateway binary
 #   supervisor-builder  Release openshell-sandbox binary
 #   supervisor-output   Minimal stage exporting only the supervisor binary
 
@@ -73,7 +73,6 @@ RUN mkdir -p \
       crates/openshell-router/src \
       crates/openshell-sandbox/src \
       crates/openshell-server/src \
-      crates/openshell-server/src/bin \
       crates/openshell-tui/src \
       crates/openshell-vm/src && \
     touch crates/openshell-bootstrap/src/lib.rs && \
@@ -90,7 +89,6 @@ RUN mkdir -p \
     printf 'fn main() {}\n' > crates/openshell-sandbox/src/main.rs && \
     touch crates/openshell-server/src/lib.rs && \
     printf 'fn main() {}\n' > crates/openshell-server/src/main.rs && \
-    printf 'fn main() {}\n' > crates/openshell-server/src/bin/openshell-gateway.rs && \
     touch crates/openshell-tui/src/lib.rs && \
     touch crates/openshell-vm/src/lib.rs && \
     printf 'fn main() {}\n' > crates/openshell-vm/src/main.rs
@@ -125,7 +123,6 @@ COPY crates/openshell-server/ crates/openshell-server/
 RUN touch \
     crates/openshell-core/build.rs \
     crates/openshell-server/src/main.rs \
-    crates/openshell-server/src/bin/openshell-gateway.rs \
     proto/*.proto && \
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
@@ -142,7 +139,7 @@ RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/us
     . cross-build.sh && \
     cargo_cross_build --release -p openshell-server ${EXTRA_CARGO_FEATURES:+--features "$EXTRA_CARGO_FEATURES"} && \
     mkdir -p /build/out && \
-    cp "$(cross_output_dir release)/openshell-server" /build/out/
+    cp "$(cross_output_dir release)/openshell-gateway" /build/out/
 
 FROM rust-deps AS supervisor-workspace
 ARG OPENSHELL_CARGO_VERSION
@@ -194,7 +191,7 @@ RUN useradd --create-home --user-group openshell
 
 WORKDIR /app
 
-COPY --from=gateway-builder /build/out/openshell-server /usr/local/bin/
+COPY --from=gateway-builder /build/out/openshell-gateway /usr/local/bin/
 
 RUN mkdir -p /build/crates/openshell-server
 COPY --chmod=755 crates/openshell-server/migrations /build/crates/openshell-server/migrations
@@ -202,7 +199,7 @@ COPY --chmod=755 crates/openshell-server/migrations /build/crates/openshell-serv
 USER openshell
 EXPOSE 8080
 
-ENTRYPOINT ["openshell-server"]
+ENTRYPOINT ["openshell-gateway"]
 CMD ["--port", "8080"]
 
 # ---------------------------------------------------------------------------

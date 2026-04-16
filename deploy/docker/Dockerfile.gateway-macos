@@ -65,20 +65,18 @@ RUN mkdir -p crates/openshell-core/src \
              crates/openshell-driver-kubernetes/src \
              crates/openshell-policy/src \
              crates/openshell-router/src \
-             crates/openshell-server/src/bin && \
     touch crates/openshell-core/src/lib.rs && \
     touch crates/openshell-driver-kubernetes/src/lib.rs && \
     printf 'fn main() {}\n' > crates/openshell-driver-kubernetes/src/main.rs && \
     touch crates/openshell-policy/src/lib.rs && \
     touch crates/openshell-router/src/lib.rs && \
     touch crates/openshell-server/src/lib.rs && \
-    printf 'fn main() {}\n' > crates/openshell-server/src/main.rs && \
-    printf 'fn main() {}\n' > crates/openshell-server/src/bin/openshell-gateway.rs
+    printf 'fn main() {}\n' > crates/openshell-server/src/main.rs
 
 RUN --mount=type=cache,id=cargo-registry-gateway-macos,sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-gateway-macos,sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-gateway-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    cargo build --release --target aarch64-apple-darwin -p openshell-server --bin openshell-gateway 2>/dev/null || true
+    cargo build --release --target aarch64-apple-darwin -p openshell-server 2>/dev/null || true
 
 COPY crates/ crates/
 
@@ -89,7 +87,6 @@ RUN touch crates/openshell-core/src/lib.rs \
     crates/openshell-router/src/lib.rs \
     crates/openshell-server/src/lib.rs \
     crates/openshell-server/src/main.rs \
-    crates/openshell-server/src/bin/openshell-gateway.rs \
     crates/openshell-core/build.rs \
     proto/*.proto
 
@@ -100,7 +97,7 @@ RUN --mount=type=cache,id=cargo-registry-gateway-macos,sharing=locked,target=/ro
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi && \
-    cargo build --release --target aarch64-apple-darwin -p openshell-server --bin openshell-gateway && \
+    cargo build --release --target aarch64-apple-darwin -p openshell-server && \
     cp target/aarch64-apple-darwin/release/openshell-gateway /openshell-gateway
 
 FROM scratch AS binary

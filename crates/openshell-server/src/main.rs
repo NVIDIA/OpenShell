@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `OpenShell` Server binary entrypoint.
+//! `OpenShell` Gateway binary entrypoint.
 
 use miette::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    openshell_server::cli::run_cli("openshell-server").await
+    openshell_server::cli::run_cli().await
 }

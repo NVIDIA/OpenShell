@@ -9,7 +9,7 @@ The gateway runs the control plane API server. It is deployed as a StatefulSet i
 - **Docker target**: `gateway` in `deploy/docker/Dockerfile.images`
 - **Registry**: `ghcr.io/nvidia/openshell/gateway:latest`
 - **Pulled when**: Cluster startup (the Helm chart triggers the pull)
-- **Entrypoint**: `openshell-server --port 8080` (gRPC + HTTP, mTLS)
+- **Entrypoint**: `openshell-gateway --port 8080` (gRPC + HTTP, mTLS)
 
 ## Cluster (`openshell/cluster`)
 
@@ -31,7 +31,7 @@ OpenShell also publishes a standalone `openshell-gateway` binary as a GitHub rel
 - **Release workflows**: `.github/workflows/release-dev.yml`, `.github/workflows/release-tag.yml`
 - **Installer**: None yet. The binary is a manual-download asset.
 
-The standalone artifact is user-facing only. The deployed container image keeps using the internal `openshell-server` binary name and entrypoint.
+Both the standalone artifact and the deployed container image use the `openshell-gateway` binary.
 
 ## Python Wheels
 
