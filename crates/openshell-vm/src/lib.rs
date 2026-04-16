@@ -254,6 +254,7 @@ const GATEWAY_NAME_PREFIX: &str = "openshell-vm";
 const DEFAULT_STATE_DISK_SIZE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const DEFAULT_STATE_DISK_BLOCK_ID: &str = "openshell-state";
 const DEFAULT_STATE_DISK_GUEST_DEVICE: &str = "/dev/vda";
+const ROOTFS_VARIANT_MARKER: &str = ".openshell-rootfs-variant";
 
 /// Resolve the gateway metadata name for an instance name.
 pub fn gateway_name(instance_name: &str) -> Result<String, VmError> {
@@ -300,6 +301,53 @@ pub fn ensure_named_rootfs(instance_name: &str) -> Result<PathBuf, VmError> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootfsVariant {
+    Gateway,
+    Sandbox,
+}
+
+impl RootfsVariant {
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::Gateway => "gateway",
+            Self::Sandbox => "sandbox",
+        }
+    }
+
+    pub const fn guest_init_path(self) -> &'static str {
+        match self {
+            Self::Gateway => "/srv/openshell-vm-init.sh",
+            Self::Sandbox => "/srv/openshell-vm-sandbox-init.sh",
+        }
+    }
+}
+
+pub fn extract_rootfs_variant_to(variant: RootfsVariant, dest: &Path) -> Result<(), VmError> {
+    let expected_marker = format!("{}:{}", env!("CARGO_PKG_VERSION"), variant.marker());
+    let marker_path = dest.join(ROOTFS_VARIANT_MARKER);
+
+    if dest.is_dir()
+        && std::fs::read_to_string(&marker_path)
+            .map(|value| value.trim() == expected_marker)
+            .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    if dest.exists() {
+        std::fs::remove_dir_all(dest).map_err(|e| {
+            VmError::HostSetup(format!("remove old rootfs {}: {e}", dest.display()))
+        })?;
+    }
+
+    embedded::extract_rootfs_to(dest)?;
+    configure_rootfs_variant(variant, dest)?;
+    std::fs::write(marker_path, format!("{expected_marker}\n"))
+        .map_err(|e| VmError::HostSetup(format!("write rootfs variant marker: {e}")))?;
+    Ok(())
+}
+
 /// Ensure the requested rootfs exists, extracting the embedded rootfs when needed.
 ///
 /// When `rootfs` is `None`, this uses the named-instance layout under
@@ -336,6 +384,127 @@ pub fn prepare_rootfs(
     Err(VmError::RootfsNotFound {
         path: target.display().to_string(),
     })
+}
+
+fn configure_rootfs_variant(variant: RootfsVariant, rootfs: &Path) -> Result<(), VmError> {
+    match variant {
+        RootfsVariant::Gateway => Ok(()),
+        RootfsVariant::Sandbox => prepare_sandbox_rootfs(rootfs),
+    }
+}
+
+fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), VmError> {
+    for relative in [
+        "usr/local/bin/k3s",
+        "usr/local/bin/kubectl",
+        "var/lib/rancher",
+        "etc/rancher",
+        "opt/openshell/charts",
+        "opt/openshell/manifests",
+        "opt/openshell/.initialized",
+        "opt/openshell/.rootfs-type",
+    ] {
+        remove_rootfs_path(rootfs, relative)?;
+    }
+
+    let init_path = rootfs.join("srv/openshell-vm-sandbox-init.sh");
+    if let Some(parent) = init_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| VmError::HostSetup(format!("create {}: {e}", parent.display())))?;
+    }
+    std::fs::write(
+        &init_path,
+        include_str!("../scripts/openshell-vm-sandbox-init.sh"),
+    )
+    .map_err(|e| VmError::HostSetup(format!("write {}: {e}", init_path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(&init_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| VmError::HostSetup(format!("chmod {}: {e}", init_path.display())))?;
+    }
+
+    let opt_dir = rootfs.join("opt/openshell");
+    std::fs::create_dir_all(&opt_dir)
+        .map_err(|e| VmError::HostSetup(format!("create {}: {e}", opt_dir.display())))?;
+    std::fs::write(opt_dir.join(".rootfs-type"), "sandbox\n")
+        .map_err(|e| VmError::HostSetup(format!("write sandbox rootfs marker: {e}")))?;
+    ensure_sandbox_guest_user(rootfs)?;
+    std::fs::create_dir_all(rootfs.join("sandbox"))
+        .map_err(|e| VmError::HostSetup(format!("create sandbox workdir: {e}")))?;
+
+    Ok(())
+}
+
+fn ensure_sandbox_guest_user(rootfs: &Path) -> Result<(), VmError> {
+    const SANDBOX_UID: u32 = 10001;
+    const SANDBOX_GID: u32 = 10001;
+
+    let etc_dir = rootfs.join("etc");
+    std::fs::create_dir_all(&etc_dir)
+        .map_err(|e| VmError::HostSetup(format!("create {}: {e}", etc_dir.display())))?;
+
+    ensure_line_in_file(
+        &etc_dir.join("group"),
+        &format!("sandbox:x:{SANDBOX_GID}:"),
+        |line| line.starts_with("sandbox:"),
+    )?;
+    ensure_line_in_file(&etc_dir.join("gshadow"), "sandbox:!::", |line| {
+        line.starts_with("sandbox:")
+    })?;
+    ensure_line_in_file(
+        &etc_dir.join("passwd"),
+        &format!("sandbox:x:{SANDBOX_UID}:{SANDBOX_GID}:OpenShell Sandbox:/sandbox:/bin/bash"),
+        |line| line.starts_with("sandbox:"),
+    )?;
+    ensure_line_in_file(
+        &etc_dir.join("shadow"),
+        "sandbox:!:20123:0:99999:7:::",
+        |line| line.starts_with("sandbox:"),
+    )?;
+
+    Ok(())
+}
+
+fn ensure_line_in_file(
+    path: &Path,
+    line: &str,
+    exists: impl Fn(&str) -> bool,
+) -> Result<(), VmError> {
+    let mut contents = if path.exists() {
+        std::fs::read_to_string(path)
+            .map_err(|e| VmError::HostSetup(format!("read {}: {e}", path.display())))?
+    } else {
+        String::new()
+    };
+
+    if contents.lines().any(exists) {
+        return Ok(());
+    }
+
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(line);
+    contents.push('\n');
+
+    std::fs::write(path, contents)
+        .map_err(|e| VmError::HostSetup(format!("write {}: {e}", path.display())))
+}
+
+fn remove_rootfs_path(rootfs: &Path, relative: &str) -> Result<(), VmError> {
+    let path = rootfs.join(relative);
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let result = if path.is_dir() {
+        std::fs::remove_dir_all(&path)
+    } else {
+        std::fs::remove_file(&path)
+    };
+    result.map_err(|e| VmError::HostSetup(format!("remove {}: {e}", path.display())))
 }
 
 fn sanitize_instance_name(name: &str) -> Result<String, VmError> {
@@ -2079,6 +2248,54 @@ mod tests {
             prepare_rootfs(Some(rootfs.clone()), "default", false).expect("prepare rootfs");
 
         assert_eq!(prepared, rootfs);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_sandbox_rootfs_rewrites_guest_layout() {
+        let dir = temp_runtime_dir();
+        let rootfs = dir.join("rootfs");
+
+        fs::create_dir_all(rootfs.join("usr/local/bin")).expect("create usr/local/bin");
+        fs::create_dir_all(rootfs.join("etc")).expect("create etc");
+        fs::create_dir_all(rootfs.join("var/lib/rancher")).expect("create var/lib/rancher");
+        fs::create_dir_all(rootfs.join("opt/openshell/charts")).expect("create charts");
+        fs::create_dir_all(rootfs.join("opt/openshell/manifests")).expect("create manifests");
+        fs::write(rootfs.join("usr/local/bin/k3s"), b"k3s").expect("write k3s");
+        fs::write(rootfs.join("usr/local/bin/kubectl"), b"kubectl").expect("write kubectl");
+        fs::write(rootfs.join("opt/openshell/.initialized"), b"yes").expect("write initialized");
+        fs::write(
+            rootfs.join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/bash\n",
+        )
+        .expect("write passwd");
+        fs::write(rootfs.join("etc/group"), "root:x:0:\n").expect("write group");
+
+        prepare_sandbox_rootfs(&rootfs).expect("prepare sandbox rootfs");
+
+        assert!(!rootfs.join("usr/local/bin/k3s").exists());
+        assert!(!rootfs.join("usr/local/bin/kubectl").exists());
+        assert!(!rootfs.join("var/lib/rancher").exists());
+        assert!(!rootfs.join("opt/openshell/charts").exists());
+        assert!(!rootfs.join("opt/openshell/manifests").exists());
+        assert!(rootfs.join("srv/openshell-vm-sandbox-init.sh").is_file());
+        assert!(rootfs.join("sandbox").is_dir());
+        assert!(
+            fs::read_to_string(rootfs.join("etc/passwd"))
+                .expect("read passwd")
+                .contains("sandbox:x:10001:10001:OpenShell Sandbox:/sandbox:/bin/bash")
+        );
+        assert!(
+            fs::read_to_string(rootfs.join("etc/group"))
+                .expect("read group")
+                .contains("sandbox:x:10001:")
+        );
+        assert_eq!(
+            fs::read_to_string(rootfs.join("opt/openshell/.rootfs-type"))
+                .expect("read sandbox rootfs marker"),
+            "sandbox\n"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

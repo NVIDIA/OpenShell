@@ -27,19 +27,39 @@ mod ws_tunnel;
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
 use std::collections::HashMap;
 use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::process::Command;
 use tracing::{debug, error, info};
 
-use compute::ComputeRuntime;
+use compute::{ComputeRuntime, ManagedDriverProcess};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router};
+#[cfg(unix)]
+use hyper_util::rt::TokioIo;
 pub use multiplex::{MultiplexService, MultiplexedService};
+#[cfg(unix)]
+use openshell_core::proto::compute::v1::{
+    GetCapabilitiesRequest, compute_driver_client::ComputeDriverClient,
+};
 use openshell_driver_kubernetes::KubernetesComputeConfig;
 use persistence::Store;
 use sandbox_index::SandboxIndex;
 use sandbox_watch::SandboxWatchBus;
+#[cfg(unix)]
+use std::process::Stdio;
+#[cfg(unix)]
+use std::time::Duration;
 pub use tls::TlsAcceptor;
+#[cfg(unix)]
+use tokio::net::UnixStream;
+use tonic::transport::Channel;
+#[cfg(unix)]
+use tonic::transport::Endpoint;
+#[cfg(unix)]
+use tower::service_fn;
 use tracing_bus::TracingLogBus;
 
 /// Server state shared across handlers.
@@ -148,7 +168,7 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
     ));
 
     state.compute.spawn_watchers();
-    ssh_tunnel::spawn_session_reaper(store.clone(), std::time::Duration::from_secs(3600));
+    ssh_tunnel::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
@@ -244,6 +264,19 @@ async fn build_compute_runtime(
         )
         .await
         .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
+        ComputeDriverKind::Vm => {
+            let (channel, driver_process) = spawn_vm_compute_driver(config).await?;
+            ComputeRuntime::new_remote_vm(
+                channel,
+                Some(driver_process),
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
         ComputeDriverKind::Podman => Err(Error::config(
             "compute driver 'podman' is not implemented yet",
         )),
@@ -255,7 +288,7 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
         [] => Err(Error::config(
             "at least one compute driver must be configured",
         )),
-        [driver @ ComputeDriverKind::Kubernetes] => Ok(*driver),
+        [driver @ ComputeDriverKind::Kubernetes] | [driver @ ComputeDriverKind::Vm] => Ok(*driver),
         [ComputeDriverKind::Podman] => Err(Error::config(
             "compute driver 'podman' is not implemented yet",
         )),
@@ -268,6 +301,174 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
                 .join(",")
         ))),
     }
+}
+
+fn resolve_vm_compute_driver_bin(config: &Config) -> Result<PathBuf> {
+    let path = if let Some(path) = config.vm_compute_driver_bin.clone() {
+        path
+    } else {
+        let current_exe = std::env::current_exe()
+            .map_err(|e| Error::config(format!("failed to resolve current executable: {e}")))?;
+        let Some(parent) = current_exe.parent() else {
+            return Err(Error::config(format!(
+                "current executable '{}' has no parent directory",
+                current_exe.display()
+            )));
+        };
+        parent.join("openshell-driver-vm")
+    };
+
+    if !path.is_file() {
+        return Err(Error::config(format!(
+            "vm compute driver binary '{}' does not exist; set --vm-compute-driver-bin or OPENSHELL_VM_COMPUTE_DRIVER_BIN",
+            path.display()
+        )));
+    }
+
+    Ok(path)
+}
+
+fn vm_compute_driver_socket_path(config: &Config) -> PathBuf {
+    config.vm_driver_state_dir.join("compute-driver.sock")
+}
+
+#[cfg(unix)]
+async fn spawn_vm_compute_driver(config: &Config) -> Result<(Channel, Arc<ManagedDriverProcess>)> {
+    if config.grpc_endpoint.trim().is_empty() {
+        return Err(Error::config(
+            "grpc_endpoint is required when using the vm compute driver",
+        ));
+    }
+
+    let driver_bin = resolve_vm_compute_driver_bin(config)?;
+    let socket_path = vm_compute_driver_socket_path(config);
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            Error::execution(format!(
+                "failed to create vm compute driver socket dir '{}': {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    match std::fs::remove_file(&socket_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(Error::execution(format!(
+                "failed to remove stale vm compute driver socket '{}': {err}",
+                socket_path.display()
+            )));
+        }
+    }
+
+    let mut command = Command::new(&driver_bin);
+    command.kill_on_drop(true);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::inherit());
+    command.stderr(Stdio::inherit());
+    command.arg("--bind-socket").arg(&socket_path);
+    command.arg("--log-level").arg(&config.log_level);
+    command
+        .arg("--openshell-endpoint")
+        .arg(&config.grpc_endpoint);
+    command.arg("--state-dir").arg(&config.vm_driver_state_dir);
+    command
+        .arg("--ssh-handshake-secret")
+        .arg(&config.ssh_handshake_secret);
+    command
+        .arg("--ssh-handshake-skew-secs")
+        .arg(config.ssh_handshake_skew_secs.to_string());
+    command
+        .arg("--krun-log-level")
+        .arg(config.vm_krun_log_level.to_string());
+    command.arg("--vcpus").arg(config.vm_vcpus.to_string());
+    command.arg("--mem-mib").arg(config.vm_mem_mib.to_string());
+    if let Some(tls) = &config.tls {
+        command.arg("--tls-ca").arg(&tls.client_ca_path);
+        command.arg("--tls-cert").arg(&tls.cert_path);
+        command.arg("--tls-key").arg(&tls.key_path);
+    }
+
+    let mut child = command.spawn().map_err(|e| {
+        Error::execution(format!(
+            "failed to launch vm compute driver '{}': {e}",
+            driver_bin.display()
+        ))
+    })?;
+    let channel = wait_for_vm_compute_driver(&socket_path, &mut child).await?;
+    let process = Arc::new(ManagedDriverProcess::new(child, socket_path));
+    Ok((channel, process))
+}
+
+#[cfg(not(unix))]
+async fn spawn_vm_compute_driver(_config: &Config) -> Result<(Channel, Arc<ManagedDriverProcess>)> {
+    Err(Error::config(
+        "the vm compute driver requires unix domain socket support",
+    ))
+}
+
+#[cfg(unix)]
+async fn wait_for_vm_compute_driver(
+    socket_path: &std::path::Path,
+    child: &mut tokio::process::Child,
+) -> Result<Channel> {
+    let mut last_error: Option<String> = None;
+    for _ in 0..100 {
+        if let Some(status) = child.try_wait().map_err(|e| {
+            Error::execution(format!("failed to poll vm compute driver process: {e}"))
+        })? {
+            return Err(Error::execution(format!(
+                "vm compute driver exited before becoming ready with status {status}"
+            )));
+        }
+
+        match connect_vm_compute_driver(socket_path).await {
+            Ok(channel) => {
+                let mut client = ComputeDriverClient::new(channel.clone());
+                match client
+                    .get_capabilities(tonic::Request::new(GetCapabilitiesRequest {}))
+                    .await
+                {
+                    Ok(_) => return Ok(channel),
+                    Err(status) => last_error = Some(status.to_string()),
+                }
+            }
+            Err(err) => last_error = Some(err.to_string()),
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(Error::execution(format!(
+        "timed out waiting for vm compute driver socket '{}': {}",
+        socket_path.display(),
+        last_error.unwrap_or_else(|| "unknown error".to_string())
+    )))
+}
+
+#[cfg(unix)]
+async fn connect_vm_compute_driver(socket_path: &std::path::Path) -> Result<Channel> {
+    let socket_path = socket_path.to_path_buf();
+    let display_path = socket_path.clone();
+    Endpoint::from_static("http://[::]:50051")
+        .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
+            let socket_path = socket_path.clone();
+            async move { UnixStream::connect(socket_path).await.map(TokioIo::new) }
+        }))
+        .await
+        .map_err(|e| {
+            Error::execution(format!(
+                "failed to connect to vm compute driver socket '{}': {e}",
+                display_path.display()
+            ))
+        })
+}
+
+#[cfg(not(unix))]
+async fn connect_vm_compute_driver(_socket_path: &std::path::Path) -> Result<Channel> {
+    Err(Error::config(
+        "the vm compute driver requires unix domain socket support",
+    ))
 }
 
 #[cfg(test)]
@@ -330,6 +531,15 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("compute driver 'podman' is not implemented yet")
+        );
+    }
+
+    #[test]
+    fn configured_compute_driver_accepts_vm() {
+        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Vm]);
+        assert_eq!(
+            configured_compute_driver(&config).unwrap(),
+            ComputeDriverKind::Vm
         );
     }
 }

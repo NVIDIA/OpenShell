@@ -112,6 +112,30 @@ struct Args {
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
+    /// Working directory for VM driver sandbox state.
+    #[arg(
+        long,
+        env = "OPENSHELL_VM_DRIVER_STATE_DIR",
+        default_value = "target/openshell-vm-driver"
+    )]
+    vm_driver_state_dir: PathBuf,
+
+    /// VM compute-driver binary spawned by the gateway.
+    #[arg(long, env = "OPENSHELL_VM_COMPUTE_DRIVER_BIN")]
+    vm_compute_driver_bin: Option<PathBuf>,
+
+    /// libkrun log level used by the VM helper.
+    #[arg(long, env = "OPENSHELL_VM_KRUN_LOG_LEVEL", default_value_t = 1)]
+    vm_krun_log_level: u32,
+
+    /// Default vCPU count for VM sandboxes.
+    #[arg(long, env = "OPENSHELL_VM_DRIVER_VCPUS", default_value_t = 2)]
+    vm_vcpus: u8,
+
+    /// Default memory allocation for VM sandboxes, in MiB.
+    #[arg(long, env = "OPENSHELL_VM_DRIVER_MEM_MIB", default_value_t = 2048)]
+    vm_mem_mib: u32,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -209,6 +233,16 @@ async fn run_from_args(args: Args) -> Result<()> {
 
     if let Some(ip) = args.host_gateway_ip {
         config = config.with_host_gateway_ip(ip);
+    }
+
+    config = config
+        .with_vm_driver_state_dir(args.vm_driver_state_dir)
+        .with_vm_krun_log_level(args.vm_krun_log_level)
+        .with_vm_vcpus(args.vm_vcpus)
+        .with_vm_mem_mib(args.vm_mem_mib);
+
+    if let Some(path) = args.vm_compute_driver_bin {
+        config = config.with_vm_compute_driver_bin(path);
     }
 
     if args.disable_tls {

@@ -930,6 +930,15 @@ fn is_safe_ssh_proxy_target(ip: std::net::IpAddr) -> bool {
     }
 }
 
+fn is_explicit_loopback_exec_target(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
 async fn start_single_use_ssh_proxy(
     target_host: &str,
     target_port: u16,
@@ -938,6 +947,7 @@ async fn start_single_use_ssh_proxy(
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
     let target_host = target_host.to_string();
+    let allow_explicit_loopback = is_explicit_loopback_exec_target(target_host.as_str());
     let handshake_secret = handshake_secret.to_string();
 
     let task = tokio::spawn(async move {
@@ -962,7 +972,7 @@ async fn start_single_use_ssh_proxy(
             }
         };
 
-        if !is_safe_ssh_proxy_target(resolved.ip()) {
+        if !allow_explicit_loopback && !is_safe_ssh_proxy_target(resolved.ip()) {
             warn!(
                 target_host = %target_host,
                 resolved_ip = %resolved.ip(),
@@ -1212,6 +1222,21 @@ mod tests {
         use std::net::IpAddr;
         let ip: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
         assert!(!is_safe_ssh_proxy_target(ip));
+    }
+
+    #[test]
+    fn explicit_loopback_exec_target_is_allowed() {
+        assert!(is_explicit_loopback_exec_target("127.0.0.1"));
+        assert!(is_explicit_loopback_exec_target("::1"));
+        assert!(is_explicit_loopback_exec_target("localhost"));
+    }
+
+    #[test]
+    fn non_loopback_exec_target_is_not_treated_as_explicit_loopback() {
+        assert!(!is_explicit_loopback_exec_target("10.0.0.5"));
+        assert!(!is_explicit_loopback_exec_target(
+            "sandbox.default.svc.cluster.local"
+        ));
     }
 
     // ---- petname / generate_name ----

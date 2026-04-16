@@ -3091,6 +3091,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-vm"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "libc",
+ "libloading",
+ "miette",
+ "nix",
+ "openshell-core",
+ "prost-types",
+ "tar",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "zstd",
+]
+
+[[package]]
 name = "openshell-ocsf"
 version = "0.0.0"
 dependencies = [
@@ -3245,6 +3267,7 @@ dependencies = [
  "tower-http 0.6.8",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "wiremock",
 ]

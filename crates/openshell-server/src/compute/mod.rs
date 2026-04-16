@@ -14,8 +14,8 @@ use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
     DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest, ListSandboxesRequest,
     ResolveSandboxEndpointRequest, ResolveSandboxEndpointResponse, ValidateSandboxCreateRequest,
-    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_server::ComputeDriver,
-    sandbox_endpoint, watch_sandboxes_event,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
+    compute_driver_server::ComputeDriver, sandbox_endpoint, watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -31,6 +31,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tonic::transport::Channel;
 use tonic::{Code, Request, Status};
 use tracing::{info, warn};
 
@@ -54,16 +55,145 @@ pub enum ComputeError {
     #[error("{0}")]
     Message(String),
 }
-
 #[derive(Debug)]
 pub enum ResolvedEndpoint {
     Ip(IpAddr, u16),
     Host(String, u16),
 }
 
+#[derive(Debug)]
+pub(crate) struct ManagedDriverProcess {
+    child: std::sync::Mutex<Option<tokio::process::Child>>,
+    socket_path: std::path::PathBuf,
+}
+
+impl ManagedDriverProcess {
+    pub(crate) fn new(child: tokio::process::Child, socket_path: std::path::PathBuf) -> Self {
+        Self {
+            child: std::sync::Mutex::new(Some(child)),
+            socket_path,
+        }
+    }
+}
+
+impl Drop for ManagedDriverProcess {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.take();
+        }
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RemoteComputeDriver {
+    channel: Channel,
+}
+
+impl RemoteComputeDriver {
+    fn new(channel: Channel) -> Self {
+        Self { channel }
+    }
+
+    fn client(&self) -> ComputeDriverClient<Channel> {
+        ComputeDriverClient::new(self.channel.clone())
+    }
+}
+
+#[tonic::async_trait]
+impl ComputeDriver for RemoteComputeDriver {
+    type WatchSandboxesStream = DriverWatchStream;
+
+    async fn get_capabilities(
+        &self,
+        request: Request<GetCapabilitiesRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::GetCapabilitiesResponse>, Status>
+    {
+        let mut client = self.client();
+        client.get_capabilities(request).await
+    }
+
+    async fn validate_sandbox_create(
+        &self,
+        request: Request<ValidateSandboxCreateRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::ValidateSandboxCreateResponse>,
+        Status,
+    > {
+        let mut client = self.client();
+        client.validate_sandbox_create(request).await
+    }
+
+    async fn get_sandbox(
+        &self,
+        request: Request<GetSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::GetSandboxResponse>, Status>
+    {
+        let mut client = self.client();
+        client.get_sandbox(request).await
+    }
+
+    async fn list_sandboxes(
+        &self,
+        request: Request<ListSandboxesRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::ListSandboxesResponse>, Status>
+    {
+        let mut client = self.client();
+        client.list_sandboxes(request).await
+    }
+
+    async fn create_sandbox(
+        &self,
+        request: Request<CreateSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::CreateSandboxResponse>, Status>
+    {
+        let mut client = self.client();
+        client.create_sandbox(request).await
+    }
+
+    async fn stop_sandbox(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::StopSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::StopSandboxResponse>, Status>
+    {
+        let mut client = self.client();
+        client.stop_sandbox(request).await
+    }
+
+    async fn delete_sandbox(
+        &self,
+        request: Request<DeleteSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::DeleteSandboxResponse>, Status>
+    {
+        let mut client = self.client();
+        client.delete_sandbox(request).await
+    }
+
+    async fn resolve_sandbox_endpoint(
+        &self,
+        request: Request<ResolveSandboxEndpointRequest>,
+    ) -> Result<tonic::Response<ResolveSandboxEndpointResponse>, Status> {
+        let mut client = self.client();
+        client.resolve_sandbox_endpoint(request).await
+    }
+
+    async fn watch_sandboxes(
+        &self,
+        request: Request<WatchSandboxesRequest>,
+    ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
+        let mut client = self.client();
+        let response = client.watch_sandboxes(request).await?;
+        let stream = response
+            .into_inner()
+            .map(|item| item.map_err(|status| status));
+        Ok(tonic::Response::new(Box::pin(stream)))
+    }
+}
+
 #[derive(Clone)]
 pub struct ComputeRuntime {
     driver: SharedComputeDriver,
+    _driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
@@ -79,6 +209,32 @@ impl fmt::Debug for ComputeRuntime {
 }
 
 impl ComputeRuntime {
+    async fn from_driver(
+        driver: SharedComputeDriver,
+        driver_process: Option<Arc<ManagedDriverProcess>>,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+    ) -> Result<Self, ComputeError> {
+        let default_image = driver
+            .get_capabilities(Request::new(GetCapabilitiesRequest {}))
+            .await
+            .map_err(compute_error_from_status)?
+            .into_inner()
+            .default_image;
+        Ok(Self {
+            driver,
+            _driver_process: driver_process,
+            default_image,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            sync_lock: Arc::new(Mutex::new(())),
+        })
+    }
+
     pub async fn new_kubernetes(
         config: KubernetesComputeConfig,
         store: Arc<Store>,
@@ -90,21 +246,35 @@ impl ComputeRuntime {
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(ComputeDriverService::new(driver));
-        let default_image = driver
-            .get_capabilities(Request::new(GetCapabilitiesRequest {}))
-            .await
-            .map_err(compute_error_from_status)?
-            .into_inner()
-            .default_image;
-        Ok(Self {
+        Self::from_driver(
             driver,
-            default_image,
+            None,
             store,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
-            sync_lock: Arc::new(Mutex::new(())),
-        })
+        )
+        .await
+    }
+
+    pub(crate) async fn new_remote_vm(
+        channel: Channel,
+        driver_process: Option<Arc<ManagedDriverProcess>>,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+    ) -> Result<Self, ComputeError> {
+        let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
+        Self::from_driver(
+            driver,
+            driver_process,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+        )
+        .await
     }
 
     #[must_use]
@@ -919,7 +1089,7 @@ fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Opti
 
 fn is_terminal_failure_reason(reason: &str) -> bool {
     let reason = reason.to_ascii_lowercase();
-    let transient_reasons = ["reconcilererror", "dependenciesnotready"];
+    let transient_reasons = ["reconcilererror", "dependenciesnotready", "starting"];
     !transient_reasons.contains(&reason.as_str())
 }
 
@@ -1061,6 +1231,7 @@ mod tests {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
             driver,
+            _driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
             store,
             sandbox_index: SandboxIndex::new(),
@@ -1134,6 +1305,7 @@ mod tests {
                 "Pod exists with phase: Pending; Service Exists",
             ),
             ("dependenciesnotready", "lowercase also works"),
+            ("Starting", "VM is starting"),
         ];
 
         for (reason, message) in transient_cases {
@@ -1170,6 +1342,7 @@ mod tests {
                 "DependenciesNotReady",
                 "Pod exists with phase: Pending; Service Exists",
             ),
+            ("Starting", "VM is starting"),
         ];
 
         for (reason, message) in transient_conditions {
