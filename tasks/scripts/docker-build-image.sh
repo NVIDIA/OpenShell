@@ -38,7 +38,7 @@ detect_rust_scope() {
   echo "no-rust"
 }
 
-TARGET=${1:?"Usage: docker-build-image.sh <gateway|cluster|supervisor-builder|supervisor-output> [extra-args...]"}
+TARGET=${1:?"Usage: docker-build-image.sh <gateway|supervisor|cluster|supervisor-builder|supervisor-output> [extra-args...]"}
 shift
 
 DOCKERFILE="deploy/docker/Dockerfile.images"
@@ -55,6 +55,11 @@ case "${TARGET}" in
     IS_FINAL_IMAGE=1
     IMAGE_NAME="openshell/gateway"
     DOCKER_TARGET="gateway"
+    ;;
+  supervisor)
+    IS_FINAL_IMAGE=1
+    IMAGE_NAME="openshell/supervisor"
+    DOCKER_TARGET="supervisor"
     ;;
   cluster)
     IS_FINAL_IMAGE=1

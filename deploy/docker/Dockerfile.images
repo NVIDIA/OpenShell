@@ -7,6 +7,7 @@
 #
 # Targets:
 #   gateway             Final gateway image
+#   supervisor          Final supervisor image
 #   cluster             Final cluster image
 #   gateway-builder     Release openshell-server binary
 #   supervisor-builder  Release openshell-sandbox binary
@@ -200,6 +201,26 @@ EXPOSE 8080
 
 ENTRYPOINT ["openshell-server"]
 CMD ["--port", "8080"]
+
+# ---------------------------------------------------------------------------
+# Final supervisor image
+# ---------------------------------------------------------------------------
+FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS supervisor
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates && \
+    apt-get install -y --only-upgrade gpgv && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --user-group openshell
+
+WORKDIR /app
+
+COPY --from=supervisor-builder /build/out/openshell-sandbox /usr/local/bin/
+
+USER openshell
+
+ENTRYPOINT ["openshell-sandbox"]
 
 # ---------------------------------------------------------------------------
 # Cluster asset stages
