@@ -33,7 +33,11 @@ async fn connect_channel(endpoint: &str) -> Result<Channel> {
         .connect_timeout(Duration::from_secs(10))
         .http2_keep_alive_interval(Duration::from_secs(10))
         .keep_alive_while_idle(true)
-        .keep_alive_timeout(Duration::from_secs(20));
+        .keep_alive_timeout(Duration::from_secs(20))
+        // Match the gateway-side HTTP/2 windows (see `multiplex.rs`). The
+        // defaults throttle the RelayStream data plane to ~500 Mbps on LAN.
+        .initial_stream_window_size(2 * 1024 * 1024)
+        .initial_connection_window_size(4 * 1024 * 1024);
 
     let tls_enabled = endpoint.starts_with("https://");
 

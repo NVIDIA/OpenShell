@@ -62,7 +62,20 @@ impl MultiplexService {
 
         let service = MultiplexedService::new(grpc_service, http_service);
 
-        Builder::new(TokioExecutor::new())
+        // HTTP/2 flow-control windows. The default (64 KiB stream, 64 KiB
+        // connection) throttles bulk gRPC streams — notably the RelayStream
+        // data plane used by `sandbox connect` and `ExecSandbox`. Bumping
+        // these lets a single SSH tunnel reach TCP-limited throughput on
+        // LAN and WAN alike. Values chosen empirically on `nemoclaw` — 2 MiB
+        // / 4 MiB was the point at which bulk throughput matched the raw
+        // HTTP CONNECT baseline.
+        let mut builder = Builder::new(TokioExecutor::new());
+        builder
+            .http2()
+            .initial_stream_window_size(2 * 1024 * 1024)
+            .initial_connection_window_size(4 * 1024 * 1024);
+
+        builder
             .serve_connection_with_upgrades(TokioIo::new(stream), service)
             .await?;
 
