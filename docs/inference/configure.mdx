@@ -103,7 +103,7 @@ openshell inference set \
     --timeout 300
 ```
 
-The value is in seconds. When `--timeout` is omitted (or set to `0`), the default of 60 seconds applies.
+The value is in seconds. When `--timeout` is omitted (or set to `0`), the default of 60 seconds applies. Increase `--timeout` when you expect extended thinking phases so the full response completes before the request deadline.
 
 ## Verify the Active Config
 
@@ -154,7 +154,7 @@ response = client.chat.completions.create(
 )
 ```
 
-The client-supplied `model` and `api_key` values are not sent upstream. The privacy router injects the real credentials from the configured provider and rewrites the model before forwarding.
+The client-supplied `model` and `api_key` values are not sent upstream. The privacy router injects the real credentials from the configured provider and rewrites the model before forwarding. Caller-supplied `Authorization` and other non-allowlisted headers are stripped; only a per-provider header allowlist reaches the upstream endpoint. For the exact allowlist, refer to [About Inference Routing](/inference/about).
 
 Some SDKs require a non-empty API key even though `inference.local` does not use the sandbox-provided value. In those cases, pass any placeholder such as `test` or `unused`.
 

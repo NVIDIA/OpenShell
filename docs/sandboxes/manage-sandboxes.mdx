@@ -70,6 +70,38 @@ When `--editor` is used, OpenShell keeps the sandbox alive and installs an
 OpenShell-managed SSH include file instead of cluttering your main
 `~/.ssh/config` with generated host blocks.
 
+## Execute a Command in a Sandbox
+
+Run a one-shot command inside a running sandbox without opening an interactive shell:
+
+```shell
+openshell sandbox exec -n my-sandbox -- ls -la /workspace
+```
+
+Pipe stdin into the command:
+
+```shell
+echo "hello" | openshell sandbox exec -n my-sandbox -- cat
+```
+
+The command's exit code is propagated to the CLI, so `exec` works in scripts that check return codes.
+
+Run an interactive shell with a TTY:
+
+```shell
+openshell sandbox exec -n my-sandbox --tty -- /bin/bash
+```
+
+OpenShell allocates a TTY automatically when both stdin and stdout are terminals. Force the behavior with `--tty` or disable it with `--no-tty`.
+
+| Flag | Purpose |
+|---|---|
+| `-n`, `--name` | Sandbox to target. |
+| `--workdir` | Working directory for the command inside the sandbox. |
+| `--timeout` | Command timeout in seconds. `0` disables the timeout. |
+| `--tty` | Force TTY allocation. |
+| `--no-tty` | Disable TTY allocation even when attached to a terminal. |
+
 ## Monitor and Debug
 
 List all sandboxes:

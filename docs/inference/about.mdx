@@ -18,16 +18,17 @@ The following table summarizes how OpenShell handles inference traffic.
 
 ## How `inference.local` Works
 
-When code inside a sandbox calls `https://inference.local`, the privacy router routes the request to the configured backend for that gateway. The configured model is applied to generation requests, provider credentials are supplied by OpenShell rather than by code inside the sandbox, and only approved inference headers are forwarded upstream.
+When code inside a sandbox calls `https://inference.local`, the privacy router routes the request to the configured backend for that gateway. The configured model is applied to generation requests, provider credentials are supplied by OpenShell rather than by code inside the sandbox, and only approved inference headers are forwarded upstream. The router also tolerates long idle gaps between streamed chunks, so responses from reasoning models are not truncated during extended thinking pauses.
 
 If code calls an external inference host directly, that traffic is evaluated only by `network_policies`.
 
 | Property | Detail |
 |---|---|
-| Credentials | No sandbox API keys needed. Credentials come from the configured provider record. |
-| Header forwarding | `inference.local` forwards only approved inference headers. It strips caller auth and other unexpected headers before sending the request upstream. |
+| Credentials | No sandbox API keys needed. Credentials come from the configured provider record. The router strips caller-supplied `Authorization` before forwarding the request. |
+| Header forwarding | `inference.local` forwards only a per-provider header allowlist. OpenAI routes allow `openai-organization` and `x-model-id`. Anthropic routes allow `anthropic-version` and `anthropic-beta`. NVIDIA routes allow `x-model-id`. All other caller headers are stripped. |
 | Configuration | One provider and one model define sandbox inference for the active gateway. Every sandbox on that gateway sees the same `inference.local` backend. |
 | Provider support | NVIDIA, any OpenAI-compatible provider, and Anthropic all work through the same endpoint. |
+| Streaming reliability | The router tolerates idle gaps of up to 120 seconds between streamed chunks so long reasoning responses are not cut off mid-stream. |
 | Hot-refresh | OpenShell picks up provider credential changes and inference updates without recreating sandboxes. Changes propagate within about 5 seconds by default. |
 
 ## Supported API Patterns

@@ -35,7 +35,17 @@ Every outbound connection from agent code passes through the same decision path:
    - **Allow** - the destination and binary match a policy block. Traffic flows directly to the external service.
    - **Deny** - no policy block matched. The connection is blocked and logged.
 
-For REST endpoints with TLS termination enabled, the proxy also decrypts TLS and checks each HTTP request against per-method, per-path rules before allowing it through.
+For REST endpoints, the proxy auto-detects TLS on every tunnel by peeking the first bytes. When a TLS ClientHello is detected, the proxy terminates TLS transparently using a per-sandbox ephemeral CA and checks each HTTP request against per-method, per-path rules before allowing it through. Upstream connections trust both the Mozilla webpki root set and the system CA store inside the sandbox container (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`, `/etc/ssl/cert.pem`). To trust a corporate or internal CA for upstream traffic, add the PEM file to the container's trust store during the image build.
+
+The older `tls: terminate` and `tls: passthrough` policy keys are deprecated. Leaving either in a policy emits a warning and has no effect. Use `tls: skip` on an endpoint if you need to disable TLS detection and termination for that destination.
+
+## Gateway Lifecycle
+
+OpenShell preserves sandbox state across gateway restarts. When you run `openshell gateway stop` and then `openshell gateway start`, running sandboxes resume from their saved state rather than being recreated. The gateway also persists the SSH handshake secret so open SSH sessions to sandboxes reconnect without re-authenticating.
+
+## Observability
+
+The sandbox emits operational decisions as OCSF v1.7.0 structured logs, covering network connections, HTTP requests, SSH sessions, process lifecycle events, detection findings, policy and configuration changes, and supervisor lifecycle. For the event classes and the JSONL export format, refer to [OCSF JSON Export](/observability/ocsf-json-export).
 
 ## Deployment Modes
 
