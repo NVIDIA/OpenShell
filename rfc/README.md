@@ -87,11 +87,25 @@ An RFC can be in one of the following states:
 
 ### 1. Reserve an RFC number
 
-Look at the existing RFCs in this directory and choose the next available number. If two authors happen to pick the same number on separate branches, the conflict is resolved during PR review — the later PR simply picks the next available number.
+Look at the existing RFC folders in this directory and choose the next available number. If two authors happen to pick the same number on separate branches, the conflict is resolved during PR review — the later PR simply picks the next available number.
 
 ### 2. Create your RFC
 
-Copy `0000-template.md` to `NNNN-my-feature.md` where `NNNN` is your RFC number (zero-padded to 4 digits) and `my-feature` is a short descriptive name.
+Each RFC lives in its own folder:
+
+```
+rfc/NNNN-my-feature/
+    README.md
+    (optional: diagrams, images, supporting files)
+```
+
+Where `NNNN` is your RFC number (zero-padded to 4 digits) and `my-feature` is a short descriptive name. The main proposal goes in `README.md` so GitHub renders it when browsing the folder.
+
+To start a new RFC, copy the template folder:
+
+```shell
+cp -r rfc/0000-template rfc/NNNN-my-feature
+```
 
 Fill in the metadata and start writing. The state should be `draft` while you're iterating.
 
@@ -129,7 +143,7 @@ graph LR
 ```
 ````
 
-Prefer Mermaid over external image files whenever possible. If a diagram is too complex for Mermaid (e.g., detailed UI mockups), commit the image to the same directory as the RFC and reference it with a relative path.
+Prefer Mermaid over external image files whenever possible. If a diagram is too complex for Mermaid (e.g., detailed UI mockups), commit the image to the RFC's folder alongside its `README.md` and reference it with a relative path.
 
 ## Making changes to an RFC
 
