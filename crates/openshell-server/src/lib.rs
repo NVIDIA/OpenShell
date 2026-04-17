@@ -30,7 +30,7 @@ mod persistence;
 mod sandbox_index;
 mod sandbox_watch;
 mod ssh_tunnel;
-pub(crate) mod supervisor_session;
+pub mod supervisor_session;
 mod tls;
 pub mod tracing_bus;
 mod ws_tunnel;

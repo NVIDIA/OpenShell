@@ -78,7 +78,7 @@ impl SupervisorSessionRegistry {
     /// Register a live supervisor session for the given sandbox.
     ///
     /// Returns the previous session's sender (if any) so the caller can close it.
-    fn register(
+    pub fn register(
         &self,
         sandbox_id: String,
         session_id: String,
@@ -283,7 +283,7 @@ const RELAY_STREAM_CHUNK_SIZE: usize = 16 * 1024;
 /// way are chunked and sent as `RelayFrame::data` messages back over the
 /// response stream.
 pub async fn handle_relay_stream(
-    state: &Arc<ServerState>,
+    registry: &SupervisorSessionRegistry,
     request: Request<tonic::Streaming<RelayFrame>>,
 ) -> Result<
     Response<
@@ -312,7 +312,7 @@ pub async fn handle_relay_stream(
     };
 
     // Claim the pending relay. Consumes the entry — it cannot be reused.
-    let supervisor_side = state.supervisor_sessions.claim_relay(&channel_id)?;
+    let supervisor_side = registry.claim_relay(&channel_id)?;
     info!(channel_id = %channel_id, "relay stream: claimed pending relay, bridging");
 
     let (mut read_half, mut write_half) = tokio::io::split(supervisor_side);

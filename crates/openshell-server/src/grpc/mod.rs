@@ -404,7 +404,8 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<tonic::Streaming<RelayFrame>>,
     ) -> Result<Response<Self::RelayStreamStream>, Status> {
-        crate::supervisor_session::handle_relay_stream(&self.state, request).await
+        crate::supervisor_session::handle_relay_stream(&self.state.supervisor_sessions, request)
+            .await
     }
 }
 
