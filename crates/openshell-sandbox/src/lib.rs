@@ -604,8 +604,7 @@ pub async fn run_sandbox(
         }
     });
 
-    let ssh_socket_path: Option<std::path::PathBuf> =
-        ssh_socket_path.map(std::path::PathBuf::from);
+    let ssh_socket_path: Option<std::path::PathBuf> = ssh_socket_path.map(std::path::PathBuf::from);
     if let Some(listen_path) = ssh_socket_path.clone() {
         let policy_clone = policy.clone();
         let workdir_clone = workdir.clone();
