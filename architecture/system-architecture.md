@@ -28,8 +28,7 @@ graph TB
             subgraph GatewayPod["Gateway StatefulSet"]
                 Gateway["openshell-server<br/>:8080<br/>(gRPC + HTTP, mTLS)"]
                 SQLite[("SQLite DB<br/>/var/openshell/<br/>openshell.db")]
-                SandboxWatcher["Sandbox Watcher"]
-                KubeEventTailer["Kube Event Tailer"]
+                SupRegistry["SupervisorSessionRegistry<br/>(live sessions + pending relays)"]
                 WatchBus["SandboxWatchBus<br/>(in-memory broadcast)"]
                 LogBus["TracingLogBus<br/>(in-memory broadcast)"]
             end
@@ -37,7 +36,8 @@ graph TB
             subgraph SandboxPod["Sandbox Pod (1 per sandbox)"]
 
                 subgraph Supervisor["Sandbox Supervisor<br/>(privileged user)"]
-                    SSHServer["Embedded SSH<br/>Server (russh)<br/>:2222"]
+                    SSHServer["Embedded SSH<br/>Server (russh)<br/>Unix socket<br/>/run/openshell/ssh.sock"]
+                    RelayBridge["Relay Bridge<br/>(ConnectSupervisor +<br/>RelayStream client)"]
                     Proxy["HTTP CONNECT<br/>Proxy<br/>10.200.0.1:3128"]
                     OPA["OPA Policy Engine<br/>(regorus, in-process)"]
                     InferenceRouter["Inference Router<br/>(openshell-router)"]
@@ -101,10 +101,16 @@ graph TB
     %% CONNECTIONS: Gateway internals
     %% ============================================================
     Gateway --> SQLite
+    Gateway --> SupRegistry
     Gateway -- "Watch + CRUD<br/>Sandbox CRDs" --> KubeAPI
-    SandboxWatcher -- "status changes" --> WatchBus
-    KubeEventTailer -- "K8s events" --> Gateway
-    Gateway -- "NSSH1 handshake<br/>(HMAC-SHA256) + SSH<br/>:2222" --> SSHServer
+    KubeAPI -- "compute-driver events<br/>(status, platform events)" --> Gateway
+
+    %% ============================================================
+    %% CONNECTIONS: Supervisor session (inbound from sandbox)
+    %% ============================================================
+    RelayBridge -- "ConnectSupervisor<br/>(persistent bidi stream)" --> SupRegistry
+    RelayBridge -- "RelayStream<br/>(per-invocation byte bridge,<br/>same HTTP/2 connection)" --> SupRegistry
+    RelayBridge -- "Unix socket<br/>SSH bytes" --> SSHServer
 
     %% ============================================================
     %% CONNECTIONS: CRD Controller
@@ -123,7 +129,7 @@ graph TB
     %% ============================================================
     %% CONNECTIONS: Sandbox --> Gateway (control plane)
     %% ============================================================
-    Supervisor -- "gRPC (mTLS):<br/>GetSandboxSettings<br/>(policy + settings),<br/>GetProviderEnvironment,<br/>GetInferenceBundle,<br/>PushSandboxLogs" --> Gateway
+    Supervisor -- "gRPC (mTLS):<br/>GetSandboxConfig<br/>(policy + settings),<br/>GetProviderEnvironment,<br/>GetInferenceBundle,<br/>PushSandboxLogs" --> Gateway
 
     %% ============================================================
     %% CONNECTIONS: Sandbox --> External (via proxy)
@@ -145,9 +151,9 @@ graph TB
     K3s -- "pulls images<br/>at runtime" --> GHCR
 
     %% ============================================================
-    %% FILE SYNC
+    %% CLIENT SSH / EXEC (bytes tunneled via supervisor relay)
     %% ============================================================
-    CLI -- "tar-over-SSH<br/>(file sync)" --> SSHServer
+    CLI -- "HTTP CONNECT /connect/ssh<br/>+ tar-over-SSH file sync<br/>(bytes bridged through<br/>SupervisorSessionRegistry)" --> Gateway
 
     %% ============================================================
     %% STYLES
@@ -164,8 +170,8 @@ graph TB
     classDef config fill:#90A4AE,stroke:#607D8B,color:#fff
 
     class CLI,TUI,SDK userComponent
-    class Gateway,SandboxWatcher,KubeEventTailer,WatchBus,LogBus gateway
-    class SSHServer,Proxy,OPA,InferenceRouter,CertCache sandbox
+    class Gateway,SupRegistry,WatchBus,LogBus gateway
+    class SSHServer,RelayBridge,Proxy,OPA,InferenceRouter,CertCache sandbox
     class Agent,Landlock,Seccomp,NetNS agent
     class SQLite datastore
     class Anthropic,OpenAI,NVIDIA_API,GitHub,GitLab,PyPI,NPM,LMStudio,VLLM,GHCR external
@@ -189,12 +195,14 @@ graph TB
 
 1. **CLI/SDK to Gateway**: All control-plane traffic uses gRPC over HTTPS with mutual TLS (mTLS). Single multiplexed port (8080 inside cluster, 30051 NodePort).
 
-2. **SSH Access**: CLI connects via HTTP CONNECT upgrade at `/connect/ssh`. Gateway authenticates with session token, then bridges to sandbox SSH (port 2222) using NSSH1 HMAC-SHA256 handshake.
+2. **Supervisor Session (inbound from sandbox)**: Each sandbox supervisor opens a persistent `ConnectSupervisor` bidi gRPC stream to the gateway over mTLS. The gateway tracks these in `SupervisorSessionRegistry`. When SSH or exec access is needed, the gateway sends `RelayOpen { channel_id }` on that stream; the supervisor responds by initiating a `RelayStream` RPC on the same HTTP/2 connection whose first frame is a `RelayInit { channel_id }`. Subsequent frames carry raw bytes in both directions. The gateway never dials the sandbox pod.
 
-3. **File Sync**: tar archives streamed over the SSH tunnel (no rsync dependency).
+3. **SSH / Exec Access**: CLI connects via HTTP CONNECT upgrade at `/connect/ssh` (or calls `ExecSandbox` gRPC). The gateway authenticates, calls `open_relay`, and bridges the client bytes through the supervisor's `RelayStream` to the supervisor's in-sandbox SSH daemon, which binds to a Unix socket (`/run/openshell/ssh.sock`) rather than a TCP port.
 
-4. **Sandbox to External**: All agent outbound traffic is forced through the HTTP CONNECT proxy (10.200.0.1:3128) via a network namespace veth pair. OPA/Rego policies evaluate every connection. TLS is automatically detected and terminated for credential injection; endpoints with `protocol` configured also get L7 request-level inspection.
+4. **File Sync**: tar archives streamed over the relay-tunneled SSH session (no rsync dependency).
 
-5. **Inference Routing**: Inference requests are handled inside the sandbox by the openshell-router (not through the gateway). The gateway provides route configuration and credentials via gRPC; the sandbox executes HTTP requests directly to inference backends.
+5. **Sandbox to External**: All agent outbound traffic is forced through the HTTP CONNECT proxy (10.200.0.1:3128) via a network namespace veth pair. OPA/Rego policies evaluate every connection. TLS is automatically detected and terminated for credential injection; endpoints with `protocol` configured also get L7 request-level inspection.
 
-6. **Sandbox to Gateway**: The sandbox supervisor uses gRPC (mTLS) to fetch policies and runtime settings (via `GetSandboxSettings`), provider credentials, inference bundles, and to push logs back to the gateway. The settings channel delivers typed key-value pairs alongside policy through a unified poll loop.
+6. **Inference Routing**: Inference requests are handled inside the sandbox by the openshell-router (not through the gateway). The gateway provides route configuration and credentials via gRPC; the sandbox executes HTTP requests directly to inference backends.
+
+7. **Sandbox to Gateway (control plane)**: The sandbox supervisor uses gRPC (mTLS) to fetch policies and runtime settings (via `GetSandboxConfig`), provider credentials, inference bundles, and to push logs back to the gateway. The settings channel delivers typed key-value pairs alongside policy through a unified poll loop. This reuses the same mTLS connection that carries `ConnectSupervisor`.

@@ -269,20 +269,28 @@ The gateway enforces two concurrent connection limits to bound the impact of cre
 
 These limits are tracked in-memory and decremented when tunnels close. Exceeding either limit returns HTTP 429 (Too Many Requests).
 
-### NSSH1 Handshake
+### Supervisor-Initiated Relay Model
 
-After the gateway connects to the sandbox pod's SSH port, it performs a cryptographic handshake:
+The gateway never dials the sandbox. Instead, the sandbox supervisor opens an outbound `ConnectSupervisor` bidirectional gRPC stream to the gateway on startup and keeps it alive for the sandbox lifetime. SSH traffic for `/connect/ssh` (and exec traffic for `ExecSandbox`) rides this same TCP+TLS+HTTP/2 connection as separate multiplexed HTTP/2 streams. The gateway-side registry and `RelayStream` handler live in `crates/openshell-server/src/supervisor_session.rs`; the supervisor-side bridge lives in `crates/openshell-sandbox/src/supervisor_session.rs`.
 
-```
-NSSH1 <token> <timestamp> <nonce> <hmac_signature>\n
-```
+Per-connection flow:
 
-- **HMAC**: `HMAC-SHA256(secret, "{token}|{timestamp}|{nonce}")`, hex-encoded.
-- **Secret**: shared via `OPENSHELL_SSH_HANDSHAKE_SECRET` env var, set on both the gateway and sandbox.
-- **Clock skew tolerance**: configurable via `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS` (default 300 seconds).
-- **Expected response**: `OK\n` from the sandbox.
+1. CLI presents `x-sandbox-id` + `x-sandbox-token` at `/connect/ssh` and passes gateway token validation.
+2. Gateway calls `SupervisorSessionRegistry::open_relay(sandbox_id, ...)`, which allocates a `channel_id` (UUID) and sends a `RelayOpen` message to the supervisor over the already-established `ConnectSupervisor` stream. If no session is registered yet, it polls with exponential backoff up to a bounded timeout (30 s for `/connect/ssh`, 15 s for `ExecSandbox`).
+3. The supervisor opens a new `RelayStream` RPC on the same `Channel` — a new HTTP/2 stream, no new TCP connection and no new TLS handshake. The first `RelayFrame` is a `RelayInit { channel_id }` that claims the pending slot on the gateway.
+4. `claim_relay` pairs the gateway-side waiter with the supervisor-side RPC via a `tokio::io::duplex(64 KiB)` pair. Subsequent `RelayFrame::data` frames carry raw SSH bytes in both directions. The supervisor is a dumb byte bridge: it has no protocol awareness of the SSH bytes flowing through.
+5. Inside the sandbox pod, the supervisor connects the relay to sshd over a Unix domain socket at `/run/openshell/ssh.sock` (see `crates/openshell-driver-kubernetes/src/main.rs`).
 
-This handshake prevents direct connections to sandbox SSH ports from within the cluster, even from pods that share the network.
+Security properties of this model:
+
+- **One auth boundary.** mTLS on the `ConnectSupervisor` stream is the only identity check between gateway and sandbox. Every relay rides that same authenticated HTTP/2 connection.
+- **No inbound network path into the sandbox.** The sandbox exposes no TCP port for gateway ingress; all relays are supervisor-initiated. The pod only needs egress to the gateway.
+- **In-pod access control is filesystem permissions on the Unix socket.** sshd listens on `/run/openshell/ssh.sock` with the parent directory at `0700` and the socket itself at `0600`, both owned by the supervisor (root). The sandbox entrypoint runs as an unprivileged user and cannot open either. Any process in the supervisor's filesystem view that can open the socket can reach sshd — same trust model as any local Unix socket with `0600` permissions. See `crates/openshell-sandbox/src/ssh.rs:55-83`.
+- **Supersede race is closed.** A supervisor reconnect registers a new `session_id` for the same sandbox id. Cleanup on the old session's task uses `remove_if_current(sandbox_id, session_id)` so a late-finishing old task cannot evict the new registration or serve relays meant for the new instance. See `SupervisorSessionRegistry::remove_if_current` in `crates/openshell-server/src/supervisor_session.rs`.
+- **Pending-relay reaper.** A background task sweeps `pending_relays` entries older than 10 s (`RELAY_PENDING_TIMEOUT`). If the supervisor acknowledges `RelayOpen` but never initiates `RelayStream` — crash, deadlock, or adversarial stall — the gateway-side slot does not pin indefinitely.
+- **Client-side keepalives.** The CLI's `ssh` invocation sets `ServerAliveInterval=15` / `ServerAliveCountMax=3` (`crates/openshell-cli/src/ssh.rs:150`), so a silently-dropped relay (gateway restart, supervisor restart, or adversarial TCP drop) surfaces to the user within roughly 45 s rather than hanging.
+
+Observability (sandbox side, OCSF): `session_established`, `session_closed`, `session_failed`, `relay_open`, `relay_closed`, `relay_failed`, `relay_close_from_gateway` — all emitted as `NetworkActivity` events. Gateway-side OCSF emission for the same lifecycle is a tracked follow-up.
 
 ## Port Configuration
 
@@ -325,8 +333,8 @@ graph LR
     CLI -- "mTLS<br/>(cluster CA)" --> TLS
     SDK -- "mTLS<br/>(cluster CA)" --> TLS
     TLS --> API
-    SBX -- "mTLS<br/>(cluster CA)" --> TLS
-    API -- "SSH + NSSH1<br/>handshake" --> SBX
+    SBX -- "mTLS + ConnectSupervisor<br/>(supervisor-initiated)" --> TLS
+    API -- "RelayStream<br/>(HTTP/2 on same mTLS conn)" --> SBX
     SBX -- "OPA policy +<br/>process identity" --> HOSTS
 ```
 
@@ -335,8 +343,9 @@ graph LR
 | Boundary | Mechanism |
 |---|---|
 | External → Gateway | mTLS with cluster CA by default, or trusted reverse-proxy/Cloudflare boundary in edge mode |
-| Sandbox → Gateway | mTLS with shared client cert |
-| Gateway → Sandbox (SSH) | Session token + HMAC-SHA256 handshake (NSSH1) |
+| Sandbox → Gateway | mTLS with shared client cert (supervisor-initiated `ConnectSupervisor` stream) |
+| Gateway → Sandbox (SSH/exec) | Rides the supervisor's mTLS `ConnectSupervisor` HTTP/2 connection as a `RelayStream` — no separate gateway-to-pod connection |
+| Supervisor → in-pod sshd | Unix-socket filesystem permissions (`/run/openshell/ssh.sock`, 0700 parent / 0600 socket) |
 | Sandbox → External (network) | OPA policy + process identity binding via `/proc` |
 
 ### What Is Not Authenticated (by Design)
@@ -387,8 +396,11 @@ This section defines the primary attacker profiles, what the current design prot
 |---|---|---|
 | MITM or passive interception of gateway traffic | Mandatory mTLS with cluster CA, or trusted reverse-proxy boundary in Cloudflare mode | Default mode is direct mTLS; reverse-proxy mode shifts the outer trust boundary upstream |
 | Unauthenticated API/health access | mTLS by default, or Cloudflare/reverse-proxy auth in edge mode | `/health*` are direct-mTLS only in the default deployment mode |
-| Forged SSH tunnel connection to sandbox | Session token validation + NSSH1 HMAC handshake | Requires token and shared handshake secret |
-| Direct access to sandbox SSH port from cluster peers | NSSH1 challenge-response | Connection denied without valid signature |
+| Forged SSH tunnel connection to sandbox | Session token validation at the gateway; only the supervisor's authenticated mTLS `ConnectSupervisor` stream can carry a `RelayStream` to its sandbox | Forging a relay requires stealing a valid mTLS client identity |
+| Direct access to sandbox sshd from cluster peers | sshd listens on a Unix socket (`0700` parent / `0600` socket) inside the pod | No network path exists to sshd from cluster peers |
+| Stale or reconnecting supervisor serves relays for a new instance | `session_id`-scoped `remove_if_current` on the registry | Old session cleanup cannot evict a newer registration |
+| Supervisor acknowledges `RelayOpen` but never initiates `RelayStream` | Gateway-side pending-relay reaper (10 s timeout) | Prevents indefinite resource pinning by a buggy or malicious supervisor |
+| Silent TCP drop of an in-flight relay | CLI `ServerAliveInterval=15` / `ServerAliveCountMax=3` | Client detects a dead relay within ~45 s instead of hanging |
 | Unauthorized outbound internet access from sandbox | OPA policy + process identity checks | Applies to sandbox egress policy layer |
 
 ### Residual Risks and Current Tradeoffs
@@ -414,7 +426,7 @@ This section defines the primary attacker profiles, what the current design prot
 - The cluster CA is generated and distributed without interception during bootstrap.
 - Kubernetes secret access is restricted to intended workloads and operators.
 - Gateway and sandbox container images are trusted and not tampered with.
-- System clocks are reasonably synchronized for timestamp-based SSH handshake checks.
+- The sandbox pod's filesystem is trusted: only the supervisor process (root) can open `/run/openshell/ssh.sock`, which is enforced by the `0700` parent directory and `0600` socket permissions set at sshd start.
 
 ## Sandbox Outbound TLS (L7 Inspection)
 
