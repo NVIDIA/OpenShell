@@ -237,6 +237,9 @@ from pathlib import Path
 import re
 
 line_rewrites = {
+    "python/openshell/_proto/inference_pb2.py": [
+        (r"^import datamodel_pb2 as datamodel__pb2$", "from . import datamodel_pb2 as datamodel__pb2"),
+    ],
     "python/openshell/_proto/inference_pb2_grpc.py": [
         (r"^import inference_pb2 as inference__pb2$", "from . import inference_pb2 as inference__pb2"),
     ],

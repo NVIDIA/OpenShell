@@ -15,7 +15,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
 use crate::ServerState;
-use crate::persistence::{ObjectId, ObjectName, ObjectType, Store};
+use crate::persistence::{ObjectType, Store};
 
 const HEADER_SANDBOX_ID: &str = "x-sandbox-id";
 const HEADER_TOKEN: &str = "x-sandbox-token";
@@ -238,18 +238,6 @@ impl ObjectType for SshSession {
     }
 }
 
-impl ObjectId for SshSession {
-    fn object_id(&self) -> &str {
-        &self.id
-    }
-}
-
-impl ObjectName for SshSession {
-    fn object_name(&self) -> &str {
-        &self.name
-    }
-}
-
 /// Decrement a connection count entry, removing it if it reaches zero.
 fn decrement_connection_count(
     counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
@@ -304,8 +292,12 @@ async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
             || session.revoked;
 
         if should_delete {
-            if let Err(e) = store.delete(SshSession::object_type(), &session.id).await {
-                warn!(session_id = %session.id, error = %e, "Failed to reap SSH session");
+            use openshell_core::ObjectId;
+            if let Err(e) = store
+                .delete(SshSession::object_type(), session.object_id())
+                .await
+            {
+                warn!(session_id = %session.object_id(), error = %e, "Failed to reap SSH session");
             } else {
                 reaped += 1;
             }
@@ -327,13 +319,16 @@ mod tests {
 
     fn make_session(id: &str, sandbox_id: &str, expires_at_ms: i64, revoked: bool) -> SshSession {
         SshSession {
-            id: id.to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: id.to_string(),
+                name: format!("session-{}", id),
+                created_at_ms: 1000,
+                labels: HashMap::new(),
+            }),
             sandbox_id: sandbox_id.to_string(),
             token: id.to_string(),
-            created_at_ms: 1000,
-            revoked,
-            name: format!("session-{id}"),
             expires_at_ms,
+            revoked,
         }
     }
 

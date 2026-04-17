@@ -20,6 +20,7 @@ use openshell_core::proto::{
     SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
     WatchSandboxRequest,
 };
+use openshell_core::{ObjectId, ObjectName};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
 };
@@ -105,8 +106,12 @@ impl TestOpenShell {
         providers.insert(
             name.to_string(),
             Provider {
-                id: format!("id-{name}"),
-                name: name.to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("id-{name}"),
+                    name: name.to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 r#type: provider_type.to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
@@ -201,13 +206,16 @@ impl OpenShell for TestOpenShell {
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
         let mut providers = self.state.providers.lock().await;
-        if providers.contains_key(&provider.name) {
+        let provider_name = provider.object_name().to_string();
+        if providers.contains_key(&provider_name) {
             return Err(Status::already_exists("provider already exists"));
         }
-        if provider.id.is_empty() {
-            provider.id = format!("id-{}", provider.name);
+        if provider.object_id().is_empty() {
+            if let Some(metadata) = &mut provider.metadata {
+                metadata.id = format!("id-{provider_name}");
+            }
         }
-        providers.insert(provider.name.clone(), provider.clone());
+        providers.insert(provider_name, provider.clone());
         Ok(Response::new(ProviderResponse {
             provider: Some(provider),
         }))
@@ -254,7 +262,7 @@ impl OpenShell for TestOpenShell {
 
         let mut providers = self.state.providers.lock().await;
         let existing = providers
-            .get(&provider.name)
+            .get(provider.object_name())
             .cloned()
             .ok_or_else(|| Status::not_found("provider not found"))?;
         // Merge semantics: empty map = no change, empty value = delete key.
@@ -273,14 +281,21 @@ impl OpenShell for TestOpenShell {
             }
             base
         };
+        let existing_metadata = existing.metadata.clone().unwrap_or_default();
+        let provider_metadata = provider.metadata.clone().unwrap_or_default();
         let updated = Provider {
-            id: existing.id,
-            name: provider.name,
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: existing_metadata.id,
+                name: provider_metadata.name.clone(),
+                created_at_ms: existing_metadata.created_at_ms,
+                labels: existing_metadata.labels,
+            }),
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
             config: merge(existing.config, provider.config),
         };
-        providers.insert(updated.name.clone(), updated.clone());
+        let updated_name = updated.object_name().to_string();
+        providers.insert(updated_name, updated.clone());
         Ok(Response::new(ProviderResponse {
             provider: Some(updated),
         }))

@@ -15,7 +15,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     ServerState,
-    persistence::{ObjectId, ObjectName, ObjectType, Store},
+    persistence::{ObjectName, ObjectType, Store, current_time_ms},
 };
 
 #[derive(Debug)]
@@ -48,18 +48,6 @@ fn effective_route_name(name: &str) -> Result<&str, Status> {
 impl ObjectType for InferenceRoute {
     fn object_type() -> &'static str {
         "inference_route"
-    }
-}
-
-impl ObjectId for InferenceRoute {
-    fn object_id(&self) -> &str {
-        &self.id
-    }
-}
-
-impl ObjectName for InferenceRoute {
-    fn object_name(&self) -> &str {
-        &self.name
     }
 }
 
@@ -172,7 +160,7 @@ async fn upsert_cluster_inference_route(
 
     let resolved = resolve_provider_route(&provider)?;
     let validation = if verify {
-        vec![verify_provider_endpoint(&provider.name, model_id, &resolved).await?]
+        vec![verify_provider_endpoint(provider.object_name(), model_id, &resolved).await?]
     } else {
         Vec::new()
     };
@@ -184,21 +172,30 @@ async fn upsert_cluster_inference_route(
         .await
         .map_err(|e| Status::internal(format!("fetch route failed: {e}")))?;
 
+    let now_ms =
+        current_time_ms().map_err(|e| Status::internal(format!("get current time: {e}")))?;
+
     let route = if let Some(existing) = existing {
         InferenceRoute {
-            id: existing.id,
-            name: existing.name,
+            metadata: existing.metadata.clone(),
             config: Some(config),
             version: existing.version.saturating_add(1),
         }
     } else {
         InferenceRoute {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: route_name.to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: route_name.to_string(),
+                created_at_ms: now_ms,
+                labels: std::collections::HashMap::new(),
+            }),
             config: Some(config),
             version: 1,
         }
     };
+
+    // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
+    crate::grpc::validate_object_metadata(route.metadata.as_ref(), "inference_route")?;
 
     store
         .put_message(&route)
@@ -214,7 +211,7 @@ fn build_cluster_inference_config(
     timeout_secs: u64,
 ) -> ClusterInferenceConfig {
     ClusterInferenceConfig {
-        provider_name: provider.name.clone(),
+        provider_name: provider.object_name().to_string(),
         model_id: model_id.to_string(),
         timeout_secs,
     }
@@ -238,7 +235,7 @@ fn resolve_provider_route(provider: &Provider) -> Result<ResolvedProviderRoute, 
         Status::invalid_argument(format!(
             "provider '{name}' has unsupported type '{provider_type}' for cluster inference \
                  (supported: openai, anthropic, nvidia)",
-            name = provider.name
+            name = provider.object_name()
         ))
     })?;
 
@@ -246,7 +243,7 @@ fn resolve_provider_route(provider: &Provider) -> Result<ResolvedProviderRoute, 
         find_provider_api_key(provider, profile.credential_key_names).ok_or_else(|| {
             Status::invalid_argument(format!(
                 "provider '{name}' has no usable API key credential",
-                name = provider.name
+                name = provider.object_name()
             ))
         })?;
 
@@ -258,14 +255,14 @@ fn resolve_provider_route(provider: &Provider) -> Result<ResolvedProviderRoute, 
     if base_url.is_empty() {
         return Err(Status::invalid_argument(format!(
             "provider '{name}' resolved to empty base_url",
-            name = provider.name
+            name = provider.object_name()
         )));
     }
 
     Ok(ResolvedProviderRoute {
         provider_type,
         route: RouterResolvedRoute {
-            name: provider.name.clone(),
+            name: provider.object_name().to_string(),
             endpoint: base_url,
             model: String::new(),
             api_key,
@@ -477,26 +474,35 @@ async fn resolve_route_by_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::ObjectId;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_route(name: &str, provider_name: &str, model_id: &str) -> InferenceRoute {
         InferenceRoute {
-            id: format!("id-{name}"),
-            name: name.to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("id-{name}"),
+                name: name.to_string(),
+                created_at_ms: 1000000,
+                labels: std::collections::HashMap::new(),
+            }),
             config: Some(ClusterInferenceConfig {
                 provider_name: provider_name.to_string(),
                 model_id: model_id.to_string(),
                 timeout_secs: 0,
             }),
-            version: 1,
+            version: 0,
         }
     }
 
     fn make_provider(name: &str, provider_type: &str, key_name: &str, key_value: &str) -> Provider {
         Provider {
-            id: format!("provider-{name}"),
-            name: name.to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("provider-{name}"),
+                name: name.to_string(),
+                created_at_ms: 1000000,
+                labels: std::collections::HashMap::new(),
+            }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once((key_name.to_string(), key_value.to_string())).collect(),
             config: std::collections::HashMap::new(),
@@ -539,8 +545,7 @@ mod tests {
         )
         .await
         .expect("first set should succeed");
-        assert_eq!(first.route.name, CLUSTER_INFERENCE_ROUTE_NAME);
-        assert_eq!(first.route.version, 1);
+        assert_eq!(first.route.object_name(), CLUSTER_INFERENCE_ROUTE_NAME);
 
         let second = upsert_cluster_inference_route(
             &store,
@@ -552,8 +557,7 @@ mod tests {
         )
         .await
         .expect("second set should succeed");
-        assert_eq!(second.route.version, 2);
-        assert_eq!(second.route.id, first.route.id);
+        assert_eq!(second.route.object_id(), first.route.object_id());
 
         let config = second.route.config.as_ref().expect("config");
         assert_eq!(config.provider_name, "openai-dev");
@@ -652,8 +656,12 @@ mod tests {
             .expect("store should connect");
 
         let provider = Provider {
-            id: "provider-1".to_string(),
-            name: "openai-dev".to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "provider-1".to_string(),
+                name: "openai-dev".to_string(),
+                created_at_ms: 1000000,
+                labels: std::collections::HashMap::new(),
+            }),
             r#type: "openai".to_string(),
             credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-test".to_string()))
                 .collect(),
@@ -669,14 +677,18 @@ mod tests {
             .expect("provider should persist");
 
         let route = InferenceRoute {
-            id: "r-1".to_string(),
-            name: CLUSTER_INFERENCE_ROUTE_NAME.to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "r-1".to_string(),
+                name: CLUSTER_INFERENCE_ROUTE_NAME.to_string(),
+                created_at_ms: 1000000,
+                labels: std::collections::HashMap::new(),
+            }),
             config: Some(ClusterInferenceConfig {
                 provider_name: "openai-dev".to_string(),
                 model_id: "test/model".to_string(),
                 timeout_secs: 0,
             }),
-            version: 7,
+            version: 1,
         };
         store
             .put_message(&route)
@@ -727,12 +739,11 @@ mod tests {
         assert_eq!(first.api_key, "sk-initial");
 
         let rotated_provider = Provider {
-            id: provider.id,
-            name: provider.name,
-            r#type: provider.r#type,
+            metadata: provider.metadata.clone(),
+            r#type: provider.r#type.clone(),
             credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-rotated".to_string()))
                 .collect(),
-            config: provider.config,
+            config: provider.config.clone(),
         };
         store
             .put_message(&rotated_provider)
@@ -766,8 +777,7 @@ mod tests {
         .await
         .expect("should succeed");
 
-        assert_eq!(route.route.name, SANDBOX_SYSTEM_ROUTE_NAME);
-        assert_eq!(route.route.version, 1);
+        assert_eq!(route.route.object_name(), SANDBOX_SYSTEM_ROUTE_NAME);
         let config = route.route.config.as_ref().expect("config");
         assert_eq!(config.provider_name, "anthropic-dev");
         assert_eq!(config.model_id, "claude-sonnet-4-20250514");
@@ -859,7 +869,7 @@ mod tests {
             .expect("fetch should succeed")
             .expect("route should exist");
 
-        assert_eq!(route.name, SANDBOX_SYSTEM_ROUTE_NAME);
+        assert_eq!(route.object_name(), SANDBOX_SYSTEM_ROUTE_NAME);
         let config = route.config.as_ref().expect("config");
         assert_eq!(config.model_id, "gpt-4o-mini");
     }

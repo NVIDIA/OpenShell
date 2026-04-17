@@ -17,6 +17,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use miette::{IntoDiagnostic, Result};
+use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName};
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -193,7 +194,7 @@ pub async fn run(
                         "-".to_string()
                     };
                     app.provider_detail = Some(app::ProviderDetailView {
-                        name: provider.name.clone(),
+                        name: provider.object_name().to_string(),
                         provider_type: provider.r#type.clone(),
                         credential_key: cred_key,
                         masked_value: masked,
@@ -718,11 +719,8 @@ async fn fetch_sandbox_detail(app: &mut App) {
                     if let Some(spec) = &sandbox.spec {
                         app.sandbox_providers_list = spec.providers.clone();
                     }
-                    if sandbox.id.is_empty() {
-                        None
-                    } else {
-                        Some(sandbox.id)
-                    }
+                    let id = sandbox.object_id().to_string();
+                    if id.is_empty() { None } else { Some(id) }
                 } else {
                     None
                 }
@@ -799,7 +797,7 @@ async fn handle_shell_connect(
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
             Ok(Ok(resp)) => match resp.into_inner().sandbox {
-                Some(s) => s.id,
+                Some(s) => s.object_id().to_string(),
                 None => {
                     app.status_text = "sandbox not found".to_string();
                     return;
@@ -948,7 +946,7 @@ async fn handle_exec_command(
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
             Ok(Ok(resp)) => match resp.into_inner().sandbox {
-                Some(s) => s.id,
+                Some(s) => s.object_id().to_string(),
                 None => {
                     app.status_text = format!("exec: sandbox {sandbox_name} not found");
                     return;
@@ -1313,14 +1311,22 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                 policy,
                 ..Default::default()
             }),
+            labels: std::collections::HashMap::new(),
         };
 
         let sandbox_name =
             match tokio::time::timeout(Duration::from_secs(30), client.create_sandbox(req)).await {
-                Ok(Ok(resp)) => resp
-                    .into_inner()
-                    .sandbox
-                    .map_or_else(|| "unknown".to_string(), |s| s.name),
+                Ok(Ok(resp)) => resp.into_inner().sandbox.map_or_else(
+                    || "unknown".to_string(),
+                    |s| {
+                        let name = s.object_name().to_string();
+                        if name.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            name
+                        }
+                    },
+                ),
                 Ok(Err(e)) => {
                     let _ = tx.send(Event::CreateResult(Err(e.message().to_string())));
                     return;
@@ -1351,7 +1357,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                     Ok(resp) => {
                         if let Some(sandbox) = resp.into_inner().sandbox {
                             if sandbox.phase == 2 {
-                                break sandbox.id;
+                                break sandbox.object_id().to_string();
                             }
                             if sandbox.phase == 3 {
                                 let _ = tx.send(Event::CreateResult(Err(
@@ -1558,8 +1564,12 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
             let req = openshell_core::proto::CreateProviderRequest {
                 provider: Some(openshell_core::proto::Provider {
-                    id: String::new(),
-                    name: provider_name.clone(),
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: String::new(),
+                        name: provider_name.clone(),
+                        created_at_ms: 0,
+                        labels: std::collections::HashMap::new(),
+                    }),
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
                     config: Default::default(),
@@ -1568,7 +1578,14 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
             match client.create_provider(req).await {
                 Ok(resp) => {
-                    let final_name = resp.into_inner().provider.map_or(provider_name, |p| p.name);
+                    let final_name = resp.into_inner().provider.map_or(provider_name, |p| {
+                        let name = p.object_name().to_string();
+                        if name.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            name
+                        }
+                    });
                     let _ = tx.send(Event::ProviderCreateResult(Ok(final_name)));
                     return;
                 }
@@ -1637,8 +1654,12 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = openshell_core::proto::UpdateProviderRequest {
             provider: Some(openshell_core::proto::Provider {
-                id: String::new(),
-                name: name.clone(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: name.clone(),
+                    created_at_ms: 0,
+                    labels: std::collections::HashMap::new(),
+                }),
                 r#type: ptype,
                 credentials,
                 config: Default::default(),
@@ -1865,7 +1886,10 @@ async fn refresh_providers(app: &mut App) {
         Ok(Ok(resp)) => {
             let providers = resp.into_inner().providers;
             app.provider_count = providers.len();
-            app.provider_names = providers.iter().map(|p| p.name.clone()).collect();
+            app.provider_names = providers
+                .iter()
+                .map(|p| p.object_name().to_string())
+                .collect();
             app.provider_types = providers.iter().map(|p| p.r#type.clone()).collect();
             app.provider_cred_keys = providers
                 .iter()
@@ -2162,6 +2186,7 @@ async fn refresh_sandboxes(app: &mut App) {
     let req = openshell_core::proto::ListSandboxesRequest {
         limit: 100,
         offset: 0,
+        label_selector: String::new(),
     };
     let result = tokio::time::timeout(Duration::from_secs(5), app.client.list_sandboxes(req)).await;
     match result {
@@ -2174,8 +2199,14 @@ async fn refresh_sandboxes(app: &mut App) {
         Ok(Ok(resp)) => {
             let sandboxes = resp.into_inner().sandboxes;
             app.sandbox_count = sandboxes.len();
-            app.sandbox_ids = sandboxes.iter().map(|s| s.id.clone()).collect();
-            app.sandbox_names = sandboxes.iter().map(|s| s.name.clone()).collect();
+            app.sandbox_ids = sandboxes
+                .iter()
+                .map(|s| s.object_id().to_string())
+                .collect();
+            app.sandbox_names = sandboxes
+                .iter()
+                .map(|s| s.object_name().to_string())
+                .collect();
             app.sandbox_phases = sandboxes.iter().map(|s| phase_label(s.phase)).collect();
             app.sandbox_images = sandboxes
                 .iter()
@@ -2191,11 +2222,21 @@ async fn refresh_sandboxes(app: &mut App) {
                 .collect();
             app.sandbox_ages = sandboxes
                 .iter()
-                .map(|s| format_age(s.created_at_ms))
+                .map(|s| {
+                    s.metadata
+                        .as_ref()
+                        .map(|m| format_age(m.created_at_ms))
+                        .unwrap_or_else(|| "?".to_string())
+                })
                 .collect();
             app.sandbox_created = sandboxes
                 .iter()
-                .map(|s| format_timestamp(s.created_at_ms))
+                .map(|s| {
+                    s.metadata
+                        .as_ref()
+                        .map(|m| format_timestamp(m.created_at_ms))
+                        .unwrap_or_else(|| "?".to_string())
+                })
                 .collect();
 
             app.sandbox_policy_versions =
@@ -2205,7 +2246,21 @@ async fn refresh_sandboxes(app: &mut App) {
             let forwards = openshell_core::forward::list_forwards().unwrap_or_default();
             app.sandbox_notes = sandboxes
                 .iter()
-                .map(|s| openshell_core::forward::build_sandbox_notes(&s.name, &forwards))
+                .map(|s| {
+                    let name = s.object_name();
+                    openshell_core::forward::build_sandbox_notes(name, &forwards)
+                })
+                .collect();
+
+            // Build LABELS column from metadata.
+            app.sandbox_labels = sandboxes
+                .iter()
+                .map(|s| {
+                    s.object_labels()
+                        .as_ref()
+                        .map(|labels| app::format_labels(labels))
+                        .unwrap_or_default()
+                })
                 .collect();
 
             if app.sandbox_selected >= app.sandbox_count && app.sandbox_count > 0 {

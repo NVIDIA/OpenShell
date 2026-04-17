@@ -241,10 +241,14 @@ pub(super) fn validate_string_map(
 
 /// Validate field sizes on a `Provider` before persisting.
 pub(super) fn validate_provider_fields(provider: &Provider) -> Result<(), Status> {
-    if provider.name.len() > MAX_NAME_LEN {
+    let name_len = provider
+        .metadata
+        .as_ref()
+        .map(|m| m.name.len())
+        .unwrap_or(0);
+    if name_len > MAX_NAME_LEN {
         return Err(Status::invalid_argument(format!(
-            "provider.name exceeds maximum length ({} > {MAX_NAME_LEN})",
-            provider.name.len()
+            "provider.name exceeds maximum length ({name_len} > {MAX_NAME_LEN})"
         )));
     }
     if provider.r#type.len() > MAX_PROVIDER_TYPE_LEN {
@@ -267,6 +271,252 @@ pub(super) fn validate_provider_fields(provider: &Provider) -> Result<(), Status
         MAX_MAP_VALUE_LEN,
         "provider.config",
     )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Label selector validation
+// ---------------------------------------------------------------------------
+
+/// Validate a label selector string format.
+///
+/// Format: "key1=value1,key2=value2"
+/// Returns `INVALID_ARGUMENT` if the selector has invalid format.
+/// Validate a label key according to Kubernetes requirements.
+///
+/// Label keys have an optional prefix and required name, separated by `/`:
+/// - Prefix (optional): DNS subdomain format, max 253 chars
+/// - Name (required): alphanumeric + `-._`, max 63 chars, must start/end with alphanumeric
+/// - Total length including `/` must not exceed 253 chars
+///
+/// Examples: `app`, `kubernetes.io/app`, `example.com/my-label`
+///
+/// See: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
+pub(super) fn validate_label_key(key: &str) -> Result<(), Status> {
+    if key.is_empty() {
+        return Err(Status::invalid_argument("label key cannot be empty"));
+    }
+
+    if key.len() > 253 {
+        return Err(Status::invalid_argument(format!(
+            "label key exceeds 253 characters: '{key}'"
+        )));
+    }
+
+    // Split into optional prefix and required name
+    let (prefix, name) = if let Some((p, n)) = key.split_once('/') {
+        (Some(p), n)
+    } else {
+        (None, key)
+    };
+
+    // Validate name segment (required, max 63 chars)
+    if name.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "label key name segment cannot be empty: '{key}'"
+        )));
+    }
+
+    if name.len() > 63 {
+        return Err(Status::invalid_argument(format!(
+            "label key name segment exceeds 63 characters: '{key}'"
+        )));
+    }
+
+    // Name must contain only alphanumeric, hyphens, underscores, and dots
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(Status::invalid_argument(format!(
+            "label key name segment contains invalid characters (must be alphanumeric, '-', '_', or '.'): '{key}'"
+        )));
+    }
+
+    // Name must start and end with alphanumeric
+    let first = name.chars().next().unwrap(); // safe: we checked !is_empty()
+    let last = name.chars().last().unwrap();
+    if !first.is_alphanumeric() {
+        return Err(Status::invalid_argument(format!(
+            "label key name segment must start with alphanumeric character: '{key}'"
+        )));
+    }
+    if !last.is_alphanumeric() {
+        return Err(Status::invalid_argument(format!(
+            "label key name segment must end with alphanumeric character: '{key}'"
+        )));
+    }
+
+    // Validate prefix if present (DNS subdomain format)
+    if let Some(prefix) = prefix {
+        if prefix.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "label key prefix cannot be empty when '/' is present: '{key}'"
+            )));
+        }
+
+        if prefix.len() > 253 {
+            return Err(Status::invalid_argument(format!(
+                "label key prefix exceeds 253 characters: '{key}'"
+            )));
+        }
+
+        // DNS subdomain: lowercase alphanumeric, hyphens, and dots only
+        if !prefix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+        {
+            return Err(Status::invalid_argument(format!(
+                "label key prefix must be a DNS subdomain (lowercase alphanumeric, '-', '.'): '{key}'"
+            )));
+        }
+
+        // Must not start or end with hyphen or dot
+        if prefix.starts_with('-')
+            || prefix.starts_with('.')
+            || prefix.ends_with('-')
+            || prefix.ends_with('.')
+        {
+            return Err(Status::invalid_argument(format!(
+                "label key prefix cannot start or end with '-' or '.': '{key}'"
+            )));
+        }
+
+        // Must not contain consecutive dots
+        if prefix.contains("..") {
+            return Err(Status::invalid_argument(format!(
+                "label key prefix cannot contain consecutive dots: '{key}'"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate a label value according to Kubernetes requirements.
+///
+/// Label values:
+/// - Can be empty (Kubernetes allows empty values)
+/// - Max 63 characters
+/// - If non-empty, must contain only alphanumeric, hyphens, underscores, and dots
+/// - If non-empty, must start and end with alphanumeric character
+///
+/// See: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
+pub(super) fn validate_label_value(value: &str) -> Result<(), Status> {
+    // Empty values are allowed in Kubernetes
+    if value.is_empty() {
+        return Ok(());
+    }
+
+    if value.len() > 63 {
+        return Err(Status::invalid_argument(format!(
+            "label value exceeds 63 characters: '{value}'"
+        )));
+    }
+
+    // Must contain only alphanumeric, hyphens, underscores, and dots
+    if !value
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(Status::invalid_argument(format!(
+            "label value contains invalid characters (must be alphanumeric, '-', '_', or '.'): '{value}'"
+        )));
+    }
+
+    // Must start and end with alphanumeric
+    let first = value.chars().next().unwrap(); // safe: we checked !is_empty()
+    let last = value.chars().last().unwrap();
+    if !first.is_alphanumeric() {
+        return Err(Status::invalid_argument(format!(
+            "label value must start with alphanumeric character: '{value}'"
+        )));
+    }
+    if !last.is_alphanumeric() {
+        return Err(Status::invalid_argument(format!(
+            "label value must end with alphanumeric character: '{value}'"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validate a label selector string format.
+///
+/// Format: "key1=value1,key2=value2"
+/// Each key and value is validated using `validate_label_key` and `validate_label_value`.
+/// Empty selectors are allowed. Trailing commas are ignored.
+pub(super) fn validate_label_selector(selector: &str) -> Result<(), Status> {
+    if selector.trim().is_empty() {
+        return Ok(());
+    }
+
+    for pair in selector.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = pair.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            return Err(Status::invalid_argument(format!(
+                "invalid label selector: expected 'key=value', got '{pair}'"
+            )));
+        }
+
+        let key = parts[0].trim();
+        let value = parts[1].trim();
+
+        if key.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "invalid label selector: key cannot be empty in '{pair}'"
+            )));
+        }
+
+        // Validate key and value using the Kubernetes-compliant validators
+        validate_label_key(key)?;
+        validate_label_value(value)?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Object metadata validation
+// ---------------------------------------------------------------------------
+
+/// Validate that object metadata is present and contains required fields.
+///
+/// This ensures that all resources have valid metadata with non-empty ID and name,
+/// preventing issues where missing metadata could lead to security vulnerabilities
+/// (e.g., empty string IDs/names matching unintended resources).
+///
+/// Returns `INVALID_ARGUMENT` if metadata is missing or invalid.
+pub(super) fn validate_object_metadata(
+    metadata: Option<&openshell_core::proto::datamodel::v1::ObjectMeta>,
+    resource_type: &str,
+) -> Result<(), Status> {
+    let metadata = metadata
+        .ok_or_else(|| Status::invalid_argument(format!("{resource_type} metadata is required")))?;
+
+    if metadata.id.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{resource_type} metadata.id cannot be empty"
+        )));
+    }
+
+    if metadata.name.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{resource_type} metadata.name cannot be empty"
+        )));
+    }
+
+    // Validate all labels in metadata
+    for (key, value) in &metadata.labels {
+        validate_label_key(key)?;
+        validate_label_value(value)?;
+    }
+
     Ok(())
 }
 
@@ -617,28 +867,44 @@ mod tests {
         std::iter::once(("KEY".to_string(), "val".to_string())).collect()
     }
 
+    fn make_test_provider(
+        name: &str,
+        provider_type: &str,
+        credentials: HashMap<String, String>,
+        config: HashMap<String, String>,
+    ) -> Provider {
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: name.to_string(),
+                created_at_ms: 1000000,
+                labels: HashMap::new(),
+            }),
+            r#type: provider_type.to_string(),
+            credentials,
+            config,
+        }
+    }
+
     #[test]
     fn validate_provider_fields_accepts_valid() {
-        let provider = Provider {
-            id: String::new(),
-            name: "my-provider".to_string(),
-            r#type: "claude".to_string(),
-            credentials: one_credential(),
-            config: std::iter::once(("endpoint".to_string(), "https://example.com".to_string()))
-                .collect(),
-        };
+        let provider = make_test_provider(
+            "my-provider",
+            "claude",
+            one_credential(),
+            std::iter::once(("endpoint".to_string(), "https://example.com".to_string())).collect(),
+        );
         assert!(validate_provider_fields(&provider).is_ok());
     }
 
     #[test]
     fn validate_provider_fields_rejects_over_limit_name() {
-        let provider = Provider {
-            id: String::new(),
-            name: "a".repeat(MAX_NAME_LEN + 1),
-            r#type: "claude".to_string(),
-            credentials: one_credential(),
-            config: HashMap::new(),
-        };
+        let provider = make_test_provider(
+            &"a".repeat(MAX_NAME_LEN + 1),
+            "claude",
+            one_credential(),
+            HashMap::new(),
+        );
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("provider.name"));
@@ -646,13 +912,12 @@ mod tests {
 
     #[test]
     fn validate_provider_fields_rejects_over_limit_type() {
-        let provider = Provider {
-            id: String::new(),
-            name: "ok".to_string(),
-            r#type: "x".repeat(MAX_PROVIDER_TYPE_LEN + 1),
-            credentials: one_credential(),
-            config: HashMap::new(),
-        };
+        let provider = make_test_provider(
+            "ok",
+            &"x".repeat(MAX_PROVIDER_TYPE_LEN + 1),
+            one_credential(),
+            HashMap::new(),
+        );
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("provider.type"));
@@ -663,13 +928,7 @@ mod tests {
         let creds: HashMap<String, String> = (0..=MAX_PROVIDER_CREDENTIALS_ENTRIES)
             .map(|i| (format!("K{i}"), "v".to_string()))
             .collect();
-        let provider = Provider {
-            id: String::new(),
-            name: "ok".to_string(),
-            r#type: "claude".to_string(),
-            credentials: creds,
-            config: HashMap::new(),
-        };
+        let provider = make_test_provider("ok", "claude", creds, HashMap::new());
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("provider.credentials"));
@@ -680,13 +939,7 @@ mod tests {
         let config: HashMap<String, String> = (0..=MAX_PROVIDER_CONFIG_ENTRIES)
             .map(|i| (format!("K{i}"), "v".to_string()))
             .collect();
-        let provider = Provider {
-            id: String::new(),
-            name: "ok".to_string(),
-            r#type: "claude".to_string(),
-            credentials: one_credential(),
-            config,
-        };
+        let provider = make_test_provider("ok", "claude", one_credential(), config);
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("provider.config"));
@@ -694,13 +947,12 @@ mod tests {
 
     #[test]
     fn validate_provider_fields_at_limit_name_accepted() {
-        let provider = Provider {
-            id: String::new(),
-            name: "a".repeat(MAX_NAME_LEN),
-            r#type: "claude".to_string(),
-            credentials: one_credential(),
-            config: HashMap::new(),
-        };
+        let provider = make_test_provider(
+            &"a".repeat(MAX_NAME_LEN),
+            "claude",
+            one_credential(),
+            HashMap::new(),
+        );
         assert!(validate_provider_fields(&provider).is_ok());
     }
 
@@ -708,13 +960,7 @@ mod tests {
     fn validate_provider_fields_rejects_oversized_credential_key() {
         let mut creds = HashMap::new();
         creds.insert("k".repeat(MAX_MAP_KEY_LEN + 1), "v".to_string());
-        let provider = Provider {
-            id: String::new(),
-            name: "ok".to_string(),
-            r#type: "claude".to_string(),
-            credentials: creds,
-            config: HashMap::new(),
-        };
+        let provider = make_test_provider("ok", "claude", creds, HashMap::new());
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("key"));
@@ -724,16 +970,298 @@ mod tests {
     fn validate_provider_fields_rejects_oversized_config_value() {
         let mut config = HashMap::new();
         config.insert("k".to_string(), "v".repeat(MAX_MAP_VALUE_LEN + 1));
-        let provider = Provider {
-            id: String::new(),
-            name: "ok".to_string(),
-            r#type: "claude".to_string(),
-            credentials: one_credential(),
-            config,
-        };
+        let provider = make_test_provider("ok", "claude", one_credential(), config);
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("value"));
+    }
+
+    // ---- Label selector validation ----
+
+    // ---- Label key validation ----
+
+    #[test]
+    fn validate_label_key_accepts_simple_names() {
+        assert!(validate_label_key("app").is_ok());
+        assert!(validate_label_key("my-app").is_ok());
+        assert!(validate_label_key("my_app").is_ok());
+        assert!(validate_label_key("my.app").is_ok());
+        assert!(validate_label_key("app123").is_ok());
+        assert!(validate_label_key("a1-b2_c3.d4").is_ok());
+    }
+
+    #[test]
+    fn validate_label_key_accepts_prefixed_names() {
+        assert!(validate_label_key("kubernetes.io/app").is_ok());
+        assert!(validate_label_key("example.com/my-label").is_ok());
+        assert!(validate_label_key("sub.domain.example.com/name").is_ok());
+        assert!(validate_label_key("a.b/c").is_ok());
+    }
+
+    #[test]
+    fn validate_label_key_rejects_empty() {
+        let err = validate_label_key("").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn validate_label_key_rejects_name_starting_with_hyphen() {
+        let err = validate_label_key("-app").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must start with alphanumeric"));
+    }
+
+    #[test]
+    fn validate_label_key_rejects_name_ending_with_hyphen() {
+        let err = validate_label_key("app-").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must end with alphanumeric"));
+    }
+
+    #[test]
+    fn validate_label_key_rejects_name_starting_with_underscore() {
+        let err = validate_label_key("_app").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must start with alphanumeric"));
+    }
+
+    #[test]
+    fn validate_label_key_rejects_name_starting_with_dot() {
+        let err = validate_label_key(".app").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must start with alphanumeric"));
+    }
+
+    #[test]
+    fn validate_label_key_rejects_name_too_long() {
+        let long_name = "a".repeat(64);
+        let err = validate_label_key(&long_name).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("exceeds 63 characters"));
+    }
+
+    #[test]
+    fn validate_label_key_accepts_name_at_max_length() {
+        let max_name = format!("a{}z", "b".repeat(61));
+        assert!(validate_label_key(&max_name).is_ok());
+    }
+
+    #[test]
+    fn validate_label_key_rejects_total_length_too_long() {
+        let long_key = format!("{}/app", "a".repeat(250));
+        let err = validate_label_key(&long_key).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("exceeds 253 characters"));
+    }
+
+    #[test]
+    fn validate_label_key_rejects_empty_prefix() {
+        let err = validate_label_key("/app").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("prefix cannot be empty"));
+    }
+
+    #[test]
+    fn validate_label_key_rejects_empty_name_after_prefix() {
+        let err = validate_label_key("kubernetes.io/").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("name segment cannot be empty"));
+    }
+
+    #[test]
+    fn validate_label_key_rejects_prefix_with_uppercase() {
+        let err = validate_label_key("Example.com/app").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must be a DNS subdomain"));
+    }
+
+    #[test]
+    fn validate_label_key_rejects_prefix_starting_with_hyphen() {
+        let err = validate_label_key("-example.com/app").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message()
+                .contains("cannot start or end with '-' or '.'")
+        );
+    }
+
+    #[test]
+    fn validate_label_key_rejects_prefix_ending_with_dot() {
+        let err = validate_label_key("example.com./app").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message()
+                .contains("cannot start or end with '-' or '.'")
+        );
+    }
+
+    #[test]
+    fn validate_label_key_rejects_prefix_with_consecutive_dots() {
+        let err = validate_label_key("example..com/app").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("cannot contain consecutive dots"));
+    }
+
+    #[test]
+    fn validate_label_key_rejects_invalid_characters() {
+        let err = validate_label_key("app@name").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("invalid characters"));
+    }
+
+    // ---- Label value validation ----
+
+    #[test]
+    fn validate_label_value_accepts_empty() {
+        // Kubernetes allows empty label values
+        assert!(validate_label_value("").is_ok());
+    }
+
+    #[test]
+    fn validate_label_value_accepts_valid_values() {
+        assert!(validate_label_value("prod").is_ok());
+        assert!(validate_label_value("my-value").is_ok());
+        assert!(validate_label_value("my_value").is_ok());
+        assert!(validate_label_value("my.value").is_ok());
+        assert!(validate_label_value("value123").is_ok());
+        assert!(validate_label_value("v1-2_3.4").is_ok());
+    }
+
+    #[test]
+    fn validate_label_value_accepts_max_length() {
+        let max_value = format!("a{}z", "b".repeat(61));
+        assert!(validate_label_value(&max_value).is_ok());
+    }
+
+    #[test]
+    fn validate_label_value_rejects_too_long() {
+        let long_value = "a".repeat(64);
+        let err = validate_label_value(&long_value).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("exceeds 63 characters"));
+    }
+
+    #[test]
+    fn validate_label_value_rejects_starting_with_hyphen() {
+        let err = validate_label_value("-value").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must start with alphanumeric"));
+    }
+
+    #[test]
+    fn validate_label_value_rejects_ending_with_hyphen() {
+        let err = validate_label_value("value-").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must end with alphanumeric"));
+    }
+
+    #[test]
+    fn validate_label_value_rejects_starting_with_underscore() {
+        let err = validate_label_value("_value").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must start with alphanumeric"));
+    }
+
+    #[test]
+    fn validate_label_value_rejects_starting_with_dot() {
+        let err = validate_label_value(".value").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must start with alphanumeric"));
+    }
+
+    #[test]
+    fn validate_label_value_rejects_invalid_characters() {
+        let err = validate_label_value("value@123").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("invalid characters"));
+    }
+
+    // ---- Label selector validation ----
+
+    #[test]
+    fn validate_label_selector_accepts_empty() {
+        assert!(validate_label_selector("").is_ok());
+        assert!(validate_label_selector("  ").is_ok());
+    }
+
+    #[test]
+    fn validate_label_selector_accepts_single_pair() {
+        assert!(validate_label_selector("env=prod").is_ok());
+        assert!(validate_label_selector("  env=prod  ").is_ok());
+    }
+
+    #[test]
+    fn validate_label_selector_accepts_multiple_pairs() {
+        assert!(validate_label_selector("env=prod,team=platform").is_ok());
+        assert!(validate_label_selector("env=prod, team=platform").is_ok());
+    }
+
+    #[test]
+    fn validate_label_selector_rejects_missing_equals() {
+        let err = validate_label_selector("env:prod").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("expected 'key=value'"));
+    }
+
+    #[test]
+    fn validate_label_selector_rejects_empty_key() {
+        let err = validate_label_selector("=prod").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("key cannot be empty"));
+    }
+
+    #[test]
+    fn validate_label_selector_accepts_empty_value() {
+        // Kubernetes allows empty label values
+        assert!(validate_label_selector("env=").is_ok());
+        assert!(validate_label_selector("app=,env=prod").is_ok());
+    }
+
+    #[test]
+    fn validate_label_selector_allows_trailing_comma() {
+        // Trailing commas are treated as empty pairs and ignored
+        assert!(validate_label_selector("env=prod,").is_ok());
+    }
+
+    #[test]
+    fn validate_label_selector_accepts_prefixed_keys() {
+        assert!(validate_label_selector("kubernetes.io/app=web").is_ok());
+        assert!(validate_label_selector("example.com/env=prod,team=platform").is_ok());
+    }
+
+    #[test]
+    fn validate_label_selector_rejects_invalid_key_format() {
+        // Key starting with hyphen
+        let err = validate_label_selector("-app=prod").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must start with alphanumeric"));
+    }
+
+    #[test]
+    fn validate_label_selector_rejects_invalid_value_format() {
+        // Value starting with hyphen
+        let err = validate_label_selector("env=-prod").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must start with alphanumeric"));
+    }
+
+    #[test]
+    fn validate_label_selector_rejects_oversized_key() {
+        let long_key = "a".repeat(64);
+        let selector = format!("{long_key}=value");
+        let err = validate_label_selector(&selector).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("exceeds 63 characters"));
+    }
+
+    #[test]
+    fn validate_label_selector_rejects_oversized_value() {
+        let long_value = "a".repeat(64);
+        let selector = format!("key={long_value}");
+        let err = validate_label_selector(&selector).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("exceeds 63 characters"));
     }
 
     // ---- Policy safety ----

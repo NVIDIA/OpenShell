@@ -317,13 +317,13 @@ impl ComputeRuntime {
     pub async fn create_sandbox(&self, sandbox: Sandbox) -> Result<Sandbox, Status> {
         let existing = self
             .store
-            .get_message_by_name::<Sandbox>(&sandbox.name)
+            .get_message_by_name::<Sandbox>(sandbox.object_name())
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
         if existing.is_some() {
             return Err(Status::already_exists(format!(
                 "sandbox '{}' already exists",
-                sandbox.name
+                sandbox.object_name()
             )));
         }
 
@@ -342,22 +342,31 @@ impl ComputeRuntime {
             .await
         {
             Ok(_) => {
-                self.sandbox_watch_bus.notify(&sandbox.id);
+                self.sandbox_watch_bus.notify(sandbox.object_id());
                 Ok(sandbox)
             }
             Err(status) if status.code() == Code::AlreadyExists => {
-                let _ = self.store.delete(Sandbox::object_type(), &sandbox.id).await;
-                self.sandbox_index.remove_sandbox(&sandbox.id);
+                let _ = self
+                    .store
+                    .delete(Sandbox::object_type(), sandbox.object_id())
+                    .await;
+                self.sandbox_index.remove_sandbox(sandbox.object_id());
                 Err(Status::already_exists("sandbox already exists"))
             }
             Err(status) if status.code() == Code::FailedPrecondition => {
-                let _ = self.store.delete(Sandbox::object_type(), &sandbox.id).await;
-                self.sandbox_index.remove_sandbox(&sandbox.id);
+                let _ = self
+                    .store
+                    .delete(Sandbox::object_type(), sandbox.object_id())
+                    .await;
+                self.sandbox_index.remove_sandbox(sandbox.object_id());
                 Err(Status::failed_precondition(status.message().to_string()))
             }
             Err(err) => {
-                let _ = self.store.delete(Sandbox::object_type(), &sandbox.id).await;
-                self.sandbox_index.remove_sandbox(&sandbox.id);
+                let _ = self
+                    .store
+                    .delete(Sandbox::object_type(), sandbox.object_id())
+                    .await;
+                self.sandbox_index.remove_sandbox(sandbox.object_id());
                 Err(Status::internal(format!(
                     "create sandbox failed: {}",
                     err.message()
@@ -377,7 +386,7 @@ impl ComputeRuntime {
             return Err(Status::not_found("sandbox not found"));
         };
 
-        let id = sandbox.id.clone();
+        let id = sandbox.object_id().to_string();
         sandbox.phase = SandboxPhase::Deleting as i32;
         self.store
             .put_message(&sandbox)
@@ -392,11 +401,11 @@ impl ComputeRuntime {
                     && session.sandbox_id == id
                     && let Err(e) = self
                         .store
-                        .delete(SshSession::object_type(), &session.id)
+                        .delete(SshSession::object_type(), session.object_id())
                         .await
                 {
                     warn!(
-                        session_id = %session.id,
+                        session_id = %session.object_id(),
                         error = %e,
                         "Failed to delete SSH session during sandbox cleanup"
                     );
@@ -529,7 +538,7 @@ impl ComputeRuntime {
                 }
             };
 
-            if backend_ids.contains(&sandbox.id) {
+            if backend_ids.contains(sandbox.object_id()) {
                 continue;
             }
 
@@ -598,19 +607,26 @@ impl ComputeRuntime {
 
         let session_connected = self.supervisor_sessions.has_session(&incoming.id);
         let mut phase = derive_phase(incoming.status.as_ref());
-        let mut sandbox = existing.unwrap_or_else(|| Sandbox {
-            id: incoming.id.clone(),
-            name: incoming.name.clone(),
-            namespace: incoming.namespace.clone(),
-            spec: None,
-            status: None,
-            phase: SandboxPhase::Unknown as i32,
-            ..Default::default()
+        let mut sandbox = existing.unwrap_or_else(|| {
+            use crate::persistence::current_time_ms;
+            let now_ms = current_time_ms().unwrap_or(0);
+            Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: incoming.id.clone(),
+                    name: incoming.name.clone(),
+                    created_at_ms: now_ms,
+                    labels: std::collections::HashMap::new(),
+                }),
+                spec: None,
+                status: None,
+                phase: SandboxPhase::Unknown as i32,
+                current_policy_version: 0,
+            }
         });
 
         if session_connected && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown)
         {
-            ensure_supervisor_ready_status(&mut status, &sandbox.name);
+            ensure_supervisor_ready_status(&mut status, sandbox.object_name());
             phase = SandboxPhase::Ready;
         }
 
@@ -644,8 +660,11 @@ impl ComputeRuntime {
             }
         }
 
-        sandbox.name = incoming.name;
-        sandbox.namespace = incoming.namespace;
+        // Update metadata fields
+        if let Some(metadata) = sandbox.metadata.as_mut() {
+            metadata.name = incoming.name;
+        }
+        // Note: namespace field removed from public Sandbox API - it remains internal to DriverSandbox
         sandbox.status = status;
         sandbox.phase = phase as i32;
 
@@ -658,7 +677,7 @@ impl ComputeRuntime {
             .put_message(&sandbox)
             .await
             .map_err(|e| e.to_string())?;
-        self.sandbox_watch_bus.notify(&sandbox.id);
+        self.sandbox_watch_bus.notify(sandbox.object_id());
         Ok(())
     }
 
@@ -692,11 +711,12 @@ impl ComputeRuntime {
             return Ok(());
         }
 
+        let sandbox_name = sandbox.object_name().to_string();
         if connected {
-            ensure_supervisor_ready_status(&mut sandbox.status, &sandbox.name);
+            ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
             sandbox.phase = SandboxPhase::Ready as i32;
         } else if current_phase == SandboxPhase::Ready {
-            ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox.name);
+            ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
             sandbox.phase = SandboxPhase::Provisioning as i32;
         } else {
             return Ok(());
@@ -790,19 +810,22 @@ impl ComputeRuntime {
             return Ok(());
         }
 
-        if let Some(current) = self.get_driver_sandbox(&sandbox.id, &sandbox.name).await? {
+        if let Some(current) = self
+            .get_driver_sandbox(sandbox.object_id(), sandbox.object_name())
+            .await?
+        {
             return self
                 .apply_sandbox_update_locked(current, Some(current_record))
                 .await;
         }
 
         info!(
-            sandbox_id = %sandbox.id,
-            sandbox_name = %sandbox.name,
+            sandbox_id = %sandbox.object_id(),
+            sandbox_name = %sandbox.object_name(),
             age_secs = age_ms / 1000,
             "Removing sandbox from store after it disappeared from the compute driver snapshot"
         );
-        self.apply_deleted_locked(&sandbox.id).await
+        self.apply_deleted_locked(sandbox.object_id()).await
     }
 
     async fn get_driver_sandbox(
@@ -827,9 +850,9 @@ impl ComputeRuntime {
 
 fn driver_sandbox_from_public(sandbox: &Sandbox) -> DriverSandbox {
     DriverSandbox {
-        id: sandbox.id.clone(),
-        name: sandbox.name.clone(),
-        namespace: sandbox.namespace.clone(),
+        id: sandbox.object_id().to_string(),
+        name: sandbox.object_name().to_string(),
+        namespace: String::new(), // Namespace is set by the driver based on its config
         spec: sandbox.spec.as_ref().map(driver_sandbox_spec_from_public),
         status: sandbox
             .status
@@ -1002,18 +1025,6 @@ fn driver_condition_from_public(condition: &SandboxCondition) -> DriverCondition
 impl ObjectType for Sandbox {
     fn object_type() -> &'static str {
         "sandbox"
-    }
-}
-
-impl ObjectId for Sandbox {
-    fn object_id(&self) -> &str {
-        &self.id
-    }
-}
-
-impl ObjectName for Sandbox {
-    fn object_name(&self) -> &str {
-        &self.name
     }
 }
 
@@ -1326,9 +1337,12 @@ mod tests {
 
     fn sandbox_record(id: &str, name: &str, phase: SandboxPhase) -> Sandbox {
         Sandbox {
-            id: id.to_string(),
-            name: name.to_string(),
-            namespace: "default".to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: id.to_string(),
+                name: name.to_string(),
+                created_at_ms: 1000000,
+                labels: std::collections::HashMap::new(),
+            }),
             phase: phase as i32,
             ..Default::default()
         }
@@ -1869,7 +1883,7 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime.sandbox_index.update_from_sandbox(&sandbox);
 
-        let mut watch_rx = runtime.sandbox_watch_bus.subscribe(&sandbox.id);
+        let mut watch_rx = runtime.sandbox_watch_bus.subscribe(sandbox.object_id());
 
         runtime
             .reconcile_store_with_backend(Duration::ZERO)
@@ -1879,7 +1893,7 @@ mod tests {
         assert!(
             runtime
                 .store
-                .get_message::<Sandbox>(&sandbox.id)
+                .get_message::<Sandbox>(sandbox.object_id())
                 .await
                 .unwrap()
                 .is_none()
@@ -1887,7 +1901,7 @@ mod tests {
         assert!(
             runtime
                 .sandbox_index
-                .sandbox_id_for_sandbox_name(&sandbox.name)
+                .sandbox_id_for_sandbox_name(sandbox.object_name())
                 .is_none()
         );
         let _ = watch_rx.try_recv();
