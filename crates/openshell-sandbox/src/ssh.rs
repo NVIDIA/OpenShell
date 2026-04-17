@@ -13,8 +13,7 @@ use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
 use openshell_ocsf::{
-    ActionId, ActivityId, AuthTypeId, ConfidenceId, DetectionFindingBuilder, DispositionId,
-    FindingInfo, SeverityId, SshActivityBuilder, StatusId, ocsf_emit,
+    ActionId, ActivityId, DispositionId, SeverityId, SshActivityBuilder, StatusId, ocsf_emit,
 };
 use rand_core::OsRng;
 use russh::keys::{Algorithm, PrivateKey};
@@ -22,33 +21,22 @@ use russh::server::{Auth, Handle, Session};
 use russh::{ChannelId, CryptoVec};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
+use tokio::net::UnixListener;
 use tracing::warn;
 
-const PREFACE_MAGIC: &str = "NSSH1";
-#[cfg(test)]
-const SSH_HANDSHAKE_SECRET_ENV: &str = "OPENSHELL_SSH_HANDSHAKE_SECRET";
-
-/// A time-bounded set of nonces used to detect replayed NSSH1 handshakes.
-/// Each entry records the `Instant` it was inserted; a background reaper task
-/// periodically evicts entries older than the handshake skew window.
-type NonceCache = Arc<Mutex<HashMap<String, Instant>>>;
-
 /// Perform SSH server initialization: generate a host key, build the config,
-/// and bind the TCP listener. Extracted so that startup errors can be forwarded
-/// through the readiness channel rather than being silently logged.
+/// and bind the Unix socket listener. Extracted so that startup errors can be
+/// forwarded through the readiness channel rather than being silently logged.
 async fn ssh_server_init(
-    listen_addr: SocketAddr,
+    listen_path: &Path,
     ca_file_paths: &Option<(PathBuf, PathBuf)>,
 ) -> Result<(
-    TcpListener,
+    UnixListener,
     Arc<russh::server::Config>,
     Option<Arc<(PathBuf, PathBuf)>>,
 )> {
@@ -63,14 +51,43 @@ async fn ssh_server_init(
 
     let config = Arc::new(config);
     let ca_paths = ca_file_paths.as_ref().map(|p| Arc::new(p.clone()));
-    let listener = TcpListener::bind(listen_addr).await.into_diagnostic()?;
+
+    // Ensure the parent directory exists and is root-owned with 0700
+    // permissions. The sandbox entrypoint runs as an unprivileged user; it
+    // must not be able to enter this directory and connect to the socket.
+    if let Some(parent) = listen_path.parent() {
+        std::fs::create_dir_all(parent).into_diagnostic()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            std::fs::set_permissions(parent, perms).into_diagnostic()?;
+        }
+    }
+
+    // Remove any stale socket from a previous run before binding.
+    if listen_path.exists() {
+        std::fs::remove_file(listen_path).into_diagnostic()?;
+    }
+    let listener = UnixListener::bind(listen_path).into_diagnostic()?;
+
+    // Tighten permissions so only the supervisor (root) can connect. The
+    // sandbox entrypoint runs as an unprivileged user and must not be able to
+    // dial the SSH daemon directly — all access goes through the relay from
+    // the gateway.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(listen_path, perms).into_diagnostic()?;
+    }
+
     ocsf_emit!(
         SshActivityBuilder::new(crate::ocsf_ctx())
             .activity(ActivityId::Listen)
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
-            .src_endpoint_addr(listen_addr.ip(), listen_addr.port())
-            .message(format!("SSH server listening on {listen_addr}"))
+            .message(format!("SSH server listening on {}", listen_path.display()))
             .build()
     );
 
@@ -79,18 +96,16 @@ async fn ssh_server_init(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_ssh_server(
-    listen_addr: SocketAddr,
+    listen_path: PathBuf,
     ready_tx: tokio::sync::oneshot::Sender<Result<()>>,
     policy: SandboxPolicy,
     workdir: Option<String>,
-    handshake_secret: String,
-    handshake_skew_secs: u64,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<(PathBuf, PathBuf)>,
     provider_env: HashMap<String, String>,
 ) -> Result<()> {
-    let (listener, config, ca_paths) = match ssh_server_init(listen_addr, &ca_file_paths).await {
+    let (listener, config, ca_paths) = match ssh_server_init(&listen_path, &ca_file_paths).await {
         Ok(v) => {
             // Signal that the SSH server has bound the socket and is ready to
             // accept connections. The parent task awaits this before spawning
@@ -105,49 +120,25 @@ pub async fn run_ssh_server(
         }
     };
 
-    // Nonce cache for replay detection. Entries are evicted by a background
-    // reaper once they exceed the handshake skew window.
-    let nonce_cache: NonceCache = Arc::new(Mutex::new(HashMap::new()));
-
-    // Background task that periodically purges expired nonces.
-    let reaper_cache = nonce_cache.clone();
-    let ttl = Duration::from_secs(handshake_skew_secs);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            if let Ok(mut cache) = reaper_cache.lock() {
-                cache.retain(|_, inserted| inserted.elapsed() < ttl);
-            }
-        }
-    });
-
     loop {
-        let (stream, peer) = listener.accept().await.into_diagnostic()?;
-        stream.set_nodelay(true).into_diagnostic()?;
+        let (stream, _peer) = listener.accept().await.into_diagnostic()?;
         let config = config.clone();
         let policy = policy.clone();
         let workdir = workdir.clone();
-        let secret = handshake_secret.clone();
         let proxy_url = proxy_url.clone();
         let ca_paths = ca_paths.clone();
         let provider_env = provider_env.clone();
-        let nonce_cache = nonce_cache.clone();
 
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
                 stream,
-                peer,
                 config,
                 policy,
                 workdir,
-                &secret,
-                handshake_skew_secs,
                 netns_fd,
                 proxy_url,
                 ca_paths,
                 provider_env,
-                &nonce_cache,
             )
             .await
             {
@@ -166,41 +157,18 @@ pub async fn run_ssh_server(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
-    mut stream: tokio::net::TcpStream,
-    peer: SocketAddr,
+    stream: tokio::net::UnixStream,
     config: Arc<russh::server::Config>,
     policy: SandboxPolicy,
     workdir: Option<String>,
-    secret: &str,
-    handshake_skew_secs: u64,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: HashMap<String, String>,
-    nonce_cache: &NonceCache,
 ) -> Result<()> {
-    tracing::debug!(peer = %peer, "SSH connection: reading handshake preface");
-    let mut line = String::new();
-    read_line(&mut stream, &mut line).await?;
-    tracing::debug!(peer = %peer, preface_len = line.len(), "SSH connection: preface received, verifying");
-    if !verify_preface(&line, secret, handshake_skew_secs, nonce_cache)? {
-        ocsf_emit!(
-            SshActivityBuilder::new(crate::ocsf_ctx())
-                .activity(ActivityId::Open)
-                .action(ActionId::Denied)
-                .disposition(DispositionId::Blocked)
-                .severity(SeverityId::Medium)
-                .status(StatusId::Failure)
-                .src_endpoint_addr(peer.ip(), peer.port())
-                .message(format!(
-                    "SSH connection: handshake verification failed from {peer}"
-                ))
-                .build()
-        );
-        let _ = stream.write_all(b"ERR\n").await;
-        return Ok(());
-    }
-    stream.write_all(b"OK\n").await.into_diagnostic()?;
+    // Access is gated by the Unix-socket filesystem permissions (root-only),
+    // not by an application-level preface. The supervisor bridges the
+    // gateway's RelayStream directly into this socket.
     ocsf_emit!(
         SshActivityBuilder::new(crate::ocsf_ctx())
             .activity(ActivityId::Open)
@@ -208,9 +176,7 @@ async fn handle_connection(
             .disposition(DispositionId::Allowed)
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
-            .src_endpoint_addr(peer.ip(), peer.port())
-            .auth_type(AuthTypeId::Other, "NSSH1")
-            .message(format!("SSH handshake accepted from {peer}"))
+            .message("SSH connection accepted on supervisor Unix socket")
             .build()
     );
 
@@ -226,107 +192,6 @@ async fn handle_connection(
         .await
         .map_err(|err| miette::miette!("ssh stream error: {err}"))?;
     Ok(())
-}
-
-async fn read_line(stream: &mut tokio::net::TcpStream, buf: &mut String) -> Result<()> {
-    let mut bytes = Vec::new();
-    loop {
-        let mut byte = [0u8; 1];
-        let n = stream.read(&mut byte).await.into_diagnostic()?;
-        if n == 0 {
-            break;
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        bytes.push(byte[0]);
-        if bytes.len() > 1024 {
-            break;
-        }
-    }
-    *buf = String::from_utf8_lossy(&bytes).to_string();
-    Ok(())
-}
-
-fn verify_preface(
-    line: &str,
-    secret: &str,
-    handshake_skew_secs: u64,
-    nonce_cache: &NonceCache,
-) -> Result<bool> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() != 5 || parts[0] != PREFACE_MAGIC {
-        return Ok(false);
-    }
-    let token = parts[1];
-    let timestamp: i64 = parts[2].parse().unwrap_or(0);
-    let nonce = parts[3];
-    let signature = parts[4];
-
-    let now = i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .into_diagnostic()?
-            .as_secs(),
-    )
-    .into_diagnostic()?;
-    let skew = (now - timestamp).unsigned_abs();
-    if skew > handshake_skew_secs {
-        return Ok(false);
-    }
-
-    let payload = format!("{token}|{timestamp}|{nonce}");
-    let expected = hmac_sha256(secret.as_bytes(), payload.as_bytes());
-    if signature != expected {
-        return Ok(false);
-    }
-
-    // Reject replayed nonces. The cache is bounded by the reaper task which
-    // evicts entries older than `handshake_skew_secs`.
-    let mut cache = nonce_cache
-        .lock()
-        .map_err(|_| miette::miette!("nonce cache lock poisoned"))?;
-    if cache.contains_key(nonce) {
-        ocsf_emit!(
-            SshActivityBuilder::new(crate::ocsf_ctx())
-                .activity(ActivityId::Other)
-                .action(ActionId::Denied)
-                .disposition(DispositionId::Blocked)
-                .severity(SeverityId::High)
-                .auth_type(AuthTypeId::Other, "NSSH1")
-                .message(format!("NSSH1 nonce replay detected: {nonce}"))
-                .build()
-        );
-        ocsf_emit!(
-            DetectionFindingBuilder::new(crate::ocsf_ctx())
-                .activity(ActivityId::Open)
-                .action(ActionId::Denied)
-                .disposition(DispositionId::Blocked)
-                .severity(SeverityId::High)
-                .is_alert(true)
-                .confidence(ConfidenceId::High)
-                .finding_info(FindingInfo::new(
-                    "nssh1-nonce-replay",
-                    "NSSH1 Nonce Replay Attack"
-                ))
-                .evidence("nonce", nonce)
-                .build()
-        );
-        return Ok(false);
-    }
-    cache.insert(nonce.to_string(), Instant::now());
-
-    Ok(true)
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
-    mac.update(data);
-    let result = mac.finalize().into_bytes();
-    hex::encode(result)
 }
 
 /// Per-channel state for tracking PTY resources and I/O senders.
@@ -1422,136 +1287,6 @@ mod tests {
             100 * 1024,
             "expected all 100 KiB delivered before EOF"
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // verify_preface tests
-    // -----------------------------------------------------------------------
-
-    /// Build a valid NSSH1 preface line with the given parameters.
-    fn build_preface(token: &str, secret: &str, nonce: &str, timestamp: i64) -> String {
-        let payload = format!("{token}|{timestamp}|{nonce}");
-        let signature = hmac_sha256(secret.as_bytes(), payload.as_bytes());
-        format!("{PREFACE_MAGIC} {token} {timestamp} {nonce} {signature}")
-    }
-
-    fn fresh_nonce_cache() -> NonceCache {
-        Arc::new(Mutex::new(HashMap::new()))
-    }
-
-    fn current_timestamp() -> i64 {
-        i64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn verify_preface_accepts_valid_preface() {
-        let secret = "test-secret-key";
-        let nonce = "unique-nonce-1";
-        let ts = current_timestamp();
-        let line = build_preface("tok1", secret, nonce, ts);
-        let cache = fresh_nonce_cache();
-
-        assert!(verify_preface(&line, secret, 300, &cache).unwrap());
-    }
-
-    #[test]
-    fn verify_preface_rejects_replayed_nonce() {
-        let secret = "test-secret-key";
-        let nonce = "replay-nonce";
-        let ts = current_timestamp();
-        let line = build_preface("tok1", secret, nonce, ts);
-        let cache = fresh_nonce_cache();
-
-        // First attempt should succeed.
-        assert!(verify_preface(&line, secret, 300, &cache).unwrap());
-        // Second attempt with the same nonce should be rejected.
-        assert!(!verify_preface(&line, secret, 300, &cache).unwrap());
-    }
-
-    #[test]
-    fn verify_preface_rejects_expired_timestamp() {
-        let secret = "test-secret-key";
-        let nonce = "expired-nonce";
-        // Timestamp 600 seconds in the past, with a 300-second skew window.
-        let ts = current_timestamp() - 600;
-        let line = build_preface("tok1", secret, nonce, ts);
-        let cache = fresh_nonce_cache();
-
-        assert!(!verify_preface(&line, secret, 300, &cache).unwrap());
-    }
-
-    #[test]
-    fn verify_preface_rejects_invalid_hmac() {
-        let secret = "test-secret-key";
-        let nonce = "hmac-nonce";
-        let ts = current_timestamp();
-        // Build with the correct secret, then verify with the wrong one.
-        let line = build_preface("tok1", secret, nonce, ts);
-        let cache = fresh_nonce_cache();
-
-        assert!(!verify_preface(&line, "wrong-secret", 300, &cache).unwrap());
-    }
-
-    #[test]
-    fn verify_preface_rejects_malformed_input() {
-        let cache = fresh_nonce_cache();
-
-        // Too few parts.
-        assert!(!verify_preface("NSSH1 tok1 123", "s", 300, &cache).unwrap());
-        // Wrong magic.
-        assert!(!verify_preface("NSSH2 tok1 123 nonce sig", "s", 300, &cache).unwrap());
-        // Empty string.
-        assert!(!verify_preface("", "s", 300, &cache).unwrap());
-    }
-
-    #[test]
-    fn verify_preface_distinct_nonces_both_accepted() {
-        let secret = "test-secret-key";
-        let ts = current_timestamp();
-        let cache = fresh_nonce_cache();
-
-        let line1 = build_preface("tok1", secret, "nonce-a", ts);
-        let line2 = build_preface("tok1", secret, "nonce-b", ts);
-
-        assert!(verify_preface(&line1, secret, 300, &cache).unwrap());
-        assert!(verify_preface(&line2, secret, 300, &cache).unwrap());
-    }
-
-    #[test]
-    fn apply_child_env_keeps_handshake_secret_out_of_ssh_children() {
-        let mut cmd = Command::new("/usr/bin/env");
-        cmd.env(SSH_HANDSHAKE_SECRET_ENV, "should-not-leak")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-
-        let provider_env = std::iter::once((
-            "ANTHROPIC_API_KEY".to_string(),
-            "openshell:resolve:env:ANTHROPIC_API_KEY".to_string(),
-        ))
-        .collect();
-
-        apply_child_env(
-            &mut cmd,
-            "/sandbox",
-            "sandbox",
-            "dumb",
-            None,
-            None,
-            &provider_env,
-        );
-
-        let output = cmd.output().expect("spawn env");
-        let stdout = String::from_utf8(output.stdout).expect("utf8");
-
-        assert!(!stdout.contains(SSH_HANDSHAKE_SECRET_ENV));
-        assert!(stdout.contains("ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY"));
     }
 
     // -----------------------------------------------------------------------

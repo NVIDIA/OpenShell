@@ -452,7 +452,6 @@ pub(super) async fn handle_exec_sandbox(
     let timeout_seconds = req.timeout_seconds;
     let request_tty = req.tty;
     let sandbox_id = sandbox.id;
-    let handshake_secret = state.config.ssh_handshake_secret.clone();
 
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
@@ -486,7 +485,6 @@ pub(super) async fn handle_exec_sandbox(
             stdin_payload,
             timeout_seconds,
             request_tty,
-            &handshake_secret,
         )
         .await
         {
@@ -680,7 +678,6 @@ async fn stream_exec_over_relay(
     stdin_payload: Vec<u8>,
     timeout_seconds: u32,
     request_tty: bool,
-    handshake_secret: &str,
 ) -> Result<(), Status> {
     let command_preview: String = command.chars().take(120).collect();
     info!(
@@ -692,10 +689,9 @@ async fn stream_exec_over_relay(
         "ExecSandbox (relay): command started"
     );
 
-    let (local_proxy_port, proxy_task) =
-        start_single_use_ssh_proxy_over_relay(relay_stream, handshake_secret)
-            .await
-            .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
+    let (local_proxy_port, proxy_task) = start_single_use_ssh_proxy_over_relay(relay_stream)
+        .await
+        .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
 
     let exec = run_exec_with_russh(
         local_proxy_port,
@@ -749,68 +745,21 @@ async fn stream_exec_over_relay(
 
 /// Create a localhost SSH proxy that bridges to a relay DuplexStream.
 ///
-/// The proxy sends the NSSH1 handshake preface through the relay (which flows
-/// to the supervisor and on to the embedded SSH daemon), waits for "OK", then
-/// bridges the russh client connection with the relay stream.
+/// The proxy forwards raw SSH bytes between the `russh` client and the relay.
+/// The supervisor bridges the relay to its Unix-socket SSH daemon; filesystem
+/// permissions on that socket are the only access-control boundary.
 async fn start_single_use_ssh_proxy_over_relay(
-    relay_stream: tokio::io::DuplexStream,
-    handshake_secret: &str,
+    mut relay_stream: tokio::io::DuplexStream,
 ) -> Result<(u16, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
-    let handshake_secret = handshake_secret.to_string();
 
     let task = tokio::spawn(async move {
         let Ok((mut client_conn, _)) = listener.accept().await else {
             warn!("SSH relay proxy: failed to accept local connection");
             return;
         };
-
-        let (mut relay_read, mut relay_write) = tokio::io::split(relay_stream);
-
-        // Send NSSH1 handshake through the relay to the SSH daemon.
-        let Ok(preface) = build_preface(&uuid::Uuid::new_v4().to_string(), &handshake_secret)
-        else {
-            warn!("SSH relay proxy: failed to build handshake preface");
-            return;
-        };
-        if let Err(e) =
-            tokio::io::AsyncWriteExt::write_all(&mut relay_write, preface.as_bytes()).await
-        {
-            warn!(error = %e, "SSH relay proxy: failed to send handshake preface");
-            return;
-        }
-
-        // Read handshake response from the relay.
-        let mut response_buf = Vec::new();
-        loop {
-            let mut byte = [0u8; 1];
-            match tokio::io::AsyncReadExt::read(&mut relay_read, &mut byte).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    if byte[0] == b'\n' {
-                        break;
-                    }
-                    response_buf.push(byte[0]);
-                    if response_buf.len() > 1024 {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "SSH relay proxy: failed to read handshake response");
-                    return;
-                }
-            }
-        }
-        let response = String::from_utf8_lossy(&response_buf);
-        if response.trim() != "OK" {
-            warn!(response = %response.trim(), "SSH relay proxy: handshake rejected");
-            return;
-        }
-
-        // Reunite the split halves for copy_bidirectional.
-        let mut relay = relay_read.unsplit(relay_write);
-        let _ = tokio::io::copy_bidirectional(&mut client_conn, &mut relay).await;
+        let _ = tokio::io::copy_bidirectional(&mut client_conn, &mut relay_stream).await;
     });
 
     Ok((port, task))
@@ -940,33 +889,6 @@ async fn run_exec_with_russh(
         .await;
 
     Ok(exit_code.unwrap_or(1))
-}
-
-fn build_preface(
-    token: &str,
-    secret: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let timestamp = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| "time error")?
-            .as_secs(),
-    )
-    .map_err(|_| "time error")?;
-    let nonce = uuid::Uuid::new_v4().to_string();
-    let payload = format!("{token}|{timestamp}|{nonce}");
-    let signature = hmac_sha256(secret.as_bytes(), payload.as_bytes());
-    Ok(format!("NSSH1 {token} {timestamp} {nonce} {signature}\n"))
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
-    mac.update(data);
-    let result = mac.finalize().into_bytes();
-    hex::encode(result)
 }
 
 // ---------------------------------------------------------------------------

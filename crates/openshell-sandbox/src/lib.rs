@@ -604,18 +604,17 @@ pub async fn run_sandbox(
         }
     });
 
+    // The `ssh_listen_addr` argument now carries a filesystem path to the
+    // Unix socket the embedded SSH daemon listens on. Kept as an `Option<String>`
+    // for backwards compatibility with the CLI flag name and env var.
+    let ssh_socket_path: Option<std::path::PathBuf> =
+        ssh_listen_addr.as_ref().map(std::path::PathBuf::from);
     if let Some(listen_addr) = ssh_listen_addr {
-        let addr: SocketAddr = listen_addr.parse().into_diagnostic()?;
+        let listen_path = std::path::PathBuf::from(listen_addr);
         let policy_clone = policy.clone();
         let workdir_clone = workdir.clone();
-        let secret = ssh_handshake_secret
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                miette::miette!(
-                    "OPENSHELL_SSH_HANDSHAKE_SECRET is required when SSH is enabled.\n\
-                     Set --ssh-handshake-secret or the OPENSHELL_SSH_HANDSHAKE_SECRET env var."
-                )
-            })?;
+        let _ = ssh_handshake_secret; // retained in the signature for compat; unused
+        let _ = ssh_handshake_skew_secs;
         let proxy_url = ssh_proxy_url;
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
@@ -625,12 +624,10 @@ pub async fn run_sandbox(
 
         tokio::spawn(async move {
             if let Err(err) = ssh::run_ssh_server(
-                addr,
+                listen_path,
                 ssh_ready_tx,
                 policy_clone,
                 workdir_clone,
-                secret,
-                ssh_handshake_skew_secs,
                 netns_fd,
                 proxy_url,
                 ca_paths,
@@ -682,15 +679,12 @@ pub async fn run_sandbox(
     // Spawn the persistent supervisor session if we have a gateway endpoint
     // and sandbox identity. The session provides relay channels for SSH
     // connect and ExecSandbox through the gateway.
-    if let (Some(endpoint), Some(id)) = (openshell_endpoint.as_ref(), sandbox_id.as_ref()) {
-        // The SSH listen address was consumed above, so we use the configured
-        // SSH port (default 2222) for loopback connections from the relay.
-        let ssh_port = std::env::var("OPENSHELL_SSH_PORT")
-            .ok()
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(2222);
-
-        supervisor_session::spawn(endpoint.clone(), id.clone(), ssh_port);
+    if let (Some(endpoint), Some(id), Some(socket)) = (
+        openshell_endpoint.as_ref(),
+        sandbox_id.as_ref(),
+        ssh_socket_path.as_ref(),
+    ) {
+        supervisor_session::spawn(endpoint.clone(), id.clone(), socket.clone());
         info!("supervisor session task spawned");
     }
 

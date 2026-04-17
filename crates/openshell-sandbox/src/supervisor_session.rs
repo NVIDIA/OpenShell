@@ -40,19 +40,23 @@ const RELAY_CHUNK_SIZE: usize = 16 * 1024;
 pub fn spawn(
     endpoint: String,
     sandbox_id: String,
-    ssh_listen_port: u16,
+    ssh_socket_path: std::path::PathBuf,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_session_loop(endpoint, sandbox_id, ssh_listen_port))
+    tokio::spawn(run_session_loop(endpoint, sandbox_id, ssh_socket_path))
 }
 
-async fn run_session_loop(endpoint: String, sandbox_id: String, ssh_listen_port: u16) {
+async fn run_session_loop(
+    endpoint: String,
+    sandbox_id: String,
+    ssh_socket_path: std::path::PathBuf,
+) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
 
     loop {
         attempt += 1;
 
-        match run_single_session(&endpoint, &sandbox_id, ssh_listen_port).await {
+        match run_single_session(&endpoint, &sandbox_id, &ssh_socket_path).await {
             Ok(()) => {
                 info!(sandbox_id = %sandbox_id, "supervisor session ended cleanly");
                 break;
@@ -75,7 +79,7 @@ async fn run_session_loop(endpoint: String, sandbox_id: String, ssh_listen_port:
 async fn run_single_session(
     endpoint: &str,
     sandbox_id: &str,
-    ssh_listen_port: u16,
+    ssh_socket_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -142,7 +146,7 @@ async fn run_single_session(
                         handle_gateway_message(
                             &msg,
                             sandbox_id,
-                            ssh_listen_port,
+                            ssh_socket_path,
                             &channel,
                         ).await;
                     }
@@ -172,7 +176,7 @@ async fn run_single_session(
 async fn handle_gateway_message(
     msg: &GatewayMessage,
     sandbox_id: &str,
-    ssh_listen_port: u16,
+    ssh_socket_path: &std::path::Path,
     channel: &Channel,
 ) {
     match &msg.payload {
@@ -183,6 +187,7 @@ async fn handle_gateway_message(
             let channel_id = open.channel_id.clone();
             let sandbox_id = sandbox_id.to_string();
             let channel = channel.clone();
+            let ssh_socket_path = ssh_socket_path.to_path_buf();
 
             info!(
                 sandbox_id = %sandbox_id,
@@ -191,7 +196,7 @@ async fn handle_gateway_message(
             );
 
             tokio::spawn(async move {
-                if let Err(e) = handle_relay_open(&channel_id, ssh_listen_port, channel).await {
+                if let Err(e) = handle_relay_open(&channel_id, &ssh_socket_path, channel).await {
                     warn!(
                         sandbox_id = %sandbox_id,
                         channel_id = %channel_id,
@@ -223,7 +228,7 @@ async fn handle_gateway_message(
 /// `channel_id`; subsequent chunks carry raw SSH bytes.
 async fn handle_relay_open(
     channel_id: &str,
-    ssh_listen_port: u16,
+    ssh_socket_path: &std::path::Path,
     channel: Channel,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = OpenShellClient::new(channel);
@@ -248,11 +253,15 @@ async fn handle_relay_open(
         .map_err(|e| format!("relay_stream RPC failed: {e}"))?;
     let mut inbound = response.into_inner();
 
-    // Connect to the local SSH daemon on loopback.
-    let ssh = tokio::net::TcpStream::connect(("127.0.0.1", ssh_listen_port)).await?;
+    // Connect to the local SSH daemon on its Unix socket.
+    let ssh = tokio::net::UnixStream::connect(ssh_socket_path).await?;
     let (mut ssh_r, mut ssh_w) = ssh.into_split();
 
-    info!(channel_id = %channel_id, "relay bridge: connected to local SSH daemon");
+    info!(
+        channel_id = %channel_id,
+        socket = %ssh_socket_path.display(),
+        "relay bridge: connected to local SSH daemon"
+    );
 
     // SSH → gRPC (out_tx): read local SSH, forward as `RelayChunk`s.
     let out_tx_writer = out_tx.clone();

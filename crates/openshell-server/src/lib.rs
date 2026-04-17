@@ -253,7 +253,11 @@ async fn build_compute_runtime(
                 default_image: config.sandbox_image.clone(),
                 image_pull_policy: config.sandbox_image_pull_policy.clone(),
                 grpc_endpoint: config.grpc_endpoint.clone(),
-                ssh_listen_addr: format!("0.0.0.0:{}", config.sandbox_ssh_port),
+                // Filesystem path to the supervisor's Unix-socket SSH daemon.
+                // The path lives in a root-only directory so only the
+                // supervisor can connect; the gateway reaches it through the
+                // RelayStream bridge, not directly.
+                ssh_listen_addr: "/run/openshell/ssh.sock".to_string(),
                 ssh_port: config.sandbox_ssh_port,
                 ssh_handshake_secret: config.ssh_handshake_secret.clone(),
                 ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,

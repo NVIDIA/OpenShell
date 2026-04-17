@@ -11,9 +11,8 @@ use openshell_core::proto::{Sandbox, SandboxPhase, SshSession};
 use prost::Message;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use crate::ServerState;
 use crate::persistence::{ObjectId, ObjectName, ObjectType, Store};
@@ -143,15 +142,15 @@ async fn ssh_connect(
         *count += 1;
     }
 
-    let handshake_secret = state.config.ssh_handshake_secret.clone();
     let sandbox_id_clone = sandbox_id.clone();
     let token_clone = token.clone();
     let state_clone = state.clone();
 
     let upgrade = hyper::upgrade::on(req);
     tokio::spawn(async move {
-        // Wait for the supervisor's reverse CONNECT to arrive and claim the relay.
-        let relay_stream = match tokio::time::timeout(Duration::from_secs(10), relay_rx).await {
+        // Wait for the supervisor to open its `RelayStream` and deliver the
+        // bridge half of the relay.
+        let mut relay = match tokio::time::timeout(Duration::from_secs(10), relay_rx).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(_)) => {
                 warn!(sandbox_id = %sandbox_id_clone, channel_id = %channel_id, "SSH tunnel: relay channel dropped");
@@ -173,67 +172,7 @@ async fn ssh_connect(
             }
         };
 
-        // Send NSSH1 handshake through the relay to the SSH daemon before
-        // bridging the client's SSH bytes. The relay carries bytes to the
-        // supervisor which bridges them to the local SSH daemon on loopback.
-        let (mut relay_read, mut relay_write) = tokio::io::split(relay_stream);
-        let preface = match build_preface(&token_clone, &handshake_secret) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(error = %e, "SSH tunnel: failed to build NSSH1 preface");
-                decrement_connection_count(&state_clone.ssh_connections_by_token, &token_clone);
-                decrement_connection_count(
-                    &state_clone.ssh_connections_by_sandbox,
-                    &sandbox_id_clone,
-                );
-                return;
-            }
-        };
-        if let Err(e) = relay_write.write_all(preface.as_bytes()).await {
-            warn!(error = %e, "SSH tunnel: failed to send NSSH1 preface through relay");
-            decrement_connection_count(&state_clone.ssh_connections_by_token, &token_clone);
-            decrement_connection_count(&state_clone.ssh_connections_by_sandbox, &sandbox_id_clone);
-            return;
-        }
-
-        // Read handshake response from the SSH daemon through the relay.
-        let mut response_buf = Vec::new();
-        loop {
-            let mut byte = [0u8; 1];
-            match relay_read.read(&mut byte).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    if byte[0] == b'\n' {
-                        break;
-                    }
-                    response_buf.push(byte[0]);
-                    if response_buf.len() > 1024 {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "SSH tunnel: failed to read NSSH1 response from relay");
-                    decrement_connection_count(&state_clone.ssh_connections_by_token, &token_clone);
-                    decrement_connection_count(
-                        &state_clone.ssh_connections_by_sandbox,
-                        &sandbox_id_clone,
-                    );
-                    return;
-                }
-            }
-        }
-        let response = String::from_utf8_lossy(&response_buf);
-        if response.trim() != "OK" {
-            warn!(response = %response.trim(), "SSH tunnel: NSSH1 handshake rejected by sandbox");
-            decrement_connection_count(&state_clone.ssh_connections_by_token, &token_clone);
-            decrement_connection_count(&state_clone.ssh_connections_by_sandbox, &sandbox_id_clone);
-            return;
-        }
-
-        info!(sandbox_id = %sandbox_id_clone, channel_id = %channel_id, "SSH tunnel: NSSH1 handshake OK, bridging client");
-
-        // Reunite the split relay halves and bridge with the client's upgraded stream.
-        let mut relay = relay_read.unsplit(relay_write);
+        info!(sandbox_id = %sandbox_id_clone, channel_id = %channel_id, "SSH tunnel: relay established, bridging client");
 
         match upgrade.await {
             Ok(upgraded) => {
@@ -266,37 +205,6 @@ fn header_value(headers: &http::HeaderMap, name: &str) -> Result<String, StatusC
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok(value)
-}
-
-const PREFACE_MAGIC: &str = "NSSH1";
-
-fn build_preface(
-    token: &str,
-    secret: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let timestamp = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| "time error")?
-            .as_secs(),
-    )
-    .map_err(|_| "time error")?;
-    let nonce = Uuid::new_v4().to_string();
-    let payload = format!("{token}|{timestamp}|{nonce}");
-    let signature = hmac_sha256(secret.as_bytes(), payload.as_bytes());
-    Ok(format!(
-        "{PREFACE_MAGIC} {token} {timestamp} {nonce} {signature}\n"
-    ))
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
-    mac.update(data);
-    let result = mac.finalize().into_bytes();
-    hex::encode(result)
 }
 
 impl ObjectType for SshSession {
