@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::rootfs::{extract_sandbox_rootfs_to, sandbox_guest_init_path};
+use crate::{
+    GUEST_SSH_PORT,
+    rootfs::{extract_sandbox_rootfs_to, sandbox_guest_init_path},
+};
 use futures::Stream;
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
@@ -34,7 +37,6 @@ use url::{Host, Url};
 
 const DRIVER_NAME: &str = "openshell-driver-vm";
 const WATCH_BUFFER: usize = 256;
-const GUEST_SSH_PORT: u16 = 2222;
 const DEFAULT_VCPUS: u8 = 2;
 const DEFAULT_MEM_MIB: u32 = 2048;
 const GUEST_TLS_DIR: &str = "/opt/openshell/tls";

@@ -8,6 +8,16 @@
 //! - HTTP health endpoints
 //! - Protocol multiplexing (gRPC + HTTP on same port)
 //! - mTLS support
+//!
+//! TODO(driver-abstraction): `build_compute_runtime` still switches on
+//! [`ComputeDriverKind`] and calls driver-specific constructors
+//! ([`ComputeRuntime::new_kubernetes`], [`compute::vm::spawn`] +
+//! [`ComputeRuntime::new_remote_vm`]). Once we have a generalized compute
+//! driver interface, the per-arm wiring here should collapse to a single
+//! driver-agnostic path that asks each registered driver to produce a
+//! [`Channel`](tonic::transport::Channel) and hands the rest of the gateway a
+//! uniform [`ComputeRuntime`]. The remaining VM plumbing now lives in
+//! [`compute::vm`]; keep this file driver-agnostic going forward.
 
 mod auth;
 pub mod cli;
@@ -27,39 +37,20 @@ mod ws_tunnel;
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::TcpListener;
-#[cfg(unix)]
-use tokio::process::Command;
 use tracing::{debug, error, info};
 
-use compute::{ComputeRuntime, ManagedDriverProcess, VmComputeConfig};
+use compute::{ComputeRuntime, VmComputeConfig};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router};
-#[cfg(unix)]
-use hyper_util::rt::TokioIo;
 pub use multiplex::{MultiplexService, MultiplexedService};
-#[cfg(unix)]
-use openshell_core::proto::compute::v1::{
-    GetCapabilitiesRequest, compute_driver_client::ComputeDriverClient,
-};
 use openshell_driver_kubernetes::KubernetesComputeConfig;
 use persistence::Store;
 use sandbox_index::SandboxIndex;
 use sandbox_watch::SandboxWatchBus;
-#[cfg(unix)]
-use std::process::Stdio;
-#[cfg(unix)]
-use std::time::Duration;
 pub use tls::TlsAcceptor;
-#[cfg(unix)]
-use tokio::net::UnixStream;
-use tonic::transport::Channel;
-#[cfg(unix)]
-use tonic::transport::Endpoint;
-#[cfg(unix)]
-use tower::service_fn;
 use tracing_bus::TracingLogBus;
 
 /// Server state shared across handlers.
@@ -271,7 +262,7 @@ async fn build_compute_runtime(
         .await
         .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
         ComputeDriverKind::Vm => {
-            let (channel, driver_process) = spawn_vm_compute_driver(config, vm_config).await?;
+            let (channel, driver_process) = compute::vm::spawn(config, vm_config).await?;
             ComputeRuntime::new_remote_vm(
                 channel,
                 Some(driver_process),
@@ -309,246 +300,11 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
     }
 }
 
-fn resolve_vm_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf> {
-    let path = if let Some(path) = vm_config.compute_driver_bin.clone() {
-        path
-    } else {
-        let current_exe = std::env::current_exe()
-            .map_err(|e| Error::config(format!("failed to resolve current executable: {e}")))?;
-        let Some(parent) = current_exe.parent() else {
-            return Err(Error::config(format!(
-                "current executable '{}' has no parent directory",
-                current_exe.display()
-            )));
-        };
-        parent.join("openshell-driver-vm")
-    };
-
-    if !path.is_file() {
-        return Err(Error::config(format!(
-            "vm compute driver binary '{}' does not exist; set --vm-compute-driver-bin or OPENSHELL_VM_COMPUTE_DRIVER_BIN",
-            path.display()
-        )));
-    }
-
-    Ok(path)
-}
-
-fn vm_compute_driver_socket_path(vm_config: &VmComputeConfig) -> PathBuf {
-    vm_config.state_dir.join("compute-driver.sock")
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VmGuestTlsPaths {
-    ca: PathBuf,
-    cert: PathBuf,
-    key: PathBuf,
-}
-
-#[cfg(unix)]
-fn vm_compute_driver_guest_tls_paths(
-    config: &Config,
-    vm_config: &VmComputeConfig,
-) -> Result<Option<VmGuestTlsPaths>> {
-    if !config.grpc_endpoint.starts_with("https://") {
-        return Ok(None);
-    }
-
-    let provided = [
-        vm_config.guest_tls_ca.as_ref(),
-        vm_config.guest_tls_cert.as_ref(),
-        vm_config.guest_tls_key.as_ref(),
-    ];
-    if provided.iter().all(Option::is_none) {
-        return Err(Error::config(
-            "vm compute driver requires --vm-tls-ca, --vm-tls-cert, and --vm-tls-key when OPENSHELL_GRPC_ENDPOINT uses https://",
-        ));
-    }
-
-    let Some(ca) = vm_config.guest_tls_ca.clone() else {
-        return Err(Error::config(
-            "--vm-tls-ca is required when VM guest TLS materials are configured",
-        ));
-    };
-    let Some(cert) = vm_config.guest_tls_cert.clone() else {
-        return Err(Error::config(
-            "--vm-tls-cert is required when VM guest TLS materials are configured",
-        ));
-    };
-    let Some(key) = vm_config.guest_tls_key.clone() else {
-        return Err(Error::config(
-            "--vm-tls-key is required when VM guest TLS materials are configured",
-        ));
-    };
-
-    for path in [&ca, &cert, &key] {
-        if !path.is_file() {
-            return Err(Error::config(format!(
-                "vm guest TLS material '{}' does not exist or is not a file",
-                path.display()
-            )));
-        }
-    }
-
-    Ok(Some(VmGuestTlsPaths { ca, cert, key }))
-}
-
-#[cfg(unix)]
-async fn spawn_vm_compute_driver(
-    config: &Config,
-    vm_config: &VmComputeConfig,
-) -> Result<(Channel, Arc<ManagedDriverProcess>)> {
-    if config.grpc_endpoint.trim().is_empty() {
-        return Err(Error::config(
-            "grpc_endpoint is required when using the vm compute driver",
-        ));
-    }
-
-    let driver_bin = resolve_vm_compute_driver_bin(vm_config)?;
-    let socket_path = vm_compute_driver_socket_path(vm_config);
-    let guest_tls_paths = vm_compute_driver_guest_tls_paths(config, vm_config)?;
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            Error::execution(format!(
-                "failed to create vm compute driver socket dir '{}': {e}",
-                parent.display()
-            ))
-        })?;
-    }
-    match std::fs::remove_file(&socket_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(Error::execution(format!(
-                "failed to remove stale vm compute driver socket '{}': {err}",
-                socket_path.display()
-            )));
-        }
-    }
-
-    let mut command = Command::new(&driver_bin);
-    command.kill_on_drop(true);
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::inherit());
-    command.stderr(Stdio::inherit());
-    command.arg("--bind-socket").arg(&socket_path);
-    command.arg("--log-level").arg(&config.log_level);
-    command
-        .arg("--openshell-endpoint")
-        .arg(&config.grpc_endpoint);
-    command.arg("--state-dir").arg(&vm_config.state_dir);
-    command
-        .arg("--ssh-handshake-secret")
-        .arg(&config.ssh_handshake_secret);
-    command
-        .arg("--ssh-handshake-skew-secs")
-        .arg(config.ssh_handshake_skew_secs.to_string());
-    command
-        .arg("--krun-log-level")
-        .arg(vm_config.krun_log_level.to_string());
-    command.arg("--vcpus").arg(vm_config.vcpus.to_string());
-    command.arg("--mem-mib").arg(vm_config.mem_mib.to_string());
-    if let Some(tls) = guest_tls_paths {
-        command.arg("--guest-tls-ca").arg(tls.ca);
-        command.arg("--guest-tls-cert").arg(tls.cert);
-        command.arg("--guest-tls-key").arg(tls.key);
-    }
-
-    let mut child = command.spawn().map_err(|e| {
-        Error::execution(format!(
-            "failed to launch vm compute driver '{}': {e}",
-            driver_bin.display()
-        ))
-    })?;
-    let channel = wait_for_vm_compute_driver(&socket_path, &mut child).await?;
-    let process = Arc::new(ManagedDriverProcess::new(child, socket_path));
-    Ok((channel, process))
-}
-
-#[cfg(not(unix))]
-async fn spawn_vm_compute_driver(
-    _config: &Config,
-    _vm_config: &VmComputeConfig,
-) -> Result<(Channel, Arc<ManagedDriverProcess>)> {
-    Err(Error::config(
-        "the vm compute driver requires unix domain socket support",
-    ))
-}
-
-#[cfg(unix)]
-async fn wait_for_vm_compute_driver(
-    socket_path: &std::path::Path,
-    child: &mut tokio::process::Child,
-) -> Result<Channel> {
-    let mut last_error: Option<String> = None;
-    for _ in 0..100 {
-        if let Some(status) = child.try_wait().map_err(|e| {
-            Error::execution(format!("failed to poll vm compute driver process: {e}"))
-        })? {
-            return Err(Error::execution(format!(
-                "vm compute driver exited before becoming ready with status {status}"
-            )));
-        }
-
-        match connect_vm_compute_driver(socket_path).await {
-            Ok(channel) => {
-                let mut client = ComputeDriverClient::new(channel.clone());
-                match client
-                    .get_capabilities(tonic::Request::new(GetCapabilitiesRequest {}))
-                    .await
-                {
-                    Ok(_) => return Ok(channel),
-                    Err(status) => last_error = Some(status.to_string()),
-                }
-            }
-            Err(err) => last_error = Some(err.to_string()),
-        }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    Err(Error::execution(format!(
-        "timed out waiting for vm compute driver socket '{}': {}",
-        socket_path.display(),
-        last_error.unwrap_or_else(|| "unknown error".to_string())
-    )))
-}
-
-#[cfg(unix)]
-async fn connect_vm_compute_driver(socket_path: &std::path::Path) -> Result<Channel> {
-    let socket_path = socket_path.to_path_buf();
-    let display_path = socket_path.clone();
-    Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
-            let socket_path = socket_path.clone();
-            async move { UnixStream::connect(socket_path).await.map(TokioIo::new) }
-        }))
-        .await
-        .map_err(|e| {
-            Error::execution(format!(
-                "failed to connect to vm compute driver socket '{}': {e}",
-                display_path.display()
-            ))
-        })
-}
-
-#[cfg(not(unix))]
-async fn connect_vm_compute_driver(_socket_path: &std::path::Path) -> Result<Channel> {
-    Err(Error::config(
-        "the vm compute driver requires unix domain socket support",
-    ))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        VmComputeConfig, configured_compute_driver, is_benign_tls_handshake_failure,
-        vm_compute_driver_guest_tls_paths,
-    };
-    use openshell_core::{ComputeDriverKind, Config, TlsConfig};
+    use super::{configured_compute_driver, is_benign_tls_handshake_failure};
+    use openshell_core::{ComputeDriverKind, Config};
     use std::io::{Error, ErrorKind};
-    use tempfile::tempdir;
 
     #[test]
     fn classifies_probe_style_tls_disconnects_as_benign() {
@@ -614,75 +370,5 @@ mod tests {
             configured_compute_driver(&config).unwrap(),
             ComputeDriverKind::Vm
         );
-    }
-
-    #[test]
-    fn vm_compute_driver_tls_requires_explicit_guest_bundle() {
-        let dir = tempdir().unwrap();
-        let server_cert = dir.path().join("server.crt");
-        let server_key = dir.path().join("server.key");
-        let server_ca = dir.path().join("client-ca.crt");
-        std::fs::write(&server_cert, "server-cert").unwrap();
-        std::fs::write(&server_key, "server-key").unwrap();
-        std::fs::write(&server_ca, "client-ca").unwrap();
-
-        let config = Config::new(Some(TlsConfig {
-            cert_path: server_cert,
-            key_path: server_key,
-            client_ca_path: server_ca,
-            allow_unauthenticated: false,
-        }))
-        .with_grpc_endpoint("https://gateway.internal:8443");
-
-        let err = vm_compute_driver_guest_tls_paths(&config, &VmComputeConfig::default())
-            .expect_err("https vm endpoints should require an explicit guest client bundle");
-        assert!(
-            err.to_string()
-                .contains("--vm-tls-ca, --vm-tls-cert, and --vm-tls-key")
-        );
-    }
-
-    #[test]
-    fn vm_compute_driver_tls_uses_guest_bundle_not_gateway_server_identity() {
-        let dir = tempdir().unwrap();
-        let server_cert = dir.path().join("server.crt");
-        let server_key = dir.path().join("server.key");
-        let server_ca = dir.path().join("client-ca.crt");
-        let guest_ca = dir.path().join("guest-ca.crt");
-        let guest_cert = dir.path().join("guest.crt");
-        let guest_key = dir.path().join("guest.key");
-        for path in [
-            &server_cert,
-            &server_key,
-            &server_ca,
-            &guest_ca,
-            &guest_cert,
-            &guest_key,
-        ] {
-            std::fs::write(path, path.display().to_string()).unwrap();
-        }
-
-        let config = Config::new(Some(TlsConfig {
-            cert_path: server_cert.clone(),
-            key_path: server_key.clone(),
-            client_ca_path: server_ca,
-            allow_unauthenticated: false,
-        }))
-        .with_grpc_endpoint("https://gateway.internal:8443");
-        let vm_config = VmComputeConfig {
-            guest_tls_ca: Some(guest_ca.clone()),
-            guest_tls_cert: Some(guest_cert.clone()),
-            guest_tls_key: Some(guest_key.clone()),
-            ..Default::default()
-        };
-
-        let guest_paths = vm_compute_driver_guest_tls_paths(&config, &vm_config)
-            .unwrap()
-            .expect("https vm endpoints should pass an explicit guest client bundle");
-        assert_eq!(guest_paths.ca, guest_ca);
-        assert_eq!(guest_paths.cert, guest_cert);
-        assert_eq!(guest_paths.key, guest_key);
-        assert_ne!(guest_paths.cert, server_cert);
-        assert_ne!(guest_paths.key, server_key);
     }
 }

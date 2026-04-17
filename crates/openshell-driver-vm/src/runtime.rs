@@ -12,8 +12,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::embedded_runtime;
-use crate::ffi;
+use crate::{GUEST_SSH_PORT, embedded_runtime, ffi};
 
 pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
 
@@ -30,6 +29,18 @@ pub struct VmLaunchConfig {
     pub port_map: Vec<String>,
     pub log_level: u32,
     pub console_output: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PortMapping {
+    host_port: u16,
+    guest_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GvproxyPortPlan {
+    ssh_port: u16,
+    forwarded_ports: Vec<String>,
 }
 
 pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
@@ -53,6 +64,7 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
     vm.set_root(&config.rootfs)?;
     vm.set_workdir(&config.workdir)?;
 
+    let mut forwarded_port_map = config.port_map.clone();
     let mut gvproxy_guard = None;
     let mut gvproxy_api_sock = None;
     if !config.port_map.is_empty() {
@@ -78,7 +90,8 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
         let gvproxy_log_file = std::fs::File::create(&gvproxy_log)
             .map_err(|e| format!("create gvproxy log {}: {e}", gvproxy_log.display()))?;
 
-        let ssh_port = pick_gvproxy_ssh_port()?;
+        let gvproxy_ports = plan_gvproxy_ports(&config.port_map)?;
+        forwarded_port_map = gvproxy_ports.forwarded_ports;
 
         #[cfg(target_os = "linux")]
         let (gvproxy_net_flag, gvproxy_net_url) =
@@ -95,7 +108,7 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
             .arg("-listen")
             .arg(format!("unix://{}", api_sock.display()))
             .arg("-ssh-port")
-            .arg(ssh_port.to_string())
+            .arg(gvproxy_ports.ssh_port.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(gvproxy_log_file)
@@ -161,7 +174,7 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
             install_signal_forwarding(pid);
 
             let port_forward_result = if let Some(api_sock) = gvproxy_api_sock.as_ref() {
-                expose_port_map(api_sock, &config.port_map)
+                expose_port_map(api_sock, &forwarded_port_map)
             } else {
                 Ok(())
             };
@@ -468,17 +481,11 @@ fn expose_port_map(api_sock: &Path, port_map: &[String]) -> Result<(), String> {
     let guest_ip = "192.168.127.2";
 
     for pm in port_map {
-        let parts: Vec<&str> = pm.split(':').collect();
-        let (host_port, guest_port) = match parts.as_slice() {
-            [host, guest] => (*host, *guest),
-            [port] => (*port, *port),
-            _ => {
-                return Err(format!("invalid port mapping '{pm}'"));
-            }
-        };
+        let mapping = parse_port_mapping(pm)?;
 
         let expose_body = format!(
-            r#"{{"local":":{host_port}","remote":"{guest_ip}:{guest_port}","protocol":"tcp"}}"#
+            r#"{{"local":":{}","remote":"{guest_ip}:{}","protocol":"tcp"}}"#,
+            mapping.host_port, mapping.guest_port
         );
 
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -495,7 +502,8 @@ fn expose_port_map(api_sock: &Path, port_map: &[String]) -> Result<(), String> {
                 }
                 Err(err) => {
                     return Err(format!(
-                        "failed to forward port {host_port} via gvproxy: {err}"
+                        "failed to forward port {} via gvproxy: {err}",
+                        mapping.host_port
                     ));
                 }
             }
@@ -543,6 +551,49 @@ fn gvproxy_expose(api_sock: &Path, body: &str) -> Result<(), String> {
             response.lines().next().unwrap_or("<empty>")
         )),
     }
+}
+
+fn plan_gvproxy_ports(port_map: &[String]) -> Result<GvproxyPortPlan, String> {
+    let mut ssh_port = None;
+    let mut forwarded_ports = Vec::with_capacity(port_map.len());
+
+    for pm in port_map {
+        let mapping = parse_port_mapping(pm)?;
+        if ssh_port.is_none() && mapping.guest_port == GUEST_SSH_PORT && mapping.host_port >= 1024 {
+            ssh_port = Some(mapping.host_port);
+            continue;
+        }
+        forwarded_ports.push(pm.clone());
+    }
+
+    Ok(GvproxyPortPlan {
+        ssh_port: match ssh_port {
+            Some(port) => port,
+            None => pick_gvproxy_ssh_port()?,
+        },
+        forwarded_ports,
+    })
+}
+
+fn parse_port_mapping(pm: &str) -> Result<PortMapping, String> {
+    let parts: Vec<&str> = pm.split(':').collect();
+    let (host, guest) = match parts.as_slice() {
+        [host, guest] => (*host, *guest),
+        [port] => (*port, *port),
+        _ => return Err(format!("invalid port mapping '{pm}'")),
+    };
+
+    let host_port = host
+        .parse::<u16>()
+        .map_err(|_| format!("invalid port mapping '{pm}'"))?;
+    let guest_port = guest
+        .parse::<u16>()
+        .map_err(|_| format!("invalid port mapping '{pm}'"))?;
+
+    Ok(PortMapping {
+        host_port,
+        guest_port,
+    })
 }
 
 fn wait_for_path(path: &Path, timeout: Duration, label: &str) -> Result<(), String> {
@@ -788,4 +839,39 @@ fn check_kvm_access() -> Result<(), String> {
         .map_err(|e| {
             format!("cannot open /dev/kvm: {e}\nKVM access is required to run microVMs on Linux.")
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_gvproxy_ports_reuses_sandbox_ssh_mapping() {
+        let plan = plan_gvproxy_ports(&["64739:2222".to_string()]).expect("plan should succeed");
+
+        assert_eq!(plan.ssh_port, 64739);
+        assert!(plan.forwarded_ports.is_empty());
+    }
+
+    #[test]
+    fn plan_gvproxy_ports_keeps_non_ssh_mappings_for_forwarder() {
+        let plan = plan_gvproxy_ports(&["64739:8080".to_string()]).expect("plan should succeed");
+
+        assert_ne!(plan.ssh_port, 64739);
+        assert_eq!(plan.forwarded_ports, vec!["64739:8080".to_string()]);
+    }
+
+    #[test]
+    fn plan_gvproxy_ports_ignores_privileged_host_ports_for_direct_ssh() {
+        let plan = plan_gvproxy_ports(&["22:2222".to_string()]).expect("plan should succeed");
+
+        assert_ne!(plan.ssh_port, 22);
+        assert_eq!(plan.forwarded_ports, vec!["22:2222".to_string()]);
+    }
+
+    #[test]
+    fn parse_port_mapping_rejects_invalid_entries() {
+        let err = parse_port_mapping("bad:mapping").expect_err("invalid mapping should fail");
+        assert!(err.contains("invalid port mapping"));
+    }
 }
