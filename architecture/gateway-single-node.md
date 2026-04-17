@@ -242,7 +242,7 @@ Layers added:
 4. Kubernetes manifests: `deploy/kube/manifests/*.yaml` -> `/opt/openshell/manifests/`
 
 Bundled manifests include:
-
+- `openshell-namespace.yaml` (declares the `openshell` namespace so it exists as soon as the k3s API is ready, before Helm reconciliation — see [Manifest injection](#manifest-injection))
 - `openshell-helmchart.yaml` (OpenShell Helm chart auto-deploy)
 - `envoy-gateway-helmchart.yaml` (Envoy Gateway for Gateway API)
 - `agent-sandbox.yaml`
@@ -272,6 +272,8 @@ Writes `/etc/rancher/k3s/registries.yaml` from `REGISTRY_HOST`, `REGISTRY_ENDPOI
 ### Manifest injection
 
 Copies bundled manifests from `/opt/openshell/manifests/` to `/var/lib/rancher/k3s/server/manifests/`. This is needed because the volume mount on `/var/lib/rancher/k3s` overwrites any files baked into that path at image build time.
+
+`openshell-namespace.yaml` is a standalone `kind: Namespace` manifest that k3s applies as soon as its API server is ready — before the Helm controller reconciles `openshell-helmchart.yaml`. `reconcile_pki` in `crates/openshell-bootstrap` waits up to ~115s for the namespace before reading or writing PKI secrets; declaring it here decouples that wait from Helm controller latency on slow networks or cold boots. `createNamespace: true` on the HelmChart is retained as an idempotent fallback — Helm's `--create-namespace` coexists with pre-existing namespaces without error.
 
 ### Image configuration overrides
 

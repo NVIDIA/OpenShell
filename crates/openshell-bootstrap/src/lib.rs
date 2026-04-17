@@ -1217,4 +1217,28 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn openshell_namespace_manifest_is_present_and_well_formed() {
+        // Guards `wait_for_namespace("openshell")` against silent regressions
+        // in the auto-applied manifest that k3s uses to create the namespace
+        // before Helm reconciles the openshell chart.
+        const MANIFEST: &str =
+            include_str!("../../../deploy/kube/manifests/openshell-namespace.yaml");
+        assert!(
+            MANIFEST.contains("apiVersion: v1"),
+            "manifest must target core/v1:
+{MANIFEST}"
+        );
+        assert!(
+            MANIFEST.contains("kind: Namespace"),
+            "manifest must declare kind: Namespace:
+{MANIFEST}"
+        );
+        assert!(
+            MANIFEST.contains("name: openshell"),
+            "manifest must name the openshell namespace:
+{MANIFEST}"
+        );
+    }
 }

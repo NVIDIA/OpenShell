@@ -439,7 +439,7 @@ MANIFEST_DEST="${ROOTFS_DIR}/opt/openshell/manifests"
 echo "==> Injecting Kubernetes manifests..."
 mkdir -p "${MANIFEST_DEST}"
 
-for manifest in openshell-helmchart.yaml agent-sandbox.yaml; do
+for manifest in openshell-namespace.yaml openshell-helmchart.yaml agent-sandbox.yaml; do
     if [ -f "${MANIFEST_SRC}/${manifest}" ]; then
         cp "${MANIFEST_SRC}/${manifest}" "${MANIFEST_DEST}/"
         echo "    ${manifest}"

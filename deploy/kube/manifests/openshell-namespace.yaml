@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Explicit Namespace manifest for the OpenShell control plane.
+#
+# k3s auto-applies every YAML in /var/lib/rancher/k3s/server/manifests/ as
+# soon as its API server is ready, before the Helm controller reconciles
+# the HelmChart CR. Declaring the namespace here guarantees it exists
+# within seconds of cluster startup and decouples PKI bootstrap
+# (wait_for_namespace in openshell-bootstrap) from Helm controller
+# reconciliation latency — which on slow networks or cold boots can
+# exceed the 115-second wait budget.
+#
+# The companion openshell-helmchart.yaml retains `createNamespace: true`
+# as an idempotent fallback; pre-existing namespaces coexist with Helm's
+# --create-namespace flag without error.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshell
