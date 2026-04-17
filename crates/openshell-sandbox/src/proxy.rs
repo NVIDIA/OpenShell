@@ -1735,15 +1735,21 @@ fn query_allowed_ips(
     }
 }
 
+/// Canonicalize the request-target for inference pattern detection.
+///
+/// Falls back to the raw path on canonicalization error: the request is then
+/// routed through the normal forward path, where `rest.rs::parse_http_request`
+/// will reject it properly. Returning the raw path here prevents a crafted
+/// target from bypassing inference routing without our detection logic having
+/// to implement a second, duplicate error-response surface.
 fn normalize_inference_path(path: &str) -> String {
-    if let Some(scheme_idx) = path.find("://") {
-        let after_scheme = &path[scheme_idx + 3..];
-        if let Some(path_start) = after_scheme.find('/') {
-            return after_scheme[path_start..].to_string();
-        }
-        return "/".to_string();
+    match crate::l7::path::canonicalize_request_target(
+        path,
+        &crate::l7::path::CanonicalizeOptions::default(),
+    ) {
+        Ok((canon, _)) => canon.path,
+        Err(_) => path.to_string(),
     }
-    path.to_string()
 }
 
 /// Extract the hostname from an absolute-form URI used in plain HTTP proxy requests.
@@ -2154,11 +2160,44 @@ async fn handle_forward_proxy(
             secret_resolver: secret_resolver.clone(),
         };
 
-        let (target_path, query_params) = crate::l7::rest::parse_target_query(&path)
-            .unwrap_or_else(|_| (path.clone(), std::collections::HashMap::new()));
+        let (canonical_path, query_params) = match crate::l7::path::canonicalize_request_target(
+            &path,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        ) {
+            Ok((canon, query)) => {
+                let params = match query.as_deref() {
+                    Some(q) => crate::l7::rest::parse_query_params(q).unwrap_or_default(),
+                    None => std::collections::HashMap::new(),
+                };
+                (canon.path, params)
+            }
+            Err(e) => {
+                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Fail)
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                    .message(format!(
+                        "FORWARD_L7 rejecting non-canonical request-target: {e}"
+                    ))
+                    .build();
+                ocsf_emit!(event);
+                respond(
+                    client,
+                    &build_json_error_response(
+                        400,
+                        "Bad Request",
+                        "invalid_request_target",
+                        "request-target must be canonical",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
         let request_info = crate::l7::L7RequestInfo {
             action: method.to_string(),
-            target: target_path,
+            target: canonical_path,
             query_params,
         };
 

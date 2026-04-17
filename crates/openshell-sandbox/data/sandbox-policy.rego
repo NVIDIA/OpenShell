@@ -328,6 +328,13 @@ method_matches(actual, expected) if {
 }
 
 # Path matching: "**" matches everything; otherwise glob.match with "/" delimiter.
+#
+# INVARIANT: `input.request.path` is canonicalized by the sandbox before
+# policy evaluation — percent-decoded, dot-segments resolved, doubled
+# slashes collapsed, `;params` stripped, `%2F` rejected (unless an
+# endpoint opts in). Patterns here must therefore match canonical paths;
+# do not attempt defensive matching against `..` or `%2e%2e` — those
+# inputs are rejected at the L7 parser boundary before this rule runs.
 path_matches(_, "**") if true
 
 path_matches(actual, pattern) if {

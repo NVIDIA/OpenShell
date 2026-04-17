@@ -149,15 +149,68 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
 
     // Determine body framing from headers
     let body_length = parse_body_length(header_str)?;
-    let (path, query_params) = parse_target_query(&target)?;
+
+    // Canonicalize the request-target before OPA evaluation AND before
+    // forwarding. This closes the parser-differential between the policy
+    // engine (which matches on segments) and the upstream server (which
+    // resolves `..` / `%2e%2e` / `%2F` before dispatch). If canonicalization
+    // fails, the request is rejected as a protocol violation — consistent
+    // with how duplicate Content-Length, bare LF, and invalid UTF-8 are
+    // handled by this parser.
+    let (canonical, raw_query) = crate::l7::path::canonicalize_request_target(
+        &target,
+        &crate::l7::path::CanonicalizeOptions::default(),
+    )
+    .map_err(|e| miette!("HTTP request-target rejected: {e}"))?;
+
+    let query_params = match raw_query.as_deref() {
+        Some(q) => parse_query_params(q)?,
+        None => HashMap::new(),
+    };
+
+    if canonical.rewritten {
+        buf = rewrite_request_line_target(
+            &buf,
+            &method,
+            &canonical.path,
+            raw_query.as_deref(),
+            version,
+        )?;
+    }
 
     Ok(Some(L7Request {
         action: method,
-        target: path,
+        target: canonical.path,
         query_params,
         raw_header: buf, // exact header bytes up to and including \r\n\r\n
         body_length,
     }))
+}
+
+/// Rebuild the request line in a raw HTTP header block with a canonicalized
+/// target. Called when the canonical path differs from what the client sent,
+/// so the upstream dispatches on the exact bytes the policy engine evaluated.
+fn rewrite_request_line_target(
+    raw: &[u8],
+    method: &str,
+    canonical_path: &str,
+    raw_query: Option<&str>,
+    version: &str,
+) -> Result<Vec<u8>> {
+    let eol = raw
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .ok_or_else(|| miette!("request line missing CRLF"))?;
+    let rest = &raw[eol..];
+    let new_target = match raw_query {
+        Some(q) if !q.is_empty() => format!("{canonical_path}?{q}"),
+        _ => canonical_path.to_string(),
+    };
+    let new_request_line = format!("{method} {new_target} {version}");
+    let mut out = Vec::with_capacity(new_request_line.len() + rest.len());
+    out.extend_from_slice(new_request_line.as_bytes());
+    out.extend_from_slice(rest);
+    Ok(out)
 }
 
 pub(crate) fn parse_target_query(target: &str) -> Result<(String, HashMap<String, Vec<String>>)> {
@@ -167,7 +220,7 @@ pub(crate) fn parse_target_query(target: &str) -> Result<(String, HashMap<String
     }
 }
 
-fn parse_query_params(query: &str) -> Result<HashMap<String, Vec<String>>> {
+pub(crate) fn parse_query_params(query: &str) -> Result<HashMap<String, Vec<String>>> {
     let mut params: HashMap<String, Vec<String>> = HashMap::new();
     if query.is_empty() {
         return Ok(params);

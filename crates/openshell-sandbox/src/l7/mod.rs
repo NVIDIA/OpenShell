@@ -9,6 +9,7 @@
 //! evaluated against OPA policy, and either forwarded or denied.
 
 pub mod inference;
+pub mod path;
 pub mod provider;
 pub mod relay;
 pub mod rest;
