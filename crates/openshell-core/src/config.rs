@@ -109,7 +109,7 @@ pub struct Config {
 
     /// Filesystem path where the sandbox supervisor binds its SSH Unix
     /// socket. The supervisor is passed this path via
-    /// `OPENSHELL_SSH_LISTEN_ADDR` / `--ssh-listen-addr` and connects its
+    /// `OPENSHELL_SSH_SOCKET_PATH` / `--ssh-socket-path` and connects its
     /// relay bridge to the same path.
     ///
     /// When the gateway orchestrates sandboxes that each live in their own

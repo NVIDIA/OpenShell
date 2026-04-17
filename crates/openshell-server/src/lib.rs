@@ -259,7 +259,7 @@ async fn build_compute_runtime(
                 // RelayStream bridge, not directly. Override via
                 // `sandbox_ssh_socket_path` in the config for deployments
                 // where multiple supervisors share a filesystem.
-                ssh_listen_addr: config.sandbox_ssh_socket_path.clone(),
+                ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
                 ssh_handshake_secret: config.ssh_handshake_secret.clone(),
                 ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
                 client_tls_secret_name: config.client_tls_secret_name.clone(),

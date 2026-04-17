@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
-        ssh_listen_addr: args.sandbox_ssh_socket_path,
+        ssh_socket_path: args.sandbox_ssh_socket_path,
         ssh_handshake_secret: args.ssh_handshake_secret,
         ssh_handshake_skew_secs: args.ssh_handshake_skew_secs,
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),

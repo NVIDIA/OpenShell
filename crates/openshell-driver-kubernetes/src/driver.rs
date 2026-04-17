@@ -5,7 +5,7 @@
 
 use crate::config::KubernetesComputeConfig;
 use futures::{Stream, StreamExt, TryStreamExt};
-use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node, Pod};
+use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
@@ -147,8 +147,8 @@ impl KubernetesComputeDriver {
         &self.config.namespace
     }
 
-    pub fn ssh_listen_addr(&self) -> &str {
-        &self.config.ssh_listen_addr
+    pub fn ssh_socket_path(&self) -> &str {
+        &self.config.ssh_socket_path
     }
 
     pub const fn ssh_handshake_skew_secs(&self) -> u64 {
@@ -294,7 +294,7 @@ impl KubernetesComputeDriver {
             &sandbox.id,
             &sandbox.name,
             &self.config.grpc_endpoint,
-            self.ssh_listen_addr(),
+            self.ssh_socket_path(),
             self.ssh_handshake_secret(),
             self.ssh_handshake_skew_secs(),
             &self.config.client_tls_secret_name,
@@ -862,7 +862,7 @@ fn sandbox_to_k8s_spec(
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
-    ssh_listen_addr: &str,
+    ssh_socket_path: &str,
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
     client_tls_secret_name: &str,
@@ -902,7 +902,7 @@ fn sandbox_to_k8s_spec(
                     sandbox_id,
                     sandbox_name,
                     grpc_endpoint,
-                    ssh_listen_addr,
+                    ssh_socket_path,
                     ssh_handshake_secret,
                     ssh_handshake_skew_secs,
                     &spec.environment,
@@ -948,7 +948,7 @@ fn sandbox_to_k8s_spec(
                 sandbox_id,
                 sandbox_name,
                 grpc_endpoint,
-                ssh_listen_addr,
+                ssh_socket_path,
                 ssh_handshake_secret,
                 ssh_handshake_skew_secs,
                 spec_env,
@@ -973,7 +973,7 @@ fn sandbox_template_to_k8s(
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
-    ssh_listen_addr: &str,
+    ssh_socket_path: &str,
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
     spec_environment: &std::collections::HashMap<String, String>,
@@ -1026,7 +1026,7 @@ fn sandbox_template_to_k8s(
         sandbox_id,
         sandbox_name,
         grpc_endpoint,
-        ssh_listen_addr,
+        ssh_socket_path,
         ssh_handshake_secret,
         ssh_handshake_skew_secs,
         !client_tls_secret_name.is_empty(),
@@ -1176,7 +1176,7 @@ fn build_env_list(
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
-    ssh_listen_addr: &str,
+    ssh_socket_path: &str,
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
@@ -1189,7 +1189,7 @@ fn build_env_list(
         sandbox_id,
         sandbox_name,
         grpc_endpoint,
-        ssh_listen_addr,
+        ssh_socket_path,
         ssh_handshake_secret,
         ssh_handshake_skew_secs,
         tls_enabled,
@@ -1211,7 +1211,7 @@ fn apply_required_env(
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
-    ssh_listen_addr: &str,
+    ssh_socket_path: &str,
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
@@ -1220,8 +1220,8 @@ fn apply_required_env(
     upsert_env(env, "OPENSHELL_SANDBOX", sandbox_name);
     upsert_env(env, "OPENSHELL_ENDPOINT", grpc_endpoint);
     upsert_env(env, "OPENSHELL_SANDBOX_COMMAND", "sleep infinity");
-    if !ssh_listen_addr.is_empty() {
-        upsert_env(env, "OPENSHELL_SSH_LISTEN_ADDR", ssh_listen_addr);
+    if !ssh_socket_path.is_empty() {
+        upsert_env(env, "OPENSHELL_SSH_SOCKET_PATH", ssh_socket_path);
     }
     upsert_env(env, "OPENSHELL_SSH_HANDSHAKE_SECRET", ssh_handshake_secret);
     upsert_env(

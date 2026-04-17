@@ -69,9 +69,11 @@ struct Args {
     #[arg(long, default_value = "warn", env = "OPENSHELL_LOG_LEVEL")]
     log_level: String,
 
-    /// SSH listen address for sandbox access.
-    #[arg(long, env = "OPENSHELL_SSH_LISTEN_ADDR")]
-    ssh_listen_addr: Option<String>,
+    /// Filesystem path to the Unix socket the embedded SSH daemon binds.
+    /// The supervisor bridges `RelayStream` traffic from the gateway onto
+    /// this socket; nothing else should connect to it.
+    #[arg(long, env = "OPENSHELL_SSH_SOCKET_PATH")]
+    ssh_socket_path: Option<String>,
 
     /// Shared secret for gateway-to-sandbox SSH handshake.
     #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
@@ -219,7 +221,7 @@ async fn main() -> Result<()> {
         args.openshell_endpoint,
         args.policy_rules,
         args.policy_data,
-        args.ssh_listen_addr,
+        args.ssh_socket_path,
         args.ssh_handshake_secret,
         args.ssh_handshake_skew_secs,
         args.health_check,

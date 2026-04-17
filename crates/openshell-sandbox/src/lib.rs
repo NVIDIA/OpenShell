@@ -209,7 +209,7 @@ pub async fn run_sandbox(
     openshell_endpoint: Option<String>,
     policy_rules: Option<String>,
     policy_data: Option<String>,
-    ssh_listen_addr: Option<String>,
+    ssh_socket_path: Option<String>,
     ssh_handshake_secret: Option<String>,
     ssh_handshake_skew_secs: u64,
     _health_check: bool,
@@ -604,13 +604,9 @@ pub async fn run_sandbox(
         }
     });
 
-    // The `ssh_listen_addr` argument now carries a filesystem path to the
-    // Unix socket the embedded SSH daemon listens on. Kept as an `Option<String>`
-    // for backwards compatibility with the CLI flag name and env var.
     let ssh_socket_path: Option<std::path::PathBuf> =
-        ssh_listen_addr.as_ref().map(std::path::PathBuf::from);
-    if let Some(listen_addr) = ssh_listen_addr {
-        let listen_path = std::path::PathBuf::from(listen_addr);
+        ssh_socket_path.map(std::path::PathBuf::from);
+    if let Some(listen_path) = ssh_socket_path.clone() {
         let policy_clone = policy.clone();
         let workdir_clone = workdir.clone();
         let _ = ssh_handshake_secret; // retained in the signature for compat; unused
