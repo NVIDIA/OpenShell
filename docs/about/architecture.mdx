@@ -30,9 +30,7 @@ Every outbound connection from agent code passes through the same decision path:
 2. The proxy inside the sandbox intercepts the connection and identifies which binary opened it.
 3. If the target is `https://inference.local`, the proxy handles it as managed inference before policy evaluation. OpenShell strips sandbox-supplied credentials, injects the configured backend credentials, and forwards the request to the managed model endpoint.
 4. For every other destination, the proxy queries the policy engine with the destination, port, and calling binary.
-5. The policy engine returns one of the decisions in the following table.
-
-   The policy engine evaluates decisions in this order. Explicit deny takes precedence over allow, and allow takes precedence over implicit deny.
+5. The policy engine returns one of the following decisions. Explicit deny takes precedence over allow, and allow takes precedence over implicit deny.
 
    | Decision | When it applies | Outcome |
    |---|---|---|
