@@ -417,11 +417,252 @@ jobs:
           retention-days: 5
 
   # ---------------------------------------------------------------------------
+  # Build openshell-driver-vm binary (Linux — native on each arch)
+  # ---------------------------------------------------------------------------
+  build-driver-vm-linux:
+    name: Build Driver VM (Linux ${{ matrix.arch }})
+    needs: [compute-versions, download-kernel-runtime, build-rootfs]
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            runner: build-arm64
+            target: aarch64-unknown-linux-gnu
+            platform: linux-aarch64
+            guest_arch: aarch64
+          - arch: amd64
+            runner: build-amd64
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+            guest_arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
+      OPENSHELL_IMAGE_TAG: dev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Install tools
+        run: mise install
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: driver-vm-linux-${{ matrix.arch }}
+          cache-directories: .cache/sccache
+          cache-targets: "true"
+
+      - name: Install zstd
+        run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
+
+      - name: Download kernel runtime tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-runtime-tarballs
+          path: runtime-download/
+
+      - name: Download rootfs tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: rootfs-${{ matrix.arch }}
+          path: rootfs-download/
+
+      - name: Stage compressed runtime for embedding
+        run: |
+          set -euo pipefail
+          COMPRESSED_DIR="${PWD}/target/vm-runtime-compressed"
+          mkdir -p "$COMPRESSED_DIR"
+
+          # Extract kernel runtime tarball and re-compress individual files
+          EXTRACT_DIR=$(mktemp -d)
+          zstd -d "runtime-download/vm-runtime-${{ matrix.platform }}.tar.zst" --stdout \
+            | tar -xf - -C "$EXTRACT_DIR"
+
+          echo "Extracted runtime files:"
+          ls -lah "$EXTRACT_DIR"
+
+          for file in "$EXTRACT_DIR"/*; do
+            [ -f "$file" ] || continue
+            name=$(basename "$file")
+            [ "$name" = "provenance.json" ] && continue
+            zstd -19 -f -q -T0 -o "${COMPRESSED_DIR}/${name}.zst" "$file"
+          done
+
+          # Copy rootfs tarball (already zstd-compressed)
+          cp rootfs-download/rootfs.tar.zst "${COMPRESSED_DIR}/rootfs.tar.zst"
+
+          echo "Staged compressed artifacts:"
+          ls -lah "$COMPRESSED_DIR"
+
+      - name: Scope workspace to driver-vm crates
+        run: |
+          set -euo pipefail
+          sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-driver-vm", "crates/openshell-core"]|' Cargo.toml
+
+      - name: Patch workspace version
+        if: needs.compute-versions.outputs.cargo_version != ''
+        run: |
+          set -euo pipefail
+          sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
+
+      - name: Build openshell-driver-vm
+        run: |
+          set -euo pipefail
+          OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${PWD}/target/vm-runtime-compressed" \
+            mise x -- cargo build --release -p openshell-driver-vm
+
+      - name: sccache stats
+        if: always()
+        run: mise x -- sccache --show-stats
+
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          tar -czf "artifacts/openshell-driver-vm-${{ matrix.target }}.tar.gz" \
+            -C target/release openshell-driver-vm
+          ls -lh artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: driver-vm-linux-${{ matrix.arch }}
+          path: artifacts/*.tar.gz
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # Build openshell-driver-vm binary (macOS ARM64 via osxcross)
+  # ---------------------------------------------------------------------------
+  build-driver-vm-macos:
+    name: Build Driver VM (macOS)
+    needs: [compute-versions, download-kernel-runtime, build-rootfs]
+    runs-on: build-amd64
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/setup-buildx
+
+      - name: Install zstd
+        run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
+
+      - name: Download kernel runtime tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-runtime-tarballs
+          path: runtime-download/
+
+      - name: Download rootfs tarball (arm64)
+        uses: actions/download-artifact@v4
+        with:
+          name: rootfs-arm64
+          path: rootfs-download/
+
+      - name: Prepare compressed runtime directory
+        run: |
+          set -euo pipefail
+          COMPRESSED_DIR="${PWD}/target/vm-runtime-compressed-macos"
+          mkdir -p "$COMPRESSED_DIR"
+
+          # Extract the darwin runtime tarball and re-compress for embedding.
+          # The macOS embedded.rs expects: libkrun.dylib.zst, libkrunfw.5.dylib.zst, gvproxy.zst
+          EXTRACT_DIR=$(mktemp -d)
+          zstd -d "runtime-download/vm-runtime-darwin-aarch64.tar.zst" --stdout \
+            | tar -xf - -C "$EXTRACT_DIR"
+
+          echo "Extracted darwin runtime files:"
+          ls -lah "$EXTRACT_DIR"
+
+          for file in "$EXTRACT_DIR"/*; do
+            [ -f "$file" ] || continue
+            name=$(basename "$file")
+            [ "$name" = "provenance.json" ] && continue
+            zstd -19 -f -q -T0 -o "${COMPRESSED_DIR}/${name}.zst" "$file"
+          done
+
+          # The macOS VM guest is always Linux ARM64, so use the arm64 rootfs
+          cp rootfs-download/rootfs.tar.zst "${COMPRESSED_DIR}/rootfs.tar.zst"
+
+          echo "Staged macOS compressed artifacts:"
+          ls -lah "$COMPRESSED_DIR"
+
+      - name: Build macOS binary via Docker (osxcross)
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file deploy/docker/Dockerfile.driver-vm-macos \
+            --build-arg OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" \
+            --build-arg OPENSHELL_IMAGE_TAG=dev \
+            --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
+            --build-context vm-runtime-compressed="${PWD}/target/vm-runtime-compressed-macos" \
+            --target binary \
+            --output type=local,dest=out/ \
+            .
+
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          tar -czf artifacts/openshell-driver-vm-aarch64-apple-darwin.tar.gz \
+            -C out openshell-driver-vm
+          ls -lh artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: driver-vm-macos
+          path: artifacts/*.tar.gz
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
   # Upload all VM binaries to the vm-dev rolling release
   # ---------------------------------------------------------------------------
   release-vm-dev:
     name: Release VM Dev
-    needs: [build-vm-linux, build-vm-macos]
+    needs:
+      - build-vm-linux
+      - build-vm-macos
+      - build-driver-vm-linux
+      - build-driver-vm-macos
     runs-on: build-amd64
     timeout-minutes: 10
     steps:
@@ -430,7 +671,7 @@ jobs:
       - name: Download all VM binary artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: vm-*
+          pattern: "{vm-*,driver-vm-*}"
           path: release/
           merge-multiple: true
 
@@ -438,21 +679,30 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-final
-          # Only include the openshell-vm binary tarballs, not kernel runtime
-          cp release/openshell-vm-*.tar.gz release-final/
-          count=$(ls release-final/openshell-vm-*.tar.gz 2>/dev/null | wc -l)
-          if [ "$count" -eq 0 ]; then
-            echo "ERROR: No VM binary tarballs found in release/" >&2
+          # Include both openshell-vm and openshell-driver-vm binary tarballs.
+          # Exclude kernel runtime tarballs (they come from release-vm-kernel.yml).
+          for pattern in 'openshell-vm-*.tar.gz' 'openshell-driver-vm-*.tar.gz'; do
+            for file in release/${pattern}; do
+              [ -f "$file" ] || continue
+              cp "$file" release-final/
+            done
+          done
+          vm_count=$(ls release-final/openshell-vm-*.tar.gz 2>/dev/null | wc -l)
+          driver_count=$(ls release-final/openshell-driver-vm-*.tar.gz 2>/dev/null | wc -l)
+          if [ "$vm_count" -eq 0 ] || [ "$driver_count" -eq 0 ]; then
+            echo "ERROR: Missing binary tarballs (openshell-vm=${vm_count}, openshell-driver-vm=${driver_count})" >&2
+            ls -la release/ || true
             exit 1
           fi
-          echo "Release artifacts (${count} binaries):"
+          echo "Release artifacts (openshell-vm=${vm_count}, openshell-driver-vm=${driver_count}):"
           ls -lh release-final/
 
       - name: Generate checksums
         run: |
           set -euo pipefail
           cd release-final
-          sha256sum openshell-vm-*.tar.gz > vm-binary-checksums-sha256.txt
+          sha256sum openshell-vm-*.tar.gz openshell-driver-vm-*.tar.gz \
+            > vm-binary-checksums-sha256.txt
           cat vm-binary-checksums-sha256.txt
 
       - name: Ensure vm-dev tag exists
@@ -479,7 +729,11 @@ jobs:
             }
             // Delete old VM binary assets (keep kernel runtime assets)
             for (const asset of release.data.assets) {
-              if (asset.name.startsWith('openshell-vm-') || asset.name === 'vm-binary-checksums-sha256.txt') {
+              if (
+                asset.name.startsWith('openshell-vm-') ||
+                asset.name.startsWith('openshell-driver-vm-') ||
+                asset.name === 'vm-binary-checksums-sha256.txt'
+              ) {
                 core.info(`Deleting stale asset: ${asset.name}`);
                 await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
               }
@@ -520,6 +774,18 @@ jobs:
             | Linux x86_64 | `openshell-vm-x86_64-unknown-linux-gnu.tar.gz` |
             | macOS ARM64 | `openshell-vm-aarch64-apple-darwin.tar.gz` |
 
+            ### VM Compute Driver Binaries
+
+            `openshell-driver-vm` binaries with embedded kernel runtime and sandbox rootfs.
+            Launched by the gateway when `--drivers=vm` is configured. Rebuilt on every
+            push to main alongside the openshell-vm binaries.
+
+            | Platform | Artifact |
+            |----------|----------|
+            | Linux ARM64 | `openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz` |
+            | Linux x86_64 | `openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz` |
+            | macOS ARM64 | `openshell-driver-vm-aarch64-apple-darwin.tar.gz` |
+
             ### Quick install
 
             ```
@@ -532,4 +798,7 @@ jobs:
             release-final/openshell-vm-aarch64-unknown-linux-gnu.tar.gz
             release-final/openshell-vm-x86_64-unknown-linux-gnu.tar.gz
             release-final/openshell-vm-aarch64-apple-darwin.tar.gz
+            release-final/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
+            release-final/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
+            release-final/openshell-driver-vm-aarch64-apple-darwin.tar.gz
             release-final/vm-binary-checksums-sha256.txt

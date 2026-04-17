@@ -72,6 +72,7 @@ graph TD
 | Persistence: Postgres | `crates/openshell-server/src/persistence/postgres.rs` | `PostgresStore` with sqlx |
 | Compute runtime | `crates/openshell-server/src/compute/mod.rs` | `ComputeRuntime`, gateway-owned sandbox lifecycle orchestration over a compute backend |
 | Compute driver: Kubernetes | `crates/openshell-driver-kubernetes/src/driver.rs` | Kubernetes CRD create/delete, endpoint resolution, watch stream, pod template translation |
+| Compute driver: VM | `crates/openshell-driver-vm/src/driver.rs` | Per-sandbox microVM create/delete, localhost endpoint resolution, watch stream, supervisor-only guest boot |
 | Sandbox index | `crates/openshell-server/src/sandbox_index.rs` | `SandboxIndex` -- in-memory name/pod-to-id correlation |
 | Watch bus | `crates/openshell-server/src/sandbox_watch.rs` | `SandboxWatchBus` -- in-memory broadcast for persisted sandbox updates |
 | Tracing bus | `crates/openshell-server/src/tracing_bus.rs` | `TracingLogBus` -- captures tracing events keyed by `sandbox_id` |
@@ -96,7 +97,9 @@ The gateway boots in `main()` (`crates/openshell-server/src/main.rs`) and procee
 4. **Build `Config`** -- Assembles a `openshell_core::Config` from the parsed arguments.
 5. **Call `run_server()`** (`crates/openshell-server/src/lib.rs`):
    1. Connect to the persistence store (`Store::connect`), which auto-detects SQLite vs Postgres from the URL prefix and runs migrations.
-   2. Create `ComputeRuntime` with an in-process `ComputeDriverService` backed by `KubernetesComputeDriver`, so the gateway calls the `openshell.compute.v1.ComputeDriver` RPC surface even without transport.
+   2. Create `ComputeRuntime` with a `ComputeDriver` implementation selected by `OPENSHELL_DRIVERS`:
+      - `kubernetes` wraps `KubernetesComputeDriver` in `ComputeDriverService`, so the gateway uses the `openshell.compute.v1.ComputeDriver` RPC surface even without transport.
+      - `vm` spawns the sibling `openshell-driver-vm` binary as a local compute-driver process, connects to it over a Unix domain socket, and keeps the libkrun/rootfs runtime out of the gateway binary.
    3. Build `ServerState` (shared via `Arc<ServerState>` across all handlers).
    4. **Spawn background tasks**:
       - `ComputeRuntime::spawn_watchers` -- consumes the compute-driver watch stream, republishes platform events, and runs a periodic `ListSandboxes` snapshot reconcile so the store-backed public sandbox reads stay aligned with the compute driver.
@@ -123,6 +126,15 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 | `--sandbox-namespace` | `OPENSHELL_SANDBOX_NAMESPACE` | `default` | Kubernetes namespace for sandbox CRDs |
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | None | Default container image for sandbox pods |
 | `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | None | gRPC endpoint reachable from within the cluster (for sandbox callbacks) |
+| `--drivers` | `OPENSHELL_DRIVERS` | `kubernetes` | Compute backend to use. Current options are `kubernetes` and `vm`. |
+| `--vm-driver-state-dir` | `OPENSHELL_VM_DRIVER_STATE_DIR` | `target/openshell-vm-driver` | Host directory for VM sandbox rootfs, console logs, and runtime state |
+| `--vm-compute-driver-bin` | `OPENSHELL_VM_COMPUTE_DRIVER_BIN` | sibling `openshell-driver-vm` binary | Local VM compute-driver process spawned by the gateway |
+| `--vm-krun-log-level` | `OPENSHELL_VM_KRUN_LOG_LEVEL` | `1` | libkrun log level for VM helper processes |
+| `--vm-driver-vcpus` | `OPENSHELL_VM_DRIVER_VCPUS` | `2` | Default vCPU count for VM sandboxes |
+| `--vm-driver-mem-mib` | `OPENSHELL_VM_DRIVER_MEM_MIB` | `2048` | Default memory allocation for VM sandboxes in MiB |
+| `--vm-tls-ca` | `OPENSHELL_VM_TLS_CA` | None | CA cert copied into VM guests for gateway mTLS |
+| `--vm-tls-cert` | `OPENSHELL_VM_TLS_CERT` | None | Client cert copied into VM guests for gateway mTLS |
+| `--vm-tls-key` | `OPENSHELL_VM_TLS_KEY` | None | Client private key copied into VM guests for gateway mTLS |
 | `--ssh-gateway-host` | `OPENSHELL_SSH_GATEWAY_HOST` | `127.0.0.1` | Public hostname returned in SSH session responses |
 | `--ssh-gateway-port` | `OPENSHELL_SSH_GATEWAY_PORT` | `8080` | Public port returned in SSH session responses |
 | `--ssh-connect-path` | `OPENSHELL_SSH_CONNECT_PATH` | `/connect/ssh` | HTTP path for SSH CONNECT/upgrade |
@@ -543,6 +555,17 @@ The Kubernetes driver also watches namespace-scoped Kubernetes `Event` objects a
 - Other event kinds are ignored.
 
 Matched events are published to the `PlatformEventBus` as `SandboxStreamEvent::Event` payloads.
+
+## VM Driver
+
+`VmDriver` (`crates/openshell-driver-vm/src/driver.rs`) is served by the standalone `openshell-driver-vm` process. The gateway spawns that binary on demand, talks to it over the internal `openshell.compute.v1.ComputeDriver` gRPC contract via a Unix domain socket, and keeps VM runtime dependencies out of `openshell-server`.
+
+- **Create**: The VM driver process allocates a localhost SSH port, prepares a sandbox-specific rootfs from its own embedded `rootfs.tar.zst`, injects an explicitly configured guest mTLS bundle when the gateway callback endpoint is `https://`, then re-execs itself in a hidden helper mode that loads libkrun directly and boots `/srv/openshell-vm-sandbox-init.sh`.
+- **Networking**: The helper starts an embedded `gvproxy`, wires it into libkrun as virtio-net, and exposes the single inbound SSH port (`host_port:2222`) through gvproxy’s forwarder API. This keeps VM launch inside `openshell-driver-vm` without depending on the `openshell-vm` binary.
+- **Gateway callback**: The guest init script configures `eth0` for gvproxy networking, prefers the configured `OPENSHELL_GRPC_ENDPOINT`, and falls back to host aliases or the gvproxy gateway IP (`192.168.127.1`) when local hostname resolution is unavailable on macOS.
+- **Guest boot**: The sandbox guest runs a minimal init script that skips k3s and starts `openshell-sandbox` directly as PID 1 inside the VM.
+- **Endpoint resolution**: Returns `127.0.0.1:<allocated-port>` for SSH/exec transport.
+- **Watch stream**: Emits provisioning, ready, error, deleting, deleted, and platform-event updates so the gateway store remains the durable source of truth.
 
 ## Sandbox Index
 

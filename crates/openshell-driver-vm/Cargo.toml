@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-driver-vm"
+description = "MicroVM compute driver for OpenShell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "openshell_driver_vm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openshell-driver-vm"
+path = "src/main.rs"
+
+[dependencies]
+openshell-core = { path = "../openshell-core" }
+
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["transport"] }
+prost-types = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
+nix = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+miette = { workspace = true }
+url = { workspace = true }
+libc = "0.2"
+libloading = "0.8"
+tar = "0.4"
+zstd = "0.13"
+
+[lints]
+workspace = true

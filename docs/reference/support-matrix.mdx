@@ -10,7 +10,7 @@ This page lists the platform, software, runtime, and kernel requirements for run
 
 ## Supported Platforms
 
-OpenShell publishes multi-architecture container images for `linux/amd64` and `linux/arm64`. The CLI is supported on the following host platforms:
+OpenShell publishes multi-architecture container images for `linux/amd64` and `linux/arm64`. The CLI and standalone gateway binary are supported on the following host platforms:
 
 | Platform                         | Architecture          | Status    |
 | -------------------------------- | --------------------- | --------- |
@@ -18,6 +18,18 @@ OpenShell publishes multi-architecture container images for `linux/amd64` and `l
 | Linux (Debian/Ubuntu)            | aarch64 (arm64)       | Supported |
 | macOS (Docker Desktop)           | Apple Silicon (arm64) | Supported |
 | Windows (WSL 2 + Docker Desktop) | x86_64                | Experimental  |
+
+## Standalone Gateway Binary
+
+OpenShell publishes standalone `openshell-gateway` release assets for manual download on these platforms:
+
+| Platform              | Artifact pattern                               |
+| --------------------- | ---------------------------------------------- |
+| Linux x86_64 (amd64)  | `openshell-gateway-x86_64-unknown-linux-gnu`   |
+| Linux aarch64 (arm64) | `openshell-gateway-aarch64-unknown-linux-gnu`  |
+| macOS Apple Silicon   | `openshell-gateway-aarch64-apple-darwin`       |
+
+These artifacts are attached to GitHub releases. `openshell gateway start` continues to use the published cluster and gateway container images.
 
 ## Software Prerequisites
 

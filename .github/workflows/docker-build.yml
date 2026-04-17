@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       component:
-        description: "Component to build (gateway, cluster)"
+        description: "Component to build (gateway, supervisor, cluster)"
         required: true
         type: string
       timeout-minutes:
@@ -93,4 +93,4 @@ jobs:
           # Enable dev-settings feature for test settings (dummy_bool, dummy_int)
           # used by e2e tests.
           EXTRA_CARGO_FEATURES: openshell-core/dev-settings
-        run: mise run --no-prepare docker:build:${{ inputs.component }}
+        run: mise run --no-prepare build:docker:${{ inputs.component }}

@@ -112,11 +112,15 @@ fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
     // --- Socket domain blocks ---
-    let mut blocked_domains = vec![libc::AF_PACKET, libc::AF_BLUETOOTH, libc::AF_VSOCK];
+    let mut blocked_domains = vec![
+        libc::AF_PACKET,
+        libc::AF_BLUETOOTH,
+        libc::AF_VSOCK,
+        libc::AF_NETLINK,
+    ];
     if !allow_inet {
         blocked_domains.push(libc::AF_INET);
         blocked_domains.push(libc::AF_INET6);
-        blocked_domains.push(libc::AF_NETLINK);
     }
 
     for domain in blocked_domains {

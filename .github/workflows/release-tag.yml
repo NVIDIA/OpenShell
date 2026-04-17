@@ -69,6 +69,13 @@ jobs:
       component: gateway
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
+  build-supervisor:
+    needs: [compute-versions]
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: supervisor
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+
   build-cluster:
     needs: [compute-versions]
     uses: ./.github/workflows/docker-build.yml
@@ -85,7 +92,7 @@ jobs:
 
   tag-ghcr-release:
     name: Tag GHCR Images for Release
-    needs: [compute-versions, build-gateway, build-cluster, e2e]
+    needs: [compute-versions, build-gateway, build-supervisor, build-cluster, e2e]
     runs-on: build-amd64
     timeout-minutes: 10
     steps:
@@ -97,7 +104,7 @@ jobs:
           set -euo pipefail
           REGISTRY="ghcr.io/nvidia/openshell"
           VERSION="${{ needs.compute-versions.outputs.semver }}"
-          for component in gateway cluster; do
+          for component in gateway supervisor cluster; do
             echo "Tagging ${REGISTRY}/${component}:${{ github.sha }} as ${VERSION} and latest..."
             docker buildx imagetools create \
               --prefer-index=false \
@@ -305,11 +312,6 @@ jobs:
           # Override z3-sys default (stdc++) so Rust links the matching runtime.
           echo "CXXSTDLIB=c++" >> "$GITHUB_ENV"
 
-      - name: Scope workspace to CLI crates
-        run: |
-          set -euo pipefail
-          sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-cli", "crates/openshell-core", "crates/openshell-bootstrap", "crates/openshell-policy", "crates/openshell-prover", "crates/openshell-providers", "crates/openshell-tui"]|' Cargo.toml
-
       - name: Patch workspace version
         if: needs.compute-versions.outputs.cargo_version != ''
         run: |
@@ -403,11 +405,249 @@ jobs:
           retention-days: 5
 
   # ---------------------------------------------------------------------------
+  # Build standalone gateway binaries (Linux GNU — native on each arch)
+  # ---------------------------------------------------------------------------
+  build-gateway-binary-linux:
+    name: Build Gateway Binary (Linux ${{ matrix.arch }})
+    needs: [compute-versions]
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: build-amd64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runner: build-arm64
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Install tools
+        run: mise install
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: gateway-binary-gnu-${{ matrix.arch }}
+          cache-directories: .cache/sccache
+          cache-targets: "true"
+
+      - name: Patch workspace version
+        if: needs.compute-versions.outputs.cargo_version != ''
+        run: |
+          set -euo pipefail
+          sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
+
+      - name: Build ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-server
+
+      - name: Verify packaged binary
+        run: |
+          set -euo pipefail
+          OUTPUT="$(target/${{ matrix.target }}/release/openshell-gateway --version)"
+          echo "$OUTPUT"
+          grep -q '^openshell-gateway ' <<<"$OUTPUT"
+
+      - name: sccache stats
+        if: always()
+        run: mise x -- sccache --show-stats
+
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          tar -czf artifacts/openshell-gateway-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release openshell-gateway
+          ls -lh artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-binary-linux-${{ matrix.arch }}
+          path: artifacts/*.tar.gz
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # Build standalone supervisor binaries (Linux GNU — native on each arch)
+  # ---------------------------------------------------------------------------
+  build-supervisor-binary-linux:
+    name: Build Supervisor Binary (Linux ${{ matrix.arch }})
+    needs: [compute-versions]
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: build-amd64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runner: build-arm64
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Install tools
+        run: mise install
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: supervisor-binary-gnu-${{ matrix.arch }}
+          cache-directories: .cache/sccache
+          cache-targets: "true"
+
+      - name: Patch workspace version
+        if: needs.compute-versions.outputs.cargo_version != ''
+        run: |
+          set -euo pipefail
+          sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
+
+      - name: Build ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-sandbox --bin openshell-sandbox
+
+      - name: Verify packaged binary
+        run: |
+          set -euo pipefail
+          OUTPUT="$(target/${{ matrix.target }}/release/openshell-sandbox --version)"
+          echo "$OUTPUT"
+          grep -q '^openshell-sandbox ' <<<"$OUTPUT"
+
+      - name: sccache stats
+        if: always()
+        run: mise x -- sccache --show-stats
+
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          tar -czf artifacts/openshell-sandbox-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release openshell-sandbox
+          ls -lh artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: supervisor-binary-linux-${{ matrix.arch }}
+          path: artifacts/*.tar.gz
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # Build standalone gateway binary (macOS aarch64 via osxcross)
+  # ---------------------------------------------------------------------------
+  build-gateway-binary-macos:
+    name: Build Gateway Binary (macOS)
+    needs: [compute-versions]
+    runs-on: build-amd64
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/setup-buildx
+
+      - name: Build macOS binary via Docker
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file deploy/docker/Dockerfile.gateway-macos \
+            --build-arg OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" \
+            --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
+            --target binary \
+            --output type=local,dest=out/ \
+            .
+
+      - name: Verify packaged binary shape
+        run: |
+          set -euo pipefail
+          test -x out/openshell-gateway
+
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          tar -czf artifacts/openshell-gateway-aarch64-apple-darwin.tar.gz \
+            -C out openshell-gateway
+          ls -lh artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-binary-macos
+          path: artifacts/*.tar.gz
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
   # Create a tagged GitHub Release with CLI binaries and wheels
   # ---------------------------------------------------------------------------
   release:
     name: Release
-    needs: [compute-versions, build-cli-linux, build-cli-macos, build-python-wheels-linux, build-python-wheel-macos, tag-ghcr-release]
+    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, tag-ghcr-release]
     runs-on: build-amd64
     timeout-minutes: 10
     outputs:
@@ -421,6 +661,20 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: cli-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download gateway binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gateway-binary-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download supervisor binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: supervisor-binary-*
           path: release/
           merge-multiple: true
 
@@ -443,8 +697,21 @@ jobs:
         run: |
           set -euo pipefail
           cd release
-          sha256sum *.tar.gz *.whl > openshell-checksums-sha256.txt
+          sha256sum \
+            openshell-x86_64-unknown-linux-musl.tar.gz \
+            openshell-aarch64-unknown-linux-musl.tar.gz \
+            openshell-aarch64-apple-darwin.tar.gz \
+            *.whl > openshell-checksums-sha256.txt
           cat openshell-checksums-sha256.txt
+          sha256sum \
+            openshell-gateway-x86_64-unknown-linux-gnu.tar.gz \
+            openshell-gateway-aarch64-unknown-linux-gnu.tar.gz \
+            openshell-gateway-aarch64-apple-darwin.tar.gz > openshell-gateway-checksums-sha256.txt
+          cat openshell-gateway-checksums-sha256.txt
+          sha256sum \
+            openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz \
+            openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz > openshell-sandbox-checksums-sha256.txt
+          cat openshell-sandbox-checksums-sha256.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -466,8 +733,15 @@ jobs:
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-apple-darwin.tar.gz
+            release/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-gateway-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-gateway-aarch64-apple-darwin.tar.gz
+            release/openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz
             release/*.whl
             release/openshell-checksums-sha256.txt
+            release/openshell-gateway-checksums-sha256.txt
+            release/openshell-sandbox-checksums-sha256.txt
 
   publish-fern-docs:
     name: Publish Fern Docs

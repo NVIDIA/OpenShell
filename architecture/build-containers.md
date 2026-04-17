@@ -9,7 +9,7 @@ The gateway runs the control plane API server. It is deployed as a StatefulSet i
 - **Docker target**: `gateway` in `deploy/docker/Dockerfile.images`
 - **Registry**: `ghcr.io/nvidia/openshell/gateway:latest`
 - **Pulled when**: Cluster startup (the Helm chart triggers the pull)
-- **Entrypoint**: `openshell-server --port 8080` (gRPC + HTTP, mTLS)
+- **Entrypoint**: `openshell-gateway --port 8080` (gRPC + HTTP, mTLS)
 
 ## Cluster (`openshell/cluster`)
 
@@ -20,6 +20,18 @@ The cluster image is a single-container Kubernetes distribution that bundles the
 - **Pulled when**: `openshell gateway start`
 
 The supervisor binary (`openshell-sandbox`) is built by the shared `supervisor-builder` stage in `deploy/docker/Dockerfile.images` and placed at `/opt/openshell/bin/openshell-sandbox`. It is exposed to sandbox pods at runtime via a read-only `hostPath` volume mount — it is not baked into sandbox images.
+
+## Standalone Gateway Binary
+
+OpenShell also publishes a standalone `openshell-gateway` binary as a GitHub release asset.
+
+- **Source crate**: `crates/openshell-server`
+- **Artifact name**: `openshell-gateway-<target>.tar.gz`
+- **Targets**: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`
+- **Release workflows**: `.github/workflows/release-dev.yml`, `.github/workflows/release-tag.yml`
+- **Installer**: None yet. The binary is a manual-download asset.
+
+Both the standalone artifact and the deployed container image use the `openshell-gateway` binary.
 
 ## Python Wheels
 

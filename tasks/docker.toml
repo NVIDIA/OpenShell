@@ -11,19 +11,9 @@ depends = [
 ]
 hide = true
 
-["docker:build"]
-description = "Alias for build:docker"
-depends = ["build:docker"]
-hide = true
-
 ["build:docker:ci"]
 description = "Build the CI Docker image"
 run = "tasks/scripts/docker-build-ci.sh"
-hide = true
-
-["docker:build:ci"]
-description = "Alias for build:docker:ci"
-depends = ["build:docker:ci"]
 hide = true
 
 ["build:docker:gateway"]
@@ -31,14 +21,19 @@ description = "Build the gateway Docker image"
 run = "tasks/scripts/docker-build-image.sh gateway"
 hide = true
 
-["docker:build:gateway"]
-description = "Alias for build:docker:gateway"
-depends = ["build:docker:gateway"]
+["build:docker:supervisor"]
+description = "Build the supervisor Docker image"
+run = "tasks/scripts/docker-build-image.sh supervisor"
 hide = true
 
 ["build:docker:cluster"]
 description = "Build the k3s cluster image (component images pulled at runtime from registry)"
 run = "tasks/scripts/docker-build-image.sh cluster"
+hide = true
+
+["docker:build:gateway"]
+description = "Alias for build:docker:gateway"
+depends = ["build:docker:gateway"]
 hide = true
 
 ["docker:build:cluster"]
@@ -49,11 +44,6 @@ hide = true
 ["build:docker:cluster:multiarch"]
 description = "Build multi-arch cluster image and push to a registry"
 run = "tasks/scripts/docker-publish-multiarch.sh"
-hide = true
-
-["docker:build:cluster:multiarch"]
-description = "Alias for build:docker:cluster:multiarch"
-depends = ["build:docker:cluster:multiarch"]
 hide = true
 
 ["docker:cleanup"]

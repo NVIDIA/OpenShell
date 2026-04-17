@@ -7,7 +7,8 @@ use super::{
 use openshell_core::Result;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
-use std::path::PathBuf;
+
+static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
 #[derive(Debug, Clone)]
 pub struct PostgresStore {
@@ -26,13 +27,7 @@ impl PostgresStore {
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("migrations")
-            .join("postgres");
-        let migrator = sqlx::migrate::Migrator::new(path)
-            .await
-            .map_err(|e| map_migrate_error(&e))?;
-        migrator
+        POSTGRES_MIGRATOR
             .run(&self.pool)
             .await
             .map_err(|e| map_migrate_error(&e))

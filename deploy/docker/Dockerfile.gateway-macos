@@ -1,0 +1,105 @@
+# syntax=docker/dockerfile:1.6
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Cross-compile the standalone openshell-gateway binary for macOS aarch64
+# (Apple Silicon) using the osxcross toolchain.
+
+ARG OSXCROSS_IMAGE=crazymax/osxcross:latest
+
+FROM ${OSXCROSS_IMAGE} AS osxcross
+
+FROM python:3.12-slim AS builder
+
+ARG CARGO_TARGET_CACHE_SCOPE=default
+
+ENV PATH="/root/.cargo/bin:/usr/local/bin:/osxcross/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/osxcross/lib"
+
+COPY --from=osxcross /osxcross /osxcross
+
+RUN SDKROOT="$(echo /osxcross/SDK/MacOSX*.sdk)" && ln -sfn "${SDKROOT}" /osxcross/SDK/MacOSX.sdk
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    clang \
+    cmake \
+    curl \
+    libclang-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88.0
+
+RUN ln -sf /osxcross/bin/arm64-apple-darwin25.1-ld /usr/local/bin/arm64-apple-macosx-ld
+
+RUN rustup target add aarch64-apple-darwin
+
+WORKDIR /build
+
+ENV CC_aarch64_apple_darwin=oa64-clang
+ENV CXX_aarch64_apple_darwin=oa64-clang++
+ENV AR_aarch64_apple_darwin=aarch64-apple-darwin25.1-ar
+ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=oa64-clang
+ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_AR=aarch64-apple-darwin25.1-ar
+ENV SDKROOT=/osxcross/SDK/MacOSX.sdk
+ENV MACOSX_DEPLOYMENT_TARGET=13.3
+ENV CFLAGS_aarch64_apple_darwin=--target=arm64-apple-macosx\ -mmacosx-version-min=13.3
+ENV CXXFLAGS_aarch64_apple_darwin=--target=arm64-apple-macosx\ -mmacosx-version-min=13.3
+ENV BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin=--target=arm64-apple-macosx\ -isysroot\ ${SDKROOT}
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/openshell-core/Cargo.toml crates/openshell-core/Cargo.toml
+COPY crates/openshell-driver-kubernetes/Cargo.toml crates/openshell-driver-kubernetes/Cargo.toml
+COPY crates/openshell-policy/Cargo.toml crates/openshell-policy/Cargo.toml
+COPY crates/openshell-router/Cargo.toml crates/openshell-router/Cargo.toml
+COPY crates/openshell-server/Cargo.toml crates/openshell-server/Cargo.toml
+COPY crates/openshell-core/build.rs crates/openshell-core/build.rs
+COPY proto/ proto/
+
+RUN sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-server", "crates/openshell-core", "crates/openshell-driver-kubernetes", "crates/openshell-policy", "crates/openshell-router"]|' Cargo.toml
+
+RUN mkdir -p crates/openshell-core/src \
+             crates/openshell-driver-kubernetes/src \
+             crates/openshell-policy/src \
+             crates/openshell-router/src \
+             crates/openshell-server/src && \
+    touch crates/openshell-core/src/lib.rs && \
+    touch crates/openshell-driver-kubernetes/src/lib.rs && \
+    printf 'fn main() {}\n' > crates/openshell-driver-kubernetes/src/main.rs && \
+    touch crates/openshell-policy/src/lib.rs && \
+    touch crates/openshell-router/src/lib.rs && \
+    touch crates/openshell-server/src/lib.rs && \
+    printf 'fn main() {}\n' > crates/openshell-server/src/main.rs
+
+RUN --mount=type=cache,id=cargo-registry-gateway-macos,sharing=locked,target=/root/.cargo/registry \
+    --mount=type=cache,id=cargo-git-gateway-macos,sharing=locked,target=/root/.cargo/git \
+    --mount=type=cache,id=cargo-target-gateway-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
+    cargo build --release --target aarch64-apple-darwin -p openshell-server 2>/dev/null || true
+
+COPY crates/ crates/
+
+RUN touch crates/openshell-core/src/lib.rs \
+    crates/openshell-driver-kubernetes/src/lib.rs \
+    crates/openshell-driver-kubernetes/src/main.rs \
+    crates/openshell-policy/src/lib.rs \
+    crates/openshell-router/src/lib.rs \
+    crates/openshell-server/src/lib.rs \
+    crates/openshell-server/src/main.rs \
+    crates/openshell-core/build.rs \
+    proto/*.proto
+
+ARG OPENSHELL_CARGO_VERSION
+RUN --mount=type=cache,id=cargo-registry-gateway-macos,sharing=locked,target=/root/.cargo/registry \
+    --mount=type=cache,id=cargo-git-gateway-macos,sharing=locked,target=/root/.cargo/git \
+    --mount=type=cache,id=cargo-target-gateway-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
+    if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
+      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
+    fi && \
+    cargo build --release --target aarch64-apple-darwin -p openshell-server && \
+    cp target/aarch64-apple-darwin/release/openshell-gateway /openshell-gateway
+
+FROM scratch AS binary
+COPY --from=builder /openshell-gateway /openshell-gateway

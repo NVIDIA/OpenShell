@@ -14,6 +14,7 @@ use std::str::FromStr;
 #[serde(rename_all = "snake_case")]
 pub enum ComputeDriverKind {
     Kubernetes,
+    Vm,
     Podman,
 }
 
@@ -22,6 +23,7 @@ impl ComputeDriverKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Kubernetes => "kubernetes",
+            Self::Vm => "vm",
             Self::Podman => "podman",
         }
     }
@@ -39,9 +41,10 @@ impl FromStr for ComputeDriverKind {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
             "kubernetes" => Ok(Self::Kubernetes),
+            "vm" => Ok(Self::Vm),
             "podman" => Ok(Self::Podman),
             other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, podman"
+                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, podman"
             )),
         }
     }
@@ -357,6 +360,10 @@ mod tests {
         assert_eq!(
             "kubernetes".parse::<ComputeDriverKind>().unwrap(),
             ComputeDriverKind::Kubernetes
+        );
+        assert_eq!(
+            "vm".parse::<ComputeDriverKind>().unwrap(),
+            ComputeDriverKind::Vm
         );
         assert_eq!(
             "podman".parse::<ComputeDriverKind>().unwrap(),

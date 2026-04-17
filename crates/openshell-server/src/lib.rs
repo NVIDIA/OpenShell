@@ -8,8 +8,19 @@
 //! - HTTP health endpoints
 //! - Protocol multiplexing (gRPC + HTTP on same port)
 //! - mTLS support
+//!
+//! TODO(driver-abstraction): `build_compute_runtime` still switches on
+//! [`ComputeDriverKind`] and calls driver-specific constructors
+//! ([`ComputeRuntime::new_kubernetes`], [`compute::vm::spawn`] +
+//! [`ComputeRuntime::new_remote_vm`]). Once we have a generalized compute
+//! driver interface, the per-arm wiring here should collapse to a single
+//! driver-agnostic path that asks each registered driver to produce a
+//! [`Channel`](tonic::transport::Channel) and hands the rest of the gateway a
+//! uniform [`ComputeRuntime`]. The remaining VM plumbing now lives in
+//! [`compute::vm`]; keep this file driver-agnostic going forward.
 
 mod auth;
+pub mod cli;
 mod compute;
 mod grpc;
 mod http;
@@ -28,10 +39,11 @@ use openshell_core::{ComputeDriverKind, Config, Error, Result};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 
-use compute::ComputeRuntime;
+use compute::{ComputeRuntime, VmComputeConfig};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
@@ -119,7 +131,11 @@ impl ServerState {
 /// # Errors
 ///
 /// Returns an error if the server fails to start or encounters a fatal error.
-pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Result<()> {
+pub async fn run_server(
+    config: Config,
+    vm_config: VmComputeConfig,
+    tracing_log_bus: TracingLogBus,
+) -> Result<()> {
     let database_url = config.database_url.trim();
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
@@ -136,6 +152,7 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
     let sandbox_watch_bus = SandboxWatchBus::new();
     let compute = build_compute_runtime(
         &config,
+        &vm_config,
         store.clone(),
         sandbox_index.clone(),
         sandbox_watch_bus.clone(),
@@ -152,8 +169,8 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
     ));
 
     state.compute.spawn_watchers();
-    ssh_tunnel::spawn_session_reaper(store.clone(), std::time::Duration::from_secs(3600));
-    supervisor_session::spawn_relay_reaper(state.clone(), std::time::Duration::from_secs(30));
+    ssh_tunnel::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
+    supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
@@ -220,6 +237,7 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
 
 async fn build_compute_runtime(
     config: &Config,
+    vm_config: &VmComputeConfig,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -249,6 +267,19 @@ async fn build_compute_runtime(
         )
         .await
         .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
+        ComputeDriverKind::Vm => {
+            let (channel, driver_process) = compute::vm::spawn(config, vm_config).await?;
+            ComputeRuntime::new_remote_vm(
+                channel,
+                Some(driver_process),
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
         ComputeDriverKind::Podman => Err(Error::config(
             "compute driver 'podman' is not implemented yet",
         )),
@@ -260,7 +291,7 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
         [] => Err(Error::config(
             "at least one compute driver must be configured",
         )),
-        [driver @ ComputeDriverKind::Kubernetes] => Ok(*driver),
+        [driver @ ComputeDriverKind::Kubernetes] | [driver @ ComputeDriverKind::Vm] => Ok(*driver),
         [ComputeDriverKind::Podman] => Err(Error::config(
             "compute driver 'podman' is not implemented yet",
         )),
@@ -335,6 +366,15 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("compute driver 'podman' is not implemented yet")
+        );
+    }
+
+    #[test]
+    fn configured_compute_driver_accepts_vm() {
+        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Vm]);
+        assert_eq!(
+            configured_compute_driver(&config).unwrap(),
+            ComputeDriverKind::Vm
         );
     }
 }
