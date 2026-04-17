@@ -5466,8 +5466,6 @@ mod tests {
                 message: "Another GPU sandbox may already be using the available GPU.".to_string(),
                 last_transition_time: String::new(),
             }],
-            driver_name: String::new(),
-            driver_config: None,
         };
 
         assert_eq!(
@@ -5490,8 +5488,6 @@ mod tests {
                 message: "Sandbox scheduled".to_string(),
                 last_transition_time: String::new(),
             }],
-            driver_name: String::new(),
-            driver_config: None,
         };
 
         assert!(ready_false_condition_message(Some(&status)).is_none());

@@ -132,6 +132,9 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 | `--vm-krun-log-level` | `OPENSHELL_VM_KRUN_LOG_LEVEL` | `1` | libkrun log level for VM helper processes |
 | `--vm-driver-vcpus` | `OPENSHELL_VM_DRIVER_VCPUS` | `2` | Default vCPU count for VM sandboxes |
 | `--vm-driver-mem-mib` | `OPENSHELL_VM_DRIVER_MEM_MIB` | `2048` | Default memory allocation for VM sandboxes in MiB |
+| `--vm-tls-ca` | `OPENSHELL_VM_TLS_CA` | None | CA cert copied into VM guests for gateway mTLS |
+| `--vm-tls-cert` | `OPENSHELL_VM_TLS_CERT` | None | Client cert copied into VM guests for gateway mTLS |
+| `--vm-tls-key` | `OPENSHELL_VM_TLS_KEY` | None | Client private key copied into VM guests for gateway mTLS |
 | `--ssh-gateway-host` | `OPENSHELL_SSH_GATEWAY_HOST` | `127.0.0.1` | Public hostname returned in SSH session responses |
 | `--ssh-gateway-port` | `OPENSHELL_SSH_GATEWAY_PORT` | `8080` | Public port returned in SSH session responses |
 | `--ssh-connect-path` | `OPENSHELL_SSH_CONNECT_PATH` | `/connect/ssh` | HTTP path for SSH CONNECT/upgrade |
@@ -557,7 +560,7 @@ Matched events are published to the `PlatformEventBus` as `SandboxStreamEvent::E
 
 `VmDriver` (`crates/openshell-driver-vm/src/driver.rs`) is served by the standalone `openshell-driver-vm` process. The gateway spawns that binary on demand, talks to it over the internal `openshell.compute.v1.ComputeDriver` gRPC contract via a Unix domain socket, and keeps VM runtime dependencies out of `openshell-server`.
 
-- **Create**: The VM driver process allocates a localhost SSH port, prepares a sandbox-specific rootfs from its own embedded `rootfs.tar.zst`, injects guest TLS material when the gateway callback endpoint is `https://`, then re-execs itself in a hidden helper mode that loads libkrun directly and boots `/srv/openshell-vm-sandbox-init.sh`.
+- **Create**: The VM driver process allocates a localhost SSH port, prepares a sandbox-specific rootfs from its own embedded `rootfs.tar.zst`, injects an explicitly configured guest mTLS bundle when the gateway callback endpoint is `https://`, then re-execs itself in a hidden helper mode that loads libkrun directly and boots `/srv/openshell-vm-sandbox-init.sh`.
 - **Networking**: The helper starts an embedded `gvproxy`, wires it into libkrun as virtio-net, and exposes the single inbound SSH port (`host_port:2222`) through gvproxy’s forwarder API. This keeps VM launch inside `openshell-driver-vm` without depending on the `openshell-vm` binary.
 - **Gateway callback**: The guest init script configures `eth0` for gvproxy networking, prefers the configured `OPENSHELL_GRPC_ENDPOINT`, and falls back to host aliases or the gvproxy gateway IP (`192.168.127.1`) when local hostname resolution is unavailable on macOS.
 - **Guest boot**: The sandbox guest runs a minimal init script that skips k3s and starts `openshell-sandbox` directly as PID 1 inside the VM.

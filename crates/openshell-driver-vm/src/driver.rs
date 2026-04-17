@@ -60,9 +60,9 @@ pub struct VmDriverConfig {
     pub krun_log_level: u32,
     pub vcpus: u8,
     pub mem_mib: u32,
-    pub tls_ca: Option<PathBuf>,
-    pub tls_cert: Option<PathBuf>,
-    pub tls_key: Option<PathBuf>,
+    pub guest_tls_ca: Option<PathBuf>,
+    pub guest_tls_cert: Option<PathBuf>,
+    pub guest_tls_key: Option<PathBuf>,
 }
 
 impl Default for VmDriverConfig {
@@ -77,9 +77,9 @@ impl Default for VmDriverConfig {
             krun_log_level: 1,
             vcpus: DEFAULT_VCPUS,
             mem_mib: DEFAULT_MEM_MIB,
-            tls_ca: None,
-            tls_cert: None,
-            tls_key: None,
+            guest_tls_ca: None,
+            guest_tls_cert: None,
+            guest_tls_key: None,
         }
     }
 }
@@ -91,14 +91,14 @@ impl VmDriverConfig {
 
     fn tls_paths(&self) -> Result<Option<VmDriverTlsPaths>, String> {
         let provided = [
-            self.tls_ca.as_ref(),
-            self.tls_cert.as_ref(),
-            self.tls_key.as_ref(),
+            self.guest_tls_ca.as_ref(),
+            self.guest_tls_cert.as_ref(),
+            self.guest_tls_key.as_ref(),
         ];
         if provided.iter().all(Option::is_none) {
             return if self.requires_tls_materials() {
                 Err(
-                    "https:// openshell endpoint requires OPENSHELL_TLS_CA, OPENSHELL_TLS_CERT, and OPENSHELL_TLS_KEY so sandbox VMs can authenticate to the gateway"
+                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA, OPENSHELL_VM_TLS_CERT, and OPENSHELL_VM_TLS_KEY so sandbox VMs can authenticate to the gateway"
                         .to_string(),
                 )
             } else {
@@ -106,19 +106,19 @@ impl VmDriverConfig {
             };
         }
 
-        let Some(ca) = self.tls_ca.clone() else {
+        let Some(ca) = self.guest_tls_ca.clone() else {
             return Err(
-                "OPENSHELL_TLS_CA is required when TLS materials are configured".to_string(),
+                "OPENSHELL_VM_TLS_CA is required when TLS materials are configured".to_string(),
             );
         };
-        let Some(cert) = self.tls_cert.clone() else {
+        let Some(cert) = self.guest_tls_cert.clone() else {
             return Err(
-                "OPENSHELL_TLS_CERT is required when TLS materials are configured".to_string(),
+                "OPENSHELL_VM_TLS_CERT is required when TLS materials are configured".to_string(),
             );
         };
-        let Some(key) = self.tls_key.clone() else {
+        let Some(key) = self.guest_tls_key.clone() else {
             return Err(
-                "OPENSHELL_TLS_KEY is required when TLS materials are configured".to_string(),
+                "OPENSHELL_VM_TLS_KEY is required when TLS materials are configured".to_string(),
             );
         };
 
@@ -331,39 +331,42 @@ impl VmDriver {
         sandbox_name: &str,
     ) -> Result<DeleteSandboxResponse, Status> {
         let record = {
-            let mut registry = self.registry.lock().await;
-            if let Some(record) = registry.remove(sandbox_id) {
-                Some(record)
+            let registry = self.registry.lock().await;
+            if let Some((id, record)) = registry.get_key_value(sandbox_id) {
+                Some((id.clone(), record.state_dir.clone(), record.process.clone()))
             } else {
                 let matched_id = registry
                     .iter()
                     .find(|(_, record)| record.snapshot.name == sandbox_name)
                     .map(|(id, _)| id.clone());
-                matched_id.and_then(|id| registry.remove(&id))
+                matched_id.and_then(|id| {
+                    registry
+                        .get(&id)
+                        .map(|record| (id, record.state_dir.clone(), record.process.clone()))
+                })
             }
         };
 
-        let Some(record) = record else {
+        let Some((record_id, state_dir, process)) = record else {
             return Ok(DeleteSandboxResponse { deleted: false });
         };
 
-        let mut deleting_snapshot = record.snapshot.clone();
-        deleting_snapshot.status = Some(status_with_condition(
-            &record.snapshot,
-            deleting_condition(),
-            true,
-        ));
-        self.publish_snapshot(deleting_snapshot);
+        if let Some(snapshot) = self
+            .set_snapshot_condition(&record_id, deleting_condition(), true)
+            .await
+        {
+            self.publish_snapshot(snapshot);
+        }
 
         {
-            let mut process = record.process.lock().await;
+            let mut process = process.lock().await;
             process.deleting = true;
             terminate_vm_process(&mut process.child)
                 .await
                 .map_err(|err| Status::internal(format!("failed to stop vm: {err}")))?;
         }
 
-        if let Err(err) = tokio::fs::remove_dir_all(&record.state_dir).await
+        if let Err(err) = tokio::fs::remove_dir_all(&state_dir).await
             && err.kind() != std::io::ErrorKind::NotFound
         {
             return Err(Status::internal(format!(
@@ -371,7 +374,12 @@ impl VmDriver {
             )));
         }
 
-        self.publish_deleted(sandbox_id.to_string());
+        {
+            let mut registry = self.registry.lock().await;
+            registry.remove(&record_id);
+        }
+
+        self.publish_deleted(record_id);
         Ok(DeleteSandboxResponse { deleted: true })
     }
 
@@ -1113,9 +1121,9 @@ mod tests {
         let config = VmDriverConfig {
             openshell_endpoint: "https://127.0.0.1:8443".to_string(),
             ssh_handshake_secret: "secret".to_string(),
-            tls_ca: Some(PathBuf::from("/host/ca.crt")),
-            tls_cert: Some(PathBuf::from("/host/tls.crt")),
-            tls_key: Some(PathBuf::from("/host/tls.key")),
+            guest_tls_ca: Some(PathBuf::from("/host/ca.crt")),
+            guest_tls_cert: Some(PathBuf::from("/host/tls.crt")),
+            guest_tls_key: Some(PathBuf::from("/host/tls.key")),
             ..Default::default()
         };
         let sandbox = Sandbox {
@@ -1140,7 +1148,59 @@ mod tests {
         let err = config
             .tls_paths()
             .expect_err("https endpoint should require TLS materials");
-        assert!(err.contains("OPENSHELL_TLS_CA"));
+        assert!(err.contains("OPENSHELL_VM_TLS_CA"));
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_keeps_registry_entry_when_cleanup_fails() {
+        let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let driver = VmDriver {
+            config: VmDriverConfig::default(),
+            launcher_bin: PathBuf::from("openshell-driver-vm"),
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            events,
+        };
+
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let state_file = base.join("state-file");
+        std::fs::write(&state_file, "not a directory").unwrap();
+
+        insert_test_record(
+            &driver,
+            "sandbox-123",
+            state_file.clone(),
+            spawn_exited_child(),
+        )
+        .await;
+
+        let err = driver
+            .delete_sandbox("sandbox-123", "sandbox-123")
+            .await
+            .expect_err("state dir cleanup should fail for a file path");
+        assert!(err.message().contains("failed to remove state dir"));
+        assert!(driver.registry.lock().await.contains_key("sandbox-123"));
+
+        let retry_state_dir = base.join("state-dir");
+        std::fs::create_dir_all(&retry_state_dir).unwrap();
+        {
+            let mut registry = driver.registry.lock().await;
+            let record = registry.get_mut("sandbox-123").unwrap();
+            record.state_dir = retry_state_dir;
+            record.process = Arc::new(Mutex::new(VmProcess {
+                child: spawn_exited_child(),
+                deleting: false,
+            }));
+        }
+
+        let response = driver
+            .delete_sandbox("sandbox-123", "sandbox-123")
+            .await
+            .expect("delete retry should succeed once cleanup works");
+        assert!(response.deleted);
+        assert!(!driver.registry.lock().await.contains_key("sandbox-123"));
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -1258,5 +1318,44 @@ mod tests {
             "openshell-vm-driver-test-{}-{nanos}-{suffix}",
             std::process::id()
         ))
+    }
+
+    fn spawn_exited_child() -> Child {
+        Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    async fn insert_test_record(
+        driver: &VmDriver,
+        sandbox_id: &str,
+        state_dir: PathBuf,
+        child: Child,
+    ) {
+        let sandbox = Sandbox {
+            id: sandbox_id.to_string(),
+            name: sandbox_id.to_string(),
+            ..Default::default()
+        };
+        let process = Arc::new(Mutex::new(VmProcess {
+            child,
+            deleting: false,
+        }));
+
+        let mut registry = driver.registry.lock().await;
+        registry.insert(
+            sandbox_id.to_string(),
+            SandboxRecord {
+                snapshot: sandbox,
+                ssh_port: 2222,
+                state_dir,
+                process,
+            },
+        );
     }
 }

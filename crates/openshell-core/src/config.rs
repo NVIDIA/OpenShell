@@ -135,26 +135,6 @@ pub struct Config {
     /// allowing them to reach services running on the Docker host.
     #[serde(default)]
     pub host_gateway_ip: String,
-
-    /// Working directory for VM driver sandbox state.
-    #[serde(default = "default_vm_driver_state_dir")]
-    pub vm_driver_state_dir: PathBuf,
-
-    /// VM compute-driver binary spawned by the gateway.
-    #[serde(default)]
-    pub vm_compute_driver_bin: Option<PathBuf>,
-
-    /// libkrun log level used by the VM driver helper.
-    #[serde(default = "default_vm_krun_log_level")]
-    pub vm_krun_log_level: u32,
-
-    /// Default vCPU count for VM sandboxes.
-    #[serde(default = "default_vm_vcpus")]
-    pub vm_vcpus: u8,
-
-    /// Default memory allocation for VM sandboxes, in MiB.
-    #[serde(default = "default_vm_mem_mib")]
-    pub vm_mem_mib: u32,
 }
 
 /// TLS configuration.
@@ -205,11 +185,6 @@ impl Config {
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
-            vm_driver_state_dir: default_vm_driver_state_dir(),
-            vm_compute_driver_bin: None,
-            vm_krun_log_level: default_vm_krun_log_level(),
-            vm_vcpus: default_vm_vcpus(),
-            vm_mem_mib: default_vm_mem_mib(),
         }
     }
 
@@ -334,41 +309,6 @@ impl Config {
         self.host_gateway_ip = ip.into();
         self
     }
-
-    /// Set the VM driver state directory.
-    #[must_use]
-    pub fn with_vm_driver_state_dir(mut self, path: PathBuf) -> Self {
-        self.vm_driver_state_dir = path;
-        self
-    }
-
-    /// Set the VM compute-driver binary path.
-    #[must_use]
-    pub fn with_vm_compute_driver_bin(mut self, path: PathBuf) -> Self {
-        self.vm_compute_driver_bin = Some(path);
-        self
-    }
-
-    /// Set the VM helper libkrun log level.
-    #[must_use]
-    pub const fn with_vm_krun_log_level(mut self, level: u32) -> Self {
-        self.vm_krun_log_level = level;
-        self
-    }
-
-    /// Set the default VM sandbox vCPU count.
-    #[must_use]
-    pub const fn with_vm_vcpus(mut self, vcpus: u8) -> Self {
-        self.vm_vcpus = vcpus;
-        self
-    }
-
-    /// Set the default VM sandbox memory allocation.
-    #[must_use]
-    pub const fn with_vm_mem_mib(mut self, mem_mib: u32) -> Self {
-        self.vm_mem_mib = mem_mib;
-        self
-    }
 }
 
 fn default_bind_address() -> SocketAddr {
@@ -409,22 +349,6 @@ const fn default_ssh_handshake_skew_secs() -> u64 {
 
 const fn default_ssh_session_ttl_secs() -> u64 {
     86400 // 24 hours
-}
-
-fn default_vm_driver_state_dir() -> PathBuf {
-    PathBuf::from("target/openshell-vm-driver")
-}
-
-const fn default_vm_krun_log_level() -> u32 {
-    1
-}
-
-const fn default_vm_vcpus() -> u8 {
-    2
-}
-
-const fn default_vm_mem_mib() -> u32 {
-    2048
 }
 
 #[cfg(test)]

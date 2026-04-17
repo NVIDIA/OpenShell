@@ -60,4 +60,4 @@ export OPENSHELL_VM_DRIVER_STATE_DIR="${STATE_DIR}"
 export OPENSHELL_VM_COMPUTE_DRIVER_BIN="${OPENSHELL_VM_COMPUTE_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}"
 
 echo "==> Starting OpenShell server with VM compute driver"
-exec "${ROOT}/target/debug/openshell-server"
+exec "${ROOT}/target/debug/openshell-gateway"

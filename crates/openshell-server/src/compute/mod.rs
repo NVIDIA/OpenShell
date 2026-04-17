@@ -3,6 +3,10 @@
 
 //! Gateway-owned compute orchestration over a pluggable compute backend.
 
+pub mod vm;
+
+pub use vm::VmComputeConfig;
+
 use crate::grpc::policy::{SANDBOX_SETTINGS_OBJECT_TYPE, sandbox_settings_id};
 use crate::persistence::{ObjectId, ObjectName, ObjectRecord, ObjectType, Store};
 use crate::sandbox_index::SandboxIndex;

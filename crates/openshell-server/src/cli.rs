@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use crate::compute::VmComputeConfig;
 use crate::{run_server, tracing_bus::TracingLogBus};
 
 /// `OpenShell` gateway process - gRPC and HTTP server with protocol multiplexing.
@@ -116,7 +117,7 @@ struct Args {
     #[arg(
         long,
         env = "OPENSHELL_VM_DRIVER_STATE_DIR",
-        default_value = "target/openshell-vm-driver"
+        default_value_os_t = VmComputeConfig::default_state_dir()
     )]
     vm_driver_state_dir: PathBuf,
 
@@ -125,16 +126,40 @@ struct Args {
     vm_compute_driver_bin: Option<PathBuf>,
 
     /// libkrun log level used by the VM helper.
-    #[arg(long, env = "OPENSHELL_VM_KRUN_LOG_LEVEL", default_value_t = 1)]
+    #[arg(
+        long,
+        env = "OPENSHELL_VM_KRUN_LOG_LEVEL",
+        default_value_t = VmComputeConfig::default_krun_log_level()
+    )]
     vm_krun_log_level: u32,
 
     /// Default vCPU count for VM sandboxes.
-    #[arg(long, env = "OPENSHELL_VM_DRIVER_VCPUS", default_value_t = 2)]
+    #[arg(
+        long,
+        env = "OPENSHELL_VM_DRIVER_VCPUS",
+        default_value_t = VmComputeConfig::default_vcpus()
+    )]
     vm_vcpus: u8,
 
     /// Default memory allocation for VM sandboxes, in MiB.
-    #[arg(long, env = "OPENSHELL_VM_DRIVER_MEM_MIB", default_value_t = 2048)]
+    #[arg(
+        long,
+        env = "OPENSHELL_VM_DRIVER_MEM_MIB",
+        default_value_t = VmComputeConfig::default_mem_mib()
+    )]
     vm_mem_mib: u32,
+
+    /// CA certificate installed into VM sandboxes for gateway mTLS.
+    #[arg(long, env = "OPENSHELL_VM_TLS_CA")]
+    vm_tls_ca: Option<PathBuf>,
+
+    /// Client certificate installed into VM sandboxes for gateway mTLS.
+    #[arg(long, env = "OPENSHELL_VM_TLS_CERT")]
+    vm_tls_cert: Option<PathBuf>,
+
+    /// Client private key installed into VM sandboxes for gateway mTLS.
+    #[arg(long, env = "OPENSHELL_VM_TLS_KEY")]
+    vm_tls_key: Option<PathBuf>,
 
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
@@ -235,15 +260,16 @@ async fn run_from_args(args: Args) -> Result<()> {
         config = config.with_host_gateway_ip(ip);
     }
 
-    config = config
-        .with_vm_driver_state_dir(args.vm_driver_state_dir)
-        .with_vm_krun_log_level(args.vm_krun_log_level)
-        .with_vm_vcpus(args.vm_vcpus)
-        .with_vm_mem_mib(args.vm_mem_mib);
-
-    if let Some(path) = args.vm_compute_driver_bin {
-        config = config.with_vm_compute_driver_bin(path);
-    }
+    let vm_config = VmComputeConfig {
+        state_dir: args.vm_driver_state_dir,
+        compute_driver_bin: args.vm_compute_driver_bin,
+        krun_log_level: args.vm_krun_log_level,
+        vcpus: args.vm_vcpus,
+        mem_mib: args.vm_mem_mib,
+        guest_tls_ca: args.vm_tls_ca,
+        guest_tls_cert: args.vm_tls_cert,
+        guest_tls_key: args.vm_tls_key,
+    };
 
     if args.disable_tls {
         info!("TLS disabled — listening on plaintext HTTP");
@@ -253,7 +279,9 @@ async fn run_from_args(args: Args) -> Result<()> {
 
     info!(bind = %config.bind_address, "Starting OpenShell server");
 
-    run_server(config, tracing_log_bus).await.into_diagnostic()
+    run_server(config, vm_config, tracing_log_bus)
+        .await
+        .into_diagnostic()
 }
 
 fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, String> {

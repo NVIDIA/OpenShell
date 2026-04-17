@@ -78,14 +78,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS", default_value_t = 300)]
     ssh_handshake_skew_secs: u64,
 
-    #[arg(long, env = "OPENSHELL_TLS_CA")]
-    tls_ca: Option<PathBuf>,
+    #[arg(long = "guest-tls-ca", env = "OPENSHELL_VM_TLS_CA")]
+    guest_tls_ca: Option<PathBuf>,
 
-    #[arg(long, env = "OPENSHELL_TLS_CERT")]
-    tls_cert: Option<PathBuf>,
+    #[arg(long = "guest-tls-cert", env = "OPENSHELL_VM_TLS_CERT")]
+    guest_tls_cert: Option<PathBuf>,
 
-    #[arg(long, env = "OPENSHELL_TLS_KEY")]
-    tls_key: Option<PathBuf>,
+    #[arg(long = "guest-tls-key", env = "OPENSHELL_VM_TLS_KEY")]
+    guest_tls_key: Option<PathBuf>,
 
     #[arg(long, env = "OPENSHELL_VM_KRUN_LOG_LEVEL", default_value_t = 1)]
     krun_log_level: u32,
@@ -125,9 +125,9 @@ async fn main() -> Result<()> {
         krun_log_level: args.krun_log_level,
         vcpus: args.vcpus,
         mem_mib: args.mem_mib,
-        tls_ca: args.tls_ca,
-        tls_cert: args.tls_cert,
-        tls_key: args.tls_key,
+        guest_tls_ca: args.guest_tls_ca,
+        guest_tls_cert: args.guest_tls_cert,
+        guest_tls_key: args.guest_tls_key,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;
