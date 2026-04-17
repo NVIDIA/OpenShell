@@ -8,7 +8,8 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use openshell_core::forward::{
-    find_ssh_forward_pid, resolve_ssh_gateway, shell_escape, write_forward_pid,
+    build_proxy_command, find_ssh_forward_pid, resolve_ssh_gateway, shell_escape,
+    validate_ssh_session_response, write_forward_pid,
 };
 use openshell_core::proto::{CreateSshSessionRequest, GetSandboxRequest};
 use owo_colors::OwoColorize;
@@ -86,11 +87,13 @@ async fn ssh_session_config(
         .await
         .into_diagnostic()?;
     let session = response.into_inner();
+    validate_ssh_session_response(&session)
+        .map_err(|err| miette::miette!("gateway returned invalid SSH session response: {err}"))?;
 
     let exe = std::env::current_exe()
         .into_diagnostic()
         .wrap_err("failed to resolve OpenShell executable")?;
-    let exe_command = shell_escape(&exe.to_string_lossy());
+    let exe_command = exe.to_string_lossy().into_owned();
 
     // When using Cloudflare bearer auth, the SSH CONNECT must go through the
     // external tunnel endpoint (the cluster URL), not the server's internal
@@ -114,12 +117,12 @@ async fn ssh_session_config(
     let gateway_name = tls
         .gateway_name()
         .ok_or_else(|| miette::miette!("gateway name is required to build SSH proxy command"))?;
-    let proxy_command = format!(
-        "{exe_command} ssh-proxy --gateway {} --sandbox-id {} --token {} --gateway-name {}",
-        gateway_url,
-        session.sandbox_id,
-        session.token,
-        shell_escape(gateway_name),
+    let proxy_command = build_proxy_command(
+        &exe_command,
+        &gateway_url,
+        &session.sandbox_id,
+        &session.token,
+        gateway_name,
     );
 
     Ok(SshSessionConfig {
@@ -867,7 +870,11 @@ fn render_ssh_config(gateway: &str, name: &str) -> String {
     let exe = std::env::current_exe().expect("failed to resolve OpenShell executable");
     let exe = shell_escape(&exe.to_string_lossy());
 
-    let proxy_cmd = format!("{exe} ssh-proxy --gateway-name {gateway} --name {name}");
+    let proxy_cmd = format!(
+        "{exe} ssh-proxy --gateway-name {} --name {}",
+        shell_escape(gateway),
+        shell_escape(name),
+    );
     let host_alias = host_alias(name);
     format!(
         "Host {host_alias}\n    User sandbox\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    GlobalKnownHostsFile /dev/null\n    LogLevel ERROR\n    ProxyCommand {proxy_cmd}\n"

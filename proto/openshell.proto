@@ -315,26 +315,38 @@ message CreateSshSessionRequest {
 }
 
 // Create SSH session response.
+//
+// Fields are interpolated into an SSH `ProxyCommand` string that OpenSSH
+// executes through `/bin/sh -c` on the caller's workstation. Servers MUST
+// uphold the charset contract below; clients MUST reject responses that
+// violate it. The client's own escaping provides defense-in-depth, but
+// narrow charsets close injection vectors at the trust boundary.
 message CreateSshSessionResponse {
-  // Sandbox id.
+  // Sandbox id. [A-Za-z0-9._-]{1,128}.
   string sandbox_id = 1;
 
-  // Session token for the gateway tunnel.
+  // Session token for the gateway tunnel. URL-safe ASCII
+  // ([A-Za-z0-9._~+/=-]) up to 4096 bytes. No shell metacharacters or
+  // whitespace.
   string token = 2;
 
-  // Gateway host for SSH proxy connection.
+  // Gateway host for SSH proxy connection. IPv4 address, bracketed IPv6
+  // address, or DNS hostname (Punycode-encoded for IDN). Alphanumeric plus
+  // `.-:[]` only, up to 253 bytes.
   string gateway_host = 3;
 
-  // Gateway port for SSH proxy connection.
+  // Gateway port for SSH proxy connection. Must be in range 1..=65535.
   uint32 gateway_port = 4;
 
-  // Gateway scheme (http or https).
+  // Gateway scheme. Must be exactly "http" or "https".
   string gateway_scheme = 5;
 
-  // HTTP path for the CONNECT/upgrade endpoint.
+  // HTTP path for the CONNECT/upgrade endpoint. Must begin with `/`. RFC
+  // 3986 path charset only ([A-Za-z0-9._~!$&'()*+,;=:@/-] plus %HH).
+  // Must not contain `?`, `#`, whitespace, backtick, or backslash.
   string connect_path = 6;
 
-  // Optional host key fingerprint.
+  // Optional host key fingerprint. If non-empty, [A-Za-z0-9:+/=-] only.
   string host_key_fingerprint = 7;
 
   // Expiry timestamp in milliseconds since epoch. 0 means no expiry.

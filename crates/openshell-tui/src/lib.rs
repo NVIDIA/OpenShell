@@ -834,6 +834,10 @@ async fn handle_shell_connect(
             }
         }
     };
+    if let Err(err) = validate_ssh_session_response(&session) {
+        app.status_text = format!("gateway returned invalid SSH session response: {err}");
+        return;
+    }
 
     // Step 3: Resolve gateway address (handle loopback override).
     #[allow(clippy::cast_possible_truncation)]
@@ -853,11 +857,12 @@ async fn handle_shell_connect(
             return;
         }
     };
-    let exe_str = shell_escape(&exe.to_string_lossy());
-    let gateway = shell_escape(&app.gateway_name);
-    let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
-        session.sandbox_id, session.token,
+    let proxy_command = build_proxy_command(
+        &exe.to_string_lossy(),
+        &gateway_url,
+        &session.sandbox_id,
+        &session.token,
+        &app.gateway_name,
     );
     // Step 5: Build the SSH command.
     let mut command = std::process::Command::new("ssh");
@@ -977,6 +982,10 @@ async fn handle_exec_command(
             }
         }
     };
+    if let Err(err) = validate_ssh_session_response(&session) {
+        app.status_text = format!("exec: gateway returned invalid SSH session response: {err}");
+        return;
+    }
 
     // Step 2: Resolve gateway and build ProxyCommand (same as handle_shell_connect).
     #[allow(clippy::cast_possible_truncation)]
@@ -995,11 +1004,12 @@ async fn handle_exec_command(
             return;
         }
     };
-    let exe_str = shell_escape(&exe.to_string_lossy());
-    let gateway = shell_escape(&app.gateway_name);
-    let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
-        session.sandbox_id, session.token,
+    let proxy_command = build_proxy_command(
+        &exe.to_string_lossy(),
+        &gateway_url,
+        &session.sandbox_id,
+        &session.token,
+        &app.gateway_name,
     );
 
     // Step 3: Build SSH command — same flags as handle_shell_connect but with
@@ -1073,7 +1083,9 @@ async fn handle_exec_command(
 }
 
 // SSH utility functions are shared via openshell_core::forward.
-use openshell_core::forward::{resolve_ssh_gateway, shell_escape};
+use openshell_core::forward::{
+    build_proxy_command, resolve_ssh_gateway, shell_escape, validate_ssh_session_response,
+};
 
 /// Convert a `SandboxPolicy` proto into styled ratatui lines for the policy viewer.
 fn render_policy_lines(
@@ -1400,6 +1412,10 @@ async fn start_port_forwards(
             }
         }
     };
+    if let Err(err) = validate_ssh_session_response(&session) {
+        tracing::warn!("gateway returned invalid SSH session response for forwards: {err}");
+        return;
+    }
 
     // Resolve gateway address.
     #[allow(clippy::cast_possible_truncation)]
@@ -1419,11 +1435,12 @@ async fn start_port_forwards(
             return;
         }
     };
-    let exe_str = shell_escape(&exe.to_string_lossy());
-    let gateway = shell_escape(gateway_name);
-    let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
-        session.sandbox_id, session.token,
+    let proxy_command = build_proxy_command(
+        &exe.to_string_lossy(),
+        &gateway_url,
+        &session.sandbox_id,
+        &session.token,
+        gateway_name,
     );
 
     // Start a forward for each spec.
