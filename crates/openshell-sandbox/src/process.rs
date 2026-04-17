@@ -49,6 +49,22 @@ pub(crate) fn harden_child_process() -> Result<()> {
         ));
     }
 
+    // Limit process creation to prevent fork bombs. 512 processes per UID is
+    // sufficient for typical agent workloads (shell, compilers, language servers)
+    // while preventing runaway forking. Set as a hard limit so the sandbox user
+    // cannot raise it after privilege drop.
+    let nproc_limit = libc::rlimit {
+        rlim_cur: 512,
+        rlim_max: 512,
+    };
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &nproc_limit) };
+    if rc != 0 {
+        return Err(miette::miette!(
+            "Failed to set RLIMIT_NPROC: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
     #[cfg(target_os = "linux")]
     {
         let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
