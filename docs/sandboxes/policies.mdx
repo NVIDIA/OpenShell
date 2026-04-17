@@ -130,7 +130,7 @@ The following steps outline the hot-reload policy update workflow.
      --wait
 
    openshell policy update <name> \
-     --add-allow api.github.com:443:POST:/repos/*/issues \
+     --add-allow 'api.github.com:443:POST:/repos/*/issues' \
      --wait
    ```
 
@@ -252,6 +252,8 @@ host:port:METHOD:path_glob
 
 This string identifies an existing REST endpoint and the request pattern you want to add.
 
+In shell commands, quote the full `SPEC` when it contains `*` or `**` so your shell passes it literally instead of expanding it as a local file glob.
+
 | Segment | Meaning |
 |---|---|
 | `host` | Existing endpoint host. |
@@ -319,7 +321,7 @@ Use `--add-allow` after the REST endpoint already exists.
 
 ```shell
 openshell policy update demo \
-  --add-allow api.github.com:443:POST:/repos/*/issues \
+  --add-allow 'api.github.com:443:POST:/repos/*/issues' \
   --wait
 ```
 
@@ -331,7 +333,7 @@ Use `--add-deny` when you want to carve out a blocked subtree under an existing 
 
 ```shell
 openshell policy update demo \
-  --add-deny api.github.com:443:POST:/admin/** \
+  --add-deny 'api.github.com:443:POST:/admin/**' \
   --wait
 ```
 
@@ -366,7 +368,7 @@ Use `--dry-run` when you want to inspect the merged YAML before you send it to t
 
 ```shell
 openshell policy update demo \
-  --add-allow api.github.com:443:GET:/repos/** \
+  --add-allow 'api.github.com:443:GET:/repos/**' \
   --dry-run
 ```
 
@@ -418,7 +420,7 @@ Then push the updated policy as described above.
 For small changes, prefer `openshell policy update` over rewriting the full YAML:
 
 ```shell
-openshell policy update <name> --add-allow api.github.com:443:GET:/repos/** --wait
+openshell policy update <name> --add-allow 'api.github.com:443:GET:/repos/**' --wait
 ```
 
 ## Examples

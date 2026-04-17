@@ -255,7 +255,7 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   $ openshell policy get my-sandbox
   $ openshell policy set my-sandbox --policy policy.yaml
   $ openshell policy update my-sandbox --add-endpoint api.github.com:443:read-only:rest:enforce
-  $ openshell policy update my-sandbox --add-allow api.github.com:443:GET:/repos/**
+  $ openshell policy update my-sandbox --add-allow 'api.github.com:443:GET:/repos/**'
   $ openshell policy set --global --policy policy.yaml
   $ openshell policy delete --global
   $ openshell policy list my-sandbox

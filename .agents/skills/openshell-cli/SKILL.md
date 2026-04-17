@@ -423,7 +423,7 @@ When denied actions are observed:
 
 1. Prefer incremental updates for additive network changes:
    `openshell policy update work-session --add-endpoint api.github.com:443:read-only:rest:enforce --binary /usr/bin/gh --wait`
-   `openshell policy update work-session --add-allow api.github.com:443:POST:/repos/*/issues --wait`
+   `openshell policy update work-session --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
 2. Use full YAML replacement when the change is broad or touches non-network fields:
    `openshell policy get work-session --full > policy.yaml`
    Modify the policy to allow the blocked actions (use `generate-sandbox-policy` skill for content)
