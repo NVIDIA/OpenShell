@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    GatewayMessage, RelayChunk, SupervisorHeartbeat, SupervisorHello, SupervisorMessage,
+    GatewayMessage, RelayFrame, RelayInit, SupervisorHeartbeat, SupervisorHello, SupervisorMessage,
     gateway_message, supervisor_message,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,7 +30,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Size of chunks read from the local SSH socket when forwarding bytes back
 /// to the gateway over the gRPC response stream. 16 KiB matches the default
-/// HTTP/2 frame size so each `RelayChunk` fits in one frame.
+/// HTTP/2 frame size so each `RelayFrame::data` fits in one frame.
 const RELAY_CHUNK_SIZE: usize = 16 * 1024;
 
 /// Spawn the supervisor session task.
@@ -224,8 +224,8 @@ async fn handle_gateway_message(
 /// bridging that stream to the local SSH daemon.
 ///
 /// This opens a new HTTP/2 stream on the existing `Channel` — no new TCP or
-/// TLS handshake. The first `RelayChunk` we send identifies the channel via
-/// `channel_id`; subsequent chunks carry raw SSH bytes.
+/// TLS handshake. The first `RelayFrame` we send is a `RelayInit`; subsequent
+/// frames carry raw SSH bytes in `data`.
 async fn handle_relay_open(
     channel_id: &str,
     ssh_socket_path: &std::path::Path,
@@ -234,14 +234,17 @@ async fn handle_relay_open(
     let mut client = OpenShellClient::new(channel);
 
     // Outbound chunks to the gateway.
-    let (out_tx, out_rx) = mpsc::channel::<RelayChunk>(16);
+    let (out_tx, out_rx) = mpsc::channel::<RelayFrame>(16);
     let outbound = tokio_stream::wrappers::ReceiverStream::new(out_rx);
 
-    // First frame: identify the channel. No payload on this frame.
+    // First frame: identify the channel.
     out_tx
-        .send(RelayChunk {
-            channel_id: channel_id.to_string(),
-            data: Vec::new(),
+        .send(RelayFrame {
+            payload: Some(openshell_core::proto::relay_frame::Payload::Init(
+                RelayInit {
+                    channel_id: channel_id.to_string(),
+                },
+            )),
         })
         .await
         .map_err(|_| "outbound channel closed before init")?;
@@ -263,7 +266,7 @@ async fn handle_relay_open(
         "relay bridge: connected to local SSH daemon"
     );
 
-    // SSH → gRPC (out_tx): read local SSH, forward as `RelayChunk`s.
+    // SSH → gRPC (out_tx): read local SSH, forward as `RelayFrame::data`.
     let out_tx_writer = out_tx.clone();
     let ssh_to_grpc = tokio::spawn(async move {
         let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
@@ -271,9 +274,10 @@ async fn handle_relay_open(
             match ssh_r.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let chunk = RelayChunk {
-                        channel_id: String::new(),
-                        data: buf[..n].to_vec(),
+                    let chunk = RelayFrame {
+                        payload: Some(openshell_core::proto::relay_frame::Payload::Data(
+                            buf[..n].to_vec(),
+                        )),
                     };
                     if out_tx_writer.send(chunk).await.is_err() {
                         break;
@@ -287,11 +291,16 @@ async fn handle_relay_open(
     let mut inbound_err: Option<String> = None;
     while let Some(next) = inbound.next().await {
         match next {
-            Ok(chunk) => {
-                if chunk.data.is_empty() {
+            Ok(frame) => {
+                let Some(openshell_core::proto::relay_frame::Payload::Data(data)) = frame.payload
+                else {
+                    inbound_err = Some("relay inbound received non-data frame".to_string());
+                    break;
+                };
+                if data.is_empty() {
                     continue;
                 }
-                if let Err(e) = ssh_w.write_all(&chunk.data).await {
+                if let Err(e) = ssh_w.write_all(&data).await {
                     inbound_err = Some(format!("write to ssh failed: {e}"));
                     break;
                 }

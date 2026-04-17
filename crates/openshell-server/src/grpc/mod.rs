@@ -22,7 +22,7 @@ use openshell_core::proto::{
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxesRequest,
     ListSandboxesResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
-    RejectDraftChunkRequest, RejectDraftChunkResponse, RelayChunk, ReportPolicyStatusRequest,
+    RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame, ReportPolicyStatusRequest,
     ReportPolicyStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
     SandboxStreamEvent, ServiceStatus, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
     SupervisorMessage, UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest,
@@ -398,11 +398,11 @@ impl OpenShell for OpenShellService {
     }
 
     type RelayStreamStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<RelayChunk, Status>> + Send + 'static>>;
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>>;
 
     async fn relay_stream(
         &self,
-        request: Request<tonic::Streaming<RelayChunk>>,
+        request: Request<tonic::Streaming<RelayFrame>>,
     ) -> Result<Response<Self::RelayStreamStream>, Status> {
         crate::supervisor_session::handle_relay_stream(&self.state, request).await
     }

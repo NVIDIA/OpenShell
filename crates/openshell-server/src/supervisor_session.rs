@@ -13,8 +13,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, RelayChunk, RelayOpen, SessionAccepted, SupervisorMessage, gateway_message,
-    supervisor_message,
+    GatewayMessage, RelayFrame, RelayInit, RelayOpen, SessionAccepted, SupervisorMessage,
+    gateway_message, supervisor_message,
 };
 
 use crate::ServerState;
@@ -277,32 +277,39 @@ pub fn spawn_relay_reaper(state: Arc<ServerState>, interval: Duration) {
 /// bytes back to the supervisor over the gRPC response stream.
 const RELAY_STREAM_CHUNK_SIZE: usize = 16 * 1024;
 
-/// Handle a RelayStream RPC from a supervisor. The first inbound `RelayChunk`
-/// identifies the pending relay via `channel_id`; subsequent chunks carry raw
-/// bytes forward to the gateway-side waiter. Bytes flowing the other way are
-/// chunked and sent as `RelayChunk` messages back over the response stream.
+/// Handle a RelayStream RPC from a supervisor. The first inbound `RelayFrame`
+/// must carry a `RelayInit` identifying the pending relay; subsequent frames
+/// carry raw bytes forward to the gateway-side waiter. Bytes flowing the other
+/// way are chunked and sent as `RelayFrame::data` messages back over the
+/// response stream.
 pub async fn handle_relay_stream(
     state: &Arc<ServerState>,
-    request: Request<tonic::Streaming<RelayChunk>>,
+    request: Request<tonic::Streaming<RelayFrame>>,
 ) -> Result<
     Response<
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<RelayChunk, Status>> + Send + 'static>>,
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>>,
     >,
     Status,
 > {
     let mut inbound = request.into_inner();
 
-    // First chunk must identify the channel.
+    // First frame must identify the channel.
     let first = inbound
         .message()
         .await?
         .ok_or_else(|| Status::invalid_argument("empty RelayStream"))?;
-    if first.channel_id.is_empty() {
-        return Err(Status::invalid_argument(
-            "first RelayChunk must set channel_id",
-        ));
-    }
-    let channel_id = first.channel_id;
+    let channel_id = match first.payload {
+        Some(openshell_core::proto::relay_frame::Payload::Init(RelayInit { channel_id }))
+            if !channel_id.is_empty() =>
+        {
+            channel_id
+        }
+        _ => {
+            return Err(Status::invalid_argument(
+                "first RelayFrame must be init with non-empty channel_id",
+            ));
+        }
+    };
 
     // Claim the pending relay. Consumes the entry — it cannot be reused.
     let supervisor_side = state.supervisor_sessions.claim_relay(&channel_id)?;
@@ -310,26 +317,23 @@ pub async fn handle_relay_stream(
 
     let (mut read_half, mut write_half) = tokio::io::split(supervisor_side);
 
-    // If the first chunk happened to carry payload bytes alongside the
-    // channel_id, forward them immediately.
-    if !first.data.is_empty() {
-        if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut write_half, &first.data).await {
-            warn!(channel_id = %channel_id, error = %e, "relay stream: failed initial write");
-            return Err(Status::internal("relay bridge write failed"));
-        }
-    }
-
     // Supervisor → gateway: drain `inbound` and write to the DuplexStream.
     let channel_id_in = channel_id.clone();
     tokio::spawn(async move {
         loop {
             match inbound.message().await {
-                Ok(Some(chunk)) => {
-                    if chunk.data.is_empty() {
+                Ok(Some(frame)) => {
+                    let Some(openshell_core::proto::relay_frame::Payload::Data(data)) =
+                        frame.payload
+                    else {
+                        warn!(channel_id = %channel_id_in, "relay stream: received non-data frame after init");
+                        break;
+                    };
+                    if data.is_empty() {
                         continue;
                     }
                     if let Err(e) =
-                        tokio::io::AsyncWriteExt::write_all(&mut write_half, &chunk.data).await
+                        tokio::io::AsyncWriteExt::write_all(&mut write_half, &data).await
                     {
                         warn!(channel_id = %channel_id_in, error = %e, "relay stream: write to duplex failed");
                         break;
@@ -346,8 +350,8 @@ pub async fn handle_relay_stream(
         let _ = tokio::io::AsyncWriteExt::shutdown(&mut write_half).await;
     });
 
-    // Gateway → supervisor: read the DuplexStream and emit RelayChunk messages.
-    let (out_tx, out_rx) = mpsc::channel::<Result<RelayChunk, Status>>(16);
+    // Gateway → supervisor: read the DuplexStream and emit RelayFrame::data messages.
+    let (out_tx, out_rx) = mpsc::channel::<Result<RelayFrame, Status>>(16);
     let channel_id_out = channel_id.clone();
     tokio::spawn(async move {
         let mut buf = vec![0u8; RELAY_STREAM_CHUNK_SIZE];
@@ -355,9 +359,10 @@ pub async fn handle_relay_stream(
             match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    let chunk = RelayChunk {
-                        channel_id: String::new(),
-                        data: buf[..n].to_vec(),
+                    let chunk = RelayFrame {
+                        payload: Some(openshell_core::proto::relay_frame::Payload::Data(
+                            buf[..n].to_vec(),
+                        )),
                     };
                     if out_tx.send(Ok(chunk)).await.is_err() {
                         break;
@@ -373,7 +378,7 @@ pub async fn handle_relay_stream(
 
     let stream = ReceiverStream::new(out_rx);
     let stream: Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<RelayChunk, Status>> + Send + 'static>,
+        Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>,
     > = Box::pin(stream);
     Ok(Response::new(stream))
 }

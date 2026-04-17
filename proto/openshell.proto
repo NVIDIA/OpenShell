@@ -102,15 +102,15 @@ service OpenShell {
   // Raw byte relay between supervisor and gateway.
   //
   // The supervisor initiates this call after receiving a RelayOpen message
-  // on its ConnectSupervisor stream. The first RelayChunk carries the
-  // channel_id to associate the new HTTP/2 stream with the pending relay
-  // slot on the gateway. Subsequent chunks carry raw bytes in either
+  // on its ConnectSupervisor stream. The first RelayFrame carries a
+  // RelayInit with the channel_id to associate the new HTTP/2 stream with
+  // the pending relay slot on the gateway. Subsequent frames carry raw bytes in either
   // direction between the gateway-side waiter (ssh_tunnel / exec handler)
   // and the supervisor-side local SSH daemon bridge.
   //
   // This rides the same TCP+TLS+HTTP/2 connection as ConnectSupervisor —
   // no new TLS handshake, no reverse HTTP CONNECT.
-  rpc RelayStream(stream RelayChunk) returns (stream RelayChunk);
+  rpc RelayStream(stream RelayFrame) returns (stream RelayFrame);
 
   // Watch a sandbox and stream updates.
   //
@@ -781,7 +781,7 @@ message GatewayHeartbeat {}
 // Gateway requests the supervisor to open a relay channel.
 //
 // On receiving this, the supervisor should initiate a RelayStream RPC to
-// the gateway, sending channel_id in the first RelayChunk to associate
+// the gateway, sending a RelayInit in the first RelayFrame to associate
 // the new HTTP/2 stream with the pending relay slot. The supervisor
 // bridges that stream to the local SSH daemon.
 message RelayOpen {
@@ -789,22 +789,21 @@ message RelayOpen {
   string channel_id = 1;
 }
 
-// Raw byte chunk for the RelayStream RPC. The first chunk sent from the
-// supervisor MUST set channel_id. All subsequent chunks (both directions)
-// leave channel_id empty and carry payload bytes in `data`.
-//
-// Leaving channel_id empty on data frames is a deliberate per-frame size
-// optimization: an SSH tunnel fragments into many small frames (a keystroke
-// is ~50–200 bytes), where repeating a 36-byte UUID every frame would be a
-// meaningful overhead. The cost is a weaker schema — the "first message is
-// init-only" invariant lives in this comment rather than the proto. If this
-// becomes confusing, switch to `oneof payload { string init_channel_id = 1;
-// bytes data = 2; }` — behavior is equivalent, migration is cheap.
-message RelayChunk {
-  // Only set on the very first message from the supervisor side.
+// Initial RelayStream frame sent by the supervisor to claim a pending relay.
+message RelayInit {
+  // Gateway-allocated channel identifier (UUID).
   string channel_id = 1;
-  // Raw bytes flowing in either direction.
-  bytes data = 2;
+}
+
+// A single frame on the RelayStream RPC.
+//
+// The supervisor MUST send `init` as the first frame. All subsequent frames
+// in either direction carry raw bytes in `data`.
+message RelayFrame {
+  oneof payload {
+    RelayInit init = 1;
+    bytes data = 2;
+  }
 }
 
 // Supervisor reports the result of a relay open request.

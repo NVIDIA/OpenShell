@@ -299,12 +299,12 @@ impl OpenShell for TestOpenShell {
     }
 
     type RelayStreamStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::RelayChunk, tonic::Status>,
+        Result<openshell_core::proto::RelayFrame, tonic::Status>,
     >;
 
     async fn relay_stream(
         &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayChunk>>,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
     ) -> Result<tonic::Response<Self::RelayStreamStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("not implemented in test"))
     }
