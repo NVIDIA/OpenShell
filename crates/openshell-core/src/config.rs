@@ -108,8 +108,25 @@ pub struct Config {
     pub ssh_connect_path: String,
 
     /// SSH listen port inside sandbox pods.
+    ///
+    /// Retained for the K8s driver's dead `ResolveSandboxEndpoint` path and
+    /// any external tooling that still references the port. The supervisor's
+    /// embedded SSH daemon itself no longer listens on TCP; it binds a Unix
+    /// socket at [`Self::sandbox_ssh_socket_path`].
     #[serde(default = "default_sandbox_ssh_port")]
     pub sandbox_ssh_port: u16,
+
+    /// Filesystem path where the sandbox supervisor binds its SSH Unix
+    /// socket. The supervisor is passed this path via
+    /// `OPENSHELL_SSH_LISTEN_ADDR` / `--ssh-listen-addr` and connects its
+    /// relay bridge to the same path.
+    ///
+    /// When the gateway orchestrates sandboxes that each live in their own
+    /// filesystem (K8s pod, libkrun VM, etc.), the default is safe. For
+    /// local dev where multiple supervisors share `/run`, override this to
+    /// something unique per sandbox.
+    #[serde(default = "default_sandbox_ssh_socket_path")]
+    pub sandbox_ssh_socket_path: String,
 
     /// Shared secret for gateway-to-sandbox SSH handshake.
     #[serde(default)]
@@ -180,6 +197,7 @@ impl Config {
             ssh_gateway_port: default_ssh_gateway_port(),
             ssh_connect_path: default_ssh_connect_path(),
             sandbox_ssh_port: default_sandbox_ssh_port(),
+            sandbox_ssh_socket_path: default_sandbox_ssh_socket_path(),
             ssh_handshake_secret: String::new(),
             ssh_handshake_skew_secs: default_ssh_handshake_skew_secs(),
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
@@ -341,6 +359,10 @@ fn default_ssh_connect_path() -> String {
 
 const fn default_sandbox_ssh_port() -> u16 {
     2222
+}
+
+fn default_sandbox_ssh_socket_path() -> String {
+    "/run/openshell/ssh.sock".to_string()
 }
 
 const fn default_ssh_handshake_skew_secs() -> u64 {

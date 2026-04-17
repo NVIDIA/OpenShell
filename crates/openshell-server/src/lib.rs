@@ -256,8 +256,10 @@ async fn build_compute_runtime(
                 // Filesystem path to the supervisor's Unix-socket SSH daemon.
                 // The path lives in a root-only directory so only the
                 // supervisor can connect; the gateway reaches it through the
-                // RelayStream bridge, not directly.
-                ssh_listen_addr: "/run/openshell/ssh.sock".to_string(),
+                // RelayStream bridge, not directly. Override via
+                // `sandbox_ssh_socket_path` in the config for deployments
+                // where multiple supervisors share a filesystem.
+                ssh_listen_addr: config.sandbox_ssh_socket_path.clone(),
                 ssh_port: config.sandbox_ssh_port,
                 ssh_handshake_secret: config.ssh_handshake_secret.clone(),
                 ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
