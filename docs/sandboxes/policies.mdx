@@ -204,7 +204,7 @@ In the first pass of this feature:
 
 - `--add-allow` and `--add-deny` only work on `protocol: rest` endpoints.
 - `--add-deny` requires the endpoint to already have an allow base, either an `access` preset or explicit allow `rules`.
-- `--add-endpoint` is the only incremental command that can create a SQL endpoint.
+- `protocol: sql` is not a practical incremental workflow today. OpenShell does not do full SQL parsing, and SQL enforcement is not meaningfully supported yet.
 
 ### Endpoint Specs
 
@@ -221,7 +221,7 @@ Each segment has a fixed meaning:
 | `host` | Yes | Destination hostname. |
 | `port` | Yes | Destination port, `1` through `65535`. |
 | `access` | No | Access preset for REST endpoints: `read-only`, `read-write`, or `full`. |
-| `protocol` | No | L7 inspection mode: `rest` or `sql`. |
+| `protocol` | No | L7 inspection mode: `rest` or `sql`. In practice, incremental updates are designed around `rest`. `sql` is audit-only and not a recommended workflow today. |
 | `enforcement` | No | Enforcement mode for inspected traffic: `enforce` or `audit`. |
 
 Examples:
@@ -230,7 +230,13 @@ Examples:
 |---|---|
 | `pypi.org:443` | Add a plain L4 endpoint. The proxy allows the TCP stream and does not inspect HTTP requests. |
 | `api.github.com:443:read-only:rest:enforce` | Add a REST endpoint with the `read-only` preset expanded by the policy engine into GET, HEAD, and OPTIONS access. |
-| `db.internal:5432::sql:audit` | Add a SQL endpoint with no `access` preset. The empty third field keeps the `protocol` segment in the right position. |
+
+If you set `protocol: rest`, you also need an allow shape. With incremental updates, that means you should provide an `access` preset on `--add-endpoint`, then use `--add-allow` or `--add-deny` to refine it later.
+
+For example:
+
+- `api.github.com:443:read-only:rest` is valid.
+- `api.github.com:443::rest` is invalid. It does not mean "allow all traffic." A REST endpoint with `protocol` but no `access` or `rules` is rejected when the policy loads.
 
 When you pass multiple `--add-endpoint` flags in one command, every `--binary` value applies to every added endpoint in that command. If different endpoints need different binaries, use separate `policy update` commands.
 

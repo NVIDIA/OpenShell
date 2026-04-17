@@ -382,6 +382,7 @@ pub(super) fn level_matches(log_level: &str, min_level: &str) -> bool {
         "ERROR" => 0,
         "WARN" => 1,
         "INFO" => 2,
+        "OCSF" => 2,
         "DEBUG" => 3,
         "TRACE" => 4,
         _ => 5, // unknown levels always pass
@@ -411,6 +412,12 @@ mod tests {
 
     fn default_spec() -> SandboxSpec {
         SandboxSpec::default()
+    }
+
+    #[test]
+    fn level_matches_treats_ocsf_as_info() {
+        assert!(level_matches("OCSF", "INFO"));
+        assert!(!level_matches("OCSF", "WARN"));
     }
 
     #[test]

@@ -178,6 +178,8 @@ Supported first-pass operations:
 
 Each `openshell policy update` invocation is atomic at the revision level: the CLI sends one `merge_operations` batch, the server merges the whole batch into the latest policy, validates the result, and persists at most one new revision. Concurrency is handled with optimistic retries on the `(sandbox_id, version)` uniqueness boundary. If another writer wins first, the server refetches the latest policy, reapplies the full batch, revalidates it, and retries. This preserves batch atomicity without serializing all sandbox policy writes behind a sandbox-global mutex.
 
+The gateway emits per-sandbox OCSF `CONFIG:*` audit lines when incremental merge operations are applied and when draft chunks are approved or removed. These audit lines are streamed through the existing gateway log path, so operators can inspect the exact logical mutation that produced a policy revision without waiting for the sandbox poll loop to reload that revision.
+
 ### Policy Revision Statuses
 
 | Status | Meaning |

@@ -152,7 +152,7 @@ matches_gateway() {
     deploy/docker/Dockerfile.images|tasks/scripts/docker-build-image.sh)
       return 0
       ;;
-    crates/openshell-core/*|crates/openshell-driver-kubernetes/*|crates/openshell-policy/*|crates/openshell-providers/*)
+    crates/openshell-core/*|crates/openshell-driver-kubernetes/*|crates/openshell-ocsf/*|crates/openshell-policy/*|crates/openshell-providers/*)
       return 0
       ;;
     crates/openshell-router/*|crates/openshell-server/*)
@@ -209,7 +209,7 @@ compute_fingerprint() {
   local committed_trees=""
   case "${component}" in
     gateway)
-      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh crates/openshell-core/ crates/openshell-driver-kubernetes/ crates/openshell-policy/ crates/openshell-providers/ crates/openshell-router/ crates/openshell-server/ 2>/dev/null || true)
+      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh crates/openshell-core/ crates/openshell-driver-kubernetes/ crates/openshell-ocsf/ crates/openshell-policy/ crates/openshell-providers/ crates/openshell-router/ crates/openshell-server/ 2>/dev/null || true)
       ;;
     supervisor)
       committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh crates/openshell-core/ crates/openshell-policy/ crates/openshell-router/ crates/openshell-sandbox/ 2>/dev/null || true)

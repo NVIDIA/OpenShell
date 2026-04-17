@@ -3218,6 +3218,7 @@ dependencies = [
  "miette",
  "openshell-core",
  "openshell-driver-kubernetes",
+ "openshell-ocsf",
  "openshell-policy",
  "openshell-router",
  "petname",

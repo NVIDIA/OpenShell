@@ -31,12 +31,22 @@ use openshell_core::proto::{
     SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
     UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
 };
-use openshell_core::proto::{Sandbox, SandboxPolicy as ProtoSandboxPolicy};
-use openshell_core::settings::{self, SettingValueKind};
+use openshell_core::proto::{
+    L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Sandbox,
+    SandboxPolicy as ProtoSandboxPolicy,
+};
+use openshell_core::{
+    VERSION,
+    settings::{self, SettingValueKind},
+};
+use openshell_ocsf::{
+    ConfigStateChangeBuilder, OCSF_TARGET, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
+};
 use openshell_policy::{PolicyMergeOp, merge_policy};
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -63,6 +73,228 @@ const POLICY_SETTING_KEY: &str = "policy";
 const GLOBAL_POLICY_SANDBOX_ID: &str = "__global__";
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
+
+fn emit_gateway_policy_audit_log(
+    sandbox_id: &str,
+    sandbox_name: &str,
+    state_label: &str,
+    detail: impl Into<String>,
+    version: i64,
+    policy_hash: &str,
+) {
+    let message = build_gateway_policy_audit_message(
+        sandbox_id,
+        sandbox_name,
+        state_label,
+        detail,
+        version,
+        policy_hash,
+    );
+    info!(
+        target: OCSF_TARGET,
+        sandbox_id = %sandbox_id,
+        message = %message
+    );
+}
+
+fn build_gateway_policy_audit_message(
+    sandbox_id: &str,
+    sandbox_name: &str,
+    state_label: &str,
+    detail: impl Into<String>,
+    version: i64,
+    policy_hash: &str,
+) -> String {
+    let ctx = SandboxContext {
+        sandbox_id: sandbox_id.to_string(),
+        sandbox_name: sandbox_name.to_string(),
+        container_image: "openshell/gateway".to_string(),
+        hostname: "openshell-gateway".to_string(),
+        product_version: VERSION.to_string(),
+        proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        proxy_port: 0,
+    };
+    let mut builder = ConfigStateChangeBuilder::new(&ctx)
+        .state(StateId::Other, state_label)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .message(detail.into());
+    if version > 0 {
+        builder = builder.unmapped("policy_version", format!("v{version}"));
+    }
+    if !policy_hash.is_empty() {
+        builder = builder.unmapped("policy_hash", policy_hash.to_string());
+    }
+    let event: OcsfEvent = builder.build();
+    event.format_shorthand()
+}
+
+fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
+    match operation {
+        PolicyMergeOp::AddRule { rule_name, rule } => summarize_add_endpoint(rule_name, rule),
+        PolicyMergeOp::RemoveEndpoint {
+            rule_name,
+            host,
+            port,
+        } => match rule_name {
+            Some(rule_name) => format!("remove-endpoint {host}:{port} from rule {rule_name}"),
+            None => format!("remove-endpoint {host}:{port}"),
+        },
+        PolicyMergeOp::RemoveRule { rule_name } => format!("remove-rule {rule_name}"),
+        PolicyMergeOp::AddDenyRules {
+            host,
+            port,
+            deny_rules,
+        } => format!(
+            "add-deny {host}:{port} [{}]",
+            deny_rules
+                .iter()
+                .map(summarize_l7_deny_rule)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        PolicyMergeOp::AddAllowRules { host, port, rules } => format!(
+            "add-allow {host}:{port} [{}]",
+            rules
+                .iter()
+                .map(summarize_l7_rule)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        PolicyMergeOp::RemoveBinary {
+            rule_name,
+            binary_path,
+        } => format!("remove-binary {rule_name} {binary_path}"),
+    }
+}
+
+fn summarize_add_endpoint(rule_name: &str, rule: &NetworkPolicyRule) -> String {
+    let endpoints = rule
+        .endpoints
+        .iter()
+        .map(summarize_endpoint)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let binaries = summarize_binaries(&rule.binaries);
+    format!("add-endpoint {rule_name} endpoints=[{endpoints}] binaries=[{binaries}]")
+}
+
+fn summarize_add_rule(rule_name: &str, rule: &NetworkPolicyRule) -> String {
+    let endpoints = rule
+        .endpoints
+        .iter()
+        .map(summarize_endpoint)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let binaries = summarize_binaries(&rule.binaries);
+    format!("add-rule {rule_name} endpoints=[{endpoints}] binaries=[{binaries}]")
+}
+
+fn summarize_endpoint(endpoint: &NetworkEndpoint) -> String {
+    let mut parts = vec![format!("{}:{}", endpoint.host, endpoint.port)];
+    if !endpoint.protocol.is_empty() {
+        parts.push(format!("protocol={}", endpoint.protocol));
+    }
+    if !endpoint.access.is_empty() {
+        parts.push(format!("access={}", endpoint.access));
+    }
+    if !endpoint.enforcement.is_empty() {
+        parts.push(format!("enforcement={}", endpoint.enforcement));
+    }
+    if !endpoint.tls.is_empty() {
+        parts.push(format!("tls={}", endpoint.tls));
+    }
+    if !endpoint.allowed_ips.is_empty() {
+        parts.push(format!("allowed_ips={}", endpoint.allowed_ips.len()));
+    }
+    if !endpoint.ports.is_empty() {
+        parts.push(format!("ports={}", endpoint.ports.len()));
+    }
+    if !endpoint.rules.is_empty() {
+        parts.push(format!(
+            "allow=[{}]",
+            endpoint
+                .rules
+                .iter()
+                .map(summarize_l7_rule)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !endpoint.deny_rules.is_empty() {
+        parts.push(format!(
+            "deny=[{}]",
+            endpoint
+                .deny_rules
+                .iter()
+                .map(summarize_l7_deny_rule)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    parts.join(" ")
+}
+
+fn summarize_l7_rule(rule: &L7Rule) -> String {
+    let Some(allow) = rule.allow.as_ref() else {
+        return "allow".to_string();
+    };
+    summarize_l7_match(
+        &allow.method,
+        &allow.path,
+        &allow.command,
+        allow.query.len(),
+    )
+}
+
+fn summarize_l7_deny_rule(rule: &L7DenyRule) -> String {
+    summarize_l7_match(&rule.method, &rule.path, &rule.command, rule.query.len())
+}
+
+fn summarize_l7_match(method: &str, path: &str, command: &str, query_count: usize) -> String {
+    let mut parts = Vec::new();
+    if !method.is_empty() {
+        parts.push(method.to_string());
+    }
+    if !path.is_empty() {
+        parts.push(path.to_string());
+    }
+    if !command.is_empty() {
+        parts.push(format!("command={}", truncate_for_log(command, 48)));
+    }
+    if query_count > 0 {
+        parts.push(format!("query_keys={query_count}"));
+    }
+    if parts.is_empty() {
+        "rule".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn summarize_binaries(binaries: &[NetworkBinary]) -> String {
+    binaries
+        .iter()
+        .map(|binary| binary.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn summarize_draft_chunk_rule(chunk: &DraftChunkRecord) -> Result<String, Status> {
+    let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
+        .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
+    Ok(summarize_add_rule(&chunk.rule_name, &rule))
+}
+
+fn truncate_for_log(input: &str, max_chars: usize) -> String {
+    let mut chars = input.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config handlers
@@ -530,6 +762,30 @@ pub(super) async fn handle_update_config(
         .await?;
 
         state.sandbox_watch_bus.notify(&sandbox_id);
+        emit_gateway_policy_audit_log(
+            &sandbox_id,
+            &sandbox.name,
+            "merged",
+            format!(
+                "gateway merged {} incremental policy operation(s)",
+                merge_ops.len()
+            ),
+            version,
+            &hash,
+        );
+        for operation in &merge_ops {
+            emit_gateway_policy_audit_log(
+                &sandbox_id,
+                &sandbox.name,
+                "merged",
+                format!(
+                    "gateway merged incremental policy op: {}",
+                    summarize_cli_policy_merge_op(operation)
+                ),
+                version,
+                &hash,
+            );
+        }
         info!(
             sandbox_id = %sandbox_id,
             version,
@@ -1098,6 +1354,7 @@ pub(super) async fn handle_approve_draft_chunk(
 
     let (version, hash) =
         merge_chunk_into_policy(state.store.as_ref(), &sandbox_id, &chunk).await?;
+    let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms =
         current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
@@ -1108,6 +1365,17 @@ pub(super) async fn handle_approve_draft_chunk(
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
+    emit_gateway_policy_audit_log(
+        &sandbox_id,
+        &sandbox.name,
+        "approved",
+        format!(
+            "gateway approved draft chunk {}: {chunk_summary}",
+            req.chunk_id
+        ),
+        version,
+        &hash,
+    );
 
     info!(
         sandbox_id = %sandbox_id,
@@ -1173,7 +1441,18 @@ pub(super) async fn handle_reject_draft_chunk(
 
     if was_approved {
         require_no_global_policy(state).await?;
-        remove_chunk_from_policy(state, &sandbox_id, &chunk).await?;
+        let (version, hash) = remove_chunk_from_policy(state, &sandbox_id, &chunk).await?;
+        emit_gateway_policy_audit_log(
+            &sandbox_id,
+            &sandbox.name,
+            "removed",
+            format!(
+                "gateway removed previously approved draft chunk {}: remove-binary {} {}",
+                req.chunk_id, chunk.rule_name, chunk.binary
+            ),
+            version,
+            &hash,
+        );
     }
 
     let now_ms =
@@ -1256,6 +1535,7 @@ pub(super) async fn handle_approve_all_draft_chunks(
             merge_chunk_into_policy(state.store.as_ref(), &sandbox_id, chunk).await?;
         last_version = version;
         last_hash = hash;
+        let chunk_summary = summarize_draft_chunk_rule(chunk)?;
 
         let now_ms =
             current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
@@ -1265,10 +1545,28 @@ pub(super) async fn handle_approve_all_draft_chunks(
             .await
             .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
+        emit_gateway_policy_audit_log(
+            &sandbox_id,
+            &sandbox.name,
+            "approved",
+            format!("gateway approved draft chunk {}: {chunk_summary}", chunk.id),
+            version,
+            &last_hash,
+        );
         chunks_approved += 1;
     }
 
     state.sandbox_watch_bus.notify(&sandbox_id);
+    emit_gateway_policy_audit_log(
+        &sandbox_id,
+        &sandbox.name,
+        "merged",
+        format!(
+            "gateway bulk-approved {chunks_approved} draft chunk(s) and skipped {chunks_skipped}"
+        ),
+        last_version,
+        &last_hash,
+    );
 
     info!(
         sandbox_id = %sandbox_id,
@@ -1390,6 +1688,17 @@ pub(super) async fn handle_undo_draft_chunk(
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
+    emit_gateway_policy_audit_log(
+        &sandbox_id,
+        &sandbox.name,
+        "removed",
+        format!(
+            "gateway reverted approved draft chunk {}: remove-binary {} {}",
+            req.chunk_id, chunk.rule_name, chunk.binary
+        ),
+        version,
+        &hash,
+    );
 
     info!(
         sandbox_id = %sandbox_id,
@@ -1668,9 +1977,7 @@ fn generate_security_notes(host: &str, port: u16) -> String {
 ///
 /// This is defense-in-depth: the proxy blocks these at runtime, so
 /// merging them into the active policy would be silently un-enforceable.
-fn validate_rule_not_always_blocked(
-    rule: &openshell_core::proto::NetworkPolicyRule,
-) -> Result<(), Status> {
+fn validate_rule_not_always_blocked(rule: &NetworkPolicyRule) -> Result<(), Status> {
     use openshell_core::net::{is_always_blocked_ip, is_always_blocked_net};
     use std::net::IpAddr;
 
@@ -1980,7 +2287,7 @@ pub(super) async fn merge_chunk_into_policy(
     sandbox_id: &str,
     chunk: &DraftChunkRecord,
 ) -> Result<(i64, String), Status> {
-    let rule = openshell_core::proto::NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
+    let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
         .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
     apply_merge_operations_with_retry(
         store,
@@ -2358,6 +2665,71 @@ mod tests {
         assert_eq!(policy.version, 1);
         assert!(policy.filesystem.is_some());
         assert_eq!(policy.process.unwrap().run_as_user, "sandbox");
+    }
+
+    #[test]
+    fn build_gateway_policy_audit_message_formats_ocsf_config_line() {
+        let message = build_gateway_policy_audit_message(
+            "sb-123",
+            "demo-sandbox",
+            "merged",
+            "gateway merged incremental policy op: add-allow api.github.com:443 [POST /repos/*/issues]",
+            7,
+            "sha256:testhash",
+        );
+
+        assert_eq!(
+            message,
+            "CONFIG:MERGED [INFO] gateway merged incremental policy op: add-allow api.github.com:443 [POST /repos/*/issues] [version:v7 hash:sha256:testhash]"
+        );
+    }
+
+    #[test]
+    fn summarize_cli_policy_merge_op_formats_rest_allow_rules() {
+        let operation = PolicyMergeOp::AddAllowRules {
+            host: "api.github.com".to_string(),
+            port: 443,
+            rules: vec![L7Rule {
+                allow: Some(openshell_core::proto::L7Allow {
+                    method: "POST".to_string(),
+                    path: "/repos/*/issues".to_string(),
+                    command: String::new(),
+                    query: HashMap::new(),
+                }),
+            }],
+        };
+
+        assert_eq!(
+            summarize_cli_policy_merge_op(&operation),
+            "add-allow api.github.com:443 [POST /repos/*/issues]"
+        );
+    }
+
+    #[test]
+    fn summarize_cli_policy_merge_op_formats_endpoint_additions() {
+        let operation = PolicyMergeOp::AddRule {
+            rule_name: "github_api".to_string(),
+            rule: NetworkPolicyRule {
+                name: "github_api".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.github.com".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    access: "read-only".to_string(),
+                    enforcement: "enforce".to_string(),
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        };
+
+        assert_eq!(
+            summarize_cli_policy_merge_op(&operation),
+            "add-endpoint github_api endpoints=[api.github.com:443 protocol=rest access=read-only enforcement=enforce] binaries=[/usr/bin/curl]"
+        );
     }
 
     // ---- merge_chunk_into_policy ----
