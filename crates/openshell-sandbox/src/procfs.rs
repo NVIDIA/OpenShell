@@ -399,6 +399,30 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Block until `/proc/<pid>/exe` points at `target`. `Command::spawn` returns
+    /// once the child is scheduled, not once it has completed `exec()`; on
+    /// contended runners the readlink can still show the parent (test harness)
+    /// binary for a brief window. Byte-level `starts_with` tolerates the kernel's
+    /// `" (deleted)"` suffix on unlinked executables.
+    #[cfg(target_os = "linux")]
+    fn wait_for_child_exec(pid: i32, target: &std::path::Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let target_bytes = target.as_os_str().as_bytes();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Ok(link) = std::fs::read_link(format!("/proc/{pid}/exe"))
+                && link.as_os_str().as_bytes().starts_with(target_bytes)
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child pid {pid} did not exec into {target:?} within 2s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn file_sha256_computes_correct_hash() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
@@ -462,6 +486,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid: i32 = child.id().cast_signed();
+        wait_for_child_exec(pid, &exe_path);
         std::fs::remove_file(&exe_path).unwrap();
 
         // Sanity check: the raw readlink should contain " (deleted)".
@@ -512,6 +537,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid: i32 = child.id().cast_signed();
+        wait_for_child_exec(pid, &exe_path);
 
         // File is still linked — binary_path must return the path unchanged,
         // suffix and all.
@@ -537,9 +563,8 @@ mod tests {
     #[test]
     fn binary_path_strips_suffix_for_non_utf8_filename() {
         use std::ffi::OsString;
-        use std::io::Write;
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::TempDir::new().unwrap();
         // 0xFF is not valid UTF-8. Build the filename on raw bytes.
@@ -548,27 +573,15 @@ mod tests {
         raw_name.extend_from_slice(b".bin");
         let exe_path = tmp.path().join(OsString::from_vec(raw_name));
 
-        // Write bytes explicitly (instead of `std::fs::copy`) with an
-        // explicit `sync_all()` + scope drop so the write fd is fully closed
-        // before we `exec()` the file. Otherwise concurrent tests can race
-        // the kernel into returning ETXTBSY on spawn.
-        let bytes = std::fs::read("/bin/sleep").expect("read /bin/sleep");
-        {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o755)
-                .open(&exe_path)
-                .expect("create non-UTF-8 target file");
-            f.write_all(&bytes).expect("write bytes");
-            f.sync_all().expect("sync_all before exec");
-        }
+        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut child = std::process::Command::new(&exe_path)
             .arg("5")
             .spawn()
             .unwrap();
         let pid: i32 = child.id().cast_signed();
+        wait_for_child_exec(pid, &exe_path);
         std::fs::remove_file(&exe_path).unwrap();
 
         // Sanity: raw readlink ends with " (deleted)" and is not valid UTF-8.
