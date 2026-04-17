@@ -91,10 +91,6 @@ struct Args {
     )]
     ssh_connect_path: String,
 
-    /// SSH port inside sandbox pods.
-    #[arg(long, env = "OPENSHELL_SANDBOX_SSH_PORT", default_value_t = 2222)]
-    sandbox_ssh_port: u16,
-
     /// Shared secret for gateway-to-sandbox SSH handshake.
     #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
     ssh_handshake_secret: Option<String>,
@@ -233,7 +229,6 @@ async fn run_from_args(args: Args) -> Result<()> {
         .with_ssh_gateway_host(args.ssh_gateway_host)
         .with_ssh_gateway_port(args.ssh_gateway_port)
         .with_ssh_connect_path(args.ssh_connect_path)
-        .with_sandbox_ssh_port(args.sandbox_ssh_port)
         .with_ssh_handshake_skew_secs(args.ssh_handshake_skew_secs);
 
     if let Some(image) = args.sandbox_image {

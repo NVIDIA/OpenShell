@@ -14,11 +14,10 @@ use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus, GetCapabilitiesRequest,
     GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest,
-    ListSandboxesResponse, ResolveSandboxEndpointRequest, ResolveSandboxEndpointResponse,
-    SandboxEndpoint, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
-    compute_driver_server::ComputeDriver, sandbox_endpoint, watch_sandboxes_event,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
@@ -385,25 +384,6 @@ impl VmDriver {
         Ok(DeleteSandboxResponse { deleted: true })
     }
 
-    pub async fn resolve_endpoint(
-        &self,
-        sandbox: &Sandbox,
-    ) -> Result<ResolveSandboxEndpointResponse, Status> {
-        let registry = self.registry.lock().await;
-        let record = registry.get(&sandbox.id).or_else(|| {
-            registry
-                .values()
-                .find(|record| record.snapshot.name == sandbox.name)
-        });
-        let record = record.ok_or_else(|| Status::not_found("sandbox not found"))?;
-        Ok(ResolveSandboxEndpointResponse {
-            endpoint: Some(SandboxEndpoint {
-                target: Some(sandbox_endpoint::Target::Host("127.0.0.1".to_string())),
-                port: u32::from(record.ssh_port),
-            }),
-        })
-    }
-
     pub async fn get_sandbox(
         &self,
         sandbox_id: &str,
@@ -647,17 +627,6 @@ impl ComputeDriver for VmDriver {
             .delete_sandbox(&request.sandbox_id, &request.sandbox_name)
             .await?;
         Ok(Response::new(response))
-    }
-
-    async fn resolve_sandbox_endpoint(
-        &self,
-        request: Request<ResolveSandboxEndpointRequest>,
-    ) -> Result<Response<ResolveSandboxEndpointResponse>, Status> {
-        let sandbox = request
-            .into_inner()
-            .sandbox
-            .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        Ok(Response::new(self.resolve_endpoint(&sandbox).await?))
     }
 
     type WatchSandboxesStream =

@@ -17,9 +17,9 @@ use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
     DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest, ListSandboxesRequest,
-    ResolveSandboxEndpointRequest, ResolveSandboxEndpointResponse, ValidateSandboxCreateRequest,
-    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
-    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
+    watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -164,14 +164,6 @@ impl ComputeDriver for RemoteComputeDriver {
     {
         let mut client = self.client();
         client.delete_sandbox(request).await
-    }
-
-    async fn resolve_sandbox_endpoint(
-        &self,
-        request: Request<ResolveSandboxEndpointRequest>,
-    ) -> Result<tonic::Response<ResolveSandboxEndpointResponse>, Status> {
-        let mut client = self.client();
-        client.resolve_sandbox_endpoint(request).await
     }
 
     async fn watch_sandboxes(
@@ -1147,13 +1139,6 @@ mod tests {
             Ok(tonic::Response::new(DeleteSandboxResponse {
                 deleted: true,
             }))
-        }
-
-        async fn resolve_sandbox_endpoint(
-            &self,
-            _request: Request<ResolveSandboxEndpointRequest>,
-        ) -> Result<tonic::Response<ResolveSandboxEndpointResponse>, Status> {
-            Err(Status::unimplemented("not used by these tests"))
         }
 
         async fn watch_sandboxes(

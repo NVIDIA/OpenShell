@@ -107,15 +107,6 @@ pub struct Config {
     #[serde(default = "default_ssh_connect_path")]
     pub ssh_connect_path: String,
 
-    /// SSH listen port inside sandbox pods.
-    ///
-    /// Retained for the K8s driver's dead `ResolveSandboxEndpoint` path and
-    /// any external tooling that still references the port. The supervisor's
-    /// embedded SSH daemon itself no longer listens on TCP; it binds a Unix
-    /// socket at [`Self::sandbox_ssh_socket_path`].
-    #[serde(default = "default_sandbox_ssh_port")]
-    pub sandbox_ssh_port: u16,
-
     /// Filesystem path where the sandbox supervisor binds its SSH Unix
     /// socket. The supervisor is passed this path via
     /// `OPENSHELL_SSH_LISTEN_ADDR` / `--ssh-listen-addr` and connects its
@@ -196,7 +187,6 @@ impl Config {
             ssh_gateway_host: default_ssh_gateway_host(),
             ssh_gateway_port: default_ssh_gateway_port(),
             ssh_connect_path: default_ssh_connect_path(),
-            sandbox_ssh_port: default_sandbox_ssh_port(),
             sandbox_ssh_socket_path: default_sandbox_ssh_socket_path(),
             ssh_handshake_secret: String::new(),
             ssh_handshake_skew_secs: default_ssh_handshake_skew_secs(),
@@ -286,13 +276,6 @@ impl Config {
         self
     }
 
-    /// Create a new configuration with the sandbox SSH port.
-    #[must_use]
-    pub const fn with_sandbox_ssh_port(mut self, port: u16) -> Self {
-        self.sandbox_ssh_port = port;
-        self
-    }
-
     /// Create a new configuration with the SSH handshake secret.
     #[must_use]
     pub fn with_ssh_handshake_secret(mut self, secret: impl Into<String>) -> Self {
@@ -355,10 +338,6 @@ const fn default_ssh_gateway_port() -> u16 {
 
 fn default_ssh_connect_path() -> String {
     "/connect/ssh".to_string()
-}
-
-const fn default_sandbox_ssh_port() -> u16 {
-    2222
 }
 
 fn default_sandbox_ssh_socket_path() -> String {

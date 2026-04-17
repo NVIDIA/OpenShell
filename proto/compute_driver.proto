@@ -38,10 +38,6 @@ service ComputeDriver {
   // Tear down platform resources for a sandbox.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
-  // Resolve the current endpoint for sandbox exec/SSH transport.
-  rpc ResolveSandboxEndpoint(ResolveSandboxEndpointRequest)
-      returns (ResolveSandboxEndpointResponse);
-
   // Stream sandbox observations from the platform.
   rpc WatchSandboxes(WatchSandboxesRequest) returns (stream WatchSandboxesEvent);
 }
@@ -236,27 +232,6 @@ message DeleteSandboxRequest {
 message DeleteSandboxResponse {
   // True when a platform resource was deleted by this request.
   bool deleted = 1;
-}
-
-message ResolveSandboxEndpointRequest {
-  // Sandbox to resolve for exec or SSH connectivity.
-  DriverSandbox sandbox = 1;
-}
-
-message SandboxEndpoint {
-  oneof target {
-    // Direct IP address for the sandbox endpoint.
-    string ip = 1;
-    // DNS host name for the sandbox endpoint.
-    string host = 2;
-  }
-  // TCP port for the sandbox endpoint.
-  uint32 port = 3;
-}
-
-message ResolveSandboxEndpointResponse {
-  // Current endpoint the gateway should use to reach the sandbox.
-  SandboxEndpoint endpoint = 1;
 }
 
 message WatchSandboxesRequest {}
