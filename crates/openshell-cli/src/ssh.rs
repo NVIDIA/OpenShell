@@ -142,7 +142,15 @@ fn ssh_base_command(proxy_command: &str) -> Command {
         .arg("-o")
         .arg("GlobalKnownHostsFile=/dev/null")
         .arg("-o")
-        .arg("LogLevel=ERROR");
+        .arg("LogLevel=ERROR")
+        // Detect a dead relay within ~45s. The relay rides on a TCP connection
+        // that the client has no way to observe silently dropping (gateway
+        // restart, supervisor restart, cluster failover), so fall back to
+        // SSH-level keepalives instead of hanging forever.
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3");
     command
 }
 
@@ -870,7 +878,7 @@ fn render_ssh_config(gateway: &str, name: &str) -> String {
     let proxy_cmd = format!("{exe} ssh-proxy --gateway-name {gateway} --name {name}");
     let host_alias = host_alias(name);
     format!(
-        "Host {host_alias}\n    User sandbox\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    GlobalKnownHostsFile /dev/null\n    LogLevel ERROR\n    ProxyCommand {proxy_cmd}\n"
+        "Host {host_alias}\n    User sandbox\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    GlobalKnownHostsFile /dev/null\n    LogLevel ERROR\n    ServerAliveInterval 15\n    ServerAliveCountMax 3\n    ProxyCommand {proxy_cmd}\n"
     )
 }
 
