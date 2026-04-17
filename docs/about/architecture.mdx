@@ -30,10 +30,15 @@ Every outbound connection from agent code passes through the same decision path:
 2. The proxy inside the sandbox intercepts the connection and identifies which binary opened it.
 3. If the target is `https://inference.local`, the proxy handles it as managed inference before policy evaluation. OpenShell strips sandbox-supplied credentials, injects the configured backend credentials, and forwards the request to the managed model endpoint.
 4. For every other destination, the proxy queries the policy engine with the destination, port, and calling binary.
-5. The policy engine returns one of the following decisions. Explicit deny takes precedence over allow.
-   - **Explicit Deny**: a deny rule, or a hardening rule such as server-side request forgery (SSRF) protection, a blocked control-plane port, or a Layer 7 (L7) deny, rejects the request even when an allow rule would otherwise permit it. The connection is blocked and logged.
-   - **Allow**: the destination and binary match a policy block, and no deny rule applies. Traffic flows directly to the external service.
-   - **Implicit Deny**: no policy block matched. The connection is blocked and logged.
+5. The policy engine returns one of the decisions in the following table.
+
+   The policy engine evaluates decisions in this order. Explicit deny takes precedence over allow, and allow takes precedence over implicit deny.
+
+   | Decision | When it applies | Outcome |
+   |---|---|---|
+   | **Explicit Deny** | A deny rule, or a hardening rule such as server-side request forgery (SSRF) protection, a blocked control-plane port, or a Layer 7 (L7) deny, rejects the request even when an allow rule would otherwise permit it. | The connection is blocked and logged. |
+   | **Allow** | The destination and binary match a policy block, and no deny rule applies. | Traffic flows directly to the external service. |
+   | **Implicit Deny** | No policy block matched. | The connection is blocked and logged. |
 
 For REST endpoints, the proxy auto-detects Transport Layer Security (TLS) by peeking the first bytes of each tunnel. When TLS is detected, the proxy terminates it transparently using a per-sandbox ephemeral certificate authority (CA) so each HTTP request can be checked against per-method, per-path rules before forwarding. To trust a corporate or internal CA for upstream traffic, add the PEM-encoded certificate to the sandbox container's trust store at image build time.
 
