@@ -107,6 +107,9 @@ After installing `mise`, activate it with `mise activate` or [add it to your she
 Shell setup examples:
 
 ```bash
+# Bash
+echo 'eval "$(~/.local/bin/mise activate bash)"' >> ~/.bashrc
+
 # Fish
 echo '~/.local/bin/mise activate fish | source' >> ~/.config/fish/config.fish
 
