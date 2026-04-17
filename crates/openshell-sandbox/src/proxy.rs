@@ -27,6 +27,7 @@ use tracing::{debug, warn};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
+const INFERENCE_LOCAL_PORT: u16 = 443;
 
 /// Maximum total bytes for a streaming inference response body (32 MiB).
 const MAX_STREAMING_BODY: usize = 32 * 1024 * 1024;
@@ -354,7 +355,7 @@ async fn handle_tcp_connection(
     let (host, port) = parse_target(target)?;
     let host_lc = host.to_ascii_lowercase();
 
-    if host_lc == INFERENCE_LOCAL_HOST {
+    if host_lc == INFERENCE_LOCAL_HOST && port == INFERENCE_LOCAL_PORT {
         respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
         let outcome = handle_inference_interception(
             client,
