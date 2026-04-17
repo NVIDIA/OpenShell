@@ -17,16 +17,122 @@ use openshell_core::proto::{
     GatewayMessage, RelayFrame, RelayInit, SupervisorHeartbeat, SupervisorHello, SupervisorMessage,
     gateway_message, supervisor_message,
 };
+use openshell_ocsf::{
+    ActivityId, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext, SeverityId, StatusId,
+    ocsf_emit,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::grpc_client;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
+/// to treating the whole string as a domain if parsing fails.
+fn ocsf_gateway_endpoint(endpoint: &str) -> Endpoint {
+    let without_scheme = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    let host_and_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+    if let Some((host, port)) = host_and_port.rsplit_once(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return Endpoint::from_domain(host, port);
+    }
+    Endpoint::from_domain(host_and_port, 0)
+}
+
+fn session_established_event(
+    ctx: &SandboxContext,
+    endpoint: &str,
+    session_id: &str,
+    heartbeat_secs: u32,
+) -> OcsfEvent {
+    NetworkActivityBuilder::new(ctx)
+        .activity(ActivityId::Open)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .dst_endpoint(ocsf_gateway_endpoint(endpoint))
+        .message(format!(
+            "supervisor session established (session_id={session_id}, heartbeat_secs={heartbeat_secs})"
+        ))
+        .build()
+}
+
+fn session_closed_event(ctx: &SandboxContext, endpoint: &str, sandbox_id: &str) -> OcsfEvent {
+    NetworkActivityBuilder::new(ctx)
+        .activity(ActivityId::Close)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .dst_endpoint(ocsf_gateway_endpoint(endpoint))
+        .message(format!("supervisor session ended cleanly ({sandbox_id})"))
+        .build()
+}
+
+fn session_failed_event(
+    ctx: &SandboxContext,
+    endpoint: &str,
+    attempt: u64,
+    error: &str,
+) -> OcsfEvent {
+    NetworkActivityBuilder::new(ctx)
+        .activity(ActivityId::Fail)
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .dst_endpoint(ocsf_gateway_endpoint(endpoint))
+        .message(format!(
+            "supervisor session failed, reconnecting (attempt {attempt}): {error}"
+        ))
+        .build()
+}
+
+fn relay_open_event(ctx: &SandboxContext, channel_id: &str) -> OcsfEvent {
+    NetworkActivityBuilder::new(ctx)
+        .activity(ActivityId::Open)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .message(format!("relay open (channel_id={channel_id})"))
+        .build()
+}
+
+fn relay_closed_event(ctx: &SandboxContext, channel_id: &str) -> OcsfEvent {
+    NetworkActivityBuilder::new(ctx)
+        .activity(ActivityId::Close)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .message(format!("relay closed (channel_id={channel_id})"))
+        .build()
+}
+
+fn relay_failed_event(ctx: &SandboxContext, channel_id: &str, error: &str) -> OcsfEvent {
+    NetworkActivityBuilder::new(ctx)
+        .activity(ActivityId::Fail)
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .message(format!(
+            "relay bridge failed (channel_id={channel_id}): {error}"
+        ))
+        .build()
+}
+
+fn relay_close_from_gateway_event(
+    ctx: &SandboxContext,
+    channel_id: &str,
+    reason: &str,
+) -> OcsfEvent {
+    NetworkActivityBuilder::new(ctx)
+        .activity(ActivityId::Close)
+        .severity(SeverityId::Informational)
+        .message(format!(
+            "relay close from gateway (channel_id={channel_id}, reason={reason})"
+        ))
+        .build()
+}
 
 /// Size of chunks read from the local SSH socket when forwarding bytes back
 /// to the gateway over the gRPC response stream. 16 KiB matches the default
@@ -58,17 +164,14 @@ async fn run_session_loop(
 
         match run_single_session(&endpoint, &sandbox_id, &ssh_socket_path).await {
             Ok(()) => {
-                info!(sandbox_id = %sandbox_id, "supervisor session ended cleanly");
+                let event = session_closed_event(crate::ocsf_ctx(), &endpoint, &sandbox_id);
+                ocsf_emit!(event);
                 break;
             }
             Err(e) => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    attempt = attempt,
-                    backoff_ms = backoff.as_millis() as u64,
-                    error = %e,
-                    "supervisor session failed, reconnecting"
-                );
+                let event =
+                    session_failed_event(crate::ocsf_ctx(), &endpoint, attempt, &e.to_string());
+                ocsf_emit!(event);
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
@@ -125,13 +228,13 @@ async fn run_single_session(
     };
 
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
-    info!(
-        sandbox_id = %sandbox_id,
-        session_id = %accepted.session_id,
-        instance_id = %instance_id,
-        heartbeat_secs = heartbeat_secs,
-        "supervisor session established"
+    let event = session_established_event(
+        crate::ocsf_ctx(),
+        endpoint,
+        &accepted.session_id,
+        heartbeat_secs,
     );
+    ocsf_emit!(event);
 
     // Main loop: receive gateway messages + send heartbeats.
     let mut heartbeat_interval =
@@ -148,10 +251,10 @@ async fn run_single_session(
                             sandbox_id,
                             ssh_socket_path,
                             &channel,
-                        ).await;
+                        );
                     }
                     Ok(None) => {
-                        info!(sandbox_id = %sandbox_id, "supervisor session: gateway closed stream");
+                        debug!(sandbox_id = %sandbox_id, "supervisor session: gateway closed stream");
                         return Ok(());
                     }
                     Err(e) => {
@@ -173,7 +276,7 @@ async fn run_single_session(
     }
 }
 
-async fn handle_gateway_message(
+fn handle_gateway_message(
     msg: &GatewayMessage,
     sandbox_id: &str,
     ssh_socket_path: &std::path::Path,
@@ -189,30 +292,33 @@ async fn handle_gateway_message(
             let channel = channel.clone();
             let ssh_socket_path = ssh_socket_path.to_path_buf();
 
-            info!(
-                sandbox_id = %sandbox_id,
-                channel_id = %channel_id,
-                "supervisor session: relay open request, spawning bridge"
-            );
+            let event = relay_open_event(crate::ocsf_ctx(), &channel_id);
+            ocsf_emit!(event);
 
             tokio::spawn(async move {
-                if let Err(e) = handle_relay_open(&channel_id, &ssh_socket_path, channel).await {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        channel_id = %channel_id,
-                        error = %e,
-                        "supervisor session: relay bridge failed"
-                    );
+                match handle_relay_open(&channel_id, &ssh_socket_path, channel).await {
+                    Ok(()) => {
+                        let event = relay_closed_event(crate::ocsf_ctx(), &channel_id);
+                        ocsf_emit!(event);
+                    }
+                    Err(e) => {
+                        let event =
+                            relay_failed_event(crate::ocsf_ctx(), &channel_id, &e.to_string());
+                        ocsf_emit!(event);
+                        warn!(
+                            sandbox_id = %sandbox_id,
+                            channel_id = %channel_id,
+                            error = %e,
+                            "supervisor session: relay bridge failed"
+                        );
+                    }
                 }
             });
         }
         Some(gateway_message::Payload::RelayClose(close)) => {
-            info!(
-                sandbox_id = %sandbox_id,
-                channel_id = %close.channel_id,
-                reason = %close.reason,
-                "supervisor session: relay close from gateway"
-            );
+            let event =
+                relay_close_from_gateway_event(crate::ocsf_ctx(), &close.channel_id, &close.reason);
+            ocsf_emit!(event);
         }
         _ => {
             warn!(sandbox_id = %sandbox_id, "supervisor session: unexpected gateway message");
@@ -260,7 +366,7 @@ async fn handle_relay_open(
     let ssh = tokio::net::UnixStream::connect(ssh_socket_path).await?;
     let (mut ssh_r, mut ssh_w) = ssh.into_split();
 
-    info!(
+    debug!(
         channel_id = %channel_id,
         socket = %ssh_socket_path.display(),
         "relay bridge: connected to local SSH daemon"
@@ -324,4 +430,131 @@ async fn handle_relay_open(
         return Err(e.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod ocsf_event_tests {
+    use super::*;
+
+    fn ctx() -> SandboxContext {
+        SandboxContext {
+            sandbox_id: "sbx-1".into(),
+            sandbox_name: "sandbox".into(),
+            container_image: "img".into(),
+            hostname: "host".into(),
+            product_version: "0.0.1".into(),
+            proxy_ip: "127.0.0.1".parse().unwrap(),
+            proxy_port: 3128,
+        }
+    }
+
+    #[test]
+    fn gateway_endpoint_parses_https_with_port() {
+        let e = ocsf_gateway_endpoint("https://gateway.openshell:8443");
+        assert_eq!(e.domain.as_deref(), Some("gateway.openshell"));
+        assert_eq!(e.port, Some(8443));
+    }
+
+    #[test]
+    fn gateway_endpoint_parses_http_with_port_and_path() {
+        let e = ocsf_gateway_endpoint("http://gw:7000/grpc");
+        assert_eq!(e.domain.as_deref(), Some("gw"));
+        assert_eq!(e.port, Some(7000));
+    }
+
+    #[test]
+    fn gateway_endpoint_falls_back_without_port() {
+        let e = ocsf_gateway_endpoint("gateway.openshell");
+        assert_eq!(e.domain.as_deref(), Some("gateway.openshell"));
+        assert_eq!(e.port, Some(0));
+    }
+
+    fn network_activity(event: &OcsfEvent) -> &openshell_ocsf::NetworkActivityEvent {
+        match event {
+            OcsfEvent::NetworkActivity(n) => n,
+            other => panic!("expected NetworkActivity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_established_emits_network_open_success() {
+        let event = session_established_event(&ctx(), "https://gw:443", "sess-1", 30);
+        let na = network_activity(&event);
+        assert_eq!(na.base.activity_id, ActivityId::Open.as_u8());
+        assert_eq!(na.base.severity, SeverityId::Informational);
+        assert_eq!(na.base.status, Some(StatusId::Success));
+        assert_eq!(
+            na.dst_endpoint.as_ref().and_then(|e| e.domain.as_deref()),
+            Some("gw")
+        );
+        let msg = na.base.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("sess-1"), "message missing session_id: {msg}");
+        assert!(msg.contains("heartbeat_secs=30"), "message: {msg}");
+    }
+
+    #[test]
+    fn session_closed_emits_network_close_success() {
+        let event = session_closed_event(&ctx(), "https://gw:443", "sbx-1");
+        let na = network_activity(&event);
+        assert_eq!(na.base.activity_id, ActivityId::Close.as_u8());
+        assert_eq!(na.base.severity, SeverityId::Informational);
+        assert_eq!(na.base.status, Some(StatusId::Success));
+    }
+
+    #[test]
+    fn session_failed_emits_network_fail_low() {
+        let event = session_failed_event(&ctx(), "https://gw:443", 3, "connect refused");
+        let na = network_activity(&event);
+        assert_eq!(na.base.activity_id, ActivityId::Fail.as_u8());
+        assert_eq!(na.base.severity, SeverityId::Low);
+        assert_eq!(na.base.status, Some(StatusId::Failure));
+        let msg = na.base.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("attempt 3"), "message: {msg}");
+        assert!(msg.contains("connect refused"), "message: {msg}");
+    }
+
+    #[test]
+    fn relay_open_emits_network_open_success() {
+        let event = relay_open_event(&ctx(), "ch-42");
+        let na = network_activity(&event);
+        assert_eq!(na.base.activity_id, ActivityId::Open.as_u8());
+        assert_eq!(na.base.severity, SeverityId::Informational);
+        assert!(
+            na.base
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ch-42")
+        );
+    }
+
+    #[test]
+    fn relay_closed_emits_network_close_success() {
+        let event = relay_closed_event(&ctx(), "ch-42");
+        let na = network_activity(&event);
+        assert_eq!(na.base.activity_id, ActivityId::Close.as_u8());
+        assert_eq!(na.base.status, Some(StatusId::Success));
+    }
+
+    #[test]
+    fn relay_failed_emits_network_fail_low() {
+        let event = relay_failed_event(&ctx(), "ch-42", "write to ssh failed");
+        let na = network_activity(&event);
+        assert_eq!(na.base.activity_id, ActivityId::Fail.as_u8());
+        assert_eq!(na.base.severity, SeverityId::Low);
+        assert_eq!(na.base.status, Some(StatusId::Failure));
+        let msg = na.base.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("ch-42"), "message: {msg}");
+        assert!(msg.contains("write to ssh failed"), "message: {msg}");
+    }
+
+    #[test]
+    fn relay_close_from_gateway_is_network_close_informational() {
+        let event = relay_close_from_gateway_event(&ctx(), "ch-42", "sandbox deleted");
+        let na = network_activity(&event);
+        assert_eq!(na.base.activity_id, ActivityId::Close.as_u8());
+        assert_eq!(na.base.severity, SeverityId::Informational);
+        let msg = na.base.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("sandbox deleted"), "message: {msg}");
+    }
 }
