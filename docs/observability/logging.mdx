@@ -171,7 +171,7 @@ Common reason phrases emitted by the sandbox include:
 | `port <n> is a blocked control-plane port, connection rejected` | The destination port matches a control-plane port (etcd, Kubernetes API, kubelet) and is always blocked. |
 | `l7 deny` | An L7 policy rule denied the request. |
 
-Policy authors can use `allowed_ips` entries that are invalid or that overlap always-blocked ranges; those entries are rejected at policy-load time so denials at runtime report the underlying phrase rather than a generic failure.
+Invalid `allowed_ips` entries and entries that overlap always-blocked ranges are rejected at policy-load time, so they never reach the runtime denial path. The phrases above come from the proxy's per-CONNECT `allowed_ips` and SSRF checks, not from policy validation.
 
 ## Proxy Error Responses
 

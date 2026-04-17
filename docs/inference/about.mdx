@@ -18,7 +18,7 @@ The following table summarizes how OpenShell handles inference traffic.
 
 ## How `inference.local` Works
 
-When code inside a sandbox calls `https://inference.local`, the privacy router routes the request to the configured backend for that gateway. The configured model is applied to generation requests, provider credentials are supplied by OpenShell rather than by code inside the sandbox, and only approved inference headers are forwarded upstream. The router also tolerates long idle gaps between streamed chunks, so responses from reasoning models are not truncated during extended thinking pauses.
+When code inside a sandbox calls `https://inference.local`, the privacy router routes the request to the configured backend for that gateway. The configured model is applied to generation requests, provider credentials are supplied by OpenShell rather than by code inside the sandbox, and only approved inference headers are forwarded upstream.
 
 If code calls an external inference host directly, that traffic is evaluated only by `network_policies`.
 

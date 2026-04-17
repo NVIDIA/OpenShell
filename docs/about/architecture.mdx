@@ -39,11 +39,11 @@ For REST endpoints, the proxy auto-detects Transport Layer Security (TLS) by pee
 
 ## Gateway Lifecycle
 
-OpenShell preserves sandbox state across gateway restarts. After `openshell gateway stop` and `openshell gateway start`, running sandboxes resume from their saved state and existing SSH sessions reconnect without re-authenticating.
+OpenShell preserves sandbox state across gateway restarts. After `openshell gateway stop` and `openshell gateway start`, running sandboxes resume from their saved state. Existing SSH sessions reconnect without re-authenticating.
 
 ## Observability
 
-The sandbox emits operational decisions as Open Cybersecurity Schema Framework (OCSF) v1.7.0 structured logs, covering network connections, HTTP requests, SSH sessions, process lifecycle, detection findings, and configuration changes. For event classes and the JSON Lines (JSONL) export format, refer to [OCSF JSON Export](/observability/ocsf-json-export).
+The sandbox emits operational decisions as Open Cybersecurity Schema Framework (OCSF) v1.7.0 structured logs. The events cover network connections, HTTP requests, SSH sessions, process lifecycle, detection findings, and configuration changes. For event classes and the JSON Lines (JSONL) export format, refer to [OCSF JSON Export](/observability/ocsf-json-export).
 
 ## Deployment Modes
 
