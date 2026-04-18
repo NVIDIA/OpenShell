@@ -19,17 +19,63 @@ use tracing::debug;
 /// `/proc/{pid}/cmdline` because `argv[0]` is trivially spoofable by any
 /// process and must not be used as a trusted identity source.
 ///
-/// If this fails, ensure the proxy process has permission to read
-/// `/proc/<pid>/exe` (e.g. same user, or `CAP_SYS_PTRACE`).
+/// ### Unlinked binaries (`(deleted)` suffix)
+///
+/// When a running binary is unlinked from its filesystem path — the common
+/// case is a `docker cp` hot-swap of `/opt/openshell/bin/openshell-sandbox`
+/// during a `cluster-deploy-fast` dev upgrade — the kernel appends the
+/// literal string `" (deleted)"` to the `/proc/<pid>/exe` readlink target.
+/// The raw tainted path (e.g. `"/opt/openshell/bin/openshell-sandbox (deleted)"`)
+/// is not a real filesystem path: any downstream `stat()` fails with `ENOENT`.
+///
+/// We strip the suffix so callers see a clean, grep-friendly path suitable
+/// for cache keys and log messages. The strip is guarded: we only strip when
+/// `stat()` on the raw readlink target reports `NotFound`, so a live executable
+/// whose basename literally ends with `" (deleted)"` is returned unchanged.
+/// The comparison is done on raw bytes via `OsStrExt`, so filenames that are
+/// not valid UTF-8 are still handled correctly. Exactly one kernel-added
+/// suffix is stripped.
+///
+/// This does NOT claim the file at the stripped path is the same binary that
+/// the process is executing — the on-disk inode may now be arbitrary. Callers
+/// that need to verify the running binary's *contents* (for integrity
+/// checking) should read the magic `/proc/<pid>/exe` symlink directly via
+/// `File::open`, which procfs resolves to the live in-memory executable even
+/// when the original inode has been unlinked.
+///
+/// If the readlink itself fails, ensure the proxy process has permission
+/// to read `/proc/<pid>/exe` (e.g. same user, or `CAP_SYS_PTRACE`).
 #[cfg(target_os = "linux")]
 pub fn binary_path(pid: i32) -> Result<PathBuf> {
-    std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|e| {
+    use std::ffi::OsString;
+    use std::io::ErrorKind;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    const DELETED_SUFFIX: &[u8] = b" (deleted)";
+
+    let link = format!("/proc/{pid}/exe");
+    let target = std::fs::read_link(&link).map_err(|e| {
         miette::miette!(
             "Failed to read /proc/{pid}/exe: {e}. \
              Cannot determine binary identity — denying request. \
              Hint: the proxy may need CAP_SYS_PTRACE or to run as the same user."
         )
-    })
+    })?;
+
+    // Only strip when the raw readlink target cannot be stat'd and its bytes
+    // end with the kernel-added suffix. This preserves live executables whose
+    // basename legitimately ends with " (deleted)" and handles non-UTF-8
+    // filenames correctly.
+    let raw_target_missing =
+        matches!(std::fs::metadata(&target), Err(err) if err.kind() == ErrorKind::NotFound);
+
+    let bytes = target.as_os_str().as_bytes();
+    if raw_target_missing && bytes.ends_with(DELETED_SUFFIX) {
+        let stripped = bytes[..bytes.len() - DELETED_SUFFIX.len()].to_vec();
+        return Ok(PathBuf::from(OsString::from_vec(stripped)));
+    }
+
+    Ok(target)
 }
 
 /// Resolve the binary path of the TCP peer inside a sandbox network namespace.
@@ -389,6 +435,167 @@ mod tests {
         let path = binary_path(pid).unwrap();
         // Should resolve to the test runner binary
         assert!(path.exists());
+    }
+
+    /// Verify that an unlinked binary's path is returned without the
+    /// kernel's " (deleted)" suffix. This is the common case during a
+    /// `docker cp` hot-swap of the supervisor binary — before this strip,
+    /// callers that `stat()` the returned path get `ENOENT` and the
+    /// ancestor integrity check in the CONNECT proxy denies every request.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn binary_path_strips_deleted_suffix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Copy /bin/sleep to a temp path we control so we can unlink it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let exe_path = tmp.path().join("deleted-sleep");
+        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Spawn a child from the temp binary, then unlink it while the
+        // child is still running. The child keeps the exec mapping via
+        // `/proc/<pid>/exe`, but readlink will now return the tainted
+        // "<path> (deleted)" string.
+        let mut child = std::process::Command::new(&exe_path)
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let pid: i32 = child.id().cast_signed();
+        std::fs::remove_file(&exe_path).unwrap();
+
+        // Sanity check: the raw readlink should contain " (deleted)".
+        let raw = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            raw.ends_with(" (deleted)"),
+            "kernel should append ' (deleted)' to unlinked exe readlink; got {raw:?}"
+        );
+
+        // The public API should return the stripped path, not the tainted one.
+        let resolved = binary_path(pid).expect("binary_path should succeed for deleted binary");
+        assert_eq!(
+            resolved, exe_path,
+            "binary_path should strip the ' (deleted)' suffix"
+        );
+        let resolved_str = resolved.to_string_lossy();
+        assert!(
+            !resolved_str.contains("(deleted)"),
+            "stripped path must not contain '(deleted)'; got {resolved_str:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// A live executable whose basename literally ends with `" (deleted)"`
+    /// must be returned unchanged — we only strip when `stat()` reports
+    /// the raw readlink target missing. This guards against the trusted
+    /// identity source misattributing a running binary to a truncated
+    /// sibling path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn binary_path_preserves_live_deleted_basename() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Basename literally ends with " (deleted)" while the file is still
+        // on disk — a pathological but legal filename.
+        let exe_path = tmp.path().join("sleepy (deleted)");
+        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut child = std::process::Command::new(&exe_path)
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let pid: i32 = child.id().cast_signed();
+
+        // File is still linked — binary_path must return the path unchanged,
+        // suffix and all.
+        let resolved = binary_path(pid).expect("binary_path should succeed for live binary");
+        assert_eq!(
+            resolved, exe_path,
+            "binary_path must NOT strip ' (deleted)' from a live executable's basename"
+        );
+        assert!(
+            resolved.to_string_lossy().ends_with(" (deleted)"),
+            "stripped path unexpectedly trimmed a real filename: {resolved:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// An unlinked executable whose filename contains non-UTF-8 bytes must
+    /// still strip exactly one kernel-added `" (deleted)"` suffix. We operate
+    /// on raw bytes via `OsStrExt`, so invalid UTF-8 is not a reason to skip
+    /// the strip and return a path that downstream `stat()` calls will reject.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn binary_path_strips_suffix_for_non_utf8_filename() {
+        use std::ffi::OsString;
+        use std::io::Write;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // 0xFF is not valid UTF-8. Build the filename on raw bytes.
+        let mut raw_name: Vec<u8> = b"badname-".to_vec();
+        raw_name.push(0xFF);
+        raw_name.extend_from_slice(b".bin");
+        let exe_path = tmp.path().join(OsString::from_vec(raw_name));
+
+        // Write bytes explicitly (instead of `std::fs::copy`) with an
+        // explicit `sync_all()` + scope drop so the write fd is fully closed
+        // before we `exec()` the file. Otherwise concurrent tests can race
+        // the kernel into returning ETXTBSY on spawn.
+        let bytes = std::fs::read("/bin/sleep").expect("read /bin/sleep");
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o755)
+                .open(&exe_path)
+                .expect("create non-UTF-8 target file");
+            f.write_all(&bytes).expect("write bytes");
+            f.sync_all().expect("sync_all before exec");
+        }
+
+        let mut child = std::process::Command::new(&exe_path)
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let pid: i32 = child.id().cast_signed();
+        std::fs::remove_file(&exe_path).unwrap();
+
+        // Sanity: raw readlink ends with " (deleted)" and is not valid UTF-8.
+        let raw = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+        let raw_bytes = raw.as_os_str().as_bytes();
+        assert!(
+            raw_bytes.ends_with(b" (deleted)"),
+            "kernel should append ' (deleted)' to unlinked exe readlink"
+        );
+        assert!(
+            std::str::from_utf8(raw_bytes).is_err(),
+            "test precondition: raw readlink must contain non-UTF-8 bytes"
+        );
+
+        let resolved =
+            binary_path(pid).expect("binary_path should succeed for non-UTF-8 unlinked path");
+        assert_eq!(
+            resolved, exe_path,
+            "binary_path must strip exactly one ' (deleted)' suffix for non-UTF-8 paths"
+        );
+        assert!(
+            !resolved.as_os_str().as_bytes().ends_with(b" (deleted)"),
+            "stripped path must not end with ' (deleted)'"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[cfg(target_os = "linux")]

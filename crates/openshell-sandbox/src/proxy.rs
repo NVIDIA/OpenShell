@@ -885,6 +885,98 @@ async fn handle_tcp_connection(
     Ok(())
 }
 
+/// Resolved process identity for a TCP peer: binary path, PID, ancestor chain,
+/// cmdline paths, and the TOFU-verified binary hash.
+///
+/// Produced by [`resolve_process_identity`]; consumed by [`evaluate_opa_tcp`]
+/// and by the identity-chain regression tests.
+#[cfg(target_os = "linux")]
+struct ResolvedIdentity {
+    bin_path: PathBuf,
+    binary_pid: u32,
+    ancestors: Vec<PathBuf>,
+    cmdline_paths: Vec<PathBuf>,
+    bin_hash: String,
+}
+
+/// Error from [`resolve_process_identity`]. Carries the deny reason and
+/// whatever partial identity data was resolved before the failure so the
+/// caller can include it in the [`ConnectDecision`] and OCSF event.
+#[cfg(target_os = "linux")]
+struct IdentityError {
+    reason: String,
+    binary: Option<PathBuf>,
+    binary_pid: Option<u32>,
+    ancestors: Vec<PathBuf>,
+}
+
+/// Resolve the identity of the process owning a TCP peer connection.
+///
+/// Walks `/proc/<entrypoint_pid>/net/tcp` to find the socket inode, locates
+/// the owning PID, reads `/proc/<pid>/exe`, TOFU-verifies the binary hash,
+/// walks the ancestor chain verifying each one, and collects cmdline-derived
+/// absolute paths for script detection.
+///
+/// This is the identity-resolution block of [`evaluate_opa_tcp`] extracted
+/// into a standalone helper so it can be exercised by Linux-only regression
+/// tests without a full OPA engine. The key invariant under test is that on
+/// a hot-swap of the peer binary, the failure mode is
+/// `"Binary integrity violation"` (from the identity cache) rather than
+/// `"Failed to stat ... (deleted)"` (from the kernel-tainted path).
+#[cfg(target_os = "linux")]
+fn resolve_process_identity(
+    entrypoint_pid: u32,
+    peer_port: u16,
+    identity_cache: &BinaryIdentityCache,
+) -> std::result::Result<ResolvedIdentity, IdentityError> {
+    let (bin_path, binary_pid) =
+        crate::procfs::resolve_tcp_peer_identity(entrypoint_pid, peer_port).map_err(|e| {
+            IdentityError {
+                reason: format!("failed to resolve peer binary: {e}"),
+                binary: None,
+                binary_pid: None,
+                ancestors: vec![],
+            }
+        })?;
+
+    let bin_hash = identity_cache
+        .verify_or_cache(&bin_path)
+        .map_err(|e| IdentityError {
+            reason: format!("binary integrity check failed: {e}"),
+            binary: Some(bin_path.clone()),
+            binary_pid: Some(binary_pid),
+            ancestors: vec![],
+        })?;
+
+    let ancestors = crate::procfs::collect_ancestor_binaries(binary_pid, entrypoint_pid);
+
+    for ancestor in &ancestors {
+        identity_cache
+            .verify_or_cache(ancestor)
+            .map_err(|e| IdentityError {
+                reason: format!(
+                    "ancestor integrity check failed for {}: {e}",
+                    ancestor.display()
+                ),
+                binary: Some(bin_path.clone()),
+                binary_pid: Some(binary_pid),
+                ancestors: ancestors.clone(),
+            })?;
+    }
+
+    let mut exclude = ancestors.clone();
+    exclude.push(bin_path.clone());
+    let cmdline_paths = crate::procfs::collect_cmdline_paths(binary_pid, entrypoint_pid, &exclude);
+
+    Ok(ResolvedIdentity {
+        bin_path,
+        binary_pid,
+        ancestors,
+        cmdline_paths,
+        bin_hash,
+    })
+}
+
 /// Evaluate OPA policy for a TCP connection with identity binding via /proc/net/tcp.
 #[cfg(target_os = "linux")]
 fn evaluate_opa_tcp(
@@ -927,55 +1019,26 @@ fn evaluate_opa_tcp(
     let total_start = std::time::Instant::now();
     let peer_port = peer_addr.port();
 
-    let (bin_path, binary_pid) = match crate::procfs::resolve_tcp_peer_identity(pid, peer_port) {
-        Ok(r) => r,
-        Err(e) => {
+    let identity = match resolve_process_identity(pid, peer_port, identity_cache) {
+        Ok(id) => id,
+        Err(err) => {
             return deny(
-                format!("failed to resolve peer binary: {e}"),
-                None,
-                None,
-                vec![],
+                err.reason,
+                err.binary,
+                err.binary_pid,
+                err.ancestors,
                 vec![],
             );
         }
     };
 
-    // TOFU verify the immediate binary
-    let bin_hash = match identity_cache.verify_or_cache(&bin_path) {
-        Ok(h) => h,
-        Err(e) => {
-            return deny(
-                format!("binary integrity check failed: {e}"),
-                Some(bin_path),
-                Some(binary_pid),
-                vec![],
-                vec![],
-            );
-        }
-    };
-
-    // Walk the process tree upward to collect ancestor binaries
-    let ancestors = crate::procfs::collect_ancestor_binaries(binary_pid, pid);
-
-    for ancestor in &ancestors {
-        if let Err(e) = identity_cache.verify_or_cache(ancestor) {
-            return deny(
-                format!(
-                    "ancestor integrity check failed for {}: {e}",
-                    ancestor.display()
-                ),
-                Some(bin_path),
-                Some(binary_pid),
-                ancestors.clone(),
-                vec![],
-            );
-        }
-    }
-
-    // Collect cmdline paths for script-based binary detection.
-    let mut exclude = ancestors.clone();
-    exclude.push(bin_path.clone());
-    let cmdline_paths = crate::procfs::collect_cmdline_paths(binary_pid, pid, &exclude);
+    let ResolvedIdentity {
+        bin_path,
+        binary_pid,
+        ancestors,
+        cmdline_paths,
+        bin_hash,
+    } = identity;
 
     let input = NetworkInput {
         host: host.to_string(),
@@ -3734,5 +3797,167 @@ mod tests {
         // Verify body length matches
         let body_start = resp_str.find("\r\n\r\n").unwrap() + 4;
         assert_eq!(resp_str[body_start..].len(), cl);
+    }
+
+    /// End-to-end regression for the `docker cp` hot-swap hazard that
+    /// motivated `binary_path()` stripping the kernel's `" (deleted)"`
+    /// suffix (PR #844).
+    ///
+    /// Before the strip, the identity-resolution chain inside
+    /// `evaluate_opa_tcp` failed with `"Failed to stat
+    /// /opt/openshell/bin/openshell-sandbox (deleted)"` because
+    /// `BinaryIdentityCache::verify_or_cache()` tried to `metadata()` the
+    /// tainted path. That masked the real security signal: a live process
+    /// was now bound to a *different* binary on disk than the one that was
+    /// TOFU-cached. After the strip, `binary_path()` returns a path that
+    /// stats fine, the cache rehashes the new bytes, and the hash mismatch
+    /// surfaces as a `Binary integrity violation` error — the contract this
+    /// PR is trying to establish.
+    ///
+    /// Test shape (from the review comment on the initial PR):
+    /// 1. Start a `TcpListener` in the test process.
+    /// 2. Copy `/bin/bash` to a temp path we control.
+    /// 3. Prime `BinaryIdentityCache` with that temp binary's hash.
+    /// 4. Spawn the temp bash as a child with a `/dev/tcp` one-liner that
+    ///    opens a real TCP connection to the listener and holds it open.
+    /// 5. Accept the connection on the listener side and capture the peer's
+    ///    ephemeral port — that's what `resolve_process_identity` uses to
+    ///    walk `/proc/net/tcp` back to the child PID.
+    /// 6. Overwrite the temp bash on disk with different bytes to simulate
+    ///    a `docker cp` hot-swap. The running child is unaffected (it still
+    ///    executes from its in-memory image), but `/proc/<child>/exe` will
+    ///    now readlink to `" (deleted)"` OR the overwritten file, depending
+    ///    on whether the filesystem reused the inode.
+    /// 7. Call `resolve_process_identity` and assert:
+    ///    - the error reason contains `"Binary integrity violation"` (the
+    ///      cache detected the tampered on-disk bytes), and
+    ///    - the error reason does NOT contain `"Failed to stat"` or
+    ///      `"(deleted)"` (the old pre-strip failure mode).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_process_identity_surfaces_binary_integrity_violation_on_hot_swap() {
+        use crate::identity::BinaryIdentityCache;
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        // Skip if /bin/bash is not present (e.g. minimal containers).
+        if !std::path::Path::new("/bin/bash").exists() {
+            eprintln!("skipping: /bin/bash not available");
+            return;
+        }
+
+        // 1. Start a listener on loopback.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let listener_port = listener.local_addr().unwrap().port();
+
+        // 2. Copy /bin/bash to a temp path.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bash_v1 = tmp.path().join("hotswap-bash");
+        std::fs::copy("/bin/bash", &bash_v1).expect("copy bash");
+        std::fs::set_permissions(&bash_v1, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // 3. Prime the cache with the v1 hash of the temp bash.
+        let cache = BinaryIdentityCache::new();
+        let v1_hash = cache
+            .verify_or_cache(&bash_v1)
+            .expect("prime cache with v1 bash hash");
+        assert!(!v1_hash.is_empty());
+
+        // 4. Spawn the temp bash with a /dev/tcp one-liner that opens a real
+        //    connection to the listener and sleeps to keep it open. The
+        //    `read -t` blocks on stdin so the shell stays resident.
+        let script = format!("exec 3<>/dev/tcp/127.0.0.1/{listener_port}; sleep 30 <&3");
+        let mut child = Command::new(&bash_v1)
+            .arg("-c")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn hotswap-bash child");
+
+        // 5. Accept on the listener side, capture the peer port.
+        listener.set_nonblocking(false).expect("blocking listener");
+        let (mut stream, peer_addr) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("failed to accept child connection: {e}");
+            }
+        };
+        let peer_port = peer_addr.port();
+        // Drain any spurious data; we just need the socket open.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .ok();
+        let mut buf = [0u8; 16];
+        let _ = stream.read(&mut buf);
+
+        // Give the kernel a moment so /proc/<pid>/net/tcp and
+        // /proc/<pid>/fd/ both reflect the ESTABLISHED socket.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // 6. Simulate `docker cp`: unlink the running binary and create a
+        //    fresh file with different bytes at the same path. Writing
+        //    in place via O_TRUNC is rejected by the kernel with ETXTBSY
+        //    because the inode is still being executed. Unlink is cheap:
+        //    the inode persists in memory via the child's exec mapping,
+        //    so the child keeps running, but a new inode now lives at
+        //    `bash_v1` with a different SHA-256.
+        std::fs::remove_file(&bash_v1).expect("unlink running bash_v1");
+        let tampered_bytes = b"#!/bin/sh\n# tampered bash v2 from hotswap test\nexit 0\n";
+        std::fs::write(&bash_v1, tampered_bytes).expect("write replacement bytes");
+
+        // 7. Resolve identity through the real helper and assert the
+        //    contract: we want "Binary integrity violation", not
+        //    "Failed to stat ... (deleted)".
+        let test_pid = std::process::id();
+        let result = resolve_process_identity(test_pid, peer_port, &cache);
+
+        // Always clean up the child before asserting so a failure doesn't
+        // leak a sleeping process across test runs.
+        let _ = child.kill();
+        let _ = child.wait();
+
+        match result {
+            Ok(_) => panic!(
+                "resolve_process_identity unexpectedly succeeded after hot-swap; \
+                 the cache should have detected the tampered on-disk bytes"
+            ),
+            Err(err) => {
+                assert!(
+                    err.reason.contains("Binary integrity violation"),
+                    "expected 'Binary integrity violation' error, got: {}",
+                    err.reason
+                );
+                assert!(
+                    !err.reason.contains("Failed to stat"),
+                    "pre-PR-#844 failure mode leaked: {}",
+                    err.reason
+                );
+                assert!(
+                    !err.reason.contains("(deleted)"),
+                    "resolved path still contains '(deleted)' suffix: {}",
+                    err.reason
+                );
+                // The binary field should be populated — we did resolve a
+                // path before failing.
+                assert!(
+                    err.binary.is_some(),
+                    "expected resolved binary path on integrity failure"
+                );
+                if let Some(path) = &err.binary {
+                    assert!(
+                        !path.to_string_lossy().contains("(deleted)"),
+                        "resolved binary path still tainted: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
     }
 }

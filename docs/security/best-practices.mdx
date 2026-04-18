@@ -145,12 +145,14 @@ Paths listed in `read_only` receive read-only access.
 Paths listed in `read_write` receive full access.
 All other paths are inaccessible.
 
+Landlock setup runs in two phases. The parent supervisor probes the kernel ABI and opens the configured path file descriptors before forking. The child then applies the ruleset with `restrict_self()` after privilege drop. At startup, OpenShell emits the selected ABI version and the applied read-only and read-write rule counts so you can confirm what the kernel accepted.
+
 | Aspect | Detail |
 |---|---|
-| Default | `compatibility: best_effort`. Uses the highest kernel ABI available. The system skips missing paths with a warning. If the kernel does not support Landlock, the sandbox continues without filesystem restrictions. |
+| Default | `compatibility: best_effort`. Uses the highest kernel ABI available. Missing paths are skipped. If the kernel does not support Landlock or any configured path cannot be opened, the sandbox continues without those restrictions and emits a High-severity OCSF `DetectionFinding`. |
 | What you can change | Set `compatibility: hard_requirement` to abort sandbox startup if Landlock is unavailable or any configured path cannot be opened. |
 | Risk if relaxed | On kernels without Landlock (pre-5.13), or when all paths fail to open, the sandbox runs without kernel-level filesystem restrictions. The agent can access any file the process user can access. |
-| Recommendation | Use `best_effort` for development. Use `hard_requirement` in environments where any gap in filesystem isolation is unacceptable. Run on Ubuntu 22.04+ or any kernel 5.13+ for Landlock support. |
+| Recommendation | Use `best_effort` for development. Use `hard_requirement` in environments where any gap in filesystem isolation is unacceptable. Treat High-severity Landlock findings as a signal to investigate the host kernel or the image. Run on Ubuntu 22.04+ or any kernel 5.13+ for Landlock support. |
 
 ### Read-Only vs Read-Write Paths
 
@@ -192,13 +194,15 @@ The sandbox process runs as a non-root user after explicit privilege dropping.
 
 ### Seccomp Filters
 
-A BPF seccomp filter restricts which socket domains the sandbox process can use.
+A BPF seccomp filter restricts which socket domains the sandbox process can use and blocks a denylist of syscalls that enable container escape, privilege escalation, or host observation. The sandbox sets `PR_SET_NO_NEW_PRIVS` before applying the filter.
 
 | Aspect | Detail |
 |---|---|
-| Default | The filter allows `AF_INET` and `AF_INET6` (for proxy communication) and blocks `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` with `EPERM`. The sandbox sets `PR_SET_NO_NEW_PRIVS` before applying the filter. |
+| Socket domains | The filter allows `AF_INET` and `AF_INET6` (for proxy communication) and blocks `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` with `EPERM`. |
+| Unconditional syscall blocks | `memfd_create`, `ptrace`, `bpf`, `process_vm_readv`, `process_vm_writev`, `pidfd_open`, `pidfd_getfd`, `pidfd_send_signal`, `io_uring_setup`, `mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `setns`, `umount2`, `pivot_root`, `userfaultfd`, `perf_event_open`. |
+| Conditional syscall blocks | `execveat` with `AT_EMPTY_PATH`, `unshare` and `clone` with `CLONE_NEWUSER`, and `seccomp(SECCOMP_SET_MODE_FILTER)` are denied with `EPERM`. |
 | What you can change | This is not a user-facing knob. OpenShell enforces it automatically. |
-| Risk if relaxed | `AF_NETLINK` allows manipulation of routing tables and firewall rules. `AF_PACKET` enables raw packet capture. `AF_VSOCK` enables VM socket communication. |
+| Risk if relaxed | The blocked syscalls support container escape (`mount`, `pivot_root`, `move_mount`, namespace creation), cross-process observation (`ptrace`, `process_vm_readv`, `pidfd_*`), raw kernel bypass (`bpf`, `io_uring_setup`, `perf_event_open`), and filter evasion (`seccomp`, `userfaultfd`). |
 | Recommendation | No action needed. OpenShell enforces this automatically. |
 
 ### Enforcement Application Order
@@ -224,6 +228,7 @@ The agent never receives the provider API key.
 | Aspect | Detail |
 |---|---|
 | Default | Always active. The proxy handles `inference.local` before OPA policy evaluation. The gateway injects credentials on the host side. |
+| Keep-alive isolation | If a sandbox reuses a keep-alive connection that previously carried a routed inference request for a subsequent non-inference request, the proxy denies the non-inference request with `connection not allowed by policy` and closes the connection. This prevents agents from reusing an inference-authorized connection for other destinations. |
 | What you can change | Configure inference routes with `openshell inference set`. |
 | Risk if bypassed | If an inference provider's host is added directly to `network_policies`, the agent could reach it with a stolen or hardcoded key, bypassing credential isolation. |
 | Recommendation | Do not add inference provider hosts to `network_policies`. Use OpenShell inference routing instead. |

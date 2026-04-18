@@ -1,18 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+landing-page:
+  page: "Home"
+  path: index.mdx
+
 navigation:
+- folder: about
+  title: "About NVIDIA OpenShell"
 - section: "Get Started"
   slug: get-started
   contents:
-  - page: "Home"
-    path: index.mdx
   - page: "Quickstart"
     path: get-started/quickstart.mdx
-  - folder: tutorials
+  - folder: get-started/tutorials
     skip-slug: true
-- folder: about
-  title: "About NVIDIA OpenShell"
 - folder: sandboxes
 - folder: inference
   title: "Inference Routing"

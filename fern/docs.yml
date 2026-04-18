@@ -84,3 +84,12 @@ redirects:
     destination: "/openshell/:path*"
   - source: "/openshell/:path*.html"
     destination: "/openshell/:path*"
+  # tutorials moved under get-started
+  - source: "/openshell/tutorials"
+    destination: "/openshell/latest/get-started/tutorials"
+  - source: "/openshell/tutorials/:path*"
+    destination: "/openshell/latest/get-started/tutorials/:path*"
+  - source: "/openshell/latest/tutorials"
+    destination: "/openshell/latest/get-started/tutorials"
+  - source: "/openshell/latest/tutorials/:path*"
+    destination: "/openshell/latest/get-started/tutorials/:path*"

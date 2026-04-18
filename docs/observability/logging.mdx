@@ -124,6 +124,12 @@ A connection denied because the destination resolves to an always-blocked addres
 OCSF NET:OPEN [MED] DENIED /usr/bin/curl(1618) -> 169.254.169.254:80 [policy:- engine:ssrf] [reason:resolves to always-blocked address]
 ```
 
+An HTTP request to a non-default port. HTTP log URLs include the port whenever it differs from the scheme default (80 for `http`, 443 for `https`):
+
+```text
+OCSF HTTP:GET [INFO] ALLOWED GET http://api.internal.corp:8080/v1/status [policy:internal_api engine:opa]
+```
+
 Proxy and SSH servers ready:
 
 ```text
@@ -149,6 +155,67 @@ A policy reload after a settings change:
 OCSF CONFIG:DETECTED [INFO] Settings poll: config change detected [old_revision:2915564174587774909 new_revision:11008534403127604466 policy_changed:true]
 OCSF CONFIG:LOADED [INFO] Policy reloaded successfully [policy_hash:0cc0c2b525573c07]
 ```
+
+## Denial Reasons
+
+Denied `NET:` and `HTTP:` events carry a `[reason:...]` suffix that surfaces the decision detail from the event's `status_detail` field. The reason helps distinguish between policy misses, SSRF hardening, and L7 enforcement without inspecting the full OCSF JSONL record.
+
+Common reason phrases emitted by the sandbox include:
+
+| Reason | Meaning |
+|---|---|
+| `no matching policy` | OPA evaluated the request and no allow rule matched. |
+| `resolves to always-blocked address` | The destination resolved to loopback, link-local, or unspecified. These ranges are always blocked, even when listed in `allowed_ips`. |
+| `resolves to <ip> which is not in allowed_ips, connection rejected` | The destination resolved to an IP outside the policy's `allowed_ips` allowlist. |
+| `DNS resolution failed for <host>:<port>` | The proxy could not resolve the destination. |
+| `port <n> is a blocked control-plane port, connection rejected` | The destination port matches a control-plane port (etcd, Kubernetes API, kubelet) and is always blocked. |
+| `l7 deny` | An L7 policy rule denied the request. |
+
+Invalid `allowed_ips` entries and entries that overlap always-blocked ranges are rejected at policy-load time, so they never reach the runtime denial path. The phrases above come from the proxy's per-CONNECT `allowed_ips` and SSRF checks, not from policy validation.
+
+## Proxy Error Responses
+
+When the HTTP CONNECT proxy denies a request or cannot reach the upstream, it returns an HTTP error response with a JSON body. Clients can parse the body to surface actionable failure details instead of treating the status code alone.
+
+A denied CONNECT returns `403 Forbidden`:
+
+```json
+{
+  "error": "policy_denied",
+  "detail": "CONNECT api.example.com:443 not permitted by policy"
+}
+```
+
+An upstream that the proxy cannot reach returns `502 Bad Gateway`:
+
+```json
+{
+  "error": "upstream_unreachable",
+  "detail": "connection to api.example.com:443 failed"
+}
+```
+
+The `error` field is a short machine-readable code (`policy_denied`, `ssrf_denied`, `upstream_unreachable`). The `detail` field is a human-readable explanation suitable for display in an agent transcript.
+
+## Filesystem Sandbox Logs
+
+Landlock filesystem restrictions emit `CONFIG:` events at startup and whenever the sandbox has to skip a requested path.
+
+On startup, the probe reports the kernel's supported Landlock ABI version alongside the requested path counts:
+
+```text
+OCSF CONFIG:ENABLED [INFO] Landlock filesystem sandbox available [abi:v2 compat:BestEffort ro:4 rw:2]
+OCSF CONFIG:ENABLED [INFO] Applying Landlock filesystem sandbox [abi:V2 compat:BestEffort ro:4 rw:2]
+OCSF CONFIG:ENABLED [INFO] Landlock ruleset built [rules_applied:5 skipped:1]
+```
+
+When `landlock.compatibility` is `best_effort` and a requested path fails to open for reasons other than `NotFound` (for example, permission denied or a symlink loop), the sandbox continues without that path and emits a `[MED]` event so the degradation is not silent:
+
+```text
+OCSF CONFIG:OTHER [MED] Skipping inaccessible Landlock path (best-effort) [path:/opt/data error:Permission denied (os error 13)]
+```
+
+Set `landlock.compatibility` to `hard_requirement` in the policy to make these failures fatal instead of degraded.
 
 ## Log File Location
 
