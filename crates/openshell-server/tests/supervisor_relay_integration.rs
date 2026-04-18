@@ -306,7 +306,15 @@ fn register_session(
     registry: &SupervisorSessionRegistry,
     sandbox_id: &str,
 ) -> mpsc::Receiver<GatewayMessage> {
-    let (tx, rx) = mpsc::channel(8);
+    register_session_with_capacity(registry, sandbox_id, 8)
+}
+
+fn register_session_with_capacity(
+    registry: &SupervisorSessionRegistry,
+    sandbox_id: &str,
+    capacity: usize,
+) -> mpsc::Receiver<GatewayMessage> {
+    let (tx, rx) = mpsc::channel(capacity);
     registry.register(sandbox_id.to_string(), "sess-1".to_string(), tx);
     rx
 }
@@ -504,4 +512,55 @@ async fn concurrent_relays_multiplex_independently() {
     rb.read_exact(&mut buf_b).await.unwrap();
     assert_eq!(&buf_a, b"stream-A");
     assert_eq!(&buf_b, b"stream-B");
+}
+
+/// Bursts more `open_relay` calls than the per-sandbox cap allows in parallel
+/// and asserts the registry enforces the ceiling cleanly. A well-behaved
+/// caller inside the cap still succeeds; overflow calls return `ResourceExhausted`
+/// rather than racing the pending map into an inconsistent state.
+#[tokio::test]
+async fn open_relay_enforces_per_sandbox_cap_under_concurrent_burst() {
+    let registry = Arc::new(SupervisorSessionRegistry::new());
+    let _channel = spawn_gateway(Arc::clone(&registry)).await;
+    // Oversized mpsc so the session doesn't backpressure the burst — the cap,
+    // not the channel, is what we're testing.
+    let _session_rx = register_session_with_capacity(&registry, "sbx", 256);
+
+    // Fire 64 concurrent opens. Per-sandbox cap is 32, global cap is 256,
+    // so exactly 32 should succeed and 32 should be rejected with
+    // `ResourceExhausted` carrying the per-sandbox message.
+    let mut handles = Vec::with_capacity(64);
+    for _ in 0..64 {
+        let r = Arc::clone(&registry);
+        handles.push(tokio::spawn(async move {
+            r.open_relay("sbx", Duration::from_secs(1)).await
+        }));
+    }
+
+    let mut ok = 0usize;
+    let mut exhausted = 0usize;
+    for h in handles {
+        match h.await.expect("task joined") {
+            Ok(_pair) => ok += 1,
+            Err(status) if status.code() == tonic::Code::ResourceExhausted => {
+                assert!(
+                    status.message().contains("per-sandbox relay limit"),
+                    "expected per-sandbox error message, got: {}",
+                    status.message()
+                );
+                exhausted += 1;
+            }
+            Err(other) => panic!("unexpected open_relay error: {other:?}"),
+        }
+    }
+    assert_eq!(ok, 32, "exactly per-sandbox cap should succeed");
+    assert_eq!(exhausted, 32, "overflow should be rejected, not dropped");
+
+    // A different sandbox still has headroom — the per-sandbox cap doesn't
+    // leak onto unrelated tenants.
+    let _other_rx = register_session_with_capacity(&registry, "sbx-other", 8);
+    registry
+        .open_relay("sbx-other", Duration::from_secs(1))
+        .await
+        .expect("other sandbox should not be affected by sbx cap");
 }

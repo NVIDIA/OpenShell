@@ -25,6 +25,16 @@ const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 const SESSION_WAIT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 /// Maximum backoff between session-availability polls in `wait_for_session`.
 const SESSION_WAIT_MAX_BACKOFF: Duration = Duration::from_secs(2);
+/// Upper bound on unclaimed relay channels across all sandboxes. Caps the
+/// memory a misbehaving caller can pin by calling `open_relay` repeatedly
+/// while the supervisor never claims (or isn't responding). Sized generously
+/// so normal bursts pass through; exceeding it returns `ResourceExhausted`.
+const MAX_PENDING_RELAYS: usize = 256;
+/// Upper bound on concurrent unclaimed relay channels for a single sandbox.
+/// Enforces the same shape per sandbox so one misbehaving sandbox can't
+/// consume the entire global budget. Sits above the SSH-tunnel per-sandbox
+/// cap (20) so tunnel-specific limits still fire first for that caller.
+const MAX_PENDING_RELAYS_PER_SANDBOX: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Session registry
@@ -56,6 +66,7 @@ pub struct SupervisorSessionRegistry {
 
 struct PendingRelay {
     sender: RelayStreamSender,
+    sandbox_id: String,
     created_at: Instant,
 }
 
@@ -186,13 +197,31 @@ impl SupervisorSessionRegistry {
         let channel_id = Uuid::new_v4().to_string();
 
         // Register the pending relay before sending RelayOpen to avoid a race.
+        // Both caps are checked and the insert happens under a single lock hold
+        // so two concurrent calls can't both observe "under the cap" and then
+        // both insert past it.
         let (relay_tx, relay_rx) = oneshot::channel();
         {
             let mut pending = self.pending_relays.lock().unwrap();
+            if pending.len() >= MAX_PENDING_RELAYS {
+                return Err(Status::resource_exhausted(format!(
+                    "gateway relay capacity reached ({MAX_PENDING_RELAYS} in flight)"
+                )));
+            }
+            let per_sandbox = pending
+                .values()
+                .filter(|p| p.sandbox_id == sandbox_id)
+                .count();
+            if per_sandbox >= MAX_PENDING_RELAYS_PER_SANDBOX {
+                return Err(Status::resource_exhausted(format!(
+                    "per-sandbox relay limit reached ({MAX_PENDING_RELAYS_PER_SANDBOX} in flight for {sandbox_id})"
+                )));
+            }
             pending.insert(
                 channel_id.clone(),
                 PendingRelay {
                     sender: relay_tx,
+                    sandbox_id: sandbox_id.to_string(),
                     created_at: Instant::now(),
                 },
             );
@@ -732,6 +761,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_relay_rejects_when_global_cap_reached() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel::<GatewayMessage>(8);
+        registry.register("sbx-a".to_string(), "s-a".to_string(), tx.clone());
+        registry.register("sbx-b".to_string(), "s-b".to_string(), tx);
+
+        // Pre-seed pending_relays to exactly the global cap, split across two
+        // sandboxes so neither hits the per-sandbox cap first.
+        {
+            let mut pending = registry.pending_relays.lock().unwrap();
+            for i in 0..MAX_PENDING_RELAYS {
+                let (oneshot_tx, _) = oneshot::channel();
+                let sandbox_id = if i % 2 == 0 { "sbx-a" } else { "sbx-b" };
+                pending.insert(
+                    format!("channel-{i}"),
+                    PendingRelay {
+                        sender: oneshot_tx,
+                        sandbox_id: sandbox_id.to_string(),
+                        created_at: Instant::now(),
+                    },
+                );
+            }
+        }
+
+        let err = registry
+            .open_relay("sbx-a", Duration::from_millis(50))
+            .await
+            .expect_err("open_relay should reject once global cap is reached");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(err.message().contains("gateway relay capacity"));
+    }
+
+    #[tokio::test]
+    async fn open_relay_rejects_when_per_sandbox_cap_reached() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel::<GatewayMessage>(8);
+        registry.register("sbx".to_string(), "s".to_string(), tx);
+
+        {
+            let mut pending = registry.pending_relays.lock().unwrap();
+            for i in 0..MAX_PENDING_RELAYS_PER_SANDBOX {
+                let (oneshot_tx, _) = oneshot::channel();
+                pending.insert(
+                    format!("channel-{i}"),
+                    PendingRelay {
+                        sender: oneshot_tx,
+                        sandbox_id: "sbx".to_string(),
+                        created_at: Instant::now(),
+                    },
+                );
+            }
+        }
+
+        let err = registry
+            .open_relay("sbx", Duration::from_millis(50))
+            .await
+            .expect_err("open_relay should reject when per-sandbox cap is reached");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(err.message().contains("per-sandbox relay limit"));
+
+        // A different sandbox still has headroom.
+        let (tx2, _rx2) = mpsc::channel::<GatewayMessage>(8);
+        registry.register("sbx-other".to_string(), "s-other".to_string(), tx2);
+        registry
+            .open_relay("sbx-other", Duration::from_millis(50))
+            .await
+            .expect("different sandbox should still accept new relays");
+    }
+
+    #[tokio::test]
     async fn open_relay_uses_newest_session_after_supersede() {
         let registry = SupervisorSessionRegistry::new();
         let (tx_old, mut rx_old) = mpsc::channel::<GatewayMessage>(4);
@@ -785,6 +884,7 @@ mod tests {
             "ch-1".to_string(),
             PendingRelay {
                 sender: relay_tx,
+                sandbox_id: "sbx-test".to_string(),
                 created_at: Instant::now(),
             },
         );
@@ -802,6 +902,7 @@ mod tests {
             "ch-old".to_string(),
             PendingRelay {
                 sender: relay_tx,
+                sandbox_id: "sbx-test".to_string(),
                 created_at: Instant::now() - Duration::from_secs(60),
             },
         );
@@ -829,6 +930,7 @@ mod tests {
             "ch-1".to_string(),
             PendingRelay {
                 sender: relay_tx,
+                sandbox_id: "sbx-test".to_string(),
                 created_at: Instant::now(),
             },
         );
@@ -847,6 +949,7 @@ mod tests {
             "ch-io".to_string(),
             PendingRelay {
                 sender: relay_tx,
+                sandbox_id: "sbx-test".to_string(),
                 created_at: Instant::now(),
             },
         );
@@ -877,6 +980,7 @@ mod tests {
             "ch-old".to_string(),
             PendingRelay {
                 sender: relay_tx,
+                sandbox_id: "sbx-test".to_string(),
                 created_at: Instant::now() - Duration::from_secs(60),
             },
         );
@@ -899,6 +1003,7 @@ mod tests {
             "ch-fresh".to_string(),
             PendingRelay {
                 sender: relay_tx,
+                sandbox_id: "sbx-test".to_string(),
                 created_at: Instant::now(),
             },
         );
