@@ -251,7 +251,7 @@ OpenShell generates a cluster CA at bootstrap and distributes it through Kuberne
 
 ### SSH Tunnel Authentication
 
-SSH connections to sandboxes pass through the gateway's HTTP CONNECT tunnel with token-based authentication and HMAC-SHA256 handshake verification (NSSH1 protocol).
+SSH connections to sandboxes travel through the gateway over the sandbox's existing mTLS session. On top of the gateway's transport authentication (mTLS by default), each SSH connect call also carries a short-lived session token scoped to a specific sandbox. The sandbox never exposes an SSH port on the network — its SSH daemon listens on a local Unix socket that only the sandbox's own supervisor process can reach.
 
 | Aspect | Detail |
 |---|---|

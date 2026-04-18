@@ -134,13 +134,13 @@ Proxy and SSH servers ready:
 
 ```text
 OCSF NET:LISTEN [INFO] 10.200.0.1:3128
-OCSF SSH:LISTEN [INFO] 0.0.0.0:2222
+OCSF SSH:LISTEN [INFO]
 ```
 
-An SSH handshake accepted, one event per connection:
+An SSH connection accepted (one event per invocation, arriving over the supervisor's Unix socket, so there is no network peer address to log):
 
 ```text
-OCSF SSH:OPEN [INFO] ALLOWED 10.42.0.52:42706 [auth:NSSH1]
+OCSF SSH:OPEN [INFO] ALLOWED
 ```
 
 A process launched inside the sandbox:
