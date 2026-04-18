@@ -423,6 +423,28 @@ mod tests {
         }
     }
 
+    /// Retry `Command::spawn` on `ETXTBSY`. The kernel rejects `execve` when
+    /// `inode->i_writecount > 0`, and the release of that counter after the
+    /// writer fd is closed isn't synchronous with `close(2)` under contention —
+    /// so the very-next-instruction `execve` can still race it. Any other error
+    /// surfaces immediately.
+    #[cfg(target_os = "linux")]
+    fn spawn_retrying_on_etxtbsy(cmd: &mut std::process::Command) -> std::process::Child {
+        let mut attempts = 0;
+        loop {
+            match cmd.spawn() {
+                Ok(child) => return child,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 20 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(err) => panic!("spawn failed after {attempts} ETXTBSY retries: {err}"),
+            }
+        }
+    }
+
     #[test]
     fn file_sha256_computes_correct_hash() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
@@ -481,10 +503,9 @@ mod tests {
         // child is still running. The child keeps the exec mapping via
         // `/proc/<pid>/exe`, but readlink will now return the tainted
         // "<path> (deleted)" string.
-        let mut child = std::process::Command::new(&exe_path)
-            .arg("5")
-            .spawn()
-            .unwrap();
+        let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg("5");
+        let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();
         wait_for_child_exec(pid, &exe_path);
         std::fs::remove_file(&exe_path).unwrap();
@@ -532,10 +553,9 @@ mod tests {
         std::fs::copy("/bin/sleep", &exe_path).unwrap();
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let mut child = std::process::Command::new(&exe_path)
-            .arg("5")
-            .spawn()
-            .unwrap();
+        let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg("5");
+        let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();
         wait_for_child_exec(pid, &exe_path);
 
@@ -576,10 +596,9 @@ mod tests {
         std::fs::copy("/bin/sleep", &exe_path).unwrap();
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let mut child = std::process::Command::new(&exe_path)
-            .arg("5")
-            .spawn()
-            .unwrap();
+        let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg("5");
+        let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();
         wait_for_child_exec(pid, &exe_path);
         std::fs::remove_file(&exe_path).unwrap();
