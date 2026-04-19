@@ -527,7 +527,9 @@ async fn ssh_tar_upload(
                         .append_path_with_name(&local_path, &tar_name)
                         .into_diagnostic()?;
                 } else if local_path.is_dir() {
-                    archive.append_dir_all(".", &local_path).into_diagnostic()?;
+                    archive
+                        .append_dir_all(&tar_name, &local_path)
+                        .into_diagnostic()?;
                 } else {
                     return Err(miette::miette!(
                         "local path does not exist: {}",
@@ -665,8 +667,11 @@ pub async fn sandbox_sync_up(
             .ok_or_else(|| miette::miette!("path has no file name"))?
             .to_os_string()
     } else {
-        // For directories the tar_name is unused — append_dir_all uses "."
-        ".".into()
+        // For directories, wrap contents under the source basename so uploads
+        // land at `<dest>/<dirname>/...` — matches `scp -r` and `cp -r`. Falls
+        // back to "." for paths with no meaningful basename (`.`, `/`), which
+        // preserves the legacy flatten behavior in those edge cases.
+        directory_upload_prefix(local_path)
     };
 
     ssh_tar_upload(
@@ -680,6 +685,19 @@ pub async fn sandbox_sync_up(
         tls,
     )
     .await
+}
+
+/// Compute the tar entry prefix for a directory upload.
+///
+/// Returns the directory's basename for any path with a meaningful basename;
+/// callers extracting at `<dest>` will see contents wrapped under
+/// `<dest>/<basename>/...`. Returns `"."` for paths without a basename
+/// (e.g. `.` or `/`), which produces flat extraction at `<dest>`.
+fn directory_upload_prefix(local_path: &Path) -> std::ffi::OsString {
+    local_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| ".".into())
 }
 
 /// Pull a path from a sandbox to a local destination using tar-over-SSH.
@@ -1278,6 +1296,34 @@ mod tests {
             ("/sandbox/sub", "file")
         );
         assert_eq!(split_sandbox_path("/a/b/c/d.txt"), ("/a/b/c", "d.txt"));
+    }
+
+    #[test]
+    fn directory_upload_prefix_uses_basename_for_named_directories() {
+        assert_eq!(
+            directory_upload_prefix(Path::new("/tmp/upload-test")),
+            std::ffi::OsString::from("upload-test")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("foo")),
+            std::ffi::OsString::from("foo")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("./parent/nested")),
+            std::ffi::OsString::from("nested")
+        );
+    }
+
+    #[test]
+    fn directory_upload_prefix_falls_back_to_dot_for_basename_less_paths() {
+        assert_eq!(
+            directory_upload_prefix(Path::new(".")),
+            std::ffi::OsString::from(".")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("/")),
+            std::ffi::OsString::from(".")
+        );
     }
 
     #[test]
