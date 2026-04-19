@@ -380,31 +380,34 @@ main() {
   fi
 
   # ---------------------------------------------------------------------------
-  # Next steps — print the command to start the gateway.
+  # Next steps — print a working command to start the gateway.
   #
-  # The gateway auto-detects the VM compute driver by searching
-  # ${_driver_dir} (default ~/.local/libexec/openshell). When the install
-  # paths are the defaults, --driver-dir can be omitted entirely.
+  # The VM compute driver requires:
+  #   * --vm-compute-driver-bin — path to openshell-driver-vm.
+  #                               Newer gateways also accept --driver-dir,
+  #                               but the explicit bin path works against
+  #                               every released gateway.
+  #   * --grpc-endpoint         — URL the VM guest uses to call the gateway
+  #                               back. Loopback is accepted; scheme must
+  #                               match TLS mode.
+  #   * --ssh-handshake-secret  — shared secret for gateway↔sandbox SSH.
   # ---------------------------------------------------------------------------
 
   echo ""
   info "Next steps — start the gateway with the VM compute driver:"
   echo ""
 
-  _start_cmd="${GATEWAY_BIN} \\
+  cat >&2 <<EOF
+    ${GATEWAY_BIN} \\
       --drivers vm \\
+      --vm-compute-driver-bin '${_driver_dir}/${DRIVER_VM_BIN}' \\
       --disable-tls \\
-      --db-url 'sqlite::memory:'"
+      --disable-gateway-auth \\
+      --db-url 'sqlite::memory:' \\
+      --grpc-endpoint 'http://127.0.0.1:8080' \\
+      --ssh-handshake-secret "\$(openssl rand -hex 32)"
+EOF
 
-  if [ "$_driver_dir" != "${HOME}/.local/libexec/openshell" ]; then
-    _start_cmd="${GATEWAY_BIN} \\
-      --drivers vm \\
-      --driver-dir '${_driver_dir}' \\
-      --disable-tls \\
-      --db-url 'sqlite::memory:'"
-  fi
-
-  printf '    %s\n' "$_start_cmd" >&2
   echo ""
   info "See '${GATEWAY_BIN} --help' for TLS, persistence, and sandbox flags."
 }
