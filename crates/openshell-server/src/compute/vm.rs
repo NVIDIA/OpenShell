@@ -58,8 +58,15 @@ pub struct VmComputeConfig {
     pub state_dir: PathBuf,
 
     /// Optional override for the `openshell-driver-vm` binary path.
-    /// When `None`, the gateway resolves a sibling of its own executable.
+    /// Takes precedence over [`driver_dir`] and the sibling fallback.
     pub compute_driver_bin: Option<PathBuf>,
+
+    /// Directory to search for compute-driver binaries when
+    /// [`compute_driver_bin`] is not set. Resolution order:
+    /// 1. `compute_driver_bin` (explicit override)
+    /// 2. `driver_dir/openshell-driver-vm`
+    /// 3. sibling of the gateway executable
+    pub driver_dir: Option<PathBuf>,
 
     /// libkrun log level used by the VM driver helper.
     pub krun_log_level: u32,
@@ -87,6 +94,23 @@ impl VmComputeConfig {
         PathBuf::from("target/openshell-vm-driver")
     }
 
+    /// Default directory the gateway searches for compute-driver binaries.
+    ///
+    /// Resolves to `$HOME/.local/libexec/openshell` when `$HOME` is set.
+    /// Callers should treat a missing directory as "no configured driver
+    /// dir" rather than an error — the sibling-of-exe fallback still
+    /// applies in that case.
+    #[must_use]
+    pub fn default_driver_dir() -> Option<PathBuf> {
+        std::env::var_os("HOME").map(|home| {
+            let mut path = PathBuf::from(home);
+            path.push(".local");
+            path.push("libexec");
+            path.push("openshell");
+            path
+        })
+    }
+
     /// Default libkrun log level.
     #[must_use]
     pub const fn default_krun_log_level() -> u32 {
@@ -111,6 +135,7 @@ impl Default for VmComputeConfig {
         Self {
             state_dir: Self::default_state_dir(),
             compute_driver_bin: None,
+            driver_dir: Self::default_driver_dir(),
             krun_log_level: Self::default_krun_log_level(),
             vcpus: Self::default_vcpus(),
             mem_mib: Self::default_mem_mib(),
@@ -129,31 +154,63 @@ pub(crate) struct VmGuestTlsPaths {
     pub(crate) key: PathBuf,
 }
 
-/// Resolve the `openshell-driver-vm` binary path, falling back to a sibling
-/// of the gateway's own executable when an override is not supplied.
+/// Resolve the `openshell-driver-vm` binary path.
+///
+/// Resolution order:
+/// 1. Explicit override via `--vm-compute-driver-bin` / `OPENSHELL_VM_COMPUTE_DRIVER_BIN`.
+/// 2. `{driver_dir}/openshell-driver-vm`, where `driver_dir` comes from
+///    `--driver-dir` / `OPENSHELL_DRIVER_DIR` (defaults to
+///    `~/.local/libexec/openshell`).
+/// 3. Sibling of the gateway's own executable (last-resort fallback so
+///    local development builds still work out of the box).
 pub(crate) fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf> {
-    let path = if let Some(path) = vm_config.compute_driver_bin.clone() {
-        path
-    } else {
-        let current_exe = std::env::current_exe()
-            .map_err(|e| Error::config(format!("failed to resolve current executable: {e}")))?;
-        let Some(parent) = current_exe.parent() else {
-            return Err(Error::config(format!(
-                "current executable '{}' has no parent directory",
-                current_exe.display()
-            )));
-        };
-        parent.join("openshell-driver-vm")
-    };
+    const DRIVER_BIN_NAME: &str = "openshell-driver-vm";
 
-    if !path.is_file() {
-        return Err(Error::config(format!(
-            "vm compute driver binary '{}' does not exist; set --vm-compute-driver-bin or OPENSHELL_VM_COMPUTE_DRIVER_BIN",
-            path.display()
-        )));
+    // 1. Explicit override wins unconditionally.
+    if let Some(path) = vm_config.compute_driver_bin.clone() {
+        if !path.is_file() {
+            return Err(Error::config(format!(
+                "vm compute driver binary '{}' does not exist; set --vm-compute-driver-bin or OPENSHELL_VM_COMPUTE_DRIVER_BIN to a valid path",
+                path.display()
+            )));
+        }
+        return Ok(path);
     }
 
-    Ok(path)
+    let mut searched: Vec<PathBuf> = Vec::new();
+
+    // 2. Configured driver directory.
+    if let Some(dir) = vm_config.driver_dir.clone() {
+        let candidate = dir.join(DRIVER_BIN_NAME);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        searched.push(candidate);
+    }
+
+    // 3. Sibling-of-gateway fallback.
+    let current_exe = std::env::current_exe()
+        .map_err(|e| Error::config(format!("failed to resolve current executable: {e}")))?;
+    let Some(parent) = current_exe.parent() else {
+        return Err(Error::config(format!(
+            "current executable '{}' has no parent directory",
+            current_exe.display()
+        )));
+    };
+    let sibling = parent.join(DRIVER_BIN_NAME);
+    if sibling.is_file() {
+        return Ok(sibling);
+    }
+    searched.push(sibling);
+
+    let searched_display = searched
+        .iter()
+        .map(|p| format!("'{}'", p.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(Error::config(format!(
+        "vm compute driver binary not found (searched {searched_display}); install it under --driver-dir / OPENSHELL_DRIVER_DIR (default ~/.local/libexec/openshell), set --vm-compute-driver-bin / OPENSHELL_VM_COMPUTE_DRIVER_BIN, or place it next to the gateway binary"
+    )))
 }
 
 /// Path of the Unix domain socket the driver will listen on.
@@ -353,9 +410,71 @@ async fn connect_compute_driver(socket_path: &std::path::Path) -> Result<Channel
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{VmComputeConfig, compute_driver_guest_tls_paths};
+    use super::{VmComputeConfig, compute_driver_guest_tls_paths, resolve_compute_driver_bin};
     use openshell_core::{Config, TlsConfig};
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    #[test]
+    fn resolve_driver_bin_prefers_explicit_override() {
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("my-driver-vm");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let vm_config = VmComputeConfig {
+            compute_driver_bin: Some(bin.clone()),
+            driver_dir: None,
+            ..Default::default()
+        };
+        assert_eq!(resolve_compute_driver_bin(&vm_config).unwrap(), bin);
+    }
+
+    #[test]
+    fn resolve_driver_bin_errors_when_override_missing() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+
+        let vm_config = VmComputeConfig {
+            compute_driver_bin: Some(missing),
+            driver_dir: None,
+            ..Default::default()
+        };
+        let err = resolve_compute_driver_bin(&vm_config).unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn resolve_driver_bin_uses_driver_dir_when_binary_present() {
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("openshell-driver-vm");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let vm_config = VmComputeConfig {
+            compute_driver_bin: None,
+            driver_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_compute_driver_bin(&vm_config).unwrap(), bin);
+    }
+
+    #[test]
+    fn resolve_driver_bin_error_mentions_driver_dir_hint() {
+        let dir = tempdir().unwrap(); // empty — no driver binary present
+
+        let vm_config = VmComputeConfig {
+            compute_driver_bin: None,
+            driver_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let err = resolve_compute_driver_bin(&vm_config)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--driver-dir"));
+        assert!(err.contains("OPENSHELL_DRIVER_DIR"));
+        assert!(err.contains("openshell-driver-vm"));
+    }
 
     #[test]
     fn vm_compute_driver_tls_requires_explicit_guest_bundle() {
