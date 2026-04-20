@@ -43,6 +43,11 @@ pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
     Ok(())
 }
 
+/// Apply the supervisor's early-startup hardening before runtime initialization.
+pub fn apply_supervisor_prelude() -> Result<()> {
+    seccomp::apply_supervisor_prelude()
+}
+
 /// Legacy single-phase apply. Kept for backward compatibility.
 /// New callers should use [`prepare`] + [`enforce`] for correct privilege ordering.
 pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {

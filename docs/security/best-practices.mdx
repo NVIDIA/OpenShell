@@ -194,12 +194,13 @@ The sandbox process runs as a non-root user after explicit privilege dropping.
 
 ### Seccomp Filters
 
-A BPF seccomp filter restricts which socket domains the sandbox process can use and blocks a denylist of syscalls that enable container escape, privilege escalation, or host observation. The sandbox sets `PR_SET_NO_NEW_PRIVS` before applying the filter.
+OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude runs before CLI parsing and async runtime initialization, then the child process receives the broader runtime seccomp filter after privilege drop.
 
 | Aspect | Detail |
 |---|---|
+| Startup prelude | Before the supervisor initializes the runtime, it sets `PR_SET_NO_NEW_PRIVS` and blocks `mount`, the new mount API syscalls, `pivot_root`, `umount2`, `bpf`, `perf_event_open`, `userfaultfd`, module-loading syscalls, and kexec. This closes the privileged remount and kernel-surface window while leaving required setup syscalls such as `setns` available. |
 | Socket domains | The filter allows `AF_INET` and `AF_INET6` (for proxy communication) and blocks `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` with `EPERM`. |
-| Unconditional syscall blocks | `memfd_create`, `ptrace`, `bpf`, `process_vm_readv`, `process_vm_writev`, `pidfd_open`, `pidfd_getfd`, `pidfd_send_signal`, `io_uring_setup`, `mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `setns`, `umount2`, `pivot_root`, `userfaultfd`, `perf_event_open`. |
+| Runtime unconditional syscall blocks | `memfd_create`, `ptrace`, `bpf`, `process_vm_readv`, `process_vm_writev`, `pidfd_open`, `pidfd_getfd`, `pidfd_send_signal`, `io_uring_setup`, `mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `setns`, `umount2`, `pivot_root`, `userfaultfd`, `perf_event_open`. |
 | Conditional syscall blocks | `execveat` with `AT_EMPTY_PATH`, `unshare` and `clone` with `CLONE_NEWUSER`, and `seccomp(SECCOMP_SET_MODE_FILTER)` are denied with `EPERM`. |
 | What you can change | This is not a user-facing knob. OpenShell enforces it automatically. |
 | Risk if relaxed | The blocked syscalls support container escape (`mount`, `pivot_root`, `move_mount`, namespace creation), cross-process observation (`ptrace`, `process_vm_readv`, `pidfd_*`), raw kernel bypass (`bpf`, `io_uring_setup`, `perf_event_open`), and filter evasion (`seccomp`, `userfaultfd`). |
@@ -208,13 +209,14 @@ A BPF seccomp filter restricts which socket domains the sandbox process can use 
 ### Enforcement Application Order
 
 The sandbox supervisor applies enforcement in a specific order during process startup.
-This ordering is intentional: privilege dropping needs `/etc/group` and `/etc/passwd`, which Landlock subsequently restricts.
+This ordering is intentional: the startup prelude must run before runtime initialization, and privilege dropping still needs `/etc/group` and `/etc/passwd`, which Landlock subsequently restricts.
 
-1. Network namespace entry (`setns`).
-2. Privilege drop (`initgroups` + `setgid` + `setuid`).
-3. Core-dump hardening (`RLIMIT_CORE=0`, plus `PR_SET_DUMPABLE=0` on Linux).
-4. Landlock filesystem restrictions.
-5. Seccomp socket domain filters.
+1. Supervisor startup prelude seccomp (`PR_SET_NO_NEW_PRIVS` plus the early syscall denylist).
+2. Network namespace entry (`setns`).
+3. Privilege drop (`initgroups` + `setgid` + `setuid`).
+4. Core-dump hardening (`RLIMIT_CORE=0`, plus `PR_SET_DUMPABLE=0` on Linux).
+5. Landlock filesystem restrictions.
+6. Runtime seccomp socket domain and syscall filters.
 
 ## Inference Controls
 

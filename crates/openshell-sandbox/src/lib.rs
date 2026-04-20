@@ -97,6 +97,7 @@ use crate::proxy::ProxyHandle;
 use crate::sandbox::linux::netns::NetworkNamespace;
 use crate::secrets::SecretResolver;
 pub use process::{ProcessHandle, ProcessStatus};
+pub use sandbox::apply_supervisor_startup_hardening;
 
 /// Default interval (seconds) for re-fetching the inference route bundle from
 /// the gateway in cluster mode. Override at runtime with the
