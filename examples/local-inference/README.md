@@ -163,4 +163,5 @@ In cluster mode, use `openshell cluster inference set` instead.
 | `POST /v1/chat/completions` | `openai_chat_completions` | Chat completion |
 | `POST /v1/completions` | `openai_completions` | Text completion |
 | `POST /v1/responses` | `openai_responses` | Responses API |
+| `POST /v1/codex/*` | `openai_responses` | OpenAI OAuth Codex responses |
 | `POST /v1/messages` | `anthropic_messages` | Anthropic messages |

@@ -39,6 +39,12 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
         },
         InferenceApiPattern {
             method: "POST".to_string(),
+            path_glob: "/v1/codex/*".to_string(),
+            protocol: "openai_responses".to_string(),
+            kind: "codex_responses".to_string(),
+        },
+        InferenceApiPattern {
+            method: "POST".to_string(),
             path_glob: "/v1/messages".to_string(),
             protocol: "anthropic_messages".to_string(),
             kind: "messages".to_string(),
@@ -395,6 +401,14 @@ mod tests {
     fn detect_openai_responses() {
         let patterns = default_patterns();
         let result = detect_inference_pattern("POST", "/v1/responses", &patterns);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().protocol, "openai_responses");
+    }
+
+    #[test]
+    fn detect_codex_responses() {
+        let patterns = default_patterns();
+        let result = detect_inference_pattern("POST", "/v1/codex/responses", &patterns);
         assert!(result.is_some());
         assert_eq!(result.unwrap().protocol, "openai_responses");
     }

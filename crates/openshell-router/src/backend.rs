@@ -518,6 +518,10 @@ fn build_backend_url(endpoint: &str, path: &str) -> String {
         return format!("{base}{}", &path[3..]);
     }
 
+    if path == "/v1/codex" || path.starts_with("/v1/codex/") {
+        return format!("{base}{}", &path[3..]);
+    }
+
     format!("{base}{path}")
 }
 
@@ -550,6 +554,14 @@ mod tests {
         assert_eq!(
             build_backend_url("https://api.openai.com/v1", "/v1"),
             "https://api.openai.com/v1"
+        );
+    }
+
+    #[test]
+    fn build_backend_url_strips_v1_for_codex_backend() {
+        assert_eq!(
+            build_backend_url("https://chatgpt.com/backend-api", "/v1/codex/responses"),
+            "https://chatgpt.com/backend-api/codex/responses"
         );
     }
 
