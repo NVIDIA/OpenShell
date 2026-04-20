@@ -78,6 +78,12 @@ pub struct VmComputeConfig {
 
     /// Host-side private key for the guest's mTLS client bundle.
     pub guest_tls_key: Option<PathBuf>,
+
+    /// Optional path to the `mksquashfs` binary used by the VM driver's OCI
+    /// pipeline to build read-only base images. When `None`, the gateway does
+    /// not pass `--mksquashfs-bin`; the driver falls back to the
+    /// `OPENSHELL_VM_MKSQUASHFS` env var inherited from the gateway process.
+    pub mksquashfs_bin: Option<PathBuf>,
 }
 
 impl VmComputeConfig {
@@ -117,6 +123,7 @@ impl Default for VmComputeConfig {
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
+            mksquashfs_bin: None,
         }
     }
 }
@@ -209,6 +216,73 @@ pub(crate) fn compute_driver_guest_tls_paths(
     Ok(Some(VmGuestTlsPaths { ca, cert, key }))
 }
 
+/// Build the argv the gateway passes to the `openshell-driver-vm` subprocess.
+///
+/// Factored out of [`spawn`] so it can be unit-tested without actually
+/// launching the driver. `socket_path` is the UDS the driver will listen on;
+/// `guest_tls_paths` is the resolved output of [`compute_driver_guest_tls_paths`].
+///
+/// The returned vector excludes `argv[0]` — callers append it to a `Command`
+/// that was already constructed with the driver binary path.
+#[cfg(unix)]
+pub(crate) fn build_driver_argv(
+    config: &Config,
+    vm_config: &VmComputeConfig,
+    socket_path: &std::path::Path,
+    guest_tls_paths: Option<&VmGuestTlsPaths>,
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    fn push_pair(argv: &mut Vec<OsString>, flag: &str, value: &str) {
+        argv.push(OsString::from(flag));
+        argv.push(OsString::from(value));
+    }
+
+    let mut argv: Vec<OsString> = Vec::new();
+    argv.push(OsString::from("--bind-socket"));
+    argv.push(socket_path.as_os_str().to_os_string());
+    push_pair(&mut argv, "--log-level", &config.log_level);
+    push_pair(&mut argv, "--openshell-endpoint", &config.grpc_endpoint);
+    argv.push(OsString::from("--state-dir"));
+    argv.push(vm_config.state_dir.as_os_str().to_os_string());
+    push_pair(
+        &mut argv,
+        "--ssh-handshake-secret",
+        &config.ssh_handshake_secret,
+    );
+    push_pair(
+        &mut argv,
+        "--ssh-handshake-skew-secs",
+        &config.ssh_handshake_skew_secs.to_string(),
+    );
+    push_pair(
+        &mut argv,
+        "--krun-log-level",
+        &vm_config.krun_log_level.to_string(),
+    );
+    push_pair(&mut argv, "--vcpus", &vm_config.vcpus.to_string());
+    push_pair(&mut argv, "--mem-mib", &vm_config.mem_mib.to_string());
+    if let Some(tls) = guest_tls_paths {
+        argv.push(OsString::from("--guest-tls-ca"));
+        argv.push(tls.ca.as_os_str().to_os_string());
+        argv.push(OsString::from("--guest-tls-cert"));
+        argv.push(tls.cert.as_os_str().to_os_string());
+        argv.push(OsString::from("--guest-tls-key"));
+        argv.push(tls.key.as_os_str().to_os_string());
+    }
+    // Plumb the gateway-configured sandbox image through to the VM driver so
+    // `GetCapabilities.default_image` matches the gateway's configuration.
+    // Empty string is a valid value meaning "no default"; the flag always has
+    // a default of "" on the driver side so we pass it unconditionally.
+    push_pair(&mut argv, "--default-image", &config.sandbox_image);
+    // Pass an explicit mksquashfs path when the operator configured one so
+    // OCI sandboxes work without relying on env inheritance.
+    if let Some(mksquashfs) = vm_config.mksquashfs_bin.as_ref() {
+        argv.push(OsString::from("--mksquashfs-bin"));
+        argv.push(mksquashfs.as_os_str().to_os_string());
+    }
+    argv
+}
+
 /// Launch the VM compute-driver subprocess, wait for its UDS to come up,
 /// and return a gRPC `Channel` connected to it plus a process handle that
 /// kills the subprocess and removes the socket on drop.
@@ -250,27 +324,8 @@ pub(crate) async fn spawn(
     command.stdin(Stdio::null());
     command.stdout(Stdio::inherit());
     command.stderr(Stdio::inherit());
-    command.arg("--bind-socket").arg(&socket_path);
-    command.arg("--log-level").arg(&config.log_level);
-    command
-        .arg("--openshell-endpoint")
-        .arg(&config.grpc_endpoint);
-    command.arg("--state-dir").arg(&vm_config.state_dir);
-    command
-        .arg("--ssh-handshake-secret")
-        .arg(&config.ssh_handshake_secret);
-    command
-        .arg("--ssh-handshake-skew-secs")
-        .arg(config.ssh_handshake_skew_secs.to_string());
-    command
-        .arg("--krun-log-level")
-        .arg(vm_config.krun_log_level.to_string());
-    command.arg("--vcpus").arg(vm_config.vcpus.to_string());
-    command.arg("--mem-mib").arg(vm_config.mem_mib.to_string());
-    if let Some(tls) = guest_tls_paths {
-        command.arg("--guest-tls-ca").arg(tls.ca);
-        command.arg("--guest-tls-cert").arg(tls.cert);
-        command.arg("--guest-tls-key").arg(tls.key);
+    for arg in build_driver_argv(config, vm_config, &socket_path, guest_tls_paths.as_ref()) {
+        command.arg(arg);
     }
 
     let mut child = command.spawn().map_err(|e| {
@@ -353,9 +408,22 @@ async fn connect_compute_driver(socket_path: &std::path::Path) -> Result<Channel
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{VmComputeConfig, compute_driver_guest_tls_paths};
+    use super::{
+        VmComputeConfig, VmGuestTlsPaths, build_driver_argv, compute_driver_guest_tls_paths,
+    };
     use openshell_core::{Config, TlsConfig};
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    fn argv_contains_pair(argv: &[OsString], flag: &str, value: &str) -> bool {
+        argv.windows(2)
+            .any(|pair| pair[0] == OsString::from(flag) && pair[1] == OsString::from(value))
+    }
+
+    fn argv_contains_flag(argv: &[OsString], flag: &str) -> bool {
+        argv.iter().any(|arg| arg == &OsString::from(flag))
+    }
 
     #[test]
     fn vm_compute_driver_tls_requires_explicit_guest_bundle() {
@@ -425,5 +493,107 @@ mod tests {
         assert_eq!(guest_paths.key, guest_key);
         assert_ne!(guest_paths.cert, server_cert);
         assert_ne!(guest_paths.key, server_key);
+    }
+
+    #[test]
+    fn build_driver_argv_passes_configured_sandbox_image_as_default_image() {
+        let config = Config::new(None)
+            .with_grpc_endpoint("http://127.0.0.1:8080")
+            .with_sandbox_image("docker.io/library/alpine:3.20");
+        let vm_config = VmComputeConfig::default();
+        let socket = PathBuf::from("/tmp/drv.sock");
+
+        let argv = build_driver_argv(&config, &vm_config, &socket, None);
+
+        assert!(
+            argv_contains_pair(&argv, "--default-image", "docker.io/library/alpine:3.20"),
+            "expected --default-image to be plumbed from sandbox_image: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_driver_argv_passes_empty_default_image_when_gateway_has_no_sandbox_image() {
+        // sandbox_image defaults to "" — the driver treats that as "no default"
+        // and falls back to the legacy non-OCI supervisor boot. We still want
+        // the flag present so the driver's value cannot diverge from the
+        // gateway's intent silently.
+        let config = Config::new(None).with_grpc_endpoint("http://127.0.0.1:8080");
+        let vm_config = VmComputeConfig::default();
+        let socket = PathBuf::from("/tmp/drv.sock");
+
+        let argv = build_driver_argv(&config, &vm_config, &socket, None);
+
+        assert!(
+            argv_contains_pair(&argv, "--default-image", ""),
+            "expected --default-image '' to be passed explicitly: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_driver_argv_passes_mksquashfs_bin_when_configured() {
+        let config = Config::new(None).with_grpc_endpoint("http://127.0.0.1:8080");
+        let vm_config = VmComputeConfig {
+            mksquashfs_bin: Some(PathBuf::from("/usr/local/bin/mksquashfs")),
+            ..Default::default()
+        };
+        let socket = PathBuf::from("/tmp/drv.sock");
+
+        let argv = build_driver_argv(&config, &vm_config, &socket, None);
+
+        assert!(
+            argv_contains_pair(&argv, "--mksquashfs-bin", "/usr/local/bin/mksquashfs"),
+            "expected --mksquashfs-bin flag: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_driver_argv_omits_mksquashfs_bin_when_unconfigured() {
+        let config = Config::new(None).with_grpc_endpoint("http://127.0.0.1:8080");
+        let vm_config = VmComputeConfig::default();
+        let socket = PathBuf::from("/tmp/drv.sock");
+
+        let argv = build_driver_argv(&config, &vm_config, &socket, None);
+
+        assert!(
+            !argv_contains_flag(&argv, "--mksquashfs-bin"),
+            "--mksquashfs-bin should be absent when vm_config.mksquashfs_bin is None: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_driver_argv_passes_guest_tls_triplet_when_present() {
+        let config = Config::new(None).with_grpc_endpoint("https://gateway.internal:8443");
+        let vm_config = VmComputeConfig::default();
+        let tls = VmGuestTlsPaths {
+            ca: PathBuf::from("/tls/ca.crt"),
+            cert: PathBuf::from("/tls/tls.crt"),
+            key: PathBuf::from("/tls/tls.key"),
+        };
+        let socket = PathBuf::from("/tmp/drv.sock");
+
+        let argv = build_driver_argv(&config, &vm_config, &socket, Some(&tls));
+
+        assert!(argv_contains_pair(&argv, "--guest-tls-ca", "/tls/ca.crt"));
+        assert!(argv_contains_pair(
+            &argv,
+            "--guest-tls-cert",
+            "/tls/tls.crt"
+        ));
+        assert!(argv_contains_pair(&argv, "--guest-tls-key", "/tls/tls.key"));
+    }
+
+    #[test]
+    fn build_driver_argv_socket_flag_points_at_provided_path() {
+        let config = Config::new(None).with_grpc_endpoint("http://127.0.0.1:8080");
+        let vm_config = VmComputeConfig::default();
+        let socket = Path::new("/var/run/openshell/driver.sock");
+
+        let argv = build_driver_argv(&config, &vm_config, socket, None);
+
+        assert!(argv_contains_pair(
+            &argv,
+            "--bind-socket",
+            "/var/run/openshell/driver.sock"
+        ));
     }
 }

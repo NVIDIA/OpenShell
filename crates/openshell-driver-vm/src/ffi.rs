@@ -23,6 +23,11 @@ pub const KRUN_LOG_LEVEL_DEBUG: u32 = 4;
 pub const KRUN_LOG_LEVEL_TRACE: u32 = 5;
 pub const KRUN_LOG_STYLE_AUTO: u32 = 0;
 pub const KRUN_LOG_OPTION_NO_ENV: u32 = 1;
+pub const KRUN_DISK_FORMAT_RAW: u32 = 0;
+#[allow(dead_code)] // Used only on macOS (cfg-gated in state_disk_sync_mode)
+pub const KRUN_SYNC_RELAXED: u32 = 1;
+#[allow(dead_code)] // Used only on Linux (cfg-gated in state_disk_sync_mode)
+pub const KRUN_SYNC_FULL: u32 = 2;
 
 type KrunInitLog =
     unsafe extern "C" fn(target_fd: i32, level: u32, style: u32, options: u32) -> i32;
@@ -39,6 +44,17 @@ type KrunSetExec = unsafe extern "C" fn(
 ) -> i32;
 type KrunSetPortMap = unsafe extern "C" fn(ctx_id: u32, port_map: *const *const c_char) -> i32;
 type KrunSetConsoleOutput = unsafe extern "C" fn(ctx_id: u32, filepath: *const c_char) -> i32;
+type KrunAddDisk3 = unsafe extern "C" fn(
+    ctx_id: u32,
+    block_id: *const c_char,
+    disk_path: *const c_char,
+    disk_format: u32,
+    read_only: bool,
+    direct_io: bool,
+    sync_mode: u32,
+) -> i32;
+type KrunAddVsockPort2 =
+    unsafe extern "C" fn(ctx_id: u32, port: u32, c_filepath: *const c_char, listen: bool) -> i32;
 type KrunStartEnter = unsafe extern "C" fn(ctx_id: u32) -> i32;
 type KrunDisableImplicitVsock = unsafe extern "C" fn(ctx_id: u32) -> i32;
 type KrunAddVsock = unsafe extern "C" fn(ctx_id: u32, tsi_features: u32) -> i32;
@@ -70,6 +86,8 @@ pub struct LibKrun {
     pub krun_set_exec: KrunSetExec,
     pub krun_set_port_map: KrunSetPortMap,
     pub krun_set_console_output: KrunSetConsoleOutput,
+    pub krun_add_disk3: Option<KrunAddDisk3>,
+    pub krun_add_vsock_port2: KrunAddVsockPort2,
     pub krun_start_enter: KrunStartEnter,
     pub krun_disable_implicit_vsock: KrunDisableImplicitVsock,
     pub krun_add_vsock: KrunAddVsock,
@@ -127,6 +145,8 @@ impl LibKrun {
                 b"krun_set_console_output\0",
                 &libkrun_path,
             )?,
+            krun_add_disk3: load_optional_symbol(library, b"krun_add_disk3\0"),
+            krun_add_vsock_port2: load_symbol(library, b"krun_add_vsock_port2\0", &libkrun_path)?,
             krun_start_enter: load_symbol(library, b"krun_start_enter\0", &libkrun_path)?,
             krun_disable_implicit_vsock: load_symbol(
                 library,
@@ -203,4 +223,9 @@ fn load_symbol<T: Copy>(library: &'static Library, name: &[u8], path: &Path) -> 
             )
         })
     }
+}
+
+fn load_optional_symbol<T: Copy>(library: &'static Library, name: &[u8]) -> Option<T> {
+    let symbol = unsafe { library.get::<T>(name).ok()? };
+    Some(*symbol)
 }

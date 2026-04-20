@@ -4,6 +4,7 @@
 //! Process management and signal handling.
 
 use crate::child_env;
+use crate::container_env;
 use crate::policy::{NetworkMode, SandboxPolicy};
 use crate::sandbox;
 #[cfg(target_os = "linux")]
@@ -158,10 +159,14 @@ impl ProcessHandle {
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .env("OPENSHELL_SANDBOX", "1");
+            .kill_on_drop(true);
 
-        scrub_sensitive_env(&mut cmd);
+        if container_env::is_container_mode() {
+            container_env::apply_clean_container_baseline(&mut cmd);
+        } else {
+            cmd.env("OPENSHELL_SANDBOX", "1");
+            scrub_sensitive_env(&mut cmd);
+        }
         inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workdir {
@@ -285,10 +290,14 @@ impl ProcessHandle {
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .env("OPENSHELL_SANDBOX", "1");
+            .kill_on_drop(true);
 
-        scrub_sensitive_env(&mut cmd);
+        if container_env::is_container_mode() {
+            container_env::apply_clean_container_baseline(&mut cmd);
+        } else {
+            cmd.env("OPENSHELL_SANDBOX", "1");
+            scrub_sensitive_env(&mut cmd);
+        }
         inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workdir {

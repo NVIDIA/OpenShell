@@ -161,6 +161,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_TLS_KEY")]
     vm_tls_key: Option<PathBuf>,
 
+    /// Path to the `mksquashfs` binary used by the VM driver's OCI pipeline.
+    /// Required for OCI-image sandboxes on the VM driver. When unset, the
+    /// gateway does not pass `--mksquashfs-bin` and the driver falls back to
+    /// the `OPENSHELL_VM_MKSQUASHFS` env var inherited from this process.
+    #[arg(long, env = "OPENSHELL_VM_MKSQUASHFS")]
+    vm_mksquashfs_bin: Option<PathBuf>,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -269,6 +276,7 @@ async fn run_from_args(args: Args) -> Result<()> {
         guest_tls_ca: args.vm_tls_ca,
         guest_tls_cert: args.vm_tls_cert,
         guest_tls_key: args.vm_tls_key,
+        mksquashfs_bin: args.vm_mksquashfs_bin,
     };
 
     if args.disable_tls {

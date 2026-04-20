@@ -7,6 +7,7 @@
 
 pub mod bypass_monitor;
 mod child_env;
+mod container_env;
 pub mod denial_aggregator;
 mod grpc_client;
 mod identity;

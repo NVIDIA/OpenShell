@@ -6,7 +6,8 @@ use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_vm::{
-    VM_RUNTIME_DIR_ENV, VmDriver, VmDriverConfig, VmLaunchConfig, configured_runtime_dir, run_vm,
+    ImportVsock, STATE_DISK_BLOCK_ID, StateDisk, VM_RUNTIME_DIR_ENV, VmDriver, VmDriverConfig,
+    VmLaunchConfig, configured_runtime_dir, run_vm,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -48,6 +49,26 @@ struct Args {
 
     #[arg(long, hide = true, default_value_t = 1)]
     vm_krun_log_level: u32,
+
+    #[arg(long, hide = true)]
+    vm_state_disk: Option<PathBuf>,
+
+    #[arg(long, hide = true, default_value = STATE_DISK_BLOCK_ID)]
+    vm_state_disk_block_id: String,
+
+    /// Optional path to a read-only base disk (e.g. cached squashfs) used as
+    /// the overlay lower layer inside the guest. OCI sandboxes only.
+    #[arg(long, hide = true)]
+    vm_ro_base_disk: Option<PathBuf>,
+
+    #[arg(long, hide = true, default_value = "oci-base")]
+    vm_ro_base_disk_block_id: String,
+
+    #[arg(long, hide = true)]
+    vm_import_socket: Option<PathBuf>,
+
+    #[arg(long, hide = true)]
+    vm_import_vsock_port: Option<u32>,
 
     #[arg(
         long,
@@ -95,6 +116,16 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_VM_DRIVER_MEM_MIB", default_value_t = 2048)]
     mem_mib: u32,
+
+    /// Default OCI image used when a sandbox spec omits `template.image`.
+    /// Advertised via `GetCapabilities.default_image`.
+    #[arg(long, env = "OPENSHELL_VM_DRIVER_DEFAULT_IMAGE", default_value = "")]
+    default_image: String,
+
+    /// Path to the `mksquashfs` binary used to build RO base fs images.
+    /// Required for OCI-image sandboxes; unset → legacy-only driver.
+    #[arg(long, env = "OPENSHELL_VM_MKSQUASHFS")]
+    mksquashfs_bin: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -128,6 +159,8 @@ async fn main() -> Result<()> {
         guest_tls_ca: args.guest_tls_ca,
         guest_tls_cert: args.guest_tls_cert,
         guest_tls_key: args.guest_tls_key,
+        default_image: args.default_image,
+        mksquashfs_bin: args.mksquashfs_bin,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;
@@ -175,6 +208,27 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         .clone()
         .ok_or_else(|| "--vm-console-output is required in internal VM mode".to_string())?;
 
+    let state_disk = args.vm_state_disk.clone().map(|path| StateDisk {
+        path,
+        block_id: args.vm_state_disk_block_id.clone(),
+        read_only: false,
+    });
+    let ro_base_disk = args.vm_ro_base_disk.clone().map(|path| StateDisk {
+        path,
+        block_id: args.vm_ro_base_disk_block_id.clone(),
+        read_only: true,
+    });
+
+    let import_vsock = match (args.vm_import_socket.clone(), args.vm_import_vsock_port) {
+        (Some(socket_path), Some(port)) => Some(ImportVsock { port, socket_path }),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "--vm-import-socket and --vm-import-vsock-port must be set together".to_string(),
+            );
+        }
+    };
+
     Ok(VmLaunchConfig {
         rootfs,
         vcpus: args.vm_vcpus,
@@ -186,6 +240,9 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         port_map: args.vm_port.clone(),
         log_level: args.vm_krun_log_level,
         console_output,
+        state_disk,
+        ro_base_disk,
+        import_vsock,
     })
 }
 

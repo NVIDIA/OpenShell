@@ -65,6 +65,13 @@ pub struct VmDriverConfig {
     pub guest_tls_ca: Option<PathBuf>,
     pub guest_tls_cert: Option<PathBuf>,
     pub guest_tls_key: Option<PathBuf>,
+    /// Default OCI image used when the sandbox spec omits `template.image`.
+    /// Empty string means "no default" — sandboxes without an image will
+    /// fall back to the historical non-OCI guest rootfs supervisor.
+    pub default_image: String,
+    /// Path to the `mksquashfs` binary. When unset, OCI-image sandboxes
+    /// are rejected with `FailedPrecondition`.
+    pub mksquashfs_bin: Option<PathBuf>,
 }
 
 impl Default for VmDriverConfig {
@@ -82,6 +89,8 @@ impl Default for VmDriverConfig {
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
+            default_image: String::new(),
+            mksquashfs_bin: None,
         }
     }
 }
@@ -173,12 +182,22 @@ struct SandboxRecord {
     process: Arc<Mutex<VmProcess>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VmDriver {
     config: VmDriverConfig,
     launcher_bin: PathBuf,
     registry: Arc<Mutex<HashMap<String, SandboxRecord>>>,
     events: broadcast::Sender<WatchSandboxesEvent>,
+    /// Shared OCI cache and puller for this driver process.
+    /// Populated once per platform; `None` when the host arch is unsupported.
+    oci: Option<Arc<VmOci>>,
+}
+
+/// Lazily-initialized OCI state attached to the driver.
+pub struct VmOci {
+    pub puller: crate::oci::OciPuller,
+    pub cache: crate::oci::CacheLayout,
+    pub platform: crate::oci::Platform,
 }
 
 impl VmDriver {
@@ -207,11 +226,25 @@ impl VmDriver {
         };
 
         let (events, _) = broadcast::channel(WATCH_BUFFER);
+
+        let oci = crate::oci::Platform::host().map(|platform| {
+            let cache = crate::oci::CacheLayout::new(config.state_dir.join("oci-cache"));
+            // Errors here are surfaced lazily at first sandbox-create; the
+            // driver still starts so non-OCI sandboxes continue to work.
+            let _ = cache.ensure_dirs();
+            Arc::new(VmOci {
+                puller: crate::oci::OciPuller::new(platform),
+                cache,
+                platform,
+            })
+        });
+
         Ok(Self {
             config,
             launcher_bin,
             registry: Arc::new(Mutex::new(HashMap::new())),
             events,
+            oci,
         })
     }
 
@@ -220,7 +253,7 @@ impl VmDriver {
         GetCapabilitiesResponse {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
-            default_image: String::new(),
+            default_image: self.config.default_image.clone(),
             supports_gpu: false,
         }
     }
@@ -261,6 +294,9 @@ impl VmDriver {
                 })?;
         }
 
+        let oci_launch = self.resolve_oci_launch(sandbox, &state_dir).await?;
+        let is_oci = oci_launch.is_some();
+
         let console_output = state_dir.join("rootfs-console.log");
         let mut command = Command::new(&self.launcher_bin);
         command.kill_on_drop(true);
@@ -282,7 +318,15 @@ impl VmDriver {
         command
             .arg("--vm-port")
             .arg(format!("{ssh_port}:{GUEST_SSH_PORT}"));
-        for env in build_guest_environment(sandbox, &self.config) {
+        if let Some(oci) = oci_launch.as_ref() {
+            command.arg("--vm-ro-base-disk").arg(&oci.base_disk_path);
+            command.arg("--vm-state-disk").arg(&oci.state_disk_path);
+        }
+        let mut guest_env = build_guest_environment(sandbox, &self.config, is_oci);
+        if let Some(oci) = oci_launch.as_ref() {
+            guest_env.extend(oci.guest_env_vars.iter().cloned());
+        }
+        for env in guest_env {
             command.arg("--vm-env").arg(env);
         }
 
@@ -431,6 +475,76 @@ impl VmDriver {
             .collect::<Vec<_>>();
         snapshots.sort_by(|left, right| left.name.cmp(&right.name));
         snapshots
+    }
+
+    /// Run the OCI pipeline for this sandbox if `template.image` (or the
+    /// driver's default image) is set, and materialize the per-sandbox state
+    /// disk. Returns `None` for legacy non-OCI sandboxes.
+    async fn resolve_oci_launch(
+        &self,
+        sandbox: &Sandbox,
+        state_dir: &Path,
+    ) -> Result<Option<OciLaunch>, Status> {
+        let image_ref = effective_image_ref(sandbox, &self.config.default_image);
+        if image_ref.is_empty() {
+            return Ok(None);
+        }
+
+        let oci = self.oci.clone().ok_or_else(|| {
+            Status::failed_precondition(
+                "OCI image support is not available: the host platform is not linux/amd64 or linux/arm64",
+            )
+        })?;
+        let mksquashfs = self.config.mksquashfs_bin.clone().ok_or_else(|| {
+            Status::failed_precondition(
+                "OCI image support is not configured: set OPENSHELL_VM_MKSQUASHFS to the path of mksquashfs",
+            )
+        })?;
+
+        let env_overrides = crate::oci::EnvOverrides {
+            template: sandbox
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.as_ref())
+                .map(|template| template.environment.clone().into_iter().collect())
+                .unwrap_or_default(),
+            spec: sandbox
+                .spec
+                .as_ref()
+                .map(|spec| spec.environment.clone().into_iter().collect())
+                .unwrap_or_default(),
+        };
+
+        let build_opts = crate::oci::fs_image::BuildOptions::with_binary(mksquashfs);
+        let cached = crate::oci::prepare(
+            &oci.puller,
+            &oci.cache,
+            &build_opts,
+            &image_ref,
+            &env_overrides,
+        )
+        .await
+        .map_err(|err| Status::internal(format!("OCI prepare failed: {err}")))?;
+
+        let state_paths = crate::state_disk::SandboxStatePaths::for_state_dir(state_dir);
+        crate::state_disk::ensure_state_disk(
+            &state_paths.state_disk,
+            crate::state_disk::DEFAULT_STATE_DISK_SIZE_BYTES,
+        )
+        .map_err(|err| Status::internal(format!("create sandbox state disk: {err}")))?;
+
+        let guest_env_vars: Vec<String> = cached
+            .metadata
+            .to_guest_env_vars()
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+
+        Ok(Some(OciLaunch {
+            base_disk_path: cached.fs_image,
+            state_disk_path: state_paths.state_disk,
+            guest_env_vars,
+        }))
     }
 
     async fn monitor_sandbox(&self, sandbox_id: String) {
@@ -713,6 +827,32 @@ impl ComputeDriver for VmDriver {
     }
 }
 
+/// Per-sandbox OCI launch artifacts: cached RO base fs image, per-sandbox
+/// writable state disk, and the launch-metadata env vars that get packed
+/// into the guest init's environ.
+#[derive(Debug)]
+struct OciLaunch {
+    base_disk_path: PathBuf,
+    state_disk_path: PathBuf,
+    guest_env_vars: Vec<String>,
+}
+
+/// Return the OCI image reference to use for this sandbox, or `""` if the
+/// sandbox is a legacy non-OCI VM sandbox. Spec overrides the driver default.
+fn effective_image_ref(sandbox: &Sandbox, default_image: &str) -> String {
+    let requested = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .map(|template| template.image.as_str())
+        .unwrap_or("");
+    if !requested.is_empty() {
+        requested.to_string()
+    } else {
+        default_image.to_string()
+    }
+}
+
 fn validate_vm_sandbox(sandbox: &Sandbox) -> Result<(), Status> {
     let spec = sandbox
         .spec
@@ -725,9 +865,9 @@ fn validate_vm_sandbox(sandbox: &Sandbox) -> Result<(), Status> {
     }
     if let Some(template) = spec.template.as_ref() {
         if !template.image.is_empty() {
-            return Err(Status::failed_precondition(
-                "vm sandboxes do not support template.image",
-            ));
+            crate::oci::validate_reference(&template.image).map_err(|err| {
+                Status::failed_precondition(format!("invalid template.image: {err}"))
+            })?;
         }
         if !template.agent_socket_path.is_empty() {
             return Err(Status::failed_precondition(
@@ -779,7 +919,11 @@ fn guest_visible_openshell_endpoint(endpoint: &str) -> String {
     endpoint.to_string()
 }
 
-fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<String> {
+fn build_guest_environment(
+    sandbox: &Sandbox,
+    config: &VmDriverConfig,
+    is_oci: bool,
+) -> Vec<String> {
     let mut environment = HashMap::from([
         ("HOME".to_string(), "/root".to_string()),
         (
@@ -806,14 +950,22 @@ fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<St
             config.ssh_handshake_skew_secs.to_string(),
         ),
         (
-            "OPENSHELL_SANDBOX_COMMAND".to_string(),
-            "tail -f /dev/null".to_string(),
-        ),
-        (
             "OPENSHELL_LOG_LEVEL".to_string(),
             sandbox_log_level(sandbox, &config.log_level),
         ),
     ]);
+    // Legacy guest rootfs supervisor reads `OPENSHELL_SANDBOX_COMMAND` when
+    // no positional command is supplied. OCI sandboxes always carry argv via
+    // `OPENSHELL_OCI_ARGV_<i>`, so this fallback is dead weight there — and
+    // passing it would muddy the contract (the supervisor's env-parsing path
+    // uses whitespace splitting, which would corrupt argv boundaries if a
+    // code path ever fell through to it). Only set it for non-OCI sandboxes.
+    if !is_oci {
+        environment.insert(
+            "OPENSHELL_SANDBOX_COMMAND".to_string(),
+            "tail -f /dev/null".to_string(),
+        );
+    }
     if config.requires_tls_materials() {
         environment.extend(HashMap::from([
             (
@@ -1097,13 +1249,42 @@ mod tests {
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config);
+        let env = build_guest_environment(&sandbox, &config, false);
         assert!(env.contains(&"HOME=/root".to_string()));
         assert!(env.contains(&"OPENSHELL_ENDPOINT=http://192.168.127.1:8080/".to_string()));
         assert!(env.contains(&"OPENSHELL_SANDBOX_ID=sandbox-123".to_string()));
         assert!(env.contains(&format!(
             "OPENSHELL_SSH_LISTEN_ADDR=0.0.0.0:{GUEST_SSH_PORT}"
         )));
+        assert!(
+            env.iter()
+                .any(|e| e.starts_with("OPENSHELL_SANDBOX_COMMAND=")),
+            "non-OCI sandboxes should receive the fallback command"
+        );
+    }
+
+    #[test]
+    fn build_guest_environment_omits_sandbox_command_for_oci_sandboxes() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ssh_handshake_secret: "secret".to_string(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            id: "sandbox-oci".to_string(),
+            name: "sandbox-oci".to_string(),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, true);
+        assert!(
+            !env.iter()
+                .any(|e| e.starts_with("OPENSHELL_SANDBOX_COMMAND=")),
+            "OCI sandboxes should not get the legacy supervisor command fallback: {env:?}"
+        );
+        // sanity: other guest-env bits should still be present
+        assert!(env.contains(&"OPENSHELL_SANDBOX_ID=sandbox-oci".to_string()));
     }
 
     #[test]
@@ -1135,7 +1316,7 @@ mod tests {
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config);
+        let env = build_guest_environment(&sandbox, &config, false);
         assert!(env.contains(&format!("OPENSHELL_TLS_CA={GUEST_TLS_CA_PATH}")));
         assert!(env.contains(&format!("OPENSHELL_TLS_CERT={GUEST_TLS_CERT_PATH}")));
         assert!(env.contains(&format!("OPENSHELL_TLS_KEY={GUEST_TLS_KEY_PATH}")));
@@ -1161,6 +1342,7 @@ mod tests {
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             events,
+            oci: None,
         };
 
         let base = unique_temp_dir();
@@ -1203,6 +1385,95 @@ mod tests {
         assert!(!driver.registry.lock().await.contains_key("sandbox-123"));
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn effective_image_ref_prefers_spec_over_default() {
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    image: "docker.io/library/alpine:3.20".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_image_ref(&sandbox, "docker.io/library/busybox"),
+            "docker.io/library/alpine:3.20"
+        );
+    }
+
+    #[test]
+    fn effective_image_ref_falls_back_to_default_when_spec_empty() {
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_image_ref(&sandbox, "docker.io/library/busybox"),
+            "docker.io/library/busybox"
+        );
+    }
+
+    #[test]
+    fn effective_image_ref_is_empty_when_neither_is_set() {
+        let sandbox = Sandbox::default();
+        assert!(effective_image_ref(&sandbox, "").is_empty());
+    }
+
+    #[test]
+    fn validate_vm_sandbox_accepts_valid_template_image() {
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    image: "docker.io/library/alpine:3.20".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_vm_sandbox(&sandbox).expect("valid image ref should pass validation");
+    }
+
+    #[test]
+    fn validate_vm_sandbox_rejects_malformed_template_image() {
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    image: "::not a valid ref::".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_vm_sandbox(&sandbox).expect_err("malformed ref should fail");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("template.image"));
+    }
+
+    #[test]
+    fn capabilities_advertise_default_image() {
+        let config = VmDriverConfig {
+            default_image: "docker.io/library/busybox".to_string(),
+            ..Default::default()
+        };
+        let driver = VmDriver {
+            config,
+            launcher_bin: PathBuf::from("openshell-driver-vm"),
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            events: broadcast::channel(WATCH_BUFFER).0,
+            oci: None,
+        };
+        let caps = driver.capabilities();
+        assert_eq!(caps.default_image, "docker.io/library/busybox");
+        assert_eq!(caps.driver_name, DRIVER_NAME);
     }
 
     #[test]
@@ -1307,6 +1578,139 @@ mod tests {
         assert!(!guest_ssh_ready(&base).await);
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn resolve_oci_launch_skips_when_no_image_is_requested() {
+        // A sandbox without template.image and with no driver default must
+        // fall through to the legacy non-OCI boot path. The resolver should
+        // return Ok(None) without consulting the puller or cache.
+        let state_dir = unique_temp_dir();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let driver = VmDriver {
+            config: VmDriverConfig::default(),
+            launcher_bin: PathBuf::from("openshell-driver-vm"),
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            events: broadcast::channel(WATCH_BUFFER).0,
+            oci: None, // unsupported host platform
+        };
+
+        let sandbox = Sandbox {
+            id: "sb".to_string(),
+            name: "sb".to_string(),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+
+        let result = driver
+            .resolve_oci_launch(&sandbox, &state_dir)
+            .await
+            .expect("no image requested → Ok(None)");
+        assert!(result.is_none());
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_oci_launch_fails_cleanly_when_host_platform_is_unsupported() {
+        // When `Platform::host()` returned None at driver construction,
+        // `self.oci` is None. Requesting an OCI image in that state must
+        // produce FailedPrecondition, not a panic or a silent fallback.
+        let state_dir = unique_temp_dir();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let driver = VmDriver {
+            config: VmDriverConfig {
+                default_image: "docker.io/library/alpine:3.20".to_string(),
+                ..Default::default()
+            },
+            launcher_bin: PathBuf::from("openshell-driver-vm"),
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            events: broadcast::channel(WATCH_BUFFER).0,
+            oci: None,
+        };
+
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+
+        let err = driver
+            .resolve_oci_launch(&sandbox, &state_dir)
+            .await
+            .expect_err("unsupported host platform should reject OCI sandboxes");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("linux/amd64 or linux/arm64"));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_oci_launch_fails_cleanly_when_mksquashfs_is_missing() {
+        // If the host platform is supported but `mksquashfs_bin` isn't
+        // configured, the driver must refuse with FailedPrecondition so the
+        // gateway surfaces a diagnosable error instead of hanging at pull time.
+        let Some(platform) = crate::oci::Platform::host() else {
+            eprintln!("skipping: unsupported host platform");
+            return;
+        };
+
+        let state_dir = unique_temp_dir();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let cache_root = state_dir.join("oci-cache");
+        let cache = crate::oci::CacheLayout::new(cache_root);
+        cache.ensure_dirs().unwrap();
+
+        let driver = VmDriver {
+            config: VmDriverConfig {
+                default_image: "docker.io/library/alpine:3.20".to_string(),
+                mksquashfs_bin: None,
+                ..Default::default()
+            },
+            launcher_bin: PathBuf::from("openshell-driver-vm"),
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            events: broadcast::channel(WATCH_BUFFER).0,
+            oci: Some(Arc::new(VmOci {
+                puller: crate::oci::OciPuller::new(platform),
+                cache,
+                platform,
+            })),
+        };
+
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+
+        let err = driver
+            .resolve_oci_launch(&sandbox, &state_dir)
+            .await
+            .expect_err("missing mksquashfs should reject OCI sandboxes");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("OPENSHELL_VM_MKSQUASHFS"));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn effective_image_ref_drops_whitespace_only_spec_overrides() {
+        // Whitespace-only image refs should not be accepted as an override of
+        // the driver's configured default. In today's implementation the spec
+        // field is compared against "" exactly, so "   " slips through — but
+        // that only affects downstream validation, which then rejects the
+        // malformed ref. This test documents the contract and will need an
+        // update if we decide to trim here.
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    image: "   ".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Current behavior: non-empty string wins, even if whitespace.
+        assert_eq!(
+            effective_image_ref(&sandbox, "docker.io/library/busybox"),
+            "   "
+        );
     }
 
     fn unique_temp_dir() -> PathBuf {

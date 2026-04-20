@@ -29,6 +29,34 @@ pub struct VmLaunchConfig {
     pub port_map: Vec<String>,
     pub log_level: u32,
     pub console_output: PathBuf,
+    /// Optional host-backed raw block image for mutable guest state.
+    /// Required when booting an imported OCI rootfs.
+    pub state_disk: Option<StateDisk>,
+    /// Optional host-backed read-only base disk (e.g. a cached squashfs
+    /// image) used as the lower layer of an overlay mount in the guest.
+    /// Only set for OCI-image sandboxes.
+    pub ro_base_disk: Option<StateDisk>,
+    /// Optional host Unix socket bridged into the guest as a vsock port.
+    /// Used by the OCI payload import channel.
+    pub import_vsock: Option<ImportVsock>,
+}
+
+/// Block device exposed to the guest.
+///
+/// The name is historical; both writable state disks and read-only base
+/// images (e.g. squashfs) use this type. `read_only` distinguishes them.
+#[derive(Debug, Clone)]
+pub struct StateDisk {
+    pub path: PathBuf,
+    pub block_id: String,
+    pub read_only: bool,
+}
+
+/// Host-side endpoint bridged to a guest vsock port.
+#[derive(Debug, Clone)]
+pub struct ImportVsock {
+    pub port: u32,
+    pub socket_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +91,18 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
     vm.set_vm_config(config.vcpus, config.mem_mib)?;
     vm.set_root(&config.rootfs)?;
     vm.set_workdir(&config.workdir)?;
+
+    if let Some(disk) = config.ro_base_disk.as_ref() {
+        vm.add_state_disk(disk)?;
+    }
+    if let Some(disk) = config.state_disk.as_ref() {
+        vm.add_state_disk(disk)?;
+    }
+    if let Some(vsock) = config.import_vsock.as_ref() {
+        crate::state_disk::prepare_import_socket_dir(&vsock.socket_path)
+            .map_err(|err| format!("prepare import socket dir: {err}"))?;
+        vm.add_vsock_port(vsock)?;
+    }
 
     let mut forwarded_port_map = config.port_map.clone();
     let mut gvproxy_guard = None;
@@ -273,6 +313,17 @@ fn raise_nofile_limit() {
     }
 }
 
+fn state_disk_sync_mode() -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::KRUN_SYNC_RELAXED
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ffi::KRUN_SYNC_FULL
+    }
+}
+
 fn clamp_log_level(level: u32) -> u32 {
     match level {
         0 => ffi::KRUN_LOG_LEVEL_OFF,
@@ -327,6 +378,39 @@ impl VmContext {
         check(
             unsafe { (self.krun.krun_set_root)(self.ctx_id, rootfs_c.as_ptr()) },
             "krun_set_root",
+        )
+    }
+
+    fn add_state_disk(&self, disk: &StateDisk) -> Result<(), String> {
+        let add_disk3 = self.krun.krun_add_disk3.ok_or_else(|| {
+            "libkrun runtime does not expose krun_add_disk3; rebuild the VM runtime with block support".to_string()
+        })?;
+        let block_id_c =
+            CString::new(disk.block_id.as_str()).map_err(|e| format!("invalid block id: {e}"))?;
+        let disk_path_c = path_to_cstring(&disk.path)?;
+        check(
+            unsafe {
+                add_disk3(
+                    self.ctx_id,
+                    block_id_c.as_ptr(),
+                    disk_path_c.as_ptr(),
+                    ffi::KRUN_DISK_FORMAT_RAW,
+                    disk.read_only,
+                    false,
+                    state_disk_sync_mode(),
+                )
+            },
+            "krun_add_disk3",
+        )
+    }
+
+    fn add_vsock_port(&self, vsock: &ImportVsock) -> Result<(), String> {
+        let socket_c = path_to_cstring(&vsock.socket_path)?;
+        check(
+            unsafe {
+                (self.krun.krun_add_vsock_port2)(self.ctx_id, vsock.port, socket_c.as_ptr(), true)
+            },
+            "krun_add_vsock_port2",
         )
     }
 
