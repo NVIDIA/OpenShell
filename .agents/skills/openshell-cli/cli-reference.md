@@ -268,9 +268,32 @@ View sandbox logs. Supports one-shot and streaming.
 
 ## Policy Commands
 
+### `openshell policy update <name>`
+
+Incrementally merge live network policy changes into the current sandbox policy. Multiple flags in one invocation are applied as one atomic batch and create at most one new revision.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--add-endpoint <SPEC>` | repeatable | `host:port[:access[:protocol[:enforcement]]]`. Adds or merges an endpoint. `access`: `read-only`, `read-write`, `full`. `protocol`: `rest`, `sql`. `enforcement`: `enforce`, `audit`. |
+| `--remove-endpoint <SPEC>` | repeatable | `host:port`. Removes the endpoint or just the requested port from a multi-port endpoint. |
+| `--add-allow <SPEC>` | repeatable | `host:port:METHOD:path_glob`. Adds REST allow rules to an existing `protocol: rest` endpoint. |
+| `--add-deny <SPEC>` | repeatable | `host:port:METHOD:path_glob`. Adds REST deny rules to an existing `protocol: rest` endpoint that already has an allow base. |
+| `--remove-rule <NAME>` | repeatable | Deletes a named network rule. |
+| `--binary <PATH>` | repeatable | Adds binaries to each `--add-endpoint` rule. Valid only with `--add-endpoint`. |
+| `--rule-name <NAME>` | none | Overrides the generated rule name. Valid only when exactly one `--add-endpoint` is provided. |
+| `--dry-run` | false | Preview the merged policy locally without sending an update to the gateway. |
+| `--wait` | false | Wait for the sandbox to confirm the new policy revision is loaded. |
+| `--timeout <SECS>` | 60 | Timeout for `--wait`. |
+
+Notes:
+
+- `--add-allow` and `--add-deny` currently operate only on `protocol: rest` endpoints.
+- `--wait` cannot be combined with `--dry-run`.
+- Use `policy set` when replacing the full policy or changing static sections.
+
 ### `openshell policy set <name> --policy <PATH>`
 
-Update the policy on a live sandbox. Only the dynamic `network_policies` field can be changed at runtime.
+Replace the full policy on a live sandbox. Only the dynamic `network_policies` field can be changed at runtime.
 
 | Flag | Default | Description |
 |------|---------|-------------|

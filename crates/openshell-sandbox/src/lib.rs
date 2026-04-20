@@ -98,6 +98,7 @@ use crate::proxy::ProxyHandle;
 use crate::sandbox::linux::netns::NetworkNamespace;
 use crate::secrets::SecretResolver;
 pub use process::{ProcessHandle, ProcessStatus};
+pub use sandbox::apply_supervisor_startup_hardening;
 
 /// Default interval (seconds) for re-fetching the inference route bundle from
 /// the gateway in cluster mode. Override at runtime with the
@@ -416,6 +417,11 @@ pub async fn run_sandbox(
     #[cfg(not(target_os = "linux"))]
     #[allow(clippy::no_effect_underscore_binding)]
     let _netns: Option<()> = None;
+
+    // Install the supervisor seccomp prelude after privileged startup helpers
+    // (network namespace setup, iptables probes) complete, but before the SSH
+    // listener and workload process are exposed.
+    apply_supervisor_startup_hardening()?;
 
     // Shared PID: set after process spawn so the proxy can look up
     // the entrypoint process's /proc/net/tcp for identity binding.

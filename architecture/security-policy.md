@@ -162,6 +162,24 @@ This guarantees that the same logical policy always produces the same hash regar
 
 **Idempotent updates**: `UpdateSandboxPolicy` compares the deterministic hash of the submitted policy against the latest stored revision's hash. If they match, the handler returns the existing version and hash without creating a new revision. The CLI detects this (the returned version equals the pre-call version) and prints `Policy unchanged` instead of `Policy version N submitted`. This makes repeated `policy set` calls safe and idempotent.
 
+### Incremental Merge Updates
+
+`UpdateConfigRequest.merge_operations` supports batched incremental changes to the dynamic `network_policies` section. The CLI exposes this as `openshell policy update`.
+
+Supported first-pass operations:
+
+- `--add-endpoint host:port[:access[:protocol[:enforcement]]]`
+- `--remove-endpoint host:port`
+- `--remove-rule <name>`
+- `--add-allow host:port:METHOD:path_glob`
+- `--add-deny host:port:METHOD:path_glob`
+
+`--add-allow` and `--add-deny` target existing `protocol: rest` endpoints only. `--binary` may be repeated with `--add-endpoint`, and `--rule-name` is allowed only when exactly one `--add-endpoint` is present.
+
+Each `openshell policy update` invocation is atomic at the revision level: the CLI sends one `merge_operations` batch, the server merges the whole batch into the latest policy, validates the result, and persists at most one new revision. Concurrency is handled with optimistic retries on the `(sandbox_id, version)` uniqueness boundary. If another writer wins first, the server refetches the latest policy, reapplies the full batch, revalidates it, and retries. This preserves batch atomicity without serializing all sandbox policy writes behind a sandbox-global mutex.
+
+The gateway emits per-sandbox OCSF `CONFIG:*` audit lines when incremental merge operations are applied and when draft chunks are approved or removed. These audit lines are streamed through the existing gateway log path, so operators can inspect the exact logical mutation that produced a policy revision without waiting for the sandbox poll loop to reload that revision.
+
 ### Policy Revision Statuses
 
 | Status | Meaning |
@@ -206,9 +224,20 @@ Failure scenarios that trigger LKG behavior include:
 
 ### CLI Commands
 
-The `openshell policy` subcommand group manages live policy updates:
+The `openshell policy` subcommand group manages live policy updates through full replacement (`policy set`) and incremental merges (`policy update`):
 
 ```bash
+# Merge endpoint/rule changes into the current sandbox policy
+openshell policy update <sandbox-name> \
+  --add-endpoint api.github.com:443:read-only:rest:enforce \
+  --binary /usr/bin/gh \
+  --wait
+
+# Add a REST allow rule to an existing endpoint
+openshell policy update <sandbox-name> \
+  --add-allow api.github.com:443:POST:/repos/*/issues \
+  --wait
+
 # Push a new policy to a running sandbox
 openshell policy set <sandbox-name> --policy updated-policy.yaml
 
@@ -255,6 +284,7 @@ Both `set` and `delete` require interactive confirmation (or `--yes` to bypass).
 
 When a global policy is active, sandbox-scoped policy mutations are blocked:
 - `policy set <sandbox>` returns `FailedPrecondition: "policy is managed globally"`
+- `policy update <sandbox>` returns `FailedPrecondition: "policy is managed globally"`
 - `rule approve`, `rule approve-all` return `FailedPrecondition: "cannot approve rules while a global policy is active"`
 - Revoking a previously approved draft chunk is blocked (it would modify the sandbox policy)
 - Rejecting pending chunks is allowed (does not modify the sandbox policy)
@@ -270,7 +300,7 @@ See [Gateway Settings Channel](gateway-settings.md#global-policy-lifecycle) for 
 
 When `--full` is specified, the server includes the deserialized `SandboxPolicy` protobuf in the `SandboxPolicyRevision.policy` field (see `crates/openshell-server/src/grpc.rs` -- `policy_record_to_revision()` with `include_policy: true`). The CLI converts this proto back to YAML via `policy_to_yaml()`, which uses a `BTreeMap` for `network_policies` to produce deterministic key ordering. See `crates/openshell-cli/src/run.rs` -- `policy_to_yaml()`, `policy_get()`.
 
-See `crates/openshell-cli/src/main.rs` -- `PolicyCommands` enum, `crates/openshell-cli/src/run.rs` -- `policy_set()`, `policy_get()`, `policy_list()`.
+See `crates/openshell-cli/src/main.rs` -- `PolicyCommands` enum, `crates/openshell-cli/src/run.rs` -- `policy_update()`, `policy_set()`, `policy_get()`, `policy_list()`.
 
 ---
 

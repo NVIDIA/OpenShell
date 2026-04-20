@@ -117,9 +117,13 @@ struct Args {
     )]
     vm_driver_state_dir: PathBuf,
 
-    /// VM compute-driver binary spawned by the gateway.
-    #[arg(long, env = "OPENSHELL_VM_COMPUTE_DRIVER_BIN")]
-    vm_compute_driver_bin: Option<PathBuf>,
+    /// Directory searched for compute-driver binaries (e.g.
+    /// `openshell-driver-vm`) when an explicit binary override isn't
+    /// configured. When unset, the gateway searches
+    /// `$HOME/.local/libexec/openshell`, `/usr/local/libexec/openshell`,
+    /// `/usr/local/libexec`, then a sibling of the gateway binary.
+    #[arg(long, env = "OPENSHELL_DRIVER_DIR")]
+    driver_dir: Option<PathBuf>,
 
     /// libkrun log level used by the VM helper.
     #[arg(
@@ -257,7 +261,7 @@ async fn run_from_args(args: Args) -> Result<()> {
 
     let vm_config = VmComputeConfig {
         state_dir: args.vm_driver_state_dir,
-        compute_driver_bin: args.vm_compute_driver_bin,
+        driver_dir: args.driver_dir,
         krun_log_level: args.vm_krun_log_level,
         vcpus: args.vm_vcpus,
         mem_mib: args.vm_mem_mib,

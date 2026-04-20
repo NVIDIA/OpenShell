@@ -115,6 +115,7 @@ ARG OPENSHELL_CARGO_VERSION
 
 COPY crates/openshell-core/ crates/openshell-core/
 COPY crates/openshell-driver-kubernetes/ crates/openshell-driver-kubernetes/
+COPY crates/openshell-ocsf/ crates/openshell-ocsf/
 COPY crates/openshell-policy/ crates/openshell-policy/
 COPY crates/openshell-providers/ crates/openshell-providers/
 COPY crates/openshell-router/ crates/openshell-router/

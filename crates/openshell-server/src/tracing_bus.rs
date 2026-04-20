@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openshell_core::proto::{SandboxLogLine, SandboxStreamEvent};
+use openshell_ocsf::OCSF_TARGET;
 use tokio::sync::broadcast;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::Context;
@@ -147,12 +148,13 @@ where
         };
 
         let msg = visitor.message.unwrap_or_else(|| meta.name().to_string());
+        let level = display_level(meta.target(), &meta.level().to_string());
 
         let ts = current_time_ms().unwrap_or(0);
         let log = SandboxLogLine {
             sandbox_id: sandbox_id.clone(),
             timestamp_ms: ts,
-            level: meta.level().to_string(),
+            level,
             target: meta.target().to_string(),
             message: msg,
             source: "gateway".to_string(),
@@ -194,6 +196,14 @@ impl tracing::field::Visit for LogVisitor {
 fn current_time_ms() -> Option<i64> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
     i64::try_from(now.as_millis()).ok()
+}
+
+fn display_level(target: &str, level: &str) -> String {
+    if target == OCSF_TARGET {
+        "OCSF".to_string()
+    } else {
+        level.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +282,12 @@ mod tests {
         let bus = TracingLogBus::new();
         // Should not panic
         bus.remove("nonexistent");
+    }
+
+    #[test]
+    fn display_level_maps_ocsf_target_to_ocsf() {
+        assert_eq!(display_level(OCSF_TARGET, "INFO"), "OCSF");
+        assert_eq!(display_level("openshell_server", "WARN"), "WARN");
     }
 
     #[test]

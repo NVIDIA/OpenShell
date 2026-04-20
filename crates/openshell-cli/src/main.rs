@@ -254,6 +254,8 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell policy get my-sandbox
   $ openshell policy set my-sandbox --policy policy.yaml
+  $ openshell policy update my-sandbox --add-endpoint api.github.com:443:read-only:rest:enforce
+  $ openshell policy update my-sandbox --add-allow 'api.github.com:443:GET:/repos/**'
   $ openshell policy set --global --policy policy.yaml
   $ openshell policy delete --global
   $ openshell policy list my-sandbox
@@ -1438,6 +1440,54 @@ enum PolicyCommands {
         timeout: u64,
     },
 
+    /// Incrementally update policy on a live sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Update {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement]]].
+        #[arg(long = "add-endpoint")]
+        add_endpoints: Vec<String>,
+
+        /// Remove an endpoint: host:port.
+        #[arg(long = "remove-endpoint")]
+        remove_endpoints: Vec<String>,
+
+        /// Add a REST allow rule: host:port:METHOD:path_glob.
+        #[arg(long = "add-allow")]
+        add_allow: Vec<String>,
+
+        /// Add a REST deny rule: host:port:METHOD:path_glob.
+        #[arg(long = "add-deny")]
+        add_deny: Vec<String>,
+
+        /// Remove a network rule by name.
+        #[arg(long = "remove-rule")]
+        remove_rules: Vec<String>,
+
+        /// Add binaries to each --add-endpoint rule.
+        #[arg(long = "binary", value_hint = ValueHint::FilePath)]
+        binaries: Vec<String>,
+
+        /// Override the generated rule name when exactly one --add-endpoint is provided.
+        #[arg(long = "rule-name")]
+        rule_name: Option<String>,
+
+        /// Preview the merged policy without sending it to the gateway.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Wait for the sandbox to load the policy revision.
+        #[arg(long)]
+        wait: bool,
+
+        /// Timeout for --wait in seconds.
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+    },
+
     /// Show current active policy for a sandbox or the global policy.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
@@ -1987,6 +2037,37 @@ async fn main() -> Result<()> {
                         run::sandbox_policy_set(&ctx.endpoint, &name, &policy, wait, timeout, &tls)
                             .await?;
                     }
+                }
+                PolicyCommands::Update {
+                    name,
+                    add_endpoints,
+                    remove_endpoints,
+                    add_allow,
+                    add_deny,
+                    remove_rules,
+                    binaries,
+                    rule_name,
+                    dry_run,
+                    wait,
+                    timeout,
+                } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_policy_update(
+                        &ctx.endpoint,
+                        &name,
+                        &add_endpoints,
+                        &remove_endpoints,
+                        &add_deny,
+                        &add_allow,
+                        &remove_rules,
+                        &binaries,
+                        rule_name.as_deref(),
+                        dry_run,
+                        wait,
+                        timeout,
+                        &tls,
+                    )
+                    .await?;
                 }
                 PolicyCommands::Get {
                     name,

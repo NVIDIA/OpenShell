@@ -90,7 +90,7 @@ target/debug/openshell-gateway \
   --vm-driver-state-dir $PWD/target/openshell-vm-driver-dev
 ```
 
-The gateway discovers `openshell-driver-vm` as a sibling of its own binary. Pass `--vm-compute-driver-bin /path/to/openshell-driver-vm` (or set `OPENSHELL_VM_COMPUTE_DRIVER_BIN`) to override.
+The gateway resolves `openshell-driver-vm` in this order: `--driver-dir`, conventional install locations (`~/.local/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`), then a sibling of the gateway binary.
 
 ## Flags
 
@@ -99,7 +99,7 @@ The gateway discovers `openshell-driver-vm` as a sibling of its own binary. Pass
 | `--drivers vm` | `OPENSHELL_DRIVERS` | `kubernetes` | Select the VM compute driver. |
 | `--grpc-endpoint URL` | `OPENSHELL_GRPC_ENDPOINT` | — | Required. URL the sandbox guest calls back to. Use a host alias that resolves to the gateway's host from inside the VM (gvproxy answers `host.containers.internal` and `host.openshell.internal` to `192.168.127.1`). |
 | `--vm-driver-state-dir DIR` | `OPENSHELL_VM_DRIVER_STATE_DIR` | `target/openshell-vm-driver` | Per-sandbox rootfs, console logs, and the `compute-driver.sock` UDS. |
-| `--vm-compute-driver-bin PATH` | `OPENSHELL_VM_COMPUTE_DRIVER_BIN` | sibling of gateway binary | Override the driver binary path. |
+| `--driver-dir DIR` | `OPENSHELL_DRIVER_DIR` | unset | Override the directory searched for `openshell-driver-vm`. |
 | `--vm-driver-vcpus N` | `OPENSHELL_VM_DRIVER_VCPUS` | `2` | vCPUs per sandbox. |
 | `--vm-driver-mem-mib N` | `OPENSHELL_VM_DRIVER_MEM_MIB` | `2048` | Memory per sandbox, in MiB. |
 | `--vm-krun-log-level N` | `OPENSHELL_VM_KRUN_LOG_LEVEL` | `1` | libkrun verbosity (0–5). |
