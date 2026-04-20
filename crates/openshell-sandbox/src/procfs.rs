@@ -576,9 +576,12 @@ mod tests {
     }
 
     /// An unlinked executable whose filename contains non-UTF-8 bytes must
-    /// still strip exactly one kernel-added `" (deleted)"` suffix. We operate
-    /// on raw bytes via `OsStrExt`, so invalid UTF-8 is not a reason to skip
-    /// the strip and return a path that downstream `stat()` calls will reject.
+    /// still resolve to its original path. Some kernels append a literal
+    /// `" (deleted)"` suffix to `/proc/<pid>/exe` after unlink while others
+    /// do not for this edge case, so the assertion has to tolerate both.
+    ///
+    /// When the suffix is present, we still need to strip exactly one copy
+    /// while operating on raw bytes via `OsStrExt`.
     #[cfg(target_os = "linux")]
     #[test]
     fn binary_path_strips_suffix_for_non_utf8_filename() {
@@ -603,13 +606,10 @@ mod tests {
         wait_for_child_exec(pid, &exe_path);
         std::fs::remove_file(&exe_path).unwrap();
 
-        // Sanity: raw readlink ends with " (deleted)" and is not valid UTF-8.
+        // Sanity: the raw readlink remains non-UTF-8 after unlink.
         let raw = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
         let raw_bytes = raw.as_os_str().as_bytes();
-        assert!(
-            raw_bytes.ends_with(b" (deleted)"),
-            "kernel should append ' (deleted)' to unlinked exe readlink"
-        );
+        let kernel_appended_deleted_suffix = raw_bytes.ends_with(b" (deleted)");
         assert!(
             std::str::from_utf8(raw_bytes).is_err(),
             "test precondition: raw readlink must contain non-UTF-8 bytes"
@@ -619,12 +619,19 @@ mod tests {
             binary_path(pid).expect("binary_path should succeed for non-UTF-8 unlinked path");
         assert_eq!(
             resolved, exe_path,
-            "binary_path must strip exactly one ' (deleted)' suffix for non-UTF-8 paths"
+            "binary_path must resolve non-UTF-8 unlinked paths back to the original filename"
         );
-        assert!(
-            !resolved.as_os_str().as_bytes().ends_with(b" (deleted)"),
-            "stripped path must not end with ' (deleted)'"
-        );
+        if kernel_appended_deleted_suffix {
+            assert!(
+                !resolved.as_os_str().as_bytes().ends_with(b" (deleted)"),
+                "stripped path must not end with ' (deleted)'"
+            );
+        } else {
+            assert_eq!(
+                raw, exe_path,
+                "kernels that omit the deleted suffix should report the original unlinked path"
+            );
+        }
 
         let _ = child.kill();
         let _ = child.wait();
