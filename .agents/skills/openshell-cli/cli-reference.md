@@ -183,6 +183,10 @@ Create a sandbox, wait for readiness, then connect or execute the trailing comma
 
 Show sandbox details (id, name, namespace, phase, policy).
 
+| Flag | Description |
+|------|-------------|
+| `--policy-only` | Print only the active policy YAML to stdout (effective sandbox or global policy via the gateway; use for scripts and piping) |
+
 ### `openshell sandbox list`
 
 List sandboxes in a table.

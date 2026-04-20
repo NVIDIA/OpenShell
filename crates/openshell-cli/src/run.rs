@@ -2734,7 +2734,16 @@ pub async fn sandbox_sync_command(
 }
 
 /// Fetch a sandbox by name.
-pub async fn sandbox_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+///
+/// With `policy_only`, prints only the active policy YAML from [`GetSandboxConfig`]
+/// (effective policy whether it is sandbox-scoped or global). Otherwise prints
+/// sandbox metadata and the creation-time `spec.policy` when present.
+pub async fn sandbox_get(
+    server: &str,
+    name: &str,
+    policy_only: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
     let response = client
@@ -2747,6 +2756,26 @@ pub async fn sandbox_get(server: &str, name: &str, tls: &TlsOptions) -> Result<(
         .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
+
+    if policy_only {
+        let config = client
+            .get_sandbox_config(GetSandboxConfigRequest {
+                sandbox_id: sandbox.id.clone(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+
+        let Some(ref policy) = config.policy else {
+            return Err(miette::miette!(
+                "no active policy configured for this sandbox"
+            ));
+        };
+        let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
+            .wrap_err("failed to serialize policy to YAML")?;
+        print!("{yaml_str}");
+        return Ok(());
+    }
 
     println!("{}", "Sandbox:".cyan().bold());
     println!();

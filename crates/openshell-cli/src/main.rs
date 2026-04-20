@@ -1208,6 +1208,10 @@ enum SandboxCommands {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
+
+        /// Print only the active policy YAML (effective sandbox or global policy).
+        #[arg(long)]
+        policy_only: bool,
     },
 
     /// List sandboxes.
@@ -2461,9 +2465,12 @@ async fn main() -> Result<()> {
                         | SandboxCommands::Download { .. } => {
                             unreachable!()
                         }
-                        SandboxCommands::Get { name } => {
+                        SandboxCommands::Get {
+                            name,
+                            policy_only,
+                        } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
-                            run::sandbox_get(endpoint, &name, &tls).await?;
+                            run::sandbox_get(endpoint, &name, policy_only, &tls).await?;
                         }
                         SandboxCommands::List {
                             limit,
