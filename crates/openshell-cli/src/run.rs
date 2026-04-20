@@ -2788,7 +2788,11 @@ pub async fn sandbox_get(
     println!(
         "  {} {}",
         "Policy source:".dimmed(),
-        if policy_from_global { "global" } else { "sandbox" }
+        if policy_from_global {
+            "global"
+        } else {
+            "sandbox"
+        }
     );
     let revision = if policy_from_global {
         if config.global_policy_version > 0 {

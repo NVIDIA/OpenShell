@@ -2465,10 +2465,7 @@ async fn main() -> Result<()> {
                         | SandboxCommands::Download { .. } => {
                             unreachable!()
                         }
-                        SandboxCommands::Get {
-                            name,
-                            policy_only,
-                        } => {
+                        SandboxCommands::Get { name, policy_only } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
                             run::sandbox_get(endpoint, &name, policy_only, &tls).await?;
                         }

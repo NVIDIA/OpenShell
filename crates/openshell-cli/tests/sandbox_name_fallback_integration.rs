@@ -13,8 +13,7 @@ use openshell_core::proto::{
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxesRequest, ListSandboxesResponse, ProviderResponse, Sandbox, SandboxPolicy,
-    SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, UpdateProviderRequest, WatchSandboxRequest,
+    SandboxResponse, SandboxStreamEvent, ServiceStatus, UpdateProviderRequest, WatchSandboxRequest,
 };
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
