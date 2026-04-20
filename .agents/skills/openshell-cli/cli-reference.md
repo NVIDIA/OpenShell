@@ -181,7 +181,11 @@ Create a sandbox, wait for readiness, then connect or execute the trailing comma
 
 ### `openshell sandbox get <name>`
 
-Show sandbox details (id, name, namespace, phase, policy).
+Show sandbox details (id, name, namespace, phase) and the **active** policy from the gateway (same source whether policy is sandbox-scoped or global). Metadata includes **Policy source** (`sandbox` or `global`) and **Revision** (global policy row when source is global, otherwise sandbox policy row).
+
+| Flag | Description |
+|------|-------------|
+| `--policy-only` | Print only the active policy YAML to stdout (same policy as above; use for scripts and piping) |
 
 ### `openshell sandbox list`
 

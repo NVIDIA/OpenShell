@@ -110,10 +110,16 @@ List all sandboxes:
 openshell sandbox list
 ```
 
-Get detailed information about a specific sandbox:
+Get detailed information about a specific sandbox. The output lists **Policy source** (`sandbox` or `global`), **Revision** (the active policy’s row version for that source), and the formatted active policy YAML:
 
 ```shell
 openshell sandbox get my-sandbox
+```
+
+Print only that policy YAML for scripting (same effective policy, no metadata):
+
+```shell
+openshell sandbox get my-sandbox --policy-only
 ```
 
 Stream sandbox logs to monitor agent activity and diagnose policy decisions:
