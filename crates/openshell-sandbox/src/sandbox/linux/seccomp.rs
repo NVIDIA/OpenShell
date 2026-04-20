@@ -16,7 +16,7 @@ use crate::policy::{NetworkMode, SandboxPolicy};
 use miette::{IntoDiagnostic, Result};
 use seccompiler::{
     SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
-    apply_filter,
+    apply_filter, apply_filter_all_threads,
 };
 use std::collections::BTreeMap;
 use std::convert::TryInto;
@@ -25,15 +25,16 @@ use tracing::debug;
 /// Value of `SECCOMP_SET_MODE_FILTER` (linux/seccomp.h).
 const SECCOMP_SET_MODE_FILTER: u64 = 1;
 
-/// Apply the supervisor's early-startup seccomp filter.
+/// Apply the supervisor seccomp filter across the running process.
 ///
-/// This prelude runs before the async runtime, logging, or argument parsing.
-/// It intentionally blocks only the privileged escape primitives that the
-/// supervisor does not need during normal startup.
+/// This runs after privileged startup helpers complete and synchronizes the
+/// filter across all supervisor threads via TSYNC. It intentionally blocks
+/// only the privileged escape primitives that the long-lived supervisor no
+/// longer needs once bootstrap is complete.
 pub fn apply_supervisor_prelude() -> Result<()> {
     let filter = build_supervisor_prelude_filter()?;
     set_no_new_privs()?;
-    apply_filter(&filter).into_diagnostic()?;
+    apply_filter_all_threads(&filter).into_diagnostic()?;
     Ok(())
 }
 

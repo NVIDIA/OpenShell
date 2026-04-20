@@ -417,6 +417,11 @@ pub async fn run_sandbox(
     #[allow(clippy::no_effect_underscore_binding)]
     let _netns: Option<()> = None;
 
+    // Install the supervisor seccomp prelude after privileged startup helpers
+    // (network namespace setup, iptables probes) complete, but before the SSH
+    // listener and workload process are exposed.
+    apply_supervisor_startup_hardening()?;
+
     // Shared PID: set after process spawn so the proxy can look up
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));

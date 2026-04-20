@@ -198,7 +198,7 @@ OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude run
 
 | Aspect | Detail |
 |---|---|
-| Startup prelude | Before the supervisor initializes the runtime, it sets `PR_SET_NO_NEW_PRIVS` and blocks `mount`, the new mount API syscalls, `pivot_root`, `umount2`, `bpf`, `perf_event_open`, `userfaultfd`, module-loading syscalls, and kexec. This closes the privileged remount and kernel-surface window while leaving required setup syscalls such as `setns` available. |
+| Startup prelude | After privileged bootstrap helpers complete, the supervisor sets `PR_SET_NO_NEW_PRIVS` and synchronizes a seccomp filter across all runtime threads that blocks `mount`, the new mount API syscalls, `pivot_root`, `umount2`, `bpf`, `perf_event_open`, `userfaultfd`, module-loading syscalls, and kexec. This closes the long-lived privileged remount and kernel-surface window while leaving required setup syscalls such as `setns` available. |
 | Socket domains | The filter allows `AF_INET` and `AF_INET6` (for proxy communication) and blocks `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` with `EPERM`. |
 | Runtime unconditional syscall blocks | `memfd_create`, `ptrace`, `bpf`, `process_vm_readv`, `process_vm_writev`, `pidfd_open`, `pidfd_getfd`, `pidfd_send_signal`, `io_uring_setup`, `mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `setns`, `umount2`, `pivot_root`, `userfaultfd`, `perf_event_open`. |
 | Conditional syscall blocks | `execveat` with `AT_EMPTY_PATH`, `unshare` and `clone` with `CLONE_NEWUSER`, and `seccomp(SECCOMP_SET_MODE_FILTER)` are denied with `EPERM`. |
@@ -209,14 +209,15 @@ OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude run
 ### Enforcement Application Order
 
 The sandbox supervisor applies enforcement in a specific order during process startup.
-This ordering is intentional: the startup prelude must run before runtime initialization, and privilege dropping still needs `/etc/group` and `/etc/passwd`, which Landlock subsequently restricts.
+This ordering is intentional: named network-namespace setup still relies on privileged helpers, and privilege dropping still needs `/etc/group` and `/etc/passwd`, which Landlock subsequently restricts.
 
-1. Supervisor startup prelude seccomp (`PR_SET_NO_NEW_PRIVS` plus the early syscall denylist).
-2. Network namespace entry (`setns`).
-3. Privilege drop (`initgroups` + `setgid` + `setuid`).
-4. Core-dump hardening (`RLIMIT_CORE=0`, plus `PR_SET_DUMPABLE=0` on Linux).
-5. Landlock filesystem restrictions.
-6. Runtime seccomp socket domain and syscall filters.
+1. Privileged supervisor bootstrap helpers, including network-namespace setup and optional `iptables` probes.
+2. Supervisor startup prelude seccomp (`PR_SET_NO_NEW_PRIVS` plus the early syscall denylist) synchronized across runtime threads.
+3. Network namespace entry (`setns`) in child `pre_exec`.
+4. Privilege drop (`initgroups` + `setgid` + `setuid`).
+5. Core-dump hardening (`RLIMIT_CORE=0`, plus `PR_SET_DUMPABLE=0` on Linux).
+6. Landlock filesystem restrictions.
+7. Runtime seccomp socket domain and syscall filters.
 
 ## Inference Controls
 

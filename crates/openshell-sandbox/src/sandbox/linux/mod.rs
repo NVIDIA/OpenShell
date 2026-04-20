@@ -43,7 +43,7 @@ pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
     Ok(())
 }
 
-/// Apply the supervisor's early-startup hardening before runtime initialization.
+/// Apply the supervisor seccomp prelude after privileged bootstrap completes.
 pub fn apply_supervisor_prelude() -> Result<()> {
     seccomp::apply_supervisor_prelude()
 }

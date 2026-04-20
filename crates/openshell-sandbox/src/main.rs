@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
-use openshell_sandbox::{apply_supervisor_startup_hardening, run_sandbox};
+use openshell_sandbox::run_sandbox;
 
 /// OpenShell Sandbox - process isolation and monitoring.
 #[derive(Parser, Debug)]
@@ -97,8 +97,6 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    apply_supervisor_startup_hardening()?;
-
     let args = Args::parse();
 
     // Try to open a rolling log file; fall back to stdout-only logging if it fails

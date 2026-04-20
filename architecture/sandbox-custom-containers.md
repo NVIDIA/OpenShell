@@ -110,7 +110,7 @@ The `openshell-sandbox` supervisor adapts to arbitrary environments:
 | Auto build+push for Dockerfiles | Eliminates the two-step `image push` + `create` workflow for local development |
 | `OPENSHELL_COMMUNITY_REGISTRY` env var | Allows organizations to host their own community sandbox registry |
 | hostPath side-load | Supervisor binary lives on the node filesystem — no init container, no emptyDir, no extra image pull. Faster pod startup. |
-| Read-only mount in agent | The supervisor binary is mounted read-only, and the startup seccomp prelude blocks the remount syscalls that would otherwise reopen it for writes during supervisor startup. |
+| Read-only mount in agent | The supervisor binary is mounted read-only, and the startup seccomp prelude blocks the remount syscalls that would otherwise reopen it for writes once privileged bootstrap has completed. |
 | Command override | Ensures `openshell-sandbox` is the entrypoint regardless of the image's default CMD |
 | Clear `run_as_user/group` for custom images | Prevents startup failure when the image lacks the default `sandbox` user |
 | Non-fatal log file init | `/var/log/openshell.log` may be unwritable in arbitrary images; falls back to stdout |
