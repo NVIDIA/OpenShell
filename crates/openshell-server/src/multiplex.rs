@@ -22,8 +22,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tower::ServiceExt;
+use tower::{ServiceBuilder, ServiceExt};
+use tower_http::trace::TraceLayer;
+use tracing::Span;
 
 use crate::{OpenShellService, ServerState, http_router, inference::InferenceService};
 
@@ -59,6 +62,23 @@ impl MultiplexService {
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
         let grpc_service = GrpcRouter::new(openshell, inference);
         let http_service = http_router(self.state.clone());
+
+        let grpc_service = ServiceBuilder::new()
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(make_request_span)
+                    .on_request(())
+                    .on_response(log_response),
+            )
+            .service(grpc_service);
+        let http_service = ServiceBuilder::new()
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(make_request_span)
+                    .on_request(())
+                    .on_response(log_response),
+            )
+            .service(http_service);
 
         let service = MultiplexedService::new(grpc_service, http_service);
 
@@ -201,6 +221,31 @@ where
             })
         }
     }
+}
+
+fn make_request_span<B>(req: &Request<B>) -> Span {
+    let path = req.uri().path();
+    if matches!(path, "/health" | "/healthz" | "/readyz") {
+        tracing::debug_span!(
+            "request",
+            method = %req.method(),
+            path,
+        )
+    } else {
+        tracing::info_span!(
+            "request",
+            method = %req.method(),
+            path,
+        )
+    }
+}
+
+fn log_response<B>(res: &Response<B>, latency: Duration, _span: &Span) {
+    tracing::info!(
+        status = res.status().as_u16(),
+        latency_ms = latency.as_millis(),
+        "response"
+    );
 }
 
 /// Boxed body type for uniform handling.
