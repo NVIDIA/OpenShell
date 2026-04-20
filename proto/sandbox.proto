@@ -97,6 +97,11 @@ message NetworkEndpoint {
   // are blocked even if they match an allow rule or access preset.
   // Deny rules take precedence over allow rules.
   repeated L7DenyRule deny_rules = 10;
+  // When true, percent-encoded '/' (%2F) is preserved in path segments
+  // rather than rejected by the L7 path canonicalizer. Required for
+  // upstreams like GitLab that embed %2F in namespaced resource paths.
+  // Defaults to false (strict).
+  bool allow_encoded_slash = 11;
 }
 
 // An L7 deny rule that blocks specific requests.

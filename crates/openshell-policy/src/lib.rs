@@ -102,6 +102,12 @@ struct NetworkEndpointDef {
     allowed_ips: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     deny_rules: Vec<L7DenyRuleDef>,
+    /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
+    /// rather than rejected by the L7 path canonicalizer. Required for
+    /// upstreams like GitLab that embed `%2F` in namespaced resource paths.
+    /// Defaults to false (strict).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    allow_encoded_slash: bool,
 }
 
 fn is_zero(v: &u16) -> bool {
@@ -254,6 +260,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                         .collect(),
                                 })
                                 .collect(),
+                            allow_encoded_slash: e.allow_encoded_slash,
                         }
                     })
                     .collect(),
@@ -393,6 +400,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                         .collect(),
                                 })
                                 .collect(),
+                            allow_encoded_slash: e.allow_encoded_slash,
                         }
                     })
                     .collect(),

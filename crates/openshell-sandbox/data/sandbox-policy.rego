@@ -401,8 +401,8 @@ command_matches(actual, expected) if {
 
 # --- Matched endpoint config (for L7 and allowed_ips extraction) ---
 # Returns the raw endpoint object for the matched policy + host:port.
-# Used by Rust to extract L7 config (protocol, tls, enforcement) and/or
-# allowed_ips for SSRF allowlist validation.
+# Used by Rust to extract L7 config (protocol, tls, enforcement,
+# allow_encoded_slash) and/or allowed_ips for SSRF allowlist validation.
 
 # Per-policy helper: returns matching endpoint configs for a single policy.
 _policy_endpoint_configs(policy) := [ep |

@@ -32,7 +32,7 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `l7/tls.rs` | Ephemeral CA generation (`SandboxCa`), per-hostname leaf cert cache (`CertCache`), TLS termination/connection helpers, `looks_like_tls()` auto-detection |
 | `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation, credential-injection-only passthrough relay |
 | `l7/rest.rs` | HTTP/1.1 request/response parsing, body framing (Content-Length, chunked), deny response generation |
-| `l7/path.rs` | Request-target canonicalization: percent-decoding, dot-segment resolution, `;params` stripping, encoded-slash policy. Single source of truth for the path both OPA evaluates and the upstream receives. |
+| `l7/path.rs` | Request-target canonicalization: percent-decoding, dot-segment resolution, `;params` stripping, encoded-slash policy (opt-in per endpoint via `allow_encoded_slash: true` for upstreams like GitLab that embed `%2F` in paths). Single source of truth for the path both OPA evaluates and the upstream receives. |
 | `l7/provider.rs` | `L7Provider` trait and `L7Request`/`BodyLength` types |
 | `secrets.rs` | `SecretResolver` credential placeholder system — placeholder generation, multi-location rewriting (headers, query params, path segments, Basic auth), fail-closed scanning, secret validation, percent-encoding |
 

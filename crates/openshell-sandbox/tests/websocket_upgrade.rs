@@ -111,7 +111,7 @@ async fn websocket_upgrade_through_l7_relay_exchanges_message() {
 
     // Run the relay in a background task (simulates what relay_rest does)
     let relay_handle = tokio::spawn(async move {
-        let outcome = RestProvider
+        let outcome = RestProvider::default()
             .relay(&req, &mut client_proxy, &mut upstream)
             .await
             .expect("relay should succeed");
@@ -239,7 +239,7 @@ async fn normal_http_request_still_works_after_relay_changes() {
 
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        RestProvider.relay(&req, &mut client_proxy, &mut upstream),
+        RestProvider::default().relay(&req, &mut client_proxy, &mut upstream),
     )
     .await
     .expect("should not deadlock")

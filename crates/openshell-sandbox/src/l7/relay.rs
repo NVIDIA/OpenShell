@@ -128,9 +128,17 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // Build a provider carrying the per-endpoint canonicalization options so
+    // request parsing honors the endpoint's `allow_encoded_slash` setting
+    // (e.g. APIs like GitLab that embed `%2F` in path segments).
+    let provider =
+        crate::l7::rest::RestProvider::with_options(crate::l7::path::CanonicalizeOptions {
+            allow_encoded_slash: config.allow_encoded_slash,
+            ..Default::default()
+        });
     loop {
         // Parse one HTTP request from client
-        let req = match crate::l7::rest::RestProvider.parse_request(client).await {
+        let req = match provider.parse_request(client).await {
             Ok(Some(req)) => req,
             Ok(None) => return Ok(()), // Client closed connection
             Err(e) => {
@@ -274,7 +282,7 @@ where
             }
         } else {
             // Enforce mode: deny with 403 and close connection (use redacted target)
-            crate::l7::rest::RestProvider
+            provider
                 .deny_with_redacted_target(
                     &req,
                     &ctx.policy_name,
@@ -374,7 +382,11 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let provider = crate::l7::rest::RestProvider;
+    // Passthrough path: no L7 policy is enforced here, so use default
+    // (strict) canonicalization options. Calls to GitLab-style APIs that
+    // need `%2F` must be configured as L7 endpoints so the per-endpoint
+    // `allow_encoded_slash` opt-in applies.
+    let provider = crate::l7::rest::RestProvider::default();
     let mut request_count: u64 = 0;
     let resolver = ctx.secret_resolver.as_deref();
 
