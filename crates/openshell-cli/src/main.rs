@@ -1209,7 +1209,7 @@ enum SandboxCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Print only the active policy YAML (effective sandbox or global policy).
+        /// Print only the active policy YAML (same policy as the default view; stdout only).
         #[arg(long)]
         policy_only: bool,
     },
