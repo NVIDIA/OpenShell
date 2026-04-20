@@ -57,7 +57,6 @@ export OPENSHELL_SSH_GATEWAY_HOST="${OPENSHELL_SSH_GATEWAY_HOST:-127.0.0.1}"
 export OPENSHELL_SSH_GATEWAY_PORT="${OPENSHELL_SSH_GATEWAY_PORT:-${SERVER_PORT}}"
 export OPENSHELL_SSH_HANDSHAKE_SECRET="${OPENSHELL_SSH_HANDSHAKE_SECRET:-dev-vm-driver-secret}"
 export OPENSHELL_VM_DRIVER_STATE_DIR="${STATE_DIR}"
-export OPENSHELL_VM_COMPUTE_DRIVER_BIN="${OPENSHELL_VM_COMPUTE_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}"
 
 echo "==> Starting OpenShell server with VM compute driver"
 exec "${ROOT}/target/debug/openshell-gateway"

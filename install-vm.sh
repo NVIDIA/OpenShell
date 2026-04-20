@@ -21,7 +21,8 @@
 #                                (default: ~/.local/bin).
 #   OPENSHELL_DRIVER_DIR         Directory for compute-driver binaries
 #                                (default: ~/.local/libexec/openshell).
-#                                Must match the gateway's --driver-dir flag.
+#                                If you install elsewhere, pass the same
+#                                directory via the gateway's --driver-dir flag.
 #
 set -eu
 
@@ -179,8 +180,8 @@ get_gateway_install_dir() {
   fi
 }
 
-# The driver dir must match the gateway's default `--driver-dir`
-# (see crates/openshell-server/src/compute/vm.rs :: default_driver_dir).
+# Default per-user install dir for the VM compute driver. Newer gateways also
+# auto-discover conventional system installs under `/usr/local/libexec`.
 get_driver_install_dir() {
   if [ -n "${OPENSHELL_DRIVER_DIR:-}" ]; then
     echo "$OPENSHELL_DRIVER_DIR"
@@ -302,7 +303,8 @@ ENVIRONMENT VARIABLES:
                             (default: ~/.local/bin).
     OPENSHELL_DRIVER_DIR    Directory for compute-driver binaries
                             (default: ~/.local/libexec/openshell).
-                            Must match the gateway's --driver-dir flag.
+                            If you install elsewhere, pass the same directory
+                            via the gateway's --driver-dir flag.
 
 EXAMPLES:
     # Install into defaults
@@ -383,10 +385,11 @@ main() {
   # Next steps — print a working command to start the gateway.
   #
   # The VM compute driver requires:
-  #   * --vm-compute-driver-bin — path to openshell-driver-vm.
-  #                               Newer gateways also accept --driver-dir,
-  #                               but the explicit bin path works against
-  #                               every released gateway.
+  #   * --driver-dir           — only needed when the driver is installed
+  #                               outside the built-in search paths:
+  #                               ~/.local/libexec/openshell,
+  #                               /usr/local/libexec/openshell,
+  #                               /usr/local/libexec, or next to the gateway.
   #   * --grpc-endpoint         — URL the VM guest uses to call the gateway
   #                               back. Loopback is accepted; scheme must
   #                               match TLS mode.
@@ -397,11 +400,19 @@ main() {
   info "Next steps — start the gateway with the VM compute driver:"
   echo ""
 
+  _driver_dir_arg=""
+  case "$_driver_dir" in
+    "${HOME}/.local/libexec/openshell"|"/usr/local/libexec/openshell"|"/usr/local/libexec") ;;
+    *)
+      _driver_dir_arg="      --driver-dir '${_driver_dir}' \\
+"
+      ;;
+  esac
+
   cat >&2 <<EOF
     ${GATEWAY_BIN} \\
       --drivers vm \\
-      --vm-compute-driver-bin '${_driver_dir}/${DRIVER_VM_BIN}' \\
-      --disable-tls \\
+${_driver_dir_arg}      --disable-tls \\
       --disable-gateway-auth \\
       --db-url 'sqlite::memory:' \\
       --grpc-endpoint 'http://127.0.0.1:8080' \\
