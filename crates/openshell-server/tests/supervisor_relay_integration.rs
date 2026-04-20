@@ -315,7 +315,13 @@ fn register_session_with_capacity(
     capacity: usize,
 ) -> mpsc::Receiver<GatewayMessage> {
     let (tx, rx) = mpsc::channel(capacity);
-    registry.register(sandbox_id.to_string(), "sess-1".to_string(), tx);
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    registry.register(
+        sandbox_id.to_string(),
+        "sess-1".to_string(),
+        tx,
+        shutdown_tx,
+    );
     rx
 }
 

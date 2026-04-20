@@ -48,6 +48,12 @@ struct LiveSession {
     /// removing a session that has since been superseded by a reconnect.
     session_id: String,
     tx: mpsc::Sender<GatewayMessage>,
+    /// Fires when this session is superseded by a reconnect so the old session
+    /// task can exit promptly — dropping its own `tx` clone and closing the
+    /// outbound stream. Without this, a concurrent `open_relay` that grabbed
+    /// the old session's `tx` just before supersede could still enqueue a
+    /// `RelayOpen` onto the stale stream and sit until the relay timeout.
+    shutdown: oneshot::Sender<()>,
     #[allow(dead_code)]
     connected_at: Instant,
 }
@@ -88,25 +94,36 @@ impl SupervisorSessionRegistry {
 
     /// Register a live supervisor session for the given sandbox.
     ///
-    /// Returns the previous session's sender (if any) so the caller can close it.
+    /// If a previous session exists for the same sandbox, its shutdown signal
+    /// is fired so the old session task exits promptly. Returns `true` iff a
+    /// previous session was superseded.
     pub fn register(
         &self,
         sandbox_id: String,
         session_id: String,
         tx: mpsc::Sender<GatewayMessage>,
-    ) -> Option<mpsc::Sender<GatewayMessage>> {
+        shutdown: oneshot::Sender<()>,
+    ) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
-        let previous = sessions.remove(&sandbox_id).map(|s| s.tx);
+        let previous = sessions.remove(&sandbox_id);
         sessions.insert(
             sandbox_id.clone(),
             LiveSession {
                 sandbox_id,
                 session_id,
                 tx,
+                shutdown,
                 connected_at: Instant::now(),
             },
         );
-        previous
+        match previous {
+            Some(prev) => {
+                // Best-effort — the old task may have already exited.
+                let _ = prev.shutdown.send(());
+                true
+            }
+            None => false,
+        }
     }
 
     /// Remove the session for a sandbox.
@@ -161,6 +178,16 @@ impl SupervisorSessionRegistry {
             .unwrap()
             .get(sandbox_id)
             .map(|s| s.tx.clone())
+    }
+
+    fn pending_channel_ids(&self, sandbox_id: &str) -> Vec<String> {
+        self.pending_relays
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, pending)| pending.sandbox_id == sandbox_id)
+            .map(|(channel_id, _)| channel_id.clone())
+            .collect()
     }
 
     /// Open a relay channel and return a receiver for the supervisor-side
@@ -278,6 +305,20 @@ impl SupervisorSessionRegistry {
     /// Clean up all state for a sandbox (session + pending relays).
     pub fn cleanup_sandbox(&self, sandbox_id: &str) {
         self.remove(sandbox_id);
+    }
+
+    pub async fn replay_pending_relays(&self, sandbox_id: &str, tx: &mpsc::Sender<GatewayMessage>) {
+        for channel_id in self.pending_channel_ids(sandbox_id) {
+            let msg = GatewayMessage {
+                payload: Some(gateway_message::Payload::RelayOpen(RelayOpen {
+                    channel_id: channel_id.clone(),
+                })),
+            };
+            if tx.send(msg).await.is_err() {
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "supervisor session: failed to replay pending relay to superseding session");
+                break;
+            }
+        }
     }
 }
 
@@ -451,11 +492,14 @@ pub async fn handle_connect_supervisor(
 
     // Step 2: Create the outbound channel and register the session.
     let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
-    if let Some(_previous_tx) =
-        state
-            .supervisor_sessions
-            .register(sandbox_id.clone(), session_id.clone(), tx.clone())
-    {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let superseded = state.supervisor_sessions.register(
+        sandbox_id.clone(),
+        session_id.clone(),
+        tx.clone(),
+        shutdown_tx,
+    );
+    if superseded {
         info!(
             sandbox_id = %sandbox_id,
             session_id = %session_id,
@@ -479,6 +523,13 @@ pub async fn handle_connect_supervisor(
         return Err(Status::internal("failed to send session accepted"));
     }
 
+    if superseded {
+        state
+            .supervisor_sessions
+            .replay_pending_relays(&sandbox_id, &tx)
+            .await;
+    }
+
     // Step 4: Spawn the session loop that reads inbound messages.
     let state_clone = Arc::clone(state);
     let sandbox_id_clone = sandbox_id.clone();
@@ -489,6 +540,7 @@ pub async fn handle_connect_supervisor(
             &session_id,
             &tx,
             &mut inbound,
+            shutdown_rx,
         )
         .await;
         let still_ours = state_clone
@@ -516,6 +568,7 @@ async fn run_session_loop(
     session_id: &str,
     tx: &mpsc::Sender<GatewayMessage>,
     inbound: &mut tonic::Streaming<SupervisorMessage>,
+    mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     let heartbeat_interval = Duration::from_secs(u64::from(HEARTBEAT_INTERVAL_SECS));
     let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
@@ -524,6 +577,10 @@ async fn run_session_loop(
 
     loop {
         tokio::select! {
+            _ = &mut shutdown_rx => {
+                info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: superseded by reconnect, shutting down");
+                break;
+            }
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(msg)) => {
@@ -605,6 +662,13 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// Returns a shutdown sender with its receiver immediately dropped. Tests
+    /// that don't observe the shutdown signal can use this to satisfy the
+    /// `register` signature without the receiver noise.
+    fn make_shutdown() -> oneshot::Sender<()> {
+        oneshot::channel::<()>().0
+    }
+
     // ---- registry: register / remove ----
 
     #[test]
@@ -612,11 +676,12 @@ mod tests {
         let registry = SupervisorSessionRegistry::new();
         let (tx, _rx) = mpsc::channel(1);
 
-        assert!(
-            registry
-                .register("sandbox-1".to_string(), "s1".to_string(), tx)
-                .is_none()
-        );
+        assert!(!registry.register(
+            "sandbox-1".to_string(),
+            "s1".to_string(),
+            tx,
+            make_shutdown(),
+        ));
 
         let sessions = registry.sessions.lock().unwrap();
         assert!(sessions.contains_key("sandbox-1"));
@@ -628,23 +693,30 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
 
-        assert!(
-            registry
-                .register("sandbox-1".to_string(), "s1".to_string(), tx1)
-                .is_none()
-        );
-        assert!(
-            registry
-                .register("sandbox-1".to_string(), "s2".to_string(), tx2)
-                .is_some()
-        );
+        assert!(!registry.register(
+            "sandbox-1".to_string(),
+            "s1".to_string(),
+            tx1,
+            make_shutdown(),
+        ));
+        assert!(registry.register(
+            "sandbox-1".to_string(),
+            "s2".to_string(),
+            tx2,
+            make_shutdown(),
+        ));
     }
 
     #[test]
     fn registry_remove() {
         let registry = SupervisorSessionRegistry::new();
         let (tx, _rx) = mpsc::channel(1);
-        registry.register("sandbox-1".to_string(), "s1".to_string(), tx);
+        registry.register(
+            "sandbox-1".to_string(),
+            "s1".to_string(),
+            tx,
+            make_shutdown(),
+        );
 
         registry.remove("sandbox-1");
         let sessions = registry.sessions.lock().unwrap();
@@ -655,7 +727,7 @@ mod tests {
     fn remove_if_current_removes_matching_session() {
         let registry = SupervisorSessionRegistry::new();
         let (tx, _rx) = mpsc::channel(1);
-        registry.register("sbx".to_string(), "s1".to_string(), tx);
+        registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
 
         assert!(registry.remove_if_current("sbx", "s1"));
         assert!(!registry.sessions.lock().unwrap().contains_key("sbx"));
@@ -668,8 +740,18 @@ mod tests {
         let (tx_new, _rx_new) = mpsc::channel(1);
 
         // Old session registers, then is superseded by a new session.
-        registry.register("sbx".to_string(), "s-old".to_string(), tx_old);
-        registry.register("sbx".to_string(), "s-new".to_string(), tx_new);
+        registry.register(
+            "sbx".to_string(),
+            "s-old".to_string(),
+            tx_old,
+            make_shutdown(),
+        );
+        registry.register(
+            "sbx".to_string(),
+            "s-new".to_string(),
+            tx_new,
+            make_shutdown(),
+        );
 
         // Cleanup from the old session task runs late. It must NOT evict the
         // newly registered session.
@@ -694,7 +776,7 @@ mod tests {
     async fn open_relay_sends_relay_open_to_registered_session() {
         let registry = SupervisorSessionRegistry::new();
         let (tx, mut rx) = mpsc::channel(4);
-        registry.register("sbx".to_string(), "s1".to_string(), tx);
+        registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
 
         let (channel_id, _relay_rx) = registry
             .open_relay("sbx", Duration::from_secs(1))
@@ -731,7 +813,12 @@ mod tests {
             let (tx, mut rx) = mpsc::channel::<GatewayMessage>(4);
             // Keep the receiver alive so the send in open_relay succeeds.
             tokio::spawn(async move { while rx.recv().await.is_some() {} });
-            registry_for_register.register("sbx".to_string(), "s1".to_string(), tx);
+            registry_for_register.register(
+                "sbx".to_string(),
+                "s1".to_string(),
+                tx,
+                make_shutdown(),
+            );
         });
 
         let result = registry.open_relay("sbx", Duration::from_secs(2)).await;
@@ -745,7 +832,7 @@ mod tests {
     async fn open_relay_fails_when_session_receiver_dropped() {
         let registry = SupervisorSessionRegistry::new();
         let (tx, rx) = mpsc::channel::<GatewayMessage>(4);
-        registry.register("sbx".to_string(), "s1".to_string(), tx);
+        registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
 
         // Simulate the supervisor's stream going away between lookup and send:
         // the receiver held by `ReceiverStream` is dropped.
@@ -764,8 +851,13 @@ mod tests {
     async fn open_relay_rejects_when_global_cap_reached() {
         let registry = SupervisorSessionRegistry::new();
         let (tx, _rx) = mpsc::channel::<GatewayMessage>(8);
-        registry.register("sbx-a".to_string(), "s-a".to_string(), tx.clone());
-        registry.register("sbx-b".to_string(), "s-b".to_string(), tx);
+        registry.register(
+            "sbx-a".to_string(),
+            "s-a".to_string(),
+            tx.clone(),
+            make_shutdown(),
+        );
+        registry.register("sbx-b".to_string(), "s-b".to_string(), tx, make_shutdown());
 
         // Pre-seed pending_relays to exactly the global cap, split across two
         // sandboxes so neither hits the per-sandbox cap first.
@@ -797,7 +889,7 @@ mod tests {
     async fn open_relay_rejects_when_per_sandbox_cap_reached() {
         let registry = SupervisorSessionRegistry::new();
         let (tx, _rx) = mpsc::channel::<GatewayMessage>(8);
-        registry.register("sbx".to_string(), "s".to_string(), tx);
+        registry.register("sbx".to_string(), "s".to_string(), tx, make_shutdown());
 
         {
             let mut pending = registry.pending_relays.lock().unwrap();
@@ -823,7 +915,12 @@ mod tests {
 
         // A different sandbox still has headroom.
         let (tx2, _rx2) = mpsc::channel::<GatewayMessage>(8);
-        registry.register("sbx-other".to_string(), "s-other".to_string(), tx2);
+        registry.register(
+            "sbx-other".to_string(),
+            "s-other".to_string(),
+            tx2,
+            make_shutdown(),
+        );
         registry
             .open_relay("sbx-other", Duration::from_millis(50))
             .await
@@ -841,8 +938,18 @@ mod tests {
         // "channel closed".
         let _tx_old_alive = tx_old.clone();
 
-        registry.register("sbx".to_string(), "s-old".to_string(), tx_old);
-        registry.register("sbx".to_string(), "s-new".to_string(), tx_new);
+        registry.register(
+            "sbx".to_string(),
+            "s-old".to_string(),
+            tx_old,
+            make_shutdown(),
+        );
+        registry.register(
+            "sbx".to_string(),
+            "s-new".to_string(),
+            tx_new,
+            make_shutdown(),
+        );
 
         let (_channel_id, _relay_rx) = registry
             .open_relay("sbx", Duration::from_secs(1))
@@ -864,6 +971,82 @@ mod tests {
         match rx_old.try_recv() {
             Err(TryRecvError::Empty) => {}
             other => panic!("expected Empty on superseded session, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_signals_shutdown_to_previous_session() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx_old, _rx_old) = mpsc::channel::<GatewayMessage>(1);
+        let (tx_new, _rx_new) = mpsc::channel::<GatewayMessage>(1);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        registry.register("sbx".to_string(), "s-old".to_string(), tx_old, shutdown_tx);
+
+        // Supersede with a new session — register must fire the old session's
+        // shutdown signal so its task can exit and drop its tx clone.
+        let superseded = registry.register(
+            "sbx".to_string(),
+            "s-new".to_string(),
+            tx_new,
+            make_shutdown(),
+        );
+        assert!(superseded, "second register should report supersede");
+
+        // The old session's shutdown receiver must now resolve.
+        shutdown_rx
+            .await
+            .expect("shutdown signal should arrive at superseded session");
+    }
+
+    #[tokio::test]
+    async fn replay_pending_relays_reissues_open_to_superseding_session() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx_old, mut rx_old) = mpsc::channel::<GatewayMessage>(4);
+        let (tx_new, mut rx_new) = mpsc::channel::<GatewayMessage>(4);
+
+        registry.register(
+            "sbx".to_string(),
+            "s-old".to_string(),
+            tx_old,
+            make_shutdown(),
+        );
+
+        let (channel_id, _relay_rx) = registry
+            .open_relay("sbx", Duration::from_secs(1))
+            .await
+            .expect("open_relay should succeed");
+
+        let original = rx_old
+            .recv()
+            .await
+            .expect("old session should receive initial RelayOpen");
+        assert!(matches!(
+            original.payload,
+            Some(gateway_message::Payload::RelayOpen(_))
+        ));
+
+        let superseded = registry.register(
+            "sbx".to_string(),
+            "s-new".to_string(),
+            tx_new,
+            make_shutdown(),
+        );
+        assert!(superseded);
+
+        registry
+            .replay_pending_relays("sbx", &registry.lookup_session("sbx").unwrap())
+            .await;
+
+        let replayed = rx_new
+            .recv()
+            .await
+            .expect("new session should receive replayed RelayOpen");
+        match replayed.payload {
+            Some(gateway_message::Payload::RelayOpen(open)) => {
+                assert_eq!(open.channel_id, channel_id);
+            }
+            other => panic!("expected RelayOpen on replay, got {other:?}"),
         }
     }
 

@@ -35,6 +35,39 @@ fn redact_token(token: &str) -> String {
 /// Maximum concurrent SSH tunnel connections per sandbox.
 const MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
 
+fn acquire_connection_slots(
+    token_counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    sandbox_counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    token: &str,
+    sandbox_id: &str,
+) -> Result<(), ConnectionLimit> {
+    {
+        let mut counts = token_counts.lock().unwrap();
+        let count = counts.entry(token.to_string()).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_TOKEN {
+            return Err(ConnectionLimit::PerToken);
+        }
+        *count += 1;
+    }
+
+    {
+        let mut counts = sandbox_counts.lock().unwrap();
+        let count = counts.entry(sandbox_id.to_string()).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_SANDBOX {
+            decrement_connection_count(token_counts, token);
+            return Err(ConnectionLimit::PerSandbox);
+        }
+        *count += 1;
+    }
+
+    Ok(())
+}
+
+enum ConnectionLimit {
+    PerToken,
+    PerSandbox,
+}
+
 pub fn router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/connect/ssh", any(ssh_connect))
@@ -95,6 +128,26 @@ async fn ssh_connect(
         return StatusCode::PRECONDITION_FAILED.into_response();
     }
 
+    // Enforce connection caps *before* opening a relay — otherwise denied
+    // calls churn pending relay slots and wake the supervisor until the relay
+    // timeout elapses.
+    if let Err(limit) = acquire_connection_slots(
+        &state.ssh_connections_by_token,
+        &state.ssh_connections_by_sandbox,
+        &token,
+        &sandbox_id,
+    ) {
+        match limit {
+            ConnectionLimit::PerToken => {
+                warn!(token = %redact_token(&token), "SSH tunnel: per-token connection limit reached");
+            }
+            ConnectionLimit::PerSandbox => {
+                warn!(sandbox_id = %sandbox_id, "SSH tunnel: per-sandbox connection limit reached");
+            }
+        }
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+
     // Open a relay channel through the supervisor session. Use a generous
     // 30s session-wait timeout because `/connect/ssh` is typically called
     // immediately after `sandbox create`, so we need to cover the supervisor's
@@ -108,39 +161,11 @@ async fn ssh_connect(
         Ok(pair) => pair,
         Err(status) => {
             warn!(sandbox_id = %sandbox_id, error = %status.message(), "SSH tunnel: supervisor session not available");
+            decrement_connection_count(&state.ssh_connections_by_token, &token);
+            decrement_connection_count(&state.ssh_connections_by_sandbox, &sandbox_id);
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
-
-    // Enforce per-token concurrent connection limit.
-    {
-        let mut counts = state.ssh_connections_by_token.lock().unwrap();
-        let count = counts.entry(token.clone()).or_insert(0);
-        if *count >= MAX_CONNECTIONS_PER_TOKEN {
-            warn!(token = %redact_token(&token), "SSH tunnel: per-token connection limit reached");
-            return StatusCode::TOO_MANY_REQUESTS.into_response();
-        }
-        *count += 1;
-    }
-
-    // Enforce per-sandbox concurrent connection limit.
-    {
-        let mut counts = state.ssh_connections_by_sandbox.lock().unwrap();
-        let count = counts.entry(sandbox_id.clone()).or_insert(0);
-        if *count >= MAX_CONNECTIONS_PER_SANDBOX {
-            // Roll back the per-token increment.
-            let mut token_counts = state.ssh_connections_by_token.lock().unwrap();
-            if let Some(c) = token_counts.get_mut(&token) {
-                *c = c.saturating_sub(1);
-                if *c == 0 {
-                    token_counts.remove(&token);
-                }
-            }
-            warn!(sandbox_id = %sandbox_id, "SSH tunnel: per-sandbox connection limit reached");
-            return StatusCode::TOO_MANY_REQUESTS.into_response();
-        }
-        *count += 1;
-    }
 
     let sandbox_id_clone = sandbox_id.clone();
     let token_clone = token.clone();
@@ -364,6 +389,36 @@ mod tests {
             .insert("sbx1".to_string(), MAX_CONNECTIONS_PER_SANDBOX);
         let current = *counts.lock().unwrap().get("sbx1").unwrap();
         assert!(current >= MAX_CONNECTIONS_PER_SANDBOX);
+    }
+
+    #[test]
+    fn acquire_connection_slots_rejects_per_token_limit_without_touching_sandbox() {
+        let token_counts: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::new());
+        let sandbox_counts: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::new());
+        token_counts
+            .lock()
+            .unwrap()
+            .insert("tok1".to_string(), MAX_CONNECTIONS_PER_TOKEN);
+
+        let result = acquire_connection_slots(&token_counts, &sandbox_counts, "tok1", "sbx1");
+
+        assert!(matches!(result, Err(ConnectionLimit::PerToken)));
+        assert!(sandbox_counts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn acquire_connection_slots_rolls_back_token_increment_on_sandbox_limit() {
+        let token_counts: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::new());
+        let sandbox_counts: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::new());
+        sandbox_counts
+            .lock()
+            .unwrap()
+            .insert("sbx1".to_string(), MAX_CONNECTIONS_PER_SANDBOX);
+
+        let result = acquire_connection_slots(&token_counts, &sandbox_counts, "tok1", "sbx1");
+
+        assert!(matches!(result, Err(ConnectionLimit::PerSandbox)));
+        assert!(token_counts.lock().unwrap().is_empty());
     }
 
     // ---- Session reaper tests ----

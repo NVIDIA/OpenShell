@@ -139,6 +139,17 @@ fn relay_close_from_gateway_event(
 /// HTTP/2 frame size so each `RelayFrame::data` fits in one frame.
 const RELAY_CHUNK_SIZE: usize = 16 * 1024;
 
+fn map_stream_message<T>(
+    message: Result<Option<T>, tonic::Status>,
+    eof_error: &'static str,
+) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+    match message {
+        Ok(Some(msg)) => Ok(msg),
+        Ok(None) => Err(eof_error.into()),
+        Err(e) => Err(format!("stream error: {e}").into()),
+    }
+}
+
 /// Spawn the supervisor session task.
 ///
 /// The task runs for the lifetime of the sandbox process, reconnecting with
@@ -216,15 +227,17 @@ async fn run_single_session(
     let mut inbound = response.into_inner();
 
     // Wait for SessionAccepted.
-    let accepted = match inbound.message().await? {
-        Some(msg) => match msg.payload {
-            Some(gateway_message::Payload::SessionAccepted(a)) => a,
-            Some(gateway_message::Payload::SessionRejected(r)) => {
-                return Err(format!("session rejected: {}", r.reason).into());
-            }
-            _ => return Err("expected SessionAccepted or SessionRejected".into()),
-        },
-        None => return Err("stream closed before session accepted".into()),
+    let accepted = match map_stream_message(
+        inbound.message().await,
+        "stream closed before session accepted",
+    )?
+    .payload
+    {
+        Some(gateway_message::Payload::SessionAccepted(a)) => a,
+        Some(gateway_message::Payload::SessionRejected(r)) => {
+            return Err(format!("session rejected: {}", r.reason).into());
+        }
+        _ => return Err("expected SessionAccepted or SessionRejected".into()),
     };
 
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
@@ -244,23 +257,13 @@ async fn run_single_session(
     loop {
         tokio::select! {
             msg = inbound.message() => {
-                match msg {
-                    Ok(Some(msg)) => {
-                        handle_gateway_message(
-                            &msg,
-                            sandbox_id,
-                            ssh_socket_path,
-                            &channel,
-                        );
-                    }
-                    Ok(None) => {
-                        debug!(sandbox_id = %sandbox_id, "supervisor session: gateway closed stream");
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        return Err(format!("stream error: {e}").into());
-                    }
-                }
+                let msg = map_stream_message(msg, "gateway closed stream")?;
+                handle_gateway_message(
+                    &msg,
+                    sandbox_id,
+                    ssh_socket_path,
+                    &channel,
+                );
             }
             _ = heartbeat_interval.tick() => {
                 let hb = SupervisorMessage {
@@ -556,5 +559,12 @@ mod ocsf_event_tests {
         assert_eq!(na.base.severity, SeverityId::Informational);
         let msg = na.base.message.as_deref().unwrap_or_default();
         assert!(msg.contains("sandbox deleted"), "message: {msg}");
+    }
+
+    #[test]
+    fn map_stream_message_treats_eof_as_reconnectable_error() {
+        let err = map_stream_message::<SupervisorMessage>(Ok(None), "gateway closed stream")
+            .expect_err("eof should force reconnect");
+        assert_eq!(err.to_string(), "gateway closed stream");
     }
 }
