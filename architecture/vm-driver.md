@@ -19,38 +19,47 @@ supervisor `pivot_root`s into it before launching the image entrypoint.
 
 ## OCI container execution model
 
-```
-┌───────────────────────────── Host ──────────────────────────────┐
-│                                                                 │
-│  openshell-driver-vm                                            │
-│    └─ OCI manager                                               │
-│        ├─ oci-client: pull manifest, config, layers             │
-│        ├─ flatten layers (apply whiteouts)                      │
-│        ├─ inject sandbox user, /sandbox, /tmp, placeholder etc. │
-│        ├─ build squashfs via mksquashfs (zstd)                  │
-│        └─ cache under  <state>/oci-cache/                       │
-│             blobs/, fs/<digest>.<arch>.squashfs, meta/*.json    │
-│                                                                 │
-│  Per-sandbox state dir                                          │
-│    ├─ sandbox-state.raw     (sparse ext4 upper + workdir)       │
-│    └─ rootfs-console.log                                        │
-│                                                                 │
-│                              ▼ krun_add_disk3 × 2 + set_exec env│
-├─────────────────────────── Guest VM ────────────────────────────┤
-│                                                                 │
-│  /dev/vda = RO base squashfs  ──mount ro──▶ /base               │
-│  /dev/vdb = sandbox-state.raw ──mkfs.ext4─▶ /state              │
-│                                                                 │
-│  overlay (lowerdir=/base, upperdir=/state/upper,                │
-│           workdir=/state/work) ──▶ /state/merged                │
-│  /state/workspace  ──bind──▶ /state/merged/sandbox              │
-│                                                                 │
-│  pivot_root /state/merged  ──▶  supervisor sees overlay as `/`  │
-│                                                                 │
-│  openshell-sandbox --workdir <OCI workdir> -- <OCI argv>        │
-│    └─ policy, Landlock, seccomp, SSH, OCSF logging as usual     │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph host["Host"]
+        driver["openshell-driver-vm"]
+        subgraph oci["OCI manager"]
+            pull["oci-client: pull manifest, config, layers"]
+            flatten["flatten layers (apply whiteouts)"]
+            inject["inject sandbox user, /sandbox, /tmp, /etc stubs"]
+            build["build squashfs via mksquashfs (zstd)"]
+            pull --> flatten --> inject --> build
+        end
+        cache[("&lt;state&gt;/oci-cache/<br/>blobs/, fs/&lt;digest&gt;.&lt;arch&gt;.squashfs,<br/>meta/*.json")]
+        statedir[("Per-sandbox state dir<br/>sandbox-state.raw (ext4 upper + workdir)<br/>rootfs-console.log")]
+        driver --> oci --> cache
+        driver --> statedir
+    end
+
+    driver -- "krun_add_disk3 × 2 + set_exec env" --> guest
+
+    subgraph guest["Guest VM"]
+        direction TB
+        vda["/dev/vda = RO base squashfs"]
+        vdb["/dev/vdb = sandbox-state.raw"]
+        base["/base (ro)"]
+        st["/state (ext4)"]
+        vda -- "mount ro" --> base
+        vdb -- "mkfs.ext4 + mount" --> st
+
+        overlay["/state/merged<br/>overlay(lower=/base, upper=/state/upper,<br/>work=/state/work)"]
+        workspace["/state/workspace<br/>bind-mounted over /sandbox"]
+        base --> overlay
+        st --> overlay
+        st --> workspace
+        workspace --> overlay
+
+        pivot["pivot_root /state/merged<br/>supervisor sees overlay as /"]
+        overlay --> pivot
+
+        supervisor["openshell-sandbox --workdir &lt;OCI workdir&gt; -- &lt;OCI argv&gt;<br/>policy, Landlock, seccomp, SSH, OCSF logging"]
+        pivot --> supervisor
+    end
 ```
 
 ### Host pipeline
@@ -73,36 +82,79 @@ Cache is keyed by `(manifest digest, platform)`. Repeated launches of
 the same image skip pull and rebuild entirely — the driver just attaches
 the cached squashfs to the VM.
 
+```mermaid
+flowchart LR
+    req["CreateSandbox<br/>template.image=&lt;ref&gt;"] --> resolve[effective_image_ref]
+    resolve --> pull["oci-client pull<br/>manifest digest"]
+    pull --> lookup{"cache.lookup(digest, platform)"}
+    lookup -- hit --> attach[attach cached squashfs<br/>+ per-sandbox state disk]
+    lookup -- miss --> layers[fetch layers]
+    layers --> flat[flatten + whiteout]
+    flat --> compat[compat inject]
+    compat --> mksquash[mksquashfs zstd]
+    mksquash --> install[atomic install_fs_image<br/>write metadata]
+    install --> attach
+    attach --> launch[launch microVM]
+```
+
 ### Guest init and pivot
 
 `crates/openshell-driver-vm/scripts/openshell-vm-sandbox-init.sh` is the
 guest's PID 1. OCI mode is gated on `OPENSHELL_OCI_ARGC` being set in
-the guest environ (delivered via libkrun `set_exec`). When set,
-`oci_launch_supervisor`:
+the guest environ (delivered via libkrun `set_exec`).
 
-1. Mounts the RO base device (default `/dev/vda`, overridable via
-   `OPENSHELL_VM_OCI_BASE_DEVICE`) at `/base`.
-2. Formats the state device (`/dev/vdb`) with ext4 on first boot,
-   mounts at `/state`.
-3. Creates `/state/upper`, `/state/work`, `/state/merged`, and
+```mermaid
+flowchart TD
+    boot([PID 1: init boots]) --> mountfs[Mount /proc, /sys, /dev, /tmp, /run]
+    mountfs --> net[Bring up eth0 + DHCP]
+    net --> gate{OPENSHELL_OCI_ARGC set?}
+    gate -- No --> legacy[exec openshell-sandbox --workdir /sandbox<br/>legacy guest-rootfs boot]
+    gate -- Yes --> resolve[Resolve base + state disks<br/>by /sys/block/vd*/serial]
+    resolve --> mntbase[mount -o ro base → /base]
+    mntbase --> fmt{state disk<br/>formatted?}
+    fmt -- No --> mkfs[mkfs.ext4 state disk]
+    fmt -- Yes --> mntstate
+    mkfs --> mntstate[mount state → /state]
+    mntstate --> mkdirs[mkdir /state/upper /state/work<br/>/state/merged /state/workspace]
+    mkdirs --> overlay[mount -t overlay overlay<br/>lowerdir=/base,upperdir=/state/upper,<br/>workdir=/state/work /state/merged]
+    overlay --> bindws[bind-mount /state/workspace<br/>over /state/merged/sandbox]
+    bindws --> resolv[Synthesize /etc/resolv.conf<br/>if image lacks one]
+    resolv --> tls[Copy $OPENSHELL_TLS_CA →<br/>/state/merged/opt/openshell/tls/ca.crt]
+    tls --> copysup[Copy supervisor binary into<br/>/state/merged/opt/openshell/bin/]
+    copysup --> bindps[bind-mount /proc /sys /dev<br/>into /state/merged]
+    bindps --> pivot[pivot_root /state/merged<br/>umount -l /.old_root]
+    pivot --> translate[Translate OPENSHELL_OCI_ENV_* →<br/>OPENSHELL_CONTAINER_ENV_*<br/>set OPENSHELL_CONTAINER_MODE=1]
+    translate --> execsup[exec openshell-sandbox<br/>--workdir $OCI_WORKDIR -- $OCI_ARGV]
+```
+
+`oci_launch_supervisor` steps:
+
+1. Resolves the RO base device (`block_id=oci-base`) and state device
+   (`block_id=sandbox-state`) by walking `/sys/block/vd*/serial`. Falls
+   back to `/dev/vda` / `/dev/vdb` when serial lookup is unavailable;
+   `OPENSHELL_VM_OCI_BASE_DEVICE` / `OPENSHELL_VM_STATE_DEVICE` short-
+   circuit the lookup for tests and operator debugging.
+2. Mounts the RO base at `/base`.
+3. Formats the state device with ext4 on first boot, mounts at `/state`.
+4. Creates `/state/upper`, `/state/work`, `/state/merged`, and
    `/state/workspace`.
-4. Mounts overlay
+5. Mounts overlay
    `lowerdir=/base,upperdir=/state/upper,workdir=/state/work` at
    `/state/merged`.
-5. Bind-mounts `/state/workspace` over the image's `/sandbox` so the
+6. Bind-mounts `/state/workspace` over the image's `/sandbox` so the
    workdir is writable on the state disk.
-6. Synthesizes `/etc/resolv.conf` if the image didn't ship one.
-7. Copies the gateway-issued TLS CA (if `$OPENSHELL_TLS_CA` is set)
+7. Synthesizes `/etc/resolv.conf` if the image didn't ship one.
+8. Copies the gateway-issued TLS CA (if `$OPENSHELL_TLS_CA` is set)
    into `/opt/openshell/tls/ca.crt` inside the overlay so post-pivot
    SSL trust paths stay valid.
-8. Copies the supervisor binary into the upper layer (reaches the state
+9. Copies the supervisor binary into the upper layer (reaches the state
    disk, not the RO base).
-9. Bind-mounts `/proc`, `/sys`, `/dev` into the overlay.
-10. Bind-mounts `/state/merged` onto itself, `pivot_root`s into it, and
+10. Bind-mounts `/proc`, `/sys`, `/dev` into the overlay.
+11. Bind-mounts `/state/merged` onto itself, `pivot_root`s into it, and
     lazy-unmounts the old root.
-11. Translates `OPENSHELL_OCI_ENV_<i>` → `OPENSHELL_CONTAINER_ENV_<i>`,
+12. Translates `OPENSHELL_OCI_ENV_<i>` → `OPENSHELL_CONTAINER_ENV_<i>`,
     sets `OPENSHELL_CONTAINER_MODE=1`, and unsets the OCI source vars.
-12. Reconstructs argv from `OPENSHELL_OCI_ARGV_<i>` and execs
+13. Reconstructs argv from `OPENSHELL_OCI_ARGV_<i>` and execs
     `openshell-sandbox --workdir "$OCI_WORKDIR" -- <argv>`.
 
 ### Supervisor clean-env mode
@@ -128,6 +180,29 @@ unset, the supervisor keeps its historical env-inheritance behavior.
 
 The overlay design replaces an earlier "unpack fresh tar per sandbox"
 model that's still described in the initial plan:
+
+```mermaid
+flowchart TB
+    subgraph shared["Shared (host, per-image)"]
+        base[("&lt;state&gt;/oci-cache/fs/<br/>&lt;digest&gt;.&lt;plat&gt;.squashfs<br/>(read-only, never GC'd per sandbox)")]
+    end
+    subgraph persandbox["Per-sandbox state dir"]
+        raw[("sandbox-state.raw<br/>sparse 16 GiB ext4")]
+        upper["/state/upper<br/>overlay upper"]
+        work["/state/work<br/>overlay workdir"]
+        ws["/state/workspace<br/>bind-mounted over /sandbox"]
+        raw --> upper
+        raw --> work
+        raw --> ws
+    end
+    subgraph view["Sandbox runtime view"]
+        merged["/  (post pivot_root)"]
+    end
+    base -- lowerdir --> merged
+    upper -- upperdir --> merged
+    work -- workdir --> merged
+    ws -- bind /sandbox --> merged
+```
 
 - **Base**: one squashfs per `(manifest digest, platform)`, shared
   across every sandbox that uses the image. Never deleted by the
