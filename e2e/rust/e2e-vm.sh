@@ -2,245 +2,227 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Run the Rust e2e smoke test against an openshell-vm gateway.
+# Run the Rust e2e smoke test against an openshell-gateway running the
+# standalone VM compute driver (`openshell-driver-vm`).
+#
+# Architecture (post supervisor-initiated relay, PR #867):
+#   * The gateway never dials the sandbox. Instead, the in-guest
+#     supervisor opens an outbound `ConnectSupervisor` gRPC stream to
+#     the gateway on startup and keeps it alive for the sandbox
+#     lifetime. SSH (`/connect/ssh`) and `ExecSandbox` traffic ride the
+#     same TCP+TLS+HTTP/2 connection as multiplexed HTTP/2 streams.
+#   * There is no host-side SSH port forward. gvproxy still provides
+#     guest egress so the supervisor can reach the gateway, but it no
+#     longer forwards any TCP port back to the guest.
+#   * Readiness is authoritative on the gateway: a sandbox's phase
+#     flips to `Ready` the moment `ConnectSupervisor` registers, and
+#     back to `Provisioning` when the session drops. The VM driver
+#     only reports `Error` conditions for dead launcher processes.
 #
 # Usage:
-#   mise run e2e:vm                                          # start new named VM on random port
-#   mise run e2e:vm -- --vm-port=30051                       # reuse existing VM on port 30051
-#   mise run e2e:vm -- --vm-port=30051 --vm-name=my-vm       # reuse existing named VM and run exec check
+#   mise run e2e:vm
 #
-# Options:
-#   --vm-port=PORT  Skip VM startup and test against this port.
-#   --vm-name=NAME  VM instance name. Auto-generated for fresh VMs.
+# What the script does:
+#   1. Ensures the VM runtime (libkrun + gvproxy + rootfs) is staged.
+#   2. Builds `openshell-gateway`, `openshell-driver-vm`, and the
+#      `openshell` CLI with the embedded runtime.
+#   3. On macOS, codesigns the VM driver (libkrun needs the
+#      `com.apple.security.hypervisor` entitlement).
+#   4. Starts the gateway with `--drivers vm --disable-tls
+#      --disable-gateway-auth --db-url sqlite::memory:` on a random
+#      free port, waits for `Server listening`, then runs the
+#      cluster-agnostic Rust smoke test.
+#   5. Tears the gateway down and (on failure) preserves the gateway
+#      log and every VM serial console log for post-mortem.
 #
-# When --vm-port is omitted:
-#   1. Picks a random free host port
-#   2. Starts the VM with --name <auto> --port <random>:30051
-#   3. Waits for the VM to fully bootstrap (mTLS certs + gRPC health)
-#   4. Verifies `openshell-vm exec` works
-#   5. Runs the Rust smoke test
-#   6. Tears down the VM
-#
-# When --vm-port is given the script assumes the VM is already running
-# on that port and runs the smoke test. The VM exec check runs only when
-# --vm-name is provided (so the script can target the correct instance).
-#
-# Prerequisites (when starting a new VM): `mise run vm:build` must already
-# be done (the e2e:vm mise task handles this via depends).
+# Prerequisites (handled automatically by this script if missing):
+#   - `mise run vm:setup`             — downloads / builds the libkrun runtime.
+#   - `mise run vm:rootfs -- --base`  — builds the sandbox rootfs tarball.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-RUNTIME_DIR="${ROOT}/target/debug/openshell-vm.runtime"
-GATEWAY_BIN="${ROOT}/target/debug/openshell-vm"
-VM_GATEWAY_IMAGE="${IMAGE_REPO_BASE:-openshell}/gateway:${IMAGE_TAG:-dev}"
-VM_GATEWAY_TAR_REL="var/lib/rancher/k3s/agent/images/openshell-server.tar.zst"
-GUEST_PORT=30051
-TIMEOUT=180
+COMPRESSED_DIR="${ROOT}/target/vm-runtime-compressed"
+GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
+DRIVER_BIN="${ROOT}/target/debug/openshell-driver-vm"
 
-named_vm_rootfs() {
-  local vm_version
+# The VM driver places `compute-driver.sock` under --vm-driver-state-dir.
+# AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
+# in the workspace's `target/` blow the limit on typical developer
+# machines — e.g. a ~100-char `~/.superset/worktrees/.../target/...`
+# prefix plus the `compute-driver.sock` leaf leaves no room. macOS'
+# per-user `$TMPDIR` (`/var/folders/xx/.../T/`) can be 50+ chars too,
+# so root state under `/tmp` unconditionally to keep UDS paths short.
+STATE_DIR_ROOT="/tmp"
 
-  vm_version=$("${GATEWAY_BIN}" --version | awk '{print $2}')
-  printf '%s\n' "${XDG_DATA_HOME:-${HOME}/.local/share}/openshell/openshell-vm/${vm_version}/instances/${VM_NAME}/rootfs"
-}
+# Smoke test timeouts. First boot extracts the embedded libkrun runtime
+# (~60–90MB of zstd per architecture) and the sandbox rootfs (~200MB).
+# The guest then runs k3s-free sandbox supervisor startup; a cold
+# microVM is typically ready within ~15s.
+GATEWAY_READY_TIMEOUT=60
+SANDBOX_PROVISION_TIMEOUT=180
 
-vm_exec() {
-  local rootfs_args=()
-  if [ -n "${VM_ROOTFS_DIR:-}" ]; then
-    rootfs_args=(--rootfs "${VM_ROOTFS_DIR}")
+# ── Build prerequisites ──────────────────────────────────────────────
+
+if [ ! -f "${COMPRESSED_DIR}/rootfs.tar.zst" ]; then
+  echo "==> Building base VM rootfs tarball (mise run vm:rootfs -- --base)"
+  mise run vm:rootfs -- --base
+fi
+
+if [ ! -f "${COMPRESSED_DIR}/rootfs.tar.zst" ] \
+  || ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q .; then
+  echo "==> Preparing embedded VM runtime (mise run vm:setup)"
+  mise run vm:setup
+fi
+
+export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${COMPRESSED_DIR}}"
+
+echo "==> Building openshell-gateway, openshell-driver-vm, openshell (CLI)"
+cargo build \
+  -p openshell-server \
+  -p openshell-driver-vm \
+  -p openshell-cli \
+  --features openshell-core/dev-settings
+
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "==> Codesigning openshell-driver-vm (Hypervisor entitlement)"
+  codesign \
+    --entitlements "${ROOT}/crates/openshell-driver-vm/entitlements.plist" \
+    --force \
+    -s - \
+    "${DRIVER_BIN}"
+fi
+
+# ── Pick a random free host port for the gateway ─────────────────────
+
+HOST_PORT="$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("", 0))
+print(s.getsockname()[1])
+s.close()')"
+
+# Per-run state dir so concurrent e2e runs don't collide on the UDS or
+# sandbox state. The VM driver creates `<state_dir>/compute-driver.sock`
+# and `<state_dir>/sandboxes/<id>/rootfs/` under here. Keep the
+# basename short — see the SUN_LEN comment above.
+RUN_STATE_DIR="${STATE_DIR_ROOT}/os-vm-e2e-${HOST_PORT}-$$"
+mkdir -p "${RUN_STATE_DIR}"
+
+GATEWAY_LOG="$(mktemp /tmp/openshell-gateway-e2e.XXXXXX)"
+
+# ── Cleanup (trap) ───────────────────────────────────────────────────
+
+cleanup() {
+  local exit_code=$?
+
+  if [ -n "${GATEWAY_PID:-}" ] && kill -0 "${GATEWAY_PID}" 2>/dev/null; then
+    echo "Stopping openshell-gateway (pid ${GATEWAY_PID})..."
+    # SIGTERM first; gateway drops ManagedDriverProcess which SIGKILLs
+    # the driver and removes the UDS. Wait briefly, then force-kill.
+    kill -TERM "${GATEWAY_PID}" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "${GATEWAY_PID}" 2>/dev/null || break
+      sleep 0.5
+    done
+    kill -KILL "${GATEWAY_PID}" 2>/dev/null || true
+    wait "${GATEWAY_PID}" 2>/dev/null || true
   fi
-  "${GATEWAY_BIN}" "${rootfs_args[@]}" --name "${VM_NAME}" exec -- "$@"
-}
 
-prepare_named_vm_rootfs() {
-  if [ -z "${VM_NAME}" ]; then
-    return 0
+  # On failure, keep the VM console log for debugging. We deliberately
+  # print it instead of leaving it on disk because the state dir gets
+  # wiped on success.
+  if [ "${exit_code}" -ne 0 ]; then
+    echo "=== gateway log (preserved for debugging) ==="
+    cat "${GATEWAY_LOG}" 2>/dev/null || true
+    echo "=== end gateway log ==="
+
+    local console
+    while IFS= read -r -d '' console; do
+      echo "=== VM console log: ${console} ==="
+      cat "${console}" 2>/dev/null || true
+      echo "=== end VM console log ==="
+    done < <(find "${RUN_STATE_DIR}/sandboxes" -name 'rootfs-console.log' -print0 2>/dev/null)
   fi
 
-  echo "Preparing named VM rootfs '${VM_NAME}'..."
-  VM_ROOTFS_DIR="$("${ROOT}/tasks/scripts/vm/ensure-vm-rootfs.sh" --name "${VM_NAME}" \
-    | tail -n 1 | sed 's/^using openshell-vm rootfs at //')"
-  "${ROOT}/tasks/scripts/vm/sync-vm-rootfs.sh" --name "${VM_NAME}"
-}
-
-refresh_vm_gateway() {
-  if [ -z "${VM_NAME}" ]; then
-    return 0
+  rm -f "${GATEWAY_LOG}" 2>/dev/null || true
+  # Only wipe the per-run state dir on success. On failure, leave it for
+  # post-mortem (serial console logs, gvproxy logs, rootfs dumps).
+  if [ "${exit_code}" -eq 0 ]; then
+    rm -rf "${RUN_STATE_DIR}" 2>/dev/null || true
+  else
+    echo "NOTE: preserving ${RUN_STATE_DIR} for debugging"
   fi
-
-  echo "Refreshing VM gateway StatefulSet image to ${VM_GATEWAY_IMAGE}..."
-  # Re-import the host-synced :dev image into the VM's containerd, then
-  # force a rollout when the StatefulSet already points at the same tag.
-  vm_exec sh -lc "set -eu; \
-    image_tar='/${VM_GATEWAY_TAR_REL}'; \
-    k3s ctr -n k8s.io images import \"\${image_tar}\" >/dev/null; \
-    current_image=\$(kubectl -n openshell get statefulset/openshell -o jsonpath='{.spec.template.spec.containers[?(@.name==\"openshell\")].image}'); \
-    if [ \"\${current_image}\" = \"${VM_GATEWAY_IMAGE}\" ]; then \
-      kubectl -n openshell rollout restart statefulset/openshell >/dev/null; \
-    else \
-      kubectl -n openshell set image statefulset/openshell openshell=${VM_GATEWAY_IMAGE} >/dev/null; \
-    fi; \
-    kubectl -n openshell rollout status statefulset/openshell --timeout=300s"
-  echo "Gateway rollout complete."
 }
+trap cleanup EXIT
 
-wait_for_gateway_health() {
-  local elapsed=0 timeout=60 consecutive_ok=0
+# ── Launch the gateway + VM driver ───────────────────────────────────
 
-  echo "Waiting for refreshed gateway health..."
-  while [ "${elapsed}" -lt "${timeout}" ]; do
-    if "${ROOT}/target/debug/openshell" status >/dev/null 2>&1; then
-      consecutive_ok=$((consecutive_ok + 1))
-      if [ "${consecutive_ok}" -ge 3 ]; then
-        echo "Gateway health confirmed after refresh."
-        return 0
-      fi
-    else
-      consecutive_ok=0
-    fi
+SSH_HANDSHAKE_SECRET="$(openssl rand -hex 32)"
 
-    sleep 2
-    elapsed=$((elapsed + 2))
-  done
+echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STATE_DIR})"
 
-  echo "ERROR: refreshed gateway did not become healthy after ${timeout}s"
-  return 1
-}
+# Pin --driver-dir to the workspace `target/debug/` so we always pick up
+# the driver we just cargo-built. Without this, the gateway's
+# `resolve_compute_driver_bin` fallback prefers
+# `~/.local/libexec/openshell/openshell-driver-vm` when present
+# (install-vm.sh installs there), which silently shadows development
+# builds — a subtle source of stale-binary bugs in e2e runs.
+"${GATEWAY_BIN}" \
+  --drivers vm \
+  --disable-tls \
+  --disable-gateway-auth \
+  --db-url 'sqlite::memory:' \
+  --port "${HOST_PORT}" \
+  --grpc-endpoint "http://127.0.0.1:${HOST_PORT}" \
+  --ssh-handshake-secret "${SSH_HANDSHAKE_SECRET}" \
+  --driver-dir "${ROOT}/target/debug" \
+  --vm-driver-state-dir "${RUN_STATE_DIR}" \
+  >"${GATEWAY_LOG}" 2>&1 &
+GATEWAY_PID=$!
 
-# ── Parse arguments ──────────────────────────────────────────────────
-VM_PORT=""
-VM_NAME=""
-VM_ROOTFS_DIR=""
-for arg in "$@"; do
-  case "$arg" in
-    --vm-port=*) VM_PORT="${arg#--vm-port=}" ;;
-    --vm-name=*) VM_NAME="${arg#--vm-name=}" ;;
-    *) echo "Unknown argument: $arg"; exit 1 ;;
-  esac
+# ── Wait for gateway readiness ───────────────────────────────────────
+#
+# The gateway logs `INFO openshell_server: Server listening
+# address=0.0.0.0:<port>` after its tonic listener is up. That is the
+# only signal the smoke test needs — the VM driver is spawned eagerly
+# but sandboxes are created on demand, so "Server listening" is the
+# right gate here.
+
+echo "==> Waiting for gateway readiness (timeout ${GATEWAY_READY_TIMEOUT}s)"
+elapsed=0
+while ! grep -q 'Server listening' "${GATEWAY_LOG}" 2>/dev/null; do
+  if ! kill -0 "${GATEWAY_PID}" 2>/dev/null; then
+    echo "ERROR: openshell-gateway exited before becoming ready"
+    exit 1
+  fi
+  if [ "${elapsed}" -ge "${GATEWAY_READY_TIMEOUT}" ]; then
+    echo "ERROR: openshell-gateway did not become ready after ${GATEWAY_READY_TIMEOUT}s"
+    exit 1
+  fi
+  sleep 1
+  elapsed=$((elapsed + 1))
 done
 
-# ── Determine mode ───────────────────────────────────────────────────
-if [ -n "${VM_PORT}" ]; then
-  # Point at an already-running VM.
-  HOST_PORT="${VM_PORT}"
-  echo "Using existing VM on port ${HOST_PORT}."
-  if [ -n "${VM_NAME}" ]; then
-    prepare_named_vm_rootfs
-  fi
-else
-  # Pick a random free port and start a new VM.
-  HOST_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
-  if [ -z "${VM_NAME}" ]; then
-    VM_NAME="e2e-${HOST_PORT}-$$"
-  fi
-
-  cleanup() {
-    local exit_code=$?
-    if [ -n "${VM_PID:-}" ] && kill -0 "$VM_PID" 2>/dev/null; then
-      echo "Stopping openshell-vm (pid ${VM_PID})..."
-      kill "$VM_PID" 2>/dev/null || true
-      wait "$VM_PID" 2>/dev/null || true
-    fi
-    # On failure, preserve the VM console log for post-mortem debugging.
-    if [ "$exit_code" -ne 0 ] && [ -n "${VM_NAME:-}" ]; then
-      local console_log
-      console_log="$(named_vm_rootfs)-console.log"
-      if [ -f "$console_log" ]; then
-        echo "=== VM console log (preserved for debugging) ==="
-        cat "$console_log"
-        echo "=== end VM console log ==="
-      fi
-    fi
-    rm -f "${VM_LOG:-}" 2>/dev/null || true
-    if [ -n "${VM_NAME:-}" ]; then
-      rm -rf "$(dirname "$(named_vm_rootfs)")" 2>/dev/null || true
-    fi
-  }
-  trap cleanup EXIT
-
-  prepare_named_vm_rootfs
-
-  echo "Starting openshell-vm '${VM_NAME}' on port ${HOST_PORT}..."
-  if [ "$(uname -s)" = "Darwin" ]; then
-    export DYLD_FALLBACK_LIBRARY_PATH="${RUNTIME_DIR}${DYLD_FALLBACK_LIBRARY_PATH:+:${DYLD_FALLBACK_LIBRARY_PATH}}"
-  fi
-
-  VM_LOG=$(mktemp /tmp/openshell-vm-e2e.XXXXXX)
-  rootfs_args=()
-  if [ -n "${VM_ROOTFS_DIR}" ]; then
-    rootfs_args=(--rootfs "${VM_ROOTFS_DIR}")
-  fi
-  "${GATEWAY_BIN}" "${rootfs_args[@]}" --name "${VM_NAME}" --port "${HOST_PORT}:${GUEST_PORT}" 2>"${VM_LOG}" &
-  VM_PID=$!
-
-  # ── Wait for full bootstrap (mTLS certs + gRPC health) ─────────────
-  # The VM prints "Ready [Xs total]" to stderr after bootstrap_gateway()
-  # stores mTLS certs and wait_for_gateway_ready() confirms the gRPC
-  # service is responding. Waiting only for TCP port reachability (nc -z)
-  # is insufficient because port forwarding is established before the
-  # mTLS certs are written, causing `openshell status` to fail.
-  echo "Waiting for VM bootstrap to complete (timeout ${TIMEOUT}s)..."
-  elapsed=0
-  while ! grep -q "^Ready " "${VM_LOG}" 2>/dev/null; do
-    if ! kill -0 "$VM_PID" 2>/dev/null; then
-      echo "ERROR: openshell-vm exited before becoming ready"
-      echo "VM log:"
-      cat "${VM_LOG}"
-      exit 1
-    fi
-    if [ "$elapsed" -ge "$TIMEOUT" ]; then
-      echo "ERROR: openshell-vm did not become ready after ${TIMEOUT}s"
-      echo "VM log:"
-      cat "${VM_LOG}"
-      exit 1
-    fi
-    sleep 2
-    elapsed=$((elapsed + 2))
-  done
-  echo "Gateway is ready (${elapsed}s)."
-  echo "VM log:"
-  cat "${VM_LOG}"
-fi
-
-# ── Exec into the VM (when instance name is known) ───────────────────
-if [ -n "${VM_NAME}" ]; then
-  echo "Verifying openshell-vm exec for '${VM_NAME}'..."
-  exec_elapsed=0
-  exec_timeout=60
-  until vm_exec /bin/true; do
-    if [ "$exec_elapsed" -ge "$exec_timeout" ]; then
-      echo "ERROR: openshell-vm exec did not become ready after ${exec_timeout}s"
-      exit 1
-    fi
-    sleep 2
-    exec_elapsed=$((exec_elapsed + 2))
-  done
-  echo "VM exec succeeded."
-else
-  echo "Skipping openshell-vm exec check (provide --vm-name for existing VMs)."
-fi
-
-refresh_vm_gateway
+echo "==> Gateway ready after ${elapsed}s"
 
 # ── Run the smoke test ───────────────────────────────────────────────
-# The openshell CLI reads OPENSHELL_GATEWAY_ENDPOINT to connect to the
-# gateway directly, and OPENSHELL_GATEWAY to resolve mTLS certs from
-# ~/.config/openshell/gateways/<name>/mtls/.
-# In the VM, the overlayfs snapshotter re-extracts all image layers on
-# every boot. The 1GB sandbox base image extraction can take >300s
-# under contention, so allow 600s for sandbox provisioning.
-export OPENSHELL_PROVISION_TIMEOUT=600
-export OPENSHELL_GATEWAY_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
-if [ -n "${VM_NAME}" ]; then
-  export OPENSHELL_GATEWAY="openshell-vm-${VM_NAME}"
-else
-  export OPENSHELL_GATEWAY="openshell-vm"
-fi
+#
+# The CLI takes OPENSHELL_GATEWAY_ENDPOINT directly; no gateway
+# metadata lookup needed when TLS is disabled.
 
-echo "Running e2e smoke test (gateway: ${OPENSHELL_GATEWAY}, endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})..."
-cargo build -p openshell-cli --features openshell-core/dev-settings
-wait_for_gateway_health
-cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test smoke -- --nocapture
+export OPENSHELL_GATEWAY_ENDPOINT="http://127.0.0.1:${HOST_PORT}"
 
-echo "Smoke test passed."
+# The VM driver creates each sandbox VM from scratch — the embedded
+# rootfs is extracted per sandbox, and the guest's sandbox supervisor
+# then initializes policy, netns, Landlock, and sshd. On a cold host
+# this is ~15s; allow 180s for slower CI runners.
+export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
+
+echo "==> Running e2e smoke test (endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})"
+cargo test \
+  --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \
+  --features e2e \
+  --test smoke \
+  -- --nocapture
+
+echo "==> Smoke test passed."
