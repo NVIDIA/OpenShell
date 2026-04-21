@@ -18,7 +18,7 @@ use openshell_ocsf::{
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -483,6 +483,8 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
+    let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
+
     // Query allowed_ips from the matched endpoint config (if any).
     // When present, the SSRF check validates resolved IPs against this
     // allowlist instead of blanket-blocking all private IPs.
@@ -499,54 +501,60 @@ async fn handle_tcp_connection(
         // allowed_ips mode: validate resolved IPs against CIDR allowlist.
         // Loopback and link-local are still always blocked.
         match parse_allowed_ips(&raw_allowed_ips) {
-            Ok(nets) => match resolve_and_check_allowed_ips(&host, port, &nets).await {
-                Ok(addrs) => TcpStream::connect(addrs.as_slice())
+            Ok(nets) => {
+                match resolve_and_check_allowed_ips(&host, port, &nets, sandbox_entrypoint_pid)
                     .await
-                    .into_diagnostic()?,
-                Err(reason) => {
-                    {
-                        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                            .activity(ActivityId::Open)
-                            .action(ActionId::Denied)
-                            .disposition(DispositionId::Blocked)
-                            .severity(SeverityId::Medium)
-                            .status(StatusId::Failure)
-                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-                            .actor_process(
-                                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                    .with_cmd_line(&cmdline_str),
-                            )
-                            .firewall_rule("-", "ssrf")
-                            .message(format!(
-                                "CONNECT blocked: allowed_ips check failed for {host_lc}:{port}"
-                            ))
-                            .status_detail(&reason)
-                            .build();
-                        ocsf_emit!(event);
+                {
+                    Ok(addrs) => TcpStream::connect(addrs.as_slice())
+                        .await
+                        .into_diagnostic()?,
+                    Err(reason) => {
+                        {
+                            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                                .activity(ActivityId::Open)
+                                .action(ActionId::Denied)
+                                .disposition(DispositionId::Blocked)
+                                .severity(SeverityId::Medium)
+                                .status(StatusId::Failure)
+                                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                                .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                                .actor_process(
+                                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                        .with_cmd_line(&cmdline_str),
+                                )
+                                .firewall_rule("-", "ssrf")
+                                .message(format!(
+                                    "CONNECT blocked: allowed_ips check failed for {host_lc}:{port}"
+                                ))
+                                .status_detail(&reason)
+                                .build();
+                            ocsf_emit!(event);
+                        }
+                        emit_denial(
+                            &denial_tx,
+                            &host_lc,
+                            port,
+                            &binary_str,
+                            &decision,
+                            &reason,
+                            "ssrf",
+                        );
+                        respond(
+                            &mut client,
+                            &build_json_error_response(
+                                403,
+                                "Forbidden",
+                                "ssrf_denied",
+                                &format!(
+                                    "CONNECT {host_lc}:{port} blocked: allowed_ips check failed"
+                                ),
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
                     }
-                    emit_denial(
-                        &denial_tx,
-                        &host_lc,
-                        port,
-                        &binary_str,
-                        &decision,
-                        &reason,
-                        "ssrf",
-                    );
-                    respond(
-                        &mut client,
-                        &build_json_error_response(
-                            403,
-                            "Forbidden",
-                            "ssrf_denied",
-                            &format!("CONNECT {host_lc}:{port} blocked: allowed_ips check failed"),
-                        ),
-                    )
-                    .await?;
-                    return Ok(());
                 }
-            },
+            }
             Err(reason) => {
                 {
                     let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
@@ -593,7 +601,7 @@ async fn handle_tcp_connection(
         }
     } else {
         // Default: reject all internal IPs (loopback, RFC 1918, link-local).
-        match resolve_and_reject_internal(&host, port).await {
+        match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
             Ok(addrs) => TcpStream::connect(addrs.as_slice())
                 .await
                 .into_diagnostic()?,
@@ -1575,7 +1583,8 @@ fn query_tls_mode(
 /// — synthesizing an `allowed_ips` entry for them would be silently
 /// un-enforceable at runtime.
 fn implicit_allowed_ips_for_ip_host(host: &str) -> Vec<String> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    let lookup_host = normalize_host_lookup_key(host);
+    if let Ok(ip) = lookup_host.parse::<IpAddr>() {
         if is_always_blocked_ip(ip) {
             warn!(
                 host,
@@ -1585,32 +1594,137 @@ fn implicit_allowed_ips_for_ip_host(host: &str) -> Vec<String> {
             );
             return vec![];
         }
-        vec![host.to_string()]
+        vec![lookup_host.to_string()]
     } else {
         vec![]
     }
 }
 
-/// Resolve DNS for a host:port and reject if any resolved address is internal.
-///
-/// Returns the resolved `SocketAddr` list on success. Returns an error string
-/// if any resolved IP is in an internal range or if DNS resolution fails.
-async fn resolve_and_reject_internal(
+fn normalize_host_lookup_key(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|trimmed| trimmed.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+fn resolve_ip_literal(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    normalize_host_lookup_key(host)
+        .parse::<IpAddr>()
+        .ok()
+        .map(|ip| vec![SocketAddr::new(ip, port)])
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_hosts_file_for_host(contents: &str, host: &str) -> Vec<IpAddr> {
+    let lookup_host = normalize_host_lookup_key(host);
+    let mut addrs = Vec::new();
+
+    for raw_line in contents.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let mut fields = line.split_whitespace();
+        let Some(ip_str) = fields.next() else {
+            continue;
+        };
+        let Ok(ip) = ip_str.parse::<IpAddr>() else {
+            continue;
+        };
+
+        if fields.any(|alias| alias.eq_ignore_ascii_case(lookup_host)) && !addrs.contains(&ip) {
+            addrs.push(ip);
+        }
+    }
+
+    addrs
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn resolve_from_hosts_file_contents(contents: &str, host: &str, port: u16) -> Vec<SocketAddr> {
+    parse_hosts_file_for_host(contents, host)
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+async fn resolve_from_sandbox_hosts(
     host: &str,
     port: u16,
+    entrypoint_pid: u32,
+) -> Option<Vec<SocketAddr>> {
+    if entrypoint_pid == 0 {
+        return None;
+    }
+
+    let hosts_path = format!("/proc/{entrypoint_pid}/root/etc/hosts");
+    let contents = match tokio::fs::read_to_string(&hosts_path).await {
+        Ok(contents) => contents,
+        Err(error) => {
+            debug!(
+                pid = entrypoint_pid,
+                path = %hosts_path,
+                host,
+                "Falling back to DNS; failed to read sandbox hosts file: {error}"
+            );
+            return None;
+        }
+    };
+
+    let addrs = resolve_from_hosts_file_contents(&contents, host, port);
+    if addrs.is_empty() { None } else { Some(addrs) }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn resolve_from_sandbox_hosts(
+    _host: &str,
+    _port: u16,
+    _entrypoint_pid: u32,
+) -> Option<Vec<SocketAddr>> {
+    None
+}
+
+async fn resolve_socket_addrs(
+    host: &str,
+    port: u16,
+    entrypoint_pid: u32,
 ) -> std::result::Result<Vec<SocketAddr>, String> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+    if let Some(addrs) = resolve_ip_literal(host, port) {
+        return Ok(addrs);
+    }
+
+    if let Some(addrs) = resolve_from_sandbox_hosts(host, port, entrypoint_pid).await {
+        return Ok(addrs);
+    }
+
+    let lookup_host = normalize_host_lookup_key(host);
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((lookup_host, port))
         .await
-        .map_err(|e| format!("DNS resolution failed for {host}:{port}: {e}"))?
+        .map_err(|e| format!("DNS resolution failed for {lookup_host}:{port}: {e}"))?
         .collect();
 
     if addrs.is_empty() {
         return Err(format!(
-            "DNS resolution returned no addresses for {host}:{port}"
+            "DNS resolution returned no addresses for {lookup_host}:{port}"
         ));
     }
 
-    for addr in &addrs {
+    Ok(addrs)
+}
+
+fn reject_internal_resolved_addrs(
+    host: &str,
+    addrs: &[SocketAddr],
+) -> std::result::Result<(), String> {
+    if addrs.is_empty() {
+        return Err(format!(
+            "DNS resolution returned no addresses for {}",
+            normalize_host_lookup_key(host)
+        ));
+    }
+
+    for addr in addrs {
         if is_internal_ip(addr.ip()) {
             return Err(format!(
                 "{host} resolves to internal address {}, connection rejected",
@@ -1619,29 +1733,19 @@ async fn resolve_and_reject_internal(
         }
     }
 
-    Ok(addrs)
+    Ok(())
 }
 
-/// Resolve DNS and validate resolved addresses against a CIDR/IP allowlist.
-///
-/// Rejects loopback and link-local unconditionally. For all other resolved
-/// addresses, checks that each one matches at least one entry in `allowed_ips`.
-/// Entries can be CIDR notation ("10.0.5.0/24") or exact IPs ("10.0.5.20").
-///
-/// Returns the resolved `SocketAddr` list on success.
-async fn resolve_and_check_allowed_ips(
+fn validate_allowed_ips_for_resolved_addrs(
     host: &str,
     port: u16,
+    addrs: &[SocketAddr],
     allowed_ips: &[ipnet::IpNet],
-) -> std::result::Result<Vec<SocketAddr>, String> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| format!("DNS resolution failed for {host}:{port}: {e}"))?
-        .collect();
-
+) -> std::result::Result<(), String> {
     if addrs.is_empty() {
         return Err(format!(
-            "DNS resolution returned no addresses for {host}:{port}"
+            "DNS resolution returned no addresses for {}",
+            normalize_host_lookup_key(host)
         ));
     }
 
@@ -1652,7 +1756,7 @@ async fn resolve_and_check_allowed_ips(
         ));
     }
 
-    for addr in &addrs {
+    for addr in addrs {
         // Always block loopback and link-local
         if is_always_blocked_ip(addr.ip()) {
             return Err(format!(
@@ -1671,6 +1775,40 @@ async fn resolve_and_check_allowed_ips(
         }
     }
 
+    Ok(())
+}
+
+/// Resolve a host:port using sandbox `/etc/hosts` first (when available), then
+/// reject if any resolved address is internal.
+///
+/// Returns the resolved `SocketAddr` list on success. Returns an error string
+/// if any resolved IP is in an internal range or if DNS resolution fails.
+async fn resolve_and_reject_internal(
+    host: &str,
+    port: u16,
+    entrypoint_pid: u32,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
+    reject_internal_resolved_addrs(host, &addrs)?;
+    Ok(addrs)
+}
+
+/// Resolve a host:port using sandbox `/etc/hosts` first (when available), then
+/// validate resolved addresses against a CIDR/IP allowlist.
+///
+/// Rejects loopback and link-local unconditionally. For all other resolved
+/// addresses, checks that each one matches at least one entry in `allowed_ips`.
+/// Entries can be CIDR notation ("10.0.5.0/24") or exact IPs ("10.0.5.20").
+///
+/// Returns the resolved `SocketAddr` list on success.
+async fn resolve_and_check_allowed_ips(
+    host: &str,
+    port: u16,
+    allowed_ips: &[ipnet::IpNet],
+    entrypoint_pid: u32,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
+    validate_allowed_ips_for_resolved_addrs(host, port, &addrs, allowed_ips)?;
     Ok(addrs)
 }
 
@@ -2186,6 +2324,7 @@ async fn handle_forward_proxy(
         }
     };
     let policy_str = matched_policy.as_deref().unwrap_or("-");
+    let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
     // 4b. If the endpoint has L7 config, evaluate the request against
     //     L7 policy.  The forward proxy handles exactly one request per
@@ -2377,14 +2516,18 @@ async fn handle_forward_proxy(
         raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
     }
 
-    let addrs = if !raw_allowed_ips.is_empty() {
-        // allowed_ips mode: validate resolved IPs against CIDR allowlist.
-        match parse_allowed_ips(&raw_allowed_ips) {
-            Ok(nets) => match resolve_and_check_allowed_ips(&host, port, &nets).await {
-                Ok(addrs) => addrs,
-                Err(reason) => {
+    let addrs =
+        if !raw_allowed_ips.is_empty() {
+            // allowed_ips mode: validate resolved IPs against CIDR allowlist.
+            match parse_allowed_ips(&raw_allowed_ips) {
+                Ok(nets) => {
+                    match resolve_and_check_allowed_ips(&host, port, &nets, sandbox_entrypoint_pid)
+                        .await
                     {
-                        let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                        Ok(addrs) => addrs,
+                        Err(reason) => {
+                            {
+                                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                             .activity(ActivityId::Other)
                             .action(ActionId::Denied)
                             .disposition(DispositionId::Blocked)
@@ -2406,18 +2549,18 @@ async fn handle_forward_proxy(
                             ))
                             .status_detail(&reason)
                             .build();
-                        ocsf_emit!(event);
-                    }
-                    emit_denial_simple(
-                        denial_tx,
-                        &host_lc,
-                        port,
-                        &binary_str,
-                        &decision,
-                        &reason,
-                        "ssrf",
-                    );
-                    respond(
+                                ocsf_emit!(event);
+                            }
+                            emit_denial_simple(
+                                denial_tx,
+                                &host_lc,
+                                port,
+                                &binary_str,
+                                &decision,
+                                &reason,
+                                "ssrf",
+                            );
+                            respond(
                         client,
                         &build_json_error_response(
                             403,
@@ -2427,12 +2570,13 @@ async fn handle_forward_proxy(
                         ),
                     )
                     .await?;
-                    return Ok(());
+                            return Ok(());
+                        }
+                    }
                 }
-            },
-            Err(reason) => {
-                {
-                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                Err(reason) => {
+                    {
+                        let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                         .activity(ActivityId::Other)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
@@ -2454,39 +2598,39 @@ async fn handle_forward_proxy(
                         ))
                         .status_detail(&reason)
                         .build();
-                    ocsf_emit!(event);
-                }
-                emit_denial_simple(
-                    denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
-                respond(
-                    client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "ssrf_denied",
-                        &format!(
-                            "{method} {host_lc}:{port} blocked: invalid allowed_ips in policy"
+                        ocsf_emit!(event);
+                    }
+                    emit_denial_simple(
+                        denial_tx,
+                        &host_lc,
+                        port,
+                        &binary_str,
+                        &decision,
+                        &reason,
+                        "ssrf",
+                    );
+                    respond(
+                        client,
+                        &build_json_error_response(
+                            403,
+                            "Forbidden",
+                            "ssrf_denied",
+                            &format!(
+                                "{method} {host_lc}:{port} blocked: invalid allowed_ips in policy"
+                            ),
                         ),
-                    ),
-                )
-                .await?;
-                return Ok(());
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
-        }
-    } else {
-        // No allowed_ips: reject internal IPs, allow public IPs through.
-        match resolve_and_reject_internal(&host, port).await {
-            Ok(addrs) => addrs,
-            Err(reason) => {
-                {
-                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+        } else {
+            // No allowed_ips: reject internal IPs, allow public IPs through.
+            match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
+                Ok(addrs) => addrs,
+                Err(reason) => {
+                    {
+                        let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                         .activity(ActivityId::Other)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
@@ -2508,31 +2652,31 @@ async fn handle_forward_proxy(
                         ))
                         .status_detail(&reason)
                         .build();
-                    ocsf_emit!(event);
+                        ocsf_emit!(event);
+                    }
+                    emit_denial_simple(
+                        denial_tx,
+                        &host_lc,
+                        port,
+                        &binary_str,
+                        &decision,
+                        &reason,
+                        "ssrf",
+                    );
+                    respond(
+                        client,
+                        &build_json_error_response(
+                            403,
+                            "Forbidden",
+                            "ssrf_denied",
+                            &format!("{method} {host_lc}:{port} blocked: internal address"),
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
                 }
-                emit_denial_simple(
-                    denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
-                respond(
-                    client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "ssrf_denied",
-                        &format!("{method} {host_lc}:{port} blocked: internal address"),
-                    ),
-                )
-                .await?;
-                return Ok(());
             }
-        }
-    };
+        };
 
     // 6. Connect upstream
     let mut upstream = match TcpStream::connect(addrs.as_slice()).await {
@@ -2687,7 +2831,7 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     // -- is_internal_ip: IPv4 --
 
@@ -2845,9 +2989,93 @@ mod tests {
 
     // -- resolve_and_reject_internal --
 
+    #[test]
+    fn test_parse_hosts_file_for_host_handles_comments_invalid_rows_and_case() {
+        let contents = r#"
+            # comment
+            192.168.1.105 searxng.local searxng
+            bad-ip ignored.local
+            93.184.216.34 Example.Local # trailing comment
+            ::1 loopback.local
+            192.168.1.105 searxng.local
+        "#;
+
+        let result = parse_hosts_file_for_host(contents, "SEARXNG.LOCAL");
+        assert_eq!(result, vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 105))]);
+
+        let public = parse_hosts_file_for_host(contents, "example.local");
+        assert_eq!(public, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+    }
+
+    #[test]
+    fn test_resolve_from_hosts_file_contents_requires_exact_alias_match() {
+        let contents = "192.168.1.105 searxng.local\n";
+
+        assert!(
+            resolve_from_hosts_file_contents(contents, "searxng", 8080).is_empty(),
+            "partial alias match should not resolve"
+        );
+
+        let result = resolve_from_hosts_file_contents(contents, "searxng.local", 8080);
+        assert_eq!(
+            result,
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 105)),
+                8080
+            )]
+        );
+    }
+
+    #[test]
+    fn test_resolve_from_hosts_file_contents_public_ip_passes_default_ssrf_check() {
+        let addrs =
+            resolve_from_hosts_file_contents("93.184.216.34 example.local\n", "example.local", 80);
+        assert!(reject_internal_resolved_addrs("example.local", &addrs).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_from_hosts_file_contents_private_ip_requires_allowed_ips() {
+        let addrs = resolve_from_hosts_file_contents(
+            "192.168.1.105 searxng.local\n",
+            "searxng.local",
+            8080,
+        );
+
+        let err = reject_internal_resolved_addrs("searxng.local", &addrs).unwrap_err();
+        assert!(
+            err.contains("internal address"),
+            "expected private hosts-file resolution to remain blocked: {err}"
+        );
+
+        let nets = parse_allowed_ips(&["192.168.1.105/32".to_string()]).unwrap();
+        assert!(
+            validate_allowed_ips_for_resolved_addrs("searxng.local", 8080, &addrs, &nets).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_resolve_from_hosts_file_contents_always_blocked_ip_stays_blocked() {
+        let addrs =
+            resolve_from_hosts_file_contents("127.0.0.1 loopback.local\n", "loopback.local", 80);
+        let nets = vec!["127.0.0.0/8".parse::<ipnet::IpNet>().unwrap()];
+        let err = validate_allowed_ips_for_resolved_addrs("loopback.local", 80, &addrs, &nets)
+            .unwrap_err();
+        assert!(
+            err.contains("always-blocked"),
+            "expected always-blocked hosts-file resolution to stay blocked: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_from_hosts_file_contents_returns_empty_without_match() {
+        let result =
+            resolve_from_hosts_file_contents("192.168.1.105 searxng.local\n", "missing.local", 80);
+        assert!(result.is_empty());
+    }
+
     #[tokio::test]
     async fn test_rejects_localhost_resolution() {
-        let result = resolve_and_reject_internal("localhost", 80).await;
+        let result = resolve_and_reject_internal("localhost", 80, 0).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -2858,7 +3086,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rejects_loopback_ip_literal() {
-        let result = resolve_and_reject_internal("127.0.0.1", 443).await;
+        let result = resolve_and_reject_internal("127.0.0.1", 443, 0).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -2869,7 +3097,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rejects_metadata_ip() {
-        let result = resolve_and_reject_internal("169.254.169.254", 80).await;
+        let result = resolve_and_reject_internal("169.254.169.254", 80, 0).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -2880,7 +3108,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dns_failure_returns_error() {
-        let result = resolve_and_reject_internal("this-host-does-not-exist.invalid", 80).await;
+        let result = resolve_and_reject_internal("this-host-does-not-exist.invalid", 80, 0).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -3222,7 +3450,7 @@ mod tests {
     async fn test_resolve_check_allowed_ips_blocks_loopback() {
         // Construct nets directly (parse_allowed_ips now rejects always-blocked).
         let nets = vec!["127.0.0.0/8".parse::<ipnet::IpNet>().unwrap()];
-        let result = resolve_and_check_allowed_ips("127.0.0.1", 80, &nets).await;
+        let result = resolve_and_check_allowed_ips("127.0.0.1", 80, &nets, 0).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -3235,7 +3463,7 @@ mod tests {
     async fn test_resolve_check_allowed_ips_blocks_metadata() {
         // Construct nets directly (parse_allowed_ips now rejects always-blocked).
         let nets = vec!["169.254.0.0/16".parse::<ipnet::IpNet>().unwrap()];
-        let result = resolve_and_check_allowed_ips("169.254.169.254", 80, &nets).await;
+        let result = resolve_and_check_allowed_ips("169.254.169.254", 80, &nets, 0).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -3248,7 +3476,7 @@ mod tests {
     async fn test_resolve_check_allowed_ips_blocks_unspecified() {
         // Construct nets directly (parse_allowed_ips now rejects always-blocked).
         let nets = vec!["0.0.0.0/0".parse::<ipnet::IpNet>().unwrap()];
-        let result = resolve_and_check_allowed_ips("0.0.0.0", 80, &nets).await;
+        let result = resolve_and_check_allowed_ips("0.0.0.0", 80, &nets, 0).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -3261,7 +3489,7 @@ mod tests {
     async fn test_resolve_check_allowed_ips_rejects_outside_allowlist() {
         // 8.8.8.8 resolves to a public IP which is NOT in 10.0.0.0/8
         let nets = parse_allowed_ips(&["10.0.0.0/8".to_string()]).unwrap();
-        let result = resolve_and_check_allowed_ips("dns.google", 443, &nets).await;
+        let result = resolve_and_check_allowed_ips("dns.google", 443, &nets, 0).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -3277,17 +3505,17 @@ mod tests {
         // Use a public CIDR (parse_allowed_ips now rejects 0.0.0.0/0).
         let nets = parse_allowed_ips(&["8.8.8.0/24".to_string()]).unwrap();
         // K8s API server port
-        let result = resolve_and_check_allowed_ips("8.8.8.8", 6443, &nets).await;
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 6443, &nets, 0).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("blocked control-plane port"));
 
         // etcd client port
-        let result = resolve_and_check_allowed_ips("8.8.8.8", 2379, &nets).await;
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 2379, &nets, 0).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("blocked control-plane port"));
 
         // kubelet API port
-        let result = resolve_and_check_allowed_ips("8.8.8.8", 10250, &nets).await;
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 10250, &nets, 0).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("blocked control-plane port"));
     }
@@ -3296,7 +3524,7 @@ mod tests {
     async fn test_resolve_check_allowed_ips_allows_non_control_plane_ports() {
         // Port 443 should not be blocked by the control-plane port list
         let nets = parse_allowed_ips(&["8.8.8.0/24".to_string()]).unwrap();
-        let result = resolve_and_check_allowed_ips("8.8.8.8", 443, &nets).await;
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 443, &nets, 0).await;
         assert!(result.is_ok());
     }
 
@@ -3624,7 +3852,7 @@ mod tests {
     async fn test_forward_public_ip_allowed_without_allowed_ips() {
         // Public IPs (e.g. dns.google -> 8.8.8.8) should pass through
         // resolve_and_reject_internal without needing allowed_ips.
-        let result = resolve_and_reject_internal("dns.google", 80).await;
+        let result = resolve_and_reject_internal("dns.google", 80, 0).await;
         assert!(
             result.is_ok(),
             "Public IP should be allowed without allowed_ips: {result:?}"
@@ -3644,7 +3872,7 @@ mod tests {
     #[tokio::test]
     async fn test_forward_private_ip_rejected_without_allowed_ips() {
         // Private IP literals should be rejected by resolve_and_reject_internal.
-        let result = resolve_and_reject_internal("10.0.0.1", 80).await;
+        let result = resolve_and_reject_internal("10.0.0.1", 80, 0).await;
         assert!(
             result.is_err(),
             "Private IP should be rejected without allowed_ips"
@@ -3660,7 +3888,7 @@ mod tests {
     async fn test_forward_private_ip_accepted_with_allowed_ips() {
         // Private IP with matching allowed_ips should pass through.
         let nets = parse_allowed_ips(&["10.0.0.0/8".to_string()]).unwrap();
-        let result = resolve_and_check_allowed_ips("10.0.0.1", 80, &nets).await;
+        let result = resolve_and_check_allowed_ips("10.0.0.1", 80, &nets, 0).await;
         assert!(
             result.is_ok(),
             "Private IP with matching allowed_ips should be accepted: {result:?}"
@@ -3671,7 +3899,7 @@ mod tests {
     async fn test_forward_private_ip_rejected_with_wrong_allowed_ips() {
         // Private IP not in allowed_ips should be rejected.
         let nets = parse_allowed_ips(&["192.168.0.0/16".to_string()]).unwrap();
-        let result = resolve_and_check_allowed_ips("10.0.0.1", 80, &nets).await;
+        let result = resolve_and_check_allowed_ips("10.0.0.1", 80, &nets, 0).await;
         assert!(
             result.is_err(),
             "Private IP not in allowed_ips should be rejected"
@@ -3688,7 +3916,7 @@ mod tests {
         // Loopback addresses are always blocked, even if in allowed_ips.
         // Construct nets directly (parse_allowed_ips now rejects always-blocked).
         let nets = vec!["127.0.0.0/8".parse::<ipnet::IpNet>().unwrap()];
-        let result = resolve_and_check_allowed_ips("127.0.0.1", 80, &nets).await;
+        let result = resolve_and_check_allowed_ips("127.0.0.1", 80, &nets, 0).await;
         assert!(result.is_err(), "Loopback should be always blocked");
         let err = result.unwrap_err();
         assert!(
@@ -3702,7 +3930,7 @@ mod tests {
         // Link-local / cloud metadata addresses are always blocked.
         // Construct nets directly (parse_allowed_ips now rejects always-blocked).
         let nets = vec!["169.254.0.0/16".parse::<ipnet::IpNet>().unwrap()];
-        let result = resolve_and_check_allowed_ips("169.254.169.254", 80, &nets).await;
+        let result = resolve_and_check_allowed_ips("169.254.169.254", 80, &nets, 0).await;
         assert!(result.is_err(), "Link-local should be always blocked");
         let err = result.unwrap_err();
         assert!(

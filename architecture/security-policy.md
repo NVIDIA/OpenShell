@@ -1104,9 +1104,9 @@ IP classification helpers live in `crates/openshell-core/src/net.rs` and are sha
 
 Runtime resolution and enforcement functions remain in `crates/openshell-sandbox/src/proxy.rs`:
 
-- **`resolve_and_reject_internal(host, port) -> Result<Vec<SocketAddr>, String>`**: Default SSRF check. Resolves DNS via `tokio::net::lookup_host()`, then checks every resolved address against `is_internal_ip()`. If any address is internal, the entire connection is rejected.
+- **`resolve_and_reject_internal(host, port, entrypoint_pid) -> Result<Vec<SocketAddr>, String>`**: Default SSRF check. Resolves the host using the sandbox's `/etc/hosts` first on Linux (via `/proc/<pid>/root/etc/hosts`, which captures Kubernetes `hostAliases`), then falls back to `tokio::net::lookup_host()`. It checks every resolved address against `is_internal_ip()`. If any address is internal, the entire connection is rejected.
 
-- **`resolve_and_check_allowed_ips(host, port, allowed_ips) -> Result<Vec<SocketAddr>, String>`**: Allowlist-based SSRF check. Resolves DNS, rejects any always-blocked IPs, then verifies every resolved address matches at least one entry in the `allowed_ips` list.
+- **`resolve_and_check_allowed_ips(host, port, allowed_ips, entrypoint_pid) -> Result<Vec<SocketAddr>, String>`**: Allowlist-based SSRF check. Resolves the host using the sandbox's `/etc/hosts` first on Linux, rejects any always-blocked IPs, then verifies every resolved address matches at least one entry in the `allowed_ips` list.
 
 - **`parse_allowed_ips(raw) -> Result<Vec<IpNet>, String>`**: Parses CIDR/IP strings into typed `IpNet` values. **Rejects entries at load time** that overlap always-blocked ranges (loopback, link-local, unspecified) via `is_always_blocked_net`. Accepts both CIDR notation (`10.0.5.0/24`) and bare IPs (`10.0.5.20`, treated as `/32`). This prevents confusing UX where an entry is accepted in policy but silently denied at runtime.
 
@@ -1162,6 +1162,8 @@ The `allowed_ips` field on a `NetworkEndpoint` enables controlled access to priv
 
 **Load-time validation**: `parse_allowed_ips` rejects entries that overlap always-blocked ranges with a hard error at policy load time. This catches misconfigurations early — an entry like `127.0.0.0/8` or `0.0.0.0/0` in `allowed_ips` would be silently un-enforceable at runtime, so it is rejected before the policy is applied. The same validation runs in both file mode (sandbox startup) and gRPC mode (live policy updates via `OpaEngine::reload_from_proto`).
 
+**Sandbox `/etc/hosts` and `hostAliases`**: On Linux, the proxy consults the sandbox's `/etc/hosts` before falling back to DNS. This gives policy evaluation the same hostname-to-IP view that sandboxed tools see when Kubernetes `hostAliases` populate `/etc/hosts`. This is resolver input only. It does **not** synthesize `allowed_ips`, and it does not bypass the private-IP SSRF check. If `searxng.local` resolves to `192.168.1.105`, the request still needs `allowed_ips: ["192.168.1.105/32"]` to succeed.
+
 **Implicit `allowed_ips` for IP hosts**: When a policy endpoint has a literal IP address as its host (e.g., `host: 10.0.5.20`), the proxy synthesizes an `allowed_ips` entry automatically via `implicit_allowed_ips_for_ip_host`. If the host is an always-blocked address (e.g., `127.0.0.1`, `169.254.169.254`, `0.0.0.0`), the function returns empty and logs a warning — no `allowed_ips` entry is synthesized, so the standard SSRF rejection applies.
 
 This supports three usage modes:
@@ -1171,6 +1173,23 @@ This supports three usage modes:
 | **Default** | `host` only, no `allowed_ips` | Standard SSRF protection: all private IPs blocked |
 | **Host + allowlist** | `host` + `allowed_ips` | Domain must match `host` AND resolve to an IP in `allowed_ips` |
 | **Hostless allowlist** | `allowed_ips` only (no `host`) | Any domain allowed on the specified `port`, as long as it resolves to an IP in `allowed_ips` |
+
+Example:
+
+```yaml
+network_policies:
+  websearch:
+    name: websearch
+    endpoints:
+      - host: searxng.local
+        port: 8080
+        allowed_ips:
+          - "192.168.1.105/32"
+    binaries:
+      - path: /usr/bin/curl
+```
+
+With a matching sandbox `/etc/hosts` entry such as `192.168.1.105 searxng.local`, this policy works. Without the `allowed_ips` entry, the request stays blocked because the resolved destination is private.
 
 #### `allowed_ips` Format
 

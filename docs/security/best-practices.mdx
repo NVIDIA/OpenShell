@@ -118,9 +118,9 @@ After OPA policy allows a connection, the proxy resolves DNS and rejects connect
 | Aspect | Detail |
 |---|---|
 | Default | The proxy blocks all private IPs. Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), and unspecified (`0.0.0.0`) addresses are always blocked and cannot be overridden with `allowed_ips`. |
-| What you can change | Add `allowed_ips` (CIDR notation) to an endpoint to permit connections to specific private IP ranges. Policies with `allowed_ips` entries that overlap loopback, link-local, or unspecified addresses fail to load with a clear validation error. |
+| What you can change | Add `allowed_ips` (CIDR notation) to an endpoint to permit connections to specific private IP ranges. On Linux, the proxy consults the sandbox's `/etc/hosts` before DNS, so Kubernetes `hostAliases` can make LAN-only hostnames resolvable. Policies with `allowed_ips` entries that overlap loopback, link-local, or unspecified addresses fail to load with a clear validation error. |
 | Risk if relaxed | Without SSRF protection, a misconfigured policy could allow the agent to reach cloud metadata services (`169.254.169.254`), internal databases, or other infrastructure endpoints through DNS rebinding. |
-| Recommendation | Use `allowed_ips` only for known internal services. Scope the CIDR as narrowly as possible (for example, `10.0.5.20/32` for a single host). Loopback, link-local, and unspecified addresses are always blocked regardless of `allowed_ips`. The policy advisor does not propose rules for always-blocked destinations. |
+| Recommendation | Use `allowed_ips` only for known internal services. Scope the CIDR as narrowly as possible (for example, `10.0.5.20/32` for a single host). Loopback, link-local, and unspecified addresses are always blocked regardless of `allowed_ips`. `hostAliases` change resolution, not authorization: `host: searxng.local` with `/etc/hosts` mapping to `192.168.1.105` still needs `allowed_ips: ["192.168.1.105/32"]`. The policy advisor does not propose rules for always-blocked destinations. |
 
 ### Operator Approval
 
