@@ -135,7 +135,7 @@ pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
     std::io::stdin().read_line(&mut input).ok();
     drop(input);
 
-    if let Err(e) = open_browser(&auth_url) {
+    if let Err(e) = open_browser_url(&auth_url) {
         debug!(error = %e, "failed to open browser");
         eprintln!("Could not open browser automatically.");
         eprintln!("Open this URL in your browser:");
@@ -167,7 +167,7 @@ pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
 }
 
 /// Open a URL in the default browser.
-fn open_browser(url: &str) -> std::result::Result<(), String> {
+pub fn open_browser_url(url: &str) -> std::result::Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")

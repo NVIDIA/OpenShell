@@ -12,6 +12,7 @@ pub mod auth;
 pub mod bootstrap;
 pub mod completers;
 pub mod edge_tunnel;
+pub mod oidc_auth;
 pub(crate) mod policy_update;
 pub mod run;
 pub mod ssh;

@@ -22,10 +22,13 @@
 mod auth;
 pub mod cli;
 mod compute;
+mod authz;
 mod grpc;
 mod http;
+pub mod identity;
 mod inference;
 mod multiplex;
+pub mod oidc;
 mod persistence;
 pub(crate) mod policy_store;
 mod sandbox_index;
@@ -95,6 +98,9 @@ pub struct ServerState {
     /// can be constructed before `ServerState` and still
     /// query session state to surface supervisor readiness.
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
+
+    /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
+    pub oidc_cache: Option<Arc<oidc::JwksCache>>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -115,6 +121,7 @@ impl ServerState {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
+        oidc_cache: Option<Arc<oidc::JwksCache>>,
     ) -> Self {
         Self {
             config,
@@ -127,6 +134,7 @@ impl ServerState {
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
+            oidc_cache,
         }
     }
 }
@@ -157,6 +165,25 @@ pub async fn run_server(
 
     let store = Arc::new(Store::connect(database_url).await?);
 
+    let oidc_cache = if let Some(ref oidc) = config.oidc {
+        // Validate RBAC configuration before starting.
+        let policy = authz::AuthzPolicy {
+            admin_role: oidc.admin_role.clone(),
+            user_role: oidc.user_role.clone(),
+        };
+        policy
+            .validate()
+            .map_err(|e| Error::config(e))?;
+
+        let cache = oidc::JwksCache::new(oidc)
+            .await
+            .map_err(|e| Error::config(format!("OIDC initialization failed: {e}")))?;
+        info!("OIDC JWT validation enabled (issuer: {})", oidc.issuer);
+        Some(Arc::new(cache))
+    } else {
+        None
+    };
+
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
     let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
@@ -179,6 +206,7 @@ pub async fn run_server(
         sandbox_watch_bus,
         tracing_log_bus,
         supervisor_sessions,
+        oidc_cache,
     ));
 
     // Resume sandboxes that were stopped during the previous gateway

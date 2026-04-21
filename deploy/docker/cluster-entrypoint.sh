@@ -506,6 +506,23 @@ if [ -f "$HELMCHART" ]; then
         sed -i "s|__DISABLE_GATEWAY_AUTH__|false|g" "$HELMCHART"
     fi
 
+    # OIDC JWT authentication: when OIDC_ISSUER is set, the server validates
+    # Bearer tokens on gRPC requests against the issuer's JWKS endpoint.
+    if [ -n "${OIDC_ISSUER:-}" ]; then
+        echo "Enabling OIDC authentication (issuer: ${OIDC_ISSUER})"
+        sed -i "s|__OIDC_ISSUER__|${OIDC_ISSUER}|g" "$HELMCHART"
+        sed -i "s|__OIDC_AUDIENCE__|${OIDC_AUDIENCE:-openshell-cli}|g" "$HELMCHART"
+        sed -i "s|__OIDC_ROLES_CLAIM__|${OIDC_ROLES_CLAIM:-realm_access.roles}|g" "$HELMCHART"
+        sed -i "s|__OIDC_ADMIN_ROLE__|${OIDC_ADMIN_ROLE:-openshell-admin}|g" "$HELMCHART"
+        sed -i "s|__OIDC_USER_ROLE__|${OIDC_USER_ROLE:-openshell-user}|g" "$HELMCHART"
+    else
+        sed -i "s|__OIDC_ISSUER__||g" "$HELMCHART"
+        sed -i "s|__OIDC_AUDIENCE__|openshell-cli|g" "$HELMCHART"
+        sed -i "s|__OIDC_ROLES_CLAIM__||g" "$HELMCHART"
+        sed -i "s|__OIDC_ADMIN_ROLE__||g" "$HELMCHART"
+        sed -i "s|__OIDC_USER_ROLE__||g" "$HELMCHART"
+    fi
+
     # Disable TLS entirely: the server listens on plaintext HTTP.
     # Used when a reverse proxy / tunnel terminates TLS at the edge.
     if [ "${DISABLE_TLS:-}" = "true" ]; then

@@ -58,6 +58,12 @@ anyhow = { workspace = true }
 # File archiving (tar-over-SSH sync)
 tar = "0.4"
 
+# OIDC/Auth
+sha2 = { workspace = true }
+base64 = { workspace = true }
+hex = "0.4"
+getrandom = { workspace = true }
+
 # WebSocket (Cloudflare tunnel proxy)
 tokio-tungstenite = { workspace = true }
 

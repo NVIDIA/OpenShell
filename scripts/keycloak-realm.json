@@ -1,0 +1,94 @@
+{
+  "realm": "openshell",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": false,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "offlineSessionIdleTimeout": 2592000,
+  "roles": {
+    "realm": [
+      {
+        "name": "openshell-admin",
+        "description": "Full administrative access to OpenShell"
+      },
+      {
+        "name": "openshell-user",
+        "description": "Standard user access to OpenShell"
+      }
+    ]
+  },
+  "defaultRoles": ["openshell-user"],
+  "clients": [
+    {
+      "clientId": "openshell-cli",
+      "name": "OpenShell CLI",
+      "description": "Public client for interactive CLI login (Authorization Code + PKCE)",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["http://127.0.0.1:*", "http://localhost:*"],
+      "webOrigins": ["http://127.0.0.1:*", "http://localhost:*"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocol": "openid-connect",
+      "fullScopeAllowed": true
+    },
+    {
+      "clientId": "openshell-ci",
+      "name": "OpenShell CI",
+      "description": "Confidential client for CI/automation (Client Credentials grant)",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "ci-test-secret",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "protocol": "openid-connect",
+      "fullScopeAllowed": true
+    }
+  ],
+  "users": [
+    {
+      "username": "admin@test",
+      "email": "admin@test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Admin",
+      "lastName": "User",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "admin",
+          "temporary": false
+        }
+      ],
+      "realmRoles": ["openshell-admin", "openshell-user"]
+    },
+    {
+      "username": "user@test",
+      "email": "user@test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Regular",
+      "lastName": "User",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "user",
+          "temporary": false
+        }
+      ],
+      "realmRoles": ["openshell-user"]
+    }
+  ]
+}

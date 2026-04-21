@@ -14,6 +14,7 @@ use openshell_core::proto::{
     SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, UpdateConfigRequest,
     inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
 
@@ -83,10 +84,37 @@ pub async fn connect_channel_pub(endpoint: &str) -> Result<Channel> {
     connect_channel(endpoint).await
 }
 
-/// Connect to the `OpenShell` server (mTLS or plaintext based on endpoint scheme).
-async fn connect(endpoint: &str) -> Result<OpenShellClient<Channel>> {
+/// Interceptor that injects the sandbox shared secret into every gRPC request.
+///
+/// The server validates this header on sandbox-to-server RPCs (GetSandboxConfig,
+/// GetSandboxProviderEnvironment, etc.) instead of requiring an OIDC Bearer token.
+#[derive(Clone)]
+pub(crate) struct SandboxSecretInterceptor {
+    secret: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+}
+
+impl tonic::service::Interceptor for SandboxSecretInterceptor {
+    fn call(
+        &mut self,
+        mut req: tonic::Request<()>,
+    ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+        if let Some(ref val) = self.secret {
+            req.metadata_mut().insert("x-sandbox-secret", val.clone());
+        }
+        Ok(req)
+    }
+}
+
+type AuthenticatedClient = OpenShellClient<InterceptedService<Channel, SandboxSecretInterceptor>>;
+
+/// Connect to the OpenShell server with sandbox secret authentication.
+async fn connect(endpoint: &str) -> Result<AuthenticatedClient> {
     let channel = connect_channel(endpoint).await?;
-    Ok(OpenShellClient::new(channel))
+    let secret = std::env::var("OPENSHELL_SSH_HANDSHAKE_SECRET")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let interceptor = SandboxSecretInterceptor { secret };
+    Ok(OpenShellClient::with_interceptor(channel, interceptor))
 }
 
 /// Fetch sandbox policy from `OpenShell` server via gRPC.
@@ -106,7 +134,7 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<Pro
 
 /// Fetch sandbox policy using an existing client connection.
 async fn fetch_policy_with_client(
-    client: &mut OpenShellClient<Channel>,
+    client: &mut AuthenticatedClient,
     sandbox_id: &str,
 ) -> Result<Option<ProtoSandboxPolicy>> {
     let response = client
@@ -130,7 +158,7 @@ async fn fetch_policy_with_client(
 
 /// Sync a locally-discovered policy using an existing client connection.
 async fn sync_policy_with_client(
-    client: &mut OpenShellClient<Channel>,
+    client: &mut AuthenticatedClient,
     sandbox: &str,
     policy: &ProtoSandboxPolicy,
 ) -> Result<()> {
@@ -220,7 +248,7 @@ pub async fn fetch_provider_environment(
 /// and status reporting, avoiding per-request TLS handshake overhead.
 #[derive(Clone)]
 pub struct CachedOpenShellClient {
-    client: OpenShellClient<Channel>,
+    client: AuthenticatedClient,
 }
 
 /// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
@@ -239,13 +267,12 @@ pub struct SettingsPollResult {
 impl CachedOpenShellClient {
     pub async fn connect(endpoint: &str) -> Result<Self> {
         debug!(endpoint = %endpoint, "Connecting openshell gRPC client for policy polling");
-        let channel = connect_channel(endpoint).await?;
-        let client = OpenShellClient::new(channel);
+        let client = connect(endpoint).await?;
         Ok(Self { client })
     }
 
     /// Get a clone of the underlying tonic client for direct RPC calls.
-    pub fn raw_client(&self) -> OpenShellClient<Channel> {
+    pub fn raw_client(&self) -> AuthenticatedClient {
         self.client.clone()
     }
 

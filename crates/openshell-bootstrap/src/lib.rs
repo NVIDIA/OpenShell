@@ -4,6 +4,7 @@
 pub mod build;
 pub mod edge_token;
 pub mod errors;
+pub mod oidc_token;
 pub mod image;
 
 pub mod constants;
@@ -123,6 +124,18 @@ pub struct DeployOptions {
     /// When false, an existing gateway is left as-is and deployment is
     /// skipped (the caller is responsible for prompting the user first).
     pub recreate: bool,
+    /// OIDC issuer URL. When set, the server validates Bearer JWTs.
+    pub oidc_issuer: Option<String>,
+    /// OIDC audience for the API resource server. Defaults to "openshell-cli".
+    pub oidc_audience: String,
+    /// OIDC client ID for CLI login. Defaults to "openshell-cli".
+    pub oidc_client_id: String,
+    /// OIDC roles claim path (e.g. "realm_access.roles").
+    pub oidc_roles_claim: Option<String>,
+    /// OIDC admin role name.
+    pub oidc_admin_role: Option<String>,
+    /// OIDC user role name.
+    pub oidc_user_role: Option<String>,
 }
 
 impl DeployOptions {
@@ -139,6 +152,12 @@ impl DeployOptions {
             registry_token: None,
             gpu: vec![],
             recreate: false,
+            oidc_issuer: None,
+            oidc_audience: "openshell-cli".to_string(),
+            oidc_client_id: "openshell-cli".to_string(),
+            oidc_roles_claim: None,
+            oidc_admin_role: None,
+            oidc_user_role: None,
         }
     }
 
@@ -208,6 +227,20 @@ impl DeployOptions {
         self.recreate = recreate;
         self
     }
+
+    /// Set the OIDC issuer URL for JWT-based authentication.
+    #[must_use]
+    pub fn with_oidc_issuer(mut self, issuer: impl Into<String>) -> Self {
+        self.oidc_issuer = Some(issuer.into());
+        self
+    }
+
+    /// Set the OIDC audience (client ID).
+    #[must_use]
+    pub fn with_oidc_audience(mut self, audience: impl Into<String>) -> Self {
+        self.oidc_audience = audience.into();
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +305,12 @@ where
     let registry_token = options.registry_token;
     let gpu = options.gpu;
     let recreate = options.recreate;
+    let oidc_issuer = options.oidc_issuer;
+    let oidc_audience = options.oidc_audience;
+    let oidc_client_id = options.oidc_client_id;
+    let oidc_roles_claim = options.oidc_roles_claim;
+    let oidc_admin_role = options.oidc_admin_role;
+    let oidc_user_role = options.oidc_user_role;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
     // which needs a 'static callback for the bollard streaming pull.
@@ -457,6 +496,11 @@ where
             registry_token.as_deref(),
             &device_ids,
             resume,
+            oidc_issuer.as_deref(),
+            &oidc_audience,
+            oidc_roles_claim.as_deref(),
+            oidc_admin_role.as_deref(),
+            oidc_user_role.as_deref(),
         )
         .await?;
         let port = actual_port;
@@ -558,13 +602,19 @@ where
         }
 
         // Create and store gateway metadata.
-        let metadata = create_gateway_metadata_with_host(
+        let mut metadata = create_gateway_metadata_with_host(
             &name,
             remote_opts.as_ref(),
             port,
             ssh_gateway_host.as_deref(),
             disable_tls,
         );
+        if oidc_issuer.is_some() {
+            metadata.auth_mode = Some("oidc".to_string());
+            metadata.oidc_issuer = oidc_issuer.clone();
+            metadata.oidc_client_id = Some(oidc_client_id.clone());
+            metadata.oidc_audience = Some(oidc_audience.clone());
+        }
         store_gateway_metadata(&name, &metadata)?;
 
         Ok(metadata)

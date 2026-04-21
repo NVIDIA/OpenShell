@@ -79,6 +79,12 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 # Clipboard (OSC 52)
 base64 = "0.22"
 
+# Crypto / Auth
+sha2 = "0.10"
+rand = "0.9"
+jsonwebtoken = "9"
+getrandom = "0.3"
+
 # Filesystem embedding
 include_dir = "0.7"
 

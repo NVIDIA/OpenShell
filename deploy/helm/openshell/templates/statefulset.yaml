@@ -104,6 +104,26 @@ spec:
               value: "true"
             {{- end }}
             {{- end }}
+            {{- if .Values.server.oidc.issuer }}
+            - name: OPENSHELL_OIDC_ISSUER
+              value: {{ .Values.server.oidc.issuer | quote }}
+            - name: OPENSHELL_OIDC_AUDIENCE
+              value: {{ .Values.server.oidc.audience | quote }}
+            - name: OPENSHELL_OIDC_JWKS_TTL
+              value: {{ .Values.server.oidc.jwksTtl | quote }}
+            {{- if .Values.server.oidc.rolesClaim }}
+            - name: OPENSHELL_OIDC_ROLES_CLAIM
+              value: {{ .Values.server.oidc.rolesClaim | quote }}
+            {{- end }}
+            {{- if .Values.server.oidc.adminRole }}
+            - name: OPENSHELL_OIDC_ADMIN_ROLE
+              value: {{ .Values.server.oidc.adminRole | quote }}
+            {{- end }}
+            {{- if .Values.server.oidc.userRole }}
+            - name: OPENSHELL_OIDC_USER_ROLE
+              value: {{ .Values.server.oidc.userRole | quote }}
+            {{- end }}
+            {{- end }}
           volumeMounts:
             - name: openshell-data
               mountPath: /var/openshell

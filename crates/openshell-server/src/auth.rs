@@ -16,9 +16,9 @@
 //! CLI's ephemeral localhost server captures and stores the token.
 
 use axum::{
-    Router,
+    Json, Router,
     extract::{Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::get,
 };
@@ -58,7 +58,23 @@ struct ConnectParams {
 pub fn router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/auth/connect", get(auth_connect))
+        .route("/auth/oidc-config", get(oidc_config_handler))
         .with_state(state)
+}
+
+/// OIDC configuration discovery endpoint.
+///
+/// Returns the OIDC issuer and audience when OIDC is configured on the server,
+/// so CLI clients can auto-discover settings during `gateway add`.
+async fn oidc_config_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    match &state.config.oidc {
+        Some(oidc) => Json(serde_json::json!({
+            "issuer": oidc.issuer,
+            "audience": oidc.audience,
+        }))
+        .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Handle the auth connect request.
