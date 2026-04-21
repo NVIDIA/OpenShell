@@ -68,6 +68,11 @@ pub struct LibKrun {
     pub krun_set_root: KrunSetRoot,
     pub krun_set_workdir: KrunSetWorkdir,
     pub krun_set_exec: KrunSetExec,
+    /// Kept loaded for future use (e.g. exposing sandbox-requested ports
+    /// from the guest via libkrun's built-in port mapper instead of
+    /// gvproxy). Currently unused since all port forwarding is done by
+    /// gvproxy over its API socket.
+    #[allow(dead_code)]
     pub krun_set_port_map: KrunSetPortMap,
     pub krun_set_console_output: KrunSetConsoleOutput,
     pub krun_start_enter: KrunStartEnter,

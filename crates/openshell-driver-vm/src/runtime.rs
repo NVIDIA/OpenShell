@@ -64,10 +64,15 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
     vm.set_root(&config.rootfs)?;
     vm.set_workdir(&config.workdir)?;
 
-    let mut forwarded_port_map = config.port_map.clone();
-    let mut gvproxy_guard = None;
-    let mut gvproxy_api_sock = None;
-    if !config.port_map.is_empty() {
+    // The guest supervisor opens an outbound `ConnectSupervisor` gRPC
+    // stream to the host gateway on startup and keeps it alive for the
+    // sandbox lifetime. Without gvproxy wired up, the VM has no eth0,
+    // loses DHCP, and cannot reach the gateway — so we always start
+    // gvproxy even when the caller doesn't request any explicit port
+    // forwards. (Prior to the supervisor-initiated relay migration the
+    // driver forwarded a host-side SSH port and gvproxy ran incidentally
+    // as a byproduct; that implicit setup is gone now.)
+    let (gvproxy_guard, gvproxy_api_sock, forwarded_port_map) = {
         let gvproxy_binary = runtime_dir.join("gvproxy");
         if !gvproxy_binary.is_file() {
             return Err(format!(
@@ -91,7 +96,6 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
             .map_err(|e| format!("create gvproxy log {}: {e}", gvproxy_log.display()))?;
 
         let gvproxy_ports = plan_gvproxy_ports(&config.port_map)?;
-        forwarded_port_map = gvproxy_ports.forwarded_ports;
 
         #[cfg(target_os = "linux")]
         let (gvproxy_net_flag, gvproxy_net_url) =
@@ -142,13 +146,13 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
             vm.add_net_unixgram(&net_sock, &mac, COMPAT_NET_FEATURES, NET_FLAG_VFKIT)?;
         }
 
-        gvproxy_guard = Some(GvproxyGuard::new(child));
-        gvproxy_api_sock = Some(api_sock);
-    }
+        (
+            Some(GvproxyGuard::new(child)),
+            Some(api_sock),
+            gvproxy_ports.forwarded_ports,
+        )
+    };
 
-    if !config.port_map.is_empty() && gvproxy_api_sock.is_none() {
-        vm.set_port_map(&config.port_map)?;
-    }
     vm.set_console_output(&config.console_output)?;
 
     let env = if config.env.is_empty() {
@@ -396,15 +400,6 @@ impl VmContext {
                 )
             },
             "krun_add_net_unixstream",
-        )
-    }
-
-    fn set_port_map(&self, port_map: &[String]) -> Result<(), String> {
-        let port_strs: Vec<&str> = port_map.iter().map(String::as_str).collect();
-        let (_owners, ptrs) = c_string_array(&port_strs)?;
-        check(
-            unsafe { (self.krun.krun_set_port_map)(self.ctx_id, ptrs.as_ptr()) },
-            "krun_set_port_map",
         )
     }
 

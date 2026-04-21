@@ -403,16 +403,23 @@ impl VmDriver {
         snapshots
     }
 
+    /// Watch the launcher child process and surface errors as driver
+    /// conditions.
+    ///
+    /// The driver no longer owns the `Ready` transition — the gateway
+    /// promotes a sandbox to `Ready` the moment its supervisor session
+    /// lands (see `openshell-server/src/compute/mod.rs`). This loop only
+    /// handles the sad paths: the child process failing to start, exiting
+    /// abnormally, or becoming unpollable. Those still surface as driver
+    /// `Error` conditions so the gateway can reason about a dead VM.
     async fn monitor_sandbox(&self, sandbox_id: String) {
-        let mut ready_emitted = false;
-
         loop {
-            let (process, state_dir) = {
+            let process = {
                 let registry = self.registry.lock().await;
                 let Some(record) = registry.get(&sandbox_id) else {
                     return;
                 };
-                (record.process.clone(), record.state_dir.clone())
+                record.process.clone()
             };
 
             let exit_status = {
@@ -467,16 +474,6 @@ impl VmDriver {
                     platform_event("vm", "Warning", "ProcessExited", message),
                 );
                 return;
-            }
-
-            if !ready_emitted && guest_ssh_ready(&state_dir).await {
-                if let Some(snapshot) = self
-                    .set_snapshot_condition(&sandbox_id, ready_condition(), false)
-                    .await
-                {
-                    self.publish_snapshot(snapshot);
-                }
-                ready_emitted = true;
             }
 
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -843,16 +840,6 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
     }
 }
 
-async fn guest_ssh_ready(state_dir: &Path) -> bool {
-    let console_log = state_dir.join("rootfs-console.log");
-    let Ok(contents) = tokio::fs::read_to_string(console_log).await else {
-        return false;
-    };
-
-    contents.contains("SSH server is ready to accept connections")
-        || contents.contains("SSH server listening")
-}
-
 fn sandbox_snapshot(sandbox: &Sandbox, condition: SandboxCondition, deleting: bool) -> Sandbox {
     Sandbox {
         id: sandbox.id.clone(),
@@ -891,16 +878,6 @@ fn provisioning_condition() -> SandboxCondition {
         status: "False".to_string(),
         reason: "Starting".to_string(),
         message: "VM is starting".to_string(),
-        last_transition_time: String::new(),
-    }
-}
-
-fn ready_condition() -> SandboxCondition {
-    SandboxCondition {
-        r#type: "Ready".to_string(),
-        status: "True".to_string(),
-        reason: "Listening".to_string(),
-        message: "Supervisor is listening for SSH connections".to_string(),
         last_transition_time: String::new(),
     }
 }
@@ -1210,32 +1187,6 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(key_mode, 0o600);
-
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn guest_ssh_ready_detects_guest_console_marker() {
-        let base = unique_temp_dir();
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(
-            base.join("rootfs-console.log"),
-            "...\nINFO openshell_sandbox: SSH server is ready to accept connections\n",
-        )
-        .unwrap();
-
-        assert!(guest_ssh_ready(&base).await);
-
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn guest_ssh_ready_is_false_without_marker() {
-        let base = unique_temp_dir();
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(base.join("rootfs-console.log"), "sandbox booting\n").unwrap();
-
-        assert!(!guest_ssh_ready(&base).await);
 
         let _ = std::fs::remove_dir_all(base);
     }
