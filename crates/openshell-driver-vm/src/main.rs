@@ -35,9 +35,6 @@ struct Args {
     vm_env: Vec<String>,
 
     #[arg(long, hide = true)]
-    vm_port: Vec<String>,
-
-    #[arg(long, hide = true)]
     vm_console_output: Option<PathBuf>,
 
     #[arg(long, hide = true, default_value_t = 2)]
@@ -183,7 +180,6 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         args: Vec::new(),
         env: args.vm_env.clone(),
         workdir: args.vm_workdir.clone(),
-        port_map: args.vm_port.clone(),
         log_level: args.vm_krun_log_level,
         console_output,
     })
