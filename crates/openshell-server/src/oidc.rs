@@ -49,12 +49,16 @@ const SANDBOX_SECRET_METHODS: &[&str] = &[
     "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
     "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
     "/openshell.sandbox.v1.SandboxService/GetSandboxConfig",
+    "/openshell.inference.v1.Inference/GetInferenceBundle",
 ];
 
 /// Methods that accept either OIDC Bearer token (CLI users) or sandbox
 /// secret (supervisor). UpdateConfig is called by both CLI (policy/settings
 /// mutations) and the sandbox supervisor (policy sync on startup).
-const DUAL_AUTH_METHODS: &[&str] = &["/openshell.v1.OpenShell/UpdateConfig"];
+const DUAL_AUTH_METHODS: &[&str] = &[
+    "/openshell.v1.OpenShell/UpdateConfig",
+    "/openshell.v1.OpenShell/GetSandboxConfig",
+];
 
 /// Returns `true` if the method accepts either Bearer or sandbox-secret auth.
 pub fn is_dual_auth_method(path: &str) -> bool {

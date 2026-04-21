@@ -160,7 +160,14 @@ cargo run -p openshell-cli --features bundled-z3 -- sandbox list
 
 ### Test client credentials (CI mode)
 
+The CI client (`openshell-ci`) is separate from the interactive client (`openshell-cli`).
+Register the gateway with the CI client ID first:
+
 ```bash
+cargo run -p openshell-cli --features bundled-z3 -- gateway add http://127.0.0.1:8080 \
+  --oidc-issuer http://localhost:8180/realms/openshell \
+  --oidc-client-id openshell-ci
+
 OPENSHELL_OIDC_CLIENT_SECRET=ci-test-secret \
 cargo run -p openshell-cli --features bundled-z3 -- gateway login
 # Expected: ✓ Authenticated to gateway (no browser opened)
@@ -304,13 +311,25 @@ openshell sandbox create
 
 ### 4g. Test client credentials (CI mode)
 
+The CI client uses `openshell-ci` (confidential) instead of `openshell-cli` (public).
+Update the gateway metadata to use the CI client, then login:
+
 ```bash
+jq '.oidc_client_id = "openshell-ci"' \
+  ~/.config/openshell/gateways/openshell/metadata.json > /tmp/meta.json \
+  && mv /tmp/meta.json ~/.config/openshell/gateways/openshell/metadata.json
+
 OPENSHELL_OIDC_CLIENT_SECRET=ci-test-secret \
 openshell gateway login
 # Expected: ✓ Authenticated to gateway 'openshell' (no browser)
 
 openshell sandbox list
 # Expected: success
+
+# Restore interactive client for further testing
+jq '.oidc_client_id = "openshell-cli"' \
+  ~/.config/openshell/gateways/openshell/metadata.json > /tmp/meta.json \
+  && mv /tmp/meta.json ~/.config/openshell/gateways/openshell/metadata.json
 ```
 
 ### 4h. Clean up sandboxes

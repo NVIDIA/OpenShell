@@ -229,6 +229,8 @@ The roles claim path and role names are configurable to support different OIDC p
 
 When both `--oidc-admin-role` and `--oidc-user-role` are set to empty strings, RBAC is skipped entirely — any valid JWT is authorized. This supports providers like GitHub that don't emit roles in JWTs (authentication-only mode).
 
+**Security note on authentication-only mode:** In this mode, the server validates token signature, issuer, and audience, but does not restrict which principals can call which methods. Any entity able to mint a valid token for the configured audience gains full access. For GitHub Actions, this means any workflow in any repository that can request a token with the configured audience is authorized. Consider using scope enforcement (`--oidc-scopes-claim`) or restricting the audience to limit the blast radius.
+
 ## Scope-Based Fine-Grained Permissions
 
 Scopes provide opt-in, per-method access control on top of roles. When `--oidc-scopes-claim` is set, the server extracts scopes from the JWT and checks them against an exhaustive method-to-scope map. A caller must have both the required role AND the required scope.

@@ -606,7 +606,9 @@ where
             wait_for_gateway_ready(&target_docker, &name, &mut gateway_log).await?;
         }
 
-        // Create and store gateway metadata.
+        // Create and store gateway metadata. On resume, preserve existing
+        // OIDC fields so a bare `gateway start` without `--oidc-*` flags
+        // doesn't erase a previously configured OIDC registration.
         let mut metadata = create_gateway_metadata_with_host(
             &name,
             remote_opts.as_ref(),
@@ -619,6 +621,12 @@ where
             metadata.oidc_issuer = oidc_issuer.clone();
             metadata.oidc_client_id = Some(oidc_client_id.clone());
             metadata.oidc_audience = Some(oidc_audience.clone());
+        } else if let Ok(existing) = load_gateway_metadata(&name) {
+            metadata.auth_mode = existing.auth_mode;
+            metadata.oidc_issuer = existing.oidc_issuer;
+            metadata.oidc_client_id = existing.oidc_client_id;
+            metadata.oidc_audience = existing.oidc_audience;
+            metadata.oidc_scopes = existing.oidc_scopes;
         }
         store_gateway_metadata(&name, &metadata)?;
 
