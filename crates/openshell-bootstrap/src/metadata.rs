@@ -60,6 +60,11 @@ pub struct GatewayMetadata {
     /// When `None`, defaults to the client_id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc_audience: Option<String>,
+
+    /// Space-separated OAuth2 scopes to request during OIDC login.
+    /// When set, tokens will include these scopes for fine-grained access control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_scopes: Option<String>,
 }
 
 impl GatewayMetadata {

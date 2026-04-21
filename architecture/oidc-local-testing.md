@@ -327,7 +327,158 @@ openshell sandbox delete <name>
 openshell provider delete test-provider
 ```
 
-## 5. Cleanup
+## 5. Scope-Based Permissions Testing
+
+Scopes provide fine-grained, per-method access control on top of roles. This section tests scope enforcement using both the standalone server and K3s.
+
+### 5a. Standalone server with scope enforcement
+
+```bash
+cargo run -p openshell-server -- \
+  --disable-tls \
+  --db-url sqlite:/tmp/openshell-scopes-test.db \
+  --ssh-handshake-secret test \
+  --oidc-issuer http://localhost:8180/realms/openshell \
+  --oidc-scopes-claim scope
+```
+
+### 5b. Get tokens with specific scopes
+
+```bash
+# Token with sandbox scopes only
+TOKEN_SANDBOX=$(curl -s -X POST http://localhost:8180/realms/openshell/protocol/openid-connect/token \
+  -d 'grant_type=password&client_id=openshell-cli&username=admin@test&password=admin' \
+  -d 'scope=openid sandbox:read sandbox:write' \
+  | jq -r .access_token)
+
+# Token with all scopes
+TOKEN_ALL=$(curl -s -X POST http://localhost:8180/realms/openshell/protocol/openid-connect/token \
+  -d 'grant_type=password&client_id=openshell-cli&username=admin@test&password=admin' \
+  -d 'scope=openid openshell:all' \
+  | jq -r .access_token)
+
+# Token without OpenShell scopes (roles-only)
+TOKEN_NO_SCOPES=$(curl -s -X POST http://localhost:8180/realms/openshell/protocol/openid-connect/token \
+  -d 'grant_type=password&client_id=openshell-cli&username=admin@test&password=admin' \
+  | jq -r .access_token)
+```
+
+### 5c. Inspect tokens
+
+```bash
+# Verify scopes are in the JWT
+echo "$TOKEN_SANDBOX" | cut -d. -f2 | base64 -d 2>/dev/null | jq '{scope, realm_access, preferred_username}'
+# Expected: scope contains "sandbox:read sandbox:write", realm_access has roles, preferred_username is set
+
+echo "$TOKEN_NO_SCOPES" | cut -d. -f2 | base64 -d 2>/dev/null | jq '.scope'
+# Expected: "openid email profile" (no OpenShell scopes)
+```
+
+### 5d. Test scope enforcement with grpcurl
+
+```bash
+# Sandbox-scoped token — ListSandboxes should work
+grpcurl -plaintext -import-path proto -proto openshell.proto \
+  -H "authorization: Bearer $TOKEN_SANDBOX" \
+  127.0.0.1:8080 openshell.v1.OpenShell/ListSandboxes
+# Expected: success (empty list)
+
+# Sandbox-scoped token — ListProviders should FAIL
+grpcurl -plaintext -import-path proto -proto openshell.proto \
+  -H "authorization: Bearer $TOKEN_SANDBOX" \
+  127.0.0.1:8080 openshell.v1.OpenShell/ListProviders
+# Expected: PermissionDenied: scope 'provider:read' required
+
+# openshell:all token — everything works
+grpcurl -plaintext -import-path proto -proto openshell.proto \
+  -H "authorization: Bearer $TOKEN_ALL" \
+  127.0.0.1:8080 openshell.v1.OpenShell/ListProviders
+# Expected: success
+
+# No-scopes token — denied
+grpcurl -plaintext -import-path proto -proto openshell.proto \
+  -H "authorization: Bearer $TOKEN_NO_SCOPES" \
+  127.0.0.1:8080 openshell.v1.OpenShell/ListSandboxes
+# Expected: PermissionDenied: scope 'sandbox:read' required
+```
+
+### 5e. Test CLI with scopes
+
+Stop the standalone server. Register a gateway with scopes:
+
+```bash
+openshell gateway add http://127.0.0.1:8080 \
+  --oidc-issuer http://localhost:8180/realms/openshell \
+  --oidc-scopes "sandbox:read sandbox:write"
+```
+
+Or for K3s testing:
+
+```bash
+HOST_IP=$(hostname -I | awk '{print $1}')
+OPENSHELL_OIDC_ISSUER="http://${HOST_IP}:8180/realms/openshell" \
+OPENSHELL_OIDC_SCOPES_CLAIM="scope" \
+mise run cluster
+
+# Update gateway metadata with scopes
+jq '.oidc_scopes = "sandbox:read sandbox:write"' \
+  ~/.config/openshell/gateways/openshell/metadata.json > /tmp/meta.json \
+  && mv /tmp/meta.json ~/.config/openshell/gateways/openshell/metadata.json
+```
+
+Then login and test:
+
+```bash
+openshell gateway login
+# Login with: admin@test / admin
+
+openshell sandbox list    # should work (has sandbox:read)
+openshell provider list   # should fail (no provider:read scope)
+```
+
+### 5f. Test openshell:all via CLI
+
+```bash
+jq '.oidc_scopes = "openshell:all"' \
+  ~/.config/openshell/gateways/openshell/metadata.json > /tmp/meta.json \
+  && mv /tmp/meta.json ~/.config/openshell/gateways/openshell/metadata.json
+
+openshell gateway login
+openshell sandbox list    # should work
+openshell provider list   # should work
+```
+
+### 5g. Test CI client credentials with scopes
+
+```bash
+OPENSHELL_OIDC_CLIENT_SECRET=ci-test-secret openshell gateway login
+# openshell-ci has openshell:all as a default scope
+
+openshell sandbox list    # should work
+openshell provider list   # should work
+```
+
+### 5h. Test without scope enforcement (default behavior preserved)
+
+Restart the server WITHOUT `--oidc-scopes-claim`:
+
+```bash
+cargo run -p openshell-server -- \
+  --disable-tls \
+  --db-url sqlite:/tmp/openshell-noscopes-test.db \
+  --ssh-handshake-secret test \
+  --oidc-issuer http://localhost:8180/realms/openshell
+```
+
+```bash
+# Token without scopes should work (roles-only mode)
+grpcurl -plaintext -import-path proto -proto openshell.proto \
+  -H "authorization: Bearer $TOKEN_NO_SCOPES" \
+  127.0.0.1:8080 openshell.v1.OpenShell/ListSandboxes
+# Expected: success — scopes are not enforced
+```
+
+## 6. Cleanup
 
 ```bash
 # Stop the cluster
@@ -391,3 +542,9 @@ mise run keycloak:stop
 **"connection refused" with grpcurl** — On Fedora/systems where `localhost` resolves to IPv6, use `127.0.0.1` instead of `localhost`.
 
 **"no such table: objects"** — Using `sqlite::memory:` which doesn't run migrations. Use a file path like `sqlite:/tmp/openshell-test.db`.
+
+**"scope 'X' required"** — The server has `--oidc-scopes-claim` enabled and the token is missing the required scope. Either request the scope during login (`--oidc-scopes "sandbox:read sandbox:write"`) or use `openshell:all` for full access.
+
+**Token has scopes but server doesn't enforce them** — The server was started without `--oidc-scopes-claim`. Add `--oidc-scopes-claim scope` (for Keycloak) to enable enforcement.
+
+**Scopes missing from token after Keycloak login** — The browser may have reused an old Keycloak session with the previous scope set. Sign out at `http://localhost:8180/realms/openshell/account/#/` and re-run `openshell gateway login`.

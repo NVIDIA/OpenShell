@@ -232,16 +232,34 @@ struct Args {
 
     /// Dot-separated path to the roles array in the JWT claims.
     /// Keycloak: "realm_access.roles" (default). Entra ID: "roles". Okta: "groups".
-    #[arg(long, env = "OPENSHELL_OIDC_ROLES_CLAIM", default_value = "realm_access.roles")]
+    #[arg(
+        long,
+        env = "OPENSHELL_OIDC_ROLES_CLAIM",
+        default_value = "realm_access.roles"
+    )]
     oidc_roles_claim: String,
 
     /// Role name that grants admin access.
-    #[arg(long, env = "OPENSHELL_OIDC_ADMIN_ROLE", default_value = "openshell-admin")]
+    #[arg(
+        long,
+        env = "OPENSHELL_OIDC_ADMIN_ROLE",
+        default_value = "openshell-admin"
+    )]
     oidc_admin_role: String,
 
     /// Role name that grants standard user access.
-    #[arg(long, env = "OPENSHELL_OIDC_USER_ROLE", default_value = "openshell-user")]
+    #[arg(
+        long,
+        env = "OPENSHELL_OIDC_USER_ROLE",
+        default_value = "openshell-user"
+    )]
     oidc_user_role: String,
+
+    /// Dot-separated path to the scopes value in the JWT claims.
+    /// When set, the server enforces scope-based permissions on top of roles.
+    /// Keycloak: "scope". Okta: "scp". Leave empty to disable scope enforcement.
+    #[arg(long, env = "OPENSHELL_OIDC_SCOPES_CLAIM", default_value = "")]
+    oidc_scopes_claim: String,
 }
 
 pub fn command() -> Command {
@@ -366,6 +384,7 @@ async fn run_from_args(args: Args) -> Result<()> {
             roles_claim: args.oidc_roles_claim,
             admin_role: args.oidc_admin_role,
             user_role: args.oidc_user_role,
+            scopes_claim: args.oidc_scopes_claim,
         });
     }
 

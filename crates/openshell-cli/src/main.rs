@@ -150,8 +150,10 @@ fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
                         .block_on(openshell_cli::oidc_auth::oidc_refresh_token(&bundle))
                 }) {
                     Ok(refreshed) => {
-                        let _ =
-                            openshell_bootstrap::oidc_token::store_oidc_token(gateway_name, &refreshed);
+                        let _ = openshell_bootstrap::oidc_token::store_oidc_token(
+                            gateway_name,
+                            &refreshed,
+                        );
                         tls.oidc_token = Some(refreshed.access_token);
                     }
                     Err(e) => {
@@ -879,6 +881,15 @@ enum GatewayCommands {
         /// Role name that grants standard user access.
         #[arg(long, requires = "oidc_issuer")]
         oidc_user_role: Option<String>,
+
+        /// Space-separated OAuth2 scopes to request during OIDC login.
+        #[arg(long, requires = "oidc_issuer")]
+        oidc_scopes: Option<String>,
+
+        /// Dot-separated path to the scopes value in the JWT claims.
+        /// When set, the server enforces scope-based permissions on top of roles.
+        #[arg(long, requires = "oidc_issuer")]
+        oidc_scopes_claim: Option<String>,
     },
 
     /// Stop the gateway (preserves state).
@@ -970,6 +981,11 @@ enum GatewayCommands {
         /// Defaults to the client ID value.
         #[arg(long, requires = "oidc_issuer")]
         oidc_audience: Option<String>,
+
+        /// Space-separated OAuth2 scopes to request during OIDC login.
+        /// When set, tokens will include these scopes for fine-grained access control.
+        #[arg(long, requires = "oidc_issuer")]
+        oidc_scopes: Option<String>,
     },
 
     /// Authenticate with an edge-authenticated or OIDC gateway.
@@ -1829,6 +1845,8 @@ async fn main() -> Result<()> {
                 oidc_roles_claim,
                 oidc_admin_role,
                 oidc_user_role,
+                oidc_scopes,
+                oidc_scopes_claim,
             } => {
                 let gpu = if gpu {
                     vec!["auto".to_string()]
@@ -1853,6 +1871,8 @@ async fn main() -> Result<()> {
                     oidc_roles_claim.as_deref(),
                     oidc_admin_role.as_deref(),
                     oidc_user_role.as_deref(),
+                    oidc_scopes.as_deref(),
+                    oidc_scopes_claim.as_deref(),
                 )
                 .await?;
             }
@@ -1885,6 +1905,7 @@ async fn main() -> Result<()> {
                 oidc_issuer,
                 oidc_client_id,
                 oidc_audience,
+                oidc_scopes,
             } => {
                 run::gateway_add(
                     &endpoint,
@@ -1895,6 +1916,7 @@ async fn main() -> Result<()> {
                     oidc_issuer.as_deref(),
                     &oidc_client_id,
                     oidc_audience.as_deref(),
+                    oidc_scopes.as_deref(),
                 )
                 .await?;
             }

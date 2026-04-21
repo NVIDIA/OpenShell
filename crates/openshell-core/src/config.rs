@@ -261,6 +261,12 @@ pub struct OidcConfig {
     /// Role name that grants standard user access. Defaults to `openshell-user`.
     #[serde(default = "default_user_role")]
     pub user_role: String,
+
+    /// Dot-separated path to the scopes value in the JWT claims.
+    /// When non-empty, the server enforces scope-based permissions on top of roles.
+    /// Keycloak: `scope` (space-delimited string). Okta: `scp` (JSON array).
+    #[serde(default)]
+    pub scopes_claim: String,
 }
 
 const fn default_jwks_ttl_secs() -> u64 {

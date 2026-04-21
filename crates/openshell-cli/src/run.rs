@@ -964,6 +964,7 @@ pub async fn gateway_add(
     oidc_issuer: Option<&str>,
     oidc_client_id: &str,
     oidc_audience: Option<&str>,
+    oidc_scopes: Option<&str>,
 ) -> Result<()> {
     // If the endpoint starts with ssh://, parse it into an SSH destination
     // and a gateway endpoint automatically.  The host is resolved via
@@ -1054,8 +1055,7 @@ pub async fn gateway_add(
         if local {
             let endpoint_port = url::Url::parse(&endpoint).ok().and_then(|u| u.port());
             eprintln!("• Extracting TLS certificates from gateway container...");
-            openshell_bootstrap::extract_and_store_pki(name, None, endpoint_port)
-                .await?;
+            openshell_bootstrap::extract_and_store_pki(name, None, endpoint_port).await?;
         }
 
         let metadata = GatewayMetadata {
@@ -1066,6 +1066,7 @@ pub async fn gateway_add(
             oidc_issuer: Some(issuer.to_string()),
             oidc_client_id: Some(oidc_client_id.to_string()),
             oidc_audience: oidc_audience.map(String::from),
+            oidc_scopes: oidc_scopes.map(String::from),
             ..Default::default()
         };
 
@@ -1086,7 +1087,14 @@ pub async fn gateway_add(
 
         // Check for client_credentials env var (CI mode).
         if std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").is_ok() {
-            match crate::oidc_auth::oidc_client_credentials_flow(issuer, oidc_client_id, oidc_audience).await {
+            match crate::oidc_auth::oidc_client_credentials_flow(
+                issuer,
+                oidc_client_id,
+                oidc_audience,
+                oidc_scopes,
+            )
+            .await
+            {
                 Ok(bundle) => {
                     openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
                     eprintln!(
@@ -1099,7 +1107,14 @@ pub async fn gateway_add(
                 }
             }
         } else {
-            match crate::oidc_auth::oidc_browser_auth_flow(issuer, oidc_client_id, oidc_audience).await {
+            match crate::oidc_auth::oidc_browser_auth_flow(
+                issuer,
+                oidc_client_id,
+                oidc_audience,
+                oidc_scopes,
+            )
+            .await
+            {
                 Ok(bundle) => {
                     openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
                     eprintln!("{} Authenticated successfully", "✓".green().bold());
@@ -1249,13 +1264,19 @@ pub async fn gateway_login(name: &str) -> Result<()> {
             let issuer = metadata.oidc_issuer.as_deref().ok_or_else(|| {
                 miette::miette!("Gateway '{name}' has OIDC auth but no issuer URL in metadata")
             })?;
-            let client_id = metadata.oidc_client_id.as_deref().unwrap_or("openshell-cli");
+            let client_id = metadata
+                .oidc_client_id
+                .as_deref()
+                .unwrap_or("openshell-cli");
             let audience = metadata.oidc_audience.as_deref();
+            let scopes = metadata.oidc_scopes.as_deref();
 
             let bundle = if std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").is_ok() {
-                crate::oidc_auth::oidc_client_credentials_flow(issuer, client_id, audience).await?
+                crate::oidc_auth::oidc_client_credentials_flow(issuer, client_id, audience, scopes)
+                    .await?
             } else {
-                crate::oidc_auth::oidc_browser_auth_flow(issuer, client_id, audience).await?
+                crate::oidc_auth::oidc_browser_auth_flow(issuer, client_id, audience, scopes)
+                    .await?
             };
 
             let username = jwt_preferred_username(&bundle.access_token);
@@ -1284,11 +1305,8 @@ pub async fn gateway_login(name: &str) -> Result<()> {
 /// Extract `preferred_username` from a JWT payload without signature verification.
 fn jwt_preferred_username(token: &str) -> Option<String> {
     let payload = token.split('.').nth(1)?;
-    let decoded = base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        payload,
-    )
-    .ok()?;
+    let decoded =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload).ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
     claims
         .get("preferred_username")
@@ -1320,10 +1338,7 @@ pub fn gateway_logout(name: &str) -> Result<()> {
         }
     }
 
-    eprintln!(
-        "{} Logged out of gateway '{name}'",
-        "✓".green().bold(),
-    );
+    eprintln!("{} Logged out of gateway '{name}'", "✓".green().bold(),);
     Ok(())
 }
 
@@ -1581,6 +1596,8 @@ pub async fn gateway_admin_deploy(
     oidc_roles_claim: Option<&str>,
     oidc_admin_role: Option<&str>,
     oidc_user_role: Option<&str>,
+    oidc_scopes: Option<&str>,
+    oidc_scopes_claim: Option<&str>,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
@@ -1658,9 +1675,21 @@ pub async fn gateway_admin_deploy(
         if let Some(role) = oidc_user_role {
             options.oidc_user_role = Some(role.to_string());
         }
+        if let Some(claim) = oidc_scopes_claim {
+            options.oidc_scopes_claim = Some(claim.to_string());
+        }
     }
 
     let handle = deploy_gateway_with_panel(options, name, location).await?;
+
+    // Persist oidc_scopes in gateway metadata so `gateway login` can
+    // request the correct scopes later.
+    if let Some(scopes) = oidc_scopes {
+        if let Ok(mut meta) = openshell_bootstrap::load_gateway_metadata(name) {
+            meta.oidc_scopes = Some(scopes.to_string());
+            let _ = store_gateway_metadata(name, &meta);
+        }
+    }
 
     // Wait for the gRPC endpoint to actually accept connections before
     // declaring the gateway ready. The Docker health check may pass before
@@ -6218,9 +6247,19 @@ mod tests {
         with_tmp_xdg(tmpdir.path(), || {
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
             runtime.block_on(async {
-                gateway_add("http://127.0.0.1:8080", None, None, None, false, None, "openshell-cli", None)
-                    .await
-                    .expect("register plaintext gateway");
+                gateway_add(
+                    "http://127.0.0.1:8080",
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    "openshell-cli",
+                    None,
+                    None,
+                )
+                .await
+                .expect("register plaintext gateway");
             });
 
             let metadata = load_gateway_metadata("127.0.0.1").expect("load stored gateway");
@@ -6245,6 +6284,7 @@ mod tests {
                     true,
                     None,
                     "openshell-cli",
+                    None,
                     None,
                 )
                 .await

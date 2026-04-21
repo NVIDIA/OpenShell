@@ -37,10 +37,7 @@ const UNAUTHENTICATED_METHODS: &[&str] = &[
 ];
 
 /// Path prefixes that bypass OIDC validation (gRPC reflection, health probes).
-const UNAUTHENTICATED_PREFIXES: &[&str] = &[
-    "/grpc.reflection.",
-    "/grpc.health.",
-];
+const UNAUTHENTICATED_PREFIXES: &[&str] = &["/grpc.reflection.", "/grpc.health."];
 
 /// Sandbox-to-server RPCs that use the shared sandbox secret instead of
 /// OIDC Bearer tokens. These require the `x-sandbox-secret` metadata header
@@ -57,9 +54,7 @@ const SANDBOX_SECRET_METHODS: &[&str] = &[
 /// Methods that accept either OIDC Bearer token (CLI users) or sandbox
 /// secret (supervisor). UpdateConfig is called by both CLI (policy/settings
 /// mutations) and the sandbox supervisor (policy sync on startup).
-const DUAL_AUTH_METHODS: &[&str] = &[
-    "/openshell.v1.OpenShell/UpdateConfig",
-];
+const DUAL_AUTH_METHODS: &[&str] = &["/openshell.v1.OpenShell/UpdateConfig"];
 
 /// Returns `true` if the method accepts either Bearer or sandbox-secret auth.
 pub fn is_dual_auth_method(path: &str) -> bool {
@@ -69,7 +64,9 @@ pub fn is_dual_auth_method(path: &str) -> bool {
 /// Returns `true` if the method needs no authentication at all.
 pub fn is_unauthenticated_method(path: &str) -> bool {
     UNAUTHENTICATED_METHODS.contains(&path)
-        || UNAUTHENTICATED_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
+        || UNAUTHENTICATED_PREFIXES
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
 }
 
 /// Returns `true` if the method authenticates via the sandbox shared secret
@@ -86,9 +83,7 @@ pub fn validate_sandbox_secret(
     let provided = headers
         .get("x-sandbox-secret")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            Status::unauthenticated("sandbox secret required for this method")
-        })?;
+        .ok_or_else(|| Status::unauthenticated("sandbox secret required for this method"))?;
 
     if provided != expected_secret {
         return Err(Status::unauthenticated("invalid sandbox secret"));
@@ -185,6 +180,8 @@ pub struct OidcClaims {
     extra: serde_json::Value,
 }
 
+const STANDARD_OIDC_SCOPES: &[&str] = &["openid", "profile", "email", "offline_access"];
+
 impl OidcClaims {
     /// Extract roles from the JWT claims using a dot-separated path.
     ///
@@ -206,6 +203,37 @@ impl OidcClaims {
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
         }
+    }
+
+    /// Extract scopes from the JWT claims using a dot-separated path.
+    ///
+    /// Handles two formats:
+    /// - Space-delimited string: `"openid sandbox:read sandbox:write"` (Keycloak, Entra)
+    /// - JSON array: `["sandbox:read", "sandbox:write"]` (Okta)
+    ///
+    /// Filters out standard OIDC scopes (`openid`, `profile`, `email`, `offline_access`).
+    fn extract_scopes(&self, scopes_claim: &str) -> Vec<String> {
+        let mut value = &self.extra;
+        for segment in scopes_claim.split('.') {
+            match value.get(segment) {
+                Some(v) => value = v,
+                None => return vec![],
+            }
+        }
+
+        let raw: Vec<String> = if let Some(s) = value.as_str() {
+            s.split_whitespace().map(String::from).collect()
+        } else if let Some(arr) = value.as_array() {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        } else {
+            return vec![];
+        };
+
+        raw.into_iter()
+            .filter(|s| !STANDARD_OIDC_SCOPES.contains(&s.as_str()))
+            .collect()
     }
 }
 
@@ -377,10 +405,17 @@ impl JwksCache {
         let mut claims = token_data.claims;
         claims.extract_roles(&self.config.roles_claim);
 
+        let scopes = if self.config.scopes_claim.is_empty() {
+            vec![]
+        } else {
+            claims.extract_scopes(&self.config.scopes_claim)
+        };
+
         Ok(Identity {
             subject: claims.sub,
             display_name: claims.preferred_username,
             roles: claims.roles,
+            scopes,
             provider: IdentityProvider::Oidc,
         })
     }
@@ -397,8 +432,12 @@ mod tests {
 
     #[test]
     fn sandbox_operations_require_auth() {
-        assert!(!is_unauthenticated_method("/openshell.v1.OpenShell/CreateSandbox"));
-        assert!(!is_sandbox_secret_method("/openshell.v1.OpenShell/CreateSandbox"));
+        assert!(!is_unauthenticated_method(
+            "/openshell.v1.OpenShell/CreateSandbox"
+        ));
+        assert!(!is_sandbox_secret_method(
+            "/openshell.v1.OpenShell/CreateSandbox"
+        ));
     }
 
     #[test]
@@ -418,11 +457,21 @@ mod tests {
 
     #[test]
     fn sandbox_rpcs_use_sandbox_secret() {
-        assert!(is_sandbox_secret_method("/openshell.v1.OpenShell/GetSandboxConfig"));
-        assert!(is_sandbox_secret_method("/openshell.v1.OpenShell/GetSandboxProviderEnvironment"));
-        assert!(is_sandbox_secret_method("/openshell.v1.OpenShell/ReportPolicyStatus"));
-        assert!(is_sandbox_secret_method("/openshell.v1.OpenShell/PushSandboxLogs"));
-        assert!(is_sandbox_secret_method("/openshell.v1.OpenShell/SubmitPolicyAnalysis"));
+        assert!(is_sandbox_secret_method(
+            "/openshell.v1.OpenShell/GetSandboxConfig"
+        ));
+        assert!(is_sandbox_secret_method(
+            "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
+        ));
+        assert!(is_sandbox_secret_method(
+            "/openshell.v1.OpenShell/ReportPolicyStatus"
+        ));
+        assert!(is_sandbox_secret_method(
+            "/openshell.v1.OpenShell/PushSandboxLogs"
+        ));
+        assert!(is_sandbox_secret_method(
+            "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
+        ));
     }
 
     #[test]
@@ -480,5 +529,57 @@ mod tests {
         let mut claims: OidcClaims = serde_json::from_value(json).unwrap();
         claims.extract_roles("realm_access.roles");
         assert!(claims.roles.is_empty());
+    }
+
+    #[test]
+    fn extract_scopes_space_delimited() {
+        let json = serde_json::json!({
+            "sub": "user1",
+            "scope": "openid sandbox:read sandbox:write"
+        });
+        let claims: OidcClaims = serde_json::from_value(json).unwrap();
+        let scopes = claims.extract_scopes("scope");
+        assert_eq!(scopes, vec!["sandbox:read", "sandbox:write"]);
+    }
+
+    #[test]
+    fn extract_scopes_json_array() {
+        let json = serde_json::json!({
+            "sub": "user1",
+            "scp": ["sandbox:read", "provider:read"]
+        });
+        let claims: OidcClaims = serde_json::from_value(json).unwrap();
+        let scopes = claims.extract_scopes("scp");
+        assert_eq!(scopes, vec!["sandbox:read", "provider:read"]);
+    }
+
+    #[test]
+    fn extract_scopes_filters_standard_oidc_scopes() {
+        let json = serde_json::json!({
+            "sub": "user1",
+            "scope": "openid profile email sandbox:read offline_access"
+        });
+        let claims: OidcClaims = serde_json::from_value(json).unwrap();
+        let scopes = claims.extract_scopes("scope");
+        assert_eq!(scopes, vec!["sandbox:read"]);
+    }
+
+    #[test]
+    fn extract_scopes_missing_claim() {
+        let json = serde_json::json!({ "sub": "user1" });
+        let claims: OidcClaims = serde_json::from_value(json).unwrap();
+        let scopes = claims.extract_scopes("scope");
+        assert!(scopes.is_empty());
+    }
+
+    #[test]
+    fn extract_scopes_openid_only_yields_empty() {
+        let json = serde_json::json!({
+            "sub": "user1",
+            "scope": "openid"
+        });
+        let claims: OidcClaims = serde_json::from_value(json).unwrap();
+        let scopes = claims.extract_scopes("scope");
+        assert!(scopes.is_empty());
     }
 }

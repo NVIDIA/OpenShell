@@ -515,12 +515,14 @@ if [ -f "$HELMCHART" ]; then
         sed -i "s|__OIDC_ROLES_CLAIM__|${OIDC_ROLES_CLAIM:-realm_access.roles}|g" "$HELMCHART"
         sed -i "s|__OIDC_ADMIN_ROLE__|${OIDC_ADMIN_ROLE:-openshell-admin}|g" "$HELMCHART"
         sed -i "s|__OIDC_USER_ROLE__|${OIDC_USER_ROLE:-openshell-user}|g" "$HELMCHART"
+        sed -i "s|__OIDC_SCOPES_CLAIM__|${OIDC_SCOPES_CLAIM:-}|g" "$HELMCHART"
     else
         sed -i "s|__OIDC_ISSUER__||g" "$HELMCHART"
         sed -i "s|__OIDC_AUDIENCE__|openshell-cli|g" "$HELMCHART"
         sed -i "s|__OIDC_ROLES_CLAIM__||g" "$HELMCHART"
         sed -i "s|__OIDC_ADMIN_ROLE__||g" "$HELMCHART"
         sed -i "s|__OIDC_USER_ROLE__||g" "$HELMCHART"
+        sed -i "s|__OIDC_SCOPES_CLAIM__||g" "$HELMCHART"
     fi
 
     # Disable TLS entirely: the server listens on plaintext HTTP.

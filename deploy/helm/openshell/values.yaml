@@ -128,6 +128,8 @@ server:
     adminRole: ""
     # Role name for standard user access.
     userRole: ""
+    # Dot-separated path to the scopes array in the JWT claims.
+    scopesClaim: ""
 
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:

@@ -23,6 +23,9 @@ pub struct Identity {
     /// Roles granted to this identity (OIDC `realm_access.roles`, cert OU, etc.).
     pub roles: Vec<String>,
 
+    /// OAuth2 scopes granted to this identity. Empty when scope enforcement is disabled.
+    pub scopes: Vec<String>,
+
     /// Which authentication provider produced this identity.
     pub provider: IdentityProvider,
 }

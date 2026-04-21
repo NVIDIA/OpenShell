@@ -4,8 +4,8 @@
 pub mod build;
 pub mod edge_token;
 pub mod errors;
-pub mod oidc_token;
 pub mod image;
+pub mod oidc_token;
 
 pub mod constants;
 mod docker;
@@ -136,6 +136,8 @@ pub struct DeployOptions {
     pub oidc_admin_role: Option<String>,
     /// OIDC user role name.
     pub oidc_user_role: Option<String>,
+    /// OIDC scopes claim path. When set, the server enforces scope-based permissions.
+    pub oidc_scopes_claim: Option<String>,
 }
 
 impl DeployOptions {
@@ -158,6 +160,7 @@ impl DeployOptions {
             oidc_roles_claim: None,
             oidc_admin_role: None,
             oidc_user_role: None,
+            oidc_scopes_claim: None,
         }
     }
 
@@ -311,6 +314,7 @@ where
     let oidc_roles_claim = options.oidc_roles_claim;
     let oidc_admin_role = options.oidc_admin_role;
     let oidc_user_role = options.oidc_user_role;
+    let oidc_scopes_claim = options.oidc_scopes_claim;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
     // which needs a 'static callback for the bollard streaming pull.
@@ -501,6 +505,7 @@ where
             oidc_roles_claim.as_deref(),
             oidc_admin_role.as_deref(),
             oidc_user_role.as_deref(),
+            oidc_scopes_claim.as_deref(),
         )
         .await?;
         let port = actual_port;

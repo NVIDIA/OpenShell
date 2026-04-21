@@ -279,6 +279,7 @@ if [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
   [ -n "${OPENSHELL_OIDC_ROLES_CLAIM:-}" ] && DEPLOY_CMD+=(--oidc-roles-claim "${OPENSHELL_OIDC_ROLES_CLAIM}")
   [ -n "${OPENSHELL_OIDC_ADMIN_ROLE:-}" ] && DEPLOY_CMD+=(--oidc-admin-role "${OPENSHELL_OIDC_ADMIN_ROLE}")
   [ -n "${OPENSHELL_OIDC_USER_ROLE:-}" ] && DEPLOY_CMD+=(--oidc-user-role "${OPENSHELL_OIDC_USER_ROLE}")
+  [ -n "${OPENSHELL_OIDC_SCOPES_CLAIM:-}" ] && DEPLOY_CMD+=(--oidc-scopes-claim "${OPENSHELL_OIDC_SCOPES_CLAIM}")
 fi
 
 "${DEPLOY_CMD[@]}"

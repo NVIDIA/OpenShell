@@ -123,6 +123,10 @@ spec:
             - name: OPENSHELL_OIDC_USER_ROLE
               value: {{ .Values.server.oidc.userRole | quote }}
             {{- end }}
+            {{- if .Values.server.oidc.scopesClaim }}
+            - name: OPENSHELL_OIDC_SCOPES_CLAIM
+              value: {{ .Values.server.oidc.scopesClaim | quote }}
+            {{- end }}
             {{- end }}
           volumeMounts:
             - name: openshell-data

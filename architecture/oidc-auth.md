@@ -229,6 +229,72 @@ The roles claim path and role names are configurable to support different OIDC p
 
 When both `--oidc-admin-role` and `--oidc-user-role` are set to empty strings, RBAC is skipped entirely — any valid JWT is authorized. This supports providers like GitHub that don't emit roles in JWTs (authentication-only mode).
 
+## Scope-Based Fine-Grained Permissions
+
+Scopes provide opt-in, per-method access control on top of roles. When `--oidc-scopes-claim` is set, the server extracts scopes from the JWT and checks them against an exhaustive method-to-scope map. A caller must have both the required role AND the required scope.
+
+### Scope Definitions
+
+| Scope | Operations |
+|---|---|
+| `sandbox:read` | GetSandbox, ListSandboxes, WatchSandbox, GetSandboxLogs, GetSandboxPolicyStatus, ListSandboxPolicies |
+| `sandbox:write` | CreateSandbox, DeleteSandbox, ExecSandbox, CreateSshSession, RevokeSshSession |
+| `provider:read` | GetProvider, ListProviders |
+| `provider:write` | CreateProvider, UpdateProvider, DeleteProvider |
+| `config:read` | GetGatewayConfig, GetDraftPolicy, GetDraftHistory |
+| `config:write` | UpdateConfig (Bearer), ApproveDraftChunk, ApproveAllDraftChunks, RejectDraftChunk, EditDraftChunk, UndoDraftChunk, ClearDraftChunks |
+| `inference:read` | GetClusterInference |
+| `inference:write` | SetClusterInference |
+| `openshell:all` | All of the above (wildcard) |
+
+Methods not listed in the scope map require `openshell:all`. Scopes cannot escalate privilege — `openshell:all` on a user-role token still cannot call admin methods.
+
+### Authorization Flow
+
+```
+Request arrives (Bearer-authenticated)
+  │
+  ├── Role check (existing)
+  │     └── Does identity have required role? No → PERMISSION_DENIED
+  │
+  └── Scope check (only if --oidc-scopes-claim is configured)
+        ├── Does identity have openshell:all? → proceed
+        ├── Does identity have required scope for this method? → proceed
+        └── No → PERMISSION_DENIED("scope 'X' required")
+```
+
+When `--oidc-scopes-claim` is not set (default), scope enforcement is disabled and roles alone determine access. Auth-only mode (empty role names) still enforces scopes when enabled.
+
+### Scope Extraction
+
+The server extracts scopes from the JWT claim path configured by `--oidc-scopes-claim`. Two formats are supported:
+
+- **Space-delimited string** (Keycloak, Entra ID): `"openid sandbox:read sandbox:write"`
+- **JSON array** (Okta): `["sandbox:read", "sandbox:write"]`
+
+Standard OIDC scopes (`openid`, `profile`, `email`, `offline_access`) are filtered out before enforcement.
+
+### CLI Scope Requests
+
+The `--oidc-scopes` flag on `gateway add` and `gateway start` is stored in gateway metadata and included in OAuth2 token requests:
+
+- **Browser flow**: appended to the `scope` parameter alongside `openid`
+- **Client credentials flow**: sent as-is (without `openid`, which is inappropriate for service tokens)
+- **Token refresh**: scopes are not re-sent; the authorization server preserves them per RFC 6749 §6
+
+### Provider Compatibility
+
+| Provider | Scopes Claim | Format | Fine-Grained Selection |
+|---|---|---|---|
+| Keycloak | `scope` | Space-delimited | Yes — client requests specific scopes |
+| Okta | `scp` | JSON array | Yes — client requests specific scopes |
+| Entra ID | `scp` | Space-delimited | Limited — uses `.default` for all granted permissions |
+| GitHub | N/A | N/A | No — use with scopes disabled |
+
+### Keycloak Client Scopes
+
+The dev realm (`scripts/keycloak-realm.json`) includes all 9 OpenShell scopes as **optional scopes** on `openshell-cli` and `openshell:all` as a **default scope** on `openshell-ci`. Built-in Keycloak scopes (`openid`, `profile`, `email`, `roles`, `web-origins`, `acr`) are assigned as default scopes on both clients so roles and profile claims are always present regardless of optional scope requests.
+
 ## Server Configuration
 
 ### Server Binary Flags
@@ -243,6 +309,7 @@ These flags configure JWT validation on the `openshell-server` binary:
 | `--oidc-roles-claim` | `OPENSHELL_OIDC_ROLES_CLAIM` | `realm_access.roles` | Dot-separated path to roles array in JWT |
 | `--oidc-admin-role` | `OPENSHELL_OIDC_ADMIN_ROLE` | `openshell-admin` | Role name for admin access |
 | `--oidc-user-role` | `OPENSHELL_OIDC_USER_ROLE` | `openshell-user` | Role name for user access |
+| `--oidc-scopes-claim` | `OPENSHELL_OIDC_SCOPES_CLAIM` | (empty) | Claim path for scopes; enables scope enforcement when set |
 
 When `--oidc-issuer` is not set, OIDC validation is disabled and the server falls back to mTLS-only or plaintext behavior.
 
@@ -258,6 +325,8 @@ The `openshell gateway start` command exposes flags that configure both the serv
 | `--oidc-roles-claim` | (none) | Passed to the server binary if set |
 | `--oidc-admin-role` | (none) | Passed to the server binary if set |
 | `--oidc-user-role` | (none) | Passed to the server binary if set |
+| `--oidc-scopes-claim` | (none) | Passed to the server binary; enables scope enforcement |
+| `--oidc-scopes` | (none) | Stored in gateway metadata; included in CLI token requests |
 
 The `--oidc-client-id` flag is **not** a server flag — it is stored in gateway metadata and used by the CLI during login. The `--oidc-audience` flag is both a server flag (for JWT validation) and stored in metadata (for token requests).
 
@@ -269,6 +338,7 @@ server:
     issuer: "https://keycloak.example.com/realms/openshell"
     audience: "openshell-cli"
     jwksTtl: 3600
+    scopesClaim: "scope"   # enable scope enforcement (Keycloak)
 ```
 
 ### Discovery Endpoint
@@ -438,7 +508,7 @@ Request arrives
   |     +-- No sandbox secret      --> Fall through to Bearer
   |
   +-- Has "authorization: Bearer" header?
-  |     +-- Validate JWT --> Check RBAC --> Authenticated (OIDC)
+  |     +-- Validate JWT --> Check RBAC --> Check scopes (if enabled) --> Authenticated (OIDC)
   |     +-- Invalid JWT  --> UNAUTHENTICATED
   |
   +-- No bearer header --> UNAUTHENTICATED

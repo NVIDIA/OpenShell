@@ -104,6 +104,7 @@ pub async fn oidc_browser_auth_flow(
     issuer: &str,
     client_id: &str,
     audience: Option<&str>,
+    scopes: Option<&str>,
 ) -> Result<OidcTokenBundle> {
     let discovery = discover(issuer).await?;
 
@@ -115,13 +116,25 @@ pub async fn oidc_browser_auth_flow(
     let port = listener.local_addr().into_diagnostic()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
+    let scope_value = match scopes {
+        Some(s) => {
+            let extra: Vec<&str> = s.split_whitespace().filter(|&sc| sc != "openid").collect();
+            if extra.is_empty() {
+                "openid".to_string()
+            } else {
+                format!("openid {}", extra.join(" "))
+            }
+        }
+        None => "openid".to_string(),
+    };
     let mut auth_url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state={}&scope=openid",
+        "{}?response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state={}&scope={}",
         discovery.authorization_endpoint,
         urlencoded(client_id),
         urlencoded(&redirect_uri),
         urlencoded(&code_challenge),
         urlencoded(&state),
+        urlencoded(&scope_value),
     );
     // Request a specific API audience when configured (needed for providers
     // like Entra ID where the API audience differs from the client ID).
@@ -180,6 +193,7 @@ pub async fn oidc_client_credentials_flow(
     issuer: &str,
     client_id: &str,
     audience: Option<&str>,
+    scopes: Option<&str>,
 ) -> Result<OidcTokenBundle> {
     let client_secret = std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").map_err(|_| {
         miette::miette!(
@@ -196,6 +210,9 @@ pub async fn oidc_client_credentials_flow(
     ];
     if let Some(aud) = audience {
         params.push(("audience", aud));
+    }
+    if let Some(s) = scopes {
+        params.push(("scope", s));
     }
 
     let client = reqwest::Client::new();
@@ -218,7 +235,9 @@ pub async fn oidc_client_credentials_flow(
 /// one (per OAuth 2.0 spec, the refresh response may omit `refresh_token`).
 pub async fn oidc_refresh_token(bundle: &OidcTokenBundle) -> Result<OidcTokenBundle> {
     let refresh_token = bundle.refresh_token.as_deref().ok_or_else(|| {
-        miette::miette!("no refresh token available — re-authenticate with: openshell gateway login")
+        miette::miette!(
+            "no refresh token available — re-authenticate with: openshell gateway login"
+        )
     })?;
 
     let discovery = discover(&bundle.issuer).await?;
@@ -252,19 +271,23 @@ pub async fn oidc_refresh_token(bundle: &OidcTokenBundle) -> Result<OidcTokenBun
 ///
 /// Returns the access token string.
 pub async fn ensure_valid_oidc_token(gateway_name: &str) -> Result<String> {
-    let bundle = openshell_bootstrap::oidc_token::load_oidc_token(gateway_name).ok_or_else(|| {
-        miette::miette!(
-            "No OIDC token stored for gateway '{gateway_name}'.\n\
+    let bundle =
+        openshell_bootstrap::oidc_token::load_oidc_token(gateway_name).ok_or_else(|| {
+            miette::miette!(
+                "No OIDC token stored for gateway '{gateway_name}'.\n\
              Authenticate with: openshell gateway login"
-        )
-    })?;
+            )
+        })?;
 
     if !openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
         return Ok(bundle.access_token);
     }
 
     // Token expired — try to refresh.
-    debug!(gateway = gateway_name, "OIDC token expired, attempting refresh");
+    debug!(
+        gateway = gateway_name,
+        "OIDC token expired, attempting refresh"
+    );
     let refreshed = oidc_refresh_token(&bundle).await?;
     openshell_bootstrap::oidc_token::store_oidc_token(gateway_name, &refreshed)?;
     Ok(refreshed.access_token)
@@ -391,9 +414,7 @@ async fn run_oidc_callback_server(
         tokio::spawn(async move {
             let service = service_fn(move |req| {
                 let state = Arc::clone(&state);
-                async move {
-                    Ok::<_, Infallible>(handle_oidc_callback(req, state).await)
-                }
+                async move { Ok::<_, Infallible>(handle_oidc_callback(req, state).await) }
             });
 
             if let Err(error) = Builder::new(TokioExecutor::new())

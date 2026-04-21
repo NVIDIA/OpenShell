@@ -441,6 +441,9 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     if [[ -n "${OPENSHELL_OIDC_USER_ROLE:-}" ]]; then
       OIDC_HELM_ARGS="${OIDC_HELM_ARGS} --set server.oidc.userRole=${OPENSHELL_OIDC_USER_ROLE}"
     fi
+    if [[ -n "${OPENSHELL_OIDC_SCOPES_CLAIM:-}" ]]; then
+      OIDC_HELM_ARGS="${OIDC_HELM_ARGS} --set server.oidc.scopesClaim=${OPENSHELL_OIDC_SCOPES_CLAIM}"
+    fi
   fi
 
   cluster_exec "helm upgrade openshell ${CONTAINER_CHART_DIR} \

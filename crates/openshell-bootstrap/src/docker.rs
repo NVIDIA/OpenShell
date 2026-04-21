@@ -511,6 +511,7 @@ pub async fn ensure_container(
     oidc_roles_claim: Option<&str>,
     oidc_admin_role: Option<&str>,
     oidc_user_role: Option<&str>,
+    oidc_scopes_claim: Option<&str>,
 ) -> Result<u16> {
     let container_name = container_name(name);
 
@@ -802,6 +803,9 @@ pub async fn ensure_container(
         }
         if let Some(role) = oidc_user_role {
             env_vars.push(format!("OIDC_USER_ROLE={role}"));
+        }
+        if let Some(claim) = oidc_scopes_claim {
+            env_vars.push(format!("OIDC_SCOPES_CLAIM={claim}"));
         }
     }
 

@@ -20,9 +20,9 @@
 //! [`compute::vm`]; keep this file driver-agnostic going forward.
 
 mod auth;
+mod authz;
 pub mod cli;
 mod compute;
-mod authz;
 mod grpc;
 mod http;
 pub mod identity;
@@ -170,10 +170,9 @@ pub async fn run_server(
         let policy = authz::AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
+            scopes_enabled: !oidc.scopes_claim.is_empty(),
         };
-        policy
-            .validate()
-            .map_err(|e| Error::config(e))?;
+        policy.validate().map_err(|e| Error::config(e))?;
 
         let cache = oidc::JwksCache::new(oidc)
             .await

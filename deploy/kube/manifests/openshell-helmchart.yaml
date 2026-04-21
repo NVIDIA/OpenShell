@@ -45,6 +45,7 @@ spec:
         rolesClaim: "__OIDC_ROLES_CLAIM__"
         adminRole: "__OIDC_ADMIN_ROLE__"
         userRole: "__OIDC_USER_ROLE__"
+        scopesClaim: "__OIDC_SCOPES_CLAIM__"
       tls:
         certSecretName: openshell-server-tls
         clientCaSecretName: openshell-server-client-ca
