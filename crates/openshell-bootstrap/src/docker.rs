@@ -23,6 +23,24 @@ use std::collections::HashMap;
 
 const REGISTRY_NAMESPACE_DEFAULT: &str = "openshell";
 
+/// Default total HTTP timeout for Docker API calls that stream large payloads
+/// (e.g. `docker save` used by `sandbox create --from`). Bollard's own
+/// `connect_with_local_defaults()` ceiling is 120s, which is far too short for
+/// multi-GB image exports — a 7 GB image on a laptop SSD takes ~4–5 minutes.
+/// One hour is a safe upper bound; override with `OPENSHELL_DOCKER_TIMEOUT_SECS`.
+pub(crate) const DEFAULT_LARGE_TRANSFER_TIMEOUT_SECS: u64 = 3600;
+
+/// Build a local-Docker client suitable for large streaming transfers.
+/// Respects `OPENSHELL_DOCKER_TIMEOUT_SECS` (in seconds); falls back to
+/// [`DEFAULT_LARGE_TRANSFER_TIMEOUT_SECS`] when unset or unparseable.
+pub fn connect_local_for_large_transfers() -> std::result::Result<Docker, BollardError> {
+    let secs: u64 = std::env::var("OPENSHELL_DOCKER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_LARGE_TRANSFER_TIMEOUT_SECS);
+    Ok(Docker::connect_with_local_defaults()?.with_timeout(std::time::Duration::from_secs(secs)))
+}
+
 /// Resolve the raw GPU device-ID list, replacing the `"auto"` sentinel with a
 /// concrete device ID based on whether CDI is enabled on the daemon.
 ///
