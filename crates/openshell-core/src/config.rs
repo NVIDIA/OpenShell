@@ -57,6 +57,10 @@ pub struct Config {
     #[serde(default = "default_bind_address")]
     pub bind_address: SocketAddr,
 
+    /// Address to bind the unauthenticated health endpoint to.
+    #[serde(default = "default_health_bind_address")]
+    pub health_bind_address: SocketAddr,
+
     /// Log level (trace, debug, info, warn, error).
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -168,6 +172,7 @@ impl Config {
     pub fn new(tls: Option<TlsConfig>) -> Self {
         Self {
             bind_address: default_bind_address(),
+            health_bind_address: default_health_bind_address(),
             log_level: default_log_level(),
             tls,
             database_url: String::new(),
@@ -192,6 +197,12 @@ impl Config {
     #[must_use]
     pub const fn with_bind_address(mut self, addr: SocketAddr) -> Self {
         self.bind_address = addr;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_health_bind_address(mut self, addr: SocketAddr) -> Self {
+        self.health_bind_address = addr;
         self
     }
 
@@ -313,6 +324,10 @@ impl Config {
 
 fn default_bind_address() -> SocketAddr {
     "0.0.0.0:8080".parse().expect("valid default address")
+}
+
+fn default_health_bind_address() -> SocketAddr {
+    "0.0.0.0:8081".parse().expect("valid default address")
 }
 
 fn default_log_level() -> String {

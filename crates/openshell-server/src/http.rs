@@ -47,8 +47,7 @@ pub fn health_router() -> Router {
 
 /// Create the HTTP router.
 pub fn http_router(state: Arc<crate::ServerState>) -> Router {
-    health_router()
-        .merge(crate::ssh_tunnel::router(state.clone()))
+    crate::ssh_tunnel::router(state.clone())
         .merge(crate::ws_tunnel::router(state.clone()))
         .merge(crate::auth::router(state))
 }

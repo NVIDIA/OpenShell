@@ -23,6 +23,10 @@ struct Args {
     #[arg(long, default_value_t = 8080, env = "OPENSHELL_SERVER_PORT")]
     port: u16,
 
+    /// Port for unauthenticated health endpoints (healthz, readyz).
+    #[arg(long, default_value_t = 8081, env = "OPENSHELL_HEALTH_PORT")]
+    health_port: u16,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info", env = "OPENSHELL_LOG_LEVEL")]
     log_level: String,
@@ -197,6 +201,14 @@ async fn run_from_args(args: Args) -> Result<()> {
     );
 
     let bind = SocketAddr::from(([0, 0, 0, 0], args.port));
+    let health_bind = SocketAddr::from(([0, 0, 0, 0], args.health_port));
+
+    if args.port == args.health_port {
+        return Err(miette::miette!(
+            "--port and --health-port must be different (both set to {})",
+            args.port
+        ));
+    }
 
     let tls = if args.disable_tls {
         None
@@ -224,6 +236,7 @@ async fn run_from_args(args: Args) -> Result<()> {
 
     let mut config = openshell_core::Config::new(tls)
         .with_bind_address(bind)
+        .with_health_bind_address(health_bind)
         .with_log_level(&args.log_level);
 
     config = config
