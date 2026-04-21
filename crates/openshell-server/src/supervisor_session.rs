@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, SessionAccepted, SupervisorMessage,
+    GatewayMessage, RelayFrame, RelayInit, RelayOpen, Sandbox, SessionAccepted, SupervisorMessage,
     gateway_message, supervisor_message,
 };
 
@@ -339,6 +339,22 @@ pub fn spawn_relay_reaper(state: Arc<ServerState>, interval: Duration) {
     });
 }
 
+async fn require_persisted_sandbox(
+    store: &Arc<crate::persistence::Store>,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    let sandbox = store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|err| Status::internal(format!("failed to load sandbox: {err}")))?;
+
+    if sandbox.is_none() {
+        return Err(Status::not_found("sandbox not found"));
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // RelayStream gRPC handler
 // ---------------------------------------------------------------------------
@@ -481,6 +497,7 @@ pub async fn handle_connect_supervisor(
     if sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
+    require_persisted_sandbox(&state.store, &sandbox_id).await?;
 
     let session_id = Uuid::new_v4().to_string();
     info!(
@@ -660,6 +677,7 @@ fn handle_supervisor_message(sandbox_id: &str, session_id: &str, msg: Supervisor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::Store;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Returns a shutdown sender with its receiver immediately dropped. Tests
@@ -667,6 +685,15 @@ mod tests {
     /// `register` signature without the receiver noise.
     fn make_shutdown() -> oneshot::Sender<()> {
         oneshot::channel::<()>().0
+    }
+
+    fn sandbox_record(id: &str, name: &str) -> Sandbox {
+        Sandbox {
+            id: id.to_string(),
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            ..Default::default()
+        }
     }
 
     // ---- registry: register / remove ----
@@ -1048,6 +1075,38 @@ mod tests {
             }
             other => panic!("expected RelayOpen on replay, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn require_persisted_sandbox_rejects_missing_sandbox() {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+
+        let err = require_persisted_sandbox(&store, "missing")
+            .await
+            .expect_err("missing sandbox should be rejected");
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn require_persisted_sandbox_accepts_existing_sandbox() {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        store
+            .put_message(&sandbox_record("sbx-1", "sandbox-one"))
+            .await
+            .expect("sandbox should persist");
+
+        require_persisted_sandbox(&store, "sbx-1")
+            .await
+            .expect("persisted sandbox should be accepted");
     }
 
     // ---- claim_relay: expiry, drop, wiring ----
