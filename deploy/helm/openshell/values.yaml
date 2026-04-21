@@ -42,17 +42,30 @@ service:
 podLifecycle:
   terminationGracePeriodSeconds: 5
 
+# Probes for service liveness, readiness, and startup.
 probes:
   startup:
+    httpGet:
+      path: /healthz
+      port: health
+      scheme: HTTP
     periodSeconds: 2
     timeoutSeconds: 1
     failureThreshold: 30
   liveness:
+    httpGet:
+      path: /healthz
+      port: health
+      scheme: HTTP
     initialDelaySeconds: 2
     periodSeconds: 5
     timeoutSeconds: 1
     failureThreshold: 3
   readiness:
+    httpGet:
+      path: /readyz
+      port: health
+      scheme: HTTP
     initialDelaySeconds: 1
     periodSeconds: 2
     timeoutSeconds: 1
@@ -69,6 +82,8 @@ affinity: {}
 # Server configuration
 server:
   logLevel: info
+  # Health check server port.
+  healthPort: 8081
   sandboxNamespace: openshell
   dbUrl: "sqlite:/var/openshell/openshell.db"
   sandboxImage: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"

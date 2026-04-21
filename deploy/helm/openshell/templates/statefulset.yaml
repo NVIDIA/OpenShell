@@ -47,12 +47,14 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
-            - --port
+            - --server.port
             - {{ .Values.service.port | quote }}
             - --log-level
             - {{ .Values.server.logLevel }}
             - --db-url
             - {{ .Values.server.dbUrl | quote }}
+            - --health.port
+            - {{ .Values.server.healthPort | quote }}
           env:
             - name: OPENSHELL_SANDBOX_NAMESPACE
               value: {{ .Values.server.sandboxNamespace | quote }}
@@ -113,26 +115,15 @@ spec:
             - name: grpc
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+            - name: health
+              containerPort: {{ .Values.server.healthHttpPort }}
+              protocol: TCP
           startupProbe:
-            tcpSocket:
-              port: grpc
-            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
-            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
-            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            {{- toYaml .Values.probes.startup | nindent 12 }}
           livenessProbe:
-            tcpSocket:
-              port: grpc
-            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
-            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
-            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
-            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
           readinessProbe:
-            tcpSocket:
-              port: grpc
-            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
-            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
-            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
-            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:

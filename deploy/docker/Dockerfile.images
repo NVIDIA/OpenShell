@@ -201,7 +201,7 @@ USER openshell
 EXPOSE 8080
 
 ENTRYPOINT ["openshell-gateway"]
-CMD ["--port", "8080"]
+CMD ["--server.port", "8080"]
 
 # ---------------------------------------------------------------------------
 # Final supervisor image

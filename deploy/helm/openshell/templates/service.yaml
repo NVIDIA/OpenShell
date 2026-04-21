@@ -18,5 +18,9 @@ spec:
       {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort }}
       nodePort: {{ .Values.service.nodePort }}
       {{- end }}
+    - port: {{ .Values.server.healthPort }}
+      targetPort: health
+      protocol: TCP
+      name: health
   selector:
     {{- include "openshell.selectorLabels" . | nindent 4 }}

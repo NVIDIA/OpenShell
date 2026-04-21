@@ -9,7 +9,7 @@ The gateway runs the control plane API server. It is deployed as a StatefulSet i
 - **Docker target**: `gateway` in `deploy/docker/Dockerfile.images`
 - **Registry**: `ghcr.io/nvidia/openshell/gateway:latest`
 - **Pulled when**: Cluster startup (the Helm chart triggers the pull)
-- **Entrypoint**: `openshell-gateway --port 8080` (gRPC + HTTP, mTLS)
+- **Entrypoint**: `openshell-gateway --server.port 8080` (gRPC + HTTP, mTLS; `--port` alias)
 
 ## Cluster (`openshell/cluster`)
 
