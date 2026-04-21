@@ -1347,17 +1347,18 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
         }
     }
     for path in &rw {
-        if !fs.read_write.iter().any(|p| p == path) {
-            if !std::path::Path::new(path).exists() {
-                debug!(
-                    path,
-                    "Baseline read-write path does not exist, skipping enrichment"
-                );
-                continue;
-            }
-            fs.read_write.push(path.clone());
-            modified = true;
+        if fs.read_only.iter().any(|p| p == path) || fs.read_write.iter().any(|p| p == path) {
+            continue;
         }
+        if !std::path::Path::new(path).exists() {
+            debug!(
+                path,
+                "Baseline read-write path does not exist, skipping enrichment"
+            );
+            continue;
+        }
+        fs.read_write.push(path.clone());
+        modified = true;
     }
 
     if modified {
@@ -1401,17 +1402,18 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
     }
     for path in &rw {
         let p = std::path::PathBuf::from(path);
-        if !policy.filesystem.read_write.contains(&p) {
-            if !p.exists() {
-                debug!(
-                    path,
-                    "Baseline read-write path does not exist, skipping enrichment"
-                );
-                continue;
-            }
-            policy.filesystem.read_write.push(p);
-            modified = true;
+        if policy.filesystem.read_only.contains(&p) || policy.filesystem.read_write.contains(&p) {
+            continue;
         }
+        if !p.exists() {
+            debug!(
+                path,
+                "Baseline read-write path does not exist, skipping enrichment"
+            );
+            continue;
+        }
+        policy.filesystem.read_write.push(p);
+        modified = true;
     }
 
     if modified {
@@ -1429,6 +1431,7 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
 #[cfg(test)]
 mod baseline_tests {
     use super::*;
+    use crate::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
 
     #[test]
     fn proc_not_in_both_read_only_and_read_write_when_gpu_present() {
@@ -1492,6 +1495,75 @@ mod baseline_tests {
                 "path {path} appears in both read_only and read_write"
             );
         }
+    }
+
+    #[test]
+    fn proto_enrichment_preserves_explicit_read_only_for_baseline_read_write_paths() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec!["/tmp".to_string()],
+            read_write: vec![],
+            include_workdir: false,
+        });
+        policy.network_policies.insert(
+            "test".into(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "test-rule".into(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "example.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        enrich_proto_baseline_paths(&mut policy);
+
+        let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(
+            filesystem.read_only.contains(&"/tmp".to_string()),
+            "explicit read_only baseline path should be preserved"
+        );
+        assert!(
+            !filesystem.read_write.contains(&"/tmp".to_string()),
+            "baseline enrichment must not promote explicit read_only /tmp to read_write"
+        );
+    }
+
+    #[test]
+    fn local_enrichment_preserves_explicit_read_only_for_baseline_read_write_paths() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy {
+                read_only: vec![std::path::PathBuf::from("/tmp")],
+                read_write: vec![],
+                include_workdir: false,
+            },
+            network: NetworkPolicy {
+                mode: NetworkMode::Proxy,
+                proxy: Some(ProxyPolicy { http_addr: None }),
+            },
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy::default(),
+        };
+
+        enrich_sandbox_baseline_paths(&mut policy);
+
+        assert!(
+            policy
+                .filesystem
+                .read_only
+                .contains(&std::path::PathBuf::from("/tmp")),
+            "explicit read_only baseline path should be preserved"
+        );
+        assert!(
+            !policy
+                .filesystem
+                .read_write
+                .contains(&std::path::PathBuf::from("/tmp")),
+            "baseline enrichment must not promote explicit read_only /tmp to read_write"
+        );
     }
 }
 
