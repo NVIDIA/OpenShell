@@ -13,7 +13,7 @@ use openshell_core::proto::{
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
-    ProviderResponse, Sandbox, SandboxResponse, SandboxStreamEvent, ServiceStatus,
+    ProviderResponse, Sandbox, SandboxPolicy, SandboxResponse, SandboxStreamEvent, ServiceStatus,
     SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
 };
 use rcgen::{
@@ -135,9 +135,20 @@ impl OpenShell for TestOpenShell {
 
     async fn get_sandbox_config(
         &self,
-        _request: tonic::Request<GetSandboxConfigRequest>,
+        request: tonic::Request<GetSandboxConfigRequest>,
     ) -> Result<Response<GetSandboxConfigResponse>, Status> {
-        Ok(Response::new(GetSandboxConfigResponse::default()))
+        let req = request.into_inner();
+        assert_eq!(
+            req.sandbox_id, "test-id",
+            "sandbox_get --policy-only should pass the id from GetSandbox"
+        );
+        Ok(Response::new(GetSandboxConfigResponse {
+            policy: Some(SandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
     }
 
     async fn get_gateway_config(
@@ -453,7 +464,7 @@ async fn run_server() -> TestServer {
 async fn sandbox_get_sends_correct_name() {
     let ts = run_server().await;
 
-    run::sandbox_get(&ts.endpoint, "my-sandbox", &ts.tls)
+    run::sandbox_get(&ts.endpoint, "my-sandbox", false, &ts.tls)
         .await
         .expect("sandbox_get should succeed");
 
@@ -463,6 +474,19 @@ async fn sandbox_get_sends_correct_name() {
         Some("my-sandbox"),
         "mock should have recorded the requested sandbox name"
     );
+}
+
+/// `sandbox_get` with `policy_only` calls `GetSandboxConfig` and prints YAML from the response.
+#[tokio::test]
+async fn sandbox_get_policy_only_round_trip() {
+    let ts = run_server().await;
+
+    run::sandbox_get(&ts.endpoint, "my-sandbox", true, &ts.tls)
+        .await
+        .expect("sandbox_get with policy_only should succeed");
+
+    let recorded = ts.openshell.state.last_get_name.lock().await.clone();
+    assert_eq!(recorded.as_deref(), Some("my-sandbox"));
 }
 
 /// End-to-end: save a last-used sandbox, load it back, then call `sandbox_get`
@@ -483,7 +507,7 @@ async fn sandbox_get_with_persisted_last_sandbox() {
     assert_eq!(resolved, "persisted-sb");
 
     // Call sandbox_get with the resolved name.
-    run::sandbox_get(&ts.endpoint, &resolved, &ts.tls)
+    run::sandbox_get(&ts.endpoint, &resolved, false, &ts.tls)
         .await
         .expect("sandbox_get should succeed");
 
@@ -505,7 +529,7 @@ async fn explicit_name_takes_precedence_over_persisted() {
     // Persist one name, but supply a different one explicitly.
     save_last_sandbox("my-cluster", "old-sandbox").expect("save should succeed");
 
-    run::sandbox_get(&ts.endpoint, "explicit-sandbox", &ts.tls)
+    run::sandbox_get(&ts.endpoint, "explicit-sandbox", false, &ts.tls)
         .await
         .expect("sandbox_get should succeed");
 

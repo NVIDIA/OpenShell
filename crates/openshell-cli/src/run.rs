@@ -2734,7 +2734,16 @@ pub async fn sandbox_sync_command(
 }
 
 /// Fetch a sandbox by name.
-pub async fn sandbox_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+///
+/// Policy always comes from [`GetSandboxConfig`] (effective active policy, sandbox
+/// or global). With `policy_only`, prints only that YAML to stdout; otherwise
+/// prints sandbox metadata and the same policy with formatted YAML.
+pub async fn sandbox_get(
+    server: &str,
+    name: &str,
+    policy_only: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
     let response = client
@@ -2748,6 +2757,26 @@ pub async fn sandbox_get(server: &str, name: &str, tls: &TlsOptions) -> Result<(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
+    let config = client
+        .get_sandbox_config(GetSandboxConfigRequest {
+            sandbox_id: sandbox.id.clone(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if policy_only {
+        let Some(ref policy) = config.policy else {
+            return Err(miette::miette!(
+                "no active policy configured for this sandbox"
+            ));
+        };
+        let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
+            .wrap_err("failed to serialize policy to YAML")?;
+        print!("{yaml_str}");
+        return Ok(());
+    }
+
     println!("{}", "Sandbox:".cyan().bold());
     println!();
     println!("  {} {}", "Id:".dimmed(), sandbox.id);
@@ -2755,9 +2784,34 @@ pub async fn sandbox_get(server: &str, name: &str, tls: &TlsOptions) -> Result<(
     println!("  {} {}", "Namespace:".dimmed(), sandbox.namespace);
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase));
 
-    if let Some(spec) = &sandbox.spec
-        && let Some(policy) = &spec.policy
-    {
+    let policy_from_global = config.policy_source == PolicySource::Global as i32;
+    println!(
+        "  {} {}",
+        "Policy source:".dimmed(),
+        if policy_from_global {
+            "global"
+        } else {
+            "sandbox"
+        }
+    );
+    let revision = if policy_from_global {
+        if config.global_policy_version > 0 {
+            Some(config.global_policy_version)
+        } else if config.version > 0 {
+            Some(config.version)
+        } else {
+            None
+        }
+    } else if config.version > 0 {
+        Some(config.version)
+    } else {
+        None
+    };
+    if let Some(rev) = revision {
+        println!("  {} {}", "Revision:".dimmed(), rev);
+    }
+
+    if let Some(ref policy) = config.policy {
         println!();
         print_sandbox_policy(policy);
     }
