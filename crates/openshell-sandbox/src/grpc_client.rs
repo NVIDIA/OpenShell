@@ -106,15 +106,32 @@ impl tonic::service::Interceptor for SandboxSecretInterceptor {
 }
 
 type AuthenticatedClient = OpenShellClient<InterceptedService<Channel, SandboxSecretInterceptor>>;
+type AuthenticatedInferenceClient =
+    InferenceClient<InterceptedService<Channel, SandboxSecretInterceptor>>;
+
+fn sandbox_secret_interceptor() -> SandboxSecretInterceptor {
+    let secret = std::env::var("OPENSHELL_SSH_HANDSHAKE_SECRET")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    SandboxSecretInterceptor { secret }
+}
 
 /// Connect to the OpenShell server with sandbox secret authentication.
 async fn connect(endpoint: &str) -> Result<AuthenticatedClient> {
     let channel = connect_channel(endpoint).await?;
-    let secret = std::env::var("OPENSHELL_SSH_HANDSHAKE_SECRET")
-        .ok()
-        .and_then(|s| s.parse().ok());
-    let interceptor = SandboxSecretInterceptor { secret };
-    Ok(OpenShellClient::with_interceptor(channel, interceptor))
+    Ok(OpenShellClient::with_interceptor(
+        channel,
+        sandbox_secret_interceptor(),
+    ))
+}
+
+/// Connect to the inference service with sandbox secret authentication.
+async fn connect_inference(endpoint: &str) -> Result<AuthenticatedInferenceClient> {
+    let channel = connect_channel(endpoint).await?;
+    Ok(InferenceClient::with_interceptor(
+        channel,
+        sandbox_secret_interceptor(),
+    ))
 }
 
 /// Fetch sandbox policy from `OpenShell` server via gRPC.
@@ -356,8 +373,7 @@ impl CachedOpenShellClient {
 pub async fn fetch_inference_bundle(endpoint: &str) -> Result<GetInferenceBundleResponse> {
     debug!(endpoint = %endpoint, "Fetching inference route bundle");
 
-    let channel = connect_channel(endpoint).await?;
-    let mut client = InferenceClient::new(channel);
+    let mut client = connect_inference(endpoint).await?;
 
     let response = client
         .get_inference_bundle(GetInferenceBundleRequest {})
@@ -365,4 +381,33 @@ pub async fn fetch_inference_bundle(endpoint: &str) -> Result<GetInferenceBundle
         .into_diagnostic()?;
 
     Ok(response.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_secret_interceptor_injects_header() {
+        let mut interceptor = SandboxSecretInterceptor {
+            secret: Some("test-secret".parse().unwrap()),
+        };
+        let request =
+            tonic::service::Interceptor::call(&mut interceptor, tonic::Request::new(())).unwrap();
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-sandbox-secret")
+                .and_then(|v| v.to_str().ok()),
+            Some("test-secret")
+        );
+    }
+
+    #[test]
+    fn sandbox_secret_interceptor_is_noop_without_secret() {
+        let mut interceptor = SandboxSecretInterceptor { secret: None };
+        let request =
+            tonic::service::Interceptor::call(&mut interceptor, tonic::Request::new(())).unwrap();
+        assert!(request.metadata().get("x-sandbox-secret").is_none());
+    }
 }

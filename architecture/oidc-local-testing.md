@@ -109,24 +109,21 @@ grpcurl -plaintext -import-path proto -proto openshell.proto \
 ### 2f. Test sandbox secret auth
 
 ```bash
-# Correct secret — should succeed (returns NOT_FOUND since sandbox doesn't exist)
-grpcurl -plaintext -import-path proto -proto openshell.proto \
+# Correct secret — should succeed (returns an empty bundle when no routes are configured)
+grpcurl -plaintext -import-path proto -proto inference.proto \
   -H "x-sandbox-secret: test" \
-  -d '{"sandbox_id":"fake"}' \
-  127.0.0.1:8080 openshell.v1.OpenShell/GetSandboxConfig
-# Expected: Code: NotFound (sandbox doesn't exist, but auth passed)
+  127.0.0.1:8080 openshell.inference.v1.Inference/GetInferenceBundle
+# Expected: success with { "routes": [], ... }
 
 # Wrong secret — should fail at auth
-grpcurl -plaintext -import-path proto -proto openshell.proto \
+grpcurl -plaintext -import-path proto -proto inference.proto \
   -H "x-sandbox-secret: wrong" \
-  -d '{"sandbox_id":"fake"}' \
-  127.0.0.1:8080 openshell.v1.OpenShell/GetSandboxConfig
+  127.0.0.1:8080 openshell.inference.v1.Inference/GetInferenceBundle
 # Expected: Code: Unauthenticated, Message: invalid sandbox secret
 
 # No secret — should fail at auth
-grpcurl -plaintext -import-path proto -proto openshell.proto \
-  -d '{"sandbox_id":"fake"}' \
-  127.0.0.1:8080 openshell.v1.OpenShell/GetSandboxConfig
+grpcurl -plaintext -import-path proto -proto inference.proto \
+  127.0.0.1:8080 openshell.inference.v1.Inference/GetInferenceBundle
 # Expected: Code: Unauthenticated, Message: sandbox secret required
 ```
 

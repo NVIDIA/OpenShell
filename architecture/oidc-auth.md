@@ -175,11 +175,12 @@ Sandbox-to-server RPCs authenticate via the `x-sandbox-secret` metadata header, 
 
 | Method | Purpose |
 |---|---|
-| `GetSandboxConfig` (both services) | Supervisor fetches sandbox configuration |
+| `SandboxService/GetSandboxConfig` | Supervisor fetches sandbox configuration |
 | `ReportPolicyStatus` | Supervisor reports policy enforcement status |
 | `PushSandboxLogs` | Supervisor streams sandbox logs to gateway |
 | `GetSandboxProviderEnvironment` | Supervisor fetches provider credentials |
 | `SubmitPolicyAnalysis` | Supervisor submits policy analysis results |
+| `Inference/GetInferenceBundle` | Supervisor fetches resolved inference routes and provider API keys |
 
 ### Dual-Auth
 
@@ -188,6 +189,7 @@ These methods accept either an OIDC Bearer token (CLI users) or a sandbox secret
 | Method | Purpose |
 |---|---|
 | `UpdateConfig` | Policy and settings mutations |
+| `OpenShell/GetSandboxConfig` | CLI reads effective sandbox policy and settings; sandbox callers may still use the shared secret |
 
 **Sandbox-secret restriction on `UpdateConfig`:** When a sandbox-secret-authenticated caller invokes `UpdateConfig`, the handler in `policy.rs` enforces strict scope limits via `validate_sandbox_secret_update()`. The caller:
 - **Must** provide a sandbox `name` (sandbox-scoped only).
@@ -207,8 +209,9 @@ After JWT validation, the server checks the user's roles against a per-method re
 | Operation | Required Role |
 |---|---|
 | Health probes, reflection | (no auth — unauthenticated) |
-| Supervisor RPCs (GetSandboxConfig, etc.) | (sandbox secret — no RBAC) |
+| Supervisor-only RPCs (`SandboxService/GetSandboxConfig`, `GetInferenceBundle`, etc.) | (sandbox secret — no RBAC) |
 | UpdateConfig via sandbox secret | (sandbox secret — scope-restricted, no RBAC) |
+| OpenShell/GetSandboxConfig via Bearer | user role |
 | Sandbox create, list, delete, exec, SSH | user role |
 | Provider list, get | user role |
 | Provider create, update, delete | admin role |
@@ -243,7 +246,7 @@ Scopes provide opt-in, per-method access control on top of roles. When `--oidc-s
 | `sandbox:write` | CreateSandbox, DeleteSandbox, ExecSandbox, CreateSshSession, RevokeSshSession |
 | `provider:read` | GetProvider, ListProviders |
 | `provider:write` | CreateProvider, UpdateProvider, DeleteProvider |
-| `config:read` | GetGatewayConfig, GetDraftPolicy, GetDraftHistory |
+| `config:read` | GetGatewayConfig, GetSandboxConfig, GetDraftPolicy, GetDraftHistory |
 | `config:write` | UpdateConfig (Bearer), ApproveDraftChunk, ApproveAllDraftChunks, RejectDraftChunk, EditDraftChunk, UndoDraftChunk, ClearDraftChunks |
 | `inference:read` | GetClusterInference |
 | `inference:write` | SetClusterInference |

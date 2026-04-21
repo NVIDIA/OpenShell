@@ -246,6 +246,34 @@ impl DeployOptions {
     }
 }
 
+fn apply_oidc_gateway_metadata(
+    metadata: &mut GatewayMetadata,
+    resume: bool,
+    existing: Option<&GatewayMetadata>,
+    oidc_issuer: Option<&str>,
+    oidc_client_id: &str,
+    oidc_audience: &str,
+) {
+    if let Some(issuer) = oidc_issuer {
+        metadata.auth_mode = Some("oidc".to_string());
+        metadata.oidc_issuer = Some(issuer.to_string());
+        metadata.oidc_client_id = Some(oidc_client_id.to_string());
+        metadata.oidc_audience = Some(oidc_audience.to_string());
+        return;
+    }
+
+    if resume
+        && let Some(existing) = existing
+        && existing.auth_mode.as_deref() == Some("oidc")
+    {
+        metadata.auth_mode = existing.auth_mode.clone();
+        metadata.oidc_issuer = existing.oidc_issuer.clone();
+        metadata.oidc_client_id = existing.oidc_client_id.clone();
+        metadata.oidc_audience = existing.oidc_audience.clone();
+        metadata.oidc_scopes = existing.oidc_scopes.clone();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayHandle {
     name: String,
@@ -616,18 +644,19 @@ where
             ssh_gateway_host.as_deref(),
             disable_tls,
         );
-        if oidc_issuer.is_some() {
-            metadata.auth_mode = Some("oidc".to_string());
-            metadata.oidc_issuer = oidc_issuer.clone();
-            metadata.oidc_client_id = Some(oidc_client_id.clone());
-            metadata.oidc_audience = Some(oidc_audience.clone());
-        } else if let Ok(existing) = load_gateway_metadata(&name) {
-            metadata.auth_mode = existing.auth_mode;
-            metadata.oidc_issuer = existing.oidc_issuer;
-            metadata.oidc_client_id = existing.oidc_client_id;
-            metadata.oidc_audience = existing.oidc_audience;
-            metadata.oidc_scopes = existing.oidc_scopes;
-        }
+        let existing_metadata = if resume {
+            load_gateway_metadata(&name).ok()
+        } else {
+            None
+        };
+        apply_oidc_gateway_metadata(
+            &mut metadata,
+            resume,
+            existing_metadata.as_ref(),
+            oidc_issuer.as_deref(),
+            &oidc_client_id,
+            &oidc_audience,
+        );
         store_gateway_metadata(&name, &metadata)?;
 
         Ok(metadata)
@@ -1278,5 +1307,83 @@ mod tests {
                 "{label} should contain PEM marker"
             );
         }
+    }
+
+    #[test]
+    fn apply_oidc_gateway_metadata_sets_explicit_values() {
+        let mut metadata = GatewayMetadata::default();
+        apply_oidc_gateway_metadata(
+            &mut metadata,
+            false,
+            None,
+            Some("http://issuer.test/realm"),
+            "openshell-cli",
+            "openshell-api",
+        );
+
+        assert_eq!(metadata.auth_mode.as_deref(), Some("oidc"));
+        assert_eq!(
+            metadata.oidc_issuer.as_deref(),
+            Some("http://issuer.test/realm")
+        );
+        assert_eq!(metadata.oidc_client_id.as_deref(), Some("openshell-cli"));
+        assert_eq!(metadata.oidc_audience.as_deref(), Some("openshell-api"));
+    }
+
+    #[test]
+    fn apply_oidc_gateway_metadata_preserves_existing_oidc_on_resume() {
+        let mut metadata = GatewayMetadata::default();
+        let existing = GatewayMetadata {
+            auth_mode: Some("oidc".to_string()),
+            oidc_issuer: Some("http://issuer.test/realm".to_string()),
+            oidc_client_id: Some("openshell-cli".to_string()),
+            oidc_audience: Some("openshell-api".to_string()),
+            oidc_scopes: Some("sandbox:read".to_string()),
+            ..GatewayMetadata::default()
+        };
+
+        apply_oidc_gateway_metadata(
+            &mut metadata,
+            true,
+            Some(&existing),
+            None,
+            "ignored-client",
+            "ignored-audience",
+        );
+
+        assert_eq!(metadata.auth_mode.as_deref(), Some("oidc"));
+        assert_eq!(
+            metadata.oidc_issuer.as_deref(),
+            Some("http://issuer.test/realm")
+        );
+        assert_eq!(metadata.oidc_client_id.as_deref(), Some("openshell-cli"));
+        assert_eq!(metadata.oidc_audience.as_deref(), Some("openshell-api"));
+        assert_eq!(metadata.oidc_scopes.as_deref(), Some("sandbox:read"));
+    }
+
+    #[test]
+    fn apply_oidc_gateway_metadata_does_not_preserve_without_resume() {
+        let mut metadata = GatewayMetadata::default();
+        let existing = GatewayMetadata {
+            auth_mode: Some("oidc".to_string()),
+            oidc_issuer: Some("http://issuer.test/realm".to_string()),
+            oidc_client_id: Some("openshell-cli".to_string()),
+            oidc_audience: Some("openshell-api".to_string()),
+            ..GatewayMetadata::default()
+        };
+
+        apply_oidc_gateway_metadata(
+            &mut metadata,
+            false,
+            Some(&existing),
+            None,
+            "ignored-client",
+            "ignored-audience",
+        );
+
+        assert!(metadata.auth_mode.is_none());
+        assert!(metadata.oidc_issuer.is_none());
+        assert!(metadata.oidc_client_id.is_none());
+        assert!(metadata.oidc_audience.is_none());
     }
 }

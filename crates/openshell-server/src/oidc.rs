@@ -43,7 +43,6 @@ const UNAUTHENTICATED_PREFIXES: &[&str] = &["/grpc.reflection.", "/grpc.health."
 /// OIDC Bearer tokens. These require the `x-sandbox-secret` metadata header
 /// matching the server's SSH handshake secret.
 const SANDBOX_SECRET_METHODS: &[&str] = &[
-    "/openshell.v1.OpenShell/GetSandboxConfig",
     "/openshell.v1.OpenShell/ReportPolicyStatus",
     "/openshell.v1.OpenShell/PushSandboxLogs",
     "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
@@ -53,8 +52,10 @@ const SANDBOX_SECRET_METHODS: &[&str] = &[
 ];
 
 /// Methods that accept either OIDC Bearer token (CLI users) or sandbox
-/// secret (supervisor). UpdateConfig is called by both CLI (policy/settings
-/// mutations) and the sandbox supervisor (policy sync on startup).
+/// secret (supervisor). `UpdateConfig` is called by both CLI
+/// (policy/settings mutations) and the sandbox supervisor (policy sync on
+/// startup). `OpenShell/GetSandboxConfig` serves CLI settings reads while
+/// remaining compatible with sandbox-secret-authenticated callers.
 const DUAL_AUTH_METHODS: &[&str] = &[
     "/openshell.v1.OpenShell/UpdateConfig",
     "/openshell.v1.OpenShell/GetSandboxConfig",
@@ -462,7 +463,7 @@ mod tests {
     #[test]
     fn sandbox_rpcs_use_sandbox_secret() {
         assert!(is_sandbox_secret_method(
-            "/openshell.v1.OpenShell/GetSandboxConfig"
+            "/openshell.sandbox.v1.SandboxService/GetSandboxConfig"
         ));
         assert!(is_sandbox_secret_method(
             "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
@@ -475,6 +476,19 @@ mod tests {
         ));
         assert!(is_sandbox_secret_method(
             "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
+        ));
+        assert!(is_sandbox_secret_method(
+            "/openshell.inference.v1.Inference/GetInferenceBundle"
+        ));
+    }
+
+    #[test]
+    fn openshell_get_sandbox_config_is_dual_auth() {
+        assert!(!is_sandbox_secret_method(
+            "/openshell.v1.OpenShell/GetSandboxConfig"
+        ));
+        assert!(is_dual_auth_method(
+            "/openshell.v1.OpenShell/GetSandboxConfig"
         ));
     }
 

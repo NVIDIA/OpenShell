@@ -66,6 +66,7 @@ const SCOPED_METHODS: &[(&str, &str)] = &[
     ("/openshell.v1.OpenShell/DeleteProvider", "provider:write"),
     // config:read
     ("/openshell.v1.OpenShell/GetGatewayConfig", "config:read"),
+    ("/openshell.v1.OpenShell/GetSandboxConfig", "config:read"),
     ("/openshell.v1.OpenShell/GetDraftPolicy", "config:read"),
     ("/openshell.v1.OpenShell/GetDraftHistory", "config:read"),
     // config:write
@@ -417,6 +418,24 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(err.message().contains("sandbox:write"));
+    }
+
+    #[test]
+    fn get_sandbox_config_requires_config_read_scope() {
+        let policy = scoped_policy();
+        let id = identity_with_roles_and_scopes(&["openshell-user"], &["config:read"]);
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/GetSandboxConfig")
+                .is_ok()
+        );
+
+        let wrong_scope = identity_with_roles_and_scopes(&["openshell-user"], &["sandbox:read"]);
+        let err = policy
+            .check(&wrong_scope, "/openshell.v1.OpenShell/GetSandboxConfig")
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("config:read"));
     }
 
     #[test]
