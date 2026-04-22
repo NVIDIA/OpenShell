@@ -254,6 +254,31 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 3. Run `mise run ci` to verify.
 4. Open a PR using the `create-github-pr` skill or manually following the [PR template](.github/PULL_REQUEST_TEMPLATE.md).
 
+### CI Lanes
+
+Most CI runs automatically on every PR push (lint, unit tests, docs validation). Expensive lanes that need self-hosted runners — **Branch E2E Checks** and **GPU Test** — are gated to protect those runners from untrusted code.
+
+Both lanes run against PR code only after it has been mirrored to a `pull-request/<N>` branch in this repository by [`copy-pr-bot`](https://docs.gha-runners.nvidia.com/platform/apps/copy-pr-bot/). They also require an explicit label on the PR:
+
+| Lane                 | Label          | Runner           |
+| -------------------- | -------------- | ---------------- |
+| Branch E2E Checks    | `test:e2e`     | `build-arm64`    |
+| GPU Test             | `test:e2e-gpu` | Self-hosted GPU  |
+
+**Trusted PRs** (org members, vouched contributors with signed commits) are mirrored automatically when marked ready-for-review.
+
+**Untrusted PRs** (unvouched users, unsigned commits) need a vetter to comment `/ok to test <SHA>` on the PR. `copy-pr-bot` mirrors the code once the vetter approves.
+
+The workflow re-checks the label and head SHA on every `pull-request/<N>` push. A maintainer typically:
+
+1. Reviews the PR for safety.
+2. Applies `test:e2e` (and/or `test:e2e-gpu`).
+3. Triggers the run:
+   - If the label was applied **before** `copy-pr-bot` mirrored the code, the push already ran the workflow and it will now pick up the label automatically on the next commit.
+   - If `copy-pr-bot` already mirrored and the initial run showed `should_run=false`, re-run that workflow from the Actions UI (or `gh run rerun <run-id>`). The gate fetches live PR metadata, sees the label, and proceeds.
+
+Release builds (`Release Tag`, `Release Dev`) run the same E2E reusable workflow on `main` / tag pushes — those refs are inherently trusted, so they do not go through `copy-pr-bot`.
+
 ### Commit Messages
 
 This project uses [Conventional Commits](https://www.conventionalcommits.org/). All commit messages must follow the format:
