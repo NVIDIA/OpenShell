@@ -6,12 +6,12 @@ description: >
   non-`push` events (e.g. `workflow_dispatch`), always sets `should-run=true`.
 
 inputs:
-  required-label:
+  required_label:
     description: PR label required to enable the run (e.g. "test:e2e").
     required: true
 
 outputs:
-  should-run:
+  should_run:
     description: "true if the workflow should proceed, false otherwise"
     value: ${{ steps.gate.outputs.should_run }}
 
@@ -30,7 +30,7 @@ runs:
         GITHUB_SHA_VALUE: ${{ github.sha }}
         GET_PR_INFO_OUTCOME: ${{ steps.get_pr_info.outcome }}
         PR_INFO: ${{ steps.get_pr_info.outputs.pr-info }}
-        REQUIRED_LABEL: ${{ inputs.required-label }}
+        REQUIRED_LABEL: ${{ inputs.required_label }}
       run: |
         if [ "$EVENT_NAME" != "push" ]; then
           echo "should_run=true" >> "$GITHUB_OUTPUT"

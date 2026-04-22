@@ -1,0 +1,101 @@
+name: E2E Gate Check
+
+# Reusable gate that enforces: when `required_label` is present on a PR,
+# `workflow_file` must have completed successfully for the PR head SHA.
+#
+# Callers wire their own triggers (`pull_request` + `workflow_run` for the
+# workflow this gate guards) and pass in the label and workflow filename.
+
+on:
+  workflow_call:
+    inputs:
+      required_label:
+        description: PR label that makes the gated workflow mandatory.
+        required: true
+        type: string
+      workflow_file:
+        description: Filename of the workflow whose run must have succeeded (e.g. "branch-e2e.yml").
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  check:
+    name: Enforce ${{ inputs.required_label }} runs when labeled
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    steps:
+      - name: Resolve PR context
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_SHA_FROM_EVENT: ${{ github.event.pull_request.head.sha }}
+          PR_LABELS_FROM_EVENT: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            head_sha="$PR_HEAD_SHA_FROM_EVENT"
+            labels_json=$(jq -c . <<< "$PR_LABELS_FROM_EVENT")
+          else
+            head_sha="$WORKFLOW_RUN_HEAD_SHA"
+            pr=$(gh api "repos/$GH_REPO/commits/$head_sha/pulls" --jq '.[0] // empty')
+            if [ -z "$pr" ]; then
+              echo "No PR associated with $head_sha; gate is a no-op."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            labels_json=$(jq -c '[.labels[].name]' <<< "$pr")
+          fi
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "labels_json=$labels_json" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate gate
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          LABELS_JSON: ${{ steps.pr.outputs.labels_json }}
+          REQUIRED_LABEL: ${{ inputs.required_label }}
+          WORKFLOW_FILE: ${{ inputs.workflow_file }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          has_label=$(jq -r --arg L "$REQUIRED_LABEL" 'any(.[]; . == $L)' <<< "$LABELS_JSON")
+          if [ "$has_label" != "true" ]; then
+            echo "::notice::$REQUIRED_LABEL not applied; gate passes."
+            exit 0
+          fi
+
+          runs=$(gh api "repos/$GH_REPO/actions/workflows/$WORKFLOW_FILE/runs?head_sha=$HEAD_SHA&event=push" --jq '.workflow_runs')
+          latest=$(jq -c 'sort_by(.created_at) | reverse | .[0] // empty' <<< "$runs")
+
+          if [ -z "$latest" ]; then
+            echo "::error::$REQUIRED_LABEL is applied but $WORKFLOW_FILE has not run for $HEAD_SHA. Wait for copy-pr-bot to mirror the PR, or re-run the gate once the workflow completes."
+            exit 1
+          fi
+
+          status=$(jq -r '.status' <<< "$latest")
+          conclusion=$(jq -r '.conclusion' <<< "$latest")
+
+          if [ "$conclusion" = "success" ]; then
+            echo "$WORKFLOW_FILE succeeded for $HEAD_SHA."
+            exit 0
+          fi
+
+          if [ "$status" != "completed" ]; then
+            echo "::error::$WORKFLOW_FILE is $status for $HEAD_SHA. This gate will re-evaluate on completion."
+            exit 1
+          fi
+
+          echo "::error::$WORKFLOW_FILE concluded as $conclusion for $HEAD_SHA."
+          exit 1

@@ -1,10 +1,10 @@
-name: E2E Gate
+name: GPU E2E Gate
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
   workflow_run:
-    workflows: ["Branch E2E Checks"]
+    workflows: ["GPU Test"]
     types: [completed]
 
 permissions: {}
@@ -17,5 +17,5 @@ jobs:
       actions: read
     uses: ./.github/workflows/e2e-gate-check.yml
     with:
-      required_label: test:e2e
-      workflow_file: branch-e2e.yml
+      required_label: test:e2e-gpu
+      workflow_file: test-gpu.yml

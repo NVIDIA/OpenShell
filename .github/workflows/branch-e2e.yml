@@ -16,13 +16,13 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      should_run: ${{ steps.gate.outputs.should-run }}
+      should_run: ${{ steps.gate.outputs.should_run }}
     steps:
       - uses: actions/checkout@v4
       - id: gate
         uses: ./.github/actions/pr-gate
         with:
-          required-label: test:e2e
+          required_label: test:e2e
 
   build-gateway:
     needs: [pr_metadata]
