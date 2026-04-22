@@ -39,6 +39,18 @@ The following software must be installed on the host before using the OpenShell 
 | ------------------------------- | --------------- | ----------------------------------------------- |
 | Docker Desktop or Docker Engine | 28.04           | Must be running before any `openshell` command. |
 
+## Compute Driver Notes
+
+OpenShell gateway deployments always run inside Docker, but sandbox provisioning can target different compute backends.
+
+| Backend | Host requirement | Notes |
+| --- | --- | --- |
+| Kubernetes | Docker plus the bundled single-node cluster | Default backend used by `openshell gateway start`. |
+| Docker | Local Docker-compatible daemon reachable from the gateway process | Sandboxes stay as long-lived containers. No sandbox ports are published; access still uses the supervisor relay. |
+| VM | Host support for the packaged libkrun runtime | The gateway spawns a separate `openshell-driver-vm` helper. |
+
+For Docker-backed sandboxes on macOS, the gateway must side-load a Linux `openshell-sandbox` binary into each container. Provide that binary with `--docker-supervisor-bin` or build one locally so the gateway can auto-discover it at `target/aarch64-unknown-linux-gnu/release/openshell-sandbox`.
+
 ## Sandbox Runtime Versions
 
 Sandbox container images are maintained in the [openshell-community](https://github.com/nvidia/openshell-community) repository. Refer to that repository for the current list of installed components and their versions.

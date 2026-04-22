@@ -3317,6 +3317,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
+ "bollard",
  "bytes",
  "clap",
  "futures",

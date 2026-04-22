@@ -72,6 +72,7 @@ sqlx = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
+bollard = { version = "0.20" }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"

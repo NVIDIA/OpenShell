@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::compute::VmComputeConfig;
+use crate::compute::{DockerComputeConfig, VmComputeConfig};
 use crate::{run_server, tracing_bus::TracingLogBus};
 
 /// `OpenShell` gateway process - gRPC and HTTP server with protocol multiplexing.
@@ -177,6 +177,22 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_TLS_KEY")]
     vm_tls_key: Option<PathBuf>,
 
+    /// Linux `openshell-sandbox` binary bind-mounted into Docker sandboxes.
+    #[arg(long, env = "OPENSHELL_DOCKER_SUPERVISOR_BIN")]
+    docker_supervisor_bin: Option<PathBuf>,
+
+    /// CA certificate bind-mounted into Docker sandboxes for gateway mTLS.
+    #[arg(long, env = "OPENSHELL_DOCKER_TLS_CA")]
+    docker_tls_ca: Option<PathBuf>,
+
+    /// Client certificate bind-mounted into Docker sandboxes for gateway mTLS.
+    #[arg(long, env = "OPENSHELL_DOCKER_TLS_CERT")]
+    docker_tls_cert: Option<PathBuf>,
+
+    /// Client private key bind-mounted into Docker sandboxes for gateway mTLS.
+    #[arg(long, env = "OPENSHELL_DOCKER_TLS_KEY")]
+    docker_tls_key: Option<PathBuf>,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -315,6 +331,13 @@ async fn run_from_args(args: Args) -> Result<()> {
         guest_tls_key: args.vm_tls_key,
     };
 
+    let docker_config = DockerComputeConfig {
+        supervisor_bin: args.docker_supervisor_bin,
+        guest_tls_ca: args.docker_tls_ca,
+        guest_tls_cert: args.docker_tls_cert,
+        guest_tls_key: args.docker_tls_key,
+    };
+
     if args.disable_tls {
         info!("TLS disabled — listening on plaintext HTTP");
     } else if args.disable_gateway_auth {
@@ -323,7 +346,7 @@ async fn run_from_args(args: Args) -> Result<()> {
 
     info!(bind = %config.bind_address, "Starting OpenShell server");
 
-    run_server(config, vm_config, tracing_log_bus)
+    run_server(config, vm_config, docker_config, tracing_log_bus)
         .await
         .into_diagnostic()
 }

@@ -22,6 +22,18 @@ The following table describes each component and its role in the system:
 | **Sandbox** | Isolated runtime that includes container supervision and policy-enforced egress routing. |
 | **Policy Engine** | Policy definition and enforcement layer for filesystem, network, process, and inference constraints. Defense in depth enforces policies from the application layer down to infrastructure and kernel layers. |
 
+## Compute Backends
+
+The gateway talks to sandbox runtimes through a compute driver. OpenShell currently supports three backends:
+
+| Backend | Where it runs | Notes |
+|---|---|---|
+| **Kubernetes** | In-process in the gateway | Creates sandbox CRDs and lets the sandbox supervisor call back over the gateway's gRPC control plane. |
+| **Docker** | In-process in the gateway | Uses the local Docker daemon through Bollard, keeps one container per sandbox alive until delete, and does not publish sandbox ports. |
+| **VM** | Separate helper process | Spawns `openshell-driver-vm`, which boots libkrun guests and keeps the VM runtime outside the gateway binary. |
+
+Regardless of backend, sandbox access is supervisor-initiated. The gateway does not dial sandbox IPs or expose sandbox SSH ports. Each supervisor opens `ConnectSupervisor` back to the gateway, and SSH or exec traffic rides that existing mTLS HTTP/2 connection as relay streams.
+
 ## How a Request Flows
 
 Every outbound connection from agent code passes through the same decision path:

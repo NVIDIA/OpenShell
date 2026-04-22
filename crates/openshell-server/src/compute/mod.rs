@@ -3,8 +3,10 @@
 
 //! Gateway-owned compute orchestration over a pluggable compute backend.
 
+pub mod docker;
 pub mod vm;
 
+pub use docker::DockerComputeConfig;
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::{SANDBOX_SETTINGS_OBJECT_TYPE, sandbox_settings_id};
@@ -224,6 +226,29 @@ impl ComputeRuntime {
             supervisor_sessions,
             sync_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    pub async fn new_docker(
+        config: openshell_core::Config,
+        docker_config: DockerComputeConfig,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+    ) -> Result<Self, ComputeError> {
+        let driver = docker::DockerComputeDriver::new(&config, &docker_config)
+            .await
+            .map_err(|err| ComputeError::Message(err.to_string()))?;
+        let driver: SharedComputeDriver = Arc::new(driver);
+        Self::from_driver(
+            driver,
+            None,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+        )
+        .await
     }
 
     pub async fn new_kubernetes(
