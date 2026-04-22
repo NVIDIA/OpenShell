@@ -32,7 +32,7 @@ jobs:
           set -euo pipefail
           if [ "$EVENT_NAME" = "pull_request" ]; then
             head_sha="$PR_HEAD_SHA_FROM_EVENT"
-            labels_json="$PR_LABELS_FROM_EVENT"
+            labels_json=$(jq -c . <<< "$PR_LABELS_FROM_EVENT")
           else
             head_sha="$WORKFLOW_RUN_HEAD_SHA"
             pr=$(gh api "repos/$GH_REPO/commits/$head_sha/pulls" --jq '.[0] // empty')
@@ -41,7 +41,7 @@ jobs:
               echo "skip=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            labels_json=$(echo "$pr" | jq -c '[.labels[].name]')
+            labels_json=$(jq -c '[.labels[].name]' <<< "$pr")
           fi
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "labels_json=$labels_json" >> "$GITHUB_OUTPUT"
