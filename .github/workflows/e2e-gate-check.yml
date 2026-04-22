@@ -84,18 +84,30 @@ jobs:
             exit 1
           fi
 
+          run_id=$(jq -r '.id' <<< "$latest")
           status=$(jq -r '.status' <<< "$latest")
           conclusion=$(jq -r '.conclusion' <<< "$latest")
-
-          if [ "$conclusion" = "success" ]; then
-            echo "$WORKFLOW_FILE succeeded for $HEAD_SHA."
-            exit 0
-          fi
 
           if [ "$status" != "completed" ]; then
             echo "::error::$WORKFLOW_FILE is $status for $HEAD_SHA. This gate will re-evaluate on completion."
             exit 1
           fi
 
-          echo "::error::$WORKFLOW_FILE concluded as $conclusion for $HEAD_SHA."
-          exit 1
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::$WORKFLOW_FILE concluded as $conclusion for $HEAD_SHA."
+            exit 1
+          fi
+
+          # Top-level success isn't enough: if `pr_metadata` gated downstream
+          # jobs out (label wasn't set at run time), only the gate job itself
+          # concludes `success` and the workflow still reports `success`.
+          # Require at least one non-gate job to have succeeded as proof the
+          # label was present when the workflow ran.
+          real_success=$(gh api "repos/$GH_REPO/actions/runs/$run_id/jobs" --jq '[.jobs[] | select(.conclusion == "success" and .name != "Resolve PR metadata")] | length')
+          if [ "$real_success" -lt 1 ]; then
+            echo "::error::$WORKFLOW_FILE run $run_id only ran the metadata gate — $REQUIRED_LABEL was not set when the workflow last executed. Re-run $WORKFLOW_FILE so the gate re-evaluates with the label present."
+            exit 1
+          fi
+
+          echo "$WORKFLOW_FILE run $run_id executed and succeeded for $HEAD_SHA ($real_success non-gate job(s) passed)."
+          exit 0
