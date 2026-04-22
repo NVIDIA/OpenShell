@@ -37,5 +37,13 @@ libloading = "0.8"
 tar = "0.4"
 zstd = "0.13"
 
+# smol-rs/polling drives the BSD/macOS parent-death detection in
+# procguard via kqueue's EVFILT_PROC / NOTE_EXIT filter. We could use
+# it on Linux too (via epoll + pidfd) but sticking with
+# nix::sys::prctl::set_pdeathsig there keeps the Linux path a single
+# syscall with no helper thread.
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
+polling = "3.11"
+
 [lints]
 workspace = true

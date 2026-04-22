@@ -4,6 +4,7 @@
 pub mod driver;
 mod embedded_runtime;
 mod ffi;
+pub mod procguard;
 mod rootfs;
 mod runtime;
 

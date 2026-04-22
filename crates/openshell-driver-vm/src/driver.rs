@@ -258,7 +258,19 @@ impl VmDriver {
 
         let console_output = state_dir.join("rootfs-console.log");
         let mut command = Command::new(&self.launcher_bin);
-        command.kill_on_drop(true);
+        // Intentionally DO NOT set kill_on_drop(true). On a signal-driven
+        // driver exit (SIGKILL, SIGTERM without a handler, panic),
+        // tokio's Drop is racy with the launcher's procguard-initiated
+        // cleanup: if kill_on_drop SIGKILLs the launcher first, its
+        // cleanup callback never gets to SIGTERM gvproxy, and gvproxy is
+        // reparented to init as an orphan. Instead the whole cleanup
+        // cascade runs via procguard:
+        //   driver exits → launcher's kqueue (macOS) or PR_SET_PDEATHSIG
+        //   (Linux) fires → launcher kills gvproxy + libkrun fork →
+        //   launcher exits → its own children die under pdeathsig.
+        // The explicit Drop path in VmProcess::terminate_vm_process still
+        // handles voluntary `delete_sandbox` teardown cleanly, where we
+        // do want SIGTERM + wait + SIGKILL semantics.
         command.stdin(Stdio::null());
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());

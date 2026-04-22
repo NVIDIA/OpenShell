@@ -10,11 +10,18 @@ use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::{embedded_runtime, ffi};
+use crate::{embedded_runtime, ffi, procguard};
 
 pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
 
+/// PID of the forked libkrun worker (the VM's PID 1). Zero when not running.
+/// Used by the SIGTERM/SIGINT handler to forward signals to the VM.
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+
+/// PID of the gvproxy helper process. Zero when not running. Used by the
+/// SIGTERM/SIGINT handler to make sure gvproxy doesn't survive the
+/// launcher on macOS (where we can't use `PR_SET_PDEATHSIG`).
+static GVPROXY_PID: AtomicI32 = AtomicI32::new(0);
 
 pub struct VmLaunchConfig {
     pub rootfs: PathBuf,
@@ -34,6 +41,47 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
             "rootfs directory not found: {}",
             config.rootfs.display()
         ));
+    }
+
+    // Arm procguard first, BEFORE we spawn gvproxy or fork libkrun, so
+    // that the launcher can't be orphaned during setup. The cleanup
+    // callback reads the GVPROXY_PID atomic (initially 0 — no-op) and
+    // the CHILD_PID atomic (the libkrun fork), so it stays correct as
+    // those slots get populated later in this function. Only ONE arm
+    // per process: racing two watchers for the same NOTE_EXIT event
+    // would cause whichever wins to skip the cleanup.
+    if let Err(err) = procguard::die_with_parent_cleanup(|| {
+        // Cleanup order: SIGTERM gvproxy and the libkrun fork first so
+        // they can drain cleanly, then SIGKILL after a brief grace
+        // window. We can't rely on Rust destructors here; when
+        // procguard's watcher thread returns we call `std::process::exit`
+        // and the process tears down. Only async-signal-safe calls here:
+        // atomic loads and `kill(2)` are both on the POSIX list.
+        let gv_pid = GVPROXY_PID.load(Ordering::Relaxed);
+        let child_pid = CHILD_PID.load(Ordering::Relaxed);
+        if gv_pid > 0 {
+            unsafe {
+                libc::kill(gv_pid, libc::SIGTERM);
+            }
+        }
+        if child_pid > 0 {
+            unsafe {
+                libc::kill(child_pid, libc::SIGTERM);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        if gv_pid > 0 {
+            unsafe {
+                libc::kill(gv_pid, libc::SIGKILL);
+            }
+        }
+        if child_pid > 0 {
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+            }
+        }
+    }) {
+        return Err(format!("procguard arm failed: {err}"));
     }
 
     #[cfg(target_os = "linux")]
@@ -118,16 +166,43 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
         // surfacing a misleading "sshd is reachable" endpoint. See
         // https://github.com/containers/gvisor-tap-vsock `cmd/gvproxy/main.go`
         // (`getForwardsMap` returns an empty map when `sshPort == -1`).
-        let child = StdCommand::new(&gvproxy_binary)
+        let mut gvproxy_cmd = StdCommand::new(&gvproxy_binary);
+        gvproxy_cmd
             .arg(gvproxy_net_flag)
             .arg(&gvproxy_net_url)
             .arg("-ssh-port")
             .arg("-1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(gvproxy_log_file)
+            .stderr(gvproxy_log_file);
+
+        // On Linux the kernel will SIGKILL gvproxy the moment this
+        // launcher dies (or is SIGKILLed). `pre_exec` runs in the child
+        // between fork and execve, so the PR_SET_PDEATHSIG flag is
+        // inherited across execve and applies to gvproxy proper. On
+        // macOS/BSDs there is no equivalent; we fall back to killing
+        // gvproxy explicitly from the launcher's procguard cleanup
+        // callback (see `run_vm` above) and SIGTERM handler
+        // (see `install_signal_forwarding` below).
+        #[cfg(target_os = "linux")]
+        {
+            use nix::sys::signal::Signal;
+            use std::os::unix::process::CommandExt as _;
+            unsafe {
+                gvproxy_cmd.pre_exec(|| {
+                    nix::sys::prctl::set_pdeathsig(Signal::SIGKILL)
+                        .map_err(|err| std::io::Error::other(format!("pdeathsig: {err}")))
+                });
+            }
+        }
+
+        let child = gvproxy_cmd
             .spawn()
             .map_err(|e| format!("failed to start gvproxy {}: {e}", gvproxy_binary.display()))?;
+        // The procguard cleanup reads GVPROXY_PID atomically. Storing it
+        // here makes the callback able to SIGTERM gvproxy if the driver
+        // dies from this moment onward.
+        GVPROXY_PID.store(child.id() as i32, Ordering::Relaxed);
 
         wait_for_path(&net_sock, Duration::from_secs(5), "gvproxy data socket")?;
 
@@ -176,6 +251,20 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
     match pid {
         -1 => Err(format!("fork failed: {}", std::io::Error::last_os_error())),
         0 => {
+            // We are the libkrun worker (the VM's PID 1 inside the guest
+            // kernel, but a normal host process until krun_start_enter
+            // fires). Arm procguard so this fork is SIGKILLed if the
+            // parent launcher dies abruptly. On Linux this uses
+            // `PR_SET_PDEATHSIG`; on macOS this spawns a kqueue
+            // NOTE_EXIT watcher thread. Either way it closes the same
+            // leak gvproxy does above.
+            //
+            // We also SIGKILL ourselves if arming fails — there's no
+            // safe way to continue if we can't guarantee cleanup.
+            if let Err(err) = procguard::die_with_parent() {
+                eprintln!("libkrun worker: procguard arm failed: {err}");
+                std::process::exit(1);
+            }
             let ret = vm.start_enter();
             eprintln!("krun_start_enter failed: {ret}");
             std::process::exit(1);
@@ -186,6 +275,7 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
             let status = wait_for_child(pid)?;
             CHILD_PID.store(0, Ordering::Relaxed);
             cleanup_gvproxy(gvproxy_guard);
+            GVPROXY_PID.store(0, Ordering::Relaxed);
 
             if libc::WIFEXITED(status) {
                 match libc::WEXITSTATUS(status) {
@@ -554,11 +644,28 @@ fn install_signal_forwarding(pid: i32) {
     CHILD_PID.store(pid, Ordering::Relaxed);
 }
 
+/// Async-signal-safe handler that forwards SIGTERM to every process we
+/// own: the libkrun VM worker and the gvproxy helper. We cannot rely on
+/// Rust destructors (`GvproxyGuard::drop`, `ManagedDriverProcess::drop`)
+/// running on signal-driven exit, so we explicitly deliver the signal
+/// here. The `wait_for_child` loop reaps libkrun and `cleanup_gvproxy`
+/// reaps gvproxy before `run_vm` returns.
+///
+/// Only async-signal-safe libc calls are used — `kill(2)` is listed in
+/// POSIX.1-2017 as async-signal-safe, atomic loads are lock-free on the
+/// platforms we target.
 extern "C" fn forward_signal(_sig: libc::c_int) {
-    let pid = CHILD_PID.load(Ordering::Relaxed);
-    if pid > 0 {
+    let vm_pid = CHILD_PID.load(Ordering::Relaxed);
+    if vm_pid > 0 {
         unsafe {
-            libc::kill(pid, libc::SIGTERM);
+            libc::kill(vm_pid, libc::SIGTERM);
+        }
+    }
+    let gv_pid = GVPROXY_PID.load(Ordering::Relaxed);
+    if gv_pid > 0 {
+        // gvproxy handles SIGTERM cleanly; no need for SIGKILL.
+        unsafe {
+            libc::kill(gv_pid, libc::SIGTERM);
         }
     }
 }
