@@ -193,8 +193,14 @@ issuer to the Helm chart so the gateway starts with JWT validation enabled.
 
 ```bash
 HOST_IP=$(hostname -I | awk '{print $1}')
-OPENSHELL_OIDC_ISSUER="http://${HOST_IP}:8180/realms/openshell" mise run cluster
+OPENSHELL_OIDC_ISSUER="http://${HOST_IP}:8180/realms/openshell" \
+OPENSHELL_OIDC_SCOPES="openshell:all" \
+mise run cluster
 ```
+
+Add `OPENSHELL_OIDC_SCOPES_CLAIM="scope"` to also enable scope enforcement.
+The `OPENSHELL_OIDC_SCOPES` value is stored in gateway metadata so `gateway login`
+requests these scopes automatically.
 
 Wait for "Deploy complete!" and verify OIDC is active:
 
@@ -428,18 +434,14 @@ openshell gateway add http://127.0.0.1:8080 \
   --oidc-scopes "sandbox:read sandbox:write"
 ```
 
-Or for K3s testing:
+Or for K3s testing, pass `OPENSHELL_OIDC_SCOPES` during bootstrap:
 
 ```bash
 HOST_IP=$(hostname -I | awk '{print $1}')
 OPENSHELL_OIDC_ISSUER="http://${HOST_IP}:8180/realms/openshell" \
 OPENSHELL_OIDC_SCOPES_CLAIM="scope" \
+OPENSHELL_OIDC_SCOPES="sandbox:read sandbox:write" \
 mise run cluster
-
-# Update gateway metadata with scopes
-jq '.oidc_scopes = "sandbox:read sandbox:write"' \
-  ~/.config/openshell/gateways/openshell/metadata.json > /tmp/meta.json \
-  && mv /tmp/meta.json ~/.config/openshell/gateways/openshell/metadata.json
 ```
 
 Then login and test:
@@ -454,10 +456,15 @@ openshell provider list   # should fail (no provider:read scope)
 
 ### 5f. Test openshell:all via CLI
 
+For K3s, restart the cluster with `openshell:all`:
+
 ```bash
-jq '.oidc_scopes = "openshell:all"' \
-  ~/.config/openshell/gateways/openshell/metadata.json > /tmp/meta.json \
-  && mv /tmp/meta.json ~/.config/openshell/gateways/openshell/metadata.json
+mise run cluster:stop
+HOST_IP=$(hostname -I | awk '{print $1}')
+OPENSHELL_OIDC_ISSUER="http://${HOST_IP}:8180/realms/openshell" \
+OPENSHELL_OIDC_SCOPES_CLAIM="scope" \
+OPENSHELL_OIDC_SCOPES="openshell:all" \
+mise run cluster
 
 openshell gateway login
 openshell sandbox list    # should work
