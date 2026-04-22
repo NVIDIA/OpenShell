@@ -38,6 +38,7 @@ use url::{Host, Url};
 
 const WATCH_BUFFER: usize = 128;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 const MANAGED_BY_LABEL_KEY: &str = "openshell.ai/managed-by";
 const MANAGED_BY_LABEL_VALUE: &str = "openshell";
@@ -289,14 +290,24 @@ impl DockerComputeDriver {
         else {
             return Ok(false);
         };
-        let Some(container_name) = summary_container_name(&container) else {
+        // Prefer the container ID: it's always populated in ContainerSummary,
+        // remains valid while the container exists, and is accepted by
+        // `remove_container` just like a name. Falling back to the parsed
+        // name covers any transient where `id` is missing.
+        let Some(target) = container
+            .id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .or_else(|| summary_container_name(&container))
+        else {
             return Ok(false);
         };
 
         match self
             .docker
             .remove_container(
-                &container_name,
+                &target,
                 Some(RemoveContainerOptionsBuilder::default().force(true).build()),
             )
             .await
@@ -316,15 +327,25 @@ impl DockerComputeDriver {
             }
         };
 
+        // Exponential backoff on consecutive Docker failures to avoid a 2s
+        // warn-log flood when the daemon is unreachable for an extended
+        // period (e.g. restart, socket removed).
+        let mut backoff = WATCH_POLL_INTERVAL;
         loop {
-            tokio::time::sleep(WATCH_POLL_INTERVAL).await;
+            tokio::time::sleep(backoff).await;
             match self.current_snapshot_map().await {
                 Ok(current) => {
                     emit_snapshot_diff(&self.events, &previous, &current);
                     previous = current;
+                    backoff = WATCH_POLL_INTERVAL;
                 }
                 Err(err) => {
-                    warn!(error = %err, "Failed to poll Docker sandboxes");
+                    warn!(
+                        error = %err,
+                        backoff_secs = backoff.as_secs(),
+                        "Failed to poll Docker sandboxes"
+                    );
+                    backoff = (backoff * 2).min(WATCH_POLL_MAX_BACKOFF);
                 }
             }
         }
@@ -583,8 +604,13 @@ impl ComputeDriver for DockerComputeDriver {
         &self,
         _request: Request<WatchSandboxesRequest>,
     ) -> Result<Response<Self::WatchSandboxesStream>, Status> {
-        let initial = self.current_snapshots().await?;
+        // Subscribe before taking the initial snapshot so any event emitted
+        // between the snapshot and this subscriber becoming active is still
+        // delivered. Downstream consumers treat sandbox events as
+        // idempotent (keyed by sandbox id), so a duplicate event is benign
+        // while a missed one leaks state.
         let mut rx = self.events.subscribe();
+        let initial = self.current_snapshots().await?;
         let (tx, out_rx) = mpsc::channel(WATCH_BUFFER);
         tokio::spawn(async move {
             for sandbox in initial {
@@ -957,18 +983,56 @@ fn label_filters(values: impl IntoIterator<Item = String>) -> HashMap<String, Ve
     HashMap::from([("label".to_string(), values.into_iter().collect())])
 }
 
+/// Maximum Docker container name length. Docker's own limit is 253 bytes, but
+/// we cap at a conservative 200 to leave headroom for tooling that truncates
+/// names further.
+const MAX_CONTAINER_NAME_LEN: usize = 200;
+const CONTAINER_NAME_PREFIX: &str = "openshell-";
+
 fn container_name_for_sandbox(sandbox: &DriverSandbox) -> String {
     let id_suffix = sanitize_docker_name(&sandbox.id);
     let name = sanitize_docker_name(&sandbox.name);
-    let mut base = if name.is_empty() {
-        format!("openshell-{id_suffix}")
-    } else {
-        format!("openshell-{name}-{id_suffix}")
-    };
-    if base.len() > 96 {
-        base.truncate(96);
+    if name.is_empty() {
+        let mut base = format!("{CONTAINER_NAME_PREFIX}{id_suffix}");
+        // The prefix is always < MAX_CONTAINER_NAME_LEN. Truncate the id
+        // suffix only if the sandbox id itself is pathologically long.
+        if base.len() > MAX_CONTAINER_NAME_LEN {
+            base.truncate(MAX_CONTAINER_NAME_LEN);
+        }
+        return base;
     }
-    base
+
+    // Reserve space for the prefix and the `-<id_suffix>` tail so the id
+    // suffix — which is what makes the name unique between sandboxes that
+    // share a human-readable prefix — is never truncated away.
+    let reserved = CONTAINER_NAME_PREFIX.len() + 1 + id_suffix.len();
+    if reserved >= MAX_CONTAINER_NAME_LEN {
+        // Pathological sandbox id. Fall back to `<prefix><id>` and truncate.
+        let mut base = format!("{CONTAINER_NAME_PREFIX}{id_suffix}");
+        base.truncate(MAX_CONTAINER_NAME_LEN);
+        return trim_container_name_tail(base);
+    }
+
+    let name_budget = MAX_CONTAINER_NAME_LEN - reserved;
+    let truncated_name = if name.len() > name_budget {
+        trim_container_name_tail(name[..name_budget].to_string())
+    } else {
+        name
+    };
+    format!("{CONTAINER_NAME_PREFIX}{truncated_name}-{id_suffix}")
+}
+
+/// Docker container names may not end with `-`, `.`, or `_`. Truncation can
+/// leave one of those trailing, so strip them before returning.
+fn trim_container_name_tail(mut value: String) -> String {
+    while value
+        .chars()
+        .last()
+        .is_some_and(|ch| matches!(ch, '-' | '.' | '_'))
+    {
+        value.pop();
+    }
+    value
 }
 
 fn sanitize_docker_name(value: &str) -> String {
@@ -1092,7 +1156,17 @@ pub(crate) fn docker_guest_tls_paths(
     config: &Config,
     docker_config: &DockerComputeConfig,
 ) -> CoreResult<Option<DockerGuestTlsPaths>> {
+    let tls_flags_provided = docker_config.guest_tls_ca.is_some()
+        || docker_config.guest_tls_cert.is_some()
+        || docker_config.guest_tls_key.is_some();
+
     if !config.grpc_endpoint.starts_with("https://") {
+        if tls_flags_provided {
+            return Err(Error::config(format!(
+                "--docker-tls-ca/--docker-tls-cert/--docker-tls-key were provided but OPENSHELL_GRPC_ENDPOINT is '{}'; TLS materials require an https:// endpoint",
+                config.grpc_endpoint,
+            )));
+        }
         return Ok(None);
     }
 
@@ -1378,5 +1452,97 @@ mod tests {
                 "target/aarch64-unknown-linux-gnu/release/openshell-sandbox",
             )]
         );
+    }
+
+    #[test]
+    fn container_name_preserves_id_suffix_for_long_names() {
+        // Names up to 253 chars are permitted by the gRPC layer. The id
+        // suffix is what makes the container name unique between sandboxes
+        // sharing a prefix, so it must always appear in the final name.
+        let long_name = "a".repeat(253);
+        let first = DriverSandbox {
+            id: "sbx-first-1234567890".to_string(),
+            name: long_name.clone(),
+            namespace: "default".to_string(),
+            spec: None,
+            status: None,
+        };
+        let second = DriverSandbox {
+            id: "sbx-second-0987654321".to_string(),
+            ..first.clone()
+        };
+
+        let first_container = container_name_for_sandbox(&first);
+        let second_container = container_name_for_sandbox(&second);
+
+        assert!(
+            first_container.len() <= MAX_CONTAINER_NAME_LEN,
+            "container name {} exceeded {MAX_CONTAINER_NAME_LEN} chars: {first_container}",
+            first_container.len(),
+        );
+        assert!(
+            first_container.ends_with(&first.id),
+            "container name should end with sandbox id: {first_container}",
+        );
+        assert_ne!(
+            first_container, second_container,
+            "container names must differ for sandboxes with distinct ids",
+        );
+    }
+
+    #[test]
+    fn container_name_empty_sandbox_name_uses_id_only() {
+        let sandbox = DriverSandbox {
+            id: "sbx-abc".to_string(),
+            name: String::new(),
+            namespace: "default".to_string(),
+            spec: None,
+            status: None,
+        };
+        assert_eq!(container_name_for_sandbox(&sandbox), "openshell-sbx-abc",);
+    }
+
+    #[test]
+    fn trim_container_name_tail_strips_separators() {
+        assert_eq!(trim_container_name_tail("foo-".to_string()), "foo");
+        assert_eq!(trim_container_name_tail("foo-.".to_string()), "foo");
+        assert_eq!(trim_container_name_tail("foo_-.".to_string()), "foo");
+        assert_eq!(trim_container_name_tail("foo".to_string()), "foo");
+    }
+
+    #[test]
+    fn docker_guest_tls_paths_rejects_tls_flags_without_https() {
+        let config = Config::new(None).with_grpc_endpoint("http://localhost:8080");
+        let tempdir = TempDir::new().unwrap();
+        let ca = tempdir.path().join("ca.crt");
+        fs::write(&ca, b"ca").unwrap();
+
+        let err = docker_guest_tls_paths(
+            &config,
+            &DockerComputeConfig {
+                supervisor_bin: None,
+                guest_tls_ca: Some(ca),
+                guest_tls_cert: None,
+                guest_tls_key: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("https://"));
+    }
+
+    #[test]
+    fn docker_guest_tls_paths_allows_plain_http_without_tls_flags() {
+        let config = Config::new(None).with_grpc_endpoint("http://localhost:8080");
+        let result = docker_guest_tls_paths(
+            &config,
+            &DockerComputeConfig {
+                supervisor_bin: None,
+                guest_tls_ca: None,
+                guest_tls_cert: None,
+                guest_tls_key: None,
+            },
+        )
+        .unwrap();
+        assert!(result.is_none());
     }
 }
