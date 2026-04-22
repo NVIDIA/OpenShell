@@ -35,6 +35,7 @@ mod tls;
 pub mod tracing_bus;
 mod ws_tunnel;
 
+use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -45,7 +46,7 @@ use tracing::{debug, error, info};
 
 use compute::{ComputeRuntime, VmComputeConfig};
 pub use grpc::OpenShellService;
-pub use http::{health_router, http_router};
+pub use http::{health_router, http_router, metrics_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
 use openshell_driver_kubernetes::KubernetesComputeConfig;
 use persistence::Store;
@@ -203,6 +204,31 @@ pub async fn run_server(
         });
     } else {
         info!("Health server disabled");
+    }
+
+    // Bind the Prometheus metrics endpoint on a dedicated port when configured.
+    if let Some(metrics_bind_address) = config.metrics_bind_address {
+        let prometheus_handle = PrometheusBuilder::new()
+            .install_recorder()
+            .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+        let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
+            Error::transport(format!(
+                "failed to bind metrics port {metrics_bind_address}: {e}",
+            ))
+        })?;
+        info!(address = %metrics_bind_address, "Metrics server listening");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(
+                metrics_listener,
+                metrics_router(prometheus_handle).into_make_service(),
+            )
+            .await
+            {
+                error!("Metrics server error: {e}");
+            }
+        });
+    } else {
+        info!("Metrics server disabled");
     }
 
     // Build TLS acceptor when TLS is configured; otherwise serve plaintext.

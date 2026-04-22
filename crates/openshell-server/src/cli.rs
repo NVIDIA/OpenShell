@@ -28,6 +28,11 @@ struct Args {
     #[arg(long, default_value_t = 0, env = "OPENSHELL_HEALTH_PORT")]
     health_port: u16,
 
+    /// Port for the Prometheus metrics endpoint (/metrics).
+    /// Set to 0 to disable the dedicated metrics listener.
+    #[arg(long, default_value_t = 0, env = "OPENSHELL_METRICS_PORT")]
+    metrics_port: u16,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info", env = "OPENSHELL_LOG_LEVEL")]
     log_level: String,
@@ -202,6 +207,7 @@ async fn run_from_args(args: Args) -> Result<()> {
     );
 
     let bind = SocketAddr::from(([0, 0, 0, 0], args.port));
+
     let tls = if args.disable_tls {
         None
     } else {
@@ -239,6 +245,23 @@ async fn run_from_args(args: Args) -> Result<()> {
         }
         let health_bind = SocketAddr::from(([0, 0, 0, 0], args.health_port));
         config = config.with_health_bind_address(health_bind);
+    }
+
+    if args.metrics_port != 0 {
+        if args.port == args.metrics_port {
+            return Err(miette::miette!(
+                "--port and --metrics-port must be different (both set to {})",
+                args.port
+            ));
+        }
+        if args.health_port != 0 && args.health_port == args.metrics_port {
+            return Err(miette::miette!(
+                "--health-port and --metrics-port must be different (both set to {})",
+                args.health_port
+            ));
+        }
+        let metrics_bind = SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
+        config = config.with_metrics_bind_address(metrics_bind);
     }
 
     config = config

@@ -15,6 +15,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
 };
+use metrics::{counter, histogram};
 use openshell_core::proto::{
     inference_server::InferenceServer, open_shell_server::OpenShellServer,
 };
@@ -22,7 +23,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower::{ServiceBuilder, ServiceExt};
 use tower_http::trace::TraceLayer;
@@ -192,6 +193,8 @@ where
             .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"));
 
         if is_grpc {
+            let method = grpc_method_from_path(req.uri().path());
+            let start = Instant::now();
             let mut grpc = self.grpc.clone();
             Box::pin(async move {
                 let (parts, body) = req.into_parts();
@@ -206,11 +209,18 @@ where
                     .await
                     .map_err(Into::into)?;
 
+                let code = grpc_status_from_response(&res);
+                let elapsed = start.elapsed().as_secs_f64();
+                counter!("openshell_server_grpc_requests_total", "method" => method.clone(), "code" => code.clone()).increment(1);
+                histogram!("openshell_server_grpc_request_duration_seconds", "method" => method, "code" => code).record(elapsed);
+
                 let (parts, body) = res.into_parts();
                 let body = body.map_err(Into::into).boxed_unsync();
                 Ok(Response::from_parts(parts, BoxBody(body)))
             })
         } else {
+            let path = normalize_http_path(req.uri().path());
+            let start = Instant::now();
             let mut http = self.http.clone();
             Box::pin(async move {
                 let (parts, body) = req.into_parts();
@@ -224,6 +234,11 @@ where
                     .call(req)
                     .await
                     .map_err(Into::into)?;
+
+                let status = res.status().as_u16().to_string();
+                let elapsed = start.elapsed().as_secs_f64();
+                counter!("openshell_server_http_requests_total", "path" => path, "status" => status.clone()).increment(1);
+                histogram!("openshell_server_http_request_duration_seconds", "path" => path, "status" => status).record(elapsed);
 
                 let (parts, body) = res.into_parts();
                 let body = body.map_err(Into::into).boxed_unsync();
@@ -258,6 +273,26 @@ fn log_response<B>(res: &Response<B>, latency: Duration, _span: &Span) {
     );
 }
 
+fn grpc_method_from_path(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+fn grpc_status_from_response<B>(res: &Response<B>) -> String {
+    res.headers()
+        .get("grpc-status")
+        .and_then(|v| v.to_str().ok())
+        .map_or_else(|| "0".to_string(), ToString::to_string)
+}
+
+fn normalize_http_path(path: &str) -> &'static str {
+    match path {
+        p if p.starts_with("/connect/ssh") => "/connect/ssh",
+        p if p.starts_with("/_ws_tunnel") => "/_ws_tunnel",
+        p if p.starts_with("/auth/") => "/auth",
+        _ => "unknown",
+    }
+}
+
 /// Boxed body type for uniform handling.
 pub struct BoxBody(
     http_body_util::combinators::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>,
@@ -280,5 +315,92 @@ impl Body for BoxBody {
 
     fn size_hint(&self) -> http_body::SizeHint {
         self.0.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grpc_method_extracts_last_segment() {
+        assert_eq!(
+            grpc_method_from_path("/openshell.v1.OpenShell/CreateSandbox"),
+            "CreateSandbox"
+        );
+    }
+
+    #[test]
+    fn grpc_method_extracts_inference_service() {
+        assert_eq!(
+            grpc_method_from_path("/openshell.inference.v1.Inference/GetInferenceBundle"),
+            "GetInferenceBundle"
+        );
+    }
+
+    #[test]
+    fn grpc_method_handles_bare_path() {
+        assert_eq!(grpc_method_from_path("Health"), "Health");
+    }
+
+    #[test]
+    fn grpc_method_handles_single_slash() {
+        assert_eq!(grpc_method_from_path("/"), "");
+    }
+
+    #[test]
+    fn grpc_method_handles_empty_string() {
+        assert_eq!(grpc_method_from_path(""), "");
+    }
+
+    #[test]
+    fn normalize_ssh_path() {
+        assert_eq!(normalize_http_path("/connect/ssh"), "/connect/ssh");
+    }
+
+    #[test]
+    fn normalize_ssh_path_with_trailing_segments() {
+        assert_eq!(
+            normalize_http_path("/connect/ssh?token=abc"),
+            "/connect/ssh"
+        );
+    }
+
+    #[test]
+    fn normalize_ws_tunnel() {
+        assert_eq!(normalize_http_path("/_ws_tunnel"), "/_ws_tunnel");
+    }
+
+    #[test]
+    fn normalize_ws_tunnel_with_trailing() {
+        assert_eq!(normalize_http_path("/_ws_tunnel/foo"), "/_ws_tunnel");
+    }
+
+    #[test]
+    fn normalize_auth_path() {
+        assert_eq!(normalize_http_path("/auth/connect"), "/auth");
+    }
+
+    #[test]
+    fn normalize_auth_with_query() {
+        assert_eq!(
+            normalize_http_path("/auth/connect?callback_port=12345&code=AB7-X9KM"),
+            "/auth"
+        );
+    }
+
+    #[test]
+    fn normalize_unknown_path_collapses_to_unknown() {
+        assert_eq!(normalize_http_path("/random/scanner/probe"), "unknown");
+    }
+
+    #[test]
+    fn normalize_empty_path() {
+        assert_eq!(normalize_http_path(""), "unknown");
+    }
+
+    #[test]
+    fn normalize_root_path() {
+        assert_eq!(normalize_http_path("/"), "unknown");
     }
 }

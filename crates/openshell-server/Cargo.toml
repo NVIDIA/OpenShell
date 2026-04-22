@@ -56,6 +56,10 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Metrics
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+
 # Utilities
 futures = { workspace = true }
 bytes = { workspace = true }
