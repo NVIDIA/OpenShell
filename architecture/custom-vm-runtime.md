@@ -1,18 +1,31 @@
-# Custom libkrunfw VM Runtime
+# Custom VM Runtime
 
 > Status: Experimental and work in progress (WIP). VM support is under active development and may change.
 
 ## Overview
 
-The OpenShell gateway VM uses [libkrun](https://github.com/containers/libkrun) to boot a
-lightweight microVM with Apple Hypervisor.framework (macOS) or KVM (Linux). The kernel
-is embedded inside `libkrunfw`, a companion library that packages a pre-built Linux kernel.
+The OpenShell gateway VM supports two hypervisor backends:
+
+- **libkrun** (default) — lightweight VMM using Apple Hypervisor.framework (macOS) or KVM
+  (Linux). The kernel is embedded inside `libkrunfw`. Uses virtio-MMIO device transport and
+  gvproxy for user-space networking.
+- **cloud-hypervisor** — Linux-only KVM-based VMM used for GPU passthrough (VFIO). Uses
+  virtio-PCI device transport, TAP networking, and requires a separate `vmlinux` kernel and
+  `virtiofsd` for rootfs access.
+
+Backend selection is automatic: `--gpu` selects cloud-hypervisor, otherwise libkrun is used.
+The `--backend` flag provides explicit control (`auto`, `libkrun`, `cloud-hypervisor`).
+
+When `--gpu` is passed, `openshell-vm` automatically binds an eligible GPU to `vfio-pci`
+and restores it to the original driver on shutdown. See
+[vm-gpu-passthrough.md](vm-gpu-passthrough.md) for the full lifecycle description.
+
+Both backends share the same guest kernel (built from a single `openshell.kconfig` fragment)
+and rootfs.
 
 The stock `libkrunfw` from Homebrew ships a minimal kernel without bridge, netfilter, or
-conntrack support. This is insufficient for Kubernetes pod networking.
-
-The custom libkrunfw runtime adds bridge CNI, iptables/nftables, and conntrack support to
-the VM kernel, enabling standard Kubernetes networking.
+conntrack support. This is insufficient for Kubernetes pod networking. The custom kconfig
+adds bridge CNI, iptables/nftables, conntrack, and cloud-hypervisor compatibility.
 
 ## Architecture
 
@@ -20,10 +33,11 @@ the VM kernel, enabling standard Kubernetes networking.
 graph TD
     subgraph Host["Host (macOS / Linux)"]
         BIN[openshell-vm binary]
-        EMB["Embedded runtime (zstd-compressed)\nlibkrun · libkrunfw · gvproxy"]
+        EMB["Embedded runtime (zstd-compressed)\nlibkrun · libkrunfw · gvproxy · rootfs"]
         CACHE["~/.local/share/openshell/vm-runtime/{version}/"]
         PROV[Runtime provenance logging]
         GVP[gvproxy networking proxy]
+        CHV_BIN["cloud-hypervisor · virtiofsd · vmlinux\n(GPU runtime bundle)"]
 
         BIN --> EMB
         BIN -->|extracts to| CACHE
@@ -44,8 +58,9 @@ graph TD
         INIT --> VAL --> CNI --> EXECA --> PKI --> K3S
     end
 
-    BIN -- "fork + krun_start_enter" --> INIT
-    GVP -- "virtio-net" --> Guest
+    BIN -- "libkrun: fork + krun_start_enter" --> INIT
+    BIN -- "CHV: cloud-hypervisor API + virtiofsd" --> INIT
+    GVP -- "virtio-net (libkrun only)" --> Guest
 ```
 
 ## Embedded Runtime
@@ -67,9 +82,23 @@ these to XDG cache directories with progress bars:
 └── ...
 ```
 
-This eliminates the need for separate bundles or downloads - a single ~120MB binary
-provides everything needed to run the VM. Old cache versions are automatically
-cleaned up when a new version is extracted.
+When using cloud-hypervisor, an additional runtime bundle is required alongside the
+binary:
+
+```
+target/debug/openshell-vm.runtime/    (or alongside the installed binary)
+├── cloud-hypervisor                   # CHV binary
+├── virtiofsd                          # virtio-fs daemon
+└── vmlinux                            # extracted guest kernel
+```
+
+This bundle is built with `mise run vm:bundle-runtime` and is separate from the
+embedded runtime because CHV and virtiofsd are Linux-only and not embedded in the
+self-extracting binary.
+
+This eliminates the need for separate bundles or downloads for the default (libkrun)
+path — a single ~120MB binary provides everything needed. Old cache versions are
+automatically cleaned up when a new version is extracted.
 
 ### Hybrid Approach
 
@@ -103,6 +132,31 @@ mise run vm:rootfs                 # Full rootfs (~2GB, includes images)
 mise run vm:build                  # Rebuild binary with full rootfs
 ```
 
+## Backend Comparison
+
+| | libkrun (default) | cloud-hypervisor |
+|---|---|---|
+| Platforms | macOS (Hypervisor.framework), Linux (KVM) | Linux (KVM) only |
+| Device transport | virtio-MMIO | virtio-PCI |
+| Networking | gvproxy (user-space, no root needed) | TAP (requires root/CAP_NET_ADMIN) |
+| Rootfs delivery | In-process (krun API) | virtiofsd (virtio-fs daemon) |
+| Kernel delivery | Embedded in libkrunfw | Separate `vmlinux` file |
+| Console | virtio-console (`hvc0`) | 8250 UART (`ttyS0`) |
+| Shutdown | Automatic on PID 1 exit | ACPI poweroff (`poweroff -f`) |
+| GPU passthrough | Not supported | VFIO PCI passthrough |
+| `--exec` mode | Direct init replacement | Wrapper script with ACPI shutdown |
+| CLI flag | `--backend libkrun` | `--backend cloud-hypervisor` or `--gpu` |
+
+### Exec mode differences
+
+With libkrun, when `--exec <cmd>` is used, the command replaces the init process and
+the VM exits when PID 1 exits.
+
+With cloud-hypervisor, the VM does not automatically exit when PID 1 terminates. A
+wrapper init script is dynamically written to the guest rootfs that mounts necessary
+filesystems, executes the user command, captures the exit code, and calls
+`poweroff -f` to trigger an ACPI shutdown that cloud-hypervisor detects.
+
 ## Network Profile
 
 The VM uses the bridge CNI profile, which requires a custom libkrunfw with bridge and
@@ -116,6 +170,26 @@ fast with an actionable error if they are missing.
 - kube-proxy: enabled (nftables mode)
 - Service VIPs: functional (ClusterIP, NodePort)
 - hostNetwork workarounds: not required
+
+### Networking by backend
+
+- **libkrun**: Uses gvproxy for user-space virtio-net networking. No root privileges
+  needed. Port forwarding is handled via gvproxy configuration.
+- **cloud-hypervisor**: Uses TAP networking (requires root or CAP_NET_ADMIN). When
+  `--net none` is passed, networking is disabled entirely (useful for `--exec` mode
+  tests). gvproxy is not used with cloud-hypervisor.
+
+## Guest Init Script
+
+The init script (`openshell-vm-init.sh`) runs as PID 1 in the guest. After mounting essential filesystems, it performs:
+
+1. **Kernel cmdline parsing** — exports environment variables passed via the kernel command line (`GPU_ENABLED`, `OPENSHELL_VM_STATE_DISK_DEVICE`, `VM_NET_IP`, `VM_NET_GW`, `VM_NET_DNS`). This runs after `/proc` is mounted so `/proc/cmdline` is available.
+
+2. **Cgroup v2 controller enablement** — enables `cpu`, `cpuset`, `memory`, `pids`, and `io` controllers in the root cgroup hierarchy (`cgroup.subtree_control`). k3s/kubelet requires these controllers; the `cpu` controller depends on `CONFIG_CGROUP_SCHED` in the kernel.
+
+3. **Networking** — detects `eth0` and attempts DHCP (via `udhcpc`). On failure, falls back to static IP configuration using `VM_NET_IP` and `VM_NET_GW` from the kernel cmdline (set by the CHV backend for TAP networking). DNS is configured from `VM_NET_DNS` if set, overriding any stale `/etc/resolv.conf` entries.
+
+4. **Capability validation** — verifies required kernel features (bridge networking, netfilter, cgroups) and fails fast with actionable errors if missing.
 
 ## Runtime Provenance
 
@@ -145,21 +219,35 @@ graph LR
         BUILD_M["Build libkrunfw.dylib + libkrun.dylib"]
     end
 
+    subgraph CHV["Linux CI (build-cloud-hypervisor.sh)"]
+        BUILD_CHV["Build cloud-hypervisor + virtiofsd"]
+    end
+
     subgraph Output["target/libkrun-build/"]
         LIB_SO["libkrunfw.so + libkrun.so\n(Linux)"]
         LIB_DY["libkrunfw.dylib + libkrun.dylib\n(macOS)"]
+        CHV_OUT["cloud-hypervisor + virtiofsd\n(Linux)"]
+        VMLINUX["vmlinux\n(extracted from libkrunfw)"]
     end
 
     KCONF --> BUILD_L
     BUILD_L --> LIB_SO
+    BUILD_L --> VMLINUX
     KCONF --> BUILD_M
     BUILD_M --> LIB_DY
+    BUILD_CHV --> CHV_OUT
 ```
+
+The `vmlinux` kernel is extracted from the libkrunfw build and reused by cloud-hypervisor.
+Both backends boot the same kernel — the kconfig fragment includes drivers for both
+virtio-MMIO (libkrun) and virtio-PCI (CHV) transports.
 
 ## Kernel Config Fragment
 
 The `openshell.kconfig` fragment enables these kernel features on top of the stock
-libkrunfw kernel:
+libkrunfw kernel. A single kernel binary is shared by both libkrun and cloud-hypervisor —
+backend-specific drivers coexist safely (the kernel probes whichever transport the
+hypervisor provides).
 
 | Feature | Key Configs | Purpose |
 |---------|-------------|---------|
@@ -175,11 +263,18 @@ libkrunfw kernel:
 | IP forwarding | `CONFIG_IP_ADVANCED_ROUTER`, `CONFIG_IP_MULTIPLE_TABLES` | Pod-to-pod routing |
 | IPVS | `CONFIG_IP_VS`, `CONFIG_IP_VS_RR`, `CONFIG_IP_VS_NFCT` | kube-proxy IPVS mode (optional) |
 | Traffic control | `CONFIG_NET_SCH_HTB`, `CONFIG_NET_CLS_CGROUP` | Kubernetes QoS |
-| Cgroups | `CONFIG_CGROUPS`, `CONFIG_CGROUP_DEVICE`, `CONFIG_MEMCG`, `CONFIG_CGROUP_PIDS` | Container resource limits |
+| Cgroups | `CONFIG_CGROUPS`, `CONFIG_CGROUP_DEVICE`, `CONFIG_CGROUP_CPUACCT`, `CONFIG_MEMCG`, `CONFIG_CGROUP_PIDS`, `CONFIG_CGROUP_FREEZER` | Container resource limits |
+| Cgroup CPU | `CONFIG_CGROUP_SCHED`, `CONFIG_FAIR_GROUP_SCHED`, `CONFIG_CFS_BANDWIDTH` | cgroup v2 `cpu` controller for k3s/kubelet |
 | TUN/TAP | `CONFIG_TUN` | CNI plugin support |
 | Dummy interface | `CONFIG_DUMMY` | Fallback networking |
 | Landlock | `CONFIG_SECURITY_LANDLOCK` | Filesystem sandboxing support |
 | Seccomp filter | `CONFIG_SECCOMP_FILTER` | Syscall filtering support |
+| PCI / GPU | `CONFIG_PCI`, `CONFIG_PCI_MSI`, `CONFIG_DRM` | GPU passthrough via VFIO |
+| Kernel modules | `CONFIG_MODULES`, `CONFIG_MODULE_UNLOAD` | Loading NVIDIA drivers in guest |
+| virtio-PCI transport | `CONFIG_VIRTIO_PCI` | cloud-hypervisor device bus (libkrun uses MMIO) |
+| Serial console | `CONFIG_SERIAL_8250`, `CONFIG_SERIAL_8250_CONSOLE` | cloud-hypervisor console (`ttyS0`) |
+| ACPI | `CONFIG_ACPI` | cloud-hypervisor power management / clean shutdown |
+| x2APIC | `CONFIG_X86_X2APIC` | Multi-vCPU support (CHV uses x2APIC MADT entries) |
 
 See `crates/openshell-vm/runtime/kernel/openshell.kconfig` for the full fragment with
 inline comments explaining why each option is needed.
@@ -206,13 +301,21 @@ The standalone `openshell-vm` binary supports `openshell-vm exec -- <command...>
 `openshell-vm exec` also injects `KUBECONFIG=/etc/rancher/k3s/k3s.yaml` by default so kubectl-style
 commands work the same way they would inside the VM shell.
 
+### Vsock by backend
+
+- **libkrun**: Uses libkrun's built-in vsock port mapping, which transparently
+  bridges the guest vsock port to a host Unix socket.
+- **cloud-hypervisor**: Uses a vsock exec bridge — a host-side process that
+  connects an AF_VSOCK socket to a Unix domain socket, providing the same
+  interface to the exec agent.
+
 ## Build Commands
 
 ```bash
 # One-time setup: download pre-built runtime (~30s)
 mise run vm:setup
 
-# Build and run
+# Build and run (libkrun, default)
 mise run vm
 
 # Build embedded binary with base rootfs (~120MB, recommended)
@@ -227,6 +330,13 @@ mise run vm:build                          # Rebuild binary
 FROM_SOURCE=1 mise run vm:setup            # Build runtime from source
 mise run vm:build                          # Then build embedded binary
 
+# Build cloud-hypervisor runtime bundle (Linux only)
+mise run vm:bundle-runtime                 # Builds CHV + virtiofsd + extracts vmlinux
+
+# Run with cloud-hypervisor backend
+openshell-vm --backend cloud-hypervisor    # Requires runtime bundle
+openshell-vm --gpu                         # Auto-selects CHV with GPU passthrough
+
 # Wipe everything and start over
 mise run vm:clean
 ```
@@ -238,20 +348,23 @@ rolling `vm-dev` GitHub Release:
 
 ### Kernel Runtime (`release-vm-kernel.yml`)
 
-Builds the custom libkrunfw (kernel firmware), libkrun (VMM), and gvproxy for all
-supported platforms. Runs on-demand or when the kernel config / pinned versions change.
+Builds the custom libkrunfw (kernel firmware), libkrun (VMM), gvproxy, cloud-hypervisor,
+and virtiofsd for all supported platforms. Runs on-demand or when the kernel config /
+pinned versions change.
 
 | Platform | Runner | Build Method |
 |----------|--------|-------------|
-| Linux ARM64 | `build-arm64` (self-hosted) | Native `build-libkrun.sh` |
-| Linux x86_64 | `build-amd64` (self-hosted) | Native `build-libkrun.sh` |
-| macOS ARM64 | `macos-latest-xlarge` (GitHub-hosted) | `build-libkrun-macos.sh` |
+| Linux ARM64 | `build-arm64` (self-hosted) | `build-libkrun.sh` + `build-cloud-hypervisor.sh` |
+| Linux x86_64 | `build-amd64` (self-hosted) | `build-libkrun.sh` + `build-cloud-hypervisor.sh` |
+| macOS ARM64 | `macos-latest-xlarge` (GitHub-hosted) | `build-libkrun-macos.sh` (no CHV) |
 
-Artifacts: `vm-runtime-{platform}.tar.zst` containing libkrun, libkrunfw, gvproxy, and
-provenance metadata.
+Artifacts: `vm-runtime-{platform}.tar.zst` containing libkrun, libkrunfw, gvproxy,
+and provenance metadata. Linux artifacts additionally include cloud-hypervisor,
+virtiofsd, and the extracted `vmlinux` kernel.
 
 Each platform builds its own libkrunfw and libkrun natively. The kernel inside
-libkrunfw is always Linux regardless of host platform.
+libkrunfw is always Linux regardless of host platform. cloud-hypervisor and virtiofsd
+are Linux-only (macOS does not support VFIO/KVM passthrough).
 
 ### VM Binary (`release-vm-dev.yml`)
 

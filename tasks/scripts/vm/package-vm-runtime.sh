@@ -84,6 +84,13 @@ case "$PLATFORM" in
             versioned="$(ls "${PACKAGE_DIR}"/libkrunfw.so.5.* 2>/dev/null | head -n1 || true)"
             [ -n "$versioned" ] && cp "$versioned" "${PACKAGE_DIR}/libkrunfw.so.5"
         fi
+        # GPU passthrough binaries (optional — only included if present)
+        for gpu_bin in cloud-hypervisor vmlinux virtiofsd; do
+            if [ -f "${BUILD_DIR}/${gpu_bin}" ]; then
+                cp "${BUILD_DIR}/${gpu_bin}" "${PACKAGE_DIR}/"
+                echo "    Included GPU passthrough binary: ${gpu_bin}"
+            fi
+        done
         ;;
     darwin-aarch64)
         cp "${BUILD_DIR}/libkrun.dylib" "${PACKAGE_DIR}/"

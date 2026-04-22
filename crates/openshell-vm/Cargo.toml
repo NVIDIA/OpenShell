@@ -28,6 +28,7 @@ miette = { workspace = true }
 nix = { workspace = true }
 openshell-bootstrap = { path = "../openshell-bootstrap" }
 openshell-core = { path = "../openshell-core" }
+openshell-vfio = { path = "../openshell-vfio" }
 serde = { workspace = true }
 serde_json = "1"
 tar = "0.4"
@@ -45,6 +46,9 @@ tokio-rustls = { workspace = true }
 
 [build-dependencies]
 zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

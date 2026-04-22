@@ -48,6 +48,22 @@ fn safe_remove_dir_all(path: &Path) -> Result<bool, VmError> {
 
 pub const VM_EXEC_VSOCK_PORT: u32 = 10_777;
 
+/// How to connect to the VM exec agent.
+///
+/// libkrun bridges each guest vsock port to a host Unix socket via
+/// `krun_add_vsock_port2`. cloud-hypervisor uses standard vhost-vsock
+/// with CID-based addressing — the host connects via `AF_VSOCK` or a
+/// vsock-proxy/socat bridge.
+#[derive(Debug, Clone)]
+pub enum VsockConnectMode {
+    /// Connect via a host Unix socket (libkrun per-port bridging).
+    UnixSocket(PathBuf),
+    /// Connect via a vsock proxy bridge (cloud-hypervisor).
+    /// The path points to a socat-bridged Unix socket that forwards
+    /// to guest CID 3, port [`VM_EXEC_VSOCK_PORT`].
+    VsockBridge(PathBuf),
+}
+
 const VM_STATE_NAME: &str = "vm-state.json";
 const VM_LOCK_NAME: &str = "vm.lock";
 const KUBECONFIG_ENV: &str = "KUBECONFIG=/etc/rancher/k3s/k3s.yaml";
@@ -72,6 +88,10 @@ pub struct VmRuntimeState {
     /// PID of the gvproxy process (if networking uses gvproxy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gvproxy_pid: Option<u32>,
+    /// Whether this VM uses vsock-bridge mode (cloud-hypervisor) vs
+    /// Unix socket mode (libkrun). Defaults to false for backward compat.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vsock_bridge: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +152,7 @@ pub fn write_vm_runtime_state(
     pid: i32,
     console_log: &Path,
     gvproxy_pid: Option<u32>,
+    vsock_bridge: bool,
 ) -> Result<(), VmError> {
     let state = VmRuntimeState {
         pid,
@@ -141,6 +162,7 @@ pub fn write_vm_runtime_state(
         console_log: console_log.to_path_buf(),
         started_at_ms: now_ms()?,
         gvproxy_pid,
+        vsock_bridge,
     };
     let path = vm_state_path(rootfs);
     let bytes = serde_json::to_vec_pretty(&state)
@@ -471,10 +493,21 @@ pub fn ensure_vm_not_running(rootfs: &Path) -> Result<(), VmError> {
 
 pub fn exec_running_vm(options: VmExecOptions) -> Result<i32, VmError> {
     let state = load_vm_runtime_state(options.rootfs.as_deref())?;
-    let mut stream = UnixStream::connect(&state.socket_path).map_err(|e| {
+
+    let connect_mode = if state.vsock_bridge {
+        VsockConnectMode::VsockBridge(state.socket_path.clone())
+    } else {
+        VsockConnectMode::UnixSocket(state.socket_path.clone())
+    };
+
+    let socket_path = match &connect_mode {
+        VsockConnectMode::UnixSocket(p) | VsockConnectMode::VsockBridge(p) => p,
+    };
+
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
         VmError::Exec(format!(
             "connect to VM exec socket {}: {e}",
-            state.socket_path.display()
+            socket_path.display()
         ))
     })?;
     let mut writer = stream

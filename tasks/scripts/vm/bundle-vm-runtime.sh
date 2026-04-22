@@ -46,6 +46,9 @@ TARGETS=(
     "${ROOT}/target/release"
 )
 
+COMPRESSED_DIR="${ROOT}/target/vm-runtime-compressed"
+GPU_ROOTFS_TARBALL="${COMPRESSED_DIR}/rootfs-gpu.tar.zst"
+
 for target_dir in "${TARGETS[@]}"; do
     # Only stage if the binary exists (avoid creating orphan runtime dirs)
     if [ ! -f "${target_dir}/openshell-vm" ] && [ ! -f "${target_dir}/openshell-vm.d" ]; then
@@ -60,6 +63,12 @@ for target_dir in "${TARGETS[@]}"; do
         name="$(basename "$file")"
         install -m 0755 "$file" "${runtime_dir}/${name}"
     done
+
+    # Stage the GPU rootfs tarball if it was built
+    if [ -f "${GPU_ROOTFS_TARBALL}" ]; then
+        install -m 0644 "${GPU_ROOTFS_TARBALL}" "${runtime_dir}/rootfs-gpu.tar.zst"
+        echo "staged GPU rootfs tarball in ${runtime_dir}"
+    fi
 
     echo "staged runtime bundle in ${runtime_dir}"
 done

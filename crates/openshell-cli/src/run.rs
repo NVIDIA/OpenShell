@@ -1435,7 +1435,9 @@ pub async fn gateway_admin_deploy(
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     gpu: Vec<String>,
-) -> Result<()> {
+) -> Result<Option<openshell_vfio::GpuBindGuard>> {
+    let (gpu, gpu_guard) = prepare_gateway_deploy_gpu(gpu, remote.as_deref())?;
+
     let location = if remote.is_some() { "remote" } else { "local" };
 
     // Build remote options once so we can reuse them for the existence check
@@ -1458,7 +1460,7 @@ pub async fn gateway_admin_deploy(
                     "{} Gateway '{name}' is already running.",
                     "✓".green().bold()
                 );
-                return Ok(());
+                return Ok(gpu_guard);
             }
         }
     }
@@ -1519,7 +1521,7 @@ pub async fn gateway_admin_deploy(
     save_active_gateway(name)?;
     eprintln!("{} Active gateway set to '{name}'", "✓".green().bold());
 
-    Ok(())
+    Ok(gpu_guard)
 }
 
 /// Resolve the remote SSH destination for a gateway.
@@ -5432,6 +5434,123 @@ fn format_timestamp_ms(ms: i64) -> String {
     }
 }
 
+/// Environment variable selecting the gateway deployment backend for GPU checks.
+///
+/// VFIO sysfs probes apply only to the microVM (`openshell-vm`) deploy path.
+/// The default `openshell gateway start` flow uses Docker with the NVIDIA
+/// Container Toolkit; leave this unset for that path.
+const OPENSHELL_GATEWAY_BACKEND_ENV: &str = "OPENSHELL_GATEWAY_BACKEND";
+
+fn gateway_deploy_uses_vm_backend() -> bool {
+    std::env::var(OPENSHELL_GATEWAY_BACKEND_ENV)
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "vm" | "microvm" | "openshell-vm"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Heuristic: value looks like a PCI domain:bus:dev.fn address (Linux sysfs BDF).
+fn looks_like_pci_bdf(s: &str) -> bool {
+    let s = s.trim();
+    let rest = if let Some((prefix, after_colon)) = s.split_once(':') {
+        if prefix.len() == 4 && prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+            after_colon
+        } else {
+            s
+        }
+    } else {
+        return false;
+    };
+
+    let Some((bus, dev_fn)) = rest.split_once(':') else {
+        return false;
+    };
+    if bus.len() != 2 || !bus.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    let Some((dev, func)) = dev_fn.split_once('.') else {
+        return false;
+    };
+    if dev.len() != 2 || !dev.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    if func.len() != 1 || !func.chars().all(|c| ('0'..='7').contains(&c)) {
+        return false;
+    }
+    true
+}
+
+/// Validate `--gpu` for `gateway start`, run VFIO checks only for the VM deploy path,
+/// and normalize Docker-path requests to CDI-compatible `auto`.
+fn prepare_gateway_deploy_gpu(
+    gpu: Vec<String>,
+    remote: Option<&str>,
+) -> Result<(Vec<String>, Option<openshell_vfio::GpuBindGuard>)> {
+    if gpu.is_empty() {
+        return Ok((gpu, None));
+    }
+
+    if gateway_deploy_uses_vm_backend() {
+        if remote.is_none() {
+            let guard = check_gpu_readiness(&gpu)?;
+            let selected_bdf = guard.pci_addr().unwrap_or("auto").to_string();
+            let updated_gpu = vec![selected_bdf];
+            return Ok((updated_gpu, Some(guard)));
+        } else {
+            eprintln!(
+                "{} Local VFIO GPU probe skipped (--remote): GPU readiness is checked on the remote host during deployment.",
+                "ℹ".cyan().bold()
+            );
+        }
+        return Ok((gpu, None));
+    }
+
+    let Some(first) = gpu.first() else {
+        return Ok((gpu, None));
+    };
+    if first.as_str() != "auto" {
+        if looks_like_pci_bdf(first) {
+            return Err(miette!(
+                "PCI address GPU selection ({first}) is only supported for the microVM gateway backend.\n\n\
+                 `openshell gateway start` uses Docker by default (NVIDIA Container Toolkit / CDI, or Docker `--gpus all`). \
+                 Use `--gpu` or `--gpu auto` for that path.\n\n\
+                 For VFIO passthrough, set {}=vm and follow architecture/vm-gpu-passthrough.md.",
+                OPENSHELL_GATEWAY_BACKEND_ENV,
+            ));
+        }
+        return Err(miette!(
+            "Unrecognized --gpu value `{first}` for Docker gateway deploy. Use `--gpu` or `--gpu auto`.",
+        ));
+    }
+
+    Ok((vec!["auto".to_string()], None))
+}
+
+/// Bind a GPU for VFIO passthrough and return an RAII guard that restores it on drop.
+fn check_gpu_readiness(gpu: &[String]) -> Result<openshell_vfio::GpuBindGuard> {
+    use openshell_vfio::{GpuBindGuard, prepare_gpu_for_passthrough};
+
+    let requested_addr = gpu
+        .first()
+        .filter(|v| v.as_str() != "auto")
+        .map(|v| v.as_str());
+
+    let bind_state = prepare_gpu_for_passthrough(requested_addr).map_err(|e| miette!("{e}"))?;
+
+    eprintln!(
+        "{} GPU {} bound to vfio-pci (was: {})",
+        "✓".green().bold(),
+        bind_state.pci_addr,
+        bind_state.original_driver,
+    );
+
+    Ok(GpuBindGuard::new(bind_state))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5653,6 +5772,16 @@ mod tests {
     fn sandbox_should_persist_when_forward_is_requested() {
         let spec = openshell_core::forward::ForwardSpec::new(8080);
         assert!(sandbox_should_persist(false, Some(&spec)));
+    }
+
+    #[test]
+    fn looks_like_pci_bdf_recognizes_sysfs_addresses() {
+        assert!(super::looks_like_pci_bdf("0000:41:00.0"));
+        assert!(super::looks_like_pci_bdf("41:00.0"));
+        assert!(super::looks_like_pci_bdf(" 0a:1f.7 "));
+        assert!(!super::looks_like_pci_bdf("auto"));
+        assert!(!super::looks_like_pci_bdf("nvidia.com/gpu=all"));
+        assert!(!super::looks_like_pci_bdf("00:00.8")); // invalid function
     }
 
     #[test]

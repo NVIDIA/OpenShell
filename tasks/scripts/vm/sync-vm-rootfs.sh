@@ -141,6 +141,22 @@ fi
 patch_vm_helmchart "${MANIFEST_DST}/openshell-helmchart.yaml"
 patch_vm_helmchart "${ROOTFS_DIR}/var/lib/rancher/k3s/server/manifests/openshell-helmchart.yaml"
 
+# ── GPU manifests ──────────────────────────────────────────────────────
+# Only sync if the rootfs was built with --gpu (sentinel file present).
+GPU_MANIFEST_SRC="${ROOT}/crates/openshell-vm/scripts/gpu-manifests"
+GPU_MANIFEST_DST="${ROOTFS_DIR}/opt/openshell/gpu-manifests"
+if [ -f "${ROOTFS_DIR}/opt/openshell/.rootfs-gpu" ] && [ -d "${GPU_MANIFEST_SRC}" ]; then
+    mkdir -p "${GPU_MANIFEST_DST}"
+    for manifest in "${GPU_MANIFEST_SRC}"/*.yaml; do
+        [ -f "$manifest" ] || continue
+        base=$(basename "$manifest")
+        if ! cmp -s "$manifest" "${GPU_MANIFEST_DST}/${base}" 2>/dev/null; then
+            cp "$manifest" "${GPU_MANIFEST_DST}/${base}"
+            echo "  updated: /opt/openshell/gpu-manifests/${base}"
+        fi
+    done
+fi
+
 # ── Gateway image tarball ──────────────────────────────────────────────
 # The VM rootfs airgap-imports openshell/gateway:dev from k3s/agent/images/.
 # Keep that tarball in sync with the local Docker image so `mise run e2e:vm`

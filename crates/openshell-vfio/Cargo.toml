@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-vfio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host-side NVIDIA GPU VFIO bind/unbind for VM passthrough"
+
+[dependencies]
+nix = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

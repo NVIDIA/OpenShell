@@ -91,8 +91,8 @@ if [ -z "${VM_RUNTIME_TARBALL:-}" ] && _check_compressed_artifacts "$OUTPUT_DIR"
     for f in "${OUTPUT_DIR}"/*.zst; do
         [ -f "$f" ] || continue
         name="$(basename "${f%.zst}")"
-        # Skip rootfs tarball — bundle-vm-runtime.sh doesn't need it
-        [[ "$name" == rootfs.tar ]] && continue
+        # Skip rootfs tarballs — bundle-vm-runtime.sh doesn't need them
+        [[ "$name" == rootfs.tar || "$name" == rootfs-gpu.tar ]] && continue
         zstd -d "$f" -o "${WORK_DIR}/${name}" -f -q
         chmod 0755 "${WORK_DIR}/${name}"
     done
@@ -126,14 +126,18 @@ if [ -n "${VM_RUNTIME_TARBALL:-}" ]; then
     echo ""
     compress_dir "$WORK_DIR" "$OUTPUT_DIR"
 
-    # Check for rootfs tarball (built separately)
+    # Check for rootfs tarballs (built separately)
     ROOTFS_TARBALL="${OUTPUT_DIR}/rootfs.tar.zst"
+    GPU_ROOTFS_TARBALL="${OUTPUT_DIR}/rootfs-gpu.tar.zst"
     if [ -f "$ROOTFS_TARBALL" ]; then
         echo "    rootfs.tar.zst: $(du -h "$ROOTFS_TARBALL" | cut -f1) (pre-built)"
     else
         echo ""
         echo "Note: rootfs.tar.zst not found."
         echo "      To build one, run: mise run vm:rootfs -- --base"
+    fi
+    if [ -f "$GPU_ROOTFS_TARBALL" ]; then
+        echo "    rootfs-gpu.tar.zst: $(du -h "$GPU_ROOTFS_TARBALL" | cut -f1) (pre-built)"
     fi
 
     echo ""
@@ -272,16 +276,20 @@ ls -lah "$WORK_DIR"
 echo ""
 compress_dir "$WORK_DIR" "$OUTPUT_DIR"
 
-# Check for rootfs tarball (built separately by build-rootfs-tarball.sh)
+# Check for rootfs tarballs (built separately by build-rootfs-tarball.sh)
 ROOTFS_TARBALL="${OUTPUT_DIR}/rootfs.tar.zst"
+GPU_ROOTFS_TARBALL="${OUTPUT_DIR}/rootfs-gpu.tar.zst"
 if [ -f "$ROOTFS_TARBALL" ]; then
     echo "    rootfs.tar.zst: $(du -h "$ROOTFS_TARBALL" | cut -f1) (pre-built)"
 else
     echo ""
     echo "Note: rootfs.tar.zst not found."
-      echo "      To build one, run: mise run vm:rootfs -- --base"
-      echo "      Without it, the binary will still work but require the rootfs"
-      echo "      to be built separately on first run."
+    echo "      To build one, run: mise run vm:rootfs -- --base"
+    echo "      Without it, the binary will still work but require the rootfs"
+    echo "      to be built separately on first run."
+fi
+if [ -f "$GPU_ROOTFS_TARBALL" ]; then
+    echo "    rootfs-gpu.tar.zst: $(du -h "$GPU_ROOTFS_TARBALL" | cut -f1) (pre-built)"
 fi
 
 echo ""

@@ -3028,6 +3028,7 @@ dependencies = [
  "openshell-prover",
  "openshell-providers",
  "openshell-tui",
+ "openshell-vfio",
  "owo-colors",
  "prost-types",
  "rcgen",
@@ -3295,6 +3296,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-vfio"
+version = "0.0.0"
+dependencies = [
+ "nix",
+ "tempfile",
+]
+
+[[package]]
 name = "openshell-vm"
 version = "0.0.0"
 dependencies = [
@@ -3307,11 +3316,13 @@ dependencies = [
  "nix",
  "openshell-bootstrap",
  "openshell-core",
+ "openshell-vfio",
  "rustls",
  "rustls-pemfile",
  "serde",
  "serde_json",
  "tar",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",

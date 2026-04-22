@@ -46,6 +46,31 @@ mkdir -p /sys/fs/cgroup
 mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null &
 wait
 
+# ── Parse kernel cmdline for env vars (cloud-hypervisor path) ────────
+# cloud-hypervisor passes environment variables via kernel cmdline
+# (KEY=VALUE tokens). These are not automatically exported to init.
+# Must run after /proc is mounted.
+if [ -f /proc/cmdline ]; then
+    for token in $(cat /proc/cmdline); do
+        case "$token" in
+            GPU_ENABLED=*|OPENSHELL_VM_STATE_DISK_DEVICE=*|VM_NET_IP=*|VM_NET_GW=*|VM_NET_DNS=*)
+                export "$token"
+                ;;
+        esac
+    done
+fi
+
+# Enable cgroup v2 controllers in the root cgroup hierarchy.
+# k3s/kubelet requires cpu, cpuset, memory, and pids controllers.
+# The kernel must have CONFIG_CGROUP_SCHED=y for the cpu controller.
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+    for ctrl in cpu cpuset memory pids io; do
+        if grep -qw "$ctrl" /sys/fs/cgroup/cgroup.controllers; then
+            echo "+$ctrl" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+        fi
+    done
+fi
+
 ts "filesystems mounted"
 
 # ── Networking ──────────────────────────────────────────────────────────
@@ -97,20 +122,26 @@ DHCP_SCRIPT
         # -n: exit if no lease, -T 1: 1s between retries, -t 3: 3 retries
         # -A 1: wait 1s before first retry (aggressive for local gvproxy)
         if ! udhcpc -i eth0 -f -q -n -T 1 -t 3 -A 1 -s "$UDHCPC_SCRIPT" 2>&1; then
-            ts "WARNING: DHCP failed, falling back to static config"
-            ip addr add 192.168.127.2/24 dev eth0 2>/dev/null || true
-            ip route add default via 192.168.127.1 2>/dev/null || true
+            STATIC_IP="${VM_NET_IP:-192.168.127.2}"
+            STATIC_GW="${VM_NET_GW:-192.168.127.1}"
+            ts "WARNING: DHCP failed, falling back to static config ($STATIC_IP gw $STATIC_GW)"
+            ip addr add "${STATIC_IP}/24" dev eth0 2>/dev/null || true
+            ip route add default via "$STATIC_GW" 2>/dev/null || true
         fi
     else
-        # Fallback to static config if no DHCP client available.
-        ts "no DHCP client, using static config"
-        ip addr add 192.168.127.2/24 dev eth0 2>/dev/null || true
-        ip route add default via 192.168.127.1 2>/dev/null || true
+        STATIC_IP="${VM_NET_IP:-192.168.127.2}"
+        STATIC_GW="${VM_NET_GW:-192.168.127.1}"
+        ts "no DHCP client, using static config ($STATIC_IP gw $STATIC_GW)"
+        ip addr add "${STATIC_IP}/24" dev eth0 2>/dev/null || true
+        ip route add default via "$STATIC_GW" 2>/dev/null || true
     fi
 
-    # Ensure DNS is configured. DHCP should have set /etc/resolv.conf,
-    # but if it didn't (or static fallback was used), provide a default.
-    if [ ! -s /etc/resolv.conf ]; then
+    # Ensure DNS is configured. When VM_NET_DNS is set (TAP networking),
+    # always use it — the rootfs may have a stale resolv.conf from a
+    # previous gvproxy run that points to an unreachable gateway.
+    if [ -n "${VM_NET_DNS:-}" ]; then
+        echo "nameserver $VM_NET_DNS" > /etc/resolv.conf
+    elif [ ! -s /etc/resolv.conf ]; then
         echo "nameserver 8.8.8.8" > /etc/resolv.conf
         echo "nameserver 8.8.4.4" >> /etc/resolv.conf
     fi
@@ -366,6 +397,35 @@ if [ "$_caps_ok" = false ]; then
     exit 1
 fi
 
+# ── GPU: NVIDIA driver and device plugin ─────────────────────────────
+# When the VM is launched with --gpu, the Rust launcher passes
+# GPU_ENABLED=true. Load the NVIDIA kernel modules, verify the device
+# is visible via nvidia-smi, and confirm that the container runtime is
+# available before k3s starts.
+
+if [ "${GPU_ENABLED:-false}" = "true" ]; then
+    ts "GPU mode enabled — loading NVIDIA drivers"
+
+    modprobe nvidia || { echo "FATAL: failed to load nvidia kernel module" >&2; exit 1; }
+    modprobe nvidia_uvm || { echo "FATAL: failed to load nvidia_uvm kernel module" >&2; exit 1; }
+    modprobe nvidia_modeset || { echo "FATAL: failed to load nvidia_modeset kernel module" >&2; exit 1; }
+    ts "NVIDIA kernel modules loaded"
+
+    if ! nvidia-smi > /dev/null 2>&1; then
+        echo "FATAL: GPU_ENABLED=true but nvidia-smi failed — GPU not visible to guest" >&2
+        echo "Check: VFIO passthrough, IOMMU groups, guest kernel modules" >&2
+        exit 1
+    fi
+    ts "nvidia-smi: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+
+    if command -v nvidia-container-runtime >/dev/null 2>&1; then
+        ts "nvidia-container-runtime: $(command -v nvidia-container-runtime)"
+    else
+        echo "FATAL: nvidia-container-runtime not found — GPU pods will fail" >&2
+        exit 1
+    fi
+fi
+
 # ── Deploy bundled manifests (cold boot only) ───────────────────────────
 # On pre-initialized rootfs, manifests are already in place from the
 # build-time k3s boot. Skip this entirely for fast startup.
@@ -409,6 +469,29 @@ if [ "$PRE_INITIALIZED" = false ]; then
     ts "manifests deployed"
 else
     ts "skipping manifest deploy (pre-initialized)"
+fi
+
+# ── GPU manifests (device plugin, runtime class) ─────────────────────
+# Deployed on every boot (not just cold boot) so the device plugin is
+# always present when GPU_ENABLED=true. Mirrors cluster-entrypoint.sh.
+if [ "${GPU_ENABLED:-false}" = "true" ]; then
+    GPU_MANIFESTS="/opt/openshell/gpu-manifests"
+    if [ ! -d "$GPU_MANIFESTS" ]; then
+        echo "FATAL: GPU_ENABLED=true but GPU manifests directory missing: $GPU_MANIFESTS" >&2
+        exit 1
+    fi
+    mkdir -p "$K3S_MANIFESTS"
+    _gpu_manifest_deployed=false
+    for manifest in "$GPU_MANIFESTS"/*.yaml; do
+        [ -f "$manifest" ] || continue
+        _gpu_manifest_deployed=true
+        cp "$manifest" "$K3S_MANIFESTS/"
+        ts "deployed GPU manifest: $(basename "$manifest")"
+    done
+    if [ "$_gpu_manifest_deployed" = false ]; then
+        echo "FATAL: GPU_ENABLED=true but no YAML manifests found in $GPU_MANIFESTS" >&2
+        exit 1
+    fi
 fi
 
 # Patch manifests for VM deployment constraints.
@@ -737,7 +820,7 @@ K3S_ARGS=(
     --node-ip="$NODE_IP"
     --kube-apiserver-arg=bind-address=0.0.0.0
     --resolv-conf=/etc/resolv.conf
-    --tls-san=localhost,127.0.0.1,10.0.2.15,192.168.127.2
+    --tls-san="localhost,127.0.0.1,10.0.2.15,192.168.127.2,$NODE_IP"
     --flannel-backend=none
     --snapshotter=overlayfs
     --kube-proxy-arg=proxy-mode=nftables

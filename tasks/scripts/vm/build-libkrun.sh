@@ -239,6 +239,18 @@ make -j"$(nproc)"
 cp libkrunfw.so* "$OUTPUT_DIR/"
 echo "    Built: $(ls "$OUTPUT_DIR"/libkrunfw.so* | xargs -n1 basename | tr '\n' ' ')"
 
+# Copy vmlinux kernel image for cloud-hypervisor GPU passthrough.
+# This is the uncompressed kernel built by libkrunfw's kernel build.
+if [ -f "${KERNEL_SOURCES}/vmlinux" ]; then
+  cp "${KERNEL_SOURCES}/vmlinux" "$OUTPUT_DIR/vmlinux"
+  echo "    Copied vmlinux for cloud-hypervisor GPU passthrough"
+elif [ -f "vmlinux" ]; then
+  cp "vmlinux" "$OUTPUT_DIR/vmlinux"
+  echo "    Copied vmlinux for cloud-hypervisor GPU passthrough"
+else
+  echo "    Warning: vmlinux not found in kernel build tree (GPU passthrough will not be available)" >&2
+fi
+
 cd "$BUILD_DIR"
 
 # ── Build libkrun (VMM) ─────────────────────────────────────────────────

@@ -92,6 +92,16 @@ struct Cli {
     /// unclean shutdown.
     #[arg(long)]
     reset: bool,
+
+    /// Enable GPU passthrough. Optionally specify a PCI address
+    /// (e.g. `0000:41:00.0`). Uses cloud-hypervisor backend with VFIO.
+    #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
+    gpu: Option<String>,
+
+    /// Hypervisor backend: "auto" (default), "libkrun", or "cloud-hypervisor".
+    /// Auto selects cloud-hypervisor when --gpu is set, libkrun otherwise.
+    #[arg(long, default_value = "auto")]
+    backend: String,
 }
 
 #[derive(Subcommand)]
@@ -196,12 +206,16 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
                 return Err("openshell-vm exec requires a command when stdin is not a TTY".into());
             }
         }
+        let exec_rootfs = if let Some(explicit) = cli.rootfs {
+            explicit
+        } else if cli.gpu.is_some() {
+            openshell_vm::named_gpu_rootfs_dir(&cli.name)?
+        } else {
+            openshell_vm::named_rootfs_dir(&cli.name)?
+        };
         return Ok(openshell_vm::exec_running_vm(
             openshell_vm::VmExecOptions {
-                rootfs: Some(
-                    cli.rootfs
-                        .unwrap_or(openshell_vm::named_rootfs_dir(&cli.name)?),
-                ),
+                rootfs: Some(exec_rootfs),
                 command,
                 workdir,
                 env,
@@ -223,11 +237,58 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         }
     };
 
-    let rootfs = cli
-        .rootfs
-        .map_or_else(|| openshell_vm::ensure_named_rootfs(&cli.name), Ok)?;
+    let rootfs = if let Some(explicit) = cli.rootfs {
+        Ok(explicit)
+    } else if cli.gpu.is_some() {
+        openshell_vm::ensure_gpu_rootfs(&cli.name)
+    } else {
+        openshell_vm::ensure_named_rootfs(&cli.name)
+    }?;
 
     let gateway_name = openshell_vm::gateway_name(&cli.name)?;
+
+    let (gpu_enabled, vfio_device, _gpu_guard) = match cli.gpu {
+        Some(ref addr) if addr != "auto" => {
+            let state = openshell_vfio::prepare_gpu_for_passthrough(Some(addr))?;
+            let bdf = state.pci_addr.clone();
+            (
+                true,
+                Some(bdf),
+                Some(openshell_vfio::GpuBindGuard::new(state)),
+            )
+        }
+        Some(_) => {
+            let state = openshell_vfio::prepare_gpu_for_passthrough(None)?;
+            let bdf = state.pci_addr.clone();
+            (
+                true,
+                Some(bdf),
+                Some(openshell_vfio::GpuBindGuard::new(state)),
+            )
+        }
+        None => (false, None, None),
+    };
+
+    let backend_choice = match cli.backend.as_str() {
+        "cloud-hypervisor" | "chv" => openshell_vm::VmBackendChoice::CloudHypervisor,
+        "libkrun" => {
+            if gpu_enabled {
+                return Err(
+                    "--backend libkrun is incompatible with --gpu (libkrun does not support \
+                     VFIO passthrough). Use --backend auto or --backend cloud-hypervisor."
+                        .into(),
+                );
+            }
+            openshell_vm::VmBackendChoice::Libkrun
+        }
+        "auto" => openshell_vm::VmBackendChoice::Auto,
+        other => {
+            return Err(format!(
+                "unknown --backend: {other} (expected: auto, libkrun, cloud-hypervisor)"
+            )
+            .into());
+        }
+    };
 
     let mut config = if let Some(exec_path) = cli.exec {
         openshell_vm::VmConfig {
@@ -246,6 +307,9 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
             reset: cli.reset,
             gateway_name,
             state_disk: None,
+            gpu_enabled,
+            vfio_device,
+            backend: backend_choice,
         }
     } else {
         let mut c = openshell_vm::VmConfig::gateway(rootfs);
@@ -261,6 +325,9 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         c.net = net_backend;
         c.reset = cli.reset;
         c.gateway_name = gateway_name;
+        c.gpu_enabled = gpu_enabled;
+        c.vfio_device = vfio_device;
+        c.backend = backend_choice;
         if state_disk_disabled() {
             c.state_disk = None;
         }
