@@ -7,8 +7,6 @@
 //! Client Credentials (CI/automation) OAuth2 grant types against a
 //! Keycloak-compatible OIDC provider.
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::service::service_fn;
@@ -16,9 +14,13 @@ use hyper::{Method, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use miette::{IntoDiagnostic, Result};
+use oauth2::basic::BasicClient;
+use oauth2::{
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
+    RefreshToken, Scope, TokenResponse, TokenUrl,
+};
 use openshell_bootstrap::oidc_token::OidcTokenBundle;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,16 +36,6 @@ struct OidcDiscovery {
     issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
-}
-
-/// Token endpoint response.
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    #[serde(default)]
-    expires_in: Option<u64>,
 }
 
 /// Discover OIDC endpoints from the issuer's well-known configuration.
@@ -71,29 +63,32 @@ async fn discover(issuer: &str) -> Result<OidcDiscovery> {
     Ok(resp)
 }
 
-/// Generate a random PKCE code verifier (43-128 unreserved chars).
-fn generate_code_verifier() -> String {
-    let mut buf = [0u8; 32];
-    csprng_fill(&mut buf);
-    URL_SAFE_NO_PAD.encode(buf)
+fn http_client() -> reqwest::Client {
+    reqwest::ClientBuilder::new()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build HTTP client")
 }
 
-/// Compute the S256 code challenge from a code verifier.
-fn compute_code_challenge(verifier: &str) -> String {
-    let digest = Sha256::digest(verifier.as_bytes());
-    URL_SAFE_NO_PAD.encode(digest)
+fn build_scopes(scopes: Option<&str>) -> Vec<Scope> {
+    let mut result = vec![Scope::new("openid".to_string())];
+    if let Some(s) = scopes {
+        for scope in s.split_whitespace() {
+            if scope != "openid" {
+                result.push(Scope::new(scope.to_string()));
+            }
+        }
+    }
+    result
 }
 
-/// Generate a random state parameter.
-fn generate_state() -> String {
-    let mut buf = [0u8; 16];
-    csprng_fill(&mut buf);
-    hex::encode(buf)
-}
-
-/// Fill a buffer with cryptographically secure random bytes from the OS.
-fn csprng_fill(buf: &mut [u8]) {
-    getrandom::fill(buf).expect("OS RNG failed");
+fn build_ci_scopes(scopes: Option<&str>) -> Vec<Scope> {
+    let Some(s) = scopes else {
+        return vec![];
+    };
+    s.split_whitespace()
+        .map(|scope| Scope::new(scope.to_string()))
+        .collect()
 }
 
 /// Run the OIDC Authorization Code + PKCE browser flow.
@@ -108,47 +103,40 @@ pub async fn oidc_browser_auth_flow(
 ) -> Result<OidcTokenBundle> {
     let discovery = discover(issuer).await?;
 
-    let code_verifier = generate_code_verifier();
-    let code_challenge = compute_code_challenge(&code_verifier);
-    let state = generate_state();
-
     let listener = TcpListener::bind("127.0.0.1:0").await.into_diagnostic()?;
     let port = listener.local_addr().into_diagnostic()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
-    let scope_value = match scopes {
-        Some(s) => {
-            let extra: Vec<&str> = s.split_whitespace().filter(|&sc| sc != "openid").collect();
-            if extra.is_empty() {
-                "openid".to_string()
-            } else {
-                format!("openid {}", extra.join(" "))
-            }
-        }
-        None => "openid".to_string(),
-    };
-    let mut auth_url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state={}&scope={}",
-        discovery.authorization_endpoint,
-        urlencoded(client_id),
-        urlencoded(&redirect_uri),
-        urlencoded(&code_challenge),
-        urlencoded(&state),
-        urlencoded(&scope_value),
-    );
-    // Request a specific API audience when configured (needed for providers
-    // like Entra ID where the API audience differs from the client ID).
+    let client = BasicClient::new(ClientId::new(client_id.to_string()))
+        .set_auth_uri(AuthUrl::new(discovery.authorization_endpoint).into_diagnostic()?)
+        .set_token_uri(TokenUrl::new(discovery.token_endpoint).into_diagnostic()?)
+        .set_redirect_uri(RedirectUrl::new(redirect_uri).into_diagnostic()?);
+
+    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+
+    let mut auth_request = client
+        .authorize_url(CsrfToken::new_random)
+        .set_pkce_challenge(pkce_challenge);
+
+    for scope in build_scopes(scopes) {
+        auth_request = auth_request.add_scope(scope);
+    }
+
+    let (mut auth_url, csrf_token) = auth_request.url();
+
+    // Append audience parameter for providers like Entra ID where the API
+    // audience differs from the client ID.
     if let Some(aud) = audience {
-        auth_url.push_str(&format!("&audience={}", urlencoded(aud)));
+        auth_url.query_pairs_mut().append_pair("audience", aud);
     }
 
     let (tx, rx) = oneshot::channel::<String>();
-    let expected_state = state.clone();
+    let expected_state = csrf_token.secret().clone();
 
     let server_handle = tokio::spawn(run_oidc_callback_server(listener, tx, expected_state));
 
     eprintln!("  Opening browser for OIDC authentication...");
-    if let Err(e) = crate::auth::open_browser_url(&auth_url) {
+    if let Err(e) = crate::auth::open_browser_url(auth_url.as_str()) {
         debug!(error = %e, "failed to open browser");
         eprintln!("Could not open browser automatically.");
         eprintln!("Open this URL in your browser:");
@@ -173,17 +161,19 @@ pub async fn oidc_browser_auth_flow(
 
     server_handle.abort();
 
-    // Exchange the authorization code for tokens.
-    let token_response = exchange_code(
-        &discovery.token_endpoint,
-        client_id,
-        &code,
-        &redirect_uri,
-        &code_verifier,
-    )
-    .await?;
+    let http = http_client();
+    let token_response = client
+        .exchange_code(AuthorizationCode::new(code))
+        .set_pkce_verifier(pkce_verifier)
+        .request_async(&http)
+        .await
+        .map_err(|e| miette::miette!("token exchange failed: {e}"))?;
 
-    Ok(bundle_from_response(token_response, issuer, client_id))
+    Ok(bundle_from_oauth2_response(
+        &token_response,
+        issuer,
+        client_id,
+    ))
 }
 
 /// Run the OIDC Client Credentials flow (for CI/automation).
@@ -203,30 +193,29 @@ pub async fn oidc_client_credentials_flow(
 
     let discovery = discover(issuer).await?;
 
-    let mut params = vec![
-        ("grant_type", "client_credentials"),
-        ("client_id", client_id),
-        ("client_secret", client_secret.as_str()),
-    ];
+    let client = BasicClient::new(ClientId::new(client_id.to_string()))
+        .set_client_secret(ClientSecret::new(client_secret))
+        .set_token_uri(TokenUrl::new(discovery.token_endpoint).into_diagnostic()?);
+
+    let mut request = client.exchange_client_credentials();
+    for scope in build_ci_scopes(scopes) {
+        request = request.add_scope(scope);
+    }
     if let Some(aud) = audience {
-        params.push(("audience", aud));
-    }
-    if let Some(s) = scopes {
-        params.push(("scope", s));
+        request = request.add_extra_param("audience", aud);
     }
 
-    let client = reqwest::Client::new();
-    let resp: TokenResponse = client
-        .post(&discovery.token_endpoint)
-        .form(&params)
-        .send()
+    let http = http_client();
+    let token_response = request
+        .request_async(&http)
         .await
-        .into_diagnostic()?
-        .json()
-        .await
-        .into_diagnostic()?;
+        .map_err(|e| miette::miette!("client credentials token exchange failed: {e}"))?;
 
-    Ok(bundle_from_response(resp, issuer, client_id))
+    Ok(bundle_from_oauth2_response(
+        &token_response,
+        issuer,
+        client_id,
+    ))
 }
 
 /// Refresh an OIDC token using the refresh_token grant.
@@ -242,25 +231,18 @@ pub async fn oidc_refresh_token(bundle: &OidcTokenBundle) -> Result<OidcTokenBun
 
     let discovery = discover(&bundle.issuer).await?;
 
-    let params = [
-        ("grant_type", "refresh_token"),
-        ("client_id", bundle.client_id.as_str()),
-        ("refresh_token", refresh_token),
-    ];
+    let client = BasicClient::new(ClientId::new(bundle.client_id.clone()))
+        .set_token_uri(TokenUrl::new(discovery.token_endpoint).into_diagnostic()?);
 
-    let client = reqwest::Client::new();
-    let resp: TokenResponse = client
-        .post(&discovery.token_endpoint)
-        .form(&params)
-        .send()
+    let http = http_client();
+    let token_response = client
+        .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
+        .request_async(&http)
         .await
-        .into_diagnostic()?
-        .json()
-        .await
-        .into_diagnostic()?;
+        .map_err(|e| miette::miette!("token refresh failed: {e}"))?;
 
-    let mut refreshed = bundle_from_response(resp, &bundle.issuer, &bundle.client_id);
-    // Preserve the old refresh token if the server didn't return a new one.
+    let mut refreshed =
+        bundle_from_oauth2_response(&token_response, &bundle.issuer, &bundle.client_id);
     if refreshed.refresh_token.is_none() {
         refreshed.refresh_token = bundle.refresh_token.clone();
     }
@@ -283,7 +265,6 @@ pub async fn ensure_valid_oidc_token(gateway_name: &str) -> Result<String> {
         return Ok(bundle.access_token);
     }
 
-    // Token expired — try to refresh.
     debug!(
         gateway = gateway_name,
         "OIDC token expired, attempting refresh"
@@ -295,65 +276,23 @@ pub async fn ensure_valid_oidc_token(gateway_name: &str) -> Result<String> {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-fn bundle_from_response(resp: TokenResponse, issuer: &str, client_id: &str) -> OidcTokenBundle {
+fn bundle_from_oauth2_response(
+    resp: &oauth2::basic::BasicTokenResponse,
+    issuer: &str,
+    client_id: &str,
+) -> OidcTokenBundle {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
     OidcTokenBundle {
-        access_token: resp.access_token,
-        refresh_token: resp.refresh_token,
-        expires_at: resp.expires_in.map(|ei| now + ei),
+        access_token: resp.access_token().secret().to_string(),
+        refresh_token: resp.refresh_token().map(|rt| rt.secret().to_string()),
+        expires_at: resp.expires_in().map(|ei| now + ei.as_secs()),
         issuer: issuer.to_string(),
         client_id: client_id.to_string(),
     }
-}
-
-async fn exchange_code(
-    token_endpoint: &str,
-    client_id: &str,
-    code: &str,
-    redirect_uri: &str,
-    code_verifier: &str,
-) -> Result<TokenResponse> {
-    let params = [
-        ("grant_type", "authorization_code"),
-        ("client_id", client_id),
-        ("code", code),
-        ("redirect_uri", redirect_uri),
-        ("code_verifier", code_verifier),
-    ];
-
-    let client = reqwest::Client::new();
-    let resp: TokenResponse = client
-        .post(token_endpoint)
-        .form(&params)
-        .send()
-        .await
-        .into_diagnostic()?
-        .json()
-        .await
-        .into_diagnostic()?;
-
-    Ok(resp)
-}
-
-/// Minimal percent-encoding for URL query parameter values.
-fn urlencoded(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                out.push('%');
-                out.push_str(&format!("{b:02X}"));
-            }
-        }
-    }
-    out
 }
 
 /// Percent-decode a URL query parameter value.

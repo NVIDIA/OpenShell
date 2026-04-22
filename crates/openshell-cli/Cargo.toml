@@ -59,10 +59,8 @@ anyhow = { workspace = true }
 tar = "0.4"
 
 # OIDC/Auth
-sha2 = { workspace = true }
+oauth2 = "5"
 base64 = { workspace = true }
-hex = "0.4"
-getrandom = { workspace = true }
 
 # WebSocket (Cloudflare tunnel proxy)
 tokio-tungstenite = { workspace = true }
