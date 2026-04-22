@@ -135,7 +135,8 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | None | Default container image for sandbox pods |
 | `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | None | gRPC endpoint reachable from within the cluster (for supervisor callbacks) |
 | `--drivers` | `OPENSHELL_DRIVERS` | `kubernetes` | Compute backend to use. Current options are `kubernetes`, `docker`, and `vm`. |
-| `--docker-supervisor-bin` | `OPENSHELL_DOCKER_SUPERVISOR_BIN` | Linux: sibling `openshell-sandbox`; macOS: auto-discovered local Linux build | Linux `openshell-sandbox` binary bind-mounted into Docker sandboxes as PID 1 |
+| `--docker-supervisor-bin` | `OPENSHELL_DOCKER_SUPERVISOR_BIN` | Sibling `openshell-sandbox` → local cargo build → extracted from `--docker-supervisor-image` | Linux `openshell-sandbox` binary bind-mounted into Docker sandboxes as PID 1 |
+| `--docker-supervisor-image` | `OPENSHELL_DOCKER_SUPERVISOR_IMAGE` | `ghcr.io/nvidia/openshell/supervisor:<gateway-image-tag>` | Image the gateway pulls to extract the Linux supervisor binary when no explicit path or local build is available. The binary is cached under `$XDG_DATA_HOME/openshell/docker-supervisor/<image-digest>/openshell-sandbox` and reused across restarts. |
 | `--docker-tls-ca` | `OPENSHELL_DOCKER_TLS_CA` | None | CA cert bind-mounted into Docker sandboxes at `/etc/openshell/tls/client/ca.crt` for gateway mTLS |
 | `--docker-tls-cert` | `OPENSHELL_DOCKER_TLS_CERT` | None | Client cert bind-mounted into Docker sandboxes at `/etc/openshell/tls/client/tls.crt` for gateway mTLS |
 | `--docker-tls-key` | `OPENSHELL_DOCKER_TLS_KEY` | None | Client private key bind-mounted into Docker sandboxes at `/etc/openshell/tls/client/tls.key` for gateway mTLS |

@@ -235,10 +235,12 @@ impl ComputeRuntime {
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
+        supervisor_readiness: Arc<dyn docker::SupervisorReadiness>,
     ) -> Result<Self, ComputeError> {
-        let driver = docker::DockerComputeDriver::new(&config, &docker_config)
-            .await
-            .map_err(|err| ComputeError::Message(err.to_string()))?;
+        let driver =
+            docker::DockerComputeDriver::new(&config, &docker_config, supervisor_readiness)
+                .await
+                .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(driver);
         Self::from_driver(
             driver,

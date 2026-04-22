@@ -10,9 +10,10 @@ use bollard::models::{
     MountTypeEnum, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, CreateImageOptions, ListContainersOptionsBuilder,
-    RemoveContainerOptionsBuilder,
+    CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
+    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
 };
+use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
@@ -33,7 +34,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::warn;
+use tracing::{info, warn};
 use url::{Host, Url};
 
 const WATCH_BUFFER: usize = 128;
@@ -56,11 +57,51 @@ const SANDBOX_COMMAND: &str = "sleep infinity";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 
+/// Default image holding the Linux `openshell-sandbox` binary. The gateway
+/// pulls this image and extracts the binary to a host-side cache when no
+/// explicit `--docker-supervisor-bin` override or local build is available.
+const DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
+
+/// Image tag baked in at compile time to pair the gateway with a matching
+/// supervisor image. Mirrors the pattern used by `openshell-bootstrap`:
+/// defaults to `"dev"`; CI overrides with a release version via the
+/// `OPENSHELL_IMAGE_TAG` env var during `cargo build`.
+const DEFAULT_DOCKER_SUPERVISOR_IMAGE_TAG: &str = match option_env!("OPENSHELL_IMAGE_TAG") {
+    Some(tag) => tag,
+    None => "dev",
+};
+
+/// Path to the supervisor binary inside the `openshell/supervisor` image.
+const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/usr/local/bin/openshell-sandbox";
+
+/// Return the default `ghcr.io/nvidia/openshell/supervisor:<tag>` reference
+/// used when no supervisor binary override is provided.
+pub fn default_docker_supervisor_image() -> String {
+    format!("{DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO}:{DEFAULT_DOCKER_SUPERVISOR_IMAGE_TAG}")
+}
+
+/// Queried by the Docker driver to decide when a sandbox's supervisor
+/// relay is live. Implementations return `true` once a sandbox has an
+/// active `ConnectSupervisor` session registered.
+///
+/// The driver cannot observe the supervisor's SSH socket directly (it
+/// lives inside the container), so it leans on this signal to flip the
+/// Ready condition from `DependenciesNotReady` to `True`.
+pub trait SupervisorReadiness: Send + Sync + 'static {
+    fn is_supervisor_connected(&self, sandbox_id: &str) -> bool;
+}
+
 /// Gateway-local configuration for the bundled Docker compute driver.
 #[derive(Debug, Clone, Default)]
 pub struct DockerComputeConfig {
     /// Optional override for the Linux `openshell-sandbox` binary mounted into containers.
     pub supervisor_bin: Option<PathBuf>,
+
+    /// Optional override for the image the gateway pulls to extract the
+    /// Linux `openshell-sandbox` binary when no explicit binary path or
+    /// local build is available. Defaults to
+    /// `ghcr.io/nvidia/openshell/supervisor:<OPENSHELL_IMAGE_TAG>`.
+    pub supervisor_image: Option<String>,
 
     /// Host-side CA certificate for Docker sandbox mTLS.
     pub guest_tls_ca: Option<PathBuf>,
@@ -98,6 +139,7 @@ pub struct DockerComputeDriver {
     docker: Arc<Docker>,
     config: DockerDriverRuntimeConfig,
     events: broadcast::Sender<WatchSandboxesEvent>,
+    supervisor_readiness: Arc<dyn SupervisorReadiness>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -110,7 +152,11 @@ type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send + 'static>>;
 
 impl DockerComputeDriver {
-    pub async fn new(config: &Config, docker_config: &DockerComputeConfig) -> CoreResult<Self> {
+    pub async fn new(
+        config: &Config,
+        docker_config: &DockerComputeConfig,
+        supervisor_readiness: Arc<dyn SupervisorReadiness>,
+    ) -> CoreResult<Self> {
         if config.grpc_endpoint.trim().is_empty() {
             return Err(Error::config(
                 "grpc_endpoint is required when using the docker compute driver",
@@ -123,7 +169,7 @@ impl DockerComputeDriver {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;
         let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
-        let supervisor_bin = resolve_supervisor_bin(docker_config, &daemon_arch)?;
+        let supervisor_bin = resolve_supervisor_bin(&docker, docker_config, &daemon_arch).await?;
         let guest_tls = docker_guest_tls_paths(config, docker_config)?;
 
         let driver = Self {
@@ -141,6 +187,7 @@ impl DockerComputeDriver {
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
             },
             events: broadcast::channel(WATCH_BUFFER).0,
+            supervisor_readiness,
         };
 
         let poll_driver = driver.clone();
@@ -207,14 +254,18 @@ impl DockerComputeDriver {
         let container = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
             .await?;
-        Ok(container.and_then(|summary| sandbox_from_container_summary(&summary)))
+        Ok(container.and_then(|summary| {
+            sandbox_from_container_summary(&summary, self.supervisor_readiness.as_ref())
+        }))
     }
 
     async fn current_snapshots(&self) -> Result<Vec<DriverSandbox>, Status> {
         let containers = self.list_managed_container_summaries().await?;
         let mut sandboxes = containers
             .iter()
-            .filter_map(sandbox_from_container_summary)
+            .filter_map(|summary| {
+                sandbox_from_container_summary(summary, self.supervisor_readiness.as_ref())
+            })
             .collect::<Vec<_>>();
         sandboxes.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(sandboxes)
@@ -867,7 +918,10 @@ fn parse_memory_limit(value: &str) -> Result<Option<i64>, Status> {
     Ok(Some((amount * multiplier).round() as i64))
 }
 
-fn sandbox_from_container_summary(summary: &ContainerSummary) -> Option<DriverSandbox> {
+fn sandbox_from_container_summary(
+    summary: &ContainerSummary,
+    readiness: &dyn SupervisorReadiness,
+) -> Option<DriverSandbox> {
     let labels = summary.labels.as_ref()?;
     let id = labels.get(SANDBOX_ID_LABEL_KEY)?.clone();
     let name = labels.get(SANDBOX_NAME_LABEL_KEY)?.clone();
@@ -876,21 +930,27 @@ fn sandbox_from_container_summary(summary: &ContainerSummary) -> Option<DriverSa
         .cloned()
         .unwrap_or_default();
 
+    let supervisor_connected = readiness.is_supervisor_connected(&id);
     Some(DriverSandbox {
         id,
         name: name.clone(),
         namespace,
         spec: None,
-        status: Some(driver_status_from_summary(summary, &name)),
+        status: Some(driver_status_from_summary(
+            summary,
+            &name,
+            supervisor_connected,
+        )),
     })
 }
 
 fn driver_status_from_summary(
     summary: &ContainerSummary,
     sandbox_name: &str,
+    supervisor_connected: bool,
 ) -> DriverSandboxStatus {
     let state = summary.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
-    let (ready, reason, message, deleting) = container_ready_condition(state);
+    let (ready, reason, message, deleting) = container_ready_condition(state, supervisor_connected);
 
     DriverSandboxStatus {
         sandbox_name: summary_container_name(summary).unwrap_or_else(|| sandbox_name.to_string()),
@@ -910,14 +970,26 @@ fn driver_status_from_summary(
 
 fn container_ready_condition(
     state: ContainerSummaryStateEnum,
+    supervisor_connected: bool,
 ) -> (&'static str, &'static str, &'static str, bool) {
     match state {
-        ContainerSummaryStateEnum::RUNNING => (
-            "False",
-            "DependenciesNotReady",
-            "Container is running; waiting for supervisor relay",
-            false,
-        ),
+        ContainerSummaryStateEnum::RUNNING => {
+            if supervisor_connected {
+                (
+                    "True",
+                    "SupervisorConnected",
+                    "Supervisor relay is live",
+                    false,
+                )
+            } else {
+                (
+                    "False",
+                    "DependenciesNotReady",
+                    "Container is running; waiting for supervisor relay",
+                    false,
+                )
+            }
+        }
         ContainerSummaryStateEnum::CREATED => ("False", "Starting", "Container created", false),
         ContainerSummaryStateEnum::RESTARTING => {
             ("False", "Starting", "Container restarting", false)
@@ -1058,48 +1130,56 @@ fn normalize_docker_arch(arch: &str) -> String {
     }
 }
 
-pub(crate) fn resolve_supervisor_bin(
+pub(crate) async fn resolve_supervisor_bin(
+    docker: &Docker,
     docker_config: &DockerComputeConfig,
     daemon_arch: &str,
 ) -> CoreResult<PathBuf> {
+    // Tier 1: explicit --docker-supervisor-bin / OPENSHELL_DOCKER_SUPERVISOR_BIN.
     if let Some(path) = docker_config.supervisor_bin.clone() {
         let path = canonicalize_existing_file(&path, "docker supervisor binary")?;
         validate_linux_elf_binary(&path)?;
         return Ok(path);
     }
 
+    // Tier 2: sibling `openshell-sandbox` next to the running gateway
+    // (release artifact layout). Linux-only because the sibling must be a
+    // Linux ELF to bind-mount into a Linux container.
     if cfg!(target_os = "linux") {
         let current_exe = std::env::current_exe()
             .map_err(|err| Error::config(format!("failed to resolve current executable: {err}")))?;
-        let Some(parent) = current_exe.parent() else {
-            return Err(Error::config(format!(
-                "current executable '{}' has no parent directory",
-                current_exe.display()
-            )));
-        };
-        let sibling = parent.join("openshell-sandbox");
-        let sibling = canonicalize_existing_file(&sibling, "docker supervisor binary")?;
-        validate_linux_elf_binary(&sibling)?;
-        return Ok(sibling);
-    }
-
-    let candidates = linux_supervisor_candidates(daemon_arch);
-    for candidate in &candidates {
-        if candidate.is_file() {
-            let path = canonicalize_existing_file(candidate, "docker supervisor binary")?;
-            validate_linux_elf_binary(&path)?;
-            return Ok(path);
+        if let Some(parent) = current_exe.parent() {
+            let sibling = parent.join("openshell-sandbox");
+            if sibling.is_file() {
+                let path = canonicalize_existing_file(&sibling, "docker supervisor binary")?;
+                if validate_linux_elf_binary(&path).is_ok() {
+                    return Ok(path);
+                }
+            }
         }
     }
 
-    let candidate_list = candidates
-        .into_iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(Error::config(format!(
-        "docker supervisor binary was not found; set --docker-supervisor-bin or OPENSHELL_DOCKER_SUPERVISOR_BIN (searched: {candidate_list})",
-    )))
+    // Tier 3: local cargo target build (developer workflow). Preferred
+    // over a registry pull when available because it matches whatever the
+    // developer just built.
+    let target_candidates = linux_supervisor_candidates(daemon_arch);
+    for candidate in &target_candidates {
+        if candidate.is_file() {
+            let path = canonicalize_existing_file(candidate, "docker supervisor binary")?;
+            if validate_linux_elf_binary(&path).is_ok() {
+                return Ok(path);
+            }
+        }
+    }
+
+    // Tier 4: pull the supervisor image from a registry and extract the
+    // binary to a host-side cache keyed by image content digest. This is
+    // the default path for released gateway binaries.
+    let image = docker_config
+        .supervisor_image
+        .clone()
+        .unwrap_or_else(default_docker_supervisor_image);
+    extract_supervisor_bin_from_image(docker, &image).await
 }
 
 fn linux_supervisor_candidates(daemon_arch: &str) -> Vec<PathBuf> {
@@ -1112,6 +1192,252 @@ fn linux_supervisor_candidates(daemon_arch: &str) -> Vec<PathBuf> {
         )],
         _ => Vec::new(),
     }
+}
+
+/// Pull the supervisor image (if not already local), extract
+/// `/usr/local/bin/openshell-sandbox` to a host cache keyed by the image's
+/// content digest, and return the cache path.
+///
+/// The extraction is atomic: the binary is written to a sibling temp file
+/// inside the digest-keyed directory and renamed into place, so concurrent
+/// gateway starts don't observe a partial file.
+async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> CoreResult<PathBuf> {
+    // Inspect first to see if the image is already present; only pull on miss.
+    let inspect = match docker.inspect_image(image).await {
+        Ok(inspect) => inspect,
+        Err(err) if is_not_found_error(&err) => {
+            info!(image = image, "Pulling docker supervisor image");
+            pull_supervisor_image(docker, image).await?;
+            docker.inspect_image(image).await.map_err(|err| {
+                Error::config(format!(
+                    "failed to inspect docker supervisor image '{image}' after pull: {err}",
+                ))
+            })?
+        }
+        Err(err) => {
+            return Err(Error::config(format!(
+                "failed to inspect docker supervisor image '{image}': {err}",
+            )));
+        }
+    };
+
+    let digest = inspect.id.clone().ok_or_else(|| {
+        Error::config(format!(
+            "docker supervisor image '{image}' inspect response has no Id",
+        ))
+    })?;
+
+    let cache_path = supervisor_cache_path(&digest)?;
+    if cache_path.is_file() {
+        validate_linux_elf_binary(&cache_path)?;
+        return Ok(cache_path);
+    }
+
+    let cache_dir = cache_path.parent().ok_or_else(|| {
+        Error::config(format!(
+            "docker supervisor cache path '{}' has no parent directory",
+            cache_path.display(),
+        ))
+    })?;
+    std::fs::create_dir_all(cache_dir).map_err(|err| {
+        Error::config(format!(
+            "failed to create docker supervisor cache dir '{}': {err}",
+            cache_dir.display(),
+        ))
+    })?;
+
+    info!(
+        image = image,
+        digest = digest,
+        cache_path = %cache_path.display(),
+        "Extracting supervisor binary from image to host cache",
+    );
+
+    let binary_bytes = extract_supervisor_binary_bytes(docker, image).await?;
+    write_cache_binary_atomic(&cache_path, &binary_bytes)?;
+    validate_linux_elf_binary(&cache_path)?;
+    Ok(cache_path)
+}
+
+async fn pull_supervisor_image(docker: &Docker, image: &str) -> CoreResult<()> {
+    let mut stream = docker.create_image(
+        Some(CreateImageOptions {
+            from_image: Some(image.to_string()),
+            ..Default::default()
+        }),
+        None,
+        None,
+    );
+    while let Some(result) = stream.next().await {
+        result.map_err(|err| {
+            Error::config(format!(
+                "failed to pull docker supervisor image '{image}': {err}",
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Create a short-lived container from `image`, stream out the supervisor
+/// binary as a tar archive, and return the untarred file bytes. The
+/// container is always removed, even on error paths.
+async fn extract_supervisor_binary_bytes(docker: &Docker, image: &str) -> CoreResult<Vec<u8>> {
+    let container_name = temp_extract_container_name();
+    docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::default()
+                    .name(container_name.as_str())
+                    .build(),
+            ),
+            ContainerCreateBody {
+                image: Some(image.to_string()),
+                entrypoint: Some(vec!["/bin/true".to_string()]),
+                cmd: Some(Vec::new()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| {
+            Error::config(format!(
+                "failed to create extractor container from '{image}': {err}",
+            ))
+        })?;
+
+    // Always tear down the extractor container, even if extraction fails.
+    let result = download_binary_from_container(docker, &container_name).await;
+    if let Err(remove_err) = docker
+        .remove_container(
+            &container_name,
+            Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+        )
+        .await
+    {
+        warn!(
+            container = container_name,
+            error = %remove_err,
+            "Failed to remove supervisor extractor container",
+        );
+    }
+    result
+}
+
+async fn download_binary_from_container(
+    docker: &Docker,
+    container_name: &str,
+) -> CoreResult<Vec<u8>> {
+    let options = DownloadFromContainerOptionsBuilder::default()
+        .path(SUPERVISOR_IMAGE_BINARY_PATH)
+        .build();
+    let mut stream = docker.download_from_container(container_name, Some(options));
+
+    let mut tar_bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk: Bytes = chunk.map_err(|err| {
+            Error::config(format!(
+                "failed to read supervisor binary stream from '{container_name}': {err}",
+            ))
+        })?;
+        tar_bytes.extend_from_slice(&chunk);
+    }
+
+    extract_first_tar_entry(&tar_bytes).map_err(|err| {
+        Error::config(format!(
+            "failed to extract supervisor binary from tar archive returned by '{container_name}': {err}",
+        ))
+    })
+}
+
+/// Extract the payload of the first regular-file entry in a tar archive.
+/// Docker's `/containers/<id>/archive` endpoint returns a single-file tar
+/// when `path` points to a file, so we only need the first entry.
+fn extract_first_tar_entry(tar_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    let mut entries = archive
+        .entries()
+        .map_err(|err| format!("open tar archive: {err}"))?;
+    let mut entry = entries
+        .next()
+        .ok_or_else(|| "tar archive was empty".to_string())?
+        .map_err(|err| format!("read tar entry: {err}"))?;
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    entry
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("read tar entry payload: {err}"))?;
+    Ok(bytes)
+}
+
+fn write_cache_binary_atomic(final_path: &Path, bytes: &[u8]) -> CoreResult<()> {
+    let dir = final_path.parent().ok_or_else(|| {
+        Error::config(format!(
+            "docker supervisor cache path '{}' has no parent directory",
+            final_path.display(),
+        ))
+    })?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".openshell-sandbox-")
+        .tempfile_in(dir)
+        .map_err(|err| {
+            Error::config(format!(
+                "failed to create temp file for supervisor binary in '{}': {err}",
+                dir.display(),
+            ))
+        })?;
+    std::io::Write::write_all(&mut temp, bytes).map_err(|err| {
+        Error::config(format!(
+            "failed to write supervisor binary to temp file: {err}",
+        ))
+    })?;
+    temp.as_file().sync_all().map_err(|err| {
+        Error::config(format!("failed to sync supervisor binary temp file: {err}",))
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).map_err(
+            |err| {
+                Error::config(format!(
+                    "failed to chmod supervisor binary temp file: {err}",
+                ))
+            },
+        )?;
+    }
+
+    temp.persist(final_path).map_err(|err| {
+        Error::config(format!(
+            "failed to rename supervisor binary into '{}': {}",
+            final_path.display(),
+            err.error,
+        ))
+    })?;
+    Ok(())
+}
+
+/// Cache path for an extracted supervisor binary, keyed by the image's
+/// content-addressable digest (e.g. `sha256:abc123…`). The digest-prefixed
+/// directory keeps stale extractions from earlier releases isolated so they
+/// can be GC'd without affecting the active binary.
+fn supervisor_cache_path(digest: &str) -> CoreResult<PathBuf> {
+    let base = openshell_core::paths::xdg_data_dir()
+        .map_err(|err| Error::config(format!("failed to resolve XDG data dir: {err}")))?;
+    Ok(supervisor_cache_path_with_base(&base, digest))
+}
+
+fn supervisor_cache_path_with_base(base: &Path, digest: &str) -> PathBuf {
+    let sanitized = digest.replace(':', "-");
+    base.join("openshell")
+        .join("docker-supervisor")
+        .join(sanitized)
+        .join("openshell-sandbox")
+}
+
+fn temp_extract_container_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("openshell-supervisor-extract-{pid}-{seq}")
 }
 
 fn canonicalize_existing_file(path: &Path, description: &str) -> CoreResult<PathBuf> {
@@ -1392,8 +1718,8 @@ mod tests {
             ..running.clone()
         };
 
-        let running_status = driver_status_from_summary(&running, "demo");
-        let running_later_status = driver_status_from_summary(&running_later, "demo");
+        let running_status = driver_status_from_summary(&running, "demo", false);
+        let running_later_status = driver_status_from_summary(&running_later, "demo", false);
         assert_eq!(running_status.conditions[0].status, "False");
         assert_eq!(running_status.conditions[0].reason, "DependenciesNotReady");
         assert_eq!(
@@ -1402,10 +1728,24 @@ mod tests {
         );
         assert_eq!(running_status.conditions, running_later_status.conditions);
 
-        let exited_status = driver_status_from_summary(&exited, "demo");
+        let exited_status = driver_status_from_summary(&exited, "demo", false);
         assert_eq!(exited_status.conditions[0].status, "False");
         assert_eq!(exited_status.conditions[0].reason, "ContainerExited");
         assert_eq!(exited_status.conditions[0].message, "Container exited");
+
+        // With a live supervisor session, a RUNNING container flips Ready=True
+        // so ExecSandbox and other "sandbox must be ready" gates can proceed.
+        let running_connected = driver_status_from_summary(&running, "demo", true);
+        assert_eq!(running_connected.conditions[0].status, "True");
+        assert_eq!(
+            running_connected.conditions[0].reason,
+            "SupervisorConnected"
+        );
+
+        // Supervisor readiness is ignored for non-RUNNING states — an exited
+        // container must not report Ready=True.
+        let exited_connected = driver_status_from_summary(&exited, "demo", true);
+        assert_eq!(exited_connected.conditions[0].status, "False");
     }
 
     #[test]
@@ -1428,10 +1768,8 @@ mod tests {
         let err = docker_guest_tls_paths(
             &config,
             &DockerComputeConfig {
-                supervisor_bin: None,
                 guest_tls_ca: Some(ca),
-                guest_tls_cert: None,
-                guest_tls_key: None,
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -1520,10 +1858,8 @@ mod tests {
         let err = docker_guest_tls_paths(
             &config,
             &DockerComputeConfig {
-                supervisor_bin: None,
                 guest_tls_ca: Some(ca),
-                guest_tls_cert: None,
-                guest_tls_key: None,
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -1536,13 +1872,112 @@ mod tests {
         let result = docker_guest_tls_paths(
             &config,
             &DockerComputeConfig {
-                supervisor_bin: None,
-                guest_tls_ca: None,
-                guest_tls_cert: None,
-                guest_tls_key: None,
+                ..Default::default()
             },
         )
         .unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn default_docker_supervisor_image_uses_nvidia_ghcr_repo() {
+        let image = default_docker_supervisor_image();
+        assert!(
+            image.starts_with("ghcr.io/nvidia/openshell/supervisor:"),
+            "unexpected default image reference: {image}",
+        );
+    }
+
+    #[test]
+    fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
+        let base = PathBuf::from("/var/cache/share");
+        let path = supervisor_cache_path_with_base(
+            &base,
+            "sha256:abc123deadbeef0123456789cafe0123456789fe",
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "/var/cache/share/openshell/docker-supervisor/sha256-abc123deadbeef0123456789cafe0123456789fe/openshell-sandbox",
+            ),
+        );
+    }
+
+    #[test]
+    fn supervisor_cache_path_isolates_different_digests() {
+        let base = PathBuf::from("/data");
+        let left = supervisor_cache_path_with_base(&base, "sha256:aaaaaaaa");
+        let right = supervisor_cache_path_with_base(&base, "sha256:bbbbbbbb");
+        assert_ne!(
+            left.parent().unwrap(),
+            right.parent().unwrap(),
+            "digest-keyed directories must differ so rollouts are isolated",
+        );
+    }
+
+    #[test]
+    fn write_cache_binary_atomic_materializes_file_with_executable_mode() {
+        let tempdir = TempDir::new().unwrap();
+        let target = tempdir.path().join("nested").join("openshell-sandbox");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        write_cache_binary_atomic(&target, b"\x7fELFpayload").unwrap();
+
+        assert!(target.is_file());
+        assert_eq!(fs::read(&target).unwrap(), b"\x7fELFpayload");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "expected 0755, got {mode:04o}");
+        }
+    }
+
+    #[test]
+    fn write_cache_binary_atomic_overwrites_existing_file() {
+        let tempdir = TempDir::new().unwrap();
+        let target = tempdir.path().join("openshell-sandbox");
+        fs::write(&target, b"stale").unwrap();
+
+        write_cache_binary_atomic(&target, b"\x7fELFfresh").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"\x7fELFfresh");
+    }
+
+    #[test]
+    fn temp_extract_container_names_are_unique_per_call() {
+        let first = temp_extract_container_name();
+        let second = temp_extract_container_name();
+        assert_ne!(first, second);
+        assert!(first.starts_with("openshell-supervisor-extract-"));
+    }
+
+    #[test]
+    fn extract_first_tar_entry_returns_payload_of_single_file_archive() {
+        // Build a tar archive with the same shape Docker returns from
+        // `/containers/<id>/archive` for a single file.
+        let payload = b"\x7fELFtest-binary-bytes";
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("openshell-sandbox").unwrap();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append(&header, payload.as_slice()).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let extracted = extract_first_tar_entry(&tar_buf).unwrap();
+        assert_eq!(extracted, payload);
+    }
+
+    #[test]
+    fn extract_first_tar_entry_rejects_empty_archive() {
+        let mut tar_buf = Vec::new();
+        tar::Builder::new(&mut tar_buf).finish().unwrap();
+        let err = extract_first_tar_entry(&tar_buf).unwrap_err();
+        assert!(err.contains("empty"), "unexpected error message: {err}");
     }
 }

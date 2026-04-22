@@ -89,6 +89,10 @@ pub struct ServerState {
     pub settings_mutex: tokio::sync::Mutex<()>,
 
     /// Registry of active supervisor sessions and pending relay channels.
+    ///
+    /// Stored as `Arc` so compute drivers (e.g. the bundled Docker
+    /// driver) can be constructed before `ServerState` and still
+    /// query session state to surface supervisor readiness.
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 }
 
@@ -333,6 +337,7 @@ async fn build_compute_runtime(
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
+            supervisor_sessions,
         )
         .await
         .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),

@@ -61,6 +61,12 @@ struct LiveSession {
 /// Holds a oneshot sender that will deliver the upgraded relay stream.
 type RelayStreamSender = oneshot::Sender<tokio::io::DuplexStream>;
 
+impl crate::compute::docker::SupervisorReadiness for SupervisorSessionRegistry {
+    fn is_supervisor_connected(&self, sandbox_id: &str) -> bool {
+        Self::is_connected(self, sandbox_id)
+    }
+}
+
 /// Registry of active supervisor sessions and pending relay channels.
 #[derive(Default)]
 pub struct SupervisorSessionRegistry {
@@ -124,6 +130,14 @@ impl SupervisorSessionRegistry {
             }
             None => false,
         }
+    }
+
+    /// Report whether a live supervisor session is registered for a sandbox.
+    ///
+    /// Used by compute drivers that need to surface "supervisor relay ready"
+    /// through the Ready condition without polling the sandbox runtime.
+    pub fn is_connected(&self, sandbox_id: &str) -> bool {
+        self.sessions.lock().unwrap().contains_key(sandbox_id)
     }
 
     /// Remove the session for a sandbox.

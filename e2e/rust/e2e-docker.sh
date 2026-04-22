@@ -45,6 +45,23 @@ cleanup() {
     wait "${GATEWAY_PID}" 2>/dev/null || true
   fi
 
+  # On failure, preserve sandbox container logs for post-mortem
+  # debugging before removing the containers.
+  if [ "${exit_code}" -ne 0 ] && command -v docker >/dev/null 2>&1; then
+    local ids
+    ids=$(docker ps -aq --filter "label=openshell.ai/managed-by=openshell" 2>/dev/null || true)
+    if [ -n "${ids}" ]; then
+      echo "=== sandbox container logs (preserved for debugging) ==="
+      for id in ${ids}; do
+        echo "--- container ${id} (inspect) ---"
+        docker inspect --format '{{.Name}} state={{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}} error={{.State.Error}}' "${id}" 2>/dev/null || true
+        echo "--- container ${id} (last 80 log lines) ---"
+        docker logs --tail 80 "${id}" 2>&1 || true
+      done
+      echo "=== end sandbox container logs ==="
+    fi
+  fi
+
   # Remove any lingering sandbox containers the gateway failed to clean
   # up. The driver labels its containers with openshell.ai/managed-by.
   if command -v docker >/dev/null 2>&1; then
@@ -100,27 +117,42 @@ esac
 SUPERVISOR_BIN="${ROOT}/target/${SUPERVISOR_TARGET}/release/openshell-sandbox"
 
 # ── Build binaries ───────────────────────────────────────────────────
+# Cap build parallelism to avoid OOM when run alongside a docker build or
+# on memory-constrained developer machines. Override with CARGO_BUILD_JOBS.
+CARGO_BUILD_JOBS_ARG=()
+if [ -n "${CARGO_BUILD_JOBS:-}" ]; then
+  CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
+fi
+
 echo "Building openshell-gateway and openshell-cli..."
-cargo build -p openshell-server --bin openshell-gateway
-cargo build -p openshell-cli --features openshell-core/dev-settings
+cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
+  -p openshell-server --bin openshell-gateway
+cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
+  -p openshell-cli --features openshell-core/dev-settings
 
 echo "Cross-compiling openshell-sandbox for ${SUPERVISOR_TARGET}..."
 if ! command -v cargo-zigbuild >/dev/null 2>&1; then
   cargo install --locked cargo-zigbuild
 fi
 rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
-cargo zigbuild --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
+cargo zigbuild ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
+  --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
 
 if [ ! -f "${SUPERVISOR_BIN}" ]; then
   echo "ERROR: expected supervisor binary at ${SUPERVISOR_BIN}" >&2
   exit 1
 fi
 
-# ── Ensure supervisor image is available locally ─────────────────────
-SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-openshell/supervisor:dev}"
+# ── Ensure a sandbox base image is available locally ────────────────
+# The bundled openshell-sandbox binary enforces a 'sandbox' user/group
+# in the image. Use the community sandbox base image (also what real
+# deployments default to). Callers can override with
+# OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE if they have a smaller local image
+# with the required 'sandbox' user.
+SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
 if ! docker image inspect "${SANDBOX_IMAGE}" >/dev/null 2>&1; then
-  echo "Building ${SANDBOX_IMAGE}..."
-  mise run build:docker:supervisor
+  echo "Pulling ${SANDBOX_IMAGE}..."
+  docker pull "${SANDBOX_IMAGE}"
 fi
 
 # ── Generate ephemeral mTLS PKI ──────────────────────────────────────
@@ -138,6 +170,8 @@ CN = openshell-server
 subjectAltName = @alt_server
 [alt_server]
 DNS.1 = localhost
+DNS.2 = host.openshell.internal
+DNS.3 = host.docker.internal
 IP.1 = 127.0.0.1
 IP.2 = ::1
 [san_client]

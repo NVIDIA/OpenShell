@@ -178,8 +178,19 @@ struct Args {
     vm_tls_key: Option<PathBuf>,
 
     /// Linux `openshell-sandbox` binary bind-mounted into Docker sandboxes.
+    ///
+    /// When unset the gateway falls back to (in order) a sibling
+    /// `openshell-sandbox` next to the gateway binary, a local cargo build,
+    /// or extracting the binary from `--docker-supervisor-image`.
     #[arg(long, env = "OPENSHELL_DOCKER_SUPERVISOR_BIN")]
     docker_supervisor_bin: Option<PathBuf>,
+
+    /// Image the Docker driver pulls to extract the Linux
+    /// `openshell-sandbox` binary when no explicit `--docker-supervisor-bin`
+    /// override or local build is available. Defaults to
+    /// `ghcr.io/nvidia/openshell/supervisor:<gateway-image-tag>`.
+    #[arg(long, env = "OPENSHELL_DOCKER_SUPERVISOR_IMAGE")]
+    docker_supervisor_image: Option<String>,
 
     /// CA certificate bind-mounted into Docker sandboxes for gateway mTLS.
     #[arg(long, env = "OPENSHELL_DOCKER_TLS_CA")]
@@ -333,6 +344,7 @@ async fn run_from_args(args: Args) -> Result<()> {
 
     let docker_config = DockerComputeConfig {
         supervisor_bin: args.docker_supervisor_bin,
+        supervisor_image: args.docker_supervisor_image,
         guest_tls_ca: args.docker_tls_ca,
         guest_tls_cert: args.docker_tls_cert,
         guest_tls_key: args.docker_tls_key,
