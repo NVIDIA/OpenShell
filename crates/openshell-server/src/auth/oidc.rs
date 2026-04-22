@@ -10,7 +10,7 @@
 //! This module owns authentication (verifying who the caller is).
 //! Authorization (deciding what the caller can do) is in `authz.rs`.
 
-use crate::identity::{Identity, IdentityProvider};
+use super::identity::{Identity, IdentityProvider};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use openshell_core::OidcConfig;
 use reqwest::Client;

@@ -11,7 +11,7 @@
 //! This separation follows RFC 0001's control-plane identity design:
 //! authentication is a driver concern, authorization is a gateway concern.
 
-use crate::identity::Identity;
+use super::identity::Identity;
 use tonic::Status;
 use tracing::debug;
 
@@ -205,7 +205,7 @@ impl AuthzPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::IdentityProvider;
+    use crate::auth::identity::IdentityProvider;
 
     fn default_policy() -> AuthzPolicy {
         AuthzPolicy {

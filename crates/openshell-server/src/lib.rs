@@ -20,15 +20,12 @@
 //! [`compute::vm`]; keep this file driver-agnostic going forward.
 
 mod auth;
-mod authz;
 pub mod cli;
 mod compute;
 mod grpc;
 mod http;
-pub mod identity;
 mod inference;
 mod multiplex;
-pub mod oidc;
 mod persistence;
 pub(crate) mod policy_store;
 mod sandbox_index;
@@ -100,7 +97,7 @@ pub struct ServerState {
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
-    pub oidc_cache: Option<Arc<oidc::JwksCache>>,
+    pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -121,7 +118,7 @@ impl ServerState {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
-        oidc_cache: Option<Arc<oidc::JwksCache>>,
+        oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
     ) -> Self {
         Self {
             config,
@@ -167,14 +164,14 @@ pub async fn run_server(
 
     let oidc_cache = if let Some(ref oidc) = config.oidc {
         // Validate RBAC configuration before starting.
-        let policy = authz::AuthzPolicy {
+        let policy = auth::authz::AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
             scopes_enabled: !oidc.scopes_claim.is_empty(),
         };
         policy.validate().map_err(|e| Error::config(e))?;
 
-        let cache = oidc::JwksCache::new(oidc)
+        let cache = auth::oidc::JwksCache::new(oidc)
             .await
             .map_err(|e| Error::config(format!("OIDC initialization failed: {e}")))?;
         info!("OIDC JWT validation enabled (issuer: {})", oidc.issuer);
