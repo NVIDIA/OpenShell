@@ -101,7 +101,7 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Try to open a rolling log file; fall back to stdout-only logging if it fails
+    // Try to open a rolling log file; fall back to stderr-only logging if it fails
     // (e.g., /var/log is not writable in custom workload images).
     // Rotates daily, keeps the 3 most recent files to bound disk usage.
     let file_logging = tracing_appender::rolling::RollingFileAppender::builder()
@@ -176,7 +176,16 @@ fn main() -> Result<()> {
 
             tracing_subscriber::registry()
                 .with(
-                    OcsfShorthandLayer::new(std::io::stdout())
+                    // Tracing must target stderr, not stdout. The pre_exec hook
+                    // that applies Landlock inherits this subscriber and runs
+                    // in the SSH-exec child process after fd 1 has been remapped
+                    // to the SSH channel's stdout pipe. Any WARN emitted during
+                    // pre_exec (e.g. the "Landlock unavailable" DetectionFinding
+                    // on hosts whose kernel lacks Landlock, such as Darwin's
+                    // Docker Linux VM) otherwise interleaves with the command's
+                    // stdout — which corrupts the tar archive produced by
+                    // `openshell sandbox download`.
+                    OcsfShorthandLayer::new(std::io::stderr())
                         .with_non_ocsf(true)
                         .with_filter(stdout_filter),
                 )
@@ -192,14 +201,16 @@ fn main() -> Result<()> {
         } else {
             tracing_subscriber::registry()
                 .with(
-                    OcsfShorthandLayer::new(std::io::stdout())
+                    // See comment above: stderr prevents pre_exec tracing from
+                    // polluting the SSH exec channel's stdout.
+                    OcsfShorthandLayer::new(std::io::stderr())
                         .with_non_ocsf(true)
                         .with_filter(stdout_filter),
                 )
                 .with(push_layer)
                 .init();
             // Log the warning after the subscriber is initialized
-            warn!("Could not open /var/log for log rotation; using stdout-only logging");
+            warn!("Could not open /var/log for log rotation; using stderr-only logging");
             (None, None)
         };
 
