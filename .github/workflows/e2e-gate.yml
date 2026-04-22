@@ -1,0 +1,88 @@
+name: E2E Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+  workflow_run:
+    workflows: ["Branch E2E Checks"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  check:
+    name: Enforce test:e2e runs when labeled
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    steps:
+      - name: Resolve PR context
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_SHA_FROM_EVENT: ${{ github.event.pull_request.head.sha }}
+          PR_LABELS_FROM_EVENT: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            head_sha="$PR_HEAD_SHA_FROM_EVENT"
+            labels_json="$PR_LABELS_FROM_EVENT"
+          else
+            head_sha="$WORKFLOW_RUN_HEAD_SHA"
+            pr=$(gh api "repos/$GH_REPO/commits/$head_sha/pulls" --jq '.[0] // empty')
+            if [ -z "$pr" ]; then
+              echo "No PR associated with $head_sha; gate is a no-op."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            labels_json=$(echo "$pr" | jq -c '[.labels[].name]')
+          fi
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "labels_json=$labels_json" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate gate
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          LABELS_JSON: ${{ steps.pr.outputs.labels_json }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          has_label=$(jq -r 'any(.[]; . == "test:e2e")' <<< "$LABELS_JSON")
+          if [ "$has_label" != "true" ]; then
+            echo "::notice::test:e2e label not applied; gate passes."
+            exit 0
+          fi
+
+          runs=$(gh api "repos/$GH_REPO/actions/workflows/branch-e2e.yml/runs?head_sha=$HEAD_SHA&event=push" --jq '.workflow_runs')
+          latest=$(jq -c 'sort_by(.created_at) | reverse | .[0] // empty' <<< "$runs")
+
+          if [ -z "$latest" ]; then
+            echo "::error::test:e2e is applied but Branch E2E Checks has not run for $HEAD_SHA. Wait for copy-pr-bot to mirror the PR, or re-run the gate once Branch E2E Checks completes."
+            exit 1
+          fi
+
+          status=$(jq -r '.status' <<< "$latest")
+          conclusion=$(jq -r '.conclusion' <<< "$latest")
+
+          if [ "$conclusion" = "success" ]; then
+            echo "Branch E2E Checks succeeded for $HEAD_SHA."
+            exit 0
+          fi
+
+          if [ "$status" != "completed" ]; then
+            echo "::error::Branch E2E Checks is $status for $HEAD_SHA. This gate will re-evaluate on completion."
+            exit 1
+          fi
+
+          echo "::error::Branch E2E Checks concluded as $conclusion for $HEAD_SHA."
+          exit 1
