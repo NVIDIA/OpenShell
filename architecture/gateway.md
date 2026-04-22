@@ -605,7 +605,7 @@ The gateway reaches the sandbox exclusively through the supervisor-initiated `Co
 
 - **Create**: The VM driver process allocates a sandbox-specific rootfs from its own embedded `rootfs.tar.zst`, injects an explicitly configured guest mTLS bundle when the gateway callback endpoint is `https://`, then re-execs itself in a hidden helper mode that loads libkrun directly and boots the supervisor.
 - **Networking**: The helper starts an embedded `gvproxy`, wires it into libkrun as virtio-net, and gives the guest outbound connectivity. No inbound TCP listener is needed — the supervisor reaches the gateway over its outbound `ConnectSupervisor` stream.
-- **Gateway callback**: The guest init script configures `eth0` for gvproxy networking, prefers the configured `OPENSHELL_GRPC_ENDPOINT`, and falls back to host aliases or the gvproxy gateway IP (`192.168.127.1`) when local hostname resolution is unavailable on macOS.
+- **Gateway callback**: The guest init script configures `eth0` for gvproxy networking, seeds `/etc/hosts` so `host.openshell.internal` resolves to the gvproxy gateway IP (`192.168.127.1`), preserves gvproxy's legacy `host.containers.internal` / `host.docker.internal` DNS answers, prefers the configured `OPENSHELL_GRPC_ENDPOINT`, and falls back to those aliases or the raw gateway IP when local hostname resolution is unavailable on macOS.
 - **Guest boot**: The sandbox guest runs a minimal init script that starts `openshell-sandbox` directly as PID 1 inside the VM.
 - **Watch stream**: Emits provisioning, ready, error, deleting, deleted, and platform-event updates so the gateway store remains the durable source of truth.
 

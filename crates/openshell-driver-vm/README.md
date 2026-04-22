@@ -97,7 +97,7 @@ The gateway resolves `openshell-driver-vm` in this order: `--driver-dir`, conven
 | Flag | Env var | Default | Purpose |
 |---|---|---|---|
 | `--drivers vm` | `OPENSHELL_DRIVERS` | `kubernetes` | Select the VM compute driver. |
-| `--grpc-endpoint URL` | `OPENSHELL_GRPC_ENDPOINT` | — | Required. URL the sandbox guest calls back to. Use a host alias that resolves to the gateway's host from inside the VM (gvproxy answers `host.containers.internal` and `host.openshell.internal` to `192.168.127.1`). |
+| `--grpc-endpoint URL` | `OPENSHELL_GRPC_ENDPOINT` | — | Required. URL the sandbox guest calls back to. Use a host alias that resolves to the gateway's host from inside the VM (`host.containers.internal` comes from gvproxy DNS; the guest init script also seeds `host.openshell.internal` to `192.168.127.1`). |
 | `--vm-driver-state-dir DIR` | `OPENSHELL_VM_DRIVER_STATE_DIR` | `target/openshell-vm-driver` | Per-sandbox rootfs, console logs, and the `compute-driver.sock` UDS. |
 | `--driver-dir DIR` | `OPENSHELL_DRIVER_DIR` | unset | Override the directory searched for `openshell-driver-vm`. |
 | `--vm-driver-vcpus N` | `OPENSHELL_VM_DRIVER_VCPUS` | `2` | vCPUs per sandbox. |

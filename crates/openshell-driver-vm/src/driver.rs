@@ -33,6 +33,8 @@ const DRIVER_NAME: &str = "openshell-driver-vm";
 const WATCH_BUFFER: usize = 256;
 const DEFAULT_VCPUS: u8 = 2;
 const DEFAULT_MEM_MIB: u32 = 2048;
+const GVPROXY_GATEWAY_IP: &str = "192.168.127.1";
+const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
 const GUEST_SSH_SOCKET_PATH: &str = "/run/openshell/ssh.sock";
 const GUEST_TLS_DIR: &str = "/opt/openshell/tls";
 const GUEST_TLS_CA_PATH: &str = "/opt/openshell/tls/ca.crt";
@@ -147,7 +149,7 @@ fn validate_openshell_endpoint(endpoint: &str) -> Result<(), String> {
 
     if invalid_from_vm {
         return Err(format!(
-            "openshell endpoint '{endpoint}' is not reachable from sandbox VMs; use a concrete host such as 127.0.0.1, host.containers.internal, or another routable address"
+            "openshell endpoint '{endpoint}' is not reachable from sandbox VMs; use a concrete host such as 127.0.0.1, {OPENSHELL_HOST_GATEWAY_ALIAS}, or another routable address"
         ));
     }
 
@@ -723,7 +725,7 @@ fn guest_visible_openshell_endpoint(endpoint: &str) -> String {
         None => false,
     };
 
-    if should_rewrite && url.set_host(Some("192.168.127.1")).is_ok() {
+    if should_rewrite && url.set_host(Some(GVPROXY_GATEWAY_IP)).is_ok() {
         return url.to_string();
     }
 
@@ -1007,7 +1009,9 @@ mod tests {
 
         let env = build_guest_environment(&sandbox, &config);
         assert!(env.contains(&"HOME=/root".to_string()));
-        assert!(env.contains(&"OPENSHELL_ENDPOINT=http://192.168.127.1:8080/".to_string()));
+        assert!(env.contains(&format!(
+            "OPENSHELL_ENDPOINT=http://{GVPROXY_GATEWAY_IP}:8080/"
+        )));
         assert!(env.contains(&"OPENSHELL_SANDBOX_ID=sandbox-123".to_string()));
         assert!(env.contains(&format!(
             "OPENSHELL_SSH_SOCKET_PATH={GUEST_SSH_SOCKET_PATH}"
@@ -1015,10 +1019,36 @@ mod tests {
     }
 
     #[test]
+    fn guest_visible_openshell_endpoint_rewrites_loopback_hosts_to_gvproxy_gateway() {
+        assert_eq!(
+            guest_visible_openshell_endpoint("http://127.0.0.1:8080"),
+            format!("http://{GVPROXY_GATEWAY_IP}:8080/")
+        );
+        assert_eq!(
+            guest_visible_openshell_endpoint("http://localhost:8080"),
+            format!("http://{GVPROXY_GATEWAY_IP}:8080/")
+        );
+        assert_eq!(
+            guest_visible_openshell_endpoint("https://[::1]:8443"),
+            format!("https://{GVPROXY_GATEWAY_IP}:8443/")
+        );
+    }
+
+    #[test]
     fn guest_visible_openshell_endpoint_preserves_non_loopback_hosts() {
+        assert_eq!(
+            guest_visible_openshell_endpoint(&format!(
+                "http://{OPENSHELL_HOST_GATEWAY_ALIAS}:8080"
+            )),
+            format!("http://{OPENSHELL_HOST_GATEWAY_ALIAS}:8080")
+        );
         assert_eq!(
             guest_visible_openshell_endpoint("http://host.containers.internal:8080"),
             "http://host.containers.internal:8080"
+        );
+        assert_eq!(
+            guest_visible_openshell_endpoint(&format!("http://{GVPROXY_GATEWAY_IP}:8080")),
+            format!("http://{GVPROXY_GATEWAY_IP}:8080")
         );
         assert_eq!(
             guest_visible_openshell_endpoint("https://gateway.internal:8443"),
@@ -1134,9 +1164,9 @@ mod tests {
     fn validate_openshell_endpoint_accepts_host_gateway() {
         validate_openshell_endpoint("http://host.containers.internal:8080")
             .expect("guest-reachable host alias should be accepted");
-        validate_openshell_endpoint("http://192.168.127.1:8080")
+        validate_openshell_endpoint(&format!("http://{GVPROXY_GATEWAY_IP}:8080"))
             .expect("gateway IP should be accepted");
-        validate_openshell_endpoint("http://host.openshell.internal:8080")
+        validate_openshell_endpoint(&format!("http://{OPENSHELL_HOST_GATEWAY_ALIAS}:8080"))
             .expect("openshell host alias should be accepted");
         validate_openshell_endpoint("https://gateway.internal:8443")
             .expect("dns endpoint should be accepted");

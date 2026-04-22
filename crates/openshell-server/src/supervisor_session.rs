@@ -180,6 +180,10 @@ impl SupervisorSessionRegistry {
             .map(|s| s.tx.clone())
     }
 
+    pub fn has_session(&self, sandbox_id: &str) -> bool {
+        self.sessions.lock().unwrap().contains_key(sandbox_id)
+    }
+
     fn pending_channel_ids(&self, sandbox_id: &str) -> Vec<String> {
         self.pending_relays
             .lock()
@@ -547,6 +551,19 @@ pub async fn handle_connect_supervisor(
             .await;
     }
 
+    if let Err(err) = state
+        .compute
+        .supervisor_session_connected(&sandbox_id)
+        .await
+    {
+        warn!(
+            sandbox_id = %sandbox_id,
+            session_id = %session_id,
+            error = %err,
+            "supervisor session: failed to mark sandbox ready"
+        );
+    }
+
     // Step 4: Spawn the session loop that reads inbound messages.
     let state_clone = Arc::clone(state);
     let sandbox_id_clone = sandbox_id.clone();
@@ -565,6 +582,18 @@ pub async fn handle_connect_supervisor(
             .remove_if_current(&sandbox_id_clone, &session_id);
         if still_ours {
             info!(sandbox_id = %sandbox_id_clone, session_id = %session_id, "supervisor session: ended");
+            if let Err(err) = state_clone
+                .compute
+                .supervisor_session_disconnected(&sandbox_id_clone)
+                .await
+            {
+                warn!(
+                    sandbox_id = %sandbox_id_clone,
+                    session_id = %session_id,
+                    error = %err,
+                    "supervisor session: failed to mark sandbox disconnected"
+                );
+            }
         } else {
             info!(sandbox_id = %sandbox_id_clone, session_id = %session_id, "supervisor session: ended (already superseded)");
         }

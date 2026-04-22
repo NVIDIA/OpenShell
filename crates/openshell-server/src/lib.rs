@@ -88,7 +88,7 @@ pub struct ServerState {
     pub settings_mutex: tokio::sync::Mutex<()>,
 
     /// Registry of active supervisor sessions and pending relay channels.
-    pub supervisor_sessions: supervisor_session::SupervisorSessionRegistry,
+    pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -108,6 +108,7 @@ impl ServerState {
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
     ) -> Self {
         Self {
             config,
@@ -119,7 +120,7 @@ impl ServerState {
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
-            supervisor_sessions: supervisor_session::SupervisorSessionRegistry::new(),
+            supervisor_sessions,
         }
     }
 }
@@ -150,6 +151,7 @@ pub async fn run_server(
 
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
+    let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
     let compute = build_compute_runtime(
         &config,
         &vm_config,
@@ -157,6 +159,7 @@ pub async fn run_server(
         sandbox_index.clone(),
         sandbox_watch_bus.clone(),
         tracing_log_bus.clone(),
+        supervisor_sessions.clone(),
     )
     .await?;
     let state = Arc::new(ServerState::new(
@@ -166,6 +169,7 @@ pub async fn run_server(
         sandbox_index,
         sandbox_watch_bus,
         tracing_log_bus,
+        supervisor_sessions,
     ));
 
     state.compute.spawn_watchers();
@@ -261,6 +265,7 @@ async fn build_compute_runtime(
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
+    supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 ) -> Result<ComputeRuntime> {
     let driver = configured_compute_driver(config)?;
     info!(driver = %driver, "Using compute driver");
@@ -288,6 +293,7 @@ async fn build_compute_runtime(
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
+            supervisor_sessions.clone(),
         )
         .await
         .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
@@ -300,6 +306,7 @@ async fn build_compute_runtime(
                 sandbox_index,
                 sandbox_watch_bus,
                 tracing_log_bus,
+                supervisor_sessions,
             )
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))

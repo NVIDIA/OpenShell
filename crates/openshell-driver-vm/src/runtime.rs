@@ -63,8 +63,11 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
     //   * the DHCP server + default router the guest's udhcpc client
     //     talks to on boot (IPs 192.168.127.1 / .2, defaults for
     //     gvisor-tap-vsock);
-    //   * name resolution for `host.containers.internal` /
-    //     `host.docker.internal`, which is how the guest's
+    //   * the host-facing gateway identity the guest uses for callbacks:
+    //     the init script seeds `/etc/hosts` with
+    //     `host.openshell.internal` pointing at 192.168.127.1 while
+    //     leaving gvproxy's legacy `host.containers.internal` /
+    //     `host.docker.internal` DNS answers intact, which is how the guest's
     //     `rewrite_openshell_endpoint_if_needed` probe reaches the host
     //     gateway when the bare loopback address doesn't resolve from
     //     inside the VM.

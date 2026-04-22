@@ -119,6 +119,65 @@ verify_checksum() {
     fi
 }
 
+ensure_build_nofile_limit() {
+    local desired="${OPENSHELL_VM_BUILD_NOFILE_LIMIT:-8192}"
+    local minimum=1024
+    local current=""
+    local hard=""
+    local target=""
+
+    [ "$(uname -s)" = "Darwin" ] || return 0
+    command -v cargo-zigbuild >/dev/null 2>&1 || return 0
+
+    current="$(ulimit -n 2>/dev/null || echo "")"
+    case "${current}" in
+        ''|*[!0-9]*)
+            return 0
+            ;;
+    esac
+
+    if [ "${current}" -ge "${desired}" ]; then
+        return 0
+    fi
+
+    hard="$(ulimit -Hn 2>/dev/null || echo "")"
+    target="${desired}"
+    case "${hard}" in
+        ''|unlimited|infinity)
+            ;;
+        *[!0-9]*)
+            ;;
+        *)
+            if [ "${hard}" -lt "${target}" ]; then
+                target="${hard}"
+            fi
+            ;;
+    esac
+
+    if [ "${target}" -gt "${current}" ] && ulimit -n "${target}" 2>/dev/null; then
+        echo "==> Raised open file limit for cargo-zigbuild: ${current} -> $(ulimit -n)"
+    fi
+
+    current="$(ulimit -n 2>/dev/null || echo "${current}")"
+    case "${current}" in
+        ''|*[!0-9]*)
+            return 0
+            ;;
+    esac
+
+    if [ "${current}" -lt "${desired}" ]; then
+        echo "WARNING: Open file limit is ${current}; cargo-zigbuild is more reliable at ${desired}+ on macOS."
+    fi
+
+    if [ "${current}" -lt "${minimum}" ]; then
+        echo "ERROR: Open file limit (${current}) is too low for cargo-zigbuild on macOS."
+        echo "       Zig 0.14+ can fail with ProcessFdQuotaExceeded while linking large binaries."
+        echo "       Run: ulimit -n ${desired}"
+        echo "       Then re-run this script."
+        exit 1
+    fi
+}
+
 if [ "$BASE_ONLY" = true ]; then
     echo "==> Building base openshell-vm rootfs"
     echo "    Guest arch:  ${GUEST_ARCH}"
@@ -134,6 +193,10 @@ else
     echo "    Mode:        full (pre-loaded images, pre-initialized)"
 fi
 echo ""
+
+# cargo-zigbuild on macOS can exhaust the default per-process file descriptor
+# limit while linking larger targets with Zig 0.14+.
+ensure_build_nofile_limit
 
 # ── Check for running VM ────────────────────────────────────────────────
 # If an openshell-vm is using this rootfs via virtio-fs, wiping the rootfs
