@@ -16,8 +16,8 @@ use hyper_util::server::conn::auto::Builder;
 use miette::{IntoDiagnostic, Result};
 use oauth2::basic::BasicClient;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
-    RefreshToken, Scope, TokenResponse, TokenUrl,
+    AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
+    RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
 };
 use openshell_bootstrap::oidc_token::OidcTokenBundle;
 use serde::Deserialize;
@@ -195,7 +195,8 @@ pub async fn oidc_client_credentials_flow(
 
     let client = BasicClient::new(ClientId::new(client_id.to_string()))
         .set_client_secret(ClientSecret::new(client_secret))
-        .set_token_uri(TokenUrl::new(discovery.token_endpoint).into_diagnostic()?);
+        .set_token_uri(TokenUrl::new(discovery.token_endpoint).into_diagnostic()?)
+        .set_auth_type(AuthType::RequestBody);
 
     let mut request = client.exchange_client_credentials();
     for scope in build_ci_scopes(scopes) {
