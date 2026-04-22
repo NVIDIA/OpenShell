@@ -864,17 +864,7 @@ fn driver_status_from_summary(
     sandbox_name: &str,
 ) -> DriverSandboxStatus {
     let state = summary.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
-    let message = summary.status.clone().unwrap_or_else(|| state.to_string());
-    let (ready, reason, deleting) = match state {
-        ContainerSummaryStateEnum::RUNNING => ("True", "DependenciesReady", false),
-        ContainerSummaryStateEnum::CREATED
-        | ContainerSummaryStateEnum::RESTARTING
-        | ContainerSummaryStateEnum::EMPTY => ("False", "Starting", false),
-        ContainerSummaryStateEnum::REMOVING => ("False", "Deleting", true),
-        ContainerSummaryStateEnum::PAUSED => ("False", "ContainerPaused", false),
-        ContainerSummaryStateEnum::EXITED => ("False", "ContainerExited", false),
-        ContainerSummaryStateEnum::DEAD => ("False", "ContainerDead", false),
-    };
+    let (ready, reason, message, deleting) = container_ready_condition(state);
 
     DriverSandboxStatus {
         sandbox_name: summary_container_name(summary).unwrap_or_else(|| sandbox_name.to_string()),
@@ -885,10 +875,40 @@ fn driver_status_from_summary(
             r#type: "Ready".to_string(),
             status: ready.to_string(),
             reason: reason.to_string(),
-            message,
+            message: message.to_string(),
             last_transition_time: String::new(),
         }],
         deleting,
+    }
+}
+
+fn container_ready_condition(
+    state: ContainerSummaryStateEnum,
+) -> (&'static str, &'static str, &'static str, bool) {
+    match state {
+        ContainerSummaryStateEnum::RUNNING => (
+            "False",
+            "DependenciesNotReady",
+            "Container is running; waiting for supervisor relay",
+            false,
+        ),
+        ContainerSummaryStateEnum::CREATED => ("False", "Starting", "Container created", false),
+        ContainerSummaryStateEnum::RESTARTING => {
+            ("False", "Starting", "Container restarting", false)
+        }
+        ContainerSummaryStateEnum::EMPTY => {
+            ("False", "Starting", "Container state is unknown", false)
+        }
+        ContainerSummaryStateEnum::REMOVING => {
+            ("False", "Deleting", "Container is being removed", true)
+        }
+        ContainerSummaryStateEnum::PAUSED => {
+            ("False", "ContainerPaused", "Container is paused", false)
+        }
+        ContainerSummaryStateEnum::EXITED => {
+            ("False", "ContainerExited", "Container exited", false)
+        }
+        ContainerSummaryStateEnum::DEAD => ("False", "ContainerDead", "Container is dead", false),
     }
 }
 
@@ -1272,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn driver_status_maps_running_and_exited_states() {
+    fn driver_status_keeps_running_sandboxes_provisioning_with_stable_message() {
         let running = ContainerSummary {
             id: Some("cid".to_string()),
             names: Some(vec!["/openshell-demo".to_string()]),
@@ -1293,14 +1313,25 @@ mod tests {
             status: Some("Exited (1) 3 seconds ago".to_string()),
             ..running.clone()
         };
+        let running_later = ContainerSummary {
+            status: Some("Up 4 seconds".to_string()),
+            ..running.clone()
+        };
 
         let running_status = driver_status_from_summary(&running, "demo");
-        assert_eq!(running_status.conditions[0].status, "True");
-        assert_eq!(running_status.conditions[0].reason, "DependenciesReady");
+        let running_later_status = driver_status_from_summary(&running_later, "demo");
+        assert_eq!(running_status.conditions[0].status, "False");
+        assert_eq!(running_status.conditions[0].reason, "DependenciesNotReady");
+        assert_eq!(
+            running_status.conditions[0].message,
+            "Container is running; waiting for supervisor relay"
+        );
+        assert_eq!(running_status.conditions, running_later_status.conditions);
 
         let exited_status = driver_status_from_summary(&exited, "demo");
         assert_eq!(exited_status.conditions[0].status, "False");
         assert_eq!(exited_status.conditions[0].reason, "ContainerExited");
+        assert_eq!(exited_status.conditions[0].message, "Container exited");
     }
 
     #[test]

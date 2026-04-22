@@ -980,16 +980,68 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
         );
     }
 
-    // Pass through any non-cpu/memory resource fields from the original
-    // resources Struct so the driver can handle GPU limits, custom resources,
-    // etc. that don't map to the typed DriverResourceRequirements.
-    if let Some(ref res) = template.resources {
+    // Pass through any resource fields that do not map to the typed
+    // DriverResourceRequirements so platform-specific drivers can still see
+    // custom resources such as GPU limits.
+    if let Some(res) = build_platform_resources_config(&template.resources) {
         fields.insert(
             "resources_raw".to_string(),
             Value {
-                kind: Some(Kind::StructValue(res.clone())),
+                kind: Some(Kind::StructValue(res)),
             },
         );
+    }
+
+    if fields.is_empty() {
+        None
+    } else {
+        Some(Struct { fields })
+    }
+}
+
+fn build_platform_resources_config(
+    resources: &Option<prost_types::Struct>,
+) -> Option<prost_types::Struct> {
+    use prost_types::{Struct, Value, value::Kind};
+
+    let resources = resources.as_ref()?;
+    let mut fields = std::collections::BTreeMap::new();
+
+    for (section_name, value) in &resources.fields {
+        if !matches!(section_name.as_str(), "limits" | "requests") {
+            fields.insert(section_name.clone(), value.clone());
+            continue;
+        }
+
+        let Some(Kind::StructValue(section)) = value.kind.as_ref() else {
+            fields.insert(section_name.clone(), value.clone());
+            continue;
+        };
+
+        let section_fields = section
+            .fields
+            .iter()
+            .filter_map(|(resource_name, resource_value)| {
+                let is_typed_quantity = matches!(resource_name.as_str(), "cpu" | "memory")
+                    && matches!(resource_value.kind.as_ref(), Some(Kind::StringValue(_)));
+                if is_typed_quantity {
+                    None
+                } else {
+                    Some((resource_name.clone(), resource_value.clone()))
+                }
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        if !section_fields.is_empty() {
+            fields.insert(
+                section_name.clone(),
+                Value {
+                    kind: Some(Kind::StructValue(Struct {
+                        fields: section_fields,
+                    })),
+                },
+            );
+        }
     }
 
     if fields.is_empty() {
@@ -1218,6 +1270,31 @@ mod tests {
     };
     use std::sync::Arc;
     use tokio::sync::{mpsc, oneshot};
+
+    fn string_value(value: &str) -> prost_types::Value {
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(value.to_string())),
+        }
+    }
+
+    fn number_value(value: f64) -> prost_types::Value {
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::NumberValue(value)),
+        }
+    }
+
+    fn struct_value(
+        fields: impl IntoIterator<Item = (impl Into<String>, prost_types::Value)>,
+    ) -> prost_types::Value {
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
+                fields: fields
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value))
+                    .collect(),
+            })),
+        }
+    }
 
     #[derive(Debug, Default)]
     struct TestDriver {
@@ -1487,6 +1564,123 @@ mod tests {
         };
 
         assert_eq!(derive_phase(Some(&status)), SandboxPhase::Ready);
+    }
+
+    #[test]
+    fn build_platform_config_omits_typed_cpu_and_memory_resources() {
+        let template = SandboxTemplate {
+            resources: Some(prost_types::Struct {
+                fields: [
+                    (
+                        "limits",
+                        struct_value([("cpu", string_value("2")), ("memory", string_value("1Gi"))]),
+                    ),
+                    (
+                        "requests",
+                        struct_value([
+                            ("cpu", string_value("500m")),
+                            ("memory", string_value("512Mi")),
+                        ]),
+                    ),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+            }),
+            ..Default::default()
+        };
+
+        assert!(build_platform_config(&template).is_none());
+    }
+
+    #[test]
+    fn build_platform_config_preserves_non_typed_resource_fields() {
+        let template = SandboxTemplate {
+            resources: Some(prost_types::Struct {
+                fields: [
+                    (
+                        "limits",
+                        struct_value([
+                            ("cpu", string_value("2")),
+                            ("memory", string_value("1Gi")),
+                            ("nvidia.com/gpu", string_value("1")),
+                        ]),
+                    ),
+                    (
+                        "requests",
+                        struct_value([
+                            ("cpu", string_value("500m")),
+                            ("memory", string_value("512Mi")),
+                            ("hugepages-2Mi", string_value("4Mi")),
+                        ]),
+                    ),
+                    ("opaque_cpu", number_value(2.0)),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+            }),
+            ..Default::default()
+        };
+
+        let platform_config = build_platform_config(&template).unwrap();
+        let resources_raw = platform_config
+            .fields
+            .get("resources_raw")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StructValue(inner) => Some(inner),
+                _ => None,
+            })
+            .unwrap();
+
+        let limits = resources_raw
+            .fields
+            .get("limits")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StructValue(inner) => Some(inner),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!limits.fields.contains_key("cpu"));
+        assert!(!limits.fields.contains_key("memory"));
+        assert_eq!(
+            limits
+                .fields
+                .get("nvidia.com/gpu")
+                .and_then(|value| value.kind.as_ref())
+                .and_then(|kind| match kind {
+                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                    _ => None,
+                }),
+            Some("1")
+        );
+
+        let requests = resources_raw
+            .fields
+            .get("requests")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StructValue(inner) => Some(inner),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!requests.fields.contains_key("cpu"));
+        assert!(!requests.fields.contains_key("memory"));
+        assert_eq!(
+            requests
+                .fields
+                .get("hugepages-2Mi")
+                .and_then(|value| value.kind.as_ref())
+                .and_then(|kind| match kind {
+                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                    _ => None,
+                }),
+            Some("4Mi")
+        );
+
+        assert!(resources_raw.fields.contains_key("opaque_cpu"));
     }
 
     #[test]
