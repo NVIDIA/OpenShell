@@ -24,7 +24,8 @@ struct Args {
     port: u16,
 
     /// Port for unauthenticated health endpoints (healthz, readyz).
-    #[arg(long, default_value_t = 8081, env = "OPENSHELL_HEALTH_PORT")]
+    /// Set to 0 to disable the dedicated health listener.
+    #[arg(long, default_value_t = 0, env = "OPENSHELL_HEALTH_PORT")]
     health_port: u16,
 
     /// Log level (trace, debug, info, warn, error).
@@ -201,15 +202,6 @@ async fn run_from_args(args: Args) -> Result<()> {
     );
 
     let bind = SocketAddr::from(([0, 0, 0, 0], args.port));
-    let health_bind = SocketAddr::from(([0, 0, 0, 0], args.health_port));
-
-    if args.port == args.health_port {
-        return Err(miette::miette!(
-            "--port and --health-port must be different (both set to {})",
-            args.port
-        ));
-    }
-
     let tls = if args.disable_tls {
         None
     } else {
@@ -236,8 +228,18 @@ async fn run_from_args(args: Args) -> Result<()> {
 
     let mut config = openshell_core::Config::new(tls)
         .with_bind_address(bind)
-        .with_health_bind_address(health_bind)
         .with_log_level(&args.log_level);
+
+    if args.health_port != 0 {
+        if args.port == args.health_port {
+            return Err(miette::miette!(
+                "--port and --health-port must be different (both set to {})",
+                args.port
+            ));
+        }
+        let health_bind = SocketAddr::from(([0, 0, 0, 0], args.health_port));
+        config = config.with_health_bind_address(health_bind);
+    }
 
     config = config
         .with_database_url(args.db_url)
