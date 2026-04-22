@@ -4,13 +4,19 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
   workflow_run:
-    workflows: ["Branch E2E Checks"]
+    workflows: ["Branch E2E Checks", "GPU Test"]
     types: [completed]
 
 permissions: {}
 
 jobs:
-  check:
+  e2e:
+    name: E2E
+    # Run on every PR event; on workflow_run, only when the upstream was the
+    # matching gated workflow.
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event.workflow_run.name == 'Branch E2E Checks'
     permissions:
       contents: read
       pull-requests: read
@@ -19,3 +25,17 @@ jobs:
     with:
       required_label: test:e2e
       workflow_file: branch-e2e.yml
+
+  gpu:
+    name: GPU E2E
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event.workflow_run.name == 'GPU Test'
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    uses: ./.github/workflows/e2e-gate-check.yml
+    with:
+      required_label: test:e2e-gpu
+      workflow_file: test-gpu.yml
