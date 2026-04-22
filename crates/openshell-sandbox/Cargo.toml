@@ -63,6 +63,7 @@ base64 = { workspace = true }
 ipnet = "2"
 
 # Serialization
+serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
 
@@ -81,6 +82,10 @@ libc = "0.2"
 landlock = "0.4"
 seccompiler = "0.5"
 uuid = { version = "1", features = ["v4"] }
+# Supervisor-helper ambient-capability plumbing. Used by src/helpers.rs to
+# move caps into the inheritable + ambient sets of the pre-exec child so the
+# helper process receives them after execve.
+caps = "0.5"
 
 [dev-dependencies]
 tempfile = "3"
