@@ -51,6 +51,10 @@ spec:
             - {{ .Values.service.port | quote }}
             - --health-port
             - {{ .Values.service.healthPort | quote }}
+            {{- if .Values.service.metricsPort }}
+            - --metrics-port
+            - {{ .Values.service.metricsPort | quote }}
+            {{- end }}
             - --log-level
             - {{ .Values.server.logLevel }}
             - --db-url
@@ -118,6 +122,11 @@ spec:
             - name: health
               containerPort: {{ .Values.service.healthPort }}
               protocol: TCP
+            {{- if .Values.service.metricsPort }}
+            - name: metrics
+              containerPort: {{ .Values.service.metricsPort }}
+              protocol: TCP
+            {{- end }}
           startupProbe:
             httpGet:
               path: /healthz

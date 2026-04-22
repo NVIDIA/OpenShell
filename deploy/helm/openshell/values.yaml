@@ -38,6 +38,7 @@ service:
   port: 8080
   nodePort: 30051
   healthPort: 8081
+  metricsPort: 9090
 
 # Pod restart behavior and health probe tuning.
 podLifecycle:
