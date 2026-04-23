@@ -1,0 +1,57 @@
+name: Shadow — Shared CPU Spike
+
+# OS-49 Phase 2 / PR 1 — non-blocking spike. Runs `cargo check` on the
+# nv-gha-runners shared CPU pool (`linux-{amd64,arm64}-cpu8`) with a
+# GHA-backed sccache.
+#
+# Plan, decision thresholds, and results live in the Linear doc attached
+# to OS-126 ("OS-126 — Shared CPU spike plan & results"). Dispatch this
+# workflow 4–5 times after merge and record numbers there.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # Wire sccache (already RUSTC_WRAPPER in mise.toml) to the GHA cache
+  # backend instead of the EKS memcached used by ARC.
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  rust-check:
+    name: cargo check (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-amd64-cpu8, linux-arm64-cpu8]
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: mise install
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: shadow-shared-cpu-spike-${{ matrix.runner }}
+          cache-directories: .cache/sccache
+
+      - name: cargo check
+        run: mise x -- cargo check --workspace --all-targets
+
+      - name: sccache stats
+        if: always()
+        run: mise x -- sccache --show-stats
