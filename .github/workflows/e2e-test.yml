@@ -29,11 +29,11 @@ jobs:
           - suite: python
             cluster: e2e-python
             port: "8080"
-            cmd: "mise run --no-prepare --skip-deps e2e:python"
+            cmd: "mise run --no-deps --skip-deps e2e:python"
           - suite: rust
             cluster: e2e-rust
             port: "8081"
-            cmd: "mise run --no-prepare --skip-deps e2e:rust"
+            cmd: "mise run --no-deps --skip-deps e2e:rust"
           - suite: gateway-resume
             cluster: e2e-resume
             port: "8082"
@@ -66,7 +66,7 @@ jobs:
 
       - name: Install Python dependencies and generate protobuf stubs
         if: matrix.suite == 'python'
-        run: uv sync --frozen && mise run --no-prepare python:proto
+        run: uv sync --frozen && mise run --no-deps python:proto
 
       - name: Build Rust CLI
         if: matrix.suite != 'python'
@@ -84,7 +84,7 @@ jobs:
           SKIP_IMAGE_PUSH: "1"
           SKIP_CLUSTER_IMAGE_BUILD: "1"
           OPENSHELL_CLUSTER_IMAGE: ghcr.io/nvidia/openshell/cluster:${{ inputs.image-tag }}
-        run: mise run --no-prepare --skip-deps cluster
+        run: mise run --no-deps --skip-deps cluster
 
       - name: Run tests
         run: ${{ matrix.cmd }}
