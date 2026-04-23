@@ -37,7 +37,7 @@ description = "Clean build artifacts"
 run = "cargo clean"
 
 [fmt]
-description = "Format Rust and Python code"
+description = "Format code"
 depends = ["rust:format", "python:format", "markdown:format"]
 hide = true
 
