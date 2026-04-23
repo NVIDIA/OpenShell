@@ -24,7 +24,7 @@ fn nvidia_gpu_passthrough_is_available() {
     assert!(
         openshell_vfio::nvidia_gpu_available_for_vm_passthrough(None),
         "GPU passthrough gate returned false on a GPU CI runner — \
-         check VFIO binding and cloud-hypervisor runtime bundle"
+         check VFIO binding and VM runtime bundle"
     );
 }
 

@@ -76,20 +76,60 @@ async fn grpc_health_check(gateway_port: u16, gateway_name: &str) -> Result<(), 
     }
 }
 
+/// Default health check timeout for standard (non-GPU) VMs.
+const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 90;
+
+/// Extended health check timeout for GPU-enabled VMs.
+///
+/// Cold boot with GPU passthrough involves pulling container images (no layer
+/// cache on a fresh state disk) and loading NVIDIA drivers/firmware, which
+/// legitimately takes longer than a standard VM boot.
+const GPU_HEALTH_TIMEOUT_SECS: u64 = 240;
+
+/// Initial poll interval between health check attempts.
+const INITIAL_POLL_INTERVAL_SECS: u64 = 2;
+
+/// Maximum poll interval (exponential backoff cap).
+const MAX_POLL_INTERVAL_SECS: u64 = 10;
+
+/// How often to emit a progress log line during the health check wait.
+const PROGRESS_LOG_INTERVAL_SECS: u64 = 15;
+
 /// Wait for the gateway service to be fully ready by polling the gRPC health endpoint.
 ///
 /// This replaces the TCP-only probe with a proper gRPC health check that verifies
 /// the service is actually responding to requests, not just accepting connections.
 ///
+/// When `gpu_enabled` is true, the timeout is extended to accommodate cold-boot
+/// scenarios where container image pulls and NVIDIA driver/firmware loading push
+/// total startup well past the standard 90-second window.
+///
+/// Uses exponential backoff between retry attempts (2s initial, 10s cap) to
+/// avoid hammering the endpoint while still detecting readiness promptly.
+///
 /// Returns `Ok(())` when the gateway is confirmed healthy, or `Err` if the health
 /// check fails or times out. Falls back to TCP probe if mTLS materials aren't
 /// available yet.
-pub fn wait_for_gateway_ready(gateway_port: u16, gateway_name: &str) -> Result<(), VmError> {
+pub fn wait_for_gateway_ready(
+    gateway_port: u16,
+    gateway_name: &str,
+    gpu_enabled: bool,
+) -> Result<(), VmError> {
     let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(90);
-    let poll_interval = Duration::from_secs(1);
+    let timeout_secs = if gpu_enabled {
+        GPU_HEALTH_TIMEOUT_SECS
+    } else {
+        DEFAULT_HEALTH_TIMEOUT_SECS
+    };
+    let timeout = Duration::from_secs(timeout_secs);
+    let mut poll_interval = Duration::from_secs(INITIAL_POLL_INTERVAL_SECS);
+    let max_poll_interval = Duration::from_secs(MAX_POLL_INTERVAL_SECS);
+    let progress_interval = Duration::from_secs(PROGRESS_LOG_INTERVAL_SECS);
 
-    eprintln!("Waiting for gateway gRPC health check...");
+    eprintln!(
+        "Waiting for gateway gRPC health check (timeout {timeout_secs}s{})...",
+        if gpu_enabled { ", GPU mode" } else { "" }
+    );
 
     // Create a runtime for async health checks
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -103,7 +143,16 @@ pub fn wait_for_gateway_ready(gateway_port: u16, gateway_name: &str) -> Result<(
         }
     };
 
+    let mut attempt: u32 = 0;
+    let mut last_progress_log = start;
+    // The initial value is never read (overwritten on each loop iteration before
+    // the progress log), but we need a valid String to satisfy the borrow checker.
+    #[allow(unused_assignments)]
+    let mut last_error = String::new();
+
     loop {
+        attempt += 1;
+
         // Try gRPC health check
         let result = rt.block_on(async {
             tokio::time::timeout(
@@ -119,26 +168,40 @@ pub fn wait_for_gateway_ready(gateway_port: u16, gateway_name: &str) -> Result<(
                 return Ok(());
             }
             Ok(Err(e)) => {
+                last_error = e.clone();
                 // gRPC call completed but failed
                 if start.elapsed() >= timeout {
                     return Err(VmError::Bootstrap(format!(
-                        "gateway health check failed after {:.0}s: {e}",
+                        "gateway health check failed after {:.0}s (attempt {attempt}): {e}",
                         timeout.as_secs_f64()
                     )));
                 }
             }
             Err(_) => {
+                last_error = "health probe timed out".to_string();
                 // Timeout on the health check itself
                 if start.elapsed() >= timeout {
                     return Err(VmError::Bootstrap(format!(
-                        "gateway health check timed out after {:.0}s",
+                        "gateway health check timed out after {:.0}s (attempt {attempt})",
                         timeout.as_secs_f64()
                     )));
                 }
             }
         }
 
+        // Periodic progress logging so operators know the check is still running
+        if last_progress_log.elapsed() >= progress_interval {
+            eprintln!(
+                "  health check: attempt {attempt}, elapsed {:.0}s/{timeout_secs}s ({last_error})",
+                start.elapsed().as_secs_f64()
+            );
+            last_progress_log = std::time::Instant::now();
+        }
+
         std::thread::sleep(poll_interval);
+
+        // Exponential backoff: double the interval up to the cap
+        poll_interval = std::cmp::min(poll_interval * 2, max_poll_interval);
     }
 }
 
@@ -146,11 +209,18 @@ pub fn wait_for_gateway_ready(gateway_port: u16, gateway_name: &str) -> Result<(
 fn wait_for_tcp_only(
     gateway_port: u16,
     timeout: Duration,
-    poll_interval: Duration,
+    mut poll_interval: Duration,
 ) -> Result<(), VmError> {
     let start = std::time::Instant::now();
+    let max_poll_interval = Duration::from_secs(MAX_POLL_INTERVAL_SECS);
+    let progress_interval = Duration::from_secs(PROGRESS_LOG_INTERVAL_SECS);
+    let timeout_secs = timeout.as_secs();
+    let mut attempt: u32 = 0;
+    let mut last_progress_log = start;
 
     loop {
+        attempt += 1;
+
         if host_tcp_probe(gateway_port) {
             eprintln!(
                 "Service reachable (TCP) [{:.1}s]",
@@ -161,12 +231,22 @@ fn wait_for_tcp_only(
 
         if start.elapsed() >= timeout {
             return Err(VmError::Bootstrap(format!(
-                "gateway TCP probe failed after {:.0}s",
+                "gateway TCP probe failed after {:.0}s (attempt {attempt})",
                 timeout.as_secs_f64()
             )));
         }
 
+        // Periodic progress logging
+        if last_progress_log.elapsed() >= progress_interval {
+            eprintln!(
+                "  TCP probe: attempt {attempt}, elapsed {:.0}s/{timeout_secs}s",
+                start.elapsed().as_secs_f64()
+            );
+            last_progress_log = std::time::Instant::now();
+        }
+
         std::thread::sleep(poll_interval);
+        poll_interval = std::cmp::min(poll_interval * 2, max_poll_interval);
     }
 }
 

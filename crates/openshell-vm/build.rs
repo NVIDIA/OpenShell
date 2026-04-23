@@ -114,7 +114,13 @@ fn main() {
     };
 
     for (src_name, dst_name) in &core_files {
-        if !copy_artifact(src_name, dst_name, &compressed_dir, &out_dir, &mut total_embedded_size) {
+        if !copy_artifact(
+            src_name,
+            dst_name,
+            &compressed_dir,
+            &out_dir,
+            &mut total_embedded_size,
+        ) {
             println!(
                 "cargo:warning=Missing compressed artifact: {}",
                 compressed_dir.join(src_name).display()
@@ -158,7 +164,10 @@ fn main() {
     // Write empty stubs for any missing rootfs variant so that
     // `include_bytes!()` in embedded.rs always resolves. The embedded module
     // treats zero-length slices as "not available".
-    for (found, name) in [(has_base, "rootfs.tar.zst"), (has_gpu, "rootfs-gpu.tar.zst")] {
+    for (found, name) in [
+        (has_base, "rootfs.tar.zst"),
+        (has_gpu, "rootfs-gpu.tar.zst"),
+    ] {
         if !found {
             let stub = out_dir.join(name);
             if !stub.exists() {
@@ -184,9 +193,7 @@ fn main() {
             "cargo:warning=Total embedded data is {total_embedded_size} bytes ({:.1} GiB).",
             total_embedded_size as f64 / (1024.0 * 1024.0 * 1024.0)
         );
-        println!(
-            "cargo:warning=This exceeds the x86_64 small code model limit (~2 GiB)."
-        );
+        println!("cargo:warning=This exceeds the x86_64 small code model limit (~2 GiB).");
         println!(
             "cargo:warning=Ensure RUSTFLAGS includes '-C code-model=large' or use `mise run vm:build`."
         );

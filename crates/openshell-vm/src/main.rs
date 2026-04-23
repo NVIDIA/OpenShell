@@ -95,13 +95,12 @@ struct Cli {
     reset: bool,
 
     /// Enable GPU passthrough. Optionally specify a PCI address
-    /// (e.g. `0000:41:00.0`). Uses cloud-hypervisor backend with VFIO.
+    /// (e.g. `0000:41:00.0`). Uses QEMU backend with VFIO.
     #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
     gpu: Option<String>,
 
-    /// Hypervisor backend: "auto" (default), "libkrun", "cloud-hypervisor", or "qemu".
-    /// Auto selects cloud-hypervisor when --gpu is set (with MSI-X), qemu
-    /// when --gpu is set without MSI-X, and libkrun otherwise.
+    /// Hypervisor backend: "auto" (default), "libkrun", or "qemu".
+    /// Auto selects QEMU when --gpu is set, and libkrun otherwise.
     #[arg(long, default_value = "auto")]
     backend: String,
 }
@@ -424,13 +423,12 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
     }
 
     let backend_choice = match cli.backend.as_str() {
-        "cloud-hypervisor" | "chv" => openshell_vm::VmBackendChoice::CloudHypervisor,
         "qemu" => openshell_vm::VmBackendChoice::Qemu,
         "libkrun" => {
             if gpu_enabled {
                 return Err(
                     "--backend libkrun is incompatible with --gpu (libkrun does not support \
-                     VFIO passthrough). Use --backend auto, --backend cloud-hypervisor, or --backend qemu."
+                     VFIO passthrough). Use --backend auto or --backend qemu."
                         .into(),
                 );
             }
@@ -438,10 +436,9 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         }
         "auto" => openshell_vm::VmBackendChoice::Auto,
         other => {
-            return Err(format!(
-                "unknown --backend: {other} (expected: auto, libkrun, cloud-hypervisor, qemu)"
-            )
-            .into());
+            return Err(
+                format!("unknown --backend: {other} (expected: auto, libkrun, qemu)").into(),
+            );
         }
     };
 
@@ -476,9 +473,11 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
                     == Some(openshell_vm::GUEST_GATEWAY_NODEPORT)
             });
             if !has_gateway {
+                let gw_port = openshell_vm::GUEST_GATEWAY_NODEPORT;
+                c.port_map.push(format!("{gw_port}:{gw_port}"));
                 eprintln!(
-                    "warning: no port mapping targets guest port 30051 (gateway NodePort); \
-                     health check will use default port 30051"
+                    "Auto-added gateway port mapping {gw_port}:{gw_port} \
+                     (required for health check and CLI access)"
                 );
             }
         }

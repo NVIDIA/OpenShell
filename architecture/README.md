@@ -301,6 +301,6 @@ This opens an interactive SSH session into the sandbox, with all provider creden
 | [Inference Routing](inference-routing.md) | Transparent interception and sandbox-local routing of AI inference API calls to configured backends. |
 | [System Architecture](system-architecture.md) | Top-level system architecture diagram with all deployable components and communication flows. |
 | [Gateway Settings Channel](gateway-settings.md) | Runtime settings channel: two-tier key-value configuration, global policy override, settings registry, CLI/TUI commands. |
-| [Custom VM Runtime](custom-vm-runtime.md) | Dual-backend VM runtime (libkrun / cloud-hypervisor), kernel configuration, and build pipeline. |
+| [Custom VM Runtime](custom-vm-runtime.md) | Dual-backend VM runtime (libkrun / QEMU), kernel configuration, and build pipeline. |
 | [VM GPU Passthrough](vm-gpu-passthrough.md) | VFIO GPU passthrough for VMs: host preparation, safety checks, nvidia driver hardening, and troubleshooting. |
 | [TUI](tui.md) | Terminal user interface for sandbox interaction. |

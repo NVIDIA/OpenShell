@@ -6,7 +6,7 @@
 
 OpenShell's VM backend can pass a physical NVIDIA GPU into a microVM using VFIO (Virtual Function I/O). This gives the guest direct access to GPU hardware, enabling CUDA workloads and `nvidia-smi` inside sandboxes without virtualization overhead.
 
-GPU passthrough uses cloud-hypervisor or QEMU (instead of the default libkrun backend) to attach a VFIO device to the VM. The guest sees a real PCI GPU device and loads standard NVIDIA drivers. cloud-hypervisor is preferred; QEMU is used as a fallback when the GPU lacks MSI-X support.
+GPU passthrough uses QEMU (instead of the default libkrun backend) to attach a VFIO device to the VM. The guest sees a real PCI GPU device and loads standard NVIDIA drivers.
 
 ## Architecture
 
@@ -17,7 +17,7 @@ Host                          │  Guest (microVM)
   ↕ bound to vfio-pci         │  ↕
   /dev/vfio/<group>            │  /dev/nvidia*
   ↕                            │  ↕
-  CHV or QEMU (VFIO)      ────│→ PCI device visible
+  QEMU (VFIO)            ────│→ PCI device visible
   ↕                            │  ↕
   TAP networking               │  k3s + device plugin
   virtiofsd (rootfs)           │  ↕
@@ -29,27 +29,11 @@ Host                          │  Guest (microVM)
 | Flag | Backend | GPU attached? |
 |------|---------|---------------|
 | (none) | libkrun | No |
-| `--gpu` (MSI-X GPU) | cloud-hypervisor | Yes |
-| `--gpu` (non-MSI-X GPU) | QEMU | Yes (fallback) |
-| `--gpu 0000:41:00.0` | auto (CHV or QEMU based on MSI-X) | Yes |
-| `--backend cloud-hypervisor` | cloud-hypervisor | No (force CHV without GPU) |
+| `--gpu` | QEMU | Yes |
+| `--gpu 0000:41:00.0` | QEMU | Yes |
 | `--backend qemu` | QEMU | Optional |
 
-Auto mode (`--backend auto`, the default) selects cloud-hypervisor when `--gpu` is used with an MSI-X-capable GPU, QEMU when `--gpu` is used with a GPU lacking MSI-X, and libkrun otherwise.
-
-### QEMU fallback
-
-QEMU is used when GPU passthrough is requested but the GPU does not support MSI-X (PCI capability `0x11`). cloud-hypervisor's VFIO implementation requires MSI-X; QEMU handles MSI-only devices via its own interrupt remapping layer.
-
-| Aspect | cloud-hypervisor | QEMU |
-|--------|-----------------|------|
-| VFIO MSI-X | Required | Not required |
-| VM control | REST API over Unix socket | Command-line args + QMP |
-| Vsock transport | Unix socket + `CONNECT` text protocol | `AF_VSOCK` (kernel `vhost_vsock`) |
-| TAP networking | Built-in TAP creation | `-netdev tap` flag |
-| Shutdown | REST `vm.shutdown` | `SIGTERM` or QMP `system_powerdown` |
-
-The guest kernel, rootfs, init script, and exec agent are identical across both backends. The host requirements differ: QEMU needs `qemu-system-x86_64` installed on the host (not embedded in the runtime bundle) and the `vhost_vsock` kernel module for vsock exec support.
+Auto mode (`--backend auto`, the default) selects QEMU when `--gpu` is used, and libkrun otherwise.
 
 ### Automatic GPU binding
 
@@ -58,7 +42,7 @@ When `--gpu` is passed (with or without a specific PCI address), the launcher au
 1. **Probe** — scans `/sys/bus/pci/devices` for NVIDIA devices (vendor `0x10de`).
 2. **Safety checks** — for each candidate GPU, verifies it is safe to claim (see below). If any check fails, the launcher refuses to proceed and exits with an actionable error.
 3. **Bind** — unbinds the selected GPU from the `nvidia` driver and binds it to `vfio-pci`. Also binds any IOMMU group peers to `vfio-pci` for group cleanliness.
-4. **Launch** — starts cloud-hypervisor with the VFIO device attached and sets `GPU_ENABLED=true` in the guest kernel cmdline.
+4. **Launch** — starts QEMU with the VFIO device attached and sets `GPU_ENABLED=true` in the guest kernel cmdline.
 5. **Rebind on shutdown** — when the VM exits (clean shutdown, Ctrl+C, or crash), the launcher rebinds the GPU back to the `nvidia` driver and clears `driver_override`, restoring host GPU access. Cleanup is guaranteed by a `GpuBindGuard` RAII guard that calls restore on drop, covering normal exit, early return, and panic. Only `SIGKILL` (kill -9) bypasses the guard — see Troubleshooting below for manual recovery.
 
 When a specific PCI address is given (`--gpu 0000:41:00.0`), the launcher targets that exact device. When `--gpu` is used without an address (`auto` mode), the launcher selects the best available GPU using the multi-GPU selection strategy.
@@ -259,14 +243,11 @@ sudo openshell-vm --gpu 0000:41:00.0
 The `--backend` flag controls hypervisor selection independently of `--gpu`:
 
 ```shell
-sudo openshell-vm --gpu                           # auto: CHV if MSI-X, QEMU otherwise
-sudo openshell-vm --backend cloud-hypervisor       # explicit CHV, no GPU
+sudo openshell-vm --gpu                           # auto: selects QEMU for GPU
 sudo openshell-vm --backend qemu                   # explicit QEMU, no GPU
 sudo openshell-vm --gpu --backend qemu             # force QEMU with GPU
 sudo openshell-vm --backend libkrun                # explicit libkrun (no GPU support)
 ```
-
-The `chv` alias is accepted as shorthand for `cloud-hypervisor`.
 
 ### Diagnostics
 
@@ -304,9 +285,9 @@ GPU: restoring 0000:41:00.0 (cleanup)
 GPU: rebinding 0000:41:00.0 to nvidia
 ```
 
-## VM Networking (Cloud Hypervisor)
+## VM Networking (QEMU)
 
-Cloud Hypervisor uses TAP-based networking instead of the gvproxy user-mode networking used by the libkrun backend. This has several implications for connectivity and port forwarding.
+QEMU uses TAP-based networking instead of the gvproxy user-mode networking used by the libkrun backend. This has several implications for connectivity and port forwarding.
 
 ### Network topology
 
@@ -325,11 +306,11 @@ Host                                   Guest (microVM)
 
 ### How it works
 
-The CHV backend configures networking in three layers:
+The QEMU backend configures networking in three layers:
 
 **1. TAP device and guest IP assignment**
 
-Cloud Hypervisor creates a TAP device on the host side with IP `192.168.249.1/24`. The guest is assigned `192.168.249.2/24` via kernel command line parameters (`VM_NET_IP`, `VM_NET_GW`, `VM_NET_DNS`). The init script reads these from `/proc/cmdline` and uses them as the static fallback when DHCP is unavailable (CHV does not run a DHCP server).
+QEMU creates a TAP device on the host side with IP `192.168.249.1/24`. The guest is assigned `192.168.249.2/24` via kernel command line parameters (`VM_NET_IP`, `VM_NET_GW`, `VM_NET_DNS`). The init script reads these from `/proc/cmdline` and uses them as the static fallback when DHCP is unavailable.
 
 **2. Host-side NAT and IP forwarding**
 
@@ -342,7 +323,7 @@ This gives the guest internet access through the host. Rules are cleaned up on V
 
 **3. TCP port forwarding**
 
-Unlike gvproxy (which provides built-in port forwarding), CHV TAP networking requires explicit port forwarding. The launcher starts a userspace TCP proxy for each port mapping (e.g., `30051:30051`). The proxy binds to `127.0.0.1:{host_port}` and forwards connections to `192.168.249.2:{guest_port}`.
+Unlike gvproxy (which provides built-in port forwarding), TAP networking requires explicit port forwarding. The launcher starts a userspace TCP proxy for each port mapping (e.g., `30051:30051`). The proxy binds to `127.0.0.1:{host_port}` and forwards connections to `192.168.249.2:{guest_port}`.
 
 ### DNS resolution
 
@@ -358,14 +339,14 @@ The resolved DNS server is passed to the guest via `VM_NET_DNS=` on the kernel c
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `CHV_TAP_HOST_IP` | `192.168.249.1` | Host side of the TAP device |
-| `CHV_TAP_GUEST_IP` | `192.168.249.2` | Guest static IP |
-| `CHV_TAP_SUBNET` | `192.168.249.0/24` | Subnet for iptables rules |
-| `CHV_TAP_NETMASK` | `255.255.255.0` | Subnet mask in VM payload |
+| `TAP_HOST_IP` | `192.168.249.1` | Host side of the TAP device |
+| `TAP_GUEST_IP` | `192.168.249.2` | Guest static IP |
+| `TAP_SUBNET` | `192.168.249.0/24` | Subnet for iptables rules |
+| `TAP_NETMASK` | `255.255.255.0` | Subnet mask in VM payload |
 
 ### Differences from libkrun/gvproxy networking
 
-| Feature | libkrun + gvproxy | CHV + TAP |
+| Feature | libkrun + gvproxy | QEMU + TAP |
 |---------|------------------|-----------|
 | Network mode | User-mode (SLIRP-like) | Kernel TAP device |
 | DHCP | Built-in (gvproxy) | None (static IP via cmdline) |
@@ -412,10 +393,6 @@ ping -c1 192.168.249.2
 The launcher caches mTLS certificates on the host after the first successful boot (warm boot path). If the state disk is deleted or `--reset` is used, the VM generates new PKI that won't match the cached certs. The launcher detects this — when the state disk is freshly created or reset, it clears the stale host mTLS cache and runs the cold-boot PKI fetch path. This prevents `transport error` failures on the gateway health check after a state disk reset.
 
 ## Troubleshooting
-
-### "cloud-hypervisor requires MSI-X for VFIO passthrough"
-
-The GPU lacks MSI-X support and `--backend cloud-hypervisor` was explicitly requested. Either use `--backend qemu` or omit the `--backend` flag to let auto-selection pick QEMU as the fallback.
 
 ### "no NVIDIA PCI device found"
 
@@ -490,5 +467,4 @@ If you hit this issue repeatedly, check for nvidia driver updates or file a bug 
 - [System Architecture](system-architecture.md) — overall OpenShell architecture
 - Implementation:
   - [`crates/openshell-vfio/src/lib.rs`](../crates/openshell-vfio/src/lib.rs) — GPU binding and VFIO setup
-  - [`crates/openshell-vm/src/backend/cloud_hypervisor.rs`](../crates/openshell-vm/src/backend/cloud_hypervisor.rs) — cloud-hypervisor backend
   - [`crates/openshell-vm/src/backend/qemu.rs`](../crates/openshell-vm/src/backend/qemu.rs) — QEMU backend

@@ -26,12 +26,13 @@ const REGISTRY_NAMESPACE_DEFAULT: &str = "openshell";
 /// Resolve the raw GPU device-ID list, replacing the `"auto"` sentinel with a
 /// concrete device ID based on whether CDI is enabled on the daemon.
 ///
-/// | Input        | Output                                                       |
-/// |--------------|--------------------------------------------------------------|
-/// | `[]`         | `[]`  — no GPU                                               |
-/// | `["legacy"]` | `["legacy"]`  — pass through to the non-CDI fallback path    |
-/// | `["auto"]`   | `["nvidia.com/gpu=all"]` if CDI enabled, else `["legacy"]`   |
-/// | `[cdi-ids…]` | unchanged                                                    |
+/// | Input               | Output                                                       |
+/// |---------------------|--------------------------------------------------------------|
+/// | `[]`                | `[]`  — no GPU                                               |
+/// | `["vm-passthrough"]`| `["vm-passthrough"]`  — GPU via QEMU/VFIO, no Docker device  |
+/// | `["legacy"]`        | `["legacy"]`  — pass through to the non-CDI fallback path    |
+/// | `["auto"]`          | `["nvidia.com/gpu=all"]` if CDI enabled, else `["legacy"]`   |
+/// | `[cdi-ids…]`        | unchanged                                                    |
 pub(crate) fn resolve_gpu_device_ids(gpu: &[String], cdi_enabled: bool) -> Vec<String> {
     match gpu {
         [] => vec![],
@@ -622,6 +623,11 @@ pub async fn ensure_container(
     //                  Docker resolves them against the host CDI spec at /etc/cdi/
     match device_ids {
         [] => {}
+        [id] if id == "vm-passthrough" => {
+            // GPU passthrough is handled by QEMU/VFIO inside the container,
+            // not by Docker. No DeviceRequest needed — GPU_ENABLED=true
+            // (set below) deploys the NVIDIA device plugin in k3s.
+        }
         [id] if id == "legacy" => {
             host_config.device_requests = Some(vec![DeviceRequest {
                 driver: Some("nvidia".to_string()),
@@ -1434,6 +1440,13 @@ mod tests {
             resolve_gpu_device_ids(&["legacy".to_string()], false),
             vec!["legacy"],
         );
+    }
+
+    #[test]
+    fn resolve_gpu_vm_passthrough() {
+        let ids = vec!["vm-passthrough".to_string()];
+        assert_eq!(resolve_gpu_device_ids(&ids, true), ids);
+        assert_eq!(resolve_gpu_device_ids(&ids, false), ids);
     }
 
     #[test]

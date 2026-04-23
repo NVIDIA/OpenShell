@@ -100,7 +100,7 @@ if [ -z "${VM_RUNTIME_TARBALL:-}" ] && _check_compressed_artifacts "$OUTPUT_DIR"
     # core compressed set. Copy them into WORK_DIR so bundle-vm-runtime.sh
     # stages them alongside the core libraries.
     _BUILD_DIR="${ROOT}/target/libkrun-build"
-    for gpu_bin in vmlinux cloud-hypervisor virtiofsd; do
+    for gpu_bin in vmlinux virtiofsd; do
         if [ -f "${_BUILD_DIR}/${gpu_bin}" ]; then
             cp "${_BUILD_DIR}/${gpu_bin}" "$WORK_DIR/"
             chmod 0755 "${WORK_DIR}/${gpu_bin}"
@@ -274,7 +274,7 @@ case "$(uname -s)-$(uname -m)" in
     fi
 
     # GPU passthrough binaries (optional — included when present in libkrun-build)
-    for gpu_bin in vmlinux cloud-hypervisor virtiofsd; do
+    for gpu_bin in vmlinux virtiofsd; do
         if [ -f "${BUILD_DIR}/${gpu_bin}" ]; then
             cp "${BUILD_DIR}/${gpu_bin}" "$WORK_DIR/"
             echo "    Included GPU binary: ${gpu_bin}"

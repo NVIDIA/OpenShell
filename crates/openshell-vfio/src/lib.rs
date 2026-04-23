@@ -7,7 +7,7 @@
 //! This module scans Linux sysfs (`/sys/bus/pci/devices`) for NVIDIA GPUs
 //! (vendor ID `0x10de`), checks their driver binding, and verifies IOMMU
 //! group cleanliness — the prerequisites for passing a physical GPU into
-//! a cloud-hypervisor VM via VFIO.
+//! a VM via VFIO.
 //!
 //! Returns per-device readiness for multi-GPU hosts.
 //!
@@ -197,8 +197,8 @@ fn sysfs_write_with_timeout(
 /// Check whether a PCI device supports MSI-X by walking the PCI capability
 /// list in the sysfs `config` file. MSI-X is capability ID `0x11`.
 ///
-/// cloud-hypervisor's VFIO code assumes MSI-X and will panic if the device
-/// only has MSI. This pre-flight check prevents a cryptic crash.
+/// MSI-X support is tracked for informational purposes. QEMU handles
+/// devices with or without MSI-X via legacy interrupt emulation fallback.
 #[cfg(target_os = "linux")]
 pub fn check_msix_support(sysfs: &SysfsRoot, pci_addr: &str) -> bool {
     let config_path = sysfs.sys_bus_pci_devices().join(pci_addr).join("config");
@@ -354,7 +354,7 @@ fn probe_linux_sysfs() -> Vec<(String, HostNvidiaVfioReadiness)> {
 ///
 /// When activated, checks two conditions:
 /// 1. At least one NVIDIA device reports [`VfioBoundReady`].
-/// 2. The cloud-hypervisor binary exists in `runtime_dir` (if provided).
+/// 2. The QEMU binary (`qemu-system-x86_64`) exists in `runtime_dir` or on PATH (if provided).
 pub fn nvidia_gpu_available_for_vm_passthrough(runtime_dir: Option<PathBuf>) -> bool {
     if std::env::var("OPENSHELL_VM_GPU_E2E").as_deref() != Ok("1") {
         return false;
@@ -368,9 +368,17 @@ pub fn nvidia_gpu_available_for_vm_passthrough(runtime_dir: Option<PathBuf>) -> 
         return false;
     }
 
-    runtime_dir
-        .map(|dir| dir.join("cloud-hypervisor").is_file())
-        .unwrap_or(false)
+    let has_qemu = runtime_dir
+        .map(|dir| dir.join("qemu-system-x86_64").is_file())
+        .unwrap_or(false);
+    let has_qemu_on_path = std::process::Command::new("qemu-system-x86_64")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+
+    has_qemu || has_qemu_on_path
 }
 
 /// Sysfs root path, defaulting to "/" in production and a temp dir in tests.
@@ -765,9 +773,7 @@ fn pci_reset_device(sysfs: &SysfsRoot, pci_addr: &str) {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown");
-                eprintln!(
-                    "GPU {pci_addr}: performing secondary bus reset on bridge {bridge_name}"
-                );
+                eprintln!("GPU {pci_addr}: performing secondary bus reset on bridge {bridge_name}");
                 if let Err(e) = std::fs::write(&bridge_reset, "1") {
                     eprintln!("GPU {pci_addr}: bridge SBR failed: {e}");
                 } else {
@@ -934,15 +940,24 @@ pub fn bind_gpu_to_vfio(sysfs: &SysfsRoot, pci_addr: &str) -> Result<String, std
     }
 
     // When the device had no driver (e.g. nvidia modules were already unloaded
-    // from a previous crash), infer "nvidia" from the vendor ID so the restore
-    // path knows which driver to rebind to.
+    // from a previous crash, or display-manager was stopped), infer the restore
+    // target from vendor + PCI class so the right driver is rebound on exit.
     let original = match drv {
         Some(d) if !d.is_empty() => d,
         _ => {
             let vendor = std::fs::read_to_string(dev_dir.join("vendor"))
                 .map(|v| v.trim().to_lowercase())
                 .unwrap_or_default();
-            if vendor == NVIDIA_VENDOR_ID {
+            let class = std::fs::read_to_string(dev_dir.join("class"))
+                .map(|c| c.trim().to_lowercase())
+                .unwrap_or_default();
+            if vendor == NVIDIA_VENDOR_ID && class.starts_with("0x0403") {
+                // NVIDIA HDA audio companion (HDMI/DP audio)
+                eprintln!(
+                    "GPU {pci_addr}: no driver was bound, defaulting restore target to snd_hda_intel (audio device)"
+                );
+                "snd_hda_intel".to_string()
+            } else if vendor == NVIDIA_VENDOR_ID {
                 eprintln!(
                     "GPU {pci_addr}: no driver was bound, defaulting restore target to nvidia"
                 );
@@ -1065,6 +1080,10 @@ pub fn rebind_gpu_to_original(
     if !original_driver.is_empty() && original_driver != "none" {
         if original_driver == "nvidia" && sysfs.is_real_sysfs() {
             nvidia_reload_modules();
+        } else if sysfs.is_real_sysfs() {
+            let _ = std::process::Command::new("modprobe")
+                .arg(original_driver)
+                .output();
         }
 
         // modprobe may have auto-bound the device (now that driver_override is
@@ -1255,6 +1274,40 @@ fn is_iommu_group_clean(_sysfs: &SysfsRoot, _pci_addr: &str) -> bool {
     false
 }
 
+/// Discover IOMMU group peers already on vfio-pci (inherited from a previous
+/// session) and infer their original driver from the PCI class code so they
+/// can be restored on exit.
+#[cfg(target_os = "linux")]
+fn inherited_peer_binds(sysfs: &SysfsRoot, gpu_addr: &str) -> Vec<(String, String)> {
+    iommu_group_peers(sysfs, gpu_addr)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|peer| peer != gpu_addr)
+        .filter_map(|peer| {
+            if current_driver(sysfs, &peer).as_deref() != Some("vfio-pci") {
+                return None;
+            }
+            let class =
+                std::fs::read_to_string(sysfs.sys_bus_pci_devices().join(&peer).join("class"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_lowercase();
+            // 0x0403xx = multimedia audio controller — typically snd_hda_intel
+            let orig = if class.starts_with("0x0403") {
+                "snd_hda_intel"
+            } else {
+                "nvidia"
+            };
+            Some((peer, orig.to_string()))
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn inherited_peer_binds(_sysfs: &SysfsRoot, _gpu_addr: &str) -> Vec<(String, String)> {
+    vec![]
+}
+
 /// Captures the bind state for a GPU so it can be restored on shutdown.
 #[derive(Debug)]
 pub struct GpuBindState {
@@ -1266,7 +1319,7 @@ pub struct GpuBindState {
     pub peer_binds: Vec<(String, String)>,
     /// Whether this instance performed the bind (false if GPU was already on vfio-pci).
     pub did_bind: bool,
-    /// Whether the GPU supports MSI-X (needed by cloud-hypervisor; QEMU works without it).
+    /// Whether the GPU supports MSI-X (informational; QEMU handles both cases).
     pub has_msix: bool,
 }
 
@@ -1331,20 +1384,22 @@ impl GpuBindState {
             return Ok(());
         }
 
-        // Always attempt peer restore even if GPU restore fails, so the
-        // audio companion (and any other IOMMU group peers) aren't left
-        // stranded on vfio-pci.
+        // Restore IOMMU peers (e.g. the HDA audio companion) BEFORE the GPU.
+        // nvidia_reload_modules() during GPU restore can claim peer devices
+        // through nvidia-modeset/nvidia-drm if they're still unbound, racing
+        // with the snd_hda_intel rebind. Restoring peers first avoids this.
+        let peer_result = rebind_iommu_group_peers(sysfs, &self.peer_binds);
+        if let Err(ref e) = peer_result {
+            eprintln!("GPU: peer restore failed: {e}");
+        }
+
         eprintln!(
             "GPU: rebinding {} to {}",
             self.pci_addr, self.original_driver
         );
         let gpu_result = rebind_gpu_to_original(sysfs, &self.pci_addr, &self.original_driver);
-        let peer_result = rebind_iommu_group_peers(sysfs, &self.peer_binds);
 
         if let Err(ref gpu_err) = gpu_result {
-            if let Err(ref peer_err) = peer_result {
-                eprintln!("GPU: peer restore also failed: {peer_err}");
-            }
             return Err(std::io::Error::new(gpu_err.kind(), gpu_err.to_string()));
         }
         peer_result
@@ -1585,19 +1640,21 @@ fn prepare_specific_gpu(sysfs: &SysfsRoot, bdf: &str) -> Result<GpuBindState, st
 
     let has_msix = check_msix_support(sysfs, bdf);
     if !has_msix {
-        eprintln!(
-            "GPU {bdf}: no MSI-X support — QEMU backend will be used \
-             (cloud-hypervisor requires MSI-X)"
-        );
+        eprintln!("GPU {bdf}: no MSI-X support (QEMU will use legacy interrupt emulation)");
     }
 
     if current_driver(sysfs, bdf).as_deref() == Some("vfio-pci") && is_iommu_group_clean(sysfs, bdf)
     {
-        eprintln!("GPU {bdf}: already on vfio-pci (inherited from previous session), will restore to nvidia on exit");
+        let peer_binds = inherited_peer_binds(sysfs, bdf);
+        eprintln!(
+            "GPU {bdf}: already on vfio-pci (inherited from previous session), \
+             will restore to nvidia on exit ({} peer(s) also tracked)",
+            peer_binds.len()
+        );
         return Ok(GpuBindState {
             pci_addr: bdf.to_string(),
             original_driver: "nvidia".to_string(),
-            peer_binds: vec![],
+            peer_binds,
             did_bind: true,
             has_msix,
         });
@@ -1635,13 +1692,14 @@ fn prepare_specific_gpu(sysfs: &SysfsRoot, bdf: &str) -> Result<GpuBindState, st
                  \n\n  The display manager will need to be restarted after the VM exits:\n    \
                  sudo systemctl start display-manager",
                 display_procs.join(", "),
-                if display_procs.len() == 1 { "is" } else { "are" },
+                if display_procs.len() == 1 {
+                    "is"
+                } else {
+                    "are"
+                },
             ));
         }
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            msg,
-        ));
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
     }
 
     if !check_iommu_enabled(sysfs, bdf) {
@@ -1715,7 +1773,7 @@ fn prepare_auto_gpu(sysfs: &SysfsRoot) -> Result<GpuBindState, std::io::Error> {
     nvidia_addrs.sort();
 
     // Phase 1: prefer GPUs already on vfio-pci with clean IOMMU group.
-    // MSI-X GPUs get priority (cloud-hypervisor has lower overhead than QEMU).
+    // MSI-X GPUs get slight priority (better interrupt performance).
     let mut vfio_msix: Option<String> = None;
     let mut vfio_no_msix: Option<String> = None;
     for addr in &nvidia_addrs {
@@ -1732,25 +1790,32 @@ fn prepare_auto_gpu(sysfs: &SysfsRoot) -> Result<GpuBindState, std::io::Error> {
         }
     }
     if let Some(addr) = vfio_msix {
-        eprintln!("GPU {addr}: already on vfio-pci (inherited from previous session), will restore to nvidia on exit");
+        let peer_binds = inherited_peer_binds(sysfs, &addr);
+        eprintln!(
+            "GPU {addr}: already on vfio-pci (inherited from previous session), \
+             will restore to nvidia on exit ({} peer(s) also tracked)",
+            peer_binds.len()
+        );
         return Ok(GpuBindState {
             pci_addr: addr,
             original_driver: "nvidia".to_string(),
-            peer_binds: vec![],
+            peer_binds,
             did_bind: true,
             has_msix: true,
         });
     }
     if let Some(ref addr) = vfio_no_msix {
+        let peer_binds = inherited_peer_binds(sysfs, addr);
+        eprintln!("GPU {addr}: no MSI-X support (QEMU will use legacy interrupt emulation)");
         eprintln!(
-            "GPU {addr}: no MSI-X support — QEMU backend will be used \
-             (cloud-hypervisor requires MSI-X)"
+            "GPU {addr}: already on vfio-pci (inherited from previous session), \
+             will restore to nvidia on exit ({} peer(s) also tracked)",
+            peer_binds.len()
         );
-        eprintln!("GPU {addr}: already on vfio-pci (inherited from previous session), will restore to nvidia on exit");
         return Ok(GpuBindState {
             pci_addr: addr.clone(),
             original_driver: "nvidia".to_string(),
-            peer_binds: vec![],
+            peer_binds,
             did_bind: true,
             has_msix: false,
         });
@@ -1813,15 +1878,12 @@ fn prepare_auto_gpu(sysfs: &SysfsRoot) -> Result<GpuBindState, std::io::Error> {
         idle_candidates.push((addr.clone(), has_msix));
     }
 
-    // Sort: MSI-X candidates first (lower overhead with cloud-hypervisor).
+    // Sort: MSI-X candidates first (better interrupt performance).
     idle_candidates.sort_by_key(|(_, has_msix)| !has_msix);
 
     for (addr, has_msix) in &idle_candidates {
         if !has_msix {
-            eprintln!(
-                "GPU {addr}: no MSI-X support — QEMU backend will be used \
-                 (cloud-hypervisor requires MSI-X)"
-            );
+            eprintln!("GPU {addr}: no MSI-X support (QEMU will use legacy interrupt emulation)");
         }
         eprintln!("GPU: binding {addr} for VFIO passthrough");
         let original_driver = bind_gpu_to_vfio(sysfs, addr)?;
@@ -2321,7 +2383,10 @@ mod tests {
 
         let state = prepare_gpu_with_sysfs(&sysfs, None).unwrap();
         assert_eq!(state.pci_addr, "0000:43:00.0");
-        assert!(state.did_bind, "inherited vfio-pci should set did_bind=true for restore");
+        assert!(
+            state.did_bind,
+            "inherited vfio-pci should set did_bind=true for restore"
+        );
         assert_eq!(state.original_driver, "nvidia");
     }
 
@@ -2560,8 +2625,14 @@ mod tests {
         fs::create_dir_all(root.path().join("sys/module/vfio_iommu_type1")).unwrap();
 
         let state = prepare_gpu_with_sysfs(&sysfs, Some("0000:43:00.0")).unwrap();
-        assert!(state.did_bind, "inherited vfio-pci state should set did_bind=true");
-        assert_eq!(state.original_driver, "nvidia", "inherited vfio-pci should target nvidia for restore");
+        assert!(
+            state.did_bind,
+            "inherited vfio-pci state should set did_bind=true"
+        );
+        assert_eq!(
+            state.original_driver, "nvidia",
+            "inherited vfio-pci should target nvidia for restore"
+        );
 
         let dev_dir = root.path().join("sys/bus/pci/devices/0000:43:00.0");
         let vfio_driver_dir = root.path().join("sys/bus/pci/drivers/vfio-pci");
@@ -2574,7 +2645,10 @@ mod tests {
         state.restore_with_sysfs(&sysfs).unwrap();
 
         let override_content = fs::read_to_string(dev_dir.join("driver_override")).unwrap();
-        assert_eq!(override_content, "", "driver_override should be cleared after restore");
+        assert_eq!(
+            override_content, "",
+            "driver_override should be cleared after restore"
+        );
     }
 
     #[test]
@@ -2706,11 +2780,26 @@ mod tests {
             has_msix: true,
         };
         let cmds = state.recovery_commands();
-        assert!(cmds.contains("vfio-pci/unbind"), "should unbind GPU from vfio-pci");
-        assert!(cmds.contains("0000:41:00.0"), "should reference GPU address");
-        assert!(cmds.contains("0000:41:00.1"), "should reference peer address");
-        assert!(cmds.contains("driver_override"), "should clear driver_override");
-        assert!(cmds.contains("modprobe nvidia"), "should reload nvidia modules");
+        assert!(
+            cmds.contains("vfio-pci/unbind"),
+            "should unbind GPU from vfio-pci"
+        );
+        assert!(
+            cmds.contains("0000:41:00.0"),
+            "should reference GPU address"
+        );
+        assert!(
+            cmds.contains("0000:41:00.1"),
+            "should reference peer address"
+        );
+        assert!(
+            cmds.contains("driver_override"),
+            "should clear driver_override"
+        );
+        assert!(
+            cmds.contains("modprobe nvidia"),
+            "should reload nvidia modules"
+        );
         assert!(
             cmds.contains("modprobe snd_hda_intel"),
             "should reload peer original driver"

@@ -5258,8 +5258,10 @@ fn prepare_gateway_deploy_gpu(
     if gateway_deploy_uses_vm_backend() {
         if remote.is_none() {
             let guard = check_gpu_readiness(&gpu)?;
-            let selected_bdf = guard.pci_addr().unwrap_or("auto").to_string();
-            let updated_gpu = vec![selected_bdf];
+            // Signal that GPU is enabled but passthrough is handled by QEMU/VFIO,
+            // not by Docker CDI. The bootstrap sets GPU_ENABLED=true for the
+            // k3s NVIDIA device plugin but skips Docker DeviceRequests.
+            let updated_gpu = vec!["vm-passthrough".to_string()];
             return Ok((updated_gpu, Some(guard)));
         } else {
             eprintln!(

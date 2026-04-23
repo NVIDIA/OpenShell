@@ -419,7 +419,7 @@ fn launch_libkrun(config: &VmConfig) -> Result<i32, VmError> {
             if !config.is_exec_mode() && !config.port_map.is_empty() {
                 let gateway_port = gateway_host_port(config);
                 bootstrap_gateway(&config.rootfs, &config.gateway_name, gateway_port)?;
-                health::wait_for_gateway_ready(gateway_port, &config.gateway_name)?;
+                health::wait_for_gateway_ready(gateway_port, &config.gateway_name, config.gpu_enabled)?;
             }
 
             eprintln!("Ready [{:.1}s total]", boot_start.elapsed().as_secs_f64());

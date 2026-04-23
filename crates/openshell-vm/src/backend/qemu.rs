@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! QEMU backend for GPU passthrough VMs (devices without MSI-X support).
+//! QEMU backend for GPU passthrough VMs.
 //!
 //! Uses QEMU's command-line interface with KVM acceleration and VFIO device
 //! passthrough. This backend is Linux-only and requires a separate kernel
 //! image (`vmlinux`) and `virtiofsd` for the root filesystem.
 //!
-//! Unlike cloud-hypervisor, QEMU handles VFIO devices that lack MSI-X
-//! capability by falling back to legacy interrupt emulation.
+//! QEMU handles VFIO devices with or without MSI-X capability, falling
+//! back to legacy interrupt emulation when MSI-X is unavailable.
 
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -28,7 +28,7 @@ use crate::{NetBackend, VmConfig, VmError, vm_rootfs_key};
 const VSOCK_GUEST_CID: u32 = 3;
 const QEMU_BINARY_NAME: &str = "qemu-system-x86_64";
 
-/// QEMU hypervisor backend for GPU passthrough (non-MSI-X devices).
+/// QEMU hypervisor backend for GPU passthrough.
 pub struct QemuBackend {
     qemu_binary: PathBuf,
     vmlinux: PathBuf,
@@ -124,7 +124,6 @@ const TAP_DEVICE_NAME: &str = "vmtap0";
 
 /// Create and configure the TAP device before QEMU starts.
 ///
-/// Unlike cloud-hypervisor (which creates its own TAP via the `net` config),
 /// QEMU with `script=no` expects the TAP device to already exist.
 fn setup_tap_device() -> Result<(), VmError> {
     // Clean up stale TAP device from a previous crashed run.
@@ -132,13 +131,18 @@ fn setup_tap_device() -> Result<(), VmError> {
         eprintln!("TAP device {TAP_DEVICE_NAME} already exists, removing stale device");
         let _ = run_cmd("ip", &["link", "delete", TAP_DEVICE_NAME]);
     }
-    run_cmd("ip", &["tuntap", "add", "dev", TAP_DEVICE_NAME, "mode", "tap"])?;
+    run_cmd(
+        "ip",
+        &["tuntap", "add", "dev", TAP_DEVICE_NAME, "mode", "tap"],
+    )?;
     run_cmd(
         "ip",
         &[
-            "addr", "add",
+            "addr",
+            "add",
             &format!("{TAP_HOST_IP}/24"),
-            "dev", TAP_DEVICE_NAME,
+            "dev",
+            TAP_DEVICE_NAME,
         ],
     )?;
     run_cmd("ip", &["link", "set", TAP_DEVICE_NAME, "up"])?;
@@ -180,12 +184,8 @@ fn build_qemu_args(
     ]);
 
     // Kernel
-    args.extend([
-        "-kernel".into(),
-        backend.vmlinux.display().to_string(),
-    ]);
+    args.extend(["-kernel".into(), backend.vmlinux.display().to_string()]);
 
-    // Kernel cmdline (shared builder with CHV)
     let cmdline = build_kernel_cmdline(config, effective_exec_path, use_tap_net);
     args.extend(["-append".into(), cmdline]);
 
@@ -208,10 +208,7 @@ fn build_qemu_args(
     if let Some(disk_path) = state_disk_path {
         args.extend([
             "-drive".into(),
-            format!(
-                "file={},format=raw,if=virtio",
-                disk_path.display()
-            ),
+            format!("file={},format=raw,if=virtio", disk_path.display()),
         ]);
     }
 
@@ -327,12 +324,15 @@ fn launch_qemu(backend: &QemuBackend, config: &VmConfig) -> Result<i32, VmError>
             Ok(())
         });
     }
-    let mut virtiofsd_child = virtiofsd_cmd.spawn()
+    let mut virtiofsd_child = virtiofsd_cmd
+        .spawn()
         .map_err(|e| VmError::Fork(format!("start virtiofsd: {e}")))?;
 
+    let virtiofsd_pid = virtiofsd_child.id() as i32;
+    crate::VIRTIOFSD_PID.store(virtiofsd_pid, std::sync::atomic::Ordering::Relaxed);
+
     eprintln!(
-        "virtiofsd started (pid {}) [{:.1}s]",
-        virtiofsd_child.id(),
+        "virtiofsd started (pid {virtiofsd_pid}) [{:.1}s]",
         launch_start.elapsed().as_secs_f64()
     );
 
@@ -340,7 +340,7 @@ fn launch_qemu(backend: &QemuBackend, config: &VmConfig) -> Result<i32, VmError>
 
     let use_tap_net = !matches!(config.net, NetBackend::None);
 
-    // Build exec wrapper (same pattern as CHV)
+    // Build exec wrapper for --exec mode
     let is_exec_mode = config.is_exec_mode();
     let wrapper_path = config.rootfs.join("tmp/qemu-exec-wrapper.sh");
     let effective_exec_path;
@@ -435,7 +435,8 @@ fn launch_qemu(backend: &QemuBackend, config: &VmConfig) -> Result<i32, VmError>
             Ok(())
         });
     }
-    let mut qemu_child = qemu_cmd.spawn()
+    let mut qemu_child = qemu_cmd
+        .spawn()
         .map_err(|e| VmError::Fork(format!("start QEMU: {e}")))?;
 
     let qemu_pid = qemu_child.id() as i32;
@@ -443,6 +444,25 @@ fn launch_qemu(backend: &QemuBackend, config: &VmConfig) -> Result<i32, VmError>
         "QEMU started (pid {qemu_pid}) [{:.1}s]",
         launch_start.elapsed().as_secs_f64()
     );
+
+    // Install signal handlers immediately so SIGTERM during the long
+    // gateway bootstrap (30-120s) forwards to QEMU instead of killing
+    // the parent via the default handler (which skips Drop and leaves
+    // the GPU bound to vfio-pci).
+    //
+    // We use sigaction with SA_RESTART so that the wait() syscall in the
+    // main thread auto-restarts after the handler returns, rather than
+    // failing with EINTR. This prevents a second signal from killing the
+    // process before cleanup runs.
+    crate::CHILD_PID.store(qemu_pid, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = crate::forward_signal as *const () as libc::sighandler_t;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&raw mut sa.sa_mask);
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    }
 
     // Set up host-side TAP networking
     let mut original_ip_forward: Option<String> = None;
@@ -467,8 +487,7 @@ fn launch_qemu(backend: &QemuBackend, config: &VmConfig) -> Result<i32, VmError>
 
     // Write runtime state (vsock_bridge: true — uses AF_VSOCK bridging)
     if !config.is_exec_mode() {
-        if let Err(err) =
-            write_vm_runtime_state(&config.rootfs, qemu_pid, &console_log, None, true)
+        if let Err(err) = write_vm_runtime_state(&config.rootfs, qemu_pid, &console_log, None, true)
         {
             let _ = qemu_child.kill();
             let _ = qemu_child.wait();
@@ -485,7 +504,7 @@ fn launch_qemu(backend: &QemuBackend, config: &VmConfig) -> Result<i32, VmError>
         }
     }
 
-    // TCP port forwarding (same pattern as CHV)
+    // TCP port forwarding for TAP networking
     if use_tap_net {
         for pm in &config.port_map {
             let parts: Vec<&str> = pm.split(':').collect();
@@ -522,7 +541,7 @@ fn launch_qemu(backend: &QemuBackend, config: &VmConfig) -> Result<i32, VmError>
     if !config.is_exec_mode() && !config.port_map.is_empty() {
         let gateway_port = crate::gateway_host_port(config);
         if let Err(e) = crate::bootstrap_gateway(&config.rootfs, &config.gateway_name, gateway_port)
-            .and_then(|_| crate::health::wait_for_gateway_ready(gateway_port, &config.gateway_name))
+            .and_then(|_| crate::health::wait_for_gateway_ready(gateway_port, &config.gateway_name, config.gpu_enabled))
         {
             let _ = qemu_child.kill();
             let _ = qemu_child.wait();
@@ -541,47 +560,52 @@ fn launch_qemu(backend: &QemuBackend, config: &VmConfig) -> Result<i32, VmError>
         }
     }
 
-    eprintln!(
-        "Ready [{:.1}s total]",
-        launch_start.elapsed().as_secs_f64()
-    );
+    eprintln!("Ready [{:.1}s total]", launch_start.elapsed().as_secs_f64());
     eprintln!("Press Ctrl+C to stop.");
 
-    // Signal forwarding
-    crate::CHILD_PID.store(qemu_pid, std::sync::atomic::Ordering::Relaxed);
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            crate::forward_signal as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGTERM,
-            crate::forward_signal as *const () as libc::sighandler_t,
-        );
-    }
-
-    // Wait for QEMU to exit
+    // Wait for QEMU to exit. SA_RESTART ensures the wait() syscall
+    // auto-restarts after our signal handler runs, so QEMU gets a
+    // chance to shut down gracefully before we proceed to cleanup.
     let status = qemu_child
         .wait()
         .map_err(|e| VmError::HostSetup(format!("wait for QEMU: {e}")))?;
+
+    // Clear all signal-related atomics now that QEMU has exited.
     crate::CHILD_PID.store(0, std::sync::atomic::Ordering::Relaxed);
+    crate::VIRTIOFSD_PID.store(0, std::sync::atomic::Ordering::Relaxed);
 
-    // Clean up host networking rules
-    if let Some(ref orig) = original_ip_forward {
-        teardown_tap_host_networking(orig);
-    }
-    if use_tap_net {
-        teardown_tap_device();
+    let was_shutdown = crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed);
+    if was_shutdown {
+        eprintln!("Shutdown signal received, running explicit cleanup...");
     }
 
-    // Cleanup
-    if !config.is_exec_mode() {
-        clear_vm_runtime_state(&config.rootfs);
-    }
+    // ── Explicit cleanup (does NOT rely on Drop) ──────────────────
+    //
+    // This runs whether QEMU exited normally or was signalled. The
+    // signal handler forwarded SIGTERM to the process group, but we
+    // still need to clean up host-side state.
+
+    // 1. Kill virtiofsd
     let _ = virtiofsd_child.kill();
     let _ = virtiofsd_child.wait();
     eprintln!("virtiofsd stopped");
 
+    // 2. Tear down TAP device
+    if use_tap_net {
+        teardown_tap_device();
+    }
+
+    // 3. Tear down host networking (iptables)
+    if let Some(ref orig) = original_ip_forward {
+        teardown_tap_host_networking(orig);
+    }
+
+    // 4. Clean up runtime state files
+    if !config.is_exec_mode() {
+        clear_vm_runtime_state(&config.rootfs);
+    }
+
+    // 5. Clean up socket directories and temporary files
     let _ = std::fs::remove_dir_all(&sock_dir);
     let _ = std::fs::remove_file(&exec_socket);
     if is_exec_mode {
@@ -598,9 +622,8 @@ fn launch_qemu(backend: &QemuBackend, config: &VmConfig) -> Result<i32, VmError>
 /// Start a background bridge: exec Unix socket → guest AF_VSOCK.
 ///
 /// QEMU uses kernel `vhost-vsock-pci` which exposes guest vsock via the
-/// kernel's `AF_VSOCK` address family. This is different from
-/// cloud-hypervisor's text protocol — here we connect directly to the
-/// guest CID and port using raw `AF_VSOCK` sockets.
+/// kernel's `AF_VSOCK` address family. We connect directly to the guest
+/// CID and port using raw `AF_VSOCK` sockets.
 fn start_vsock_exec_bridge_af_vsock(
     exec_socket: &Path,
     guest_cid: u32,
@@ -692,7 +715,7 @@ fn is_transient_vsock_error(e: &std::io::Error) -> bool {
             code == libc::ENODEV         // vsock transport not ready
                 || code == libc::EHOSTUNREACH // guest CID not reachable yet
                 || code == libc::ECONNRESET   // connection reset during startup
-                || code == libc::ETIMEDOUT    // connect timed out
+                || code == libc::ETIMEDOUT // connect timed out
         }
         None => false,
     }
@@ -962,6 +985,10 @@ mod tests {
         assert!(
             cmdline.contains("GPU_ENABLED=true"),
             "cmdline should contain GPU_ENABLED=true: {cmdline}"
+        );
+        assert!(
+            cmdline.contains("firmware_class.path=/lib/firmware"),
+            "cmdline should contain firmware_class.path for GPU: {cmdline}"
         );
     }
 

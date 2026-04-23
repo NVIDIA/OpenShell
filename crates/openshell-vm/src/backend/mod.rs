@@ -5,9 +5,8 @@
 //!
 //! Defines the [`VmBackend`] trait that all hypervisor backends implement,
 //! and shared infrastructure (gvproxy startup, networking helpers) used by
-//! the libkrun, cloud-hypervisor, and QEMU backends.
+//! the libkrun and QEMU backends.
 
-pub mod cloud_hypervisor;
 pub mod libkrun;
 pub mod qemu;
 
@@ -20,7 +19,7 @@ use crate::{
     kill_stale_gvproxy, kill_stale_gvproxy_by_port, pick_gvproxy_ssh_port, vm_rootfs_key,
 };
 
-/// Trait implemented by each hypervisor backend (libkrun, cloud-hypervisor, QEMU).
+/// Trait implemented by each hypervisor backend (libkrun, QEMU).
 pub trait VmBackend {
     /// Launch a VM with the given configuration.
     ///
@@ -37,9 +36,9 @@ pub(crate) struct GvproxySetup {
 
 /// Start gvproxy for the given configuration.
 ///
-/// Shared between libkrun and cloud-hypervisor backends. Handles stale
-/// process cleanup, socket setup, and process spawning with exponential
-/// backoff waiting for the network socket.
+/// Shared between libkrun and QEMU backends. Handles stale process
+/// cleanup, socket setup, and process spawning with exponential backoff
+/// waiting for the network socket.
 pub(crate) fn start_gvproxy(
     config: &VmConfig,
     launch_start: Instant,
@@ -210,8 +209,8 @@ pub(crate) fn setup_gvproxy_port_forwarding(
 }
 
 // ── TAP networking constants ────────────────────────────────────────────
-// cloud-hypervisor defaults to 192.168.249.1/24 on the host side of the
-// TAP device. The guest uses .2 with the host as its gateway.
+// The QEMU backend uses 192.168.249.1/24 on the host side of the TAP
+// device. The guest uses .2 with the host as its gateway.
 
 /// Fixed MAC for the guest TAP interface. Only one VM runs per host.
 pub(crate) const GUEST_MAC: &str = "5a:94:ef:e4:0c:ee";
@@ -219,7 +218,6 @@ pub(crate) const GUEST_MAC: &str = "5a:94:ef:e4:0c:ee";
 pub(crate) const TAP_HOST_IP: &str = "192.168.249.1";
 pub(crate) const TAP_GUEST_IP: &str = "192.168.249.2";
 pub(crate) const TAP_SUBNET: &str = "192.168.249.0/24";
-pub(crate) const TAP_NETMASK: &str = "255.255.255.0";
 
 /// Wait for a Unix socket to appear on the filesystem.
 pub(crate) fn wait_for_socket(
@@ -273,10 +271,12 @@ pub(crate) fn shell_escape(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
     }
-    if s.bytes().all(|b| matches!(b,
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-        | b'_' | b'-' | b'.' | b'/' | b':' | b'@' | b'='
-    )) {
+    if s.bytes().all(|b| {
+        matches!(b,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'_' | b'-' | b'.' | b'/' | b':' | b'@' | b'='
+        )
+    }) {
         return s.to_string();
     }
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -333,6 +333,12 @@ pub(crate) fn build_kernel_cmdline(
 
     if config.gpu_enabled && config.vfio_device.is_some() {
         parts.push("GPU_ENABLED=true".to_string());
+        // Tell the kernel firmware loader to search /lib/firmware explicitly.
+        // The init script stages firmware to tmpfs and overrides this via
+        // sysfs, but the cmdline provides an early fallback so
+        // request_firmware() can find GSP blobs on the virtiofs rootfs even
+        // before init runs the staging logic.
+        parts.push("firmware_class.path=/lib/firmware".to_string());
     }
     if let Some(state_disk) = &config.state_disk {
         parts.push(format!(
@@ -375,9 +381,17 @@ pub(crate) fn setup_tap_host_networking() -> Result<String, VmError> {
     let _ = run_cmd(
         "iptables",
         &[
-            "-t", "nat", "-D", "POSTROUTING",
-            "-s", TAP_SUBNET, "!", "-d", TAP_SUBNET,
-            "-j", "MASQUERADE",
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-s",
+            TAP_SUBNET,
+            "!",
+            "-d",
+            TAP_SUBNET,
+            "-j",
+            "MASQUERADE",
         ],
     );
     run_cmd(
@@ -494,10 +508,7 @@ pub(crate) fn start_tcp_port_forwarder(
 }
 
 /// Copy data bidirectionally between two TCP streams until either side closes.
-fn forward_tcp_bidirectional(
-    client: std::net::TcpStream,
-    remote: std::net::TcpStream,
-) {
+fn forward_tcp_bidirectional(client: std::net::TcpStream, remote: std::net::TcpStream) {
     let Ok(mut client_r) = client.try_clone() else {
         return;
     };

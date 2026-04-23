@@ -51,17 +51,15 @@ pub const VM_EXEC_VSOCK_PORT: u32 = 10_777;
 /// How to connect to the VM exec agent.
 ///
 /// libkrun bridges each guest vsock port to a host Unix socket via
-/// `krun_add_vsock_port2`. cloud-hypervisor exposes guest vsock through
-/// a host-side Unix socket with a text protocol (`CONNECT <port>\n` /
-/// `OK <port>\n`), not kernel `AF_VSOCK` or standard `vhost-vsock`.
+/// `krun_add_vsock_port2`. QEMU uses kernel AF_VSOCK via vhost-vsock-pci,
+/// bridged through a host Unix socket by the exec bridge thread.
 #[derive(Debug, Clone)]
 pub enum VsockConnectMode {
     /// Connect via a host Unix socket (libkrun per-port bridging).
     UnixSocket(PathBuf),
-    /// Connect via a vsock proxy bridge (cloud-hypervisor).
-    /// The path points to a bridged Unix socket that performs the CHV
-    /// text-protocol handshake and forwards to guest CID 3,
-    /// port [`VM_EXEC_VSOCK_PORT`].
+    /// Connect via a vsock proxy bridge (QEMU AF_VSOCK).
+    /// The path points to a bridged Unix socket that connects to
+    /// guest CID 3, port [`VM_EXEC_VSOCK_PORT`].
     VsockBridge(PathBuf),
 }
 
@@ -89,7 +87,7 @@ pub struct VmRuntimeState {
     /// PID of the gvproxy process (if networking uses gvproxy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gvproxy_pid: Option<u32>,
-    /// Whether this VM uses vsock-bridge mode (cloud-hypervisor) vs
+    /// Whether this VM uses vsock-bridge mode (QEMU AF_VSOCK) vs
     /// Unix socket mode (libkrun). Defaults to false for backward compat.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vsock_bridge: bool,
@@ -484,9 +482,7 @@ fn cleanup_stale_state_on_lock_acquire(rootfs: &Path, lock_path: &Path) {
         return;
     }
 
-    eprintln!(
-        "Warning: cleaning up stale lock from dead process (pid {prev_pid})"
-    );
+    eprintln!("Warning: cleaning up stale lock from dead process (pid {prev_pid})");
 
     let state_path = vm_state_path(rootfs);
     if let Ok(bytes) = fs::read(&state_path) {

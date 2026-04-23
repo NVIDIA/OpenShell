@@ -159,21 +159,29 @@ CONFIG_X86_PAT=y
 # (previously CONFIG_FW_LOADER_SYSFS, now merged).
 CONFIG_FW_LOADER=y
 
-# ── cloud-hypervisor support ────────────────────────────────────────────
-# CHV uses virtio-PCI transport (libkrun uses virtio-MMIO). Both drivers
+# ── Compressed firmware support ──────────────────────────────────────────
+# NVIDIA driver packages (570.x+) ship GSP firmware as compressed files
+# (gsp_*.bin.xz). Without decompression support, request_firmware() fails
+# to find the firmware even when the files exist in /lib/firmware/.
+CONFIG_FW_LOADER_COMPRESS=y
+CONFIG_FW_LOADER_COMPRESS_XZ=y
+CONFIG_FW_LOADER_COMPRESS_ZSTD=y
+
+# ── QEMU backend support ─────────────────────────────────────────────────
+# QEMU uses virtio-PCI transport (libkrun uses virtio-MMIO). Both drivers
 # coexist safely — the kernel probes whichever transport the hypervisor
 # provides.
 CONFIG_VIRTIO_PCI=y
 
-# Serial console for cloud-hypervisor (8250/16550 UART). libkrun uses
-# virtio-console which is already enabled in the base config.
+# Serial console for QEMU (8250/16550 UART). libkrun uses virtio-console
+# which is already enabled in the base config.
 CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
 
-# ACPI support for cloud-hypervisor power management. Required for
-# `poweroff -f` to trigger a clean ACPI shutdown that CHV detects.
+# ACPI support for QEMU power management. Required for `poweroff -f`
+# to trigger a clean ACPI shutdown that QEMU detects.
 CONFIG_ACPI=y
 
-# x2APIC support — Cloud Hypervisor uses x2APIC MADT entries for
-# multi-vCPU VMs. Without this, only the bootstrap CPU is activated.
+# x2APIC support — QEMU uses x2APIC MADT entries for multi-vCPU VMs.
+# Without this, only the bootstrap CPU is activated.
 CONFIG_X86_X2APIC=y

@@ -46,8 +46,8 @@ mkdir -p /sys/fs/cgroup
 mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null &
 wait
 
-# ── Parse kernel cmdline for env vars (cloud-hypervisor path) ────────
-# cloud-hypervisor passes environment variables via kernel cmdline
+# ── Parse kernel cmdline for env vars ─────────────────────────────────
+# The QEMU backend passes environment variables via kernel cmdline
 # (KEY=VALUE tokens). These are not automatically exported to init.
 # Must run after /proc is mounted.
 if [ -f /proc/cmdline ]; then
@@ -279,6 +279,14 @@ find /run -name '*.sock' -delete 2>/dev/null || true
 # start; clear it so k3s doesn't fail node re-registration validation.
 rm -f /var/lib/rancher/k3s/server/cred/node-passwd 2>/dev/null || true
 
+# Clean stale k3s TLS certificates from previous boots. If k3s crashes
+# mid-write it can leave partially-written (0-byte or non-PEM) cert files
+# that cause "tls: failed to find any PEM data in certificate input" on
+# restart. Wiping the TLS directory forces k3s to regenerate self-signed
+# certs on startup. This is safe for both cold and warm boots — the certs
+# are ephemeral per-cluster and recreated automatically by k3s.
+rm -rf /var/lib/rancher/k3s/server/tls 2>/dev/null || true
+
 # Clean stale containerd runtime state from previous boots.
 #
 # The rootfs persists across VM restarts via virtio-fs. The snapshotter
@@ -415,10 +423,38 @@ if [ "${GPU_ENABLED:-false}" = "true" ]; then
         exit 1
     fi
 
+    # ── Stage NVIDIA GSP firmware onto tmpfs for reliable loading ─────
+    # The kernel's request_firmware() calls kernel_read_file_from_path_initns()
+    # which must read the full firmware blob (64MB+ for GSP) through the VFS
+    # layer. On virtiofs (FUSE-based), each read is a round-trip through the
+    # virtio ring to virtiofsd. This can fail or stall on non-DAX virtiofs
+    # configurations (QEMU vhost-user-fs-pci without cache-size).
+    #
+    # Copying firmware to /run (tmpfs) eliminates the FUSE path entirely —
+    # kernel_read_file() reads directly from page cache backed by RAM.
+    NVIDIA_FW_SRC="/lib/firmware/nvidia"
+    NVIDIA_FW_TMPFS="/run/firmware/nvidia"
+    if [ -d "$NVIDIA_FW_SRC" ]; then
+        mkdir -p "/run/firmware"
+        cp -a "$NVIDIA_FW_SRC" "/run/firmware/"
+        ts "staged NVIDIA firmware to tmpfs ($(du -sh "$NVIDIA_FW_TMPFS" | cut -f1))"
+
+        if [ -f /sys/module/firmware_class/parameters/path ]; then
+            echo -n "/run/firmware" > /sys/module/firmware_class/parameters/path
+            ts "firmware_class.path set to /run/firmware"
+        fi
+    else
+        echo "WARNING: NVIDIA firmware directory not found at $NVIDIA_FW_SRC" >&2
+        echo "         modprobe nvidia will likely fail with: RmFetchGspRmImages: No firmware image found" >&2
+    fi
+
     modprobe nvidia || { echo "FATAL: failed to load nvidia kernel module" >&2; exit 1; }
     modprobe nvidia_uvm || { echo "FATAL: failed to load nvidia_uvm kernel module" >&2; exit 1; }
     modprobe nvidia_modeset || { echo "FATAL: failed to load nvidia_modeset kernel module" >&2; exit 1; }
     ts "NVIDIA kernel modules loaded"
+
+    # Firmware is now in kernel memory; free the tmpfs copy.
+    rm -rf /run/firmware 2>/dev/null || true
 
     if ! nvidia-smi > /dev/null 2>&1; then
         echo "FATAL: GPU_ENABLED=true but nvidia-smi failed — GPU not visible to guest" >&2

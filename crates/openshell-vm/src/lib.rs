@@ -119,14 +119,12 @@ fn check(ret: i32, func: &'static str) -> Result<(), VmError> {
 /// Hypervisor backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VmBackendChoice {
-    /// Auto-select: cloud-hypervisor when a VFIO device is configured, libkrun otherwise.
+    /// Auto-select: QEMU when a VFIO device is configured, libkrun otherwise.
     #[default]
     Auto,
     /// Force the libkrun backend.
     Libkrun,
-    /// Force the cloud-hypervisor backend (even without GPU/VFIO).
-    CloudHypervisor,
-    /// Force the QEMU backend (Linux-only, supports VFIO without MSI-X).
+    /// Force the QEMU backend (Linux-only, supports VFIO GPU passthrough).
     Qemu,
 }
 
@@ -238,13 +236,12 @@ pub struct VmConfig {
     /// Whether GPU passthrough is enabled for this VM.
     pub gpu_enabled: bool,
 
-    /// Whether the GPU supports MSI-X (needed for cloud-hypervisor VFIO).
-    /// When `false` and `Auto` backend is selected with GPU enabled,
-    /// QEMU is used instead of cloud-hypervisor.
+    /// Whether the GPU supports MSI-X. Retained for informational purposes
+    /// but no longer affects backend selection (QEMU handles both cases).
     pub gpu_has_msix: bool,
 
     /// VFIO PCI device address for GPU passthrough (e.g. `0000:41:00.0`).
-    /// When set, the cloud-hypervisor backend is used instead of libkrun.
+    /// When set, the QEMU backend is used instead of libkrun.
     pub vfio_device: Option<String>,
 
     /// Hypervisor backend override. Defaults to [`VmBackendChoice::Auto`].
@@ -1322,32 +1319,15 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
 
     enum SelectedBackend {
         Libkrun,
-        CloudHypervisor,
         Qemu,
     }
 
     let selected = match config.backend {
-        VmBackendChoice::CloudHypervisor => {
-            if config.gpu_enabled && !config.gpu_has_msix {
-                return Err(VmError::HostSetup(
-                    "cloud-hypervisor requires MSI-X for VFIO passthrough, but this GPU \
-                     lacks MSI-X support. Use --backend auto or --backend qemu."
-                        .into(),
-                ));
-            }
-            SelectedBackend::CloudHypervisor
-        }
         VmBackendChoice::Libkrun => SelectedBackend::Libkrun,
         VmBackendChoice::Qemu => SelectedBackend::Qemu,
         VmBackendChoice::Auto => {
-            if config.gpu_enabled {
-                if config.gpu_has_msix {
-                    SelectedBackend::CloudHypervisor
-                } else {
-                    SelectedBackend::Qemu
-                }
-            } else if config.vfio_device.is_some() {
-                SelectedBackend::CloudHypervisor
+            if config.gpu_enabled || config.vfio_device.is_some() {
+                SelectedBackend::Qemu
             } else {
                 SelectedBackend::Libkrun
             }
@@ -1355,21 +1335,6 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
     };
 
     match selected {
-        SelectedBackend::CloudHypervisor => {
-            #[cfg(not(target_os = "linux"))]
-            return Err(VmError::HostSetup(
-                "cloud-hypervisor backend requires Linux with KVM".into(),
-            ));
-
-            #[cfg(target_os = "linux")]
-            {
-                if let Some(ref addr) = config.vfio_device {
-                    validate_vfio_address(addr)?;
-                }
-                let chv_backend = backend::cloud_hypervisor::CloudHypervisorBackend::new()?;
-                backend::VmBackend::launch(&chv_backend, config)
-            }
-        }
         SelectedBackend::Qemu => {
             #[cfg(not(target_os = "linux"))]
             return Err(VmError::HostSetup(
@@ -1683,11 +1648,34 @@ fn sync_host_certs_if_stale(
 
 pub(crate) static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+pub(crate) static VIRTIOFSD_PID: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+
+/// Set to `true` by the signal handler when a shutdown signal (SIGTERM/SIGINT)
+/// is received. The main thread checks this after `qemu_child.wait()` returns
+/// to ensure cleanup runs even if the wait was interrupted.
+pub(crate) static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Signal handler that forwards SIGTERM to child processes and sets the
+/// shutdown flag. Only calls async-signal-safe functions (libc::kill,
+/// atomic stores). No heap allocation, no println, no mutex.
 pub(crate) extern "C" fn forward_signal(_sig: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // Always send SIGTERM to each child individually. The process-group
+    // approach (kill(-pgid)) is unreliable because setpgid() in QEMU's
+    // pre_exec silently fails — QEMU stays in its parent's group.
     let pid = CHILD_PID.load(std::sync::atomic::Ordering::Relaxed);
     if pid > 0 {
         unsafe {
             libc::kill(pid, libc::SIGTERM);
+        }
+    }
+    let vfsd_pid = VIRTIOFSD_PID.load(std::sync::atomic::Ordering::Relaxed);
+    if vfsd_pid > 0 {
+        unsafe {
+            libc::kill(vfsd_pid, libc::SIGTERM);
         }
     }
 }
@@ -1809,50 +1797,34 @@ mod tests {
     }
 
     #[test]
-    fn auto_selects_qemu_when_gpu_no_msix() {
+    fn auto_selects_qemu_for_gpu() {
         enum SelectedBackend {
             Libkrun,
-            CloudHypervisor,
             Qemu,
         }
 
-        let select = |backend: VmBackendChoice, gpu_enabled: bool, gpu_has_msix: bool| {
-            match backend {
-                VmBackendChoice::CloudHypervisor => SelectedBackend::CloudHypervisor,
-                VmBackendChoice::Libkrun => SelectedBackend::Libkrun,
-                VmBackendChoice::Qemu => SelectedBackend::Qemu,
-                VmBackendChoice::Auto => {
-                    if gpu_enabled {
-                        if gpu_has_msix {
-                            SelectedBackend::CloudHypervisor
-                        } else {
-                            SelectedBackend::Qemu
-                        }
-                    } else {
-                        SelectedBackend::Libkrun
-                    }
+        let select = |backend: VmBackendChoice, gpu_enabled: bool| match backend {
+            VmBackendChoice::Libkrun => SelectedBackend::Libkrun,
+            VmBackendChoice::Qemu => SelectedBackend::Qemu,
+            VmBackendChoice::Auto => {
+                if gpu_enabled {
+                    SelectedBackend::Qemu
+                } else {
+                    SelectedBackend::Libkrun
                 }
             }
         };
 
         assert!(matches!(
-            select(VmBackendChoice::Auto, true, false),
+            select(VmBackendChoice::Auto, true),
             SelectedBackend::Qemu
         ));
         assert!(matches!(
-            select(VmBackendChoice::Auto, true, true),
-            SelectedBackend::CloudHypervisor
-        ));
-        assert!(matches!(
-            select(VmBackendChoice::Auto, false, true),
+            select(VmBackendChoice::Auto, false),
             SelectedBackend::Libkrun
         ));
         assert!(matches!(
-            select(VmBackendChoice::Auto, false, false),
-            SelectedBackend::Libkrun
-        ));
-        assert!(matches!(
-            select(VmBackendChoice::Qemu, false, true),
+            select(VmBackendChoice::Qemu, false),
             SelectedBackend::Qemu
         ));
     }
@@ -1889,19 +1861,13 @@ mod tests {
 
     #[test]
     fn gateway_host_port_no_gateway_mapping_returns_default() {
-        let cfg = config_with_port_map(vec![
-            "6443:6443".to_string(),
-            "8080:8080".to_string(),
-        ]);
+        let cfg = config_with_port_map(vec!["6443:6443".to_string(), "8080:8080".to_string()]);
         assert_eq!(gateway_host_port(&cfg), DEFAULT_GATEWAY_PORT);
     }
 
     #[test]
     fn gateway_host_port_finds_remapped_gateway() {
-        let cfg = config_with_port_map(vec![
-            "6443:6443".to_string(),
-            "9999:30051".to_string(),
-        ]);
+        let cfg = config_with_port_map(vec!["6443:6443".to_string(), "9999:30051".to_string()]);
         assert_eq!(gateway_host_port(&cfg), 9999);
     }
 

@@ -55,7 +55,7 @@ description = "Build NVIDIA kernel modules for GPU VM rootfs (requires FROM_SOUR
 run = "tasks/scripts/vm/build-nvidia-modules.sh"
 
 ["vm:gpu-deps"]
-description = "Build GPU passthrough dependencies (cloud-hypervisor, virtiofsd) shared by CHV and QEMU backends"
+description = "Build GPU passthrough dependencies (virtiofsd) for the QEMU backend"
 run = "tasks/scripts/vm/build-gpu-deps.sh"
 
 ["vm:qemu-check"]

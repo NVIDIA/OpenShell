@@ -919,8 +919,8 @@ done
 # per-boot layer extraction that previously added ~3-5s per container.
 echo "    Pre-unpacking container images..."
 for img in \
-    "ghcr.io/nvidia/openshell-community/sandboxes/base:latest" \
-    "ghcr.io/nvidia/openshell/gateway:latest"; do
+    "${COMMUNITY_SANDBOX_IMAGE}" \
+    "${SERVER_IMAGE}"; do
     if vm_exec k3s ctr -n k8s.io images ls -q 2>/dev/null | grep -qF "$img"; then
         echo "      unpacking: $img"
         vm_exec k3s ctr -n k8s.io run --rm "$img" "pre-unpack-$(date +%s)" true 2>/dev/null || true
