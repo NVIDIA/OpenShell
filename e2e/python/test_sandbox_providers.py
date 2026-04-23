@@ -36,7 +36,7 @@ def _default_policy() -> sandbox_pb2.SandboxPolicy:
         version=1,
         filesystem=sandbox_pb2.FilesystemPolicy(
             include_workdir=True,
-            read_only=["/usr", "/lib", "/etc", "/app"],
+            read_only=["/usr", "/lib", "/etc", "/app", "/dev/urandom"],
             read_write=["/sandbox", "/tmp"],
         ),
         landlock=sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
