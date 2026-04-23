@@ -17,8 +17,9 @@
 //! codesign --entitlements crates/openshell-vm/entitlements.plist --force -s - target/debug/openshell-vm
 //! ```
 
-use std::io::IsTerminal;
+use std::io::{BufRead, IsTerminal};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueHint};
 
@@ -98,8 +99,9 @@ struct Cli {
     #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
     gpu: Option<String>,
 
-    /// Hypervisor backend: "auto" (default), "libkrun", or "cloud-hypervisor".
-    /// Auto selects cloud-hypervisor when --gpu is set, libkrun otherwise.
+    /// Hypervisor backend: "auto" (default), "libkrun", "cloud-hypervisor", or "qemu".
+    /// Auto selects cloud-hypervisor when --gpu is set (with MSI-X), qemu
+    /// when --gpu is set without MSI-X, and libkrun otherwise.
     #[arg(long, default_value = "auto")]
     backend: String,
 }
@@ -168,6 +170,19 @@ fn main() {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        #[allow(unsafe_code)]
+        let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+        if ret != 0 {
+            eprintln!(
+                "warning: prctl(PR_SET_PDEATHSIG) failed: {} — \
+                 signal propagation through sudo may not work",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
@@ -183,6 +198,102 @@ fn main() {
     if code != 0 {
         std::process::exit(code);
     }
+}
+
+/// RAII guard that restarts the display manager when dropped.
+///
+/// Created when the user confirms stopping the display manager for GPU
+/// passthrough. On drop (normal exit, error, or panic), restarts the
+/// service so the user's graphical session is restored.
+struct DisplayManagerGuard;
+
+impl DisplayManagerGuard {
+    fn stop_display_manager() -> Result<Self, Box<dyn std::error::Error>> {
+        eprintln!("Stopping display-manager...");
+        let status = std::process::Command::new("systemctl")
+            .args(["stop", "display-manager"])
+            .status()?;
+        if !status.success() {
+            return Err(format!(
+                "failed to stop display-manager (exit {})",
+                status.code().unwrap_or(-1)
+            )
+            .into());
+        }
+        eprintln!("display-manager stopped");
+        // Give Xorg time to release GPU device handles.
+        std::thread::sleep(Duration::from_secs(2));
+        Ok(Self)
+    }
+}
+
+impl Drop for DisplayManagerGuard {
+    fn drop(&mut self) {
+        eprintln!("Restarting display-manager...");
+        match std::process::Command::new("systemctl")
+            .args(["start", "display-manager"])
+            .status()
+        {
+            Ok(s) if s.success() => eprintln!("display-manager restarted"),
+            Ok(s) => eprintln!(
+                "warning: display-manager restart failed (exit {})",
+                s.code().unwrap_or(-1)
+            ),
+            Err(e) => eprintln!("warning: could not restart display-manager: {e}"),
+        }
+    }
+}
+
+/// Prompt the user to stop the display manager for GPU passthrough.
+///
+/// Returns `true` if the user confirms. Always returns `false` when stdin
+/// is not a terminal (non-interactive mode).
+fn prompt_display_manager_stop(info: &openshell_vfio::DisplayBlockerInfo) -> bool {
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+
+    eprintln!();
+    eprintln!(
+        "WARNING: GPU {} is in use by the display manager.",
+        info.pci_addr
+    );
+    if !info.display_processes.is_empty() {
+        let procs: Vec<String> = info
+            .display_processes
+            .iter()
+            .map(|(pid, comm)| format!("{comm} (PID {pid})"))
+            .collect();
+        eprintln!("  Display server processes: {}", procs.join(", "));
+    }
+    if info.has_active_outputs {
+        eprintln!("  Active display outputs are connected to this GPU.");
+    }
+    eprintln!();
+    eprintln!("Stopping the display manager will terminate your graphical session.");
+    eprintln!("You will lose access to any open GUI applications.");
+    if !info.other_processes.is_empty() {
+        let procs: Vec<String> = info
+            .other_processes
+            .iter()
+            .map(|(pid, comm)| format!("{comm} (PID {pid})"))
+            .collect();
+        eprintln!();
+        eprintln!(
+            "Other non-display processes are also using the GPU: {}",
+            procs.join(", ")
+        );
+        eprintln!("These will also lose GPU access.");
+    }
+    eprintln!();
+    eprintln!("The display manager will be restarted automatically when the VM exits.");
+    eprint!("Stop display-manager and proceed with GPU passthrough? [y/N] ");
+
+    let mut input = String::new();
+    if std::io::stdin().lock().read_line(&mut input).is_err() {
+        return false;
+    }
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
@@ -247,35 +358,79 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
 
     let gateway_name = openshell_vm::gateway_name(&cli.name)?;
 
-    let (gpu_enabled, vfio_device, _gpu_guard) = match cli.gpu {
+    // Check if the display manager is blocking GPU passthrough and offer
+    // to stop it interactively. The guard restarts display-manager on exit.
+    let _display_manager_guard: Option<DisplayManagerGuard> = if cli.gpu.is_some() {
+        let requested_bdf = match cli.gpu.as_deref() {
+            Some(addr) if addr != "auto" => Some(addr),
+            _ => None,
+        };
+
+        if let Some(blocker) = openshell_vfio::detect_display_blocker(requested_bdf) {
+            if prompt_display_manager_stop(&blocker) {
+                Some(DisplayManagerGuard::stop_display_manager()?)
+            } else {
+                return Err(format!(
+                    "GPU passthrough aborted: GPU {} is in use by the display manager.\n\
+                     To proceed, stop it manually before launching the VM:\n  \
+                     sudo systemctl stop display-manager",
+                    blocker.pci_addr
+                )
+                .into());
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let (gpu_enabled, vfio_device, gpu_has_msix, _gpu_guard) = match cli.gpu {
         Some(ref addr) if addr != "auto" => {
             let state = openshell_vfio::prepare_gpu_for_passthrough(Some(addr))?;
             let bdf = state.pci_addr.clone();
+            let has_msix = state.has_msix;
             (
                 true,
                 Some(bdf),
+                has_msix,
                 Some(openshell_vfio::GpuBindGuard::new(state)),
             )
         }
         Some(_) => {
             let state = openshell_vfio::prepare_gpu_for_passthrough(None)?;
             let bdf = state.pci_addr.clone();
+            let has_msix = state.has_msix;
             (
                 true,
                 Some(bdf),
+                has_msix,
                 Some(openshell_vfio::GpuBindGuard::new(state)),
             )
         }
-        None => (false, None, None),
+        None => (false, None, true, None),
     };
+
+    if let Some(ref guard) = _gpu_guard {
+        if let Some(state) = guard.state() {
+            if state.did_bind {
+                eprintln!(
+                    "\nGPU recovery: if this process is force-killed (kill -9), \
+                     restore your GPU with:\n{}",
+                    state.recovery_commands()
+                );
+            }
+        }
+    }
 
     let backend_choice = match cli.backend.as_str() {
         "cloud-hypervisor" | "chv" => openshell_vm::VmBackendChoice::CloudHypervisor,
+        "qemu" => openshell_vm::VmBackendChoice::Qemu,
         "libkrun" => {
             if gpu_enabled {
                 return Err(
                     "--backend libkrun is incompatible with --gpu (libkrun does not support \
-                     VFIO passthrough). Use --backend auto or --backend cloud-hypervisor."
+                     VFIO passthrough). Use --backend auto, --backend cloud-hypervisor, or --backend qemu."
                         .into(),
                 );
             }
@@ -284,7 +439,7 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         "auto" => openshell_vm::VmBackendChoice::Auto,
         other => {
             return Err(format!(
-                "unknown --backend: {other} (expected: auto, libkrun, cloud-hypervisor)"
+                "unknown --backend: {other} (expected: auto, libkrun, cloud-hypervisor, qemu)"
             )
             .into());
         }
@@ -308,6 +463,7 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
             gateway_name,
             state_disk: None,
             gpu_enabled,
+            gpu_has_msix,
             vfio_device,
             backend: backend_choice,
         }
@@ -315,6 +471,16 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         let mut c = openshell_vm::VmConfig::gateway(rootfs);
         if !cli.port.is_empty() {
             c.port_map = cli.port;
+            let has_gateway = c.port_map.iter().any(|pm| {
+                pm.split(':').nth(1).and_then(|p| p.parse::<u16>().ok())
+                    == Some(openshell_vm::GUEST_GATEWAY_NODEPORT)
+            });
+            if !has_gateway {
+                eprintln!(
+                    "warning: no port mapping targets guest port 30051 (gateway NodePort); \
+                     health check will use default port 30051"
+                );
+            }
         }
         if let Some(v) = cli.vcpus {
             c.vcpus = v;
@@ -326,6 +492,7 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         c.reset = cli.reset;
         c.gateway_name = gateway_name;
         c.gpu_enabled = gpu_enabled;
+        c.gpu_has_msix = gpu_has_msix;
         c.vfio_device = vfio_device;
         c.backend = backend_choice;
         if state_disk_disabled() {

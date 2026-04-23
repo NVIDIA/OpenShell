@@ -3,7 +3,6 @@
 
 //! Host-side NVIDIA GPU VFIO bind/unbind for VM passthrough.
 
-#![allow(unsafe_code)]
 //!
 //! This module scans Linux sysfs (`/sys/bus/pci/devices`) for NVIDIA GPUs
 //! (vendor ID `0x10de`), checks their driver binding, and verifies IOMMU
@@ -104,6 +103,15 @@ fn sysfs_write_with_timeout(
     use std::process::{Command, Stdio};
     use std::thread;
 
+    if data.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "sysfs_write_with_timeout called with empty data for {}",
+                path.display()
+            ),
+        ));
+    }
     validate_sysfs_data(data)?;
 
     let mut child = Command::new("sh")
@@ -408,6 +416,36 @@ impl SysfsRoot {
     #[cfg(target_os = "linux")]
     fn write_sysfs(&self, path: &std::path::Path, data: &str) -> Result<(), std::io::Error> {
         if self.is_real_sysfs() {
+            if data.is_empty() {
+                // Clearing a sysfs attribute requires a direct write() syscall.
+                // Shell-based approaches (`printf '%s' '' > file`) produce zero
+                // bytes of output, and sysfs doesn't support truncation — so the
+                // kernel store function is never invoked and the attribute keeps
+                // its old value. A direct write("\n") always works: the kernel
+                // strips trailing newlines in store functions like
+                // driver_override_store(), resulting in an empty string that
+                // clears the attribute. Uses O_WRONLY only (no O_CREAT/O_TRUNC)
+                // for sysfs compatibility. This path does NOT use the timeout
+                // wrapper because clearing attributes never hangs — unlike driver
+                // unbind which can deadlock in nvidia's remove().
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("failed to open {} for clearing: {e}", path.display()),
+                        )
+                    })?;
+                f.write_all(b"\n").map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("failed to write newline to {}: {e}", path.display()),
+                    )
+                })?;
+                return Ok(());
+            }
             sysfs_write_with_timeout(path, data, SYSFS_WRITE_TIMEOUT)
         } else {
             std::fs::write(path, data).map_err(|e| {
@@ -689,6 +727,58 @@ fn nvidia_pre_unbind_prep(pci_addr: &str) {
     }
 }
 
+/// Reset a PCI device to clear stale IOMMU state after VFIO passthrough.
+///
+/// Tries the device's own `reset` file (FLR) first. If that doesn't exist,
+/// locates the parent PCI bridge and triggers a secondary bus reset (SBR).
+/// Either reset clears stale IOMMU page table entries that would otherwise
+/// cause `RmInitAdapter` failures when the nvidia driver initialises.
+#[cfg(target_os = "linux")]
+fn pci_reset_device(sysfs: &SysfsRoot, pci_addr: &str) {
+    let dev_dir = sysfs.sys_bus_pci_devices().join(pci_addr);
+
+    // Try device-level FLR first.
+    let device_reset = dev_dir.join("reset");
+    if device_reset.exists() {
+        eprintln!("GPU {pci_addr}: performing PCI function-level reset");
+        match sysfs.write_sysfs(&device_reset, "1") {
+            Ok(()) => {
+                std::thread::sleep(Duration::from_secs(1));
+                eprintln!("GPU {pci_addr}: FLR complete");
+                return;
+            }
+            Err(e) => {
+                eprintln!("GPU {pci_addr}: FLR failed ({e}), trying bridge SBR");
+            }
+        }
+    }
+
+    // Fall back to secondary bus reset on the parent bridge. The sysfs
+    // device path is a symlink whose real path encodes the PCI topology:
+    //   /sys/devices/pci0000:00/0000:00:03.1/0000:2d:00.0
+    // The parent directory (0000:00:03.1) is the bridge.
+    if let Ok(real) = std::fs::canonicalize(&dev_dir) {
+        if let Some(bridge_dir) = real.parent() {
+            let bridge_reset = bridge_dir.join("reset");
+            if bridge_reset.exists() {
+                let bridge_name = bridge_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
+                eprintln!(
+                    "GPU {pci_addr}: performing secondary bus reset on bridge {bridge_name}"
+                );
+                if let Err(e) = std::fs::write(&bridge_reset, "1") {
+                    eprintln!("GPU {pci_addr}: bridge SBR failed: {e}");
+                } else {
+                    std::thread::sleep(Duration::from_secs(1));
+                    eprintln!("GPU {pci_addr}: SBR complete");
+                }
+            }
+        }
+    }
+}
+
 /// Reload nvidia kernel modules so the driver's sysfs bind file exists.
 ///
 /// Called during restore to ensure `modprobe nvidia` brings back the driver
@@ -880,80 +970,165 @@ pub fn rebind_gpu_to_original(
     validate_pci_addr(pci_addr)?;
     let dev_dir = sysfs.sys_bus_pci_devices().join(pci_addr);
 
-    if current_driver(sysfs, pci_addr).is_some() {
-        let unbind = dev_dir.join("driver/unbind");
-        sysfs.write_sysfs(&unbind, pci_addr).map_err(|e| {
+    // Restore is best-effort: attempt every step even if earlier ones fail,
+    // so a partial failure (e.g. unbind succeeds but driver_override clear
+    // fails) doesn't leave the device in a worse state than before. Track
+    // the first error to return at the end.
+    let mut first_err: Option<std::io::Error> = None;
+
+    // Step 1: Unbind from the current driver. Without this, modprobe for
+    // the original driver fails with "No such device" because the kernel
+    // still considers the PCI slot claimed.
+    let cur_drv = current_driver(sysfs, pci_addr);
+    if cur_drv.as_deref() == Some("vfio-pci") {
+        let vfio_unbind = sysfs.sys_bus_pci_drivers("vfio-pci").join("unbind");
+        if let Err(e) = sysfs.write_sysfs(&vfio_unbind, pci_addr) {
             let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
                 " — run as root"
             } else {
                 ""
             };
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "Failed to unbind device at {path}{hint}",
-                    path = unbind.display()
-                ),
-            )
-        })?;
+            eprintln!(
+                "GPU {pci_addr}: failed to unbind from vfio-pci at {}{hint} — continuing restore",
+                vfio_unbind.display()
+            );
+            if first_err.is_none() {
+                first_err = Some(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to unbind {pci_addr} from vfio-pci at {path}{hint}",
+                        path = vfio_unbind.display()
+                    ),
+                ));
+            }
+        }
+    } else if cur_drv.is_some() {
+        let unbind = dev_dir.join("driver/unbind");
+        if let Err(e) = sysfs.write_sysfs(&unbind, pci_addr) {
+            let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                " — run as root"
+            } else {
+                ""
+            };
+            eprintln!(
+                "GPU {pci_addr}: failed to unbind from {} at {}{hint} — continuing restore",
+                cur_drv.as_deref().unwrap_or("unknown"),
+                unbind.display()
+            );
+            if first_err.is_none() {
+                first_err = Some(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to unbind device at {path}{hint}",
+                        path = unbind.display()
+                    ),
+                ));
+            }
+        }
     }
 
+    // Step 2: Clear driver_override so modprobe can claim the device. This
+    // is required even when the device is already unbound — a killed VM
+    // process can leave driver_override set to "vfio-pci" with no driver
+    // actually bound.
     let driver_override = dev_dir.join("driver_override");
-    sysfs.write_sysfs(&driver_override, "").map_err(|e| {
+    if let Err(e) = sysfs.write_sysfs(&driver_override, "") {
         let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
             " — run as root"
         } else {
             ""
         };
-        std::io::Error::new(
-            e.kind(),
-            format!(
-                "Failed to clear driver_override at {path}{hint}",
-                path = driver_override.display()
-            ),
-        )
-    })?;
+        eprintln!(
+            "GPU {pci_addr}: failed to clear driver_override at {}{hint} — continuing restore",
+            driver_override.display()
+        );
+        if first_err.is_none() {
+            first_err = Some(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "Failed to clear driver_override at {path}{hint}",
+                    path = driver_override.display()
+                ),
+            ));
+        }
+    }
 
+    // Step 3: PCI device reset to clear stale IOMMU state.
+    // After VFIO passthrough (especially on AMD-Vi systems), the GPU may
+    // retain stale IOMMU page table entries. Without a reset, modprobe
+    // nvidia fails with RmInitAdapter errors and IO_PAGE_FAULTs.
+    if sysfs.is_real_sysfs() {
+        pci_reset_device(sysfs, pci_addr);
+    }
+
+    // Step 4: Reload modules and bind to the original driver.
     if !original_driver.is_empty() && original_driver != "none" {
-        // The nvidia driver bind path requires the kernel module to be loaded.
-        // nvidia_pre_unbind_prep may have unloaded it (cascade from submodules),
-        // or it may have been absent since before we started. Reload it so the
-        // driver's bind file exists in sysfs.
         if original_driver == "nvidia" && sysfs.is_real_sysfs() {
             nvidia_reload_modules();
         }
 
-        let bind = sysfs.sys_bus_pci_drivers(original_driver).join("bind");
-        if let Err(e) = sysfs.write_sysfs(&bind, pci_addr) {
-            eprintln!(
-                "GPU {pci_addr}: explicit bind to {original_driver} failed ({e}), \
-                 falling back to PCI rescan"
-            );
-            let rescan = sysfs.0.join("sys/bus/pci/rescan");
-            let _ = sysfs.write_sysfs(&rescan, "1");
-            // Give the kernel time to re-probe and bind drivers.
-            std::thread::sleep(Duration::from_secs(1));
+        // modprobe may have auto-bound the device (now that driver_override is
+        // cleared). Skip the explicit bind if already on the right driver.
+        let cur = current_driver(sysfs, pci_addr);
+        if cur.as_deref() == Some(original_driver) {
+            eprintln!("GPU {pci_addr}: already bound to {original_driver}");
+        } else {
+            let bind = sysfs.sys_bus_pci_drivers(original_driver).join("bind");
+            if let Err(e) = sysfs.write_sysfs(&bind, pci_addr) {
+                eprintln!(
+                    "GPU {pci_addr}: explicit bind to {original_driver} failed ({e}), \
+                     falling back to PCI rescan"
+                );
+                let rescan = sysfs.0.join("sys/bus/pci/rescan");
+                if let Err(rescan_err) = sysfs.write_sysfs(&rescan, "1") {
+                    eprintln!("GPU {pci_addr}: PCI rescan write failed: {rescan_err}");
+                }
+                std::thread::sleep(Duration::from_secs(1));
 
-            if current_driver(sysfs, pci_addr).is_none() {
-                return Err(std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "Failed to restore {pci_addr} to {original_driver}: \
-                         explicit bind and PCI rescan both failed. \
-                         Manual fix: sudo modprobe nvidia && echo {pci_addr} | \
-                         sudo tee /sys/bus/pci/drivers/nvidia/bind"
-                    ),
-                ));
+                match current_driver(sysfs, pci_addr) {
+                    None => {
+                        let bind_err = std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "Failed to restore {pci_addr} to {original_driver}: \
+                                 explicit bind and PCI rescan both failed. \
+                                 Manual fix:\n  \
+                                 echo {pci_addr} | sudo tee /sys/bus/pci/drivers/vfio-pci/unbind\n  \
+                                 echo | sudo tee /sys/bus/pci/devices/{pci_addr}/driver_override\n  \
+                                 sudo modprobe {original_driver}"
+                            ),
+                        );
+                        if first_err.is_none() {
+                            first_err = Some(bind_err);
+                        }
+                    }
+                    Some(new_drv) => {
+                        eprintln!("GPU {pci_addr}: PCI rescan bound device to {new_drv}");
+                    }
+                }
             }
-            let new_drv = current_driver(sysfs, pci_addr).unwrap_or_default();
-            eprintln!("GPU {pci_addr}: PCI rescan bound device to {new_drv}");
         }
     } else {
         let rescan = sysfs.0.join("sys/bus/pci/rescan");
-        let _ = sysfs.write_sysfs(&rescan, "1");
+        if let Err(rescan_err) = sysfs.write_sysfs(&rescan, "1") {
+            eprintln!("GPU {pci_addr}: PCI rescan write failed: {rescan_err}");
+        }
     }
 
-    Ok(())
+    if first_err.is_none() {
+        if current_driver(sysfs, pci_addr).is_none() {
+            eprintln!(
+                "GPU {pci_addr}: warning: driver link missing in sysfs after restore \
+                 (nvidia-smi may still work via character devices). \
+                 To re-create the sysfs link: echo {pci_addr} | sudo tee /sys/bus/pci/drivers/{original_driver}/bind"
+            );
+        }
+    }
+
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1044,6 +1219,7 @@ pub fn rebind_iommu_group_peers(
     let mut first_err = None;
     for (peer_addr, original_driver) in peers {
         if let Err(e) = rebind_gpu_to_original(sysfs, peer_addr, original_driver) {
+            eprintln!("IOMMU peer {peer_addr}: failed to restore to {original_driver}: {e}");
             if first_err.is_none() {
                 first_err = Some(e);
             }
@@ -1090,9 +1266,61 @@ pub struct GpuBindState {
     pub peer_binds: Vec<(String, String)>,
     /// Whether this instance performed the bind (false if GPU was already on vfio-pci).
     pub did_bind: bool,
+    /// Whether the GPU supports MSI-X (needed by cloud-hypervisor; QEMU works without it).
+    pub has_msix: bool,
 }
 
 impl GpuBindState {
+    /// Shell commands to manually restore the GPU and its peers to their
+    /// original drivers. Useful for printing recovery instructions when
+    /// the process might be force-killed (SIGKILL).
+    pub fn recovery_commands(&self) -> String {
+        let mut cmds = Vec::new();
+
+        cmds.push(format!(
+            "echo {} | sudo tee /sys/bus/pci/drivers/vfio-pci/unbind",
+            self.pci_addr
+        ));
+
+        for (peer_addr, _) in &self.peer_binds {
+            cmds.push(format!(
+                "echo {} | sudo tee /sys/bus/pci/drivers/vfio-pci/unbind",
+                peer_addr
+            ));
+        }
+
+        cmds.push(format!(
+            "echo | sudo tee /sys/bus/pci/devices/{}/driver_override",
+            self.pci_addr
+        ));
+
+        for (peer_addr, _) in &self.peer_binds {
+            cmds.push(format!(
+                "echo | sudo tee /sys/bus/pci/devices/{}/driver_override",
+                peer_addr
+            ));
+        }
+
+        if self.original_driver == "nvidia" || self.original_driver.is_empty() {
+            cmds.push("sudo modprobe nvidia".to_string());
+        }
+
+        let mut peer_drivers: Vec<&str> = Vec::new();
+        for (_, original_drv) in &self.peer_binds {
+            if !original_drv.is_empty()
+                && original_drv != "nvidia"
+                && !peer_drivers.contains(&original_drv.as_str())
+            {
+                peer_drivers.push(original_drv.as_str());
+            }
+        }
+        for drv in peer_drivers {
+            cmds.push(format!("sudo modprobe {drv}"));
+        }
+
+        cmds.join("\n")
+    }
+
     /// Restore the GPU and its IOMMU peers to their original drivers.
     pub fn restore(&self) -> Result<(), std::io::Error> {
         self.restore_with_sysfs(&SysfsRoot::default())
@@ -1141,6 +1369,11 @@ impl GpuBindGuard {
         self.state.take()
     }
 
+    /// Access the inner bind state, if present.
+    pub fn state(&self) -> Option<&GpuBindState> {
+        self.state.as_ref()
+    }
+
     /// Get the PCI address of the bound GPU, if any.
     pub fn pci_addr(&self) -> Option<&str> {
         self.state.as_ref().map(|s| s.pci_addr.as_str())
@@ -1159,6 +1392,142 @@ impl Drop for GpuBindGuard {
             }
         }
     }
+}
+
+/// Known display server process names (matched against `/proc/PID/comm`).
+const DISPLAY_SERVER_NAMES: &[&str] = &[
+    "Xorg",
+    "X",
+    "Xwayland",
+    "gnome-shell",
+    "kwin_wayland",
+    "kwin_x11",
+    "sway",
+    "weston",
+    "mutter",
+];
+
+/// Returns `true` if `comm` matches a known display server process name.
+pub fn is_display_server_process(comm: &str) -> bool {
+    DISPLAY_SERVER_NAMES.contains(&comm)
+}
+
+/// Information about display manager processes blocking GPU passthrough.
+///
+/// Returned by [`detect_display_blocker`] when a GPU that would otherwise
+/// be eligible for passthrough is held by Xorg or a Wayland compositor.
+#[derive(Debug, Clone)]
+pub struct DisplayBlockerInfo {
+    /// PCI address of the GPU blocked by the display manager.
+    pub pci_addr: String,
+    /// Display-server processes holding `/dev/nvidia*` device files open.
+    pub display_processes: Vec<(u32, String)>,
+    /// Whether the GPU has active display outputs (DRM connectors).
+    pub has_active_outputs: bool,
+    /// Non-display processes also holding `/dev/nvidia*` device files.
+    /// If non-empty, stopping the display manager alone won't free the GPU.
+    pub other_processes: Vec<(u32, String)>,
+}
+
+/// Detect whether a display manager is blocking GPU passthrough.
+///
+/// Returns `Some(info)` when at least one GPU that would otherwise pass
+/// safety checks is blocked by display-server processes (Xorg, Wayland
+/// compositor) or has active display outputs. The caller can use this to
+/// prompt the user to stop the display manager before retrying.
+///
+/// Returns `None` when no display-related blocker is detected (GPUs may
+/// still be blocked by other issues like missing IOMMU or permissions).
+pub fn detect_display_blocker(requested_bdf: Option<&str>) -> Option<DisplayBlockerInfo> {
+    detect_display_blocker_with_sysfs(&SysfsRoot::default(), requested_bdf)
+}
+
+#[cfg(target_os = "linux")]
+pub fn detect_display_blocker_with_sysfs(
+    sysfs: &SysfsRoot,
+    requested_bdf: Option<&str>,
+) -> Option<DisplayBlockerInfo> {
+    let addrs: Vec<String> = match requested_bdf {
+        Some(bdf) => {
+            if validate_pci_addr(bdf).is_err() {
+                return None;
+            }
+            vec![bdf.to_string()]
+        }
+        None => find_nvidia_gpu_addrs(sysfs),
+    };
+
+    if addrs.is_empty() {
+        return None;
+    }
+
+    let active_procs = check_active_gpu_processes().unwrap_or_default();
+
+    let display_procs: Vec<(u32, String)> = active_procs
+        .iter()
+        .filter(|(_, comm)| is_display_server_process(comm))
+        .cloned()
+        .collect();
+
+    let other_procs: Vec<(u32, String)> = active_procs
+        .iter()
+        .filter(|(_, comm)| !is_display_server_process(comm))
+        .cloned()
+        .collect();
+
+    for addr in &addrs {
+        if current_driver(sysfs, addr).as_deref() == Some("vfio-pci") {
+            continue;
+        }
+
+        let has_outputs = check_display_attached(sysfs, addr);
+
+        if has_outputs || !display_procs.is_empty() {
+            return Some(DisplayBlockerInfo {
+                pci_addr: addr.clone(),
+                display_processes: display_procs,
+                other_processes: other_procs,
+                has_active_outputs: has_outputs,
+            });
+        }
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn detect_display_blocker_with_sysfs(
+    _sysfs: &SysfsRoot,
+    _requested_bdf: Option<&str>,
+) -> Option<DisplayBlockerInfo> {
+    None
+}
+
+/// Find all NVIDIA GPU PCI addresses (class 0x03xxxx) in sysfs.
+#[cfg(target_os = "linux")]
+fn find_nvidia_gpu_addrs(sysfs: &SysfsRoot) -> Vec<String> {
+    let pci_dir = sysfs.sys_bus_pci_devices();
+    let Ok(entries) = std::fs::read_dir(&pci_dir) else {
+        return vec![];
+    };
+
+    let mut addrs = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let dev_path = entry.path();
+        let vendor = match std::fs::read_to_string(dev_path.join("vendor")) {
+            Ok(v) => v.trim().to_lowercase(),
+            Err(_) => continue,
+        };
+        let class = match std::fs::read_to_string(dev_path.join("class")) {
+            Ok(c) => c.trim().to_lowercase(),
+            Err(_) => continue,
+        };
+        if vendor == NVIDIA_VENDOR_ID && class.starts_with("0x03") {
+            addrs.push(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    addrs.sort();
+    addrs
 }
 
 /// Prepare a GPU for VFIO passthrough: run safety checks, select, and bind.
@@ -1214,24 +1583,23 @@ fn prepare_specific_gpu(sysfs: &SysfsRoot, bdf: &str) -> Result<GpuBindState, st
         ));
     }
 
-    if !check_msix_support(sysfs, bdf) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!(
-                "GPU {bdf}: device does not support MSI-X (only MSI). \
-                 cloud-hypervisor requires MSI-X for VFIO passthrough. \
-                 This is a hardware/firmware limitation of this GPU model."
-            ),
-        ));
+    let has_msix = check_msix_support(sysfs, bdf);
+    if !has_msix {
+        eprintln!(
+            "GPU {bdf}: no MSI-X support — QEMU backend will be used \
+             (cloud-hypervisor requires MSI-X)"
+        );
     }
 
     if current_driver(sysfs, bdf).as_deref() == Some("vfio-pci") && is_iommu_group_clean(sysfs, bdf)
     {
+        eprintln!("GPU {bdf}: already on vfio-pci (inherited from previous session), will restore to nvidia on exit");
         return Ok(GpuBindState {
             pci_addr: bdf.to_string(),
-            original_driver: "vfio-pci".to_string(),
+            original_driver: "nvidia".to_string(),
             peer_binds: vec![],
-            did_bind: false,
+            did_bind: true,
+            has_msix,
         });
     }
 
@@ -1253,9 +1621,26 @@ fn prepare_specific_gpu(sysfs: &SysfsRoot, bdf: &str) -> Result<GpuBindState, st
             .iter()
             .map(|(pid, comm)| format!("{pid} ({comm})"))
             .collect();
+        let display_procs: Vec<&str> = procs
+            .iter()
+            .filter(|(_, comm)| is_display_server_process(comm))
+            .map(|(_, comm)| comm.as_str())
+            .collect();
+        let mut msg = format!("GPU {bdf}: in use by PIDs: {}", desc.join(", "));
+        if !display_procs.is_empty() {
+            msg.push_str(&format!(
+                "\n\n  {} {} a display server \
+                 — stop the display manager to release the GPU:\n    \
+                 sudo systemctl stop display-manager\
+                 \n\n  The display manager will need to be restarted after the VM exits:\n    \
+                 sudo systemctl start display-manager",
+                display_procs.join(", "),
+                if display_procs.len() == 1 { "is" } else { "are" },
+            ));
+        }
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
-            format!("GPU {bdf}: in use by PIDs: {}", desc.join(", ")),
+            msg,
         ));
     }
 
@@ -1294,6 +1679,7 @@ fn prepare_specific_gpu(sysfs: &SysfsRoot, bdf: &str) -> Result<GpuBindState, st
         original_driver,
         peer_binds,
         did_bind: true,
+        has_msix,
     })
 }
 
@@ -1328,43 +1714,78 @@ fn prepare_auto_gpu(sysfs: &SysfsRoot) -> Result<GpuBindState, std::io::Error> {
 
     nvidia_addrs.sort();
 
+    // Phase 1: prefer GPUs already on vfio-pci with clean IOMMU group.
+    // MSI-X GPUs get priority (cloud-hypervisor has lower overhead than QEMU).
+    let mut vfio_msix: Option<String> = None;
+    let mut vfio_no_msix: Option<String> = None;
     for addr in &nvidia_addrs {
         if current_driver(sysfs, addr).as_deref() == Some("vfio-pci")
             && is_iommu_group_clean(sysfs, addr)
         {
-            return Ok(GpuBindState {
-                pci_addr: addr.clone(),
-                original_driver: "vfio-pci".to_string(),
-                peer_binds: vec![],
-                did_bind: false,
-            });
+            if check_msix_support(sysfs, addr) {
+                if vfio_msix.is_none() {
+                    vfio_msix = Some(addr.clone());
+                }
+            } else if vfio_no_msix.is_none() {
+                vfio_no_msix = Some(addr.clone());
+            }
         }
     }
+    if let Some(addr) = vfio_msix {
+        eprintln!("GPU {addr}: already on vfio-pci (inherited from previous session), will restore to nvidia on exit");
+        return Ok(GpuBindState {
+            pci_addr: addr,
+            original_driver: "nvidia".to_string(),
+            peer_binds: vec![],
+            did_bind: true,
+            has_msix: true,
+        });
+    }
+    if let Some(ref addr) = vfio_no_msix {
+        eprintln!(
+            "GPU {addr}: no MSI-X support — QEMU backend will be used \
+             (cloud-hypervisor requires MSI-X)"
+        );
+        eprintln!("GPU {addr}: already on vfio-pci (inherited from previous session), will restore to nvidia on exit");
+        return Ok(GpuBindState {
+            pci_addr: addr.clone(),
+            original_driver: "nvidia".to_string(),
+            peer_binds: vec![],
+            did_bind: true,
+            has_msix: false,
+        });
+    }
 
+    // Phase 2: try to bind idle GPUs. Collect eligible candidates, then
+    // pick the best one (MSI-X preferred over non-MSI-X).
     let mut blocked: Vec<(String, String)> = Vec::new();
+    let mut has_display_blocker = false;
     let active_procs = check_active_gpu_processes()
         .map_err(|e| std::io::Error::new(e.kind(), format!("cannot verify GPUs are idle — {e}")))?;
 
-    for addr in &nvidia_addrs {
-        if !check_msix_support(sysfs, addr) {
-            blocked.push((
-                addr.clone(),
-                "no MSI-X support (required by cloud-hypervisor)".to_string(),
-            ));
-            continue;
-        }
+    let mut idle_candidates: Vec<(String, bool)> = Vec::new();
 
+    for addr in &nvidia_addrs {
         if current_driver(sysfs, addr).as_deref() == Some("vfio-pci") {
             blocked.push((addr.clone(), "IOMMU group not clean".to_string()));
             continue;
         }
 
         if check_display_attached(sysfs, addr) {
+            has_display_blocker = true;
             blocked.push((addr.clone(), "has active display outputs".to_string()));
             continue;
         }
 
         if !active_procs.is_empty() {
+            let display_names: Vec<&str> = active_procs
+                .iter()
+                .filter(|(_, comm)| is_display_server_process(comm))
+                .map(|(_, comm)| comm.as_str())
+                .collect();
+            if !display_names.is_empty() {
+                has_display_blocker = true;
+            }
             let desc: Vec<String> = active_procs
                 .iter()
                 .map(|(pid, comm)| format!("{pid} ({comm})"))
@@ -1388,6 +1809,20 @@ fn prepare_auto_gpu(sysfs: &SysfsRoot) -> Result<GpuBindState, std::io::Error> {
             continue;
         }
 
+        let has_msix = check_msix_support(sysfs, addr);
+        idle_candidates.push((addr.clone(), has_msix));
+    }
+
+    // Sort: MSI-X candidates first (lower overhead with cloud-hypervisor).
+    idle_candidates.sort_by_key(|(_, has_msix)| !has_msix);
+
+    for (addr, has_msix) in &idle_candidates {
+        if !has_msix {
+            eprintln!(
+                "GPU {addr}: no MSI-X support — QEMU backend will be used \
+                 (cloud-hypervisor requires MSI-X)"
+            );
+        }
         eprintln!("GPU: binding {addr} for VFIO passthrough");
         let original_driver = bind_gpu_to_vfio(sysfs, addr)?;
         let peer_binds = match bind_iommu_group_peers(sysfs, addr) {
@@ -1403,6 +1838,7 @@ fn prepare_auto_gpu(sysfs: &SysfsRoot) -> Result<GpuBindState, std::io::Error> {
             original_driver,
             peer_binds,
             did_bind: true,
+            has_msix: *has_msix,
         });
     }
 
@@ -1410,6 +1846,15 @@ fn prepare_auto_gpu(sysfs: &SysfsRoot) -> Result<GpuBindState, std::io::Error> {
         String::from("GPU passthrough blocked by safety checks.\n\n  Detected devices:\n");
     for (addr, reason) in &blocked {
         msg.push_str(&format!("    {addr}: {reason}\n"));
+    }
+    if has_display_blocker {
+        msg.push_str(
+            "\n  A display server is using the GPU. \
+             Stop the display manager to release it:\n    \
+             sudo systemctl stop display-manager\
+             \n\n  The display manager will be restarted automatically if you use the --gpu flag,\
+             \n  or manually with: sudo systemctl start display-manager\n",
+        );
     }
     msg.push_str("\n  No GPU is available for passthrough.");
 
@@ -1423,6 +1868,7 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    #[allow(unsafe_code)]
     fn passthrough_gate_is_false_without_env_var() {
         // SAFETY: test runs single-threaded; no other thread reads this var.
         unsafe { std::env::remove_var("OPENSHELL_VM_GPU_E2E") };
@@ -1875,7 +2321,8 @@ mod tests {
 
         let state = prepare_gpu_with_sysfs(&sysfs, None).unwrap();
         assert_eq!(state.pci_addr, "0000:43:00.0");
-        assert!(!state.did_bind);
+        assert!(state.did_bind, "inherited vfio-pci should set did_bind=true for restore");
+        assert_eq!(state.original_driver, "nvidia");
     }
 
     #[test]
@@ -1949,6 +2396,44 @@ mod tests {
         assert!(
             msg.contains("0000:42:00.0"),
             "error should list second GPU: {msg}"
+        );
+        assert!(
+            msg.contains("sudo systemctl stop display-manager"),
+            "error should suggest stopping display-manager: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn auto_blocked_by_display_includes_restart_hint() {
+        let root = tempfile::tempdir().unwrap();
+        let sysfs = SysfsRoot::new(root.path().to_path_buf());
+
+        mock_pci_device(root.path(), "0000:61:00.0", "0x10de", Some("nvidia"));
+        mock_drm_card(
+            root.path(),
+            "card0",
+            "0000:61:00.0",
+            &[("DP-1", "connected")],
+        );
+        mock_iommu_group(root.path(), 20, &["0000:61:00.0"]);
+
+        fs::create_dir_all(root.path().join("sys/module/vfio_pci")).unwrap();
+        fs::create_dir_all(root.path().join("sys/module/vfio_iommu_type1")).unwrap();
+
+        let err = prepare_gpu_with_sysfs(&sysfs, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sudo systemctl stop display-manager"),
+            "error should include display-manager stop command: {msg}"
+        );
+        assert!(
+            msg.contains("sudo systemctl start display-manager"),
+            "error should include display-manager restart command: {msg}"
+        );
+        assert!(
+            msg.contains("0000:61:00.0"),
+            "error should list the blocked GPU: {msg}"
         );
     }
 
@@ -2065,16 +2550,31 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn restore_noop_when_did_not_bind() {
-        let state = GpuBindState {
-            pci_addr: "0000:43:00.0".to_string(),
-            original_driver: "vfio-pci".to_string(),
-            peer_binds: vec![],
-            did_bind: false,
-        };
+    fn restore_inherited_vfio_rebinds_to_nvidia() {
         let root = tempfile::tempdir().unwrap();
         let sysfs = SysfsRoot::new(root.path().to_path_buf());
+
+        mock_pci_device(root.path(), "0000:43:00.0", "0x10de", Some("vfio-pci"));
+        mock_iommu_group(root.path(), 17, &["0000:43:00.0"]);
+        fs::create_dir_all(root.path().join("sys/module/vfio_pci")).unwrap();
+        fs::create_dir_all(root.path().join("sys/module/vfio_iommu_type1")).unwrap();
+
+        let state = prepare_gpu_with_sysfs(&sysfs, Some("0000:43:00.0")).unwrap();
+        assert!(state.did_bind, "inherited vfio-pci state should set did_bind=true");
+        assert_eq!(state.original_driver, "nvidia", "inherited vfio-pci should target nvidia for restore");
+
+        let dev_dir = root.path().join("sys/bus/pci/devices/0000:43:00.0");
+        let vfio_driver_dir = root.path().join("sys/bus/pci/drivers/vfio-pci");
+        fs::create_dir_all(&vfio_driver_dir).unwrap();
+        fs::write(vfio_driver_dir.join("unbind"), "").unwrap();
+        let nvidia_dir = root.path().join("sys/bus/pci/drivers/nvidia");
+        fs::create_dir_all(&nvidia_dir).unwrap();
+        fs::write(nvidia_dir.join("bind"), "").unwrap();
+
         state.restore_with_sysfs(&sysfs).unwrap();
+
+        let override_content = fs::read_to_string(dev_dir.join("driver_override")).unwrap();
+        assert_eq!(override_content, "", "driver_override should be cleared after restore");
     }
 
     #[test]
@@ -2160,6 +2660,7 @@ mod tests {
             original_driver: "nvidia".to_string(),
             peer_binds: vec![],
             did_bind: true,
+            has_msix: true,
         };
         let guard = GpuBindGuard::new(state);
         assert_eq!(guard.pci_addr(), Some("0000:41:00.0"));
@@ -2172,6 +2673,7 @@ mod tests {
             original_driver: "nvidia".to_string(),
             peer_binds: vec![],
             did_bind: true,
+            has_msix: true,
         };
         let mut guard = GpuBindGuard::new(state);
         let taken = guard.disarm();
@@ -2186,11 +2688,33 @@ mod tests {
             original_driver: "nvidia".to_string(),
             peer_binds: vec![],
             did_bind: true,
+            has_msix: true,
         };
         let mut guard = GpuBindGuard::new(state);
         let _ = guard.disarm();
         let second = guard.disarm();
         assert!(second.is_none());
+    }
+
+    #[test]
+    fn recovery_commands_includes_gpu_and_peers() {
+        let state = GpuBindState {
+            pci_addr: "0000:41:00.0".to_string(),
+            original_driver: "nvidia".to_string(),
+            peer_binds: vec![("0000:41:00.1".to_string(), "snd_hda_intel".to_string())],
+            did_bind: true,
+            has_msix: true,
+        };
+        let cmds = state.recovery_commands();
+        assert!(cmds.contains("vfio-pci/unbind"), "should unbind GPU from vfio-pci");
+        assert!(cmds.contains("0000:41:00.0"), "should reference GPU address");
+        assert!(cmds.contains("0000:41:00.1"), "should reference peer address");
+        assert!(cmds.contains("driver_override"), "should clear driver_override");
+        assert!(cmds.contains("modprobe nvidia"), "should reload nvidia modules");
+        assert!(
+            cmds.contains("modprobe snd_hda_intel"),
+            "should reload peer original driver"
+        );
     }
 
     #[test]
@@ -2200,6 +2724,7 @@ mod tests {
             original_driver: "nvidia".to_string(),
             peer_binds: vec![],
             did_bind: false,
+            has_msix: true,
         };
         let guard = GpuBindGuard::new(state);
         drop(guard);
@@ -2213,10 +2738,109 @@ mod tests {
                 original_driver: "nvidia".to_string(),
                 peer_binds: vec![],
                 did_bind: false,
+                has_msix: true,
             };
             let _guard = GpuBindGuard::new(state);
             panic!("test panic");
         }));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn display_server_process_detection() {
+        assert!(is_display_server_process("Xorg"));
+        assert!(is_display_server_process("X"));
+        assert!(is_display_server_process("Xwayland"));
+        assert!(is_display_server_process("gnome-shell"));
+        assert!(is_display_server_process("kwin_wayland"));
+        assert!(is_display_server_process("sway"));
+        assert!(is_display_server_process("mutter"));
+
+        assert!(!is_display_server_process("firefox"));
+        assert!(!is_display_server_process("python3"));
+        assert!(!is_display_server_process("nvidia-smi"));
+        assert!(!is_display_server_process("cuda_app"));
+        assert!(!is_display_server_process(""));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn display_blocker_detected_with_active_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        let sysfs = SysfsRoot::new(root.path().to_path_buf());
+        mock_pci_device(root.path(), "0000:41:00.0", "0x10de", Some("nvidia"));
+        mock_drm_card(
+            root.path(),
+            "card0",
+            "0000:41:00.0",
+            &[("DP-1", "connected")],
+        );
+
+        let info = detect_display_blocker_with_sysfs(&sysfs, Some("0000:41:00.0"));
+        assert!(info.is_some(), "should detect display blocker");
+        let info = info.unwrap();
+        assert_eq!(info.pci_addr, "0000:41:00.0");
+        assert!(info.has_active_outputs);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn display_blocker_none_when_gpu_already_vfio() {
+        let root = tempfile::tempdir().unwrap();
+        let sysfs = SysfsRoot::new(root.path().to_path_buf());
+        mock_pci_device(root.path(), "0000:41:00.0", "0x10de", Some("vfio-pci"));
+        mock_drm_card(
+            root.path(),
+            "card0",
+            "0000:41:00.0",
+            &[("DP-1", "connected")],
+        );
+
+        let info = detect_display_blocker_with_sysfs(&sysfs, Some("0000:41:00.0"));
+        assert!(
+            info.is_none(),
+            "should not detect blocker when GPU is already on vfio-pci"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn display_blocker_none_on_headless_idle_gpu() {
+        let root = tempfile::tempdir().unwrap();
+        let sysfs = SysfsRoot::new(root.path().to_path_buf());
+        mock_pci_device(root.path(), "0000:41:00.0", "0x10de", Some("nvidia"));
+        mock_drm_card(
+            root.path(),
+            "card0",
+            "0000:41:00.0",
+            &[("DP-1", "disconnected")],
+        );
+
+        let info = detect_display_blocker_with_sysfs(&sysfs, Some("0000:41:00.0"));
+        assert!(
+            info.is_none(),
+            "headless idle GPU should not trigger display blocker"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn display_blocker_auto_finds_blocked_gpu() {
+        let root = tempfile::tempdir().unwrap();
+        let sysfs = SysfsRoot::new(root.path().to_path_buf());
+
+        mock_pci_device(root.path(), "0000:41:00.0", "0x10de", Some("nvidia"));
+        mock_drm_card(
+            root.path(),
+            "card0",
+            "0000:41:00.0",
+            &[("DP-1", "connected")],
+        );
+
+        mock_pci_device(root.path(), "0000:42:00.0", "0x10de", Some("vfio-pci"));
+
+        let info = detect_display_blocker_with_sysfs(&sysfs, None);
+        assert!(info.is_some());
+        assert_eq!(info.unwrap().pci_addr, "0000:41:00.0");
     }
 }

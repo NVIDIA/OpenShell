@@ -6,7 +6,7 @@
 
 OpenShell's VM backend can pass a physical NVIDIA GPU into a microVM using VFIO (Virtual Function I/O). This gives the guest direct access to GPU hardware, enabling CUDA workloads and `nvidia-smi` inside sandboxes without virtualization overhead.
 
-GPU passthrough uses cloud-hypervisor (instead of the default libkrun backend) to attach a VFIO device to the VM. The guest sees a real PCI GPU device and loads standard NVIDIA drivers.
+GPU passthrough uses cloud-hypervisor or QEMU (instead of the default libkrun backend) to attach a VFIO device to the VM. The guest sees a real PCI GPU device and loads standard NVIDIA drivers. cloud-hypervisor is preferred; QEMU is used as a fallback when the GPU lacks MSI-X support.
 
 ## Architecture
 
@@ -17,7 +17,7 @@ Host                          │  Guest (microVM)
   ↕ bound to vfio-pci         │  ↕
   /dev/vfio/<group>            │  /dev/nvidia*
   ↕                            │  ↕
-  cloud-hypervisor (VFIO)  ────│→ PCI device visible
+  CHV or QEMU (VFIO)      ────│→ PCI device visible
   ↕                            │  ↕
   TAP networking               │  k3s + device plugin
   virtiofsd (rootfs)           │  ↕
@@ -29,11 +29,27 @@ Host                          │  Guest (microVM)
 | Flag | Backend | GPU attached? |
 |------|---------|---------------|
 | (none) | libkrun | No |
-| `--gpu` | cloud-hypervisor | Yes (auto-detect and bind) |
-| `--gpu 0000:41:00.0` | cloud-hypervisor | Yes (specific PCI device) |
+| `--gpu` (MSI-X GPU) | cloud-hypervisor | Yes |
+| `--gpu` (non-MSI-X GPU) | QEMU | Yes (fallback) |
+| `--gpu 0000:41:00.0` | auto (CHV or QEMU based on MSI-X) | Yes |
 | `--backend cloud-hypervisor` | cloud-hypervisor | No (force CHV without GPU) |
+| `--backend qemu` | QEMU | Optional |
 
-Auto mode (`--backend auto`, the default) selects cloud-hypervisor when `--gpu` is used or a VFIO PCI address is configured. Otherwise libkrun is used.
+Auto mode (`--backend auto`, the default) selects cloud-hypervisor when `--gpu` is used with an MSI-X-capable GPU, QEMU when `--gpu` is used with a GPU lacking MSI-X, and libkrun otherwise.
+
+### QEMU fallback
+
+QEMU is used when GPU passthrough is requested but the GPU does not support MSI-X (PCI capability `0x11`). cloud-hypervisor's VFIO implementation requires MSI-X; QEMU handles MSI-only devices via its own interrupt remapping layer.
+
+| Aspect | cloud-hypervisor | QEMU |
+|--------|-----------------|------|
+| VFIO MSI-X | Required | Not required |
+| VM control | REST API over Unix socket | Command-line args + QMP |
+| Vsock transport | Unix socket + `CONNECT` text protocol | `AF_VSOCK` (kernel `vhost_vsock`) |
+| TAP networking | Built-in TAP creation | `-netdev tap` flag |
+| Shutdown | REST `vm.shutdown` | `SIGTERM` or QMP `system_powerdown` |
+
+The guest kernel, rootfs, init script, and exec agent are identical across both backends. The host requirements differ: QEMU needs `qemu-system-x86_64` installed on the host (not embedded in the runtime bundle) and the `vhost_vsock` kernel module for vsock exec support.
 
 ### Automatic GPU binding
 
@@ -49,12 +65,12 @@ When a specific PCI address is given (`--gpu 0000:41:00.0`), the launcher target
 
 ### Safety checks
 
-All safety checks are hard failures — if any check fails, the launcher prints an error and exits without binding. There is no `--force` override.
+All safety checks are hard failures — if any check fails, the launcher prints an error and exits without binding. The one exception is display-manager-related blocking: when the GPU is held by Xorg or a Wayland compositor, the launcher prompts the user interactively to stop the display manager (see Single-GPU caveats).
 
 | Check | What it detects | Failure behavior |
 |-------|----------------|------------------|
-| **Display attached** | GPU drives an active DRM framebuffer or is the primary rendering device | Error: "GPU 0000:xx:xx.x has active display outputs — cannot passthrough without losing host display" |
-| **Active processes** | Processes holding `/dev/nvidia*` file descriptors (CUDA jobs, monitoring) | Error: "GPU 0000:xx:xx.x is in use by PID(s) — stop these processes first" |
+| **Display attached** | GPU drives an active DRM framebuffer or is the primary rendering device | Interactive prompt to stop display-manager; error if declined or non-interactive |
+| **Active processes** | Processes holding `/dev/nvidia*` file descriptors (CUDA jobs, monitoring) | Error if non-display processes; interactive prompt if only display servers |
 | **IOMMU enabled** | `/sys/kernel/iommu_groups/` exists and the GPU has a group assignment | Error: "IOMMU is not enabled — add intel_iommu=on or amd_iommu=on to kernel cmdline" |
 | **VFIO modules loaded** | `vfio-pci` and `vfio_iommu_type1` kernel modules are loaded | Error: "vfio-pci kernel module not loaded — run: sudo modprobe vfio-pci" |
 | **Permissions** | Write access to sysfs bind/unbind and `/dev/vfio/` | Error: "insufficient permissions — run as root or with CAP_NET_ADMIN" |
@@ -140,9 +156,23 @@ When `--gpu` is passed, the launcher performs the following steps that previousl
 
 When the host has only one NVIDIA GPU:
 
-- **Display-attached GPUs are blocked.** The safety checks detect if the GPU drives an active display (DRM framebuffer). If so, the launcher refuses to bind it — this prevents accidentally killing the host desktop. On headless data center servers (the typical deployment), this check passes and the GPU is bound automatically.
-- **Recovery is automatic.** When the VM exits (clean shutdown, Ctrl+C, or process crash), the launcher rebinds the GPU to the `nvidia` driver and clears `driver_override`. No manual intervention is needed.
-- **Process check.** If CUDA processes are using the GPU (visible via `/dev/nvidia*` file descriptors), the launcher refuses to unbind. Stop those processes first.
+- **Display manager prompt.** When the GPU drives an active display or is held by a display server (Xorg, Wayland compositor), the launcher detects this and prompts the user interactively:
+
+  ```text
+  WARNING: GPU 0000:2d:00.0 is in use by the display manager.
+    Display server processes: Xorg (PID 1234)
+    Active display outputs are connected to this GPU.
+
+  Stopping the display manager will terminate your graphical session.
+  You will lose access to any open GUI applications.
+
+  The display manager will be restarted automatically when the VM exits.
+  Stop display-manager and proceed with GPU passthrough? [y/N]
+  ```
+
+  If the user confirms, the launcher runs `systemctl stop display-manager`, waits for Xorg to release the GPU, then proceeds with VFIO binding. A `DisplayManagerGuard` ensures that `systemctl start display-manager` is called when the VM exits (clean shutdown, Ctrl+C, error, or panic). In non-interactive mode (stdin is not a TTY), the prompt is skipped and the launcher exits with an error instructing the user to stop the display manager manually.
+- **Recovery is automatic.** When the VM exits (clean shutdown, Ctrl+C, or process crash), the launcher rebinds the GPU to the `nvidia` driver, clears `driver_override`, and restarts the display manager if it was stopped. No manual intervention is needed.
+- **Process check.** If non-display CUDA processes are also using the GPU (visible via `/dev/nvidia*` file descriptors), the prompt warns about those processes too. The launcher lists all PIDs and process names so the user can make an informed decision.
 
 ## Supported GPUs
 
@@ -157,6 +187,50 @@ GPU passthrough is validated with NVIDIA data center GPUs. Consumer GPUs may wor
 | L40 | Ada Lovelace | 8.9 | Supported |
 | L40S | Ada Lovelace | 8.9 | Supported |
 | L4 | Ada Lovelace | 8.9 | Supported |
+
+## GPU build pipeline
+
+GPU passthrough requires NVIDIA kernel modules compiled against the VM kernel. The full build pipeline is:
+
+```shell
+# 1. Build kernel from source (needed for module compilation)
+FROM_SOURCE=1 mise run vm:setup
+
+# 2. Compile NVIDIA .ko files against the VM kernel
+mise run vm:nvidia-modules
+
+# 3. Build GPU rootfs and inject kernel modules
+mise run vm:rootfs -- --base --gpu
+
+# 4. Compile binary and package runtime
+mise run vm:build
+```
+
+### NVIDIA kernel module build (`vm:nvidia-modules`)
+
+The `build-nvidia-modules.sh` script clones [NVIDIA/open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules) at the tag pinned by `NVIDIA_DRIVER_TAG` in `pins.env` and compiles the open kernel modules against the VM kernel source tree produced by `build-libkrun.sh`.
+
+The driver tag must match the exact version of `nvidia-headless-570-open` installed in the guest rootfs. A mismatch causes "API mismatch" errors from `nvidia-smi`. The current pin is `570.211.01`.
+
+The build produces these modules:
+
+| Module | Purpose |
+|--------|---------|
+| `nvidia.ko` | Core GPU driver |
+| `nvidia-uvm.ko` | Unified Virtual Memory (CUDA managed memory) |
+| `nvidia-modeset.ko` | Display mode setting |
+| `nvidia-drm.ko` | DRM/KMS integration |
+| `nvidia-peermem.ko` | GPUDirect RDMA (optional) |
+
+### Module injection (`vm:rootfs --gpu`)
+
+When `build-rootfs.sh` runs with `--gpu`, it:
+
+1. Reads `kernel-version.txt` (exported by `build-libkrun.sh`) to determine the kernel release string.
+2. Copies `.ko` files from `target/libkrun-build/nvidia-modules/` into the rootfs at `/lib/modules/<version>/kernel/drivers/video/nvidia/`.
+3. Runs `depmod` to generate module dependency metadata so `modprobe` works at boot.
+
+The VM init script loads `nvidia`, `nvidia_uvm`, and `nvidia_modeset` during boot when `GPU_ENABLED=true` is set on the kernel command line.
 
 ## CLI usage
 
@@ -185,8 +259,10 @@ sudo openshell-vm --gpu 0000:41:00.0
 The `--backend` flag controls hypervisor selection independently of `--gpu`:
 
 ```shell
-sudo openshell-vm --gpu                           # auto: selects cloud-hypervisor
+sudo openshell-vm --gpu                           # auto: CHV if MSI-X, QEMU otherwise
 sudo openshell-vm --backend cloud-hypervisor       # explicit CHV, no GPU
+sudo openshell-vm --backend qemu                   # explicit QEMU, no GPU
+sudo openshell-vm --gpu --backend qemu             # force QEMU with GPU
 sudo openshell-vm --backend libkrun                # explicit libkrun (no GPU support)
 ```
 
@@ -337,6 +413,10 @@ The launcher caches mTLS certificates on the host after the first successful boo
 
 ## Troubleshooting
 
+### "cloud-hypervisor requires MSI-X for VFIO passthrough"
+
+The GPU lacks MSI-X support and `--backend cloud-hypervisor` was explicitly requested. Either use `--backend qemu` or omit the `--backend` flag to let auto-selection pick QEMU as the fallback.
+
 ### "no NVIDIA PCI device found"
 
 The host has no NVIDIA GPU installed, or the PCI device is not visible:
@@ -346,19 +426,17 @@ lspci -nn | grep -i nvidia
 # If empty, the GPU is not detected at the PCI level
 ```
 
-### "has active display outputs"
+### "has active display outputs" / "in use by display manager"
 
-The GPU drives a DRM framebuffer or is the boot VGA device. This is a hard safety check — the launcher will not unbind a display GPU. Options:
+The GPU drives a DRM framebuffer or is held by a display server (Xorg, Wayland compositor). If running interactively, the launcher prompts to stop the display manager. If running non-interactively or the user declines, options:
 
 - Use a different GPU for the monitor (iGPU, secondary card)
-- Stop the display manager first: `sudo systemctl stop gdm`
+- Stop the display manager manually: `sudo systemctl stop display-manager`
 - On headless servers, this should not occur — verify with `ls /sys/class/drm/card*/device`
 
 ### "in use by PIDs: ..."
 
-Active processes hold `/dev/nvidia*` file descriptors. The check is host-wide
-(across all NVIDIA GPUs, not per-device). The launcher lists the PIDs and
-process names. Stop those processes before retrying.
+Active non-display processes hold `/dev/nvidia*` file descriptors. The check is host-wide (across all NVIDIA GPUs, not per-device). The launcher lists the PIDs and process names. Stop those processes before retrying. If the only processes are display servers (Xorg, gnome-shell, etc.), the launcher will offer to stop the display manager instead.
 
 ### "IOMMU not enabled or device has no IOMMU group"
 
@@ -410,4 +488,7 @@ If you hit this issue repeatedly, check for nvidia driver updates or file a bug 
 
 - [Custom VM Runtime](custom-vm-runtime.md) — building and customizing the libkrun VM runtime
 - [System Architecture](system-architecture.md) — overall OpenShell architecture
-- Implementation: [`crates/openshell-vm/src/gpu_passthrough.rs`](../crates/openshell-vm/src/gpu_passthrough.rs)
+- Implementation:
+  - [`crates/openshell-vfio/src/lib.rs`](../crates/openshell-vfio/src/lib.rs) — GPU binding and VFIO setup
+  - [`crates/openshell-vm/src/backend/cloud_hypervisor.rs`](../crates/openshell-vm/src/backend/cloud_hypervisor.rs) — cloud-hypervisor backend
+  - [`crates/openshell-vm/src/backend/qemu.rs`](../crates/openshell-vm/src/backend/qemu.rs) — QEMU backend

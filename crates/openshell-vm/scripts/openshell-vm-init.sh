@@ -281,10 +281,10 @@ rm -f /var/lib/rancher/k3s/server/cred/node-passwd 2>/dev/null || true
 
 # Clean stale containerd runtime state from previous boots.
 #
-# The rootfs persists across VM restarts via virtio-fs. The overlayfs
-# snapshotter now lives on the host-backed state disk when present, so
-# snapshot data and meta.db persist across boots. We only clean runtime
-# state (shim PIDs, sockets) that becomes stale when the VM restarts.
+# The rootfs persists across VM restarts via virtio-fs. The snapshotter
+# (overlayfs on state disk, native on virtiofs) persists across boots,
+# so snapshot data and meta.db survive. We only clean runtime state
+# (shim PIDs, sockets) that becomes stale when the VM restarts.
 if [ -d "$CONTAINERD_DIR" ]; then
     # Remove runtime task state (stale shim PIDs, sockets from dead processes).
     rm -rf "${CONTAINERD_DIR}/io.containerd.runtime.v2.task" 2>/dev/null || true
@@ -296,24 +296,27 @@ if [ -d "$CONTAINERD_DIR" ]; then
     # Clean stale ingest temp files from the content store.
     rm -rf "${CONTAINERD_DIR}/io.containerd.content.v1.content/ingest" 2>/dev/null || true
     mkdir -p "${CONTAINERD_DIR}/io.containerd.content.v1.content/ingest"
-    # meta.db and overlayfs snapshots persist across boots on virtio-fs.
-    # No need to delete meta.db — snapshot metadata remains valid since
-    # the snapshotter directory is no longer backed by volatile tmpfs.
+    # meta.db and snapshots persist across boots.
     ts "cleaned containerd runtime state (meta.db + snapshots preserved)"
 fi
 rm -rf /run/k3s 2>/dev/null || true
 
-# Ensure the overlayfs snapshotter directory exists. The snapshotter
-# runs directly on virtio-fs, so layer data and snapshot metadata
-# persist across VM restarts. This eliminates the need to re-import
-# image tarballs and re-extract layers on every boot, significantly
-# reducing sandbox creation time.
-OVERLAYFS_DIR="${CONTAINERD_DIR}/io.containerd.snapshotter.v1.overlayfs"
-mkdir -p "$OVERLAYFS_DIR"
+# Select snapshotter based on the backing filesystem. overlayfs requires
+# filesystem features (redirect_dir xattrs) that virtiofs does not
+# support. When containerd lives on the block-backed state disk (ext4),
+# overlayfs works and provides efficient layer sharing. On virtiofs
+# (no state disk), fall back to the native snapshotter which uses
+# simple directory copies and works on any POSIX filesystem.
 if [ "$STATE_DISK_ACTIVE" = true ]; then
-    ts "overlayfs snapshotter on block-backed containerd state"
+    SNAPSHOTTER="overlayfs"
+    OVERLAYFS_DIR="${CONTAINERD_DIR}/io.containerd.snapshotter.v1.overlayfs"
+    mkdir -p "$OVERLAYFS_DIR"
+    ts "snapshotter: overlayfs on block-backed containerd state"
 else
-    ts "overlayfs snapshotter on virtio-fs (persistent)"
+    SNAPSHOTTER="native"
+    NATIVE_DIR="${CONTAINERD_DIR}/io.containerd.snapshotter.v1.native"
+    mkdir -p "$NATIVE_DIR"
+    ts "snapshotter: native on virtio-fs (overlayfs unsupported on virtiofs)"
 fi
 
 ts "stale artifacts cleaned"
@@ -405,6 +408,12 @@ fi
 
 if [ "${GPU_ENABLED:-false}" = "true" ]; then
     ts "GPU mode enabled — loading NVIDIA drivers"
+
+    if ! command -v modprobe >/dev/null 2>&1; then
+        echo "FATAL: modprobe not found — the kmod package is missing from the GPU rootfs" >&2
+        echo "Fix: add 'kmod' to the apt-get install list in build-rootfs.sh and rebuild" >&2
+        exit 1
+    fi
 
     modprobe nvidia || { echo "FATAL: failed to load nvidia kernel module" >&2; exit 1; }
     modprobe nvidia_uvm || { echo "FATAL: failed to load nvidia_uvm kernel module" >&2; exit 1; }
@@ -822,7 +831,7 @@ K3S_ARGS=(
     --resolv-conf=/etc/resolv.conf
     --tls-san="localhost,127.0.0.1,10.0.2.15,192.168.127.2,$NODE_IP"
     --flannel-backend=none
-    --snapshotter=overlayfs
+    --snapshotter="$SNAPSHOTTER"
     --kube-proxy-arg=proxy-mode=nftables
     --kube-proxy-arg=nodeport-addresses=0.0.0.0/0
     # virtio-fs passthrough reports the host disk usage, which is
@@ -838,7 +847,7 @@ K3S_ARGS=(
     # container create after an image import may still be slow if
     # containerd needs to extract layers. 10m is a conservative safety
     # margin; typical operations complete much faster with persistent
-    # overlayfs snapshots.
+    # snapshots (overlayfs on state disk, native on virtiofs).
     --kubelet-arg=runtime-request-timeout=10m
 )
 
@@ -886,30 +895,51 @@ setsid sh -c '
 ' &
 fi
 
-# ── Clear stale kine bootstrap lock ─────────────────────────────────────
-# k3s uses kine with a SQLite backend at state.db. When k3s starts, kine
-# sets a bootstrap lock row; if k3s is killed before completing bootstrap
-# (SIGKILL, host crash, power loss), the lock persists and the next k3s
-# instance hangs forever on:
-#   "Bootstrap key already locked — waiting for data to be populated by
-#    another server"
+# ── Kine database health check ───────────────────────────────────────────
+# k3s uses kine with a SQLite backend at state.db. Two failure modes:
 #
-# We clear the lock row before starting k3s so that a warm boot with
-# persistent state.db succeeds. If state.db doesn't exist (first boot or
-# --reset), this is a harmless no-op. If state.db is corrupt, sqlite3
-# fails silently (|| true) and the host-side corruption check in exec.rs
-# will have already removed the file.
+# 1. Page-level corruption (SQLITE_CORRUPT) — from a killed VM mid-write.
+#    Detected via PRAGMA quick_check; the DB is removed so k3s starts fresh.
+#    The host-side recover_corrupt_kine_db() in exec.rs only checks the
+#    virtiofs path, so it misses corruption on the state disk (--gpu).
+#    This in-VM check is the authoritative corruption gate.
+#
+# 2. Stale bootstrap lock — kine sets a lock row on startup; if k3s is
+#    killed before completing bootstrap, the lock persists and the next
+#    instance hangs on "Bootstrap key already locked". Cleared via DELETE.
 KINE_DB="/var/lib/rancher/k3s/server/db/state.db"
 if [ -f "$KINE_DB" ]; then
-    ts "clearing stale kine bootstrap lock (if any)"
-    # If sqlite3 fails (corrupt DB, missing binary), log the failure.
-    # The host-side corruption check in exec.rs handles the corrupt case,
-    # but we should still know about it.
-    if ! sqlite3 "$KINE_DB" "DELETE FROM kine WHERE name LIKE '/bootstrap/%';" 2>/dev/null; then
-        ts "WARNING: failed to clear kine bootstrap lock — k3s may hang if DB is corrupt"
+    # When the state disk is in use, the kine DB lives on the block device,
+    # not on the virtiofs rootfs. The host-side recover_corrupt_kine_db()
+    # in exec.rs can only check the virtiofs path, so it misses corruption
+    # on the state disk. Run a quick_check here inside the VM where the
+    # bind-mount is active and the DB is at its final runtime path.
+    _kine_corrupt=false
+    if command -v sqlite3 >/dev/null 2>&1; then
+        _qc_result=$(sqlite3 "$KINE_DB" "PRAGMA quick_check;" 2>&1) || _kine_corrupt=true
+        if [ "$_kine_corrupt" = false ] && [ "$_qc_result" != "ok" ]; then
+            _kine_corrupt=true
+        fi
+    else
+        # No sqlite3 binary — can't verify, try to proceed.
+        ts "WARNING: sqlite3 not available, skipping kine DB integrity check"
     fi
-    if ! sqlite3 "$KINE_DB" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null; then
-        ts "WARNING: failed to checkpoint kine WAL"
+
+    if [ "$_kine_corrupt" = true ]; then
+        ts "WARNING: kine database is corrupt ($_qc_result), removing for clean boot"
+        rm -f "$KINE_DB" "${KINE_DB}-wal" "${KINE_DB}-shm"
+        ts "corrupt kine DB removed — k3s will recreate from manifests"
+    else
+        ts "clearing stale kine bootstrap lock (if any)"
+        if ! sqlite3 "$KINE_DB" "DELETE FROM kine WHERE name LIKE '/bootstrap/%';" 2>/dev/null; then
+            ts "WARNING: failed to clear kine bootstrap lock — removing DB for safety"
+            rm -f "$KINE_DB" "${KINE_DB}-wal" "${KINE_DB}-shm"
+        fi
+        if [ -f "$KINE_DB" ]; then
+            if ! sqlite3 "$KINE_DB" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null; then
+                ts "WARNING: failed to checkpoint kine WAL"
+            fi
+        fi
     fi
 fi
 

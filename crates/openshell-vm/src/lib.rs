@@ -23,7 +23,7 @@ mod health;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub use exec::{
     VM_EXEC_VSOCK_PORT, VmExecOptions, VmRuntimeState, VsockConnectMode, acquire_rootfs_lock,
@@ -126,6 +126,8 @@ pub enum VmBackendChoice {
     Libkrun,
     /// Force the cloud-hypervisor backend (even without GPU/VFIO).
     CloudHypervisor,
+    /// Force the QEMU backend (Linux-only, supports VFIO without MSI-X).
+    Qemu,
 }
 
 /// Networking backend for the microVM.
@@ -236,6 +238,11 @@ pub struct VmConfig {
     /// Whether GPU passthrough is enabled for this VM.
     pub gpu_enabled: bool,
 
+    /// Whether the GPU supports MSI-X (needed for cloud-hypervisor VFIO).
+    /// When `false` and `Auto` backend is selected with GPU enabled,
+    /// QEMU is used instead of cloud-hypervisor.
+    pub gpu_has_msix: bool,
+
     /// VFIO PCI device address for GPU passthrough (e.g. `0000:41:00.0`).
     /// When set, the cloud-hypervisor backend is used instead of libkrun.
     pub vfio_device: Option<String>,
@@ -245,6 +252,11 @@ pub struct VmConfig {
 }
 
 impl VmConfig {
+    /// Returns true when the VM runs in exec mode (one-shot command) rather than gateway mode.
+    pub(crate) fn is_exec_mode(&self) -> bool {
+        self.exec_path != "/srv/openshell-vm-init.sh"
+    }
+
     /// Default gateway configuration: boots k3s server inside the VM.
     ///
     /// Runs `/srv/openshell-vm-init.sh` which mounts essential filesystems,
@@ -286,6 +298,7 @@ impl VmConfig {
             gateway_name: format!("{GATEWAY_NAME_PREFIX}-default"),
             state_disk: Some(state_disk),
             gpu_enabled: false,
+            gpu_has_msix: true,
             vfio_device: None,
             backend: VmBackendChoice::Auto,
         }
@@ -893,23 +906,54 @@ pub(crate) fn kill_stale_gvproxy_by_port(port: u16) {
 fn kill_gvproxy_pid(gvproxy_pid: u32) {
     let pid_i32 = gvproxy_pid as libc::pid_t;
     let is_alive = unsafe { libc::kill(pid_i32, 0) } == 0;
-    if is_alive {
-        // Verify the process is actually gvproxy before killing.
-        // Without this check, PID reuse could cause us to kill an
-        // unrelated process.
-        if !is_process_named(pid_i32, "gvproxy") {
-            eprintln!(
-                "Stale gvproxy pid {gvproxy_pid} is no longer gvproxy (PID reused), skipping kill"
-            );
+    if !is_alive {
+        return;
+    }
+
+    if !is_process_named(pid_i32, "gvproxy") {
+        eprintln!(
+            "Stale gvproxy pid {gvproxy_pid} is no longer gvproxy (PID reused), skipping kill"
+        );
+        return;
+    }
+
+    unsafe {
+        libc::kill(pid_i32, libc::SIGTERM);
+    }
+    eprintln!("Killing stale gvproxy process (pid {gvproxy_pid})...");
+
+    // Wait up to 2 seconds for graceful shutdown, then escalate to SIGKILL.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        if unsafe { libc::kill(pid_i32, 0) } != 0 {
+            eprintln!("Stale gvproxy (pid {gvproxy_pid}) terminated");
+            std::thread::sleep(Duration::from_millis(100));
             return;
         }
-        unsafe {
-            libc::kill(pid_i32, libc::SIGTERM);
+        if Instant::now() >= deadline {
+            break;
         }
-        eprintln!("Killed stale gvproxy process (pid {gvproxy_pid})");
-        // Brief pause for the port to be released.
-        std::thread::sleep(std::time::Duration::from_millis(200));
     }
+
+    eprintln!("gvproxy (pid {gvproxy_pid}) did not exit after SIGTERM, sending SIGKILL");
+    unsafe {
+        libc::kill(pid_i32, libc::SIGKILL);
+    }
+
+    // Wait for the process to be reaped (up to 2 more seconds).
+    let kill_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        if unsafe { libc::kill(pid_i32, 0) } != 0 {
+            break;
+        }
+        if Instant::now() >= kill_deadline {
+            eprintln!("warning: gvproxy (pid {gvproxy_pid}) still alive after SIGKILL");
+            break;
+        }
+    }
+    std::thread::sleep(Duration::from_millis(100));
 }
 
 /// Check whether a process with the given PID has the expected name.
@@ -1066,12 +1110,13 @@ fn secure_socket_base(subdir: &str) -> Result<PathBuf, VmError> {
                 dir.display()
             )));
         }
-        // Verify ownership matches current user.
+        // Verify ownership matches current user. Root (uid 0) can safely
+        // use any directory, so skip this check under sudo / as root.
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            let uid = unsafe { libc::getuid() };
-            if meta.uid() != uid {
+            let uid = unsafe { libc::geteuid() };
+            if uid != 0 && meta.uid() != uid {
                 return Err(VmError::HostSetup(format!(
                     "socket directory {} is owned by uid {} but we are uid {} — refusing to use it",
                     dir.display(),
@@ -1126,12 +1171,17 @@ fn validate_vfio_address(addr: &str) -> Result<(), VmError> {
 }
 
 pub(crate) fn gateway_host_port(config: &VmConfig) -> u16 {
-    config
-        .port_map
-        .first()
-        .and_then(|pm| pm.split(':').next())
-        .and_then(|port| port.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_GATEWAY_PORT)
+    for pm in &config.port_map {
+        let parts: Vec<&str> = pm.split(':').collect();
+        if parts.len() == 2 {
+            if let Ok(guest) = parts[1].parse::<u16>() {
+                if guest == GUEST_GATEWAY_NODEPORT {
+                    return parts[0].parse::<u16>().unwrap_or(DEFAULT_GATEWAY_PORT);
+                }
+            }
+        }
+    }
+    DEFAULT_GATEWAY_PORT
 }
 
 pub(crate) fn pick_gvproxy_ssh_port() -> Result<u16, VmError> {
@@ -1199,7 +1249,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
     #[cfg(target_os = "linux")]
     check_kvm_access()?;
 
-    if config.exec_path == "/srv/openshell-vm-init.sh" {
+    if !config.is_exec_mode() {
         ensure_vm_not_running(&config.rootfs)?;
     }
 
@@ -1208,7 +1258,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
     // is killed (even SIGKILL), the OS releases the lock automatically.
     // This prevents a second launch or rootfs rebuild from corrupting a
     // running VM's filesystem via virtio-fs.
-    let _rootfs_lock = if config.exec_path == "/srv/openshell-vm-init.sh" {
+    let _rootfs_lock = if !config.is_exec_mode() {
         Some(acquire_rootfs_lock(&config.rootfs)?)
     } else {
         None
@@ -1220,7 +1270,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
     // every normal boot (not --reset, which wipes k3s/server/ entirely).
     // Must happen after the lock so we know no other VM process is using
     // the rootfs.
-    if !config.reset && config.exec_path == "/srv/openshell-vm-init.sh" {
+    if !config.reset && !config.is_exec_mode() {
         recover_corrupt_kine_db(&config.rootfs)?;
     }
 
@@ -1270,50 +1320,97 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
 
     // ── Dispatch to the appropriate backend ─────────────────────────
 
-    let use_chv = match config.backend {
-        VmBackendChoice::CloudHypervisor => true,
-        VmBackendChoice::Libkrun => false,
-        VmBackendChoice::Auto => config.gpu_enabled || config.vfio_device.is_some(),
-    };
-
-    if use_chv {
-        #[cfg(not(target_os = "linux"))]
-        return Err(VmError::HostSetup(
-            "cloud-hypervisor backend requires Linux with KVM".into(),
-        ));
-
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(ref addr) = config.vfio_device {
-                validate_vfio_address(addr)?;
-            }
-            let chv_backend = backend::cloud_hypervisor::CloudHypervisorBackend::new()?;
-            return backend::VmBackend::launch(&chv_backend, config);
-        }
+    enum SelectedBackend {
+        Libkrun,
+        CloudHypervisor,
+        Qemu,
     }
 
-    // libkrun path: resolve the embedded runtime bundle and load libkrun.
-    // Cloud-hypervisor resolves its own binaries in CloudHypervisorBackend::new().
-    let runtime_gvproxy = resolve_runtime_bundle()?;
-    let runtime_dir = runtime_gvproxy.parent().ok_or_else(|| {
-        VmError::HostSetup(format!(
-            "runtime bundle file has no parent directory: {}",
-            runtime_gvproxy.display()
-        ))
-    })?;
-    configure_runtime_loader_env(runtime_dir)?;
+    let selected = match config.backend {
+        VmBackendChoice::CloudHypervisor => {
+            if config.gpu_enabled && !config.gpu_has_msix {
+                return Err(VmError::HostSetup(
+                    "cloud-hypervisor requires MSI-X for VFIO passthrough, but this GPU \
+                     lacks MSI-X support. Use --backend auto or --backend qemu."
+                        .into(),
+                ));
+            }
+            SelectedBackend::CloudHypervisor
+        }
+        VmBackendChoice::Libkrun => SelectedBackend::Libkrun,
+        VmBackendChoice::Qemu => SelectedBackend::Qemu,
+        VmBackendChoice::Auto => {
+            if config.gpu_enabled {
+                if config.gpu_has_msix {
+                    SelectedBackend::CloudHypervisor
+                } else {
+                    SelectedBackend::Qemu
+                }
+            } else if config.vfio_device.is_some() {
+                SelectedBackend::CloudHypervisor
+            } else {
+                SelectedBackend::Libkrun
+            }
+        }
+    };
 
-    let _ = ffi::libkrun()?;
-    log_runtime_provenance(runtime_dir);
+    match selected {
+        SelectedBackend::CloudHypervisor => {
+            #[cfg(not(target_os = "linux"))]
+            return Err(VmError::HostSetup(
+                "cloud-hypervisor backend requires Linux with KVM".into(),
+            ));
 
-    let libkrun_backend = backend::libkrun::LibkrunBackend;
-    backend::VmBackend::launch(&libkrun_backend, config)
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(ref addr) = config.vfio_device {
+                    validate_vfio_address(addr)?;
+                }
+                let chv_backend = backend::cloud_hypervisor::CloudHypervisorBackend::new()?;
+                backend::VmBackend::launch(&chv_backend, config)
+            }
+        }
+        SelectedBackend::Qemu => {
+            #[cfg(not(target_os = "linux"))]
+            return Err(VmError::HostSetup(
+                "QEMU backend requires Linux with KVM".into(),
+            ));
+
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(ref addr) = config.vfio_device {
+                    validate_vfio_address(addr)?;
+                }
+                let qemu_backend = backend::qemu::QemuBackend::new()?;
+                backend::VmBackend::launch(&qemu_backend, config)
+            }
+        }
+        SelectedBackend::Libkrun => {
+            let runtime_gvproxy = resolve_runtime_bundle()?;
+            let runtime_dir = runtime_gvproxy.parent().ok_or_else(|| {
+                VmError::HostSetup(format!(
+                    "runtime bundle file has no parent directory: {}",
+                    runtime_gvproxy.display()
+                ))
+            })?;
+            configure_runtime_loader_env(runtime_dir)?;
+
+            let _ = ffi::libkrun()?;
+            log_runtime_provenance(runtime_dir);
+
+            let libkrun_backend = backend::libkrun::LibkrunBackend;
+            backend::VmBackend::launch(&libkrun_backend, config)
+        }
+    }
 }
 
 // ── Post-boot bootstrap ────────────────────────────────────────────────
 
 /// Default gateway port: host port mapped to the `OpenShell` `NodePort` (30051).
 const DEFAULT_GATEWAY_PORT: u16 = 30051;
+
+/// The NodePort the OpenShell gateway listens on inside the VM.
+pub const GUEST_GATEWAY_NODEPORT: u16 = 30051;
 
 /// Bootstrap the `OpenShell` control plane after k3s is ready.
 ///
@@ -1364,7 +1461,7 @@ pub(crate) fn bootstrap_gateway(
         // drift check and the host already has valid certs. If the agent
         // isn't reachable we skip silently rather than blocking boot for
         // 30s.
-        match fetch_pki_over_exec(&exec_socket, std::time::Duration::from_secs(5)) {
+        match fetch_pki_over_exec(&exec_socket, Duration::from_secs(5)) {
             Ok(bundle) => {
                 if let Err(e) = sync_host_certs_if_stale(gateway_name, &bundle) {
                     eprintln!("Warning: cert sync check failed: {e}");
@@ -1391,7 +1488,7 @@ pub(crate) fn bootstrap_gateway(
     // We poll the exec agent with `cat <file>` for each PEM file until they
     // exist, retrying to handle the window between VM boot and PKI generation.
     eprintln!("Waiting for VM to generate PKI...");
-    let pki_bundle = fetch_pki_over_exec(&exec_socket, std::time::Duration::from_secs(120))
+    let pki_bundle = fetch_pki_over_exec(&exec_socket, Duration::from_secs(120))
         .map_err(|e| VmError::Bootstrap(format!("VM did not produce PKI within 120s: {e}")))?;
 
     eprintln!("PKI ready — storing client certs on host...");
@@ -1432,7 +1529,7 @@ const PKI_FILES: &[(&str, &str)] = &[
 /// and PKI generation completing.
 fn fetch_pki_over_exec(
     exec_socket: &Path,
-    timeout: std::time::Duration,
+    timeout: Duration,
 ) -> Result<openshell_bootstrap::pki::PkiBundle, VmError> {
     let deadline = Instant::now() + timeout;
 
@@ -1440,7 +1537,7 @@ fn fetch_pki_over_exec(
         match try_read_pki_files(exec_socket) {
             Ok(bundle) => return Ok(bundle),
             Err(_) if Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::thread::sleep(Duration::from_millis(500));
             }
             Err(e) => {
                 return Err(VmError::Bootstrap(format!(
@@ -1709,5 +1806,108 @@ mod tests {
         assert_eq!(prepared, rootfs);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_selects_qemu_when_gpu_no_msix() {
+        enum SelectedBackend {
+            Libkrun,
+            CloudHypervisor,
+            Qemu,
+        }
+
+        let select = |backend: VmBackendChoice, gpu_enabled: bool, gpu_has_msix: bool| {
+            match backend {
+                VmBackendChoice::CloudHypervisor => SelectedBackend::CloudHypervisor,
+                VmBackendChoice::Libkrun => SelectedBackend::Libkrun,
+                VmBackendChoice::Qemu => SelectedBackend::Qemu,
+                VmBackendChoice::Auto => {
+                    if gpu_enabled {
+                        if gpu_has_msix {
+                            SelectedBackend::CloudHypervisor
+                        } else {
+                            SelectedBackend::Qemu
+                        }
+                    } else {
+                        SelectedBackend::Libkrun
+                    }
+                }
+            }
+        };
+
+        assert!(matches!(
+            select(VmBackendChoice::Auto, true, false),
+            SelectedBackend::Qemu
+        ));
+        assert!(matches!(
+            select(VmBackendChoice::Auto, true, true),
+            SelectedBackend::CloudHypervisor
+        ));
+        assert!(matches!(
+            select(VmBackendChoice::Auto, false, true),
+            SelectedBackend::Libkrun
+        ));
+        assert!(matches!(
+            select(VmBackendChoice::Auto, false, false),
+            SelectedBackend::Libkrun
+        ));
+        assert!(matches!(
+            select(VmBackendChoice::Qemu, false, true),
+            SelectedBackend::Qemu
+        ));
+    }
+
+    fn config_with_port_map(port_map: Vec<String>) -> VmConfig {
+        VmConfig {
+            rootfs: PathBuf::from("/tmp/fake-rootfs"),
+            vcpus: 1,
+            mem_mib: 512,
+            exec_path: "/bin/true".to_string(),
+            args: vec![],
+            env: vec![],
+            workdir: "/".to_string(),
+            port_map,
+            vsock_ports: vec![],
+            log_level: 0,
+            console_output: None,
+            net: NetBackend::Tsi,
+            reset: false,
+            gateway_name: "test".to_string(),
+            state_disk: None,
+            gpu_enabled: false,
+            gpu_has_msix: false,
+            vfio_device: None,
+            backend: VmBackendChoice::Auto,
+        }
+    }
+
+    #[test]
+    fn gateway_host_port_default_mapping() {
+        let cfg = config_with_port_map(vec!["30051:30051".to_string()]);
+        assert_eq!(gateway_host_port(&cfg), 30051);
+    }
+
+    #[test]
+    fn gateway_host_port_no_gateway_mapping_returns_default() {
+        let cfg = config_with_port_map(vec![
+            "6443:6443".to_string(),
+            "8080:8080".to_string(),
+        ]);
+        assert_eq!(gateway_host_port(&cfg), DEFAULT_GATEWAY_PORT);
+    }
+
+    #[test]
+    fn gateway_host_port_finds_remapped_gateway() {
+        let cfg = config_with_port_map(vec![
+            "6443:6443".to_string(),
+            "9999:30051".to_string(),
+        ]);
+        assert_eq!(gateway_host_port(&cfg), 9999);
+    }
+
+    #[test]
+    fn gateway_host_port_empty_port_map() {
+        let cfg = config_with_port_map(vec![]);
+        assert_eq!(gateway_host_port(&cfg), DEFAULT_GATEWAY_PORT);
     }
 }

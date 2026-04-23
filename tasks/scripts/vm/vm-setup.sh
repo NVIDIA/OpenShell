@@ -81,6 +81,11 @@ if [ "$FROM_SOURCE" = "1" ]; then
         linux-*)
             # Linux: build both libkrunfw and libkrun in one go
             "${ROOT}/tasks/scripts/vm/build-libkrun.sh"
+            if [ "${GPU:-0}" = "1" ]; then
+                echo ""
+                echo "==> Building GPU passthrough dependencies..."
+                "${ROOT}/tasks/scripts/vm/build-gpu-deps.sh"
+            fi
             ;;
     esac
     echo ""

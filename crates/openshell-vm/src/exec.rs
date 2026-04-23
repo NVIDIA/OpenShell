@@ -51,16 +51,17 @@ pub const VM_EXEC_VSOCK_PORT: u32 = 10_777;
 /// How to connect to the VM exec agent.
 ///
 /// libkrun bridges each guest vsock port to a host Unix socket via
-/// `krun_add_vsock_port2`. cloud-hypervisor uses standard vhost-vsock
-/// with CID-based addressing — the host connects via `AF_VSOCK` or a
-/// vsock-proxy/socat bridge.
+/// `krun_add_vsock_port2`. cloud-hypervisor exposes guest vsock through
+/// a host-side Unix socket with a text protocol (`CONNECT <port>\n` /
+/// `OK <port>\n`), not kernel `AF_VSOCK` or standard `vhost-vsock`.
 #[derive(Debug, Clone)]
 pub enum VsockConnectMode {
     /// Connect via a host Unix socket (libkrun per-port bridging).
     UnixSocket(PathBuf),
     /// Connect via a vsock proxy bridge (cloud-hypervisor).
-    /// The path points to a socat-bridged Unix socket that forwards
-    /// to guest CID 3, port [`VM_EXEC_VSOCK_PORT`].
+    /// The path points to a bridged Unix socket that performs the CHV
+    /// text-protocol handshake and forwards to guest CID 3,
+    /// port [`VM_EXEC_VSOCK_PORT`].
     VsockBridge(PathBuf),
 }
 
@@ -176,8 +177,10 @@ pub fn write_vm_runtime_state(
 
 pub fn clear_vm_runtime_state(rootfs: &Path) {
     let state_path = vm_state_path(rootfs);
+    let lock_path = vm_lock_path(rootfs);
     let socket_path = vm_exec_socket_path(rootfs);
     let _ = fs::remove_file(state_path);
+    let _ = fs::remove_file(lock_path);
     let _ = fs::remove_file(socket_path);
 }
 
@@ -307,6 +310,13 @@ pub fn reset_runtime_state(rootfs: &Path, gateway_name: &str) -> Result<(), VmEr
 /// create a fresh database on startup and cluster state will be re-applied from
 /// the auto-deploy manifests in `server/manifests/`.
 ///
+/// **Limitation — state disk:** When a state disk is configured (common with
+/// `--gpu`), the kine DB lives inside the raw disk image, not on the virtiofs
+/// rootfs. This host-side check only sees the virtiofs path and cannot detect
+/// corruption on the state disk. The init script (`openshell-vm-init.sh`) runs
+/// `PRAGMA quick_check` inside the VM where the state disk is mounted, catching
+/// corruption that this function misses.
+///
 /// **Stale bootstrap locks** (a kine application-level issue where a killed k3s
 /// server leaves a lock row that causes the next instance to hang) are handled
 /// separately by the init script (`openshell-vm-init.sh`), which runs
@@ -380,6 +390,10 @@ fn remove_kine_db_files(db_path: &Path) -> Result<(), VmError> {
 /// automatically. This provides a reliable guard against two VM processes
 /// sharing the same rootfs — even if the state file is deleted.
 ///
+/// When the lock file already contains a PID from a previous holder that
+/// is no longer alive, a warning is logged and any stale VM state files
+/// are cleaned up proactively.
+///
 /// Returns `Ok(File)` on success. The caller must keep the `File` alive
 /// for as long as the VM is running.
 pub fn acquire_rootfs_lock(rootfs: &Path) -> Result<File, VmError> {
@@ -405,14 +419,13 @@ pub fn acquire_rootfs_lock(rootfs: &Path) -> Result<File, VmError> {
     if rc != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            // Another process holds the lock — read its PID for diagnostics.
+            // Another process holds the flock. Read the PID recorded in
+            // the file for diagnostics — but verify it's still alive,
+            // because the file may contain a stale PID from a crashed
+            // predecessor while a different process now holds the flock.
             let holder_pid = fs::read_to_string(&lock_path).unwrap_or_default();
             let holder_pid = holder_pid.trim();
-            return Err(VmError::RuntimeState(format!(
-                "another process (pid {holder_pid}) is using rootfs {}. \
-                 Stop the running VM first",
-                rootfs.display()
-            )));
+            return Err(stale_lock_error(rootfs, holder_pid, &lock_path));
         }
         return Err(VmError::RuntimeState(format!(
             "lock rootfs {}: {err}",
@@ -420,7 +433,11 @@ pub fn acquire_rootfs_lock(rootfs: &Path) -> Result<File, VmError> {
         )));
     }
 
-    // Lock acquired — write our PID (truncate first, then write).
+    // Lock acquired — check for stale state from a crashed predecessor.
+    // Read the previous PID before we overwrite it.
+    cleanup_stale_state_on_lock_acquire(rootfs, &lock_path);
+
+    // Write our PID (truncate first, then write).
     // This is informational only; the flock is the real guard.
     let _ = file.set_len(0);
     {
@@ -429,6 +446,58 @@ pub fn acquire_rootfs_lock(rootfs: &Path) -> Result<File, VmError> {
     }
 
     Ok(file)
+}
+
+/// Build an appropriate error when flock returns EWOULDBLOCK.
+///
+/// If the PID recorded in the lock file is dead, the flock holder is a
+/// different (unknown) process — provide enhanced diagnostics so the user
+/// isn't misled by a stale PID.
+fn stale_lock_error(rootfs: &Path, recorded_pid: &str, _lock_path: &Path) -> VmError {
+    if let Ok(pid) = recorded_pid.parse::<i32>() {
+        if pid > 0 && !process_alive(pid) {
+            return VmError::RuntimeState(format!(
+                "rootfs {} is locked, but the recorded holder (pid {pid}) is dead. \
+                 A different openshell-vm process likely holds the lock. \
+                 Check for running openshell-vm processes (`ps aux | grep openshell-vm`) \
+                 and stop them before retrying.",
+                rootfs.display(),
+            ));
+        }
+    }
+    VmError::RuntimeState(format!(
+        "another process (pid {recorded_pid}) is using rootfs {}. \
+         Stop the running VM first",
+        rootfs.display()
+    ))
+}
+
+/// After successfully acquiring the flock, check whether the lock file
+/// contained a PID from a dead process (crash recovery). If so, log a
+/// warning and clean up stale VM state/socket files.
+fn cleanup_stale_state_on_lock_acquire(rootfs: &Path, lock_path: &Path) {
+    let prev_contents = fs::read_to_string(lock_path).unwrap_or_default();
+    let Ok(prev_pid) = prev_contents.trim().parse::<i32>() else {
+        return;
+    };
+    if prev_pid <= 0 || process_alive(prev_pid) {
+        return;
+    }
+
+    eprintln!(
+        "Warning: cleaning up stale lock from dead process (pid {prev_pid})"
+    );
+
+    let state_path = vm_state_path(rootfs);
+    if let Ok(bytes) = fs::read(&state_path) {
+        if let Ok(state) = serde_json::from_slice::<VmRuntimeState>(&bytes) {
+            if !process_alive(state.pid) {
+                eprintln!("  Removing stale VM state (pid {})", state.pid);
+                let _ = fs::remove_file(&state_path);
+                let _ = fs::remove_file(vm_exec_socket_path(rootfs));
+            }
+        }
+    }
 }
 
 /// Check whether the rootfs lock file is currently held by another process.
@@ -453,11 +522,7 @@ fn check_rootfs_lock_free(rootfs: &Path) -> Result<(), VmError> {
         if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
             let holder_pid = fs::read_to_string(&lock_path).unwrap_or_default();
             let holder_pid = holder_pid.trim();
-            return Err(VmError::RuntimeState(format!(
-                "another process (pid {holder_pid}) is using rootfs {}. \
-                 Stop the running VM first",
-                rootfs.display()
-            )));
+            return Err(stale_lock_error(rootfs, holder_pid, &lock_path));
         }
     } else {
         // We acquired the lock — release it immediately since we're only probing.
@@ -468,27 +533,16 @@ fn check_rootfs_lock_free(rootfs: &Path) -> Result<(), VmError> {
 }
 
 pub fn ensure_vm_not_running(rootfs: &Path) -> Result<(), VmError> {
-    // Primary guard: check the flock. This works even if the state file
-    // has been deleted, because the kernel holds the lock until the
-    // owning process exits.
+    // The flock is the definitive guard: the kernel releases it
+    // automatically when the owning process exits (even via SIGKILL).
+    // If this succeeds, no VM process holds the rootfs.
     check_rootfs_lock_free(rootfs)?;
 
-    // Secondary guard: check the state file for any stale state.
-    match load_vm_runtime_state(Some(rootfs)) {
-        Ok(state) => Err(VmError::RuntimeState(format!(
-            "VM is already running (pid {}) with exec socket {}",
-            state.pid,
-            state.socket_path.display()
-        ))),
-        Err(VmError::RuntimeState(message))
-            if message.starts_with("read VM runtime state")
-                || message.starts_with("VM is not running") =>
-        {
-            clear_vm_runtime_state(rootfs);
-            Ok(())
-        }
-        Err(err) => Err(err),
-    }
+    // Flock is free — no VM process holds the rootfs lock. Any remaining
+    // state file is stale (from a killed/crashed VM or PID reuse by an
+    // unrelated process). Clean it up unconditionally.
+    clear_vm_runtime_state(rootfs);
+    Ok(())
 }
 
 pub fn exec_running_vm(options: VmExecOptions) -> Result<i32, VmError> {

@@ -4,17 +4,21 @@
 
 ## Overview
 
-The OpenShell gateway VM supports two hypervisor backends:
+The OpenShell gateway VM supports three hypervisor backends:
 
 - **libkrun** (default) — lightweight VMM using Apple Hypervisor.framework (macOS) or KVM
   (Linux). The kernel is embedded inside `libkrunfw`. Uses virtio-MMIO device transport and
   gvproxy for user-space networking.
 - **cloud-hypervisor** — Linux-only KVM-based VMM used for GPU passthrough (VFIO). Uses
   virtio-PCI device transport, TAP networking, and requires a separate `vmlinux` kernel and
-  `virtiofsd` for rootfs access.
+  `virtiofsd` for rootfs access. Requires GPU MSI-X support.
+- **QEMU** — Linux-only fallback VMM for GPU passthrough when the GPU lacks MSI-X support.
+  Uses the same TAP networking, `vmlinux`, and `virtiofsd` as cloud-hypervisor. QEMU binary
+  is not embedded — it must be installed on the host.
 
-Backend selection is automatic: `--gpu` selects cloud-hypervisor, otherwise libkrun is used.
-The `--backend` flag provides explicit control (`auto`, `libkrun`, `cloud-hypervisor`).
+Backend selection is automatic: `--gpu` selects cloud-hypervisor (MSI-X GPU) or QEMU
+(non-MSI-X GPU), otherwise libkrun is used. The `--backend` flag provides explicit control
+(`auto`, `libkrun`, `cloud-hypervisor`, `qemu`).
 
 When `--gpu` is passed, `openshell-vm` automatically binds an eligible GPU to `vfio-pci`
 and restores it to the original driver on shutdown. See
@@ -38,6 +42,7 @@ graph TD
         PROV[Runtime provenance logging]
         GVP[gvproxy networking proxy]
         CHV_BIN["cloud-hypervisor · virtiofsd · vmlinux\n(GPU runtime bundle)"]
+        QEMU_BIN["qemu-system-x86_64\n(host-installed, GPU fallback)"]
 
         BIN --> EMB
         BIN -->|extracts to| CACHE
@@ -60,6 +65,7 @@ graph TD
 
     BIN -- "libkrun: fork + krun_start_enter" --> INIT
     BIN -- "CHV: cloud-hypervisor API + virtiofsd" --> INIT
+    BIN -- "QEMU: qemu-system-x86_64 + virtiofsd" --> INIT
     GVP -- "virtio-net (libkrun only)" --> Guest
 ```
 
@@ -117,28 +123,31 @@ mise run vm:build                  # Rebuild binary with full rootfs
 
 ## Backend Comparison
 
-| | libkrun (default) | cloud-hypervisor |
-|---|---|---|
-| Platforms | macOS (Hypervisor.framework), Linux (KVM) | Linux (KVM) only |
-| Device transport | virtio-MMIO | virtio-PCI |
-| Networking | gvproxy (user-space, no root needed) | TAP (requires root/CAP_NET_ADMIN) |
-| Rootfs delivery | In-process (krun API) | virtiofsd (virtio-fs daemon) |
-| Kernel delivery | Embedded in libkrunfw | Separate `vmlinux` file |
-| Console | virtio-console (`hvc0`) | 8250 UART (`ttyS0`) |
-| Shutdown | Automatic on PID 1 exit | ACPI poweroff (`poweroff -f`) |
-| GPU passthrough | Not supported | VFIO PCI passthrough |
-| `--exec` mode | Direct init replacement | Wrapper script with ACPI shutdown |
-| CLI flag | `--backend libkrun` | `--backend cloud-hypervisor` or `--gpu` |
+| | libkrun (default) | cloud-hypervisor | QEMU |
+|---|---|---|---|
+| Platforms | macOS (Hypervisor.framework), Linux (KVM) | Linux (KVM) only | Linux (KVM) only |
+| Device transport | virtio-MMIO | virtio-PCI | virtio-PCI |
+| Networking | gvproxy (user-space, no root needed) | TAP (requires root/CAP_NET_ADMIN) | TAP (requires root/CAP_NET_ADMIN) |
+| Rootfs delivery | In-process (krun API) | virtiofsd (virtio-fs daemon) | virtiofsd (virtio-fs daemon) |
+| Kernel delivery | Embedded in libkrunfw | Separate `vmlinux` file | Separate `vmlinux` file |
+| Console | virtio-console (`hvc0`) | 8250 UART (`ttyS0`) | 8250 UART (`ttyS0`) |
+| Shutdown | Automatic on PID 1 exit | ACPI poweroff (`poweroff -f`) | ACPI poweroff (`poweroff -f`) |
+| GPU passthrough | Not supported | VFIO PCI (requires MSI-X) | VFIO PCI (MSI-X not required) |
+| Vsock | libkrun built-in | Unix socket + text protocol | `AF_VSOCK` (kernel `vhost_vsock`) |
+| VM control | krun C API | REST API over Unix socket | Command-line args |
+| Binary source | Embedded in runtime | Runtime bundle | Host-installed |
+| `--exec` mode | Direct init replacement | Wrapper script with ACPI shutdown | Wrapper script with ACPI shutdown |
+| CLI flag | `--backend libkrun` | `--backend cloud-hypervisor` or `--gpu` | `--backend qemu` |
 
 ### Exec mode differences
 
 With libkrun, when `--exec <cmd>` is used, the command replaces the init process and
 the VM exits when PID 1 exits.
 
-With cloud-hypervisor, the VM does not automatically exit when PID 1 terminates. A
-wrapper init script is dynamically written to the guest rootfs that mounts necessary
-filesystems, executes the user command, captures the exit code, and calls
-`poweroff -f` to trigger an ACPI shutdown that cloud-hypervisor detects.
+With cloud-hypervisor and QEMU, the VM does not automatically exit when PID 1
+terminates. A wrapper init script is dynamically written to the guest rootfs that
+mounts necessary filesystems, executes the user command, captures the exit code,
+and calls `poweroff -f` to trigger an ACPI shutdown that the hypervisor detects.
 
 ## Network Profile
 
@@ -161,6 +170,8 @@ fast with an actionable error if they are missing.
 - **cloud-hypervisor**: Uses TAP networking (requires root or CAP_NET_ADMIN). When
   `--net none` is passed, networking is disabled entirely (useful for `--exec` mode
   tests). gvproxy is not used with cloud-hypervisor.
+- **QEMU**: Uses TAP networking (same subnet and setup as cloud-hypervisor). Port
+  forwarding uses the same userspace TCP proxy. gvproxy is not used with QEMU.
 
 ## Guest Init Script
 
@@ -202,35 +213,46 @@ graph LR
         BUILD_M["Build libkrunfw.dylib + libkrun.dylib"]
     end
 
-    subgraph CHV["Linux CI (build-cloud-hypervisor.sh)"]
-        BUILD_CHV["Build cloud-hypervisor + virtiofsd"]
+    subgraph GPU["Linux CI (build-gpu-deps.sh)"]
+        BUILD_GPU["Build cloud-hypervisor + virtiofsd\n(shared by CHV and QEMU)"]
+    end
+
+    subgraph NV["Linux CI (build-nvidia-modules.sh)"]
+        BUILD_NV["Compile NVIDIA .ko against VM kernel"]
+    end
+
+    subgraph QEMU["Host-installed"]
+        QEMU_BIN["qemu-system-x86_64\n(not built — must be on host PATH)"]
     end
 
     subgraph Output["target/libkrun-build/"]
         LIB_SO["libkrunfw.so + libkrun.so\n(Linux)"]
         LIB_DY["libkrunfw.dylib + libkrun.dylib\n(macOS)"]
-        CHV_OUT["cloud-hypervisor + virtiofsd\n(Linux)"]
-        VMLINUX["vmlinux\n(extracted from libkrunfw)"]
+        CHV_OUT["cloud-hypervisor (CHV only)\n+ virtiofsd (CHV + QEMU)"]
+        VMLINUX["vmlinux\n(shared by CHV + QEMU)"]
+        NV_KO["nvidia-modules/*.ko\n(GPU builds only)"]
     end
 
     KCONF --> BUILD_L
     BUILD_L --> LIB_SO
     BUILD_L --> VMLINUX
+    BUILD_L -->|kernel source tree| BUILD_NV
+    BUILD_NV --> NV_KO
     KCONF --> BUILD_M
     BUILD_M --> LIB_DY
-    BUILD_CHV --> CHV_OUT
+    BUILD_GPU --> CHV_OUT
 ```
 
-The `vmlinux` kernel is extracted from the libkrunfw build and reused by cloud-hypervisor.
-Both backends boot the same kernel — the kconfig fragment includes drivers for both
-virtio-MMIO (libkrun) and virtio-PCI (CHV) transports.
+The `vmlinux` kernel is extracted from the libkrunfw build and reused by cloud-hypervisor
+and QEMU. All three backends boot the same kernel — the kconfig fragment includes drivers
+for both virtio-MMIO (libkrun) and virtio-PCI (CHV/QEMU) transports.
 
 ## Kernel Config Fragment
 
 The `openshell.kconfig` fragment enables these kernel features on top of the stock
-libkrunfw kernel. A single kernel binary is shared by both libkrun and cloud-hypervisor —
-backend-specific drivers coexist safely (the kernel probes whichever transport the
-hypervisor provides).
+libkrunfw kernel. A single kernel binary is shared by all three backends (libkrun,
+cloud-hypervisor, QEMU) — backend-specific drivers coexist safely (the kernel probes
+whichever transport the hypervisor provides).
 
 | Feature | Key Configs | Purpose |
 |---------|-------------|---------|
@@ -291,6 +313,10 @@ commands work the same way they would inside the VM shell.
 - **cloud-hypervisor**: Uses a vsock exec bridge — a host-side process that
   connects an AF_VSOCK socket to a Unix domain socket, providing the same
   interface to the exec agent.
+- **QEMU**: Uses `vhost-vsock-pci` with kernel `AF_VSOCK` sockets. The exec
+  bridge opens a kernel `AF_VSOCK` socket to the guest CID and bridges it to
+  the same Unix domain socket path used by the other backends. Requires the
+  `vhost_vsock` kernel module on the host.
 
 ## Build Commands
 
@@ -316,9 +342,28 @@ mise run vm:build                          # Then build embedded binary
 # Build cloud-hypervisor runtime bundle (Linux only)
 mise run vm:bundle-runtime                 # Builds CHV + virtiofsd + extracts vmlinux
 
+# Validate QEMU host prerequisites
+mise run vm:qemu-check
+
+# Install QEMU if not present (Ubuntu/Debian)
+sudo apt install qemu-system-x86
+
+# Load vhost-vsock kernel module (required for QEMU vsock)
+sudo modprobe vhost_vsock
+echo "vhost_vsock" | sudo tee /etc/modules-load.d/vhost_vsock.conf
+
+# Build with GPU support (Linux x86_64 only)
+FROM_SOURCE=1 mise run vm:setup            # Build kernel from source (module compilation needs it)
+mise run vm:nvidia-modules                 # Compile NVIDIA .ko files against VM kernel
+mise run vm:rootfs -- --base --gpu         # Build GPU rootfs with injected kernel modules
+mise run vm:build                          # Rebuild binary with GPU rootfs
+
 # Run with cloud-hypervisor backend
 openshell-vm --backend cloud-hypervisor    # Requires runtime bundle
-openshell-vm --gpu                         # Auto-selects CHV with GPU passthrough
+openshell-vm --gpu                         # Auto-selects CHV (MSI-X) or QEMU (no MSI-X)
+
+# Run with QEMU backend
+openshell-vm --backend qemu                # Requires qemu-system-x86_64 on host
 
 # Wipe everything and start over
 mise run vm:clean
@@ -337,8 +382,8 @@ pinned versions change.
 
 | Platform | Runner | Build Method |
 |----------|--------|-------------|
-| Linux ARM64 | `build-arm64` (self-hosted) | `build-libkrun.sh` + `build-cloud-hypervisor.sh` |
-| Linux x86_64 | `build-amd64` (self-hosted) | `build-libkrun.sh` + `build-cloud-hypervisor.sh` |
+| Linux ARM64 | `build-arm64` (self-hosted) | `build-libkrun.sh` + `build-gpu-deps.sh` |
+| Linux x86_64 | `build-amd64` (self-hosted) | `build-libkrun.sh` + `build-gpu-deps.sh` |
 | macOS ARM64 | `macos-latest-xlarge` (GitHub-hosted) | `build-libkrun-macos.sh` (no CHV) |
 
 Artifacts: `vm-runtime-{platform}.tar.zst` containing libkrun, libkrunfw, gvproxy,
@@ -375,6 +420,10 @@ macOS binaries produced via osxcross are not codesigned. Users must self-sign:
 ```bash
 codesign --entitlements crates/openshell-vm/entitlements.plist --force -s - ./openshell-vm
 ```
+
+> **Note:** QEMU smoke tests (`vm_boot_smoke.rs`) are gated on `OPENSHELL_VM_BACKEND=qemu`.
+> These tests require `qemu-system-x86_64` on the runner and are currently manual-only.
+> Run `mise run vm:qemu-check` to validate prerequisites before running QEMU tests.
 
 ## Rollout Strategy
 

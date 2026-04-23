@@ -96,6 +96,18 @@ if [ -z "${VM_RUNTIME_TARBALL:-}" ] && _check_compressed_artifacts "$OUTPUT_DIR"
         zstd -d "$f" -o "${WORK_DIR}/${name}" -f -q
         chmod 0755 "${WORK_DIR}/${name}"
     done
+    # GPU passthrough binaries live in libkrun-build but are not part of the
+    # core compressed set. Copy them into WORK_DIR so bundle-vm-runtime.sh
+    # stages them alongside the core libraries.
+    _BUILD_DIR="${ROOT}/target/libkrun-build"
+    for gpu_bin in vmlinux cloud-hypervisor virtiofsd; do
+        if [ -f "${_BUILD_DIR}/${gpu_bin}" ]; then
+            cp "${_BUILD_DIR}/${gpu_bin}" "$WORK_DIR/"
+            chmod 0755 "${WORK_DIR}/${gpu_bin}"
+            echo "    Included GPU binary: ${gpu_bin}"
+        fi
+    done
+
     echo "    Decompressed files:"
     ls -lah "$WORK_DIR"
 
@@ -260,6 +272,14 @@ case "$(uname -s)-$(uname -m)" in
         "https://github.com/containers/gvisor-tap-vsock/releases/download/${GVPROXY_VERSION}/gvproxy-linux-${GVPROXY_ARCH}"
       chmod +x "$WORK_DIR/gvproxy"
     fi
+
+    # GPU passthrough binaries (optional — included when present in libkrun-build)
+    for gpu_bin in vmlinux cloud-hypervisor virtiofsd; do
+        if [ -f "${BUILD_DIR}/${gpu_bin}" ]; then
+            cp "${BUILD_DIR}/${gpu_bin}" "$WORK_DIR/"
+            echo "    Included GPU binary: ${gpu_bin}"
+        fi
+    done
     ;;
     
   *)

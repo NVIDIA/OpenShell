@@ -210,9 +210,25 @@ if [ -f openshell.kconfig ]; then
   # Re-run olddefconfig to fill in any new symbols introduced by the fragment.
   make -C "${KERNEL_SOURCES}" ARCH="${KARCH}" olddefconfig
 
+  # Force-enable hidden Kconfig bools required by out-of-tree NVIDIA modules.
+  # CONFIG_MMU_NOTIFIER is a hidden bool (no prompt) that can only be
+  # activated via "select" from another in-tree option. olddefconfig and
+  # syncconfig both strip it if nothing selects it. NVIDIA UVM needs it for
+  # GPU memory management. We patch the DRM Kconfig (already enabled as
+  # CONFIG_DRM=y) to select MMU_NOTIFIER, then re-run olddefconfig so the
+  # dependency chain (INTERVAL_TREE) is resolved properly.
+  if ! grep -q "select MMU_NOTIFIER" "${KERNEL_SOURCES}/drivers/gpu/drm/Kconfig"; then
+    sed -i '/^menuconfig DRM$/,/^[[:space:]]*select VIDEO/ {
+      /^[[:space:]]*select VIDEO/a\
+\tselect MMU_NOTIFIER
+    }' "${KERNEL_SOURCES}/drivers/gpu/drm/Kconfig"
+    echo "    Patched DRM Kconfig to select MMU_NOTIFIER"
+  fi
+  make -C "${KERNEL_SOURCES}" ARCH="${KARCH}" olddefconfig
+
   # Verify that the key options were actually applied.
   all_ok=true
-  for opt in CONFIG_BRIDGE CONFIG_NETFILTER CONFIG_NF_NAT; do
+  for opt in CONFIG_BRIDGE CONFIG_NETFILTER CONFIG_NF_NAT CONFIG_X86_PAT CONFIG_MMU_NOTIFIER CONFIG_FW_LOADER; do
     val="$(grep "^${opt}=" "${KERNEL_SOURCES}/.config" 2>/dev/null || true)"
     if [ -n "$val" ]; then
       echo "    ${opt}: ${val#*=}"
@@ -250,6 +266,13 @@ elif [ -f "vmlinux" ]; then
 else
   echo "    Warning: vmlinux not found in kernel build tree (GPU passthrough will not be available)" >&2
 fi
+
+# Export kernel release string for downstream scripts (nvidia modules, rootfs).
+# Uses kernelrelease (includes CONFIG_LOCALVERSION) so that module vermagic,
+# rootfs module path, and the kernel's uname -r all agree.
+KERNEL_RELEASE="$(make -s -C "${KERNEL_SOURCES}" kernelrelease)"
+echo "${KERNEL_RELEASE}" > "${OUTPUT_DIR}/kernel-version.txt"
+echo "    Exported kernel version: ${KERNEL_RELEASE}"
 
 cd "$BUILD_DIR"
 

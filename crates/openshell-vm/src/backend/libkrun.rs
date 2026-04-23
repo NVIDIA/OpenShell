@@ -389,7 +389,7 @@ fn launch_libkrun(config: &VmConfig) -> Result<i32, VmError> {
             std::process::exit(1);
         }
         _ => {
-            if config.exec_path == "/srv/openshell-vm-init.sh" {
+            if !config.is_exec_mode() {
                 let gvproxy_pid = gvproxy_guard.as_ref().and_then(GvproxyGuard::id);
                 if let Err(err) =
                     write_vm_runtime_state(&config.rootfs, pid, &console_log, gvproxy_pid, false)
@@ -416,7 +416,7 @@ fn launch_libkrun(config: &VmConfig) -> Result<i32, VmError> {
                 setup_gvproxy_port_forwarding(api_sock, &config.port_map)?;
             }
 
-            if config.exec_path == "/srv/openshell-vm-init.sh" && !config.port_map.is_empty() {
+            if !config.is_exec_mode() && !config.port_map.is_empty() {
                 let gateway_port = gateway_host_port(config);
                 bootstrap_gateway(&config.rootfs, &config.gateway_name, gateway_port)?;
                 health::wait_for_gateway_ready(gateway_port, &config.gateway_name)?;
@@ -425,6 +425,7 @@ fn launch_libkrun(config: &VmConfig) -> Result<i32, VmError> {
             eprintln!("Ready [{:.1}s total]", boot_start.elapsed().as_secs_f64());
             eprintln!("Press Ctrl+C to stop.");
 
+            crate::CHILD_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
             unsafe {
                 libc::signal(
                     libc::SIGINT,
@@ -434,15 +435,15 @@ fn launch_libkrun(config: &VmConfig) -> Result<i32, VmError> {
                     libc::SIGTERM,
                     crate::forward_signal as *const () as libc::sighandler_t,
                 );
-                crate::CHILD_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
             }
 
             let mut status: libc::c_int = 0;
             unsafe {
                 libc::waitpid(pid, &raw mut status, 0);
             }
+            crate::CHILD_PID.store(0, std::sync::atomic::Ordering::Relaxed);
 
-            if config.exec_path == "/srv/openshell-vm-init.sh" {
+            if !config.is_exec_mode() {
                 clear_vm_runtime_state(&config.rootfs);
             }
             if let Some(mut guard) = gvproxy_guard

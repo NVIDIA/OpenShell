@@ -5,6 +5,10 @@
 #
 # Workflow:
 #   mise run vm:setup          # one-time: download pre-built runtime (~30s)
+#                              # (with FROM_SOURCE=1: builds kernel + libkrun + GPU deps)
+#   mise run vm:gpu-deps       # (standalone) build GPU passthrough binaries separately
+#   mise run vm:nvidia-modules # (GPU only) build NVIDIA kernel modules
+#   mise run vm:rootfs -- --base --gpu  # build GPU rootfs with NVIDIA drivers
 #   mise run vm                # build + run the VM
 #   mise run vm:clean          # wipe everything and start over
 #
@@ -26,7 +30,14 @@ run = [
 description = "Build the openshell-vm binary with embedded runtime"
 run = [
   "tasks/scripts/vm/compress-vm-runtime.sh",
-  "OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed cargo build -p openshell-vm",
+  """
+  # The embedded rootfs.tar.zst can exceed 2 GiB, which overflows x86_64's
+  # default small code model (R_X86_64_PC32 ±2 GiB limit). Use the large
+  # code model so include_bytes!() blobs of any size link correctly.
+  RUSTFLAGS="${RUSTFLAGS:-} -C code-model=large" \
+    OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed \
+    cargo build -p openshell-vm
+  """,
   "tasks/scripts/vm/codesign-openshell-vm.sh",
   "tasks/scripts/vm/bundle-vm-runtime.sh",
 ]
@@ -38,6 +49,18 @@ run = "tasks/scripts/vm/vm-setup.sh"
 ["vm:rootfs"]
 description = "Build the VM rootfs tarball (use -- --base for lightweight)"
 run = "tasks/scripts/vm/build-rootfs-tarball.sh"
+
+["vm:nvidia-modules"]
+description = "Build NVIDIA kernel modules for GPU VM rootfs (requires FROM_SOURCE=1 vm:setup)"
+run = "tasks/scripts/vm/build-nvidia-modules.sh"
+
+["vm:gpu-deps"]
+description = "Build GPU passthrough dependencies (cloud-hypervisor, virtiofsd) shared by CHV and QEMU backends"
+run = "tasks/scripts/vm/build-gpu-deps.sh"
+
+["vm:qemu-check"]
+description = "Validate QEMU host prerequisites for GPU passthrough"
+run = "tasks/scripts/vm/qemu-check.sh"
 
 ["vm:clean"]
 description = "Remove all VM cached artifacts (runtime, rootfs, builds)"

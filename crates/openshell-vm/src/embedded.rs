@@ -26,6 +26,7 @@ mod resources {
     pub const LIBKRUNFW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrunfw.5.dylib.zst"));
     pub const GVPROXY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gvproxy.zst"));
     pub const ROOTFS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rootfs.tar.zst"));
+    pub const ROOTFS_GPU: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rootfs-gpu.tar.zst"));
     pub const LIBKRUN_NAME: &str = "libkrun.dylib";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw.5.dylib";
 }
@@ -36,6 +37,7 @@ mod resources {
     pub const LIBKRUNFW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrunfw.so.5.zst"));
     pub const GVPROXY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gvproxy.zst"));
     pub const ROOTFS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rootfs.tar.zst"));
+    pub const ROOTFS_GPU: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rootfs-gpu.tar.zst"));
     pub const LIBKRUN_NAME: &str = "libkrun.so";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw.so.5";
 }
@@ -46,6 +48,7 @@ mod resources {
     pub const LIBKRUNFW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrunfw.so.5.zst"));
     pub const GVPROXY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gvproxy.zst"));
     pub const ROOTFS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rootfs.tar.zst"));
+    pub const ROOTFS_GPU: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rootfs-gpu.tar.zst"));
     pub const LIBKRUN_NAME: &str = "libkrun.so";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw.so.5";
 }
@@ -61,6 +64,7 @@ mod resources {
     pub const LIBKRUNFW: &[u8] = &[];
     pub const GVPROXY: &[u8] = &[];
     pub const ROOTFS: &[u8] = &[];
+    pub const ROOTFS_GPU: &[u8] = &[];
     pub const LIBKRUN_NAME: &str = "libkrun";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw";
 }
@@ -232,9 +236,14 @@ pub fn cleanup_old_rootfs() -> Result<(), VmError> {
     cleanup_old_versions_in_base(&base, &current_version_dir)
 }
 
-/// Check if the rootfs is embedded (non-empty).
+/// Check if the base rootfs is embedded (non-empty).
 pub fn has_embedded_rootfs() -> bool {
     !resources::ROOTFS.is_empty()
+}
+
+/// Check if the GPU rootfs is embedded (non-empty).
+pub fn has_embedded_gpu_rootfs() -> bool {
+    !resources::ROOTFS_GPU.is_empty()
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────────

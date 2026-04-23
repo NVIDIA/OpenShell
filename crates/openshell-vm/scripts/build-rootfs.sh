@@ -135,6 +135,67 @@ verify_checksum() {
     fi
 }
 
+verify_gpu_rootfs() {
+    local rootfs_dir="$1"
+    local kernel_version="$2"
+    local driver_tag="$3"
+    local driver_version="$4"
+
+    echo "==> Verifying GPU components in rootfs..."
+    if [ ! -f "${rootfs_dir}/usr/bin/nvidia-smi" ]; then
+        echo "ERROR: nvidia-smi not found in rootfs."
+        exit 1
+    fi
+    echo "    nvidia-smi: found"
+    if ls "${rootfs_dir}"/usr/bin/nvidia-container-runtime* >/dev/null 2>&1; then
+        echo "    nvidia-container-runtime: found"
+    else
+        echo "WARNING: nvidia-container-runtime not found — GPU pods may not work."
+    fi
+    if [ -z "${kernel_version}" ]; then
+        echo "ERROR: VM_KERNEL_VERSION not set — kernel module injection may have been skipped" >&2
+        exit 1
+    fi
+    if [ -d "${rootfs_dir}/lib/modules/${kernel_version}" ]; then
+        local mod_count
+        mod_count=$(find "${rootfs_dir}/lib/modules/${kernel_version}" -name "nvidia*.ko" | wc -l)
+        echo "    nvidia kernel modules: ${mod_count} found (kernel ${kernel_version})"
+        if [ "$mod_count" -eq 0 ]; then
+            echo "ERROR: no nvidia kernel modules in /lib/modules/${kernel_version}/"
+            echo "       Run: mise run vm:nvidia-modules"
+            exit 1
+        fi
+    else
+        echo "ERROR: /lib/modules/${kernel_version}/ not found in rootfs"
+        echo "       Run: mise run vm:nvidia-modules"
+        exit 1
+    fi
+    local fw_dir="${rootfs_dir}/lib/firmware/nvidia/${driver_tag}"
+    if [ ! -d "${fw_dir}" ]; then
+        fw_dir="${rootfs_dir}/usr/lib/firmware/nvidia/${driver_tag}"
+    fi
+    if [ -d "${fw_dir}" ]; then
+        local fw_count
+        fw_count=$(ls "${fw_dir}"/gsp_*.bin 2>/dev/null | wc -l)
+        echo "    GSP firmware: ${fw_count} files found"
+        for fw in "${fw_dir}"/gsp_*.bin; do
+            [ -f "$fw" ] || continue
+            echo "      $(basename "$fw") ($(du -h "$fw" | cut -f1))"
+        done
+        if [ "$fw_count" -eq 0 ]; then
+            echo "ERROR: No GSP firmware files (gsp_*.bin) in ${fw_dir}" >&2
+            echo "       nvidia-smi will fail with: RmFetchGspRmImages: No firmware image found" >&2
+            exit 1
+        fi
+    else
+        echo "ERROR: GSP firmware directory not found" >&2
+        echo "       Checked: ${rootfs_dir}/lib/firmware/nvidia/${driver_tag}/" >&2
+        echo "       and:     ${rootfs_dir}/usr/lib/firmware/nvidia/${driver_tag}/" >&2
+        echo "       Install: nvidia-firmware-${driver_version}-${driver_tag}" >&2
+        exit 1
+    fi
+}
+
 if [ "$BASE_ONLY" = true ]; then
     echo "==> Building base openshell-vm rootfs"
     echo "    Guest arch:  ${GUEST_ARCH}"
@@ -248,11 +309,13 @@ if [ "$GPU_BUILD" = true ]; then
     docker build --platform "${DOCKER_PLATFORM}" -t "${BASE_IMAGE_TAG}" \
         --build-arg "BASE_IMAGE=${VM_BASE_IMAGE}" \
         --build-arg "NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION}" \
+        --build-arg "NVIDIA_DRIVER_TAG=${NVIDIA_DRIVER_TAG}" \
         --build-arg "NVIDIA_CONTAINER_TOOLKIT_VERSION=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" \
         -f - . <<'DOCKERFILE'
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 ARG NVIDIA_DRIVER_VERSION
+ARG NVIDIA_DRIVER_TAG
 ARG NVIDIA_CONTAINER_TOOLKIT_VERSION
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -260,6 +323,7 @@ RUN apt-get update && \
         e2fsprogs \
         iptables \
         iproute2 \
+        kmod \
         python3 \
         busybox-static \
         sqlite3 \
@@ -276,15 +340,28 @@ RUN mkdir -p /var/lib/rancher/k3s /etc/rancher/k3s
 # Add the NVIDIA package repository and install the open kernel module
 # flavour of the driver plus nvidia-container-toolkit. The open modules
 # are required for data-center GPUs (Turing+ / compute capability >= 7.0).
+# Userspace packages are pinned to $NVIDIA_DRIVER_TAG so they match the
+# kernel modules compiled by build-nvidia-modules.sh.
 RUN curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
         | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
     && curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
         | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
         > /etc/apt/sources.list.d/nvidia-container-toolkit.list
 RUN apt-get update && \
+    HEADLESS_VER=$(apt-cache madison nvidia-headless-${NVIDIA_DRIVER_VERSION}-open \
+        | awk -v tag="${NVIDIA_DRIVER_TAG}" '$3 ~ "^"tag {print $3; exit}') && \
+    UTILS_VER=$(apt-cache madison nvidia-utils-${NVIDIA_DRIVER_VERSION} \
+        | awk -v tag="${NVIDIA_DRIVER_TAG}" '$3 ~ "^"tag {print $3; exit}') && \
+    if [ -z "$HEADLESS_VER" ] || [ -z "$UTILS_VER" ]; then \
+        echo "ERROR: No APT package found for driver tag ${NVIDIA_DRIVER_TAG}" >&2; \
+        echo "  headless: ${HEADLESS_VER:-not found}"; \
+        echo "  utils:    ${UTILS_VER:-not found}"; \
+        exit 1; \
+    fi && \
+    echo "Pinning NVIDIA packages: headless=${HEADLESS_VER} utils=${UTILS_VER}" && \
     apt-get install -y --no-install-recommends \
-        nvidia-headless-${NVIDIA_DRIVER_VERSION}-open \
-        nvidia-utils-${NVIDIA_DRIVER_VERSION} \
+        nvidia-headless-${NVIDIA_DRIVER_VERSION}-open=${HEADLESS_VER} \
+        nvidia-utils-${NVIDIA_DRIVER_VERSION}=${UTILS_VER} \
         nvidia-container-toolkit=${NVIDIA_CONTAINER_TOOLKIT_VERSION}-1 \
     && rm -rf /var/lib/apt/lists/*
 # Configure the NVIDIA container runtime as the default for containerd.
@@ -319,11 +396,19 @@ echo "==> Creating container..."
 docker create --platform "${DOCKER_PLATFORM}" --name "${CONTAINER_NAME}" "${BASE_IMAGE_TAG}" /bin/true
 
 echo "==> Exporting filesystem..."
-# Previous builds may leave overlayfs work/ dirs with permissions that
-# prevent rm on macOS. Force-fix permissions before removing.
+# Previous builds (especially VM pre-init) may leave root-owned files
+# (k3s data, CNI, kubelet) that prevent non-root removal. Try normal
+# cleanup first, fall back to sudo if needed.
 if [ -d "${ROOTFS_DIR}" ]; then
+    if [ -z "${ROOTFS_DIR}" ] || [ "${ROOTFS_DIR}" = "/" ]; then
+        echo "ERROR: ROOTFS_DIR is empty or root — refusing to rm -rf" >&2
+        exit 1
+    fi
     chmod -R u+rwx "${ROOTFS_DIR}" 2>/dev/null || true
-    rm -rf "${ROOTFS_DIR}"
+    if ! rm -rf "${ROOTFS_DIR}" 2>/dev/null; then
+        echo "    Root-owned files detected in ${ROOTFS_DIR}, using sudo to clean..."
+        sudo rm -rf "${ROOTFS_DIR}"
+    fi
 fi
 mkdir -p "${ROOTFS_DIR}"
 docker export "${CONTAINER_NAME}" | tar -C "${ROOTFS_DIR}" -xf -
@@ -455,6 +540,49 @@ if [ "$GPU_BUILD" = true ] && [ -d "${GPU_MANIFEST_SRC}" ]; then
     fi
 fi
 
+# ── Inject NVIDIA kernel modules (GPU rootfs only) ────────────────────
+# The kernel modules are compiled separately by build-nvidia-modules.sh
+# against the VM kernel source tree.  We inject them here so modprobe
+# can load nvidia.ko at VM boot time.
+if [ "$GPU_BUILD" = true ]; then
+    NVIDIA_MODULES_DIR="${PROJECT_ROOT}/target/libkrun-build/nvidia-modules"
+
+    # Read the kernel version exported by build-libkrun.sh.
+    KERNEL_VERSION_FILE="${PROJECT_ROOT}/target/libkrun-build/kernel-version.txt"
+    if [ -f "$KERNEL_VERSION_FILE" ]; then
+        VM_KERNEL_VERSION="$(cat "$KERNEL_VERSION_FILE")"
+    else
+        echo "ERROR: kernel-version.txt not found at ${KERNEL_VERSION_FILE}" >&2
+        echo "       Run: FROM_SOURCE=1 mise run vm:setup" >&2
+        exit 1
+    fi
+
+    MODULE_DEST="${ROOTFS_DIR}/lib/modules/${VM_KERNEL_VERSION}/kernel/drivers/video/nvidia"
+
+    if [ -d "${NVIDIA_MODULES_DIR}" ] && ls "${NVIDIA_MODULES_DIR}"/*.ko >/dev/null 2>&1; then
+        echo "==> Injecting NVIDIA kernel modules (kernel ${VM_KERNEL_VERSION})..."
+        mkdir -p "${MODULE_DEST}"
+        cp "${NVIDIA_MODULES_DIR}"/*.ko "${MODULE_DEST}/"
+        for mod in "${MODULE_DEST}"/*.ko; do
+            echo "    $(basename "$mod") ($(du -h "$mod" | cut -f1))"
+        done
+
+        # Generate module dependency metadata so modprobe works.
+        KERNEL_DIR_NAME="$(grep '^KERNEL_VERSION' "${PROJECT_ROOT}/target/libkrun-build/libkrunfw/Makefile" | head -1 | awk '{print $3}')"
+        SYSTEM_MAP="${PROJECT_ROOT}/target/libkrun-build/libkrunfw/${KERNEL_DIR_NAME}/System.map"
+        if [ -f "$SYSTEM_MAP" ]; then
+            depmod -a -b "${ROOTFS_DIR}" -F "$SYSTEM_MAP" "${VM_KERNEL_VERSION}"
+        else
+            depmod -a -b "${ROOTFS_DIR}" "${VM_KERNEL_VERSION}"
+        fi
+        echo "    depmod: module dependencies generated"
+    else
+        echo "ERROR: NVIDIA kernel modules not found at ${NVIDIA_MODULES_DIR}" >&2
+        echo "       Run: tasks/scripts/vm/build-nvidia-modules.sh" >&2
+        exit 1
+    fi
+fi
+
 # ── Base mode: mark rootfs type and skip pre-loading ───────────────────
 
 if [ "$BASE_ONLY" = true ]; then
@@ -477,22 +605,11 @@ if [ "$BASE_ONLY" = true ]; then
     fi
 
     if [ "$GPU_BUILD" = true ]; then
-        echo "==> Verifying GPU components in rootfs..."
-        if [ ! -f "${ROOTFS_DIR}/usr/bin/nvidia-smi" ]; then
-            echo "ERROR: nvidia-smi not found in rootfs."
-            exit 1
-        fi
         if [ ! -f "${ROOTFS_DIR}/opt/openshell/.rootfs-gpu" ]; then
             echo "ERROR: GPU sentinel file not found in rootfs."
             exit 1
         fi
-        echo "    nvidia-smi: found"
-        # nvidia-container-runtime is installed via nvidia-container-toolkit.
-        if ls "${ROOTFS_DIR}"/usr/bin/nvidia-container-runtime* >/dev/null 2>&1; then
-            echo "    nvidia-container-runtime: found"
-        else
-            echo "WARNING: nvidia-container-runtime not found — GPU pods may not work."
-        fi
+        verify_gpu_rootfs "${ROOTFS_DIR}" "${VM_KERNEL_VERSION:-}" "${NVIDIA_DRIVER_TAG}" "${NVIDIA_DRIVER_VERSION}"
     fi
 
     echo ""
@@ -713,6 +830,7 @@ else
 fi
 # Pre-initialize directly on virtio-fs. Runtime boots attach a separate
 # block-backed state disk and seed it from the rootfs on first launch.
+rm -f "${ROOTFS_DIR}-console.log" 2>/dev/null || sudo rm -f "${ROOTFS_DIR}-console.log" 2>/dev/null || true
 OPENSHELL_VM_DISABLE_STATE_DISK=1 "${GATEWAY_BIN}" --rootfs "${ROOTFS_DIR}" --reset &
 VM_PID=$!
 
@@ -722,6 +840,13 @@ cleanup_vm() {
         echo "    Stopping VM (pid ${VM_PID})..."
         kill "${VM_PID}" 2>/dev/null || true
         wait "${VM_PID}" 2>/dev/null || true
+    fi
+    # Kill orphaned gvproxy processes left by the VM (holds port 30051).
+    local gvproxy_pids
+    gvproxy_pids=$(pgrep -f "gvproxy.*listen-qemu" 2>/dev/null || true)
+    if [ -n "$gvproxy_pids" ]; then
+        echo "    Killing orphaned gvproxy: $gvproxy_pids"
+        kill $gvproxy_pids 2>/dev/null || true
     fi
 }
 trap cleanup_vm EXIT
@@ -740,15 +865,16 @@ for i in $(seq 1 120); do
     sleep 1
 done
 
-# Wait for containerd to be ready.
+# Wait for containerd to be ready. The first boot after a --reset may
+# need extra time for k3s to extract its data dir and start containerd.
 echo "    Waiting for containerd..."
-for i in $(seq 1 60); do
+for i in $(seq 1 180); do
     if vm_exec k3s ctr version >/dev/null 2>&1; then
         echo "    Containerd ready (${i}s)"
         break
     fi
-    if [ "$i" -eq 60 ]; then
-        echo "ERROR: containerd did not become ready in 60s"
+    if [ "$i" -eq 180 ]; then
+        echo "ERROR: containerd did not become ready in 180s"
         exit 1
     fi
     sleep 1
@@ -867,17 +993,7 @@ fi
 
 # ── GPU verification (full mode) ──────────────────────────────────────
 if [ "$GPU_BUILD" = true ]; then
-    echo "==> Verifying GPU components in rootfs..."
-    if [ ! -f "${ROOTFS_DIR}/usr/bin/nvidia-smi" ]; then
-        echo "ERROR: nvidia-smi not found in rootfs."
-        exit 1
-    fi
-    echo "    nvidia-smi: found"
-    if ls "${ROOTFS_DIR}"/usr/bin/nvidia-container-runtime* >/dev/null 2>&1; then
-        echo "    nvidia-container-runtime: found"
-    else
-        echo "WARNING: nvidia-container-runtime not found — GPU pods may not work."
-    fi
+    verify_gpu_rootfs "${ROOTFS_DIR}" "${VM_KERNEL_VERSION:-}" "${NVIDIA_DRIVER_TAG}" "${NVIDIA_DRIVER_VERSION}"
 fi
 
 echo ""

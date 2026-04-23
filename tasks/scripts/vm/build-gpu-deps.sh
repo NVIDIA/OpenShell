@@ -2,14 +2,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Download pre-built cloud-hypervisor and virtiofsd binaries for GPU passthrough.
+# Build GPU passthrough dependencies shared by CHV and QEMU backends.
 #
-# These are only needed on Linux for VFIO GPU passthrough via the
-# cloud-hypervisor backend. The binaries are downloaded from their
-# respective GitHub release pages.
+# Downloads pre-built cloud-hypervisor and builds virtiofsd from source.
+# These are only needed on Linux for VFIO GPU passthrough.
+#
+# Artifacts produced:
+#   cloud-hypervisor  — CHV backend binary (not needed by QEMU)
+#   virtiofsd         — shared by both CHV and QEMU backends
+#
+# The vmlinux kernel (shared by CHV and QEMU) is extracted separately
+# by build-libkrun.sh during the kernel build step.
+#
+# QEMU's own binary (qemu-system-x86_64) must be installed on the host
+# separately — it is not built or downloaded by this script.
+# Run `mise run vm:qemu-check` to validate QEMU prerequisites.
 #
 # Usage:
-#   ./build-cloud-hypervisor.sh [--output-dir <DIR>]
+#   ./build-gpu-deps.sh [--output-dir <DIR>]
 
 set -euo pipefail
 
@@ -64,6 +74,9 @@ CARGO_CMD="cargo"
 if command -v mise &>/dev/null; then
   CARGO_CMD="mise exec -- cargo"
 fi
+# Prevent external CARGO_TARGET_DIR from redirecting build output away from
+# the local temp directory (e.g. Cursor sandbox sets this globally).
+unset CARGO_TARGET_DIR
 $CARGO_CMD build --release --manifest-path "${VIRTIOFSD_SRC}/Cargo.toml"
 cp "${VIRTIOFSD_SRC}/target/release/virtiofsd" "${OUTPUT_DIR}/virtiofsd"
 chmod +x "${OUTPUT_DIR}/virtiofsd"

@@ -138,6 +138,27 @@ CONFIG_DRM=y
 CONFIG_MODULES=y
 CONFIG_MODULE_UNLOAD=y
 
+# MTRR — required dependency for CONFIG_X86_PAT below.
+CONFIG_MTRR=y
+
+# MMU notifier — required by NVIDIA UVM module for GPU memory management.
+CONFIG_MMU_NOTIFIER=y
+
+# PAT (Page Attribute Table) — required for correct GPU memory mapping.
+# Without this, the NVIDIA driver compiles a fallback code path in nv-pat.c
+# that calls __flush_tlb(), which was removed in kernel 6.12+. All modern
+# x86_64 CPUs support PAT; every distro kernel enables it.
+CONFIG_X86_PAT=y
+
+# ── Firmware loading (required for NVIDIA GSP firmware) ──────────────────
+# The NVIDIA open kernel modules use request_firmware() to load GSP firmware
+# from /lib/firmware/nvidia/<version>/. Without CONFIG_FW_LOADER, the kernel
+# has no firmware loading infrastructure and GPU init fails with:
+#   NVRM: RmFetchGspRmImages: No firmware image found
+# On kernel 6.12+, CONFIG_FW_LOADER includes the sysfs loading interface
+# (previously CONFIG_FW_LOADER_SYSFS, now merged).
+CONFIG_FW_LOADER=y
+
 # ── cloud-hypervisor support ────────────────────────────────────────────
 # CHV uses virtio-PCI transport (libkrun uses virtio-MMIO). Both drivers
 # coexist safely — the kernel probes whichever transport the hypervisor
