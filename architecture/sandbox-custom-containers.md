@@ -96,7 +96,7 @@ openshell sandbox create --from ./my-sandbox/  # directory with Dockerfile
 
 The `openshell-sandbox` supervisor adapts to arbitrary environments:
 
-- **Log file fallback**: Attempts to open `/var/log/openshell.log` for append; silently falls back to stdout-only logging if the path is not writable.
+- **Log file fallback**: Attempts to open `/var/log/openshell.log` for append; if the path is not writable, the supervisor keeps console shorthand logging on stderr only.
 - **Command resolution**: Executes the command from CLI args, then the `OPENSHELL_SANDBOX_COMMAND` env var (set to `sleep infinity` by the server), then `/bin/bash` as a last resort.
 - **Startup seccomp prelude**: Before parsing CLI args or starting the async runtime, the supervisor sets `PR_SET_NO_NEW_PRIVS` and installs a narrow seccomp filter that blocks mount/remount, the new mount API syscalls, module loading, kexec, `bpf`, `perf_event_open`, and `userfaultfd`. This closes the privileged remount window while still leaving required child-setup syscalls such as `setns` available.
 - **Network namespace**: Requires successful namespace creation for proxy isolation; startup fails in proxy mode if required capabilities (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`) or `iproute2` are unavailable. If the `iptables` package is present, the supervisor installs OUTPUT chain rules (LOG + REJECT) inside the namespace to provide fast-fail behavior (immediate `ECONNREFUSED` instead of a 30-second timeout) and diagnostic logging when processes attempt direct connections that bypass the HTTP CONNECT proxy. If `iptables` is absent, the supervisor logs a warning and continues — core network isolation still works via routing.
