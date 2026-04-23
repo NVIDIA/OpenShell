@@ -124,6 +124,7 @@ pub(crate) struct DockerGuestTlsPaths {
 struct DockerDriverRuntimeConfig {
     default_image: String,
     image_pull_policy: String,
+    sandbox_namespace: String,
     grpc_endpoint: String,
     ssh_socket_path: String,
     ssh_handshake_secret: String,
@@ -177,6 +178,7 @@ impl DockerComputeDriver {
             config: DockerDriverRuntimeConfig {
                 default_image: config.sandbox_image.clone(),
                 image_pull_policy: config.sandbox_image_pull_policy.clone(),
+                sandbox_namespace: config.sandbox_namespace.clone(),
                 grpc_endpoint: config.grpc_endpoint.clone(),
                 ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
                 ssh_handshake_secret: config.ssh_handshake_secret.clone(),
@@ -290,7 +292,7 @@ impl DockerComputeDriver {
         self.ensure_image_available(&template.image).await?;
 
         let container_name = container_name_for_sandbox(sandbox);
-        let create_body = self.build_container_create_body(sandbox)?;
+        let create_body = build_container_create_body(sandbox, &self.config)?;
         self.docker
             .create_container(
                 Some(
@@ -412,7 +414,7 @@ impl DockerComputeDriver {
     }
 
     async fn list_managed_container_summaries(&self) -> Result<Vec<ContainerSummary>, Status> {
-        let filters = label_filters([format!("{MANAGED_BY_LABEL_KEY}={MANAGED_BY_LABEL_VALUE}")]);
+        let filters = managed_container_label_filters(&self.config.sandbox_namespace, []);
         self.docker
             .list_containers(Some(
                 ListContainersOptionsBuilder::default()
@@ -429,15 +431,15 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<Option<ContainerSummary>, Status> {
-        let mut label_filter_values =
-            vec![format!("{MANAGED_BY_LABEL_KEY}={MANAGED_BY_LABEL_VALUE}")];
+        let mut label_filter_values = Vec::new();
         if !sandbox_id.is_empty() {
             label_filter_values.push(format!("{SANDBOX_ID_LABEL_KEY}={sandbox_id}"));
         } else if !sandbox_name.is_empty() {
             label_filter_values.push(format!("{SANDBOX_NAME_LABEL_KEY}={sandbox_name}"));
         }
 
-        let filters = label_filters(label_filter_values);
+        let filters =
+            managed_container_label_filters(&self.config.sandbox_namespace, label_filter_values);
         let containers = self
             .docker
             .list_containers(Some(
@@ -453,6 +455,9 @@ impl DockerComputeDriver {
             let Some(labels) = summary.labels.as_ref() else {
                 return false;
             };
+            let namespace_matches = labels
+                .get(SANDBOX_NAMESPACE_LABEL_KEY)
+                .is_some_and(|value| value == &self.config.sandbox_namespace);
             let id_matches = sandbox_id.is_empty()
                 || labels
                     .get(SANDBOX_ID_LABEL_KEY)
@@ -461,7 +466,7 @@ impl DockerComputeDriver {
                 || labels
                     .get(SANDBOX_NAME_LABEL_KEY)
                     .is_some_and(|value| value == sandbox_name);
-            id_matches && name_matches
+            namespace_matches && id_matches && name_matches
         }))
     }
 
@@ -501,61 +506,6 @@ impl DockerComputeDriver {
             result.map_err(|err| internal_status("pull Docker image", err))?;
         }
         Ok(())
-    }
-
-    fn build_container_create_body(
-        &self,
-        sandbox: &DriverSandbox,
-    ) -> Result<ContainerCreateBody, Status> {
-        let spec = sandbox
-            .spec
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("sandbox.spec is required"))?;
-        let template = spec
-            .template
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
-        let resource_limits = docker_resource_limits(template)?;
-        let mut labels = template.labels.clone();
-        labels.insert(
-            MANAGED_BY_LABEL_KEY.to_string(),
-            MANAGED_BY_LABEL_VALUE.to_string(),
-        );
-        labels.insert(SANDBOX_ID_LABEL_KEY.to_string(), sandbox.id.clone());
-        labels.insert(SANDBOX_NAME_LABEL_KEY.to_string(), sandbox.name.clone());
-        labels.insert(
-            SANDBOX_NAMESPACE_LABEL_KEY.to_string(),
-            sandbox.namespace.clone(),
-        );
-
-        Ok(ContainerCreateBody {
-            image: Some(template.image.clone()),
-            user: Some("0".to_string()),
-            env: Some(build_environment(sandbox, &self.config)),
-            entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
-            labels: Some(labels),
-            host_config: Some(HostConfig {
-                nano_cpus: resource_limits.nano_cpus,
-                memory: resource_limits.memory_bytes,
-                mounts: Some(build_mounts(&self.config)),
-                restart_policy: Some(RestartPolicy {
-                    name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
-                    maximum_retry_count: None,
-                }),
-                cap_add: Some(vec![
-                    "SYS_ADMIN".to_string(),
-                    "NET_ADMIN".to_string(),
-                    "SYS_PTRACE".to_string(),
-                    "SYSLOG".to_string(),
-                ]),
-                extra_hosts: Some(vec![
-                    format!("{HOST_DOCKER_INTERNAL}:host-gateway"),
-                    format!("{HOST_OPENSHELL_INTERNAL}:host-gateway"),
-                ]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
     }
 }
 
@@ -787,6 +737,64 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         .collect()
 }
 
+fn build_container_create_body(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<ContainerCreateBody, Status> {
+    let spec = sandbox
+        .spec
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("sandbox.spec is required"))?;
+    let template = spec
+        .template
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
+    let resource_limits = docker_resource_limits(template)?;
+    let mut labels = template.labels.clone();
+    labels.insert(
+        MANAGED_BY_LABEL_KEY.to_string(),
+        MANAGED_BY_LABEL_VALUE.to_string(),
+    );
+    labels.insert(SANDBOX_ID_LABEL_KEY.to_string(), sandbox.id.clone());
+    labels.insert(SANDBOX_NAME_LABEL_KEY.to_string(), sandbox.name.clone());
+    labels.insert(
+        SANDBOX_NAMESPACE_LABEL_KEY.to_string(),
+        sandbox.namespace.clone(),
+    );
+
+    Ok(ContainerCreateBody {
+        image: Some(template.image.clone()),
+        user: Some("0".to_string()),
+        env: Some(build_environment(sandbox, config)),
+        entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
+        // Clear the image CMD so Docker does not append inherited args to the
+        // supervisor entrypoint.
+        cmd: Some(Vec::new()),
+        labels: Some(labels),
+        host_config: Some(HostConfig {
+            nano_cpus: resource_limits.nano_cpus,
+            memory: resource_limits.memory_bytes,
+            mounts: Some(build_mounts(config)),
+            restart_policy: Some(RestartPolicy {
+                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+                maximum_retry_count: None,
+            }),
+            cap_add: Some(vec![
+                "SYS_ADMIN".to_string(),
+                "NET_ADMIN".to_string(),
+                "SYS_PTRACE".to_string(),
+                "SYSLOG".to_string(),
+            ]),
+            extra_hosts: Some(vec![
+                format!("{HOST_DOCKER_INTERNAL}:host-gateway"),
+                format!("{HOST_OPENSHELL_INTERNAL}:host-gateway"),
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
 fn sandbox_log_level(sandbox: &DriverSandbox, default_level: &str) -> String {
     sandbox
         .spec
@@ -991,9 +999,12 @@ fn container_ready_condition(
             }
         }
         ContainerSummaryStateEnum::CREATED => ("False", "Starting", "Container created", false),
-        ContainerSummaryStateEnum::RESTARTING => {
-            ("False", "Starting", "Container restarting", false)
-        }
+        ContainerSummaryStateEnum::RESTARTING => (
+            "False",
+            "ContainerRestarting",
+            "Container is restarting after a failure",
+            false,
+        ),
         ContainerSummaryStateEnum::EMPTY => {
             ("False", "Starting", "Container state is unknown", false)
         }
@@ -1053,6 +1064,18 @@ fn emit_snapshot_diff(
 
 fn label_filters(values: impl IntoIterator<Item = String>) -> HashMap<String, Vec<String>> {
     HashMap::from([("label".to_string(), values.into_iter().collect())])
+}
+
+fn managed_container_label_filters(
+    sandbox_namespace: &str,
+    extra_values: impl IntoIterator<Item = String>,
+) -> HashMap<String, Vec<String>> {
+    let mut values = vec![
+        format!("{MANAGED_BY_LABEL_KEY}={MANAGED_BY_LABEL_VALUE}"),
+        format!("{SANDBOX_NAMESPACE_LABEL_KEY}={sandbox_namespace}"),
+    ];
+    values.extend(extra_values);
+    label_filters(values)
 }
 
 /// Maximum Docker container name length. Docker's own limit is 253 bytes, but
@@ -1561,6 +1584,7 @@ fn internal_status(operation: &str, err: BollardError) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::proto::SandboxPhase;
     use openshell_core::proto::compute::v1::{
         DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
     };
@@ -1596,6 +1620,7 @@ mod tests {
         DockerDriverRuntimeConfig {
             default_image: "image:latest".to_string(),
             image_pull_policy: String::new(),
+            sandbox_namespace: "default".to_string(),
             grpc_endpoint: "https://localhost:8443".to_string(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             ssh_handshake_secret: "secret".to_string(),
@@ -1692,6 +1717,37 @@ mod tests {
     }
 
     #[test]
+    fn managed_container_label_filters_include_gateway_namespace() {
+        let filters = managed_container_label_filters(
+            "tenant-a",
+            [format!("{SANDBOX_ID_LABEL_KEY}=sbx-123")],
+        );
+        let labels = filters.get("label").unwrap();
+
+        assert!(labels.contains(&format!("{MANAGED_BY_LABEL_KEY}={MANAGED_BY_LABEL_VALUE}")));
+        assert!(labels.contains(&format!("{SANDBOX_NAMESPACE_LABEL_KEY}=tenant-a")));
+        assert!(labels.contains(&format!("{SANDBOX_ID_LABEL_KEY}=sbx-123")));
+    }
+
+    #[test]
+    fn build_container_create_body_clears_inherited_cmd() {
+        let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
+
+        assert_eq!(
+            create_body.entrypoint,
+            Some(vec![SUPERVISOR_MOUNT_PATH.to_string()])
+        );
+        assert_eq!(create_body.cmd, Some(Vec::new()));
+        assert_eq!(
+            create_body
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(SANDBOX_NAMESPACE_LABEL_KEY)),
+            Some(&"default".to_string())
+        );
+    }
+
+    #[test]
     fn driver_status_keeps_running_sandboxes_provisioning_with_stable_message() {
         let running = ContainerSummary {
             id: Some("cid".to_string()),
@@ -1746,6 +1802,37 @@ mod tests {
         // container must not report Ready=True.
         let exited_connected = driver_status_from_summary(&exited, "demo", true);
         assert_eq!(exited_connected.conditions[0].status, "False");
+    }
+
+    #[test]
+    fn driver_status_marks_restarting_sandboxes_as_error() {
+        let restarting = ContainerSummary {
+            id: Some("cid".to_string()),
+            names: Some(vec!["/openshell-demo".to_string()]),
+            labels: Some(HashMap::from([
+                (SANDBOX_ID_LABEL_KEY.to_string(), "sbx-1".to_string()),
+                (SANDBOX_NAME_LABEL_KEY.to_string(), "demo".to_string()),
+                (
+                    SANDBOX_NAMESPACE_LABEL_KEY.to_string(),
+                    "default".to_string(),
+                ),
+            ])),
+            state: Some(ContainerSummaryStateEnum::RESTARTING),
+            status: Some("Restarting (1) 2 seconds ago".to_string()),
+            ..Default::default()
+        };
+
+        let status = driver_status_from_summary(&restarting, "demo", false);
+        assert_eq!(status.conditions[0].status, "False");
+        assert_eq!(status.conditions[0].reason, "ContainerRestarting");
+        assert_eq!(
+            status.conditions[0].message,
+            "Container is restarting after a failure"
+        );
+        assert_eq!(
+            super::super::derive_phase(Some(&status)),
+            SandboxPhase::Error
+        );
     }
 
     #[test]
