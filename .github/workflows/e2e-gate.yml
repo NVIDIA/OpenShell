@@ -10,13 +10,11 @@ on:
 permissions: {}
 
 jobs:
+  # On PR events, actually evaluate the gate — these runs post their check
+  # result to the PR's head SHA, which is what branch protection sees.
   e2e:
     name: E2E
-    # Run on every PR event; on workflow_run, only when the upstream was the
-    # matching gated workflow.
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.event.workflow_run.name == 'Branch E2E Checks'
+    if: github.event_name == 'pull_request'
     permissions:
       contents: read
       pull-requests: read
@@ -28,9 +26,7 @@ jobs:
 
   gpu:
     name: GPU E2E
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.event.workflow_run.name == 'GPU Test'
+    if: github.event_name == 'pull_request'
     permissions:
       contents: read
       pull-requests: read
@@ -39,3 +35,33 @@ jobs:
     with:
       required_label: test:e2e-gpu
       workflow_file: test-gpu.yml
+
+  # When the guarded workflow finishes, GitHub fires `workflow_run` in the
+  # default-branch context — any check posted from here would land on `main`,
+  # not on the PR. Instead, find the latest `pull_request`-triggered gate run
+  # for the same head SHA and ask the API to re-run it. The re-run replays the
+  # original event (labels, head SHA) so the check posts to the PR again, and
+  # this time the gate sees the successful upstream run.
+  rerun-on-completion:
+    name: Re-run gate in PR context
+    if: github.event_name == 'workflow_run'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Rerun latest PR-context gate for this SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id=$(gh api "repos/$GH_REPO/actions/workflows/e2e-gate.yml/runs?event=pull_request&head_sha=$HEAD_SHA" \
+            --jq '.workflow_runs | sort_by(.created_at) | reverse | .[0].id // empty')
+          if [ -z "$run_id" ]; then
+            echo "No pull_request-triggered E2E Gate run found for $HEAD_SHA — nothing to re-run."
+            exit 0
+          fi
+          echo "Re-running E2E Gate run $run_id so it re-evaluates and posts a fresh check on the PR."
+          gh api --method POST "repos/$GH_REPO/actions/runs/$run_id/rerun"
