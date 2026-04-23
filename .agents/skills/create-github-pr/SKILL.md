@@ -99,22 +99,6 @@ gh pr create --title "PR title" --body "PR description"
 - `refactor(models): simplify deployment logic`
 - `chore(ci): update Python version in pipeline`
 
-## Required PR Fields
-
-Every PR **must** have:
-
-1. **Assignee** - Always assign to yourself
-
-## Assignee and Reviewer
-
-### Always Assign to Yourself
-
-**Every PR must be assigned to the user creating it.** Use the `--assignee` flag:
-
-```bash
-gh pr create --title "Title" --assignee "@me"
-```
-
 ### Link to an Issue
 
 Use `Closes #<issue-number>` in the body to auto-close the issue when merged:
@@ -122,7 +106,6 @@ Use `Closes #<issue-number>` in the body to auto-close the issue when merged:
 ```bash
 gh pr create \
   --title "Fix validation error for empty requests" \
-  --assignee "@me" \
   --body "Closes #123
 
 ## Summary
@@ -135,7 +118,7 @@ gh pr create \
 For work-in-progress that's not ready for review:
 
 ```bash
-gh pr create --draft --title "WIP: New feature" --assignee "@me"
+gh pr create --draft --title "WIP: New feature"
 ```
 
 ### With Labels
@@ -185,7 +168,6 @@ Populate the testing checklist based on what was actually run. Check boxes for s
 ```bash
 gh pr create \
   --title "feat(cli): add pagination to sandbox list" \
-  --assignee "@me" \
   --body "$(cat <<'EOF'
 ## Summary
 
@@ -222,7 +204,6 @@ EOF
 | ------------------- | ------------------------------------------ |
 | `--title, -t`       | PR title (use conventional commit format)  |
 | `--body, -b`        | PR description                             |
-| `--assignee, -a`    | Assign to user (use `@me` for yourself)    |
 | `--reviewer, -r`    | Request review from user                   |
 | `--draft`           | Create as draft (WIP)                      |
 | `--label, -l`       | Add label (can use multiple times)         |

@@ -207,7 +207,6 @@ Create a PR that closes the security issue. Put the full fix summary in the PR d
 ```bash
 gh pr create \
   --title "fix(security): <short description>" \
-  --assignee "@me" \
   --label "topic:security" \
   --body "$(cat <<'EOF'
 > **🔧 security-fix-agent**

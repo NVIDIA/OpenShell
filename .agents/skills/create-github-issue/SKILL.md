@@ -114,7 +114,6 @@ GitHub built-in issue types (`Bug`, `Feature`, `Task`) should come from the matc
 | `--title, -t`       | Issue title (required)             |
 | `--body, -b`        | Issue description                  |
 | `--label, -l`       | Add label (can use multiple times) |
-| `--assignee, -a`    | Assign to user                     |
 | `--milestone, -m`   | Add to milestone                   |
 | `--project, -p`     | Add to project                     |
 | `--web`             | Open in browser after creation     |

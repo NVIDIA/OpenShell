@@ -478,7 +478,6 @@ Create the PR:
 ```bash
 gh pr create \
   --title "<type>(<scope>): <short description>" \
-  --assignee "@me" \
   --body "$(cat <<'EOF'
 > **🏗️ build-from-issue-agent**
 
