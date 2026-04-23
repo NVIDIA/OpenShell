@@ -6,11 +6,17 @@
 #
 # Tasks are defined in tasks/*.toml — run `mise tasks` to list them all.
 
+# NOTE: keep this version in sync with what CI uses in Dockerfile.ci
+min_version = { hard = "2026.4.18" }
+
 redactions = ["*_TOKEN", "*_PASSWORD"]
 
 [settings]
 experimental = true
 python.precompiled_flavor = "install_only_stripped"
+
+lockfile = true
+lockfile_platforms = ["linux-x64", "linux-arm64", "macos-arm64"]
 
 [tools]
 python = "3.13.12"
@@ -20,10 +26,16 @@ kubectl = "1.35.1"
 uv = "0.10.2"
 protoc = "29.6"
 helm = "4.1.4"
-"ubi:mozilla/sccache" = { version = "0.14.0", matching = "sccache-v" }
 "github:anchore/syft" = { version = "1.42.3" }
 "github:EmbarkStudios/cargo-about" = { version = "0.8.4", version_prefix = "" }
 zig = "0.14.1"
+
+[tools."github:mozilla/sccache"]
+version = "0.14.0"
+
+[tools."github:mozilla/sccache".platforms]
+# NOTE: this override is necessary only for linux-x64, otherwise it selects an invalid artifact (sccache-dist-vx.y.z-x86_64-unknown-linux-musl.tar.gz)
+linux-x64 = { asset_pattern = "sccache-v*x86_64*linux*.tar.gz" }
 
 [env]
 _.path = ["{{config_root}}/scripts/bin"]

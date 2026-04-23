@@ -153,7 +153,7 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Install tools
-        run: mise install
+        run: mise install --locked
 
       - name: Install zstd
         run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
@@ -222,7 +222,7 @@ jobs:
         run: git fetch --tags --force
 
       - name: Install tools
-        run: mise install
+        run: mise install --locked
 
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
@@ -459,7 +459,7 @@ jobs:
         run: git fetch --tags --force
 
       - name: Install tools
-        run: mise install
+        run: mise install --locked
 
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
