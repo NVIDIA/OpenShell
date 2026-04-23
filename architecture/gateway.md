@@ -617,6 +617,7 @@ The gateway reaches the sandbox exclusively through the supervisor-initiated `Co
 - **TLS**: For `https://` gateway endpoints, the driver requires `--docker-tls-ca`, `--docker-tls-cert`, and `--docker-tls-key`. These files are bind-mounted read-only into `/etc/openshell/tls/client`, and the driver sets `OPENSHELL_TLS_CA`, `OPENSHELL_TLS_CERT`, and `OPENSHELL_TLS_KEY` to those paths.
 - **Limits**: V1 supports only `cpu_limit` and `memory_limit`, mapped to Docker `NanoCpus` and `Memory`. GPU requests, resource requests, `agent_socket_path`, and non-empty `platform_config` are rejected as failed preconditions.
 - **Watch stream**: The driver polls Docker for OpenShell-managed containers, emits snapshot diffs and deletions, and rebuilds its state from labels after gateway restart. Containers running under Docker restart policy `unless-stopped` come back after daemon restart without any inbound port setup.
+- **Local development**: `mise run gateway:docker` starts a standalone plaintext gateway against the local Docker daemon for manual CLI testing. `mise run e2e:docker` layers the Rust smoke test on top of that same standalone flow.
 
 ### VM Driver
 
