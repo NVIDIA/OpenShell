@@ -11,8 +11,8 @@ use owo_colors::OwoColorize;
 use std::io::Write;
 
 use openshell_bootstrap::{
-    edge_token::load_edge_token, get_gateway_metadata, list_gateways, load_active_gateway,
-    load_gateway_metadata, load_last_sandbox, save_last_sandbox,
+    GatewayBackend, edge_token::load_edge_token, get_gateway_metadata, list_gateways,
+    load_active_gateway, load_gateway_metadata, load_last_sandbox, save_last_sandbox,
 };
 use openshell_cli::completers;
 use openshell_cli::run;
@@ -24,6 +24,25 @@ struct GatewayContext {
     name: String,
     /// The gateway endpoint URL (e.g., `https://127.0.0.1` or `https://10.0.0.5`).
     endpoint: String,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum GatewayBackendArg {
+    K3s,
+    Kubernetes,
+    Vm,
+    Podman,
+}
+
+impl From<GatewayBackendArg> for GatewayBackend {
+    fn from(value: GatewayBackendArg) -> Self {
+        match value {
+            GatewayBackendArg::K3s => Self::K3s,
+            GatewayBackendArg::Kubernetes => Self::Kubernetes,
+            GatewayBackendArg::Vm => Self::Vm,
+            GatewayBackendArg::Podman => Self::Podman,
+        }
+    }
 }
 
 /// Resolve the gateway name to a [`GatewayContext`] with the gateway endpoint.
@@ -744,6 +763,15 @@ enum GatewayCommands {
         #[arg(long, default_value = "openshell", env = "OPENSHELL_GATEWAY")]
         name: String,
 
+        /// Gateway deployment backend.
+        #[arg(
+            long,
+            value_enum,
+            default_value = "k3s",
+            env = "OPENSHELL_GATEWAY_BACKEND"
+        )]
+        backend: GatewayBackendArg,
+
         /// SSH destination for remote deployment (e.g., user@hostname).
         #[arg(long)]
         remote: Option<String>,
@@ -763,7 +791,7 @@ enum GatewayCommands {
         /// example in CI containers, WSL, or when Docker runs on a
         /// remote host. Common values: `host.docker.internal`, a LAN IP,
         /// or a hostname.
-        #[arg(long)]
+        #[arg(long, env = "OPENSHELL_GATEWAY_HOST")]
         gateway_host: Option<String>,
 
         /// Destroy and recreate the gateway from scratch if one already exists.
@@ -1644,6 +1672,7 @@ async fn main() -> Result<()> {
         }) => match command {
             GatewayCommands::Start {
                 name,
+                backend,
                 remote,
                 ssh_key,
                 port,
@@ -1662,6 +1691,7 @@ async fn main() -> Result<()> {
                 };
                 run::gateway_admin_deploy(
                     &name,
+                    backend.into(),
                     remote.as_deref(),
                     ssh_key.as_deref(),
                     port,
@@ -2699,6 +2729,8 @@ mod tests {
             remote_host: None,
             resolved_host: None,
             auth_mode: Some("cloudflare_jwt".to_string()),
+            backend: None,
+            configured_gateway_host: None,
             edge_team_domain: None,
             edge_auth_url: None,
         }

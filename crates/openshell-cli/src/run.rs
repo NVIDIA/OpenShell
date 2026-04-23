@@ -15,12 +15,15 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use openshell_bootstrap::{
-    DeployOptions, GatewayMetadata, RemoteOptions, clear_active_gateway,
+    DeployOptions, GatewayBackend, GatewayMetadata, RemoteOptions, clear_active_gateway,
     clear_last_sandbox_if_matches, container_name, extract_host_from_ssh_destination,
     get_gateway_metadata, list_gateways, load_active_gateway, remove_gateway_metadata,
     resolve_ssh_hostname, save_active_gateway, save_last_sandbox, store_gateway_metadata,
 };
+use openshell_bootstrap::{constants, mtls, pki};
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
@@ -38,9 +41,11 @@ use openshell_providers::{
 };
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{IsTerminal, Read, Write};
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tonic::{Code, Status};
 
@@ -52,6 +57,10 @@ pub use crate::ssh::{
 };
 pub use openshell_core::forward::{
     find_forward_by_port, list_forwards, stop_forward, stop_forwards_for_sandbox,
+};
+use openshell_core::paths::{
+    create_dir_restricted, ensure_parent_dir_restricted, set_file_owner_only, xdg_config_dir,
+    xdg_data_dir,
 };
 
 /// Convert a sandbox phase integer to a human-readable string.
@@ -784,34 +793,38 @@ pub fn gateway_select(name: Option<&str>, gateway_flag: &Option<String>) -> Resu
 }
 
 fn format_gateway_select_header(gateways: &[GatewayMetadata]) -> String {
-    let (name_width, endpoint_width, type_width) = gateway_select_column_widths(gateways);
+    let (name_width, endpoint_width, type_width, backend_width) =
+        gateway_select_column_widths(gateways);
     format!(
-        "  {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {}",
+        "  {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {:<backend_width$}  {}",
         "NAME".bold(),
         "ENDPOINT".bold(),
         "TYPE".bold(),
+        "BACKEND".bold(),
         "AUTH".bold(),
     )
 }
 
 fn format_gateway_select_items(gateways: &[GatewayMetadata]) -> Vec<String> {
-    let (name_width, endpoint_width, type_width) = gateway_select_column_widths(gateways);
+    let (name_width, endpoint_width, type_width, backend_width) =
+        gateway_select_column_widths(gateways);
 
     gateways
         .iter()
         .map(|gateway| {
             format!(
-                "{:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {}",
+                "{:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {:<backend_width$}  {}",
                 gateway.name,
                 gateway.gateway_endpoint,
                 gateway_type_label(gateway),
+                gateway_backend_label(gateway),
                 gateway_auth_label(gateway),
             )
         })
         .collect()
 }
 
-fn gateway_select_column_widths(gateways: &[GatewayMetadata]) -> (usize, usize, usize) {
+fn gateway_select_column_widths(gateways: &[GatewayMetadata]) -> (usize, usize, usize, usize) {
     let name_width = gateways
         .iter()
         .map(|gateway| gateway.name.len())
@@ -830,8 +843,14 @@ fn gateway_select_column_widths(gateways: &[GatewayMetadata]) -> (usize, usize, 
         .max()
         .unwrap_or(4)
         .max(4);
+    let backend_width = gateways
+        .iter()
+        .map(|gateway| gateway_backend_label(gateway).len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
 
-    (name_width, endpoint_width, type_width)
+    (name_width, endpoint_width, type_width, backend_width)
 }
 
 fn gateway_type_label(gateway: &GatewayMetadata) -> &'static str {
@@ -848,6 +867,10 @@ fn gateway_auth_label(gateway: &GatewayMetadata) -> &str {
         None if gateway.gateway_endpoint.starts_with("http://") => "plaintext",
         None => "mtls",
     }
+}
+
+fn gateway_backend_label(gateway: &GatewayMetadata) -> &str {
+    gateway.backend().map_or("-", GatewayBackend::as_str)
 }
 
 fn is_loopback_gateway_endpoint(endpoint: &str) -> bool {
@@ -895,6 +918,8 @@ fn plaintext_gateway_metadata(
         remote_host,
         resolved_host,
         auth_mode: Some("plaintext".to_string()),
+        backend: None,
+        configured_gateway_host: None,
         edge_team_domain: None,
         edge_auth_url: None,
     }
@@ -1058,6 +1083,11 @@ pub async fn gateway_add(
         );
         eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint);
         eprintln!("  {} {}", "Type:".dimmed(), gateway_type);
+        eprintln!(
+            "  {} {}",
+            "Backend:".dimmed(),
+            gateway_backend_label(&metadata)
+        );
         eprintln!("  {} {}", "Auth:".dimmed(), gateway_auth);
 
         return Ok(());
@@ -1098,6 +1128,8 @@ pub async fn gateway_add(
             remote_host,
             resolved_host,
             auth_mode: Some("mtls".to_string()),
+            backend: None,
+            configured_gateway_host: None,
             edge_team_domain: None,
             edge_auth_url: None,
         };
@@ -1116,6 +1148,11 @@ pub async fn gateway_add(
             "Type:".dimmed(),
             if local { "local" } else { "remote" },
         );
+        eprintln!(
+            "  {} {}",
+            "Backend:".dimmed(),
+            gateway_backend_label(&metadata)
+        );
         eprintln!("{} TLS certificates extracted", "✓".green().bold());
     } else {
         // Cloud (edge-authenticated) gateway.
@@ -1127,6 +1164,8 @@ pub async fn gateway_add(
             remote_host: None,
             resolved_host: None,
             auth_mode: Some("cloudflare_jwt".to_string()),
+            backend: None,
+            configured_gateway_host: None,
             edge_team_domain: None,
             edge_auth_url: None,
         };
@@ -1141,6 +1180,11 @@ pub async fn gateway_add(
         );
         eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint);
         eprintln!("  {} cloud", "Type:".dimmed());
+        eprintln!(
+            "  {} {}",
+            "Backend:".dimmed(),
+            gateway_backend_label(&metadata)
+        );
         eprintln!();
 
         match crate::auth::browser_auth_flow(&endpoint).await {
@@ -1221,13 +1265,20 @@ pub fn gateway_list(gateway_flag: &Option<String>) -> Result<()> {
         .max()
         .unwrap_or(4)
         .max(4);
+    let backend_width = gateways
+        .iter()
+        .map(|g| gateway_backend_label(g).len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
 
     // Print header
     println!(
-        "  {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {}",
+        "  {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {:<backend_width$}  {}",
         "NAME".bold(),
         "ENDPOINT".bold(),
         "TYPE".bold(),
+        "BACKEND".bold(),
         "AUTH".bold(),
     );
 
@@ -1236,10 +1287,11 @@ pub fn gateway_list(gateway_flag: &Option<String>) -> Result<()> {
         let is_active = active.as_deref() == Some(&gateway.name);
         let marker = if is_active { "*" } else { " " };
         let gw_type = gateway_type_label(gateway);
+        let gw_backend = gateway_backend_label(gateway);
         let gw_auth = gateway_auth_label(gateway);
         let line = format!(
-            "{marker} {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {gw_auth}",
-            gateway.name, gateway.gateway_endpoint, gw_type,
+            "{marker} {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {:<backend_width$}  {gw_auth}",
+            gateway.name, gateway.gateway_endpoint, gw_type, gw_backend,
         );
         if is_active {
             println!("{}", line.green());
@@ -1421,9 +1473,854 @@ fn print_failure_diagnosis(diagnosis: &openshell_bootstrap::errors::GatewayFailu
     }
 }
 
+const HOST_RUN_GATEWAY_NAMESPACE: &str = "openshell";
+const HOST_RUN_GATEWAY_LOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const HOST_RUN_GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const HOST_RUN_GATEWAY_VM_CALLBACK_HOST: &str = "host.openshell.internal";
+
+#[derive(Debug, Clone)]
+struct HostRunGatewayPaths {
+    config_dir: PathBuf,
+    data_dir: PathBuf,
+    server_tls_dir: PathBuf,
+    db_path: PathBuf,
+    pid_path: PathBuf,
+    log_path: PathBuf,
+    ssh_secret_path: PathBuf,
+    vm_state_dir: PathBuf,
+}
+
+impl HostRunGatewayPaths {
+    fn for_gateway(name: &str) -> Result<Self> {
+        let config_dir = xdg_config_dir()?
+            .join("openshell")
+            .join("gateways")
+            .join(name);
+        let data_dir = xdg_data_dir()?
+            .join("openshell")
+            .join("gateways")
+            .join(name);
+        Ok(Self {
+            server_tls_dir: config_dir.join("server-tls"),
+            db_path: data_dir.join("gateway.db"),
+            pid_path: data_dir.join("gateway.pid"),
+            log_path: data_dir.join("gateway.log"),
+            ssh_secret_path: config_dir.join("ssh-handshake-secret"),
+            vm_state_dir: data_dir.join("vm"),
+            config_dir,
+            data_dir,
+        })
+    }
+
+    fn server_ca_path(&self) -> PathBuf {
+        self.server_tls_dir.join("ca.crt")
+    }
+
+    fn server_cert_path(&self) -> PathBuf {
+        self.server_tls_dir.join("tls.crt")
+    }
+
+    fn server_key_path(&self) -> PathBuf {
+        self.server_tls_dir.join("tls.key")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedGatewayKind {
+    K3s,
+    HostRun(GatewayBackend),
+    External,
+}
+
+fn gateway_kind(metadata: Option<&GatewayMetadata>) -> ManagedGatewayKind {
+    match metadata.and_then(GatewayMetadata::backend) {
+        Some(GatewayBackend::K3s) => ManagedGatewayKind::K3s,
+        Some(
+            backend @ (GatewayBackend::Kubernetes | GatewayBackend::Vm | GatewayBackend::Podman),
+        ) => ManagedGatewayKind::HostRun(backend),
+        None => ManagedGatewayKind::External,
+    }
+}
+
+fn lifecycle_gateway_kind(metadata: Option<&GatewayMetadata>) -> ManagedGatewayKind {
+    metadata.map_or(ManagedGatewayKind::K3s, |metadata| {
+        gateway_kind(Some(metadata))
+    })
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host == "127.0.0.1"
+        || host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host == "[::1]"
+}
+
+fn localhost_gateway_endpoint(port: u16, disable_tls: bool) -> String {
+    let scheme = if disable_tls { "http" } else { "https" };
+    format!("{scheme}://127.0.0.1:{port}")
+}
+
+fn host_run_auth_mode(disable_tls: bool, disable_gateway_auth: bool) -> Option<String> {
+    if disable_tls {
+        Some("plaintext".to_string())
+    } else if disable_gateway_auth {
+        Some("mtls_optional".to_string())
+    } else {
+        None
+    }
+}
+
+fn is_plaintext_auth_mode(auth_mode: Option<&str>) -> bool {
+    matches!(auth_mode, Some("plaintext"))
+}
+
+fn is_optional_mtls_auth_mode(auth_mode: Option<&str>) -> bool {
+    matches!(auth_mode, Some("mtls_optional"))
+}
+
+fn gateway_binary_candidates() -> Result<Vec<PathBuf>> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("OPENSHELL_GATEWAY_BIN")
+        && !path.trim().is_empty()
+    {
+        candidates.push(PathBuf::from(path));
+    }
+
+    let current_exe = std::env::current_exe()
+        .into_diagnostic()
+        .wrap_err("failed to resolve current OpenShell executable")?;
+    if let Some(parent) = current_exe.parent() {
+        candidates.push(parent.join("openshell-gateway"));
+    }
+    candidates.extend(path_lookup_candidates("openshell-gateway"));
+    Ok(candidates)
+}
+
+fn vm_compute_driver_candidates(gateway_bin: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("OPENSHELL_VM_COMPUTE_DRIVER_BIN")
+        && !path.trim().is_empty()
+    {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(parent) = gateway_bin.parent() {
+        candidates.push(parent.join("openshell-driver-vm"));
+    }
+    candidates.extend(path_lookup_candidates("openshell-driver-vm"));
+    candidates
+}
+
+fn path_lookup_candidates(binary_name: &str) -> Vec<PathBuf> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|dir| dir.join(binary_name))
+        .collect()
+}
+
+fn resolve_binary(candidates: &[PathBuf], install_hint: &str) -> Result<PathBuf> {
+    candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .ok_or_else(|| miette!("{install_hint}"))
+}
+
+fn configured_gateway_host(
+    requested_gateway_host: Option<&str>,
+    stored_metadata: Option<&GatewayMetadata>,
+) -> String {
+    requested_gateway_host
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            stored_metadata
+                .and_then(GatewayMetadata::gateway_host)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+fn host_run_gateway_port(port: u16, stored_metadata: Option<&GatewayMetadata>) -> u16 {
+    stored_metadata
+        .filter(|metadata| metadata.gateway_port > 0)
+        .map_or(port, |metadata| metadata.gateway_port)
+}
+
+fn host_run_gateway_metadata(
+    name: &str,
+    backend: GatewayBackend,
+    port: u16,
+    disable_tls: bool,
+    disable_gateway_auth: bool,
+    gateway_host: &str,
+) -> GatewayMetadata {
+    GatewayMetadata {
+        name: name.to_string(),
+        gateway_endpoint: localhost_gateway_endpoint(port, disable_tls),
+        is_remote: false,
+        gateway_port: port,
+        remote_host: None,
+        resolved_host: None,
+        auth_mode: host_run_auth_mode(disable_tls, disable_gateway_auth),
+        backend: Some(backend),
+        configured_gateway_host: Some(gateway_host.to_string()),
+        edge_team_domain: None,
+        edge_auth_url: None,
+    }
+}
+
+fn read_pid_file(path: &Path) -> Result<Option<i32>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read PID file {}", path.display()))?;
+    let pid = contents
+        .trim()
+        .parse::<i32>()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to parse PID file {}", path.display()))?;
+    Ok(Some(pid))
+}
+
+fn is_process_alive(pid: i32) -> bool {
+    kill(Pid::from_raw(pid), None).is_ok()
+}
+
+fn cleanup_stale_pid_file(path: &Path) {
+    if let Err(err) = fs::remove_file(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!("failed to remove stale pid file {}: {err}", path.display());
+    }
+}
+
+async fn stop_host_run_process(paths: &HostRunGatewayPaths) -> Result<bool> {
+    let Some(pid) = read_pid_file(&paths.pid_path)? else {
+        cleanup_stale_pid_file(&paths.pid_path);
+        return Ok(false);
+    };
+
+    let pid = Pid::from_raw(pid);
+    if !is_process_alive(pid.as_raw()) {
+        cleanup_stale_pid_file(&paths.pid_path);
+        return Ok(false);
+    }
+
+    kill(pid, Signal::SIGTERM)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to stop gateway process {}", pid.as_raw()))?;
+
+    let deadline = Instant::now() + HOST_RUN_GATEWAY_STOP_TIMEOUT;
+    while Instant::now() < deadline {
+        if !is_process_alive(pid.as_raw()) {
+            cleanup_stale_pid_file(&paths.pid_path);
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    kill(pid, Signal::SIGKILL)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to kill gateway process {}", pid.as_raw()))?;
+    cleanup_stale_pid_file(&paths.pid_path);
+    Ok(true)
+}
+
+fn remove_host_run_runtime_state(paths: &HostRunGatewayPaths) -> Result<()> {
+    for path in [
+        &paths.data_dir,
+        &paths.server_tls_dir,
+        &paths.config_dir.join("mtls"),
+    ] {
+        match fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(miette!("failed to remove {}: {err}", path.display()));
+            }
+        }
+    }
+    match fs::remove_file(&paths.ssh_secret_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(miette!(
+                "failed to remove {}: {err}",
+                paths.ssh_secret_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn host_run_tls_sans(
+    backend: GatewayBackend,
+    gateway_host: &str,
+    grpc_endpoint: &str,
+) -> Vec<String> {
+    let mut sans = Vec::new();
+    if !is_loopback_host(gateway_host) {
+        sans.push(gateway_host.to_string());
+    }
+    if let Ok(url) = url::Url::parse(grpc_endpoint)
+        && let Some(host) = url.host_str()
+        && !is_loopback_host(host)
+    {
+        sans.push(host.to_string());
+    }
+    if backend == GatewayBackend::Vm {
+        sans.push(HOST_RUN_GATEWAY_VM_CALLBACK_HOST.to_string());
+    }
+    sans.sort();
+    sans.dedup();
+    sans
+}
+
+fn write_private_file(path: &Path, contents: &str) -> Result<()> {
+    ensure_parent_dir_restricted(path)?;
+    fs::write(path, contents)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+    set_file_owner_only(path)?;
+    Ok(())
+}
+
+fn ensure_host_run_tls_materials(
+    name: &str,
+    backend: GatewayBackend,
+    paths: &HostRunGatewayPaths,
+    gateway_host: &str,
+    grpc_endpoint: &str,
+    disable_tls: bool,
+) -> Result<()> {
+    if disable_tls {
+        return Ok(());
+    }
+
+    let client_key_path = paths.config_dir.join("mtls").join("tls.key");
+    let server_key_path = paths.server_key_path();
+    if client_key_path.is_file() && server_key_path.is_file() {
+        return Ok(());
+    }
+
+    let bundle = pki::generate_pki(&host_run_tls_sans(backend, gateway_host, grpc_endpoint))?;
+    mtls::store_pki_bundle(name, &bundle)?;
+    create_dir_restricted(&paths.server_tls_dir)?;
+    write_private_file(&paths.server_ca_path(), &bundle.ca_cert_pem)?;
+    write_private_file(&paths.server_cert_path(), &bundle.server_cert_pem)?;
+    write_private_file(&paths.server_key_path(), &bundle.server_key_pem)?;
+    Ok(())
+}
+
+fn load_or_create_ssh_handshake_secret(paths: &HostRunGatewayPaths) -> Result<String> {
+    if paths.ssh_secret_path.is_file() {
+        let secret = fs::read_to_string(&paths.ssh_secret_path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read {}", paths.ssh_secret_path.display()))?;
+        let secret = secret.trim().to_string();
+        if !secret.is_empty() {
+            return Ok(secret);
+        }
+    }
+
+    let mut bytes = [0u8; 32];
+    File::open("/dev/urandom")
+        .into_diagnostic()
+        .wrap_err("failed to open /dev/urandom for SSH handshake secret generation")?
+        .read_exact(&mut bytes)
+        .into_diagnostic()
+        .wrap_err("failed to read randomness for SSH handshake secret")?;
+    let secret = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    write_private_file(&paths.ssh_secret_path, &secret)?;
+    Ok(secret)
+}
+
+fn kubectl_capture(args: &[&str]) -> Result<std::process::Output> {
+    Command::new("kubectl")
+        .args(args)
+        .output()
+        .into_diagnostic()
+        .wrap_err("failed to invoke kubectl")
+}
+
+fn ensure_kubernetes_backend_prereqs() -> Result<()> {
+    let namespace =
+        kubectl_capture(&["get", "namespace", HOST_RUN_GATEWAY_NAMESPACE, "-o", "name"])?;
+    if !namespace.status.success() {
+        let stderr = String::from_utf8_lossy(&namespace.stderr);
+        return Err(miette!(
+            "kubernetes backend requires namespace '{HOST_RUN_GATEWAY_NAMESPACE}'.\n\
+             Current kube context is not ready for OpenShell: {}",
+            stderr.trim()
+        ));
+    }
+
+    let crd = kubectl_capture(&["get", "crd", "sandboxes.agents.x-k8s.io", "-o", "name"])?;
+    if !crd.status.success() {
+        let stderr = String::from_utf8_lossy(&crd.stderr);
+        return Err(miette!(
+            "kubernetes backend requires the Sandbox CRD 'sandboxes.agents.x-k8s.io'.\n\
+             Current kube context is missing the OpenShell CRDs: {}",
+            stderr.trim()
+        ));
+    }
+
+    Ok(())
+}
+
+fn upsert_kubernetes_client_tls_secret(bundle_dir: &Path) -> Result<()> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let cert = fs::read(bundle_dir.join("tls.crt"))
+        .into_diagnostic()
+        .wrap_err("failed to read client TLS cert")?;
+    let key = fs::read(bundle_dir.join("tls.key"))
+        .into_diagnostic()
+        .wrap_err("failed to read client TLS key")?;
+    let ca = fs::read(bundle_dir.join("ca.crt"))
+        .into_diagnostic()
+        .wrap_err("failed to read client TLS CA")?;
+
+    let manifest = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": constants::CLIENT_TLS_SECRET_NAME,
+            "namespace": HOST_RUN_GATEWAY_NAMESPACE,
+        },
+        "type": "Opaque",
+        "data": {
+            "tls.crt": STANDARD.encode(cert),
+            "tls.key": STANDARD.encode(key),
+            "ca.crt": STANDARD.encode(ca),
+        }
+    })
+    .to_string();
+
+    let mut child = Command::new("kubectl")
+        .args(["apply", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .into_diagnostic()
+        .wrap_err("failed to apply openshell-client-tls secret")?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(manifest.as_bytes())
+            .into_diagnostic()
+            .wrap_err("failed to write openshell-client-tls manifest to kubectl")?;
+    }
+    let output = child
+        .wait_with_output()
+        .into_diagnostic()
+        .wrap_err("failed to wait for kubectl apply")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(miette!(
+            "failed to apply openshell-client-tls secret: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+fn log_file_handle(path: &Path) -> Result<File> {
+    ensure_parent_dir_restricted(path)?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to open {}", path.display()))
+}
+
+fn resolve_host_run_grpc_endpoint(
+    backend: GatewayBackend,
+    port: u16,
+    disable_tls: bool,
+    gateway_host: &str,
+) -> Result<String> {
+    let scheme = if disable_tls { "http" } else { "https" };
+    match backend {
+        GatewayBackend::Kubernetes => {
+            if let Ok(host_gateway_ip) = std::env::var("OPENSHELL_HOST_GATEWAY_IP")
+                && !host_gateway_ip.trim().is_empty()
+            {
+                return Ok(format!("{scheme}://host.openshell.internal:{port}"));
+            }
+            if !is_loopback_host(gateway_host) {
+                return Ok(format!("{scheme}://{gateway_host}:{port}"));
+            }
+            Err(miette!(
+                "kubernetes backend needs a pod-reachable gateway host.\n\
+                 Set OPENSHELL_GATEWAY_HOST to a host or IP reachable from the cluster, or set OPENSHELL_HOST_GATEWAY_IP to let sandboxes use host.openshell.internal."
+            ))
+        }
+        GatewayBackend::Vm => Ok(format!(
+            "{scheme}://{HOST_RUN_GATEWAY_VM_CALLBACK_HOST}:{port}"
+        )),
+        GatewayBackend::K3s | GatewayBackend::Podman => unreachable!("not a host-run backend"),
+    }
+}
+
+fn host_run_gateway_args(
+    backend: GatewayBackend,
+    gateway_bin: &Path,
+    paths: &HostRunGatewayPaths,
+    port: u16,
+    disable_tls: bool,
+    disable_gateway_auth: bool,
+    gateway_host: &str,
+    grpc_endpoint: &str,
+) -> Result<Vec<OsString>> {
+    let mut args = vec![
+        gateway_bin.as_os_str().to_os_string(),
+        OsString::from("--port"),
+        OsString::from(port.to_string()),
+        OsString::from("--db-url"),
+        OsString::from(format!("sqlite:{}", paths.db_path.display())),
+        OsString::from("--drivers"),
+        OsString::from(backend.to_string()),
+        OsString::from("--ssh-gateway-host"),
+        OsString::from(gateway_host),
+        OsString::from("--ssh-gateway-port"),
+        OsString::from(port.to_string()),
+        OsString::from("--ssh-handshake-secret"),
+        OsString::from(load_or_create_ssh_handshake_secret(paths)?),
+        OsString::from("--grpc-endpoint"),
+        OsString::from(grpc_endpoint),
+    ];
+
+    if backend == GatewayBackend::Kubernetes {
+        args.push(OsString::from("--sandbox-namespace"));
+        args.push(OsString::from(HOST_RUN_GATEWAY_NAMESPACE));
+        if !disable_tls {
+            args.push(OsString::from("--client-tls-secret-name"));
+            args.push(OsString::from(constants::CLIENT_TLS_SECRET_NAME));
+        }
+        if let Ok(ip) = std::env::var("OPENSHELL_HOST_GATEWAY_IP")
+            && !ip.trim().is_empty()
+        {
+            args.push(OsString::from("--host-gateway-ip"));
+            args.push(OsString::from(ip));
+        }
+    } else if backend == GatewayBackend::Vm {
+        args.push(OsString::from("--vm-driver-state-dir"));
+        args.push(paths.vm_state_dir.as_os_str().to_os_string());
+        let driver_bin = resolve_binary(
+            &vm_compute_driver_candidates(gateway_bin),
+            "vm backend requires the openshell-driver-vm binary to be installed or included alongside openshell-gateway",
+        )?;
+        args.push(OsString::from("--vm-compute-driver-bin"));
+        args.push(driver_bin.as_os_str().to_os_string());
+        if !disable_tls {
+            let mtls_dir = paths.config_dir.join("mtls");
+            args.push(OsString::from("--vm-tls-ca"));
+            args.push(mtls_dir.join("ca.crt").as_os_str().to_os_string());
+            args.push(OsString::from("--vm-tls-cert"));
+            args.push(mtls_dir.join("tls.crt").as_os_str().to_os_string());
+            args.push(OsString::from("--vm-tls-key"));
+            args.push(mtls_dir.join("tls.key").as_os_str().to_os_string());
+        }
+    }
+
+    if disable_tls {
+        args.push(OsString::from("--disable-tls"));
+    } else {
+        args.push(OsString::from("--tls-cert"));
+        args.push(paths.server_cert_path().as_os_str().to_os_string());
+        args.push(OsString::from("--tls-key"));
+        args.push(paths.server_key_path().as_os_str().to_os_string());
+        args.push(OsString::from("--tls-client-ca"));
+        args.push(paths.server_ca_path().as_os_str().to_os_string());
+        if disable_gateway_auth {
+            args.push(OsString::from("--disable-gateway-auth"));
+        }
+    }
+
+    Ok(args)
+}
+
+async fn spawn_host_run_gateway(
+    name: &str,
+    backend: GatewayBackend,
+    port: u16,
+    requested_gateway_host: Option<&str>,
+    recreate: bool,
+    disable_tls: bool,
+    disable_gateway_auth: bool,
+) -> Result<()> {
+    let paths = HostRunGatewayPaths::for_gateway(name)?;
+    create_dir_restricted(&paths.config_dir)?;
+    create_dir_restricted(&paths.data_dir)?;
+
+    let stored_metadata = if !recreate {
+        get_gateway_metadata(name)
+    } else {
+        None
+    };
+    if let Some(existing_backend) = stored_metadata.as_ref().and_then(GatewayMetadata::backend)
+        && existing_backend != backend
+    {
+        return Err(miette!(
+            "gateway '{name}' is already registered with backend '{}'.\n\
+             Destroy it first with: openshell gateway destroy --name {name}",
+            existing_backend
+        ));
+    }
+
+    let effective_port = host_run_gateway_port(port, stored_metadata.as_ref());
+    let effective_disable_tls = disable_tls
+        || stored_metadata
+            .as_ref()
+            .is_some_and(|m| is_plaintext_auth_mode(m.auth_mode.as_deref()));
+    let effective_disable_gateway_auth = disable_gateway_auth
+        || stored_metadata
+            .as_ref()
+            .is_some_and(|m| is_optional_mtls_auth_mode(m.auth_mode.as_deref()));
+    let gateway_host = configured_gateway_host(requested_gateway_host, stored_metadata.as_ref());
+    let grpc_endpoint = resolve_host_run_grpc_endpoint(
+        backend,
+        effective_port,
+        effective_disable_tls,
+        &gateway_host,
+    )?;
+
+    if backend == GatewayBackend::Kubernetes {
+        ensure_kubernetes_backend_prereqs()?;
+    }
+
+    if recreate {
+        let _ = stop_host_run_process(&paths).await;
+        remove_host_run_runtime_state(&paths)?;
+        create_dir_restricted(&paths.config_dir)?;
+        create_dir_restricted(&paths.data_dir)?;
+    } else if read_pid_file(&paths.pid_path)?.is_some_and(is_process_alive) {
+        eprintln!(
+            "{} Gateway '{name}' is already running.",
+            "✓".green().bold()
+        );
+        save_active_gateway(name)?;
+        return Ok(());
+    } else {
+        cleanup_stale_pid_file(&paths.pid_path);
+    }
+
+    ensure_host_run_tls_materials(
+        name,
+        backend,
+        &paths,
+        &gateway_host,
+        &grpc_endpoint,
+        effective_disable_tls,
+    )?;
+    if backend == GatewayBackend::Kubernetes && !effective_disable_tls {
+        upsert_kubernetes_client_tls_secret(&paths.config_dir.join("mtls"))?;
+    }
+
+    let gateway_bin = resolve_binary(
+        &gateway_binary_candidates()?,
+        "local gateway backends require the openshell-gateway binary to be installed or included alongside openshell",
+    )?;
+    let args = host_run_gateway_args(
+        backend,
+        &gateway_bin,
+        &paths,
+        effective_port,
+        effective_disable_tls,
+        effective_disable_gateway_auth,
+        &gateway_host,
+        &grpc_endpoint,
+    )?;
+
+    let stdout = log_file_handle(&paths.log_path)?;
+    let stderr = stdout
+        .try_clone()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to clone {}", paths.log_path.display()))?;
+    let mut command = Command::new(&gateway_bin);
+    command.args(&args[1..]);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::from(stdout));
+    command.stderr(Stdio::from(stderr));
+    let child = command
+        .spawn()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to start {}", gateway_bin.display()))?;
+
+    write_private_file(&paths.pid_path, &child.id().to_string())?;
+
+    let server = localhost_gateway_endpoint(effective_port, effective_disable_tls);
+    let tls = TlsOptions::default()
+        .with_gateway_name(name)
+        .with_default_paths(&server);
+    if let Err(err) = crate::bootstrap::wait_for_grpc_ready(&server, &tls).await {
+        let _ = stop_host_run_process(&paths).await;
+        return Err(err);
+    }
+
+    let metadata = host_run_gateway_metadata(
+        name,
+        backend,
+        effective_port,
+        effective_disable_tls,
+        effective_disable_gateway_auth,
+        &gateway_host,
+    );
+    store_gateway_metadata(name, &metadata)?;
+    save_active_gateway(name)?;
+
+    eprintln!("{} Gateway '{name}' is ready.", "✓".green().bold());
+    eprintln!("  {} {}", "Endpoint:".dimmed(), metadata.gateway_endpoint);
+    eprintln!(
+        "  {} {}",
+        "Backend:".dimmed(),
+        gateway_backend_label(&metadata)
+    );
+    Ok(())
+}
+
+fn ensure_host_run_backend_flags(
+    backend: GatewayBackend,
+    remote: Option<&str>,
+    ssh_key: Option<&str>,
+    registry_username: Option<&str>,
+    registry_token: Option<&str>,
+    gpu: &[String],
+) -> Result<()> {
+    if remote.is_some() || ssh_key.is_some() {
+        return Err(miette!(
+            "gateway backend '{}' only supports local host-run gateways; --remote and --ssh-key are only valid with --backend k3s",
+            backend
+        ));
+    }
+    if registry_username.is_some() || registry_token.is_some() || !gpu.is_empty() {
+        return Err(miette!(
+            "gateway backend '{}' does not support --registry-username, --registry-token, or --gpu; those flags are only valid with --backend k3s",
+            backend
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_localhost_destroy_target(
+    name: &str,
+    metadata: Option<&GatewayMetadata>,
+    remote_override: Option<&str>,
+) -> Result<()> {
+    if remote_override.is_some() {
+        return Err(miette!(
+            "gateway destroy is only supported for localhost gateways.\n\
+             Gateway '{name}' was targeted with --remote, which is not a localhost backend."
+        ));
+    }
+    if let Some(metadata) = metadata
+        && !is_loopback_gateway_endpoint(&metadata.gateway_endpoint)
+    {
+        return Err(miette!(
+            "gateway destroy is only supported for localhost gateways.\n\
+             Gateway '{name}' resolves to {}.",
+            metadata.gateway_endpoint
+        ));
+    }
+    Ok(())
+}
+
+fn print_log_lines(path: &Path, lines: Option<usize>) -> Result<()> {
+    if !path.exists() {
+        return Err(miette!(
+            "gateway log file does not exist: {}",
+            path.display()
+        ));
+    }
+
+    let file = File::open(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut contents = reader
+        .lines()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    if let Some(limit) = lines
+        && contents.len() > limit
+    {
+        let start = contents.len() - limit;
+        contents = contents.split_off(start);
+    }
+    for line in contents {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+async fn follow_log_file(path: &Path, lines: Option<usize>) -> Result<()> {
+    print_log_lines(path, lines)?;
+
+    let mut file = File::open(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to open {}", path.display()))?;
+    let mut position = file
+        .metadata()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to stat {}", path.display()))?
+        .len();
+    file.seek(SeekFrom::Start(position))
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to seek {}", path.display()))?;
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = tokio::time::sleep(HOST_RUN_GATEWAY_LOG_POLL_INTERVAL) => {
+                let metadata = file
+                    .metadata()
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to stat {}", path.display()))?;
+                if metadata.len() < position {
+                    position = 0;
+                    file.seek(SeekFrom::Start(0))
+                        .into_diagnostic()
+                        .wrap_err_with(|| format!("failed to rewind {}", path.display()))?;
+                }
+                if metadata.len() == position {
+                    continue;
+                }
+                let mut chunk = String::new();
+                file.read_to_string(&mut chunk)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+                position = metadata.len();
+                print!("{chunk}");
+                std::io::stdout().flush().into_diagnostic()?;
+            }
+        }
+    }
+}
+
+async fn doctor_logs_host_run(name: &str, lines: Option<usize>, tail: bool) -> Result<()> {
+    let paths = HostRunGatewayPaths::for_gateway(name)?;
+    if tail {
+        follow_log_file(&paths.log_path, lines).await
+    } else {
+        print_log_lines(&paths.log_path, lines)
+    }
+}
+
 /// Provision or start a gateway (local or remote).
 pub async fn gateway_admin_deploy(
     name: &str,
+    backend: GatewayBackend,
     remote: Option<&str>,
     ssh_key: Option<&str>,
     port: u16,
@@ -1435,6 +2332,33 @@ pub async fn gateway_admin_deploy(
     registry_token: Option<&str>,
     gpu: Vec<String>,
 ) -> Result<()> {
+    match backend {
+        GatewayBackend::K3s => {}
+        GatewayBackend::Kubernetes | GatewayBackend::Vm => {
+            ensure_host_run_backend_flags(
+                backend,
+                remote,
+                ssh_key,
+                registry_username,
+                registry_token,
+                &gpu,
+            )?;
+            return spawn_host_run_gateway(
+                name,
+                backend,
+                port,
+                gateway_host,
+                recreate,
+                disable_tls,
+                disable_gateway_auth,
+            )
+            .await;
+        }
+        GatewayBackend::Podman => {
+            return Err(miette!("gateway backend 'podman' is not implemented yet"));
+        }
+    }
+
     let location = if remote.is_some() { "remote" } else { "local" };
 
     // Build remote options once so we can reuse them for the existence check
@@ -1476,6 +2400,14 @@ pub async fn gateway_admin_deploy(
         .as_ref()
         .filter(|m| m.gateway_port > 0)
         .map_or(port, |m| m.gateway_port);
+    let effective_disable_tls = disable_tls
+        || stored_metadata
+            .as_ref()
+            .is_some_and(|m| is_plaintext_auth_mode(m.auth_mode.as_deref()));
+    let effective_disable_gateway_auth = disable_gateway_auth
+        || stored_metadata
+            .as_ref()
+            .is_some_and(|m| is_optional_mtls_auth_mode(m.auth_mode.as_deref()));
     let effective_gateway_host: Option<String> = gateway_host.map(String::from).or_else(|| {
         stored_metadata
             .as_ref()
@@ -1484,8 +2416,8 @@ pub async fn gateway_admin_deploy(
 
     let mut options = DeployOptions::new(name)
         .with_port(effective_port)
-        .with_disable_tls(disable_tls)
-        .with_disable_gateway_auth(disable_gateway_auth)
+        .with_disable_tls(effective_disable_tls)
+        .with_disable_gateway_auth(effective_disable_gateway_auth)
         .with_gpu(gpu)
         .with_recreate(recreate);
     if let Some(opts) = remote_opts {
@@ -1547,11 +2479,17 @@ fn resolve_gateway_control_target_from(
     }
 
     match metadata {
-        Some(metadata) if metadata.is_remote => metadata.remote_host.map_or(
-            GatewayControlTarget::ExternalRegistration,
-            GatewayControlTarget::Remote,
-        ),
-        _ => GatewayControlTarget::Local,
+        Some(metadata) => match gateway_kind(Some(&metadata)) {
+            ManagedGatewayKind::External => GatewayControlTarget::ExternalRegistration,
+            ManagedGatewayKind::K3s | ManagedGatewayKind::HostRun(_) if metadata.is_remote => {
+                metadata.remote_host.map_or(
+                    GatewayControlTarget::ExternalRegistration,
+                    GatewayControlTarget::Remote,
+                )
+            }
+            ManagedGatewayKind::K3s | ManagedGatewayKind::HostRun(_) => GatewayControlTarget::Local,
+        },
+        None => GatewayControlTarget::Local,
     }
 }
 
@@ -1570,8 +2508,8 @@ fn gateway_control_target_options(
             Ok(Some(opts))
         }
         GatewayControlTarget::ExternalRegistration => Err(miette::miette!(
-            "Gateway '{name}' is an external registration, not a managed Docker gateway.\n\
-             `openshell gateway stop` is only supported for local or SSH-managed gateways."
+            "Gateway '{name}' is an external registration, not a managed gateway.\n\
+             `openshell gateway stop` is only supported for managed local gateways."
         )),
     }
 }
@@ -1610,13 +2548,37 @@ pub async fn gateway_admin_stop(
     remote: Option<&str>,
     ssh_key: Option<&str>,
 ) -> Result<()> {
-    let remote_opts = gateway_control_target_options(name, remote, ssh_key)?;
+    let metadata = get_gateway_metadata(name);
+    match lifecycle_gateway_kind(metadata.as_ref()) {
+        ManagedGatewayKind::K3s => {
+            let remote_opts = gateway_control_target_options(name, remote, ssh_key)?;
 
-    eprintln!("• Stopping gateway {name}...");
-    let handle = openshell_bootstrap::gateway_handle(name, remote_opts.as_ref()).await?;
-    handle.stop().await?;
-    eprintln!("{} Gateway {name} stopped.", "✓".green().bold());
-    Ok(())
+            eprintln!("• Stopping gateway {name}...");
+            let handle = openshell_bootstrap::gateway_handle(name, remote_opts.as_ref()).await?;
+            handle.stop().await?;
+            eprintln!("{} Gateway {name} stopped.", "✓".green().bold());
+            Ok(())
+        }
+        ManagedGatewayKind::HostRun(_) => {
+            if remote.is_some() || ssh_key.is_some() {
+                return Err(miette!(
+                    "gateway stop does not accept --remote or --ssh-key for host-run gateways"
+                ));
+            }
+            eprintln!("• Stopping gateway {name}...");
+            let stopped = stop_host_run_process(&HostRunGatewayPaths::for_gateway(name)?).await?;
+            if stopped {
+                eprintln!("{} Gateway {name} stopped.", "✓".green().bold());
+            } else {
+                eprintln!("{} Gateway {name} is not running.", "!".yellow());
+            }
+            Ok(())
+        }
+        ManagedGatewayKind::External => Err(miette!(
+            "Gateway '{name}' is an external registration, not a managed gateway.\n\
+             `openshell gateway stop` is only supported for managed local gateways."
+        )),
+    }
 }
 
 /// Destroy a gateway and its state.
@@ -1625,8 +2587,11 @@ pub async fn gateway_admin_destroy(
     remote: Option<&str>,
     ssh_key: Option<&str>,
 ) -> Result<()> {
-    match resolve_gateway_control_target(name, remote) {
-        GatewayControlTarget::ExternalRegistration => {
+    let metadata = get_gateway_metadata(name);
+    ensure_localhost_destroy_target(name, metadata.as_ref(), remote)?;
+
+    match lifecycle_gateway_kind(metadata.as_ref()) {
+        ManagedGatewayKind::External => {
             eprintln!("• Removing gateway registration {name}...");
             remove_gateway_registration(name);
             eprintln!(
@@ -1635,7 +2600,7 @@ pub async fn gateway_admin_destroy(
             );
             Ok(())
         }
-        GatewayControlTarget::Local | GatewayControlTarget::Remote(_) => {
+        ManagedGatewayKind::K3s => {
             let remote_opts = gateway_control_target_options(name, remote, ssh_key)?;
 
             eprintln!("• Destroying gateway {name}...");
@@ -1644,6 +2609,21 @@ pub async fn gateway_admin_destroy(
 
             cleanup_gateway_metadata(name);
 
+            eprintln!("{} Gateway {name} destroyed.", "✓".green().bold());
+            Ok(())
+        }
+        ManagedGatewayKind::HostRun(_) => {
+            if ssh_key.is_some() {
+                return Err(miette!(
+                    "gateway destroy does not accept --ssh-key for host-run gateways"
+                ));
+            }
+
+            eprintln!("• Destroying gateway {name}...");
+            let paths = HostRunGatewayPaths::for_gateway(name)?;
+            let _ = stop_host_run_process(&paths).await?;
+            remove_host_run_runtime_state(&paths)?;
+            cleanup_gateway_metadata(name);
             eprintln!("{} Gateway {name} destroyed.", "✓".green().bold());
             Ok(())
         }
@@ -1666,6 +2646,11 @@ pub fn gateway_admin_info(name: &str) -> Result<()> {
         "  {} {}",
         "Gateway endpoint:".dimmed(),
         metadata.gateway_endpoint
+    );
+    println!(
+        "  {} {}",
+        "Backend:".dimmed(),
+        gateway_backend_label(&metadata)
     );
 
     if metadata.is_remote {
@@ -1693,6 +2678,25 @@ pub async fn doctor_logs(
     remote: Option<&str>,
     ssh_key: Option<&str>,
 ) -> Result<()> {
+    let metadata = get_gateway_metadata(name);
+    match lifecycle_gateway_kind(metadata.as_ref()) {
+        ManagedGatewayKind::HostRun(_) => {
+            if remote.is_some() || ssh_key.is_some() {
+                return Err(miette!(
+                    "doctor logs does not accept --remote or --ssh-key for host-run gateways"
+                ));
+            }
+            return doctor_logs_host_run(name, lines, tail).await;
+        }
+        ManagedGatewayKind::External => {
+            return Err(miette!(
+                "Gateway '{name}' is an external registration.\n\
+                 `openshell doctor logs` is only supported for managed gateways."
+            ));
+        }
+        ManagedGatewayKind::K3s => {}
+    }
+
     // Build remote options: explicit --remote flag, or auto-resolve from metadata
     let remote_opts = if let Some(dest) = remote {
         let mut opts = RemoteOptions::new(dest);
@@ -1729,6 +2733,22 @@ pub fn doctor_exec(
     ssh_key: Option<&str>,
     command: &[String],
 ) -> Result<()> {
+    let metadata = get_gateway_metadata(name);
+    match lifecycle_gateway_kind(metadata.as_ref()) {
+        ManagedGatewayKind::HostRun(_) => {
+            return Err(miette!(
+                "`openshell doctor exec` is not supported for process-managed gateways"
+            ));
+        }
+        ManagedGatewayKind::External => {
+            return Err(miette!(
+                "Gateway '{name}' is an external registration.\n\
+                 `openshell doctor exec` is only supported for managed gateways."
+            ));
+        }
+        ManagedGatewayKind::K3s => {}
+    }
+
     validate_gateway_name(name)?;
     let container = container_name(name);
     let is_tty = std::io::stdin().is_terminal();
@@ -5196,13 +6216,15 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GatewayControlTarget, TlsOptions, format_gateway_select_header,
-        format_gateway_select_items, gateway_add, gateway_auth_label, gateway_select_with,
-        gateway_type_label, git_sync_files, http_health_check, image_requests_gpu,
-        inferred_provider_type, parse_cli_setting_value, parse_credential_pairs,
-        plaintext_gateway_is_remote, provisioning_timeout_message, ready_false_condition_message,
-        resolve_gateway_control_target_from, sandbox_should_persist, shell_escape,
-        source_requests_gpu, validate_gateway_name, validate_ssh_host,
+        GatewayControlTarget, ManagedGatewayKind, TlsOptions, ensure_localhost_destroy_target,
+        format_gateway_select_header, format_gateway_select_items, gateway_add, gateway_auth_label,
+        gateway_backend_label, gateway_kind, gateway_select_with, gateway_type_label,
+        git_sync_files, http_health_check, image_requests_gpu, inferred_provider_type,
+        parse_cli_setting_value, parse_credential_pairs, plaintext_gateway_is_remote,
+        provisioning_timeout_message, ready_false_condition_message,
+        resolve_gateway_control_target_from, resolve_host_run_grpc_endpoint,
+        sandbox_should_persist, shell_escape, source_requests_gpu, validate_gateway_name,
+        validate_ssh_host,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -5214,7 +6236,7 @@ mod tests {
     use std::process::Command;
     use std::thread;
 
-    use openshell_bootstrap::GatewayMetadata;
+    use openshell_bootstrap::{GatewayBackend, GatewayMetadata};
     use openshell_core::proto::{SandboxCondition, SandboxStatus};
 
     struct EnvVarGuard {
@@ -5277,6 +6299,8 @@ mod tests {
             remote_host: None,
             resolved_host: None,
             auth_mode: Some("cloudflare_jwt".to_string()),
+            backend: None,
+            configured_gateway_host: None,
             edge_team_domain: None,
             edge_auth_url: None,
         }
@@ -5582,6 +6606,98 @@ mod tests {
     }
 
     #[test]
+    fn resolve_gateway_control_target_treats_local_external_registration_as_unmanaged() {
+        let metadata = GatewayMetadata {
+            name: "external-local".to_string(),
+            gateway_endpoint: "http://127.0.0.1:8080".to_string(),
+            is_remote: false,
+            gateway_port: 0,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: Some("plaintext".to_string()),
+            backend: None,
+            configured_gateway_host: None,
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+
+        let target = resolve_gateway_control_target_from(Some(metadata), None);
+        assert!(matches!(target, GatewayControlTarget::ExternalRegistration));
+    }
+
+    #[test]
+    fn gateway_kind_distinguishes_managed_and_external_backends() {
+        let managed = GatewayMetadata {
+            name: "managed".to_string(),
+            gateway_endpoint: "https://127.0.0.1:8080".to_string(),
+            is_remote: false,
+            gateway_port: 8080,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: None,
+            backend: Some(GatewayBackend::Kubernetes),
+            configured_gateway_host: Some("gateway.internal".to_string()),
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+        let external = edge_registration("edge", "https://edge.example.com");
+
+        assert!(matches!(
+            gateway_kind(Some(&managed)),
+            ManagedGatewayKind::HostRun(GatewayBackend::Kubernetes)
+        ));
+        assert!(matches!(
+            gateway_kind(Some(&external)),
+            ManagedGatewayKind::External
+        ));
+        assert_eq!(gateway_backend_label(&managed), "kubernetes");
+        assert_eq!(gateway_backend_label(&external), "-");
+    }
+
+    #[test]
+    fn localhost_destroy_guard_rejects_non_loopback_endpoints() {
+        let metadata = GatewayMetadata {
+            name: "remote".to_string(),
+            gateway_endpoint: "https://gateway.example.com:8443".to_string(),
+            is_remote: true,
+            gateway_port: 8443,
+            remote_host: Some("user@gateway.example.com".to_string()),
+            resolved_host: Some("gateway.example.com".to_string()),
+            auth_mode: None,
+            backend: Some(GatewayBackend::K3s),
+            configured_gateway_host: Some("gateway.example.com".to_string()),
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+
+        let err = ensure_localhost_destroy_target("remote", Some(&metadata), None)
+            .expect_err("non-loopback destroy should fail");
+        assert!(err.to_string().contains("localhost gateways"));
+    }
+
+    #[test]
+    fn kubernetes_host_run_endpoint_prefers_host_alias_when_host_gateway_ip_is_set() {
+        let _guard = EnvVarGuard::set("OPENSHELL_HOST_GATEWAY_IP", "172.17.0.1");
+
+        let endpoint =
+            resolve_host_run_grpc_endpoint(GatewayBackend::Kubernetes, 8080, false, "127.0.0.1")
+                .expect("kubernetes callback endpoint");
+
+        assert_eq!(endpoint, "https://host.openshell.internal:8080");
+    }
+
+    #[test]
+    fn kubernetes_host_run_endpoint_rejects_loopback_without_host_alias() {
+        let _guard = EnvVarGuard::unset("OPENSHELL_HOST_GATEWAY_IP");
+
+        let err =
+            resolve_host_run_grpc_endpoint(GatewayBackend::Kubernetes, 8080, false, "127.0.0.1")
+                .expect_err("loopback kubernetes callback endpoint should fail");
+
+        assert!(err.to_string().contains("pod-reachable gateway host"));
+    }
+
+    #[test]
     fn gateway_select_uses_explicit_name_without_prompting() {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
@@ -5665,6 +6781,8 @@ mod tests {
                 remote_host: None,
                 resolved_host: None,
                 auth_mode: None,
+                backend: Some(GatewayBackend::K3s),
+                configured_gateway_host: None,
                 edge_team_domain: None,
                 edge_auth_url: None,
             },
@@ -5680,12 +6798,15 @@ mod tests {
         assert!(header.contains("NAME"));
         assert!(header.contains("ENDPOINT"));
         assert!(header.contains("TYPE"));
+        assert!(header.contains("BACKEND"));
         assert!(header.contains("AUTH"));
         assert!(items[0].contains("alpha"));
         assert!(items[0].contains("https://edge.example.com"));
         assert!(items[0].contains("cloud"));
+        assert!(items[0].contains("-"));
         assert!(items[0].contains("cloudflare_jwt"));
         assert!(items[1].contains("local"));
+        assert!(items[1].contains("k3s"));
         assert!(items[1].contains("plaintext"));
         assert!(items[1].contains("http://127.0.0.1:8080"));
     }
@@ -5700,6 +6821,8 @@ mod tests {
             remote_host: None,
             resolved_host: None,
             auth_mode: None,
+            backend: Some(GatewayBackend::K3s),
+            configured_gateway_host: None,
             edge_team_domain: None,
             edge_auth_url: None,
         };

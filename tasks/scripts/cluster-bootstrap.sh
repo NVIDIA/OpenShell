@@ -241,24 +241,25 @@ if [ -z "${OPENSHELL_CLUSTER_IMAGE:-}" ]; then
   export OPENSHELL_CLUSTER_IMAGE="openshell/cluster:${IMAGE_TAG}"
 fi
 
-DEPLOY_CMD=(openshell gateway start --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}")
+DEPLOY_CMD=(openshell gateway start --backend k3s --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}")
 
 if [ "${CLUSTER_GPU:-0}" = "1" ]; then
   DEPLOY_CMD+=(--gpu)
 fi
 
-if [ -n "${GATEWAY_HOST:-}" ]; then
-  DEPLOY_CMD+=(--gateway-host "${GATEWAY_HOST}")
+EFFECTIVE_GATEWAY_HOST="${OPENSHELL_GATEWAY_HOST:-${GATEWAY_HOST:-}}"
+if [ -n "${EFFECTIVE_GATEWAY_HOST}" ]; then
+  DEPLOY_CMD+=(--gateway-host "${EFFECTIVE_GATEWAY_HOST}")
 
   # Ensure the gateway host resolves from the current environment.
   # On Linux CI runners host.docker.internal is not set automatically
   # (it's a Docker Desktop feature). If the hostname doesn't resolve,
   # add it via the Docker bridge gateway IP.
-  if ! getent hosts "${GATEWAY_HOST}" >/dev/null 2>&1; then
+  if ! getent hosts "${EFFECTIVE_GATEWAY_HOST}" >/dev/null 2>&1; then
     BRIDGE_IP=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)
     if [ -n "${BRIDGE_IP}" ]; then
-      echo "Adding /etc/hosts entry: ${BRIDGE_IP} ${GATEWAY_HOST}"
-      echo "${BRIDGE_IP} ${GATEWAY_HOST}" >> /etc/hosts
+      echo "Adding /etc/hosts entry: ${BRIDGE_IP} ${EFFECTIVE_GATEWAY_HOST}"
+      echo "${BRIDGE_IP} ${EFFECTIVE_GATEWAY_HOST}" >> /etc/hosts
     fi
   fi
 fi

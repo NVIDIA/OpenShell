@@ -179,6 +179,8 @@ mod tests {
                     remote_host: None,
                     resolved_host: None,
                     auth_mode: Some("cloudflare_jwt".to_string()),
+                    backend: None,
+                    configured_gateway_host: None,
                     edge_team_domain: None,
                     edge_auth_url: None,
                 },

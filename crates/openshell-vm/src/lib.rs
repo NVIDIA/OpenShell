@@ -1738,6 +1738,8 @@ fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Re
         remote_host: None,
         resolved_host: None,
         auth_mode: None,
+        backend: Some(openshell_bootstrap::GatewayBackend::K3s),
+        configured_gateway_host: None,
         edge_team_domain: None,
         edge_auth_url: None,
     };

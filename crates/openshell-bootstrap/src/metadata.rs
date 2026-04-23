@@ -6,7 +6,53 @@ use crate::paths::{active_gateway_path, gateways_dir, last_sandbox_path};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::paths::ensure_parent_dir_restricted;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
+
+/// Managed gateway backends supported by the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayBackend {
+    K3s,
+    Kubernetes,
+    Vm,
+    Podman,
+}
+
+impl GatewayBackend {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::K3s => "k3s",
+            Self::Kubernetes => "kubernetes",
+            Self::Vm => "vm",
+            Self::Podman => "podman",
+        }
+    }
+}
+
+impl fmt::Display for GatewayBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for GatewayBackend {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "k3s" => Ok(Self::K3s),
+            "kubernetes" => Ok(Self::Kubernetes),
+            "vm" => Ok(Self::Vm),
+            "podman" => Ok(Self::Podman),
+            other => Err(format!(
+                "unsupported gateway backend '{other}'. expected one of: k3s, kubernetes, vm, podman"
+            )),
+        }
+    }
+}
 
 /// Gateway metadata stored alongside deployment info.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +76,19 @@ pub struct GatewayMetadata {
     /// `"cloudflare_jwt"` = CF JWT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
+
+    /// Managed gateway backend, when this registration was created by
+    /// `openshell gateway start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<GatewayBackend>,
+
+    /// Host override used to configure the running gateway itself.
+    ///
+    /// This is distinct from `gateway_endpoint`: local host-run gateways keep
+    /// their CLI endpoint on loopback but still need a stable configured host
+    /// for SSH advertisements and backend-specific callback derivation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_gateway_host: Option<String>,
 
     /// Edge proxy team/org domain (e.g., `brevlab.cloudflareaccess.com`).
     #[serde(
@@ -55,6 +114,14 @@ impl GatewayMetadata {
     /// address (`127.0.0.1`, `localhost`, `::1`) — those are never meaningful
     /// as a `--gateway-host` override.
     pub fn gateway_host(&self) -> Option<&str> {
+        if let Some(host) = self
+            .configured_gateway_host
+            .as_deref()
+            .filter(|host| !is_loopback_host(host))
+        {
+            return Some(host);
+        }
+
         // Endpoint format: "https://host:port" or "http://host:port"
         let after_scheme = self
             .gateway_endpoint
@@ -64,15 +131,18 @@ impl GatewayMetadata {
         let host = after_scheme
             .rsplit_once(':')
             .map_or(after_scheme, |(h, _)| h);
-        if host.is_empty()
-            || host == "127.0.0.1"
-            || host == "localhost"
-            || host == "::1"
-            || host == "[::1]"
-        {
+        if host.is_empty() || is_loopback_host(host) {
             return None;
         }
         Some(host)
+    }
+
+    /// Return the managed backend when known, falling back to `k3s` for legacy
+    /// Docker-managed gateways that predate the `backend` field.
+    #[must_use]
+    pub fn backend(&self) -> Option<GatewayBackend> {
+        self.backend
+            .or_else(|| (self.gateway_port > 0).then_some(GatewayBackend::K3s))
     }
 }
 
@@ -134,9 +204,18 @@ pub fn create_gateway_metadata_with_host(
         remote_host,
         resolved_host,
         auth_mode: disable_tls.then(|| "plaintext".to_string()),
+        backend: Some(GatewayBackend::K3s),
+        configured_gateway_host: gateway_host.map(ToOwned::to_owned),
         edge_team_domain: None,
         edge_auth_url: None,
     }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host == "127.0.0.1"
+        || host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host == "[::1]"
 }
 
 pub fn local_gateway_host() -> Option<String> {
@@ -462,6 +541,8 @@ mod tests {
             remote_host: Some("user@openshell-dev".to_string()),
             resolved_host: Some("10.0.0.5".to_string()),
             auth_mode: None,
+            backend: Some(GatewayBackend::K3s),
+            configured_gateway_host: None,
             edge_team_domain: None,
             edge_auth_url: None,
         };
@@ -502,6 +583,11 @@ mod tests {
         assert!(!meta.is_remote);
         assert!(meta.remote_host.is_none());
         assert!(meta.resolved_host.is_none());
+        assert_eq!(meta.backend(), Some(GatewayBackend::K3s));
+        assert_eq!(
+            meta.configured_gateway_host.as_deref(),
+            Some("host.docker.internal")
+        );
     }
 
     #[test]
@@ -557,6 +643,8 @@ mod tests {
             remote_host: None,
             resolved_host: None,
             auth_mode: None,
+            backend: Some(GatewayBackend::K3s),
+            configured_gateway_host: None,
             edge_team_domain: None,
             edge_auth_url: None,
         };
@@ -573,10 +661,32 @@ mod tests {
             remote_host: Some("user@10.0.0.5".into()),
             resolved_host: Some("10.0.0.5".into()),
             auth_mode: None,
+            backend: Some(GatewayBackend::K3s),
+            configured_gateway_host: None,
             edge_team_domain: None,
             edge_auth_url: None,
         };
         assert_eq!(meta.gateway_host(), Some("10.0.0.5"));
+    }
+
+    #[test]
+    fn gateway_host_prefers_configured_host_for_loopback_endpoint() {
+        let meta = GatewayMetadata {
+            name: "t".into(),
+            gateway_endpoint: "https://127.0.0.1:8080".into(),
+            is_remote: false,
+            gateway_port: 8080,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: None,
+            backend: Some(GatewayBackend::Kubernetes),
+            configured_gateway_host: Some("gateway.internal".into()),
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+
+        assert_eq!(meta.gateway_host(), Some("gateway.internal"));
+        assert_eq!(meta.backend(), Some(GatewayBackend::Kubernetes));
     }
 
     #[test]
