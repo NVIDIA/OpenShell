@@ -19,7 +19,7 @@ that enables these networking and sandboxing features.
 
 ## Directory Structure
 
-```
+```text
 runtime/
   kernel/
     openshell.kconfig          # Kernel config fragment (networking + sandboxing)
@@ -29,7 +29,7 @@ runtime/
 
 Each platform builds its own kernel and runtime natively.
 
-```
+```text
 Linux ARM64:  builds aarch64 kernel -> .so  (parallel)
 Linux AMD64:  builds x86_64 kernel  -> .so  (parallel)
 macOS ARM64:  builds aarch64 kernel -> .dylib
@@ -67,7 +67,7 @@ FROM_SOURCE=1 mise run vm:setup
 
 Build artifacts are placed in `target/libkrun-build/`:
 
-```
+```text
 target/libkrun-build/
   libkrun.so / libkrun.dylib       # The VMM library
   libkrunfw.so* / libkrunfw.dylib  # Kernel firmware library
@@ -89,7 +89,7 @@ subsystem directly and avoids this entirely.
 At VM boot, the openshell-vm binary logs provenance information about the loaded
 runtime:
 
-```
+```text
 runtime: /path/to/openshell-vm.runtime
   libkrunfw: libkrunfw.dylib
   sha256: a1b2c3d4e5f6...
@@ -100,7 +100,8 @@ runtime: /path/to/openshell-vm.runtime
 ```
 
 For stock runtimes:
-```
+
+```text
 runtime: /path/to/openshell-vm.runtime
   libkrunfw: libkrunfw.dylib
   sha256: f6e5d4c3b2a1...
@@ -140,6 +141,7 @@ mise run vm
 ### "FailedCreatePodSandBox" bridge errors
 
 The kernel does not have bridge support. Verify:
+
 ```bash
 # Inside VM:
 ip link add test0 type bridge && echo "bridge OK" && ip link del test0
@@ -150,6 +152,7 @@ If this fails, you are running the stock runtime. Build and use the custom one.
 ### kube-proxy CrashLoopBackOff
 
 kube-proxy runs in nftables mode. If it crashes, verify nftables support:
+
 ```bash
 # Inside VM:
 nft list ruleset
@@ -158,6 +161,7 @@ nft list ruleset
 If this fails, the kernel may lack `CONFIG_NF_TABLES`. Use the custom runtime.
 
 Common errors:
+
 - `unknown option "--xor-mark"`: kube-proxy is running in iptables mode instead
   of nftables. Verify `--kube-proxy-arg=proxy-mode=nftables` is in the k3s args.
 
@@ -165,12 +169,14 @@ Common errors:
 
 If libkrunfw is updated (e.g., via `brew upgrade`), the stock runtime may
 change. Check provenance:
+
 ```bash
 # Look for provenance info in VM boot output
 grep "runtime:" ~/.local/share/openshell/openshell-vm/console.log
 ```
 
 Re-build the custom runtime if needed:
+
 ```bash
 FROM_SOURCE=1 mise run vm:setup
 mise run vm:build

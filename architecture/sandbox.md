@@ -116,18 +116,18 @@ flowchart TD
 
 8. **SSH server** (optional): If `--ssh-socket-path` is provided, spawn an async task running `ssh::run_ssh_server()` with the policy, workdir, netns FD, proxy URL, CA paths, and provider env. The value is a filesystem path to the Unix socket the embedded sshd binds. The supervisor waits on a readiness `oneshot` channel before proceeding so that exec requests arriving immediately after pod-ready cannot race against socket bind.
 
-8a. **Supervisor session** (gRPC mode + SSH socket only): If `--sandbox-id`, `--openshell-endpoint`, and an SSH socket path are all set, spawn `supervisor_session::spawn()`. This task opens a persistent outbound bidirectional gRPC stream to the gateway and bridges inbound relay requests to the local SSH daemon. See [Supervisor Session](#supervisor-session) for the full protocol.
+9. **Supervisor session** (gRPC mode + SSH socket only): If `--sandbox-id`, `--openshell-endpoint`, and an SSH socket path are all set, spawn `supervisor_session::spawn()`. This task opens a persistent outbound bidirectional gRPC stream to the gateway and bridges inbound relay requests to the local SSH daemon. See [Supervisor Session](#supervisor-session) for the full protocol.
 
-9. **Child process spawning** (`ProcessHandle::spawn()`):
-   - Build `tokio::process::Command` with inherited stdio and `kill_on_drop(true)`
-   - Set environment variables: `OPENSHELL_SANDBOX=1`, provider credentials, proxy URLs, TLS trust store paths
-   - Pre-exec closure (async-signal-safe): `setpgid` (if non-interactive) -> `setns` (enter netns) -> `drop_privileges` -> `sandbox::apply` (Landlock + seccomp)
+10. **Child process spawning** (`ProcessHandle::spawn()`):
+    - Build `tokio::process::Command` with inherited stdio and `kill_on_drop(true)`
+    - Set environment variables: `OPENSHELL_SANDBOX=1`, provider credentials, proxy URLs, TLS trust store paths
+    - Pre-exec closure (async-signal-safe): `setpgid` (if non-interactive) -> `setns` (enter netns) -> `drop_privileges` -> `sandbox::apply` (Landlock + seccomp)
 
-10. **Store entrypoint PID**: `entrypoint_pid.store(pid, Ordering::Release)` so the proxy can resolve TCP peer identity via `/proc`.
+11. **Store entrypoint PID**: `entrypoint_pid.store(pid, Ordering::Release)` so the proxy can resolve TCP peer identity via `/proc`.
 
-11. **Spawn policy poll task** (gRPC mode only): If `sandbox_id`, `openshell_endpoint`, and an OPA engine are all present, spawn `run_policy_poll_loop()` as a background tokio task. This task polls the gateway for policy updates and hot-reloads the OPA engine when a new version is detected. See [Policy Reload Lifecycle](#policy-reload-lifecycle) for details.
+12. **Spawn policy poll task** (gRPC mode only): If `sandbox_id`, `openshell_endpoint`, and an OPA engine are all present, spawn `run_policy_poll_loop()` as a background tokio task. This task polls the gateway for policy updates and hot-reloads the OPA engine when a new version is detected. See [Policy Reload Lifecycle](#policy-reload-lifecycle) for details.
 
-12. **Wait with timeout**: If `--timeout > 0`, wrap `handle.wait()` in `tokio::time::timeout()`. On timeout, kill the process and return exit code 124.
+13. **Wait with timeout**: If `--timeout > 0`, wrap `handle.wait()` in `tokio::time::timeout()`. On timeout, kill the process and return exit code 124.
 
 ## Policy Model
 
@@ -244,6 +244,7 @@ Two evaluation methods exist: `evaluate_network()` for the legacy bool-based pat
 #### `evaluate_network(input: &NetworkInput) -> Result<PolicyDecision>`
 
 Input JSON shape:
+
 ```json
 {
   "exec": {
@@ -259,6 +260,7 @@ Input JSON shape:
 ```
 
 Evaluates three Rego rules:
+
 1. `data.openshell.sandbox.allow_network` -> bool
 2. `data.openshell.sandbox.deny_reason` -> string
 3. `data.openshell.sandbox.matched_network_policy` -> string (or `Undefined`)
@@ -273,6 +275,7 @@ Uses the same input JSON shape as `evaluate_network()`. Evaluates the `data.open
 - `"deny"` -- network connections not allowed by policy
 
 The Rego logic:
+
 1. If `network_policy_for_request` exists (endpoint + binary match), return `"allow"`
 2. Default: `"deny"`
 
@@ -394,6 +397,7 @@ pub struct SettingsPollResult {
 ```
 
 Methods:
+
 - **`connect(endpoint)`**: Establish an mTLS channel and return a new client.
 - **`poll_settings(sandbox_id)`**: Call `GetSandboxSettings` RPC and return a `SettingsPollResult` containing policy payload (optional), policy metadata, effective config revision, policy source, global policy version, and the effective settings map (for diff logging).
 - **`report_policy_status(sandbox_id, version, loaded, error_msg)`**: Call `ReportPolicyStatus` RPC with the appropriate `PolicyStatus` enum value (`Loaded` or `Failed`).
@@ -404,6 +408,7 @@ Methods:
 The gateway assigns a monotonically increasing version number to each sandbox policy revision. `GetSandboxSettingsResponse` carries the full effective configuration: policy payload, effective settings map (with per-key scope indicators), a `config_revision` fingerprint that changes when any effective input changes (policy, settings, or source), and a `policy_source` field indicating whether the policy came from the sandbox's own history or from a global override.
 
 Proto messages involved:
+
 - `GetSandboxSettingsResponse` (`proto/sandbox.proto`): `policy`, `version`, `policy_hash`, `settings` (map of `EffectiveSetting`), `config_revision`, `policy_source`, `global_policy_version`
 - `EffectiveSetting` (`proto/sandbox.proto`): `SettingValue value`, `SettingScope scope`
 - `SettingScope` enum: `UNSPECIFIED`, `SANDBOX`, `GLOBAL`
@@ -449,6 +454,7 @@ Landlock restricts the child process's filesystem access to an explicit allowlis
 7. Call `ruleset.restrict_self()` -- this applies to the calling process and all descendants
 
 Kernel-level error behavior (e.g., Landlock ABI unavailable) depends on `LandlockCompatibility`:
+
 - `BestEffort`: Log a warning and continue without filesystem isolation
 - `HardRequirement`: Return a fatal error, aborting the sandbox
 
@@ -463,6 +469,7 @@ Seccomp provides three layers of syscall restriction: socket domain blocks, unco
 **Skipped entirely** in `Allow` mode.
 
 Setup:
+
 1. `prctl(PR_SET_NO_NEW_PRIVS, 1)` -- required before seccomp
 2. `seccompiler::apply_filter()` with default action `Allow` and per-rule action `Errno(EPERM)`
 
@@ -512,7 +519,7 @@ The network namespace creates an isolated network stack where the sandboxed proc
 
 #### Topology
 
-```
+```text
 HOST NAMESPACE                          SANDBOX NAMESPACE
 -----------------                       -----------------
 veth-h-{uuid}                           veth-s-{uuid}
@@ -540,6 +547,7 @@ Each step has rollback on failure -- if any `ip` command fails, previously creat
 #### Cleanup on drop
 
 `NetworkNamespace` implements `Drop`:
+
 1. Close the namespace FD
 2. Delete the host-side veth (`ip link delete veth-h-{id}`) -- this automatically removes the peer
 3. Delete the namespace (`ip netns delete sandbox-{id}`)
@@ -903,6 +911,7 @@ The sandbox is designed to operate both as part of a cluster and as a standalone
 #### Cluster mode graceful degradation
 
 In cluster mode, `fetch_inference_bundle()` failures are handled based on the error type:
+
 - gRPC `PermissionDenied` or `NotFound` (detected via error message string matching): sandbox has no inference policy -- inference routing is silently disabled.
 - Other errors: logged as a warning, inference routing is disabled.
 - Empty initial route bundle: inference routing stays enabled with an empty cache and background refresh continues.
@@ -1029,12 +1038,14 @@ Expansion happens in `expand_access_presets()` before the Rego engine loads the 
 `validate_l7_policies()` runs at engine load time and returns `(errors, warnings)`:
 
 **Errors** (block startup):
+
 - `rules` and `access` both specified on same endpoint
 - `protocol` specified without `rules` or `access`
 - `protocol: sql` with `enforcement: enforce` (SQL parsing not available in v1)
 - Empty `rules` array (would deny all traffic)
 
 **Warnings** (logged):
+
 - `tls: terminate` or `tls: passthrough` on any endpoint (deprecated — TLS termination is now automatic; use `tls: skip` to disable)
 - `tls: skip` with L7 rules on port 443 (L7 inspection cannot work on encrypted traffic)
 - Unknown HTTP method in rules
@@ -1046,23 +1057,27 @@ Expansion happens in `expand_access_presets()` before the Rego engine loads the 
 TLS termination is automatic. The proxy peeks the first bytes of every CONNECT tunnel and terminates TLS whenever a ClientHello is detected. This enables credential injection and L7 inspection on all HTTPS endpoints without requiring explicit `tls: terminate` in the policy. The `tls` field defaults to `Auto`; use `tls: skip` to opt out entirely (e.g., for client-cert mTLS to upstream).
 
 **Ephemeral CA lifecycle:**
+
 1. At sandbox startup, `SandboxCa::generate()` creates a self-signed CA (CN: "OpenShell Sandbox CA") using `rcgen`
 2. The CA cert PEM and a combined bundle (system CAs + sandbox CA) are written to `/etc/openshell-tls/`
 3. The sandbox CA cert path is set as `NODE_EXTRA_CA_CERTS` (additive for Node.js)
 4. The combined bundle is set as `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (replaces defaults for OpenSSL, Python requests, curl)
 
 **TLS auto-detection** (`looks_like_tls()`):
+
 - Peeks up to 8 bytes from the client stream
 - Checks for TLS ClientHello pattern: byte 0 = `0x16` (ContentType::Handshake), byte 1 = `0x03` (TLS major version), byte 2 ≤ `0x04` (minor version, covering SSL 3.0 through TLS 1.3)
 - Returns `false` for plaintext HTTP, SSH, or other binary protocols
 
 **Per-hostname leaf cert generation:**
+
 - `CertCache` maps hostnames to `CertifiedLeaf` structs (cert chain + private key)
 - First request for a hostname generates a leaf cert signed by the sandbox CA via `rcgen`
 - Cache has a hard limit of 256 entries; on overflow, the entire cache is cleared (sufficient for sandbox scale)
 - Each leaf cert chain contains two certs: the leaf and the CA
 
 **Connection flow (when TLS is detected):**
+
 1. `tls_terminate_client()`: Accept TLS from the sandboxed client using a `ServerConfig` with the hostname-specific leaf cert. ALPN: `http/1.1`.
 2. `tls_connect_upstream()`: Connect TLS to the real upstream using a `ClientConfig` with Mozilla root CAs (`webpki_roots`) and system CA certificates. ALPN: `http/1.1`.
 3. Proxy now holds plaintext on both sides. If L7 config is present, runs `relay_with_inspection()`. Otherwise, runs `relay_passthrough_with_credentials()` for credential injection without L7 evaluation.
@@ -1233,11 +1248,13 @@ each cached entry stores:
 - File fingerprint (`len`, `mtime`, `ctime`, and on Unix `dev` + `inode`)
 
 `verify_or_cache(path)`:
+
 - **First call for a path**: Compute SHA256 via `procfs::file_sha256()`, store as the "golden" hash plus fingerprint, return the hash.
 - **Subsequent calls, unchanged fingerprint**: Return cached hash without re-hashing the file.
 - **Subsequent calls, changed fingerprint**: Recompute SHA256 and compare with cached value. Return `Ok(hash)` on match; return `Err` on mismatch (binary tampered/replaced mid-sandbox).
 
 The TOFU model means:
+
 - No hashes are specified in policy data -- the first observed binary is trusted
 - Once trusted, the binary cannot change for the sandbox's lifetime
 - Both the immediate binary and all ancestor binaries are TOFU-verified
@@ -1279,12 +1296,14 @@ Both IPv4 (`/proc/{pid}/net/tcp`) and IPv6 (`/proc/{pid}/net/tcp6`) tables are c
 Wraps `tokio::process::Child` + PID. Platform-specific `spawn()` methods delegate to `spawn_impl()`.
 
 **Environment setup** (both Linux and non-Linux):
+
 - `OPENSHELL_SANDBOX=1` (always set)
 - Provider credentials (from `GetSandboxProviderEnvironment` RPC)
 - Proxy URLs: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (uppercase for curl/wget), `NO_PROXY=127.0.0.1,localhost,::1` for localhost bypass, `http_proxy`, `https_proxy`, `grpc_proxy` (lowercase for gRPC C-core), `no_proxy=127.0.0.1,localhost,::1`, `NODE_USE_ENV_PROXY=1` (required for Node.js built-in `fetch`/`http` clients to honor proxy env vars)
 - TLS trust store: `NODE_EXTRA_CA_CERTS` (standalone CA cert), `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (combined bundle)
 
 **Pre-exec closure** (runs in child after fork, before exec -- async-signal-safe):
+
 1. `setpgid(0, 0)` if non-interactive (create new process group)
 2. `setns(fd, CLONE_NEWNET)` to enter network namespace (Linux only)
 3. `drop_privileges(policy)`: `initgroups()` -> `setgid()` -> `setuid()`
@@ -1295,6 +1314,7 @@ Wraps `tokio::process::Child` + PID. Platform-specific `spawn()` methods delegat
 ### `drop_privileges()`
 
 Resolves user/group names from policy, then:
+
 1. `initgroups()` to set supplementary groups (Linux only, not macOS)
 2. `setgid()` to target group
 3. Verify `getegid()` matches the target GID
@@ -1352,6 +1372,7 @@ The `SshHandler` implements `russh::server::Handler`:
 ### PTY child process
 
 `spawn_pty_shell()`:
+
 1. `openpty()` to create a master/slave PTY pair
 2. Build `std::process::Command` (not tokio) with slave FDs for stdin/stdout/stderr
 3. Set environment: `OPENSHELL_SANDBOX=1`, `HOME=/sandbox`, `USER=sandbox`, `TERM={negotiated}`, proxy URLs, TLS trust store paths, provider credentials
@@ -1570,10 +1591,12 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 ## Logging
 
 Dual-output logging is configured in `main.rs`:
+
 - **stdout**: Filtered by `--log-level` (default `warn`), uses ANSI colors
 - **`/var/log/openshell.log`**: Fixed at `info` level, no ANSI, non-blocking writer
 
 Key structured log events:
+
 - `CONNECT`: One per proxy CONNECT request (for non-`inference.local` targets) with full identity context. Inference interception failures produce a separate `info!()` log with `action=deny` and the denial reason.
 - `BYPASS_DETECT`: One per detected direct connection attempt that bypassed the HTTP CONNECT proxy. Includes destination, protocol, process identity (best-effort), and remediation hint. Emitted at `warn` level.
 - `L7_REQUEST`: One per L7-inspected request with method, path, and decision
@@ -1608,6 +1631,7 @@ flowchart LR
 ```
 
 Two log sources feed the same `TracingLogBus`:
+
 - **Gateway logs** (`source: "gateway"`): Generated by the server's `SandboxLogLayer` tracing layer when server-side code emits events containing a `sandbox_id` field. These capture reconciliation, provisioning, and management operations.
 - **Sandbox logs** (`source: "sandbox"`): Pushed from the sandbox supervisor via the `PushSandboxLogs` client-streaming RPC. These capture proxy decisions, policy reloads, process lifecycle, and all other sandbox-internal tracing events.
 
@@ -1626,6 +1650,7 @@ pub struct LogPushLayer {
 ```
 
 Key behaviors:
+
 - **Level filtering**: Defaults to `INFO`. Configurable via the `OPENSHELL_LOG_PUSH_LEVEL` environment variable (accepts `trace`, `debug`, `info`, `warn`, `error`). Events above the configured level are silently discarded.
 - **Best-effort delivery**: Uses `try_send()` on the mpsc channel. If the channel is full (1024 lines buffered), the event is dropped. Logging never blocks the sandbox supervisor.
 - **Structured fields**: Implements a `LogVisitor` that collects all tracing key-value fields (e.g., `dst_host`, `action`, `policy`) into a `HashMap<String, String>`. The `message` field is extracted separately; all other fields go into `SandboxLogLine.fields`.
@@ -1662,6 +1687,7 @@ The background task batches log lines and streams them to the gateway:
 **File:** `crates/openshell-server/src/grpc.rs` (`push_sandbox_logs`)
 
 The `PushSandboxLogs` RPC handler processes each batch:
+
 1. Validates `sandbox_id` is non-empty (skips empty batches).
 2. Iterates over `batch.logs`, capped at 100 lines per batch to prevent abuse.
 3. Forces `log.source = "sandbox"` on every line -- the sandbox cannot claim to be the gateway.
@@ -1673,6 +1699,7 @@ The `PushSandboxLogs` RPC handler processes each batch:
 **File:** `crates/openshell-server/src/tracing_bus.rs`
 
 `publish_external()` wraps the `SandboxLogLine` in a `SandboxStreamEvent` and calls the internal `publish()` method, which:
+
 1. Sends the event to the per-sandbox `broadcast::Sender` (capacity 1024). Subscribers (active `WatchSandbox` streams) receive the event immediately.
 2. Appends the event to the per-sandbox tail buffer (`VecDeque`), capped at 2000 lines. Overflow evicts the oldest entry.
 
@@ -1746,12 +1773,13 @@ Filtering is implemented server-side. For `WatchSandbox`, filters apply to both 
 
 `print_log_line()` in `crates/openshell-cli/src/run.rs` formats each log line:
 
-```
+```text
 [timestamp] [source ] [level] [target] message key=value key=value
 ```
 
 Example output:
-```
+
+```text
 [1708891234.567] [sandbox] [INFO ] [openshell_sandbox::proxy] CONNECT api.example.com:443 dst_host=api.example.com action=allow
 [1708891234.890] [gateway] [INFO ] [openshell_server::grpc] ReportPolicyStatus: sandbox reported policy load result
 ```

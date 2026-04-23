@@ -45,6 +45,7 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
 The reserved key `policy` is excluded from the registry. It is handled by dedicated policy commands and stored as a hex-encoded protobuf `SandboxPolicy` in the global settings' `Bytes` variant. Attempts to set or delete the `policy` key through settings commands are rejected.
 
 Helper functions:
+
 - `setting_for_key(key)` -- look up a `RegisteredSetting` by name, returns `None` for unknown keys
 - `registered_keys_csv()` -- comma-separated list of valid keys for error messages
 - `parse_bool_like(raw)` -- flexible bool parsing from CLI string input
@@ -83,6 +84,7 @@ The `UpdateSettings` RPC multiplexes policy and setting mutations through a sing
 | `global` | `bool` | Target gateway-global scope instead of sandbox scope |
 
 Validation rules:
+
 - `policy` and `setting_key` cannot both be present
 - At least one of `policy` or `setting_key` must be present
 - `delete_setting` cannot be combined with a `policy` payload
@@ -266,7 +268,7 @@ This prevents conflicting values at different scopes. An operator must delete a 
 
 When a global policy is set, sandbox-scoped policy updates via `UpdateSettings` are rejected with `FailedPrecondition`:
 
-```
+```text
 policy is managed globally; delete global policy before sandbox policy update
 ```
 
@@ -442,6 +444,7 @@ openshell policy get --global --full
 All `--global` mutations require human-in-the-loop confirmation via an interactive prompt. The `--yes` flag bypasses the prompt for scripted/CI usage. In non-interactive mode (no TTY), `--yes` is required -- otherwise the command fails with an error.
 
 The confirmation message varies:
+
 - **Global setting set**: warns that this will override sandbox-level values for the key
 - **Global setting delete**: warns that this re-enables sandbox-level management
 - **Global policy set**: warns that this overrides all sandbox policies

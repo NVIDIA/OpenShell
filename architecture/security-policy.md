@@ -283,6 +283,7 @@ The `--global` flag on `policy set`, `policy delete`, `policy list`, and `policy
 Both `set` and `delete` require interactive confirmation (or `--yes` to bypass). The `--wait` flag is rejected for global policy updates: `"--wait is not supported for global policies; global policies are effective immediately"`.
 
 When a global policy is active, sandbox-scoped policy mutations are blocked:
+
 - `policy set <sandbox>` returns `FailedPrecondition: "policy is managed globally"`
 - `policy update <sandbox>` returns `FailedPrecondition: "policy is managed globally"`
 - `rule approve`, `rule approve-all` return `FailedPrecondition: "cannot approve rules while a global policy is active"`
@@ -764,7 +765,7 @@ If any condition fails, the proxy returns `403 Forbidden`.
 
 **Logging**: Forward proxy requests are logged distinctly from CONNECT:
 
-```
+```text
 FORWARD method=GET dst_host=10.86.8.223 dst_port=8000 path=/screenshot/ action=allow policy=computer-control
 ```
 
@@ -823,8 +824,8 @@ TLS termination is automatic. The proxy peeks the first bytes of every CONNECT t
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `tls` absent or `""` (default)  | **Auto-detect**: The proxy peeks the first bytes of the tunnel. If TLS is detected (ClientHello pattern), the proxy terminates TLS transparently (MITM), enabling credential injection and L7 inspection. If plaintext HTTP is detected, the proxy inspects directly. If neither, traffic is relayed raw. |
 | `tls: "skip"`                   | **Explicit opt-out**: No TLS detection, no termination, no credential injection. The tunnel is a raw `copy_bidirectional` relay. Use for client-cert mTLS to upstream or non-standard binary protocols. |
-| `tls: "terminate"` *(deprecated)* | Treated as auto-detect. Emits a deprecation warning: "TLS termination is now automatic. Use `tls: skip` to explicitly disable." |
-| `tls: "passthrough"` *(deprecated)* | Treated as auto-detect. Emits the same deprecation warning. |
+| `tls: "terminate"` _(deprecated)_ | Treated as auto-detect. Emits a deprecation warning: "TLS termination is now automatic. Use `tls: skip` to explicitly disable." |
+| `tls: "passthrough"` _(deprecated)_ | Treated as auto-detect. Emits the same deprecation warning. |
 
 **Prerequisites for TLS termination (auto-detect path)**:
 
@@ -837,6 +838,7 @@ TLS termination is automatic. The proxy peeks the first bytes of every CONNECT t
 **Credential injection**: When TLS is auto-terminated but no L7 policy is configured (no `protocol` field), the proxy enters a passthrough relay that rewrites credential placeholders in HTTP headers (via `SecretResolver`) and logs requests for observability, but does not evaluate L7 OPA rules. This means credential injection works on all HTTPS endpoints automatically.
 
 **Validation warnings**:
+
 - `tls: terminate` or `tls: passthrough`: deprecated, emits a warning.
 - `tls: skip` with `protocol: rest` on port 443: emits a warning ("L7 inspection cannot work on encrypted traffic").
 
@@ -1194,6 +1196,7 @@ With a matching sandbox `/etc/hosts` entry such as `192.168.1.105 searxng.local`
 #### `allowed_ips` Format
 
 Entries can be:
+
 - **CIDR notation**: `10.0.5.0/24`, `172.16.0.0/12`, `192.168.1.0/24`
 - **Exact IP**: `10.0.5.20` (treated as `/32` for IPv4 or `/128` for IPv6)
 

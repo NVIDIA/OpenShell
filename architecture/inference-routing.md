@@ -214,7 +214,7 @@ This eliminates full-body buffering for streaming responses (SSE). Time-to-first
 
 When the proxy truncates a streaming response, it injects an SSE error event via `format_sse_error()` (in `crates/openshell-sandbox/src/l7/inference.rs`) before sending the HTTP chunked terminator:
 
-```
+```text
 data: {"error":{"message":"<reason>","type":"proxy_stream_error"}}
 ```
 

@@ -68,11 +68,13 @@ Before running commands, establish:
 ### Step 0: Quick Connectivity Check
 
 Run `openshell status` first. This immediately reveals:
+
 - Which gateway and endpoint the CLI is targeting
 - Whether the CLI can reach the server (mTLS handshake success/failure)
 - The server version if connected
 
 Common errors at this stage:
+
 - **`tls handshake eof`**: The server isn't running or mTLS credentials are missing/mismatched
 - **`connection refused`**: The container isn't running or port mapping is broken
 - **`No gateway configured`**: No gateway has been deployed yet
@@ -222,6 +224,7 @@ openshell doctor exec -- kubectl -n openshell get secret openshell-client-tls -o
 ```
 
 Common mTLS issues:
+
 - **Secrets missing**: The `openshell` namespace may not have been created yet (Helm controller race). Bootstrap waits up to 2 minutes for the namespace.
 - **mTLS mismatch after manual secret deletion**: Delete all three secrets and redeploy — bootstrap will regenerate and restart the workload.
 - **CLI can't connect after redeploy**: Check that `~/.config/openshell/gateways/<name>/mtls/` contains `ca.crt`, `tls.crt`, `tls.key` and that they were updated at deploy time.

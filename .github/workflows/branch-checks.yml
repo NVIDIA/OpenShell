@@ -100,3 +100,20 @@ jobs:
 
       - name: Test
         run: mise run test:python
+
+  markdown:
+    name: Markdown
+    runs-on: build-amd64
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: mise install
+
+      - name: Lint
+        run: mise run markdown:lint

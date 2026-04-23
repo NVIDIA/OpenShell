@@ -52,7 +52,7 @@ docker exec openshell-cluster-openshell kubectl get pod private-api -o wide
 
 Example output:
 
-```
+```text
 NAME          READY   STATUS    IP            NODE
 private-api   1/1     Running   10.42.0.128   ...
 ```

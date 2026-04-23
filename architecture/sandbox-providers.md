@@ -333,7 +333,7 @@ the full implementation details, encoding rules, and security properties.
 
 ### End-to-End Flow
 
-```
+```text
 CLI: openshell sandbox create -- claude
   |
   +-- detect_provider_from_command(["claude"]) -> "claude"

@@ -31,7 +31,7 @@ demo doesn't use an AI agent.
 
 You'll land in an interactive shell inside the sandbox:
 
-```
+```text
 sandbox@demo:~$
 ```
 
@@ -46,7 +46,7 @@ The sandbox proxy intercepted the HTTPS CONNECT request to
 `api.github.com:443` and rejected it because no network policy authorizes
 `curl` to reach that host.
 
-```
+```text
 curl: (56) Received HTTP code 403 from proxy after CONNECT
 ```
 
@@ -64,7 +64,7 @@ openshell logs demo --since 5m
 
 You'll see a line like:
 
-```
+```text
 action=deny dst_host=api.github.com dst_port=443 binary=/usr/bin/curl deny_reason="no matching network policy"
 ```
 
@@ -138,7 +138,7 @@ openshell sandbox connect demo
 curl -s https://api.github.com/zen
 ```
 
-```
+```text
 Anything added dilutes everything else.
 ```
 
@@ -148,7 +148,7 @@ It works. Try a more visual endpoint:
 curl -s https://api.github.com/octocat
 ```
 
-```
+```text
                MMM.           .MMM
                MMMMMMMMMMMMMMMMMMM
                MMMMMMMMMMMMMMMMMMM      ____________________________
@@ -202,7 +202,7 @@ exit
 openshell logs demo --level warn --since 5m
 ```
 
-```
+```text
 l7_decision=deny dst_host=api.github.com l7_action=POST l7_target=/repos/octocat/hello-world/issues l7_deny_reason="POST /repos/octocat/hello-world/issues not permitted by policy"
 ```
 

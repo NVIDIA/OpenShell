@@ -25,7 +25,7 @@ No separate configuration files or authentication are needed.
 
 The TUI divides the terminal into four horizontal regions:
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │  OpenShell ─ my-cluster ─ Dashboard  ● Healthy                   │  ← title bar
 ├─────────────────────────────────────────────────────────────────┤
@@ -58,10 +58,11 @@ The dashboard is divided into a top info pane and a middle pane with two tabs:
   - **Global Settings** — gateway-global runtime settings (fetched via `GetGatewaySettings`).
 
 **Health status** indicators:
-  - `●` **Healthy** (green) — everything is running normally.
-  - `◐` **Degraded** (yellow) — the cluster is up but something needs attention.
-  - `○` **Unhealthy** (red) — the cluster is not operating correctly.
-  - `…` — still connecting or status unknown.
+
+- `●` **Healthy** (green) — everything is running normally.
+- `◐` **Degraded** (yellow) — the cluster is up but something needs attention.
+- `○` **Unhealthy** (red) — the cluster is not operating correctly.
+- `…` — still connecting or status unknown.
 
 **Global policy indicator**: When a global policy is active, the gateway row shows `Global Policy Active (vN)` in yellow (the `status_warn` style). The TUI detects this by polling `ListSandboxPolicies` with `global: true, limit: 1` on each tick and checking if the latest revision has `PolicyStatus::Loaded`. See `crates/openshell-tui/src/ui/dashboard.rs`.
 
@@ -174,6 +175,7 @@ The TUI supports creating sandboxes with port forwarding directly from the creat
 Forwarded ports are displayed in the **NOTES** column of the sandbox table as `fwd:8080,3000` and in the **Forwards** row of the sandbox detail view.
 
 Port forwarding lifecycle:
+
 - **On create**: The TUI polls for sandbox readiness (up to 30 attempts at 2-second intervals), then spawns SSH tunnels.
 - **On delete**: Any active forwards for the sandbox are automatically stopped before deletion.
 - **PID tracking**: Forward PIDs are stored in `~/.config/openshell/forwards/<name>-<port>.pid`, shared with the CLI.

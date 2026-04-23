@@ -168,7 +168,7 @@ For the target daemon (local or remote):
    - k3s server command: `server --disable=traefik --tls-san=127.0.0.1 --tls-san=localhost --tls-san=host.docker.internal` plus computed extra SANs.
    - Privileged mode.
    - Volume bind mount: `openshell-cluster-{name}:/var/lib/rancher/k3s`.
-    - Network: `openshell-cluster-{name}` (per-gateway bridge network).
+   - Network: `openshell-cluster-{name}` (per-gateway bridge network).
    - Extra host: `host.docker.internal:host-gateway`.
    - The cluster entrypoint prefers the resolved IPv4 for `host.docker.internal` when populating sandbox pod `hostAliases`, then falls back to the container default gateway. This keeps sandbox host aliases working on Docker Desktop, where the host-reachable IP differs from the bridge gateway.
    - Port mappings:
@@ -230,7 +230,7 @@ After deploy, the CLI calls `save_active_gateway(name)`, writing the gateway nam
 
 The cluster image is defined by target `cluster` in `deploy/docker/Dockerfile.images`:
 
-```
+```text
 Base:  rancher/k3s:v1.35.2-k3s1
 ```
 
@@ -242,6 +242,7 @@ Layers added:
 4. Kubernetes manifests: `deploy/kube/manifests/*.yaml` -> `/opt/openshell/manifests/`
 
 Bundled manifests include:
+
 - `openshell-helmchart.yaml` (OpenShell Helm chart auto-deploy)
 - `envoy-gateway-helmchart.yaml` (Envoy Gateway for Gateway API)
 - `agent-sandbox.yaml`
@@ -363,9 +364,10 @@ flowchart LR
 4. Force-remove the per-gateway network via `force_remove_network()`, disconnecting any stale endpoints first.
 
 **CLI layer** (`gateway_destroy()` in `run.rs` additionally):
-
-6. Remove the metadata JSON file via `remove_gateway_metadata()`.
-7. Clear the active gateway reference if it matches the destroyed gateway.
+<!-- markdownlint-disable MD029 -->
+5. Remove the metadata JSON file via `remove_gateway_metadata()`.
+6. Clear the active gateway reference if it matches the destroyed gateway.
+<!-- markdownlint-enable MD029 -->
 
 ## Idempotency and Error Behavior
 
@@ -378,8 +380,8 @@ flowchart LR
   - Docker API failures from inspect/create/start/remove.
   - SSH connection failures when creating the remote Docker client.
   - Health check timeout (6 min) with recent container logs.
-   - Container exit during any polling phase (health, mTLS) with diagnostic information (exit code, OOM status, recent logs).
-   - mTLS secret polling timeout (3 min).
+  - Container exit during any polling phase (health, mTLS) with diagnostic information (exit code, OOM status, recent logs).
+  - mTLS secret polling timeout (3 min).
   - Local image ref without registry prefix: clear error with build instructions rather than a failed Docker Hub pull.
 
 ## Auto-Bootstrap from `sandbox create`
@@ -436,7 +438,7 @@ Environment variables that affect bootstrap behavior when set on the host:
 
 Artifacts stored under `$XDG_CONFIG_HOME/openshell/` (default `~/.config/openshell/`):
 
-```
+```text
 openshell/
   active_gateway                           # plain text: active gateway name
   gateways/

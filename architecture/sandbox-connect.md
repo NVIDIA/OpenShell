@@ -178,7 +178,7 @@ sequenceDiagram
     CLI->>GW: CreateSshSession(sandbox_id)
     GW-->>CLI: token, gateway_host, gateway_port, scheme, connect_path
 
-    Note over CLI: Builds ProxyCommand string; exec()s ssh
+    Note over CLI: Builds ProxyCommand string: exec()s ssh
 
     User->>CLI: ssh spawns ssh-proxy subprocess
     CLI->>GW: CONNECT /connect/ssh<br/>X-Sandbox-Id, X-Sandbox-Token

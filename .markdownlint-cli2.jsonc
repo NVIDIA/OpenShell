@@ -1,0 +1,31 @@
+{
+  "globs": [
+    "**/*.md",
+    "**/*.mdx"
+  ],
+  "gitignore": true,
+  "ignores": [
+    ".agents/**",
+    ".claude/**",
+    ".opencode/**",
+    ".github/**",
+    "THIRD-PARTY-NOTICES/**",
+    "CLAUDE.md"
+  ],
+  "config": {
+    "default": true,
+    // Allow long lines — prose paragraphs are single-line per project style.
+    "MD013": false,
+    // Allow GitHub-rendered HTML commonly used in READMEs (centered logos,
+    // collapsible sections, keyboard hints). Regular prose HTML still flagged.
+    "MD033": { "allowed_elements": ["p", "img", "br", "a", "div", "details", "summary", "kbd", "sub", "sup"] },
+    // Allow duplicate headings in different sections.
+    "MD024": { "siblings_only": true },
+    // Bare URLs are fine in changelogs and tables.
+    "MD034": false,
+    // First line does not need to be a heading.
+    "MD002": false,
+    // Repo uses padded table pipes (`| foo | bar |`); rule default is "compact".
+    "MD060": { "style": "padded" }
+  }
+}

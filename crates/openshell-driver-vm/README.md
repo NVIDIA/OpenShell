@@ -31,11 +31,9 @@ Sandbox guests execute `/opt/openshell/bin/openshell-sandbox` as PID 1 inside th
 
 ## Quick start (recommended)
 
-
 ```shell
 mise run gateway:vm
 ```
-
 
 First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/gvproxy and `mise run vm:rootfs -- --base` builds the embedded rootfs. Subsequent runs are cached. To keep the Unix socket path under macOS `SUN_LEN`, `mise run gateway:vm` and `start.sh` default the state dir to `/tmp/openshell-vm-driver-dev-$USER-port-$PORT/` (SQLite DB + per-sandbox rootfs + `compute-driver.sock`) unless `OPENSHELL_VM_DRIVER_STATE_DIR` is set.
 The wrapper also prints the recommended gateway name (`vm-driver-port-$PORT` by default) plus the exact repo-local `scripts/bin/openshell gateway add` and `scripts/bin/openshell gateway select` commands to use from another terminal. This avoids accidentally hitting an older `openshell` binary elsewhere on your `PATH`.

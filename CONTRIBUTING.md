@@ -258,7 +258,7 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 
 This project uses [Conventional Commits](https://www.conventionalcommits.org/). All commit messages must follow the format:
 
-```
+```text
 <type>(<scope>): <description>
 
 [optional body]
@@ -279,7 +279,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/). 
 
 **Examples:**
 
-```
+```text
 feat(cli): add --verbose flag to openshell run
 fix(sandbox): handle timeout errors gracefully
 docs: update installation instructions

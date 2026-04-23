@@ -142,6 +142,7 @@ The connection flow works as follows:
 5. The CLI and sandbox exchange SSH traffic bidirectionally through the tunnel.
 
 This design provides several benefits:
+
 - Sandbox pods are never directly accessible from outside the cluster.
 - All access is authenticated and auditable through the gateway.
 - Session tokens can be revoked to immediately cut off access.
@@ -197,7 +198,6 @@ The inference routing system transparently intercepts AI inference API calls fro
 | Provider profiles | `crates/openshell-core/src/inference.rs` | Centralized auth, headers, protocols, and endpoint defaults per provider type |
 | Gateway inference service | `crates/openshell-server/src/inference.rs` | Stores cluster inference config, resolves bundles with credentials from provider records |
 | Proto definitions | `proto/inference.proto` | `ClusterInferenceConfig`, `ResolvedRoute`, bundle RPCs |
-
 
 ### Container and Build System
 

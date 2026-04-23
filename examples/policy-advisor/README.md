@@ -140,11 +140,13 @@ Once all 7 gates are unlocked the script prints a victory banner.
   environment for faster feedback during the demo.
 - **CLI alternative** -- you can approve drafts from the CLI instead of the
   TUI:
+
   ```bash
    openshell rule get advisor-ctf                    # list pending
    openshell rule approve advisor-ctf --chunk-id ID  # approve one
    openshell rule approve-all advisor-ctf             # approve all
   ```
+
 - **Gate 3 shows per-binary tracking** -- curl hits its own endpoint, producing
   a rule attributed to `curl` rather than `python3` in the TUI.
 - **Gate 7 is different** -- it targets a host that resolves to a private IP.

@@ -510,6 +510,7 @@ graph LR
 ```
 
 All buses use `tokio::sync::broadcast` channels keyed by sandbox ID. Buffer sizes:
+
 - `SandboxWatchBus`: 128 (signals only, no payload -- just `()`)
 - `TracingLogBus`: 1024 (full `SandboxStreamEvent` payloads)
 - `PlatformEventBus`: 1024 (full `SandboxStreamEvent` payloads)
