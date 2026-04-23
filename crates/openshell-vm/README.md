@@ -18,6 +18,9 @@ mise run vm
 
 - **macOS (Apple Silicon)** or **Linux (aarch64 or x86_64 with KVM)**
 - Rust toolchain
+- Guest-supervisor cross-compile toolchain (needed on macOS, and on Linux when host arch ≠ guest arch):
+  - Matching rustup target: `rustup target add aarch64-unknown-linux-gnu` (or `x86_64-unknown-linux-gnu` for an amd64 guest)
+  - `cargo install --locked cargo-zigbuild` and `brew install zig` (or distro equivalent). `build-rootfs.sh` uses `cargo zigbuild` to cross-compile the in-VM `openshell-sandbox` supervisor binary.
 - [mise](https://mise.jdx.dev/) task runner
 - Docker (for rootfs builds)
 - `gh` CLI (for downloading pre-built runtime)

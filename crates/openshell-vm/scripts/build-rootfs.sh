@@ -365,16 +365,29 @@ SUPERVISOR_TARGET="${RUST_TARGET}"
 SUPERVISOR_BIN="${PROJECT_ROOT}/target/${SUPERVISOR_TARGET}/release/openshell-sandbox"
 
 echo "==> Building openshell-sandbox supervisor binary (${SUPERVISOR_TARGET})..."
-if command -v cargo-zigbuild >/dev/null 2>&1; then
-    cargo zigbuild --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}" \
-        --manifest-path "${PROJECT_ROOT}/Cargo.toml" 2>&1 | tail -5
+SUPERVISOR_BUILD_LOG="$(mktemp -t openshell-supervisor-build.XXXXXX.log)"
+run_supervisor_build() {
+    if command -v cargo-zigbuild >/dev/null 2>&1; then
+        cargo zigbuild --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}" \
+            --manifest-path "${PROJECT_ROOT}/Cargo.toml"
+    else
+        # Fallback: use plain cargo build when cargo-zigbuild is not available.
+        # This works for native builds (e.g. building x86_64 on x86_64) but
+        # will fail for true cross-compilation without a cross toolchain.
+        echo "    cargo-zigbuild not found, falling back to cargo build..."
+        cargo build --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}" \
+            --manifest-path "${PROJECT_ROOT}/Cargo.toml"
+    fi
+}
+if run_supervisor_build >"${SUPERVISOR_BUILD_LOG}" 2>&1; then
+    tail -5 "${SUPERVISOR_BUILD_LOG}"
+    rm -f "${SUPERVISOR_BUILD_LOG}"
 else
-    # Fallback: use plain cargo build when cargo-zigbuild is not available.
-    # This works for native builds (e.g. building x86_64 on x86_64) but
-    # will fail for true cross-compilation without a cross toolchain.
-    echo "    cargo-zigbuild not found, falling back to cargo build..."
-    cargo build --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}" \
-        --manifest-path "${PROJECT_ROOT}/Cargo.toml" 2>&1 | tail -5
+    status=$?
+    echo "ERROR: supervisor build failed. Full output:" >&2
+    cat "${SUPERVISOR_BUILD_LOG}" >&2
+    echo "    (log saved at ${SUPERVISOR_BUILD_LOG})" >&2
+    exit "${status}"
 fi
 
 if [ ! -f "${SUPERVISOR_BIN}" ]; then

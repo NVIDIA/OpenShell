@@ -41,7 +41,40 @@ normalize_bool() {
     esac
 }
 
+check_supervisor_cross_toolchain() {
+    # The sandbox supervisor inside the guest is always Linux. On non-Linux
+    # hosts (macOS) and on Linux hosts with a different arch than the guest,
+    # we cross-compile via cargo-zigbuild and need the matching rustup target.
+    local host_os host_arch guest_arch rust_target
+    host_os="$(uname -s)"
+    host_arch="$(uname -m)"
+    guest_arch="${GUEST_ARCH:-${host_arch}}"
+    case "${guest_arch}" in
+        arm64|aarch64) rust_target="aarch64-unknown-linux-gnu" ;;
+        x86_64|amd64)  rust_target="x86_64-unknown-linux-gnu" ;;
+        *) return 0 ;;
+    esac
+    if [ "${host_os}" = "Linux" ] && [ "${host_arch}" = "${guest_arch}" ]; then
+        return 0
+    fi
+    local missing=0
+    if ! command -v cargo-zigbuild >/dev/null 2>&1; then
+        echo "ERROR: cargo-zigbuild not found (required to cross-compile the guest supervisor)." >&2
+        echo "       Install: cargo install --locked cargo-zigbuild && brew install zig" >&2
+        missing=1
+    fi
+    if ! rustup target list --installed 2>/dev/null | grep -qx "${rust_target}"; then
+        echo "ERROR: Rust target '${rust_target}' not installed." >&2
+        echo "       Install: rustup target add ${rust_target}" >&2
+        missing=1
+    fi
+    if [ "${missing}" -ne 0 ]; then
+        exit 1
+    fi
+}
+
 if [ ! -f "${COMPRESSED_DIR}/rootfs.tar.zst" ]; then
+    check_supervisor_cross_toolchain
     echo "==> Building base VM rootfs tarball"
     mise run vm:rootfs -- --base
 fi
