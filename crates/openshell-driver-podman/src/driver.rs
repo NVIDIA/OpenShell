@@ -564,8 +564,7 @@ mod tests {
         // Simulate what new() does once the socket/network checks pass.
         let mut cfg = config;
         if cfg.grpc_endpoint.is_empty() {
-            cfg.grpc_endpoint =
-                format!("http://host.containers.internal:{}", cfg.gateway_port);
+            cfg.grpc_endpoint = format!("http://host.containers.internal:{}", cfg.gateway_port);
         }
         assert_eq!(cfg.grpc_endpoint, "http://host.containers.internal:8081");
     }
@@ -579,8 +578,7 @@ mod tests {
         );
         let mut cfg = config;
         if cfg.grpc_endpoint.is_empty() {
-            cfg.grpc_endpoint =
-                format!("http://host.containers.internal:{}", cfg.gateway_port);
+            cfg.grpc_endpoint = format!("http://host.containers.internal:{}", cfg.gateway_port);
         }
         assert_eq!(cfg.grpc_endpoint, "http://host.containers.internal:8080");
     }
@@ -594,8 +592,7 @@ mod tests {
         };
         let mut cfg = config;
         if cfg.grpc_endpoint.is_empty() {
-            cfg.grpc_endpoint =
-                format!("http://host.containers.internal:{}", cfg.gateway_port);
+            cfg.grpc_endpoint = format!("http://host.containers.internal:{}", cfg.gateway_port);
         }
         assert_eq!(cfg.grpc_endpoint, "https://gateway.internal:9000");
     }

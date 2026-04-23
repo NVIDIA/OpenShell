@@ -86,6 +86,20 @@ fn generate_confirmation_code() -> String {
 /// 4. Waits for the XHR POST callback with the CF JWT and matching code
 /// 5. Returns the token
 pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
+    // Short-circuit when the browser is suppressed (CI, e2e tests, headless
+    // environments).  Without this early return the function still binds a TCP
+    // listener, spawns a callback server, and waits the full AUTH_TIMEOUT
+    // (120 s) for a POST that will never arrive.
+    let no_browser = std::env::var("OPENSHELL_NO_BROWSER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if no_browser {
+        return Err(miette::miette!(
+            "authentication skipped (OPENSHELL_NO_BROWSER is set).\n\
+             Authenticate later with: openshell gateway login"
+        ));
+    }
+
     let listener = TcpListener::bind("127.0.0.1:0").await.into_diagnostic()?;
     let local_addr = listener.local_addr().into_diagnostic()?;
     let callback_port = local_addr.port();
@@ -108,37 +122,24 @@ pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
         gateway_endpoint.to_string(),
     ));
 
-    // Allow suppressing the browser popup via environment variable (useful for
-    // CI, e2e tests, and headless environments).
-    let no_browser = std::env::var("OPENSHELL_NO_BROWSER")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
     // Prompt the user before opening the browser.
     eprintln!("  Confirmation code: {code}");
     eprintln!("  Verify this code matches your browser before clicking Connect.");
     eprintln!();
 
-    if no_browser {
-        eprintln!("Browser opening suppressed (OPENSHELL_NO_BROWSER is set).");
+    eprint!("Press Enter to open the browser for authentication...");
+    std::io::stderr().flush().ok();
+    let mut _input = String::new();
+    std::io::stdin().read_line(&mut _input).ok();
+
+    if let Err(e) = open_browser(&auth_url) {
+        debug!(error = %e, "failed to open browser");
+        eprintln!("Could not open browser automatically.");
         eprintln!("Open this URL in your browser:");
         eprintln!("  {auth_url}");
         eprintln!();
     } else {
-        eprint!("Press Enter to open the browser for authentication...");
-        std::io::stderr().flush().ok();
-        let mut _input = String::new();
-        std::io::stdin().read_line(&mut _input).ok();
-
-        if let Err(e) = open_browser(&auth_url) {
-            debug!(error = %e, "failed to open browser");
-            eprintln!("Could not open browser automatically.");
-            eprintln!("Open this URL in your browser:");
-            eprintln!("  {auth_url}");
-            eprintln!();
-        } else {
-            eprintln!("Browser opened.");
-        }
+        eprintln!("Browser opened.");
     }
 
     // Wait for the callback or timeout.
