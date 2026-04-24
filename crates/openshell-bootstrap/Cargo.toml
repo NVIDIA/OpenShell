@@ -20,6 +20,7 @@ miette = { workspace = true }
 rcgen = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+url = { workspace = true }
 tar = "0.4"
 tempfile = "3"
 tokio = { workspace = true }

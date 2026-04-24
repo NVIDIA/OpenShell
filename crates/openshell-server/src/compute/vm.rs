@@ -63,6 +63,9 @@ pub struct VmComputeConfig {
     /// falls back to its conventional install paths and sibling binary.
     pub driver_dir: Option<PathBuf>,
 
+    /// Default sandbox image the driver should use when a request omits one.
+    pub default_image: String,
+
     /// libkrun log level used by the VM driver helper.
     pub krun_log_level: u32,
 
@@ -124,6 +127,7 @@ impl Default for VmComputeConfig {
         Self {
             state_dir: Self::default_state_dir(),
             driver_dir: None,
+            default_image: String::new(),
             krun_log_level: Self::default_krun_log_level(),
             vcpus: Self::default_vcpus(),
             mem_mib: Self::default_mem_mib(),
@@ -303,6 +307,9 @@ pub async fn spawn(
         .arg("--openshell-endpoint")
         .arg(&config.grpc_endpoint);
     command.arg("--state-dir").arg(&vm_config.state_dir);
+    if !vm_config.default_image.trim().is_empty() {
+        command.arg("--default-image").arg(&vm_config.default_image);
+    }
     command
         .arg("--ssh-handshake-secret")
         .arg(&config.ssh_handshake_secret);

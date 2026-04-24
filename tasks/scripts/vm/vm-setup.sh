@@ -21,6 +21,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
+CLI_BIN="${ROOT}/scripts/bin/openshell"
 
 FROM_SOURCE="${FROM_SOURCE:-0}"
 
@@ -126,6 +127,6 @@ echo ""
 echo "==> Setup complete!"
 echo "    Compressed artifacts in: ${OUTPUT_DIR}"
 echo ""
-echo "Next steps:"
-echo "  mise run vm:rootfs --base   # build rootfs (requires Docker)"
-echo "  mise run gateway:vm         # start openshell-gateway with the VM driver"
+echo "After starting the gateway:"
+echo "  ${CLI_BIN} status"
+echo "  ${CLI_BIN} sandbox create --name vm-test --from ubuntu:24.04"

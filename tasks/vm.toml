@@ -5,6 +5,7 @@
 #
 # Workflow:
 #   mise run vm:setup          # one-time: download pre-built runtime (~30s)
+#   mise run vm:supervisor     # build the bundled sandbox supervisor
 #   mise run gateway:vm        # start openshell-gateway with the VM driver
 #   mise run vm                # build + run the standalone openshell-vm microVM
 #   mise run vm:clean          # wipe everything and start over
@@ -37,6 +38,10 @@ run = [
 ["vm:setup"]
 description = "One-time setup: download (or build) the VM runtime"
 run = "tasks/scripts/vm/vm-setup.sh"
+
+["vm:supervisor"]
+description = "Build the bundled openshell-sandbox supervisor for openshell-driver-vm"
+run = "tasks/scripts/vm/build-supervisor-bundle.sh"
 
 ["vm:rootfs"]
 description = "Build the VM rootfs tarball (use -- --base for lightweight)"

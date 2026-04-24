@@ -15,7 +15,7 @@ own.
 Community sandboxes are ready-to-use environments published in the
 [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) repository.
 Each sandbox bundles a Dockerfile, policy, optional skills, and startup scripts
-into a single package that you can launch with one command.
+into a single package that can be published as a pre-built sandbox image.
 
 ## Current Catalog
 
@@ -40,12 +40,11 @@ When you pass `--from` with a community sandbox name, the CLI:
 
 1. Resolves the name against the
    [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) repository.
-2. Pulls the Dockerfile, policy, skills, and any startup scripts.
-3. Builds the container image locally.
-4. Creates the sandbox with the bundled configuration applied.
+2. Converts the catalog name into the published sandbox image reference.
+3. Creates the sandbox with that image and the bundled community defaults.
 
-You end up with a running sandbox whose image, policy, and tooling are all
-preconfigured by the community package.
+You end up with a running sandbox whose image and tooling are preconfigured by
+the community package.
 
 ### Other Sources
 
@@ -58,11 +57,25 @@ The `--from` flag also accepts:
   openshell sandbox create --from ./my-sandbox-dir
   ```
 
+  This local Dockerfile flow is supported only when the selected gateway runs on
+  the same machine as the CLI. The CLI builds the image in the local Docker
+  daemon. For local Kubernetes gateways it also imports that image into the
+  gateway container runtime. For local VM gateways, the CLI exports the built
+  image as a local rootfs tar artifact and the VM driver consumes that artifact.
+
 - Container image references: Use an existing container image directly:
 
   ```shell
   openshell sandbox create --from my-registry.example.com/my-image:latest
   ```
+
+  On the VM backend, the image becomes the base guest rootfs for that sandbox.
+  The VM driver prepares and caches a rewritten rootfs per immutable image
+  identity, so different VM sandboxes can run with different `--from` images at
+  the same time. VM images must remain base-compatible with the guest init path.
+  Prepared VM rootfs caches stay on disk until they are removed from the VM
+  driver state directory. Docker is not required for registry or community image
+  refs on the VM backend.
 
 ## Contribute a Community Sandbox
 

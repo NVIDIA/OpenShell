@@ -2,7 +2,7 @@
 
 > Status: Experimental. The VM compute driver is under active development and the interface still has VM-specific plumbing that will be generalized.
 
-Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) for OpenShell. The gateway spawns this binary as a subprocess, talks to it over a Unix domain socket with the `openshell.compute.v1.ComputeDriver` gRPC surface, and lets it manage per-sandbox microVMs. The runtime (libkrun + libkrunfw + gvproxy) and sandbox rootfs are embedded directly in the binary — no sibling files required at runtime.
+Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) for OpenShell. The gateway spawns this binary as a subprocess, talks to it over a Unix domain socket with the `openshell.compute.v1.ComputeDriver` gRPC surface, and lets it manage per-sandbox microVMs. The runtime (libkrun + libkrunfw + gvproxy) and the sandbox supervisor are embedded directly in the binary; each sandbox guest rootfs is derived from a configured container image at create time.
 
 ## How it fits together
 
@@ -10,7 +10,7 @@ Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) fo
 flowchart LR
     subgraph host["Host process"]
         gateway["openshell-server<br/>(compute::vm::spawn)"]
-        driver["openshell-driver-vm<br/>├── libkrun (VM)<br/>├── gvproxy (net)<br/>└── rootfs.tar.zst"]
+        driver["openshell-driver-vm<br/>├── libkrun (VM)<br/>├── gvproxy (net)<br/>└── openshell-sandbox.zst"]
         gateway <-->|"gRPC over UDS<br/>compute-driver.sock"| driver
     end
 
@@ -35,8 +35,9 @@ Sandbox guests execute `/opt/openshell/bin/openshell-sandbox` as PID 1 inside th
 mise run gateway:vm
 ```
 
-First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/gvproxy and `mise run vm:rootfs -- --base` builds the embedded rootfs. Subsequent runs are cached. To keep the Unix socket path under macOS `SUN_LEN`, `mise run gateway:vm` and `start.sh` default the state dir to `/tmp/openshell-vm-driver-dev-$USER-port-$PORT/` (SQLite DB + per-sandbox rootfs + `compute-driver.sock`) unless `OPENSHELL_VM_DRIVER_STATE_DIR` is set.
-The wrapper auto-registers the gateway with the CLI (`gateway destroy` + `gateway add`) so no manual registration step is needed. When running under `sudo`, it uses `sudo -u $SUDO_USER` for the registration so the config is written under the invoking user's home directory. Re-runs are idempotent.
+First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/gvproxy and `mise run vm:supervisor` builds the bundled guest supervisor. Subsequent runs are cached. To keep the Unix socket path under macOS `SUN_LEN`, `mise run gateway:vm` and `start.sh` default the state dir to `/tmp/openshell-vm-driver-dev-$USER-<repo-name>/` (SQLite DB + per-sandbox rootfs + `compute-driver.sock`) unless `OPENSHELL_VM_DRIVER_STATE_DIR` is set.
+By default the wrapper names the gateway after the repo directory, writes `OPENSHELL_GATEWAY=<repo-name>` into `.env`, and writes plaintext local gateway metadata under `~/.config/openshell/gateways/<repo-name>/metadata.json` so repo-local `scripts/bin/openshell status` and `sandbox create` resolve to the VM gateway without an extra `gateway select`. When running under `sudo`, the wrapper uses `sudo -u $SUDO_USER` for the registration so the config is written under the invoking user's home directory. Re-runs are idempotent.
+If neither `OPENSHELL_SERVER_PORT` nor `GATEWAY_PORT` is set, the wrapper picks a random free local port once and appends `GATEWAY_PORT=<port>` to `.env`. Later runs reuse that port through `mise`'s env loading. If you set `OPENSHELL_SERVER_PORT` explicitly, the wrapper uses it for that run and still fails fast on conflicts.
 It also exports `OPENSHELL_DRIVER_DIR=$PWD/target/debug` before starting the gateway so local dev runs use the freshly built `openshell-driver-vm` instead of an older installed copy from `~/.local/libexec/openshell` or `/usr/local/libexec`.
 
 For GPU passthrough (VFIO), pass `-- --gpu` and run with root privileges:
@@ -55,25 +56,24 @@ OPENSHELL_SSH_HANDSHAKE_SECRET=$(openssl rand -hex 32) \
 crates/openshell-driver-vm/start.sh
 ```
 
-Run multiple dev gateways side by side by giving each one a unique port. The wrapper derives a distinct default state dir from that port automatically:
+If you want to pin the project port instead of using the `.env` default:
 
 ```shell
-OPENSHELL_SERVER_PORT=8080 mise run gateway:vm
-OPENSHELL_SERVER_PORT=8081 mise run gateway:vm
+GATEWAY_PORT=28080 mise run gateway:vm
 ```
 
-If you want a custom suffix instead of `port-$PORT`, set `OPENSHELL_VM_INSTANCE`:
+If you want a custom state-dir suffix instead of the repo-name default, set `OPENSHELL_VM_INSTANCE`:
 
 ```shell
-OPENSHELL_SERVER_PORT=8082 \
+GATEWAY_PORT=28081 \
 OPENSHELL_VM_INSTANCE=feature-a \
 mise run gateway:vm
 ```
 
-If you want a custom CLI gateway name, set `OPENSHELL_VM_GATEWAY_NAME`:
+If you want a custom CLI gateway name instead of the repo directory, set `OPENSHELL_VM_GATEWAY_NAME`:
 
 ```shell
-OPENSHELL_SERVER_PORT=8082 \
+GATEWAY_PORT=28082 \
 OPENSHELL_VM_GATEWAY_NAME=vm-feature-a \
 mise run gateway:vm
 ```
@@ -81,7 +81,7 @@ mise run gateway:vm
 Teardown:
 
 ```shell
-rm -rf /tmp/openshell-vm-driver-dev-$USER-port-8080
+rm -rf /tmp/openshell-vm-driver-dev-$USER-$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
 ```
 
 ## Manual equivalent
@@ -89,9 +89,9 @@ rm -rf /tmp/openshell-vm-driver-dev-$USER-port-8080
 If you want to drive the launch yourself instead of using `start.sh`:
 
 ```shell
-# 1. Stage runtime artifacts + base rootfs into target/vm-runtime-compressed/
+# 1. Stage runtime artifacts + supervisor bundle into target/vm-runtime-compressed/
 mise run vm:setup
-mise run vm:rootfs -- --base    # if rootfs.tar.zst is not already present
+mise run vm:supervisor          # if openshell-sandbox.zst is not already present
 
 # 2. Build both binaries with the staged artifacts embedded
 OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed \
@@ -109,6 +109,7 @@ target/debug/openshell-gateway \
   --disable-tls \
   --database-url sqlite:/tmp/openshell-vm-driver-dev-$USER-port-8080/openshell.db \
   --driver-dir $PWD/target/debug \
+  --sandbox-image <compatible-image> \
   --grpc-endpoint http://host.containers.internal:8080 \
   --ssh-handshake-secret dev-vm-driver-secret \
   --ssh-gateway-host 127.0.0.1 \
@@ -140,11 +141,12 @@ See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the full fl
 The gateway is auto-registered by `start.sh`. In another terminal:
 
 ```shell
-scripts/bin/openshell sandbox create --name demo
-scripts/bin/openshell sandbox connect demo
+./scripts/bin/openshell status
+./scripts/bin/openshell sandbox create --name demo --from <compatible-image>
+./scripts/bin/openshell sandbox connect demo
 ```
 
-First sandbox takes 10–30 seconds to boot (rootfs extraction + libkrun + guest init). Subsequent creates reuse the prepared sandbox rootfs.
+First sandbox takes 10–30 seconds to boot (image fetch/prepare/cache + libkrun + guest init). If `--from` is omitted, the VM driver uses the gateway's configured default sandbox image. Without either `--from` or `--sandbox-image`, VM sandbox creation fails. Subsequent creates reuse the prepared sandbox rootfs.
 
 ## Logs and debugging
 
@@ -163,9 +165,9 @@ The VM guest's serial console is appended to `<state-dir>/<sandbox-id>/console.l
 - Rust toolchain
 - Guest-supervisor cross-compile toolchain (needed on macOS, and on Linux when host arch ≠ guest arch):
   - Matching rustup target: `rustup target add aarch64-unknown-linux-gnu` (or `x86_64-unknown-linux-gnu` for an amd64 guest)
-  - `cargo install --locked cargo-zigbuild` and `brew install zig` (or distro equivalent). `build-rootfs.sh` uses `cargo zigbuild` to cross-compile the in-VM `openshell-sandbox` supervisor binary.
+  - `cargo install --locked cargo-zigbuild` and `brew install zig` (or distro equivalent). `vm:supervisor` uses `cargo zigbuild` to cross-compile the in-VM `openshell-sandbox` supervisor binary.
 - [mise](https://mise.jdx.dev/) task runner
-- Docker (needed by `mise run vm:rootfs` to build the base rootfs)
+- Docker-compatible socket on the CLI host when using `openshell sandbox create --from ./Dockerfile` or `--from ./dir`
 - `gh` CLI (used by `mise run vm:setup` to download pre-built runtime artifacts)
 
 ## Relationship to `openshell-vm`
