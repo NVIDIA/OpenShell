@@ -8,7 +8,7 @@
 #
 # openshell-driver-vm loads libkrun/libkrunfw at runtime via dlopen, so it
 # does NOT need Hypervisor.framework headers at build time. Pre-compressed
-# runtime artifacts (libkrun, libkrunfw, gvproxy, rootfs) are injected via
+# runtime artifacts (libkrun, libkrunfw, gvproxy, bundled supervisor) are injected via
 # the vm-runtime-compressed build context and embedded into the binary via
 # include_bytes!().
 #

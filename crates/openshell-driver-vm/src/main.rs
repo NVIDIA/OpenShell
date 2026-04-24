@@ -62,6 +62,9 @@ struct Args {
     #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
     openshell_endpoint: Option<String>,
 
+    #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE", default_value = "")]
+    default_image: String,
+
     #[arg(
         long,
         env = "OPENSHELL_VM_DRIVER_STATE_DIR",
@@ -169,6 +172,7 @@ async fn main() -> Result<()> {
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
         state_dir: args.state_dir,
         launcher_bin: None,
+        default_image: args.default_image,
         ssh_handshake_secret: args.ssh_handshake_secret.unwrap_or_default(),
         ssh_handshake_skew_secs: args.ssh_handshake_skew_secs,
         log_level: args.log_level,

@@ -402,6 +402,7 @@ async fn run_from_args(args: Args) -> Result<()> {
     let vm_config = VmComputeConfig {
         state_dir: args.vm_driver_state_dir,
         driver_dir: args.driver_dir,
+        default_image: config.sandbox_image.clone(),
         krun_log_level: args.vm_krun_log_level,
         vcpus: args.vm_vcpus,
         mem_mib: args.vm_mem_mib,

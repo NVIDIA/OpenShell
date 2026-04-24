@@ -1,26 +1,132 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build and push container images into a k3s gateway.
+//! Build and export container images for gateway runtimes.
 //!
 //! This module wraps bollard's `build_image()` API to build a container image
-//! from a Dockerfile and build context, then reuses the existing push pipeline
-//! to import the image into the gateway's containerd runtime.
+//! from a Dockerfile and build context. Kubernetes deployments reuse the
+//! existing push pipeline to import the image into the gateway's containerd
+//! runtime, while the VM backend can export the built image as a rootfs tar.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bollard::Docker;
-use bollard::query_parameters::BuildImageOptionsBuilder;
+use bollard::models::ContainerCreateBody;
+use bollard::query_parameters::{
+    BuildImageOptionsBuilder, CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder,
+};
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
+use tokio::io::AsyncWriteExt;
+use url::{Position, Url};
 
 use crate::constants::container_name;
 use crate::push::push_local_images;
 
+/// Pseudo-image URI scheme used to hand a local rootfs tar artifact to the VM driver.
+pub const ROOTFS_TAR_IMAGE_REF_SCHEME: &str = "openshell-rootfs-tar";
+
+/// Build a container image from a Dockerfile using the local Docker daemon.
+///
+/// This is used by `openshell sandbox create --from <Dockerfile>` for both the
+/// Kubernetes and VM backends. The image remains available in the local Docker
+/// daemon so the caller can either hand the resulting tag directly to the VM
+/// backend or import it into a local gateway containerd runtime.
+#[allow(clippy::implicit_hasher)]
+pub async fn build_local_image(
+    dockerfile_path: &Path,
+    tag: &str,
+    context_dir: &Path,
+    build_args: &HashMap<String, String>,
+    on_log: &mut impl FnMut(String),
+) -> Result<()> {
+    on_log(format!(
+        "Building image {tag} from {}",
+        dockerfile_path.display()
+    ));
+    build_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
+    on_log(format!("Built image {tag}"));
+    Ok(())
+}
+
+/// Encode a local rootfs tar path as an internal image reference understood by the VM driver.
+pub fn encode_rootfs_tar_image_ref(path: &Path) -> Result<String> {
+    let canonical = path
+        .canonicalize()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to resolve rootfs tar path {}", path.display()))?;
+    let file_url = Url::from_file_path(&canonical)
+        .map_err(|_| miette::miette!("failed to encode rootfs tar path {}", canonical.display()))?;
+    Ok(format!(
+        "{ROOTFS_TAR_IMAGE_REF_SCHEME}:{}",
+        &file_url[Position::BeforePath..]
+    ))
+}
+
+/// Decode a VM-driver rootfs tar image reference back to a local filesystem path.
+pub fn decode_rootfs_tar_image_ref(image_ref: &str) -> Option<PathBuf> {
+    let remainder = image_ref.strip_prefix(&format!("{ROOTFS_TAR_IMAGE_REF_SCHEME}:"))?;
+    let file_url = format!("file:{remainder}");
+    Url::parse(&file_url).ok()?.to_file_path().ok()
+}
+
+/// Export a locally-built Docker image as a persistent rootfs tar artifact for the VM driver.
+pub async fn export_local_image_rootfs(
+    image_ref: &str,
+    on_log: &mut impl FnMut(String),
+) -> Result<PathBuf> {
+    let temp = tempfile::Builder::new()
+        .prefix("openshell-vm-rootfs-")
+        .suffix(".tar")
+        .tempfile()
+        .into_diagnostic()
+        .wrap_err("failed to allocate temporary VM rootfs artifact")?;
+    let temp_path = temp.path().to_path_buf();
+    let (_file, output_path) = temp.keep().into_diagnostic().wrap_err_with(|| {
+        format!(
+            "failed to persist temporary VM rootfs artifact {}",
+            temp_path.display()
+        )
+    })?;
+
+    on_log(format!(
+        "Exporting built image {image_ref} as VM rootfs artifact {}",
+        output_path.display()
+    ));
+    export_local_image_rootfs_to_path(image_ref, &output_path).await?;
+    on_log(format!(
+        "Exported VM rootfs artifact {}",
+        output_path.display()
+    ));
+    Ok(output_path)
+}
+
+/// Push a locally-built image into the gateway's containerd runtime.
+#[allow(clippy::implicit_hasher)]
+pub async fn push_image_into_gateway(
+    tag: &str,
+    gateway_name: &str,
+    on_log: &mut impl FnMut(String),
+) -> Result<()> {
+    on_log(format!(
+        "Pushing image {tag} into gateway \"{gateway_name}\""
+    ));
+    let local_docker = crate::docker::connect_local_for_large_transfers()
+        .into_diagnostic()
+        .wrap_err("failed to connect to local Docker daemon")?;
+    let container = container_name(gateway_name);
+    let images: Vec<&str> = vec![tag];
+    push_local_images(&local_docker, &local_docker, &container, &images, on_log).await?;
+
+    on_log(format!("Image {tag} is available in the gateway."));
+    Ok(())
+}
+
 /// Build a container image from a Dockerfile and push it into the gateway.
 ///
-/// This is used by `openshell sandbox create --from <Dockerfile>`. It:
+/// This is used by `openshell sandbox create --from <Dockerfile>` when the
+/// active gateway is the local Kubernetes deployment. It:
 /// 1. Creates a tar archive of the build context directory.
 /// 2. Sends it to the local Docker daemon via `build_image()`.
 /// 3. Pushes the resulting image into the gateway's containerd via the
@@ -34,29 +140,8 @@ pub async fn build_and_push_image(
     build_args: &HashMap<String, String>,
     on_log: &mut impl FnMut(String),
 ) -> Result<()> {
-    // 1. Build the image locally.
-    on_log(format!(
-        "Building image {tag} from {}",
-        dockerfile_path.display()
-    ));
-    build_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
-    on_log(format!("Built image {tag}"));
-
-    // 2. Push into the gateway.
-    on_log(format!(
-        "Pushing image {tag} into gateway \"{gateway_name}\""
-    ));
-    // Use the long-timeout Docker client so `docker save` of multi-GB images
-    // doesn't trip the 120s bollard default mid-stream. Override with
-    // OPENSHELL_DOCKER_TIMEOUT_SECS=<secs>.
-    let local_docker = crate::docker::connect_local_for_large_transfers()
-        .into_diagnostic()
-        .wrap_err("failed to connect to local Docker daemon")?;
-    let container = container_name(gateway_name);
-    let images: Vec<&str> = vec![tag];
-    push_local_images(&local_docker, &local_docker, &container, &images, on_log).await?;
-
-    on_log(format!("Image {tag} is available in the gateway."));
+    build_local_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
+    push_image_into_gateway(tag, gateway_name, on_log).await?;
     Ok(())
 }
 
@@ -125,6 +210,79 @@ async fn build_image(
     }
 
     Ok(())
+}
+
+async fn export_local_image_rootfs_to_path(image_ref: &str, tar_path: &Path) -> Result<()> {
+    let docker = Docker::connect_with_local_defaults()
+        .into_diagnostic()
+        .wrap_err("failed to connect to local Docker daemon")?;
+    let container_name = format!(
+        "openshell-rootfs-export-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let create_options = CreateContainerOptionsBuilder::default()
+        .name(container_name.as_str())
+        .build();
+    let container = docker
+        .create_container(
+            Some(create_options),
+            ContainerCreateBody {
+                image: Some(image_ref.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!("failed to create temporary export container for image {image_ref}")
+        })?;
+    let container_id = container.id;
+
+    let export_result = async {
+        if let Some(parent) = tar_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
+        }
+        let mut file = tokio::fs::File::create(tar_path)
+            .await
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {}", tar_path.display()))?;
+        let mut stream = docker.export_container(&container_id);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to export image {image_ref}"))?;
+            file.write_all(&chunk)
+                .await
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to write {}", tar_path.display()))?;
+        }
+        file.flush()
+            .await
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to flush {}", tar_path.display()))
+    }
+    .await;
+
+    let cleanup_result = docker
+        .remove_container(
+            &container_id,
+            Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+        )
+        .await;
+
+    match (export_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err).into_diagnostic().wrap_err_with(|| {
+            format!("failed to remove temporary export container for {image_ref}")
+        }),
+    }
 }
 
 /// Create a tar archive of a directory for use as a Docker build context.
@@ -467,5 +625,17 @@ mod tests {
         }];
         assert!(is_ignored("node_modules", true, &patterns));
         assert!(is_ignored("node_modules/foo.js", false, &patterns));
+    }
+
+    #[test]
+    fn encode_and_decode_rootfs_tar_image_ref_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("rootfs tar.tar");
+        fs::write(&tar_path, "rootfs").unwrap();
+
+        let encoded = encode_rootfs_tar_image_ref(&tar_path).unwrap();
+        let decoded = decode_rootfs_tar_image_ref(&encoded).unwrap();
+
+        assert_eq!(decoded, tar_path.canonicalize().unwrap());
     }
 }
