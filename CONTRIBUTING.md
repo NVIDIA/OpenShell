@@ -293,3 +293,9 @@ All contributions must include a `Signed-off-by` line in each commit message. Th
 ```bash
 git commit -s -m "feat(sandbox): add new capability"
 ```
+
+DCO sign-off is separate from cryptographic commit signing. CI requires signing for org members so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+
+## CI
+
+How E2E runs in CI, the `test:e2e` / `test:e2e-gpu` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).
