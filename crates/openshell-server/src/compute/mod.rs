@@ -8,7 +8,7 @@ pub mod vm;
 pub use openshell_driver_docker::DockerComputeConfig;
 pub use vm::VmComputeConfig;
 
-use crate::grpc::policy::{SANDBOX_SETTINGS_OBJECT_TYPE, sandbox_settings_id};
+use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::persistence::{ObjectId, ObjectName, ObjectRecord, ObjectType, Store};
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
@@ -501,7 +501,7 @@ impl ComputeRuntime {
 
         if let Err(e) = self
             .store
-            .delete(SANDBOX_SETTINGS_OBJECT_TYPE, &sandbox_settings_id(&id))
+            .delete_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_name())
             .await
         {
             warn!(
@@ -1477,6 +1477,115 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
         "inspectfailed",
     ];
     !transient_reasons.contains(&reason.as_str())
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct NoopTestDriver;
+
+#[cfg(test)]
+#[tonic::async_trait]
+impl ComputeDriver for NoopTestDriver {
+    type WatchSandboxesStream = DriverWatchStream;
+
+    async fn get_capabilities(
+        &self,
+        _request: Request<GetCapabilitiesRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::GetCapabilitiesResponse>, Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::GetCapabilitiesResponse {
+                driver_name: "noop-test-driver".to_string(),
+                driver_version: "test".to_string(),
+                default_image: "openshell/sandbox:test".to_string(),
+                supports_gpu: false,
+            },
+        ))
+    }
+
+    async fn validate_sandbox_create(
+        &self,
+        _request: Request<ValidateSandboxCreateRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::ValidateSandboxCreateResponse>,
+        Status,
+    > {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::ValidateSandboxCreateResponse {},
+        ))
+    }
+
+    async fn get_sandbox(
+        &self,
+        _request: Request<GetSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::GetSandboxResponse>, Status>
+    {
+        Err(Status::not_found("sandbox not found"))
+    }
+
+    async fn list_sandboxes(
+        &self,
+        _request: Request<ListSandboxesRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::ListSandboxesResponse>, Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::ListSandboxesResponse {
+                sandboxes: Vec::new(),
+            },
+        ))
+    }
+
+    async fn create_sandbox(
+        &self,
+        _request: Request<CreateSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::CreateSandboxResponse>, Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::CreateSandboxResponse {},
+        ))
+    }
+
+    async fn stop_sandbox(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::StopSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::StopSandboxResponse>, Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::StopSandboxResponse {},
+        ))
+    }
+
+    async fn delete_sandbox(
+        &self,
+        _request: Request<DeleteSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::DeleteSandboxResponse>, Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::DeleteSandboxResponse { deleted: true },
+        ))
+    }
+
+    async fn watch_sandboxes(
+        &self,
+        _request: Request<WatchSandboxesRequest>,
+    ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
+        Ok(tonic::Response::new(Box::pin(futures::stream::empty())))
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
+    ComputeRuntime {
+        driver: Arc::new(NoopTestDriver),
+        _driver_process: None,
+        default_image: "openshell/sandbox:test".to_string(),
+        store,
+        sandbox_index: SandboxIndex::new(),
+        sandbox_watch_bus: SandboxWatchBus::new(),
+        tracing_log_bus: TracingLogBus::new(),
+        supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
+        sync_lock: Arc::new(Mutex::new(())),
+    }
 }
 
 #[cfg(test)]

@@ -1136,3 +1136,39 @@ message GetDraftHistoryResponse {
   // Chronological decision history.
   repeated DraftHistoryEntry entries = 1;
 }
+
+// Stored payload for a policy revision row in the generic objects table.
+message PolicyRevisionPayload {
+  // Serialized policy contents.
+  openshell.sandbox.v1.SandboxPolicy policy = 1;
+  // Deterministic hash of the policy payload.
+  string hash = 2;
+  // Load error reported by the sandbox, if any.
+  string load_error = 3;
+  // When the policy version was reported as loaded (ms since epoch). 0 if unset.
+  int64 loaded_at_ms = 4;
+}
+
+// Stored payload for a draft policy chunk row in the generic objects table.
+message DraftChunkPayload {
+  // Proposed network_policies map key.
+  string rule_name = 1;
+  // Proposed network policy rule.
+  openshell.sandbox.v1.NetworkPolicyRule proposed_rule = 2;
+  // Human-readable explanation of why this rule is proposed.
+  string rationale = 3;
+  // Security concerns flagged by analysis (empty if none).
+  string security_notes = 4;
+  // Analysis confidence (0.0-1.0). 0 for mechanistic mode.
+  float confidence = 5;
+  // When the user approved/rejected (ms since epoch). 0 if undecided.
+  int64 decided_at_ms = 6;
+  // Denormalized endpoint host for dedup and display.
+  string host = 7;
+  // Denormalized endpoint port for dedup and display.
+  int32 port = 8;
+  // Binary path that triggered the denial.
+  string binary = 9;
+  // Current draft version for the owning sandbox.
+  int64 draft_version = 10;
+}
