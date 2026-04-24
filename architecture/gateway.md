@@ -26,7 +26,7 @@ graph TD
     SUP_REG["SupervisorSessionRegistry"]
     STORE["Store<br/>(SQLite / Postgres)"]
     COMPUTE["ComputeRuntime"]
-    DRIVER["ComputeDriver<br/>(kubernetes / docker / vm)"]
+    DRIVER["ComputeDriver<br/>(kubernetes / vm)"]
     WATCH_BUS["SandboxWatchBus"]
     LOG_BUS["TracingLogBus"]
     PLAT_BUS["PlatformEventBus"]
@@ -75,7 +75,6 @@ graph TD
 | TLS | `crates/openshell-server/src/tls.rs` | `TlsAcceptor` wrapping rustls with ALPN |
 | Persistence | `crates/openshell-server/src/persistence/mod.rs` | `Store` enum (SQLite/Postgres), generic object CRUD, protobuf codec |
 | Compute runtime | `crates/openshell-server/src/compute/mod.rs` | `ComputeRuntime`, gateway-owned sandbox lifecycle orchestration over a compute backend |
-| Compute driver: Docker | `crates/openshell-server/src/compute/docker.rs` | In-process Docker create/delete/watch, supervisor side-load, local daemon integration |
 | Compute driver: Kubernetes | `crates/openshell-driver-kubernetes/src/driver.rs` | Kubernetes CRD create/delete/watch, pod template translation |
 | Compute driver: VM | `crates/openshell-driver-vm/src/driver.rs` | Per-sandbox microVM create/delete/watch, supervisor-only guest boot |
 | Sandbox index | `crates/openshell-server/src/sandbox_index.rs` | `SandboxIndex` -- in-memory name/pod-to-id correlation |
@@ -104,7 +103,6 @@ The gateway boots in `cli::run_cli` (`crates/openshell-server/src/cli.rs`) and p
    1. Connect to the persistence store (`Store::connect`), which auto-detects SQLite vs Postgres from the URL prefix and runs migrations.
    2. Create `ComputeRuntime` with a `ComputeDriver` implementation selected by `OPENSHELL_DRIVERS`:
       - `kubernetes` wraps `KubernetesComputeDriver` in `ComputeDriverService`, so the gateway uses the `openshell.compute.v1.ComputeDriver` RPC surface even without transport.
-      - `docker` constructs `DockerComputeDriver` in-process, talks directly to the local Docker daemon through Bollard, and keeps Docker-only configuration (supervisor/TLS bind mounts) local to `openshell-server`.
       - `vm` spawns the standalone `openshell-driver-vm` binary as a local compute-driver process, resolves it from `--driver-dir`, conventional libexec install paths, or a sibling of the gateway binary, connects to it over a Unix domain socket, and keeps the libkrun/rootfs runtime out of the gateway binary.
    3. Build `ServerState` (shared via `Arc<ServerState>` across all handlers), including a fresh `SupervisorSessionRegistry`.
    4. **Spawn background tasks**:
@@ -134,12 +132,7 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 | `--sandbox-namespace` | `OPENSHELL_SANDBOX_NAMESPACE` | `default` | Kubernetes namespace for sandbox CRDs |
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | None | Default container image for sandbox pods |
 | `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | None | gRPC endpoint reachable from within the cluster (for supervisor callbacks) |
-| `--drivers` | `OPENSHELL_DRIVERS` | `kubernetes` | Compute backend to use. Current options are `kubernetes`, `docker`, and `vm`. |
-| `--docker-supervisor-bin` | `OPENSHELL_DOCKER_SUPERVISOR_BIN` | Sibling `openshell-sandbox` → local cargo build → extracted from `--docker-supervisor-image` | Linux `openshell-sandbox` binary bind-mounted into Docker sandboxes as PID 1 |
-| `--docker-supervisor-image` | `OPENSHELL_DOCKER_SUPERVISOR_IMAGE` | `ghcr.io/nvidia/openshell/supervisor:<gateway-image-tag>` | Image the gateway pulls to extract the Linux supervisor binary when no explicit path or local build is available. The binary is cached under `$XDG_DATA_HOME/openshell/docker-supervisor/<image-digest>/openshell-sandbox` and reused across restarts. |
-| `--docker-tls-ca` | `OPENSHELL_DOCKER_TLS_CA` | None | CA cert bind-mounted into Docker sandboxes at `/etc/openshell/tls/client/ca.crt` for gateway mTLS |
-| `--docker-tls-cert` | `OPENSHELL_DOCKER_TLS_CERT` | None | Client cert bind-mounted into Docker sandboxes at `/etc/openshell/tls/client/tls.crt` for gateway mTLS |
-| `--docker-tls-key` | `OPENSHELL_DOCKER_TLS_KEY` | None | Client private key bind-mounted into Docker sandboxes at `/etc/openshell/tls/client/tls.key` for gateway mTLS |
+| `--drivers` | `OPENSHELL_DRIVERS` | `kubernetes` | Compute backend to use. Current options are `kubernetes` and `vm`. |
 | `--vm-driver-state-dir` | `OPENSHELL_VM_DRIVER_STATE_DIR` | `target/openshell-vm-driver` | Host directory for VM sandbox rootfs, console logs, and runtime state |
 | `--driver-dir` | `OPENSHELL_DRIVER_DIR` | unset | Override directory for `openshell-driver-vm`. When unset, the gateway searches `~/.local/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`, then a sibling binary. |
 | `--vm-krun-log-level` | `OPENSHELL_VM_KRUN_LOG_LEVEL` | `1` | libkrun log level for VM helper processes |
@@ -606,18 +599,6 @@ The Helm chart template is at `deploy/helm/openshell/templates/statefulset.yaml`
 - **Stop**: `proto/compute_driver.proto` reserves `StopSandbox` for a non-destructive lifecycle transition. Resume is intentionally not a dedicated compute-driver RPC; the gateway auto-resumes a stopped sandbox when a client connects or executes into it.
 
 The gateway reaches the sandbox exclusively through the supervisor-initiated `ConnectSupervisor` session, so the driver never returns sandbox network endpoints.
-
-### Docker Driver
-
-`DockerComputeDriver` (`crates/openshell-server/src/compute/docker.rs`) is built directly into the gateway. It connects to the local Docker daemon with Bollard and provisions one long-lived container per sandbox.
-
-- **Create**: Pulls the requested image according to `sandbox_image_pull_policy`, creates a labeled container, bind-mounts a Linux `openshell-sandbox` binary read-only at `/opt/openshell/bin/openshell-sandbox`, and starts that supervisor as PID 1. No sandbox ports are published.
-- **Persistence**: The Docker driver does not create a separate workspace volume. `/sandbox` lives on the container writable layer, so data persists across gateway restarts as long as the same container remains.
-- **Gateway callback**: When `OPENSHELL_GRPC_ENDPOINT` points at `localhost` or another loopback address, the driver rewrites it to `host.openshell.internal` inside the container and injects `host-gateway` aliases so the supervisor can still open its outbound `ConnectSupervisor` stream.
-- **TLS**: For `https://` gateway endpoints, the driver requires `--docker-tls-ca`, `--docker-tls-cert`, and `--docker-tls-key`. These files are bind-mounted read-only into `/etc/openshell/tls/client`, and the driver sets `OPENSHELL_TLS_CA`, `OPENSHELL_TLS_CERT`, and `OPENSHELL_TLS_KEY` to those paths.
-- **Limits**: V1 supports only `cpu_limit` and `memory_limit`, mapped to Docker `NanoCpus` and `Memory`. GPU requests, resource requests, `agent_socket_path`, and non-empty `platform_config` are rejected as failed preconditions.
-- **Watch stream**: The driver polls Docker for OpenShell-managed containers, emits snapshot diffs and deletions, and rebuilds its state from labels after gateway restart. Containers running under Docker restart policy `unless-stopped` come back after daemon restart without any inbound port setup.
-- **Local development**: `mise run gateway:docker` starts a standalone plaintext gateway against the local Docker daemon for manual CLI testing. `mise run e2e:docker` layers the Rust smoke test on top of that same standalone flow.
 
 ### VM Driver
 
