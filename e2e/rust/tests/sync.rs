@@ -257,7 +257,7 @@ async fn upload_respects_gitignore_by_default() {
     let download_str = download_dir.to_str().expect("verify path is UTF-8");
 
     guard
-        .download("/sandbox/filtered/repo", download_str)
+        .download("/sandbox/filtered", download_str)
         .await
         .expect("download filtered upload");
 
