@@ -292,21 +292,19 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         // OIDC bearer auth over HTTPS: use mTLS certs for the transport layer
         // when available (server may still require client certs), and layer
         // the Bearer token on top via the interceptor.
-        match require_tls_materials(server, tls) {
-            Ok(materials) => build_tonic_tls_config(&materials),
-            Err(_) => {
+        require_tls_materials(server, tls).map_or_else(
+            |_| {
                 let resolved = tls.with_default_paths(server);
-                if let Some(ca_path) = resolved.ca.as_ref() {
-                    if let Ok(ca_pem) = std::fs::read(ca_path) {
+                resolved
+                    .ca
+                    .as_ref()
+                    .and_then(|ca_path| std::fs::read(ca_path).ok())
+                    .map_or_else(ClientTlsConfig::new, |ca_pem| {
                         ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem))
-                    } else {
-                        ClientTlsConfig::new()
-                    }
-                } else {
-                    ClientTlsConfig::new()
-                }
-            }
-        }
+                    })
+            },
+            |materials| build_tonic_tls_config(&materials),
+        )
     } else if tls.edge_token.is_some() {
         // Edge bearer mode — routed through tunnel above; if we reach here
         // the server is not HTTPS so connect plaintext.
@@ -331,11 +329,13 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
     Ok(OpenShellClient::with_interceptor(channel, interceptor))
 }
 
-/// Interceptor that injects authentication headers into every outgoing
-/// gRPC request. Supports OIDC Bearer tokens (standard `authorization`
-/// header) and Cloudflare Access tokens (custom headers). When no token
-/// is set, acts as a no-op. OIDC takes precedence over edge tokens.
+/// Interceptor that injects authentication headers into every outgoing gRPC request.
+///
+/// Supports OIDC Bearer tokens (standard `authorization` header) and
+/// Cloudflare Access tokens (custom headers). When no token is set, acts
+/// as a no-op. OIDC takes precedence over edge tokens.
 #[derive(Clone)]
+#[allow(clippy::struct_field_names)]
 pub struct EdgeAuthInterceptor {
     /// Standard `authorization: Bearer <token>` for OIDC.
     bearer_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,

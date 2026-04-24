@@ -882,7 +882,7 @@ enum GatewayCommands {
         #[arg(long, requires = "oidc_issuer")]
         oidc_user_role: Option<String>,
 
-        /// Space-separated OAuth2 scopes to request during OIDC login.
+        /// Space-separated `OAuth2` scopes to request during OIDC login.
         #[arg(long, requires = "oidc_issuer")]
         oidc_scopes: Option<String>,
 
@@ -982,7 +982,7 @@ enum GatewayCommands {
         #[arg(long, requires = "oidc_issuer")]
         oidc_audience: Option<String>,
 
-        /// Space-separated OAuth2 scopes to request during OIDC login.
+        /// Space-separated `OAuth2` scopes to request during OIDC login.
         /// When set, tokens will include these scopes for fine-grained access control.
         #[arg(long, requires = "oidc_issuer")]
         oidc_scopes: Option<String>,
@@ -1873,7 +1873,7 @@ async fn main() -> Result<()> {
                     oidc_user_role.as_deref(),
                     oidc_scopes.as_deref(),
                     oidc_scopes_claim.as_deref(),
-                )
+                ))
                 .await?;
             }
             GatewayCommands::Stop {

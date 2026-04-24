@@ -81,6 +81,7 @@ pub fn is_sandbox_secret_method(path: &str) -> bool {
 }
 
 /// Validate the `x-sandbox-secret` header against the server's handshake secret.
+#[allow(clippy::result_large_err)]
 pub fn validate_sandbox_secret(
     headers: &http::HeaderMap,
     expected_secret: &str,
@@ -176,6 +177,7 @@ pub struct OidcClaims {
     #[serde(default)]
     pub preferred_username: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub email: Option<String>,
     /// Roles extracted from the configurable claim path.
     #[serde(skip)]
@@ -283,7 +285,9 @@ impl JwksCache {
             jwks_uri: discovery.jwks_uri,
             ttl: Duration::from_secs(config.jwks_ttl_secs),
             last_refresh: Arc::new(RwLock::new(
-                Instant::now() - Duration::from_secs(config.jwks_ttl_secs + 1),
+                Instant::now()
+                    .checked_sub(Duration::from_secs(config.jwks_ttl_secs + 1))
+                    .unwrap_or_else(Instant::now),
             )),
             refresh_mutex: tokio::sync::Mutex::new(()),
             http,
@@ -380,21 +384,20 @@ impl JwksCache {
 
         // Look up the key in cache.
         let keys = self.keys.read().await;
-        let decoding_key = match keys.get(&kid) {
-            Some(k) => k.clone(),
-            None => {
-                // Key not found -- try refreshing once (key rotation).
-                drop(keys);
-                self.refresh_keys_coalesced().await.map_err(|e| {
-                    warn!(error = %e, "JWKS refresh on kid miss failed");
-                    Status::internal("OIDC key refresh failed")
-                })?;
-                let keys = self.keys.read().await;
-                keys.get(&kid).cloned().ok_or_else(|| {
-                    debug!(kid = %kid, "JWT kid not found in JWKS");
-                    Status::unauthenticated("invalid token: unknown signing key")
-                })?
-            }
+        let decoding_key = if let Some(k) = keys.get(&kid) {
+            k.clone()
+        } else {
+            // Key not found -- try refreshing once (key rotation).
+            drop(keys);
+            self.refresh_keys_coalesced().await.map_err(|e| {
+                warn!(error = %e, "JWKS refresh on kid miss failed");
+                Status::internal("OIDC key refresh failed")
+            })?;
+            let keys = self.keys.read().await;
+            keys.get(&kid).cloned().ok_or_else(|| {
+                debug!(kid = %kid, "JWT kid not found in JWKS");
+                Status::unauthenticated("invalid token: unknown signing key")
+            })?
         };
 
         // Validate the JWT.

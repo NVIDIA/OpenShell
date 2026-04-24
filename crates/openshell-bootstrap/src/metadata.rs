@@ -56,12 +56,12 @@ pub struct GatewayMetadata {
     pub oidc_client_id: Option<String>,
 
     /// OIDC audience for the resource server (API). When different from
-    /// client_id, the CLI requests this audience in the token exchange.
-    /// When `None`, defaults to the client_id.
+    /// `client_id`, the CLI requests this audience in the token exchange.
+    /// When `None`, defaults to the `client_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc_audience: Option<String>,
 
-    /// Space-separated OAuth2 scopes to request during OIDC login.
+    /// Space-separated `OAuth2` scopes to request during OIDC login.
     /// When set, tokens will include these scopes for fine-grained access control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc_scopes: Option<String>,

@@ -130,7 +130,7 @@ pub struct DeployOptions {
     pub oidc_audience: String,
     /// OIDC client ID for CLI login. Defaults to "openshell-cli".
     pub oidc_client_id: String,
-    /// OIDC roles claim path (e.g. "realm_access.roles").
+    /// OIDC roles claim path (e.g. `realm_access.roles`).
     pub oidc_roles_claim: Option<String>,
     /// OIDC admin role name.
     pub oidc_admin_role: Option<String>,
@@ -266,11 +266,11 @@ fn apply_oidc_gateway_metadata(
         && let Some(existing) = existing
         && existing.auth_mode.as_deref() == Some("oidc")
     {
-        metadata.auth_mode = existing.auth_mode.clone();
-        metadata.oidc_issuer = existing.oidc_issuer.clone();
-        metadata.oidc_client_id = existing.oidc_client_id.clone();
-        metadata.oidc_audience = existing.oidc_audience.clone();
-        metadata.oidc_scopes = existing.oidc_scopes.clone();
+        metadata.auth_mode.clone_from(&existing.auth_mode);
+        metadata.oidc_issuer.clone_from(&existing.oidc_issuer);
+        metadata.oidc_client_id.clone_from(&existing.oidc_client_id);
+        metadata.oidc_audience.clone_from(&existing.oidc_audience);
+        metadata.oidc_scopes.clone_from(&existing.oidc_scopes);
     }
 }
 

@@ -231,7 +231,7 @@ struct Args {
     oidc_jwks_ttl: u64,
 
     /// Dot-separated path to the roles array in the JWT claims.
-    /// Keycloak: "realm_access.roles" (default). Entra ID: "roles". Okta: "groups".
+    /// Keycloak: `realm_access.roles` (default). Entra ID: "roles". Okta: "groups".
     #[arg(
         long,
         env = "OPENSHELL_OIDC_ROLES_CLAIM",

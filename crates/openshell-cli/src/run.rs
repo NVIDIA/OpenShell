@@ -955,6 +955,7 @@ where
 ///
 /// An `ssh://` endpoint (e.g., `ssh://user@host:8080`) is shorthand for
 /// `--remote user@host` with the gateway endpoint derived from the URL.
+#[allow(clippy::too_many_arguments)]
 pub async fn gateway_add(
     endpoint: &str,
     name: Option<&str>,
@@ -1338,7 +1339,7 @@ pub fn gateway_logout(name: &str) -> Result<()> {
         }
     }
 
-    eprintln!("{} Logged out of gateway '{name}'", "✓".green().bold(),);
+    eprintln!("{} Logged out of gateway '{name}'", "✓".green().bold());
     Ok(())
 }
 
@@ -1680,15 +1681,15 @@ pub async fn gateway_admin_deploy(
         }
     }
 
-    let handle = deploy_gateway_with_panel(options, name, location).await?;
+    let handle = Box::pin(deploy_gateway_with_panel(options, name, location)).await?;
 
     // Persist oidc_scopes in gateway metadata so `gateway login` can
     // request the correct scopes later.
-    if let Some(scopes) = oidc_scopes {
-        if let Ok(mut meta) = openshell_bootstrap::load_gateway_metadata(name) {
-            meta.oidc_scopes = Some(scopes.to_string());
-            let _ = store_gateway_metadata(name, &meta);
-        }
+    if let Some(scopes) = oidc_scopes
+        && let Ok(mut meta) = openshell_bootstrap::load_gateway_metadata(name)
+    {
+        meta.oidc_scopes = Some(scopes.to_string());
+        let _ = store_gateway_metadata(name, &meta);
     }
 
     // Wait for the gRPC endpoint to actually accept connections before

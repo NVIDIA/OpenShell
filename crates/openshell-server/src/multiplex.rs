@@ -256,13 +256,13 @@ where
 
             // Dual-auth methods (e.g. UpdateConfig) — accept either a
             // Bearer token (CLI users) or sandbox secret (supervisor).
-            if oidc::is_dual_auth_method(&path) {
-                if oidc::validate_sandbox_secret(req.headers(), &sandbox_secret).is_ok() {
-                    oidc::mark_sandbox_secret_authenticated(req.headers_mut());
-                    return inner.ready().await?.call(req).await;
-                }
-                // Fall through to Bearer token validation below.
+            if oidc::is_dual_auth_method(&path)
+                && oidc::validate_sandbox_secret(req.headers(), &sandbox_secret).is_ok()
+            {
+                oidc::mark_sandbox_secret_authenticated(req.headers_mut());
+                return inner.ready().await?.call(req).await;
             }
+            // Fall through to Bearer token validation below.
 
             // Extract Bearer token from the authorization header.
             let token = req
@@ -292,13 +292,13 @@ where
             };
 
             // Authorize: check RBAC roles against the method.
-            if let Some(ref policy) = authz_policy {
-                if let Err(status) = policy.check(&identity, &path) {
-                    let response = status.into_http();
-                    let (parts, body) = response.into_parts();
-                    let body = tonic::body::BoxBody::new(body);
-                    return Ok(Response::from_parts(parts, body));
-                }
+            if let Some(ref policy) = authz_policy
+                && let Err(status) = policy.check(&identity, &path)
+            {
+                let response = status.into_http();
+                let (parts, body) = response.into_parts();
+                let body = tonic::body::BoxBody::new(body);
+                return Ok(Response::from_parts(parts, body));
             }
 
             inner.ready().await?.call(req).await

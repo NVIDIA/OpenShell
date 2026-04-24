@@ -110,6 +110,7 @@ fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
 impl ServerState {
     /// Create new server state.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         store: Arc<Store>,
@@ -169,7 +170,7 @@ pub async fn run_server(
             user_role: oidc.user_role.clone(),
             scopes_enabled: !oidc.scopes_claim.is_empty(),
         };
-        policy.validate().map_err(|e| Error::config(e))?;
+        policy.validate().map_err(Error::config)?;
 
         let cache = auth::oidc::JwksCache::new(oidc)
             .await

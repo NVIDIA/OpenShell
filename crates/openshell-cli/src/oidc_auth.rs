@@ -4,7 +4,7 @@
 //! OIDC authentication flows for CLI gateway login.
 //!
 //! Implements Authorization Code + PKCE (interactive browser flow) and
-//! Client Credentials (CI/automation) OAuth2 grant types against a
+//! Client Credentials (CI/automation) `OAuth2` grant types against a
 //! Keycloak-compatible OIDC provider.
 
 use bytes::Bytes;
@@ -219,7 +219,7 @@ pub async fn oidc_client_credentials_flow(
     ))
 }
 
-/// Refresh an OIDC token using the refresh_token grant.
+/// Refresh an OIDC token using the `refresh_token` grant.
 ///
 /// Preserves the existing refresh token if the server does not return a new
 /// one (per OAuth 2.0 spec, the refresh response may omit `refresh_token`).
@@ -245,7 +245,7 @@ pub async fn oidc_refresh_token(bundle: &OidcTokenBundle) -> Result<OidcTokenBun
     let mut refreshed =
         bundle_from_oauth2_response(&token_response, &bundle.issuer, &bundle.client_id);
     if refreshed.refresh_token.is_none() {
-        refreshed.refresh_token = bundle.refresh_token.clone();
+        refreshed.refresh_token.clone_from(&bundle.refresh_token);
     }
     Ok(refreshed)
 }
@@ -288,8 +288,8 @@ fn bundle_from_oauth2_response(
         .as_secs();
 
     OidcTokenBundle {
-        access_token: resp.access_token().secret().to_string(),
-        refresh_token: resp.refresh_token().map(|rt| rt.secret().to_string()),
+        access_token: resp.access_token().secret().clone(),
+        refresh_token: resp.refresh_token().map(|rt| rt.secret().clone()),
         expires_at: resp.expires_in().map(|ei| now + ei.as_secs()),
         issuer: issuer.to_string(),
         client_id: client_id.to_string(),
@@ -305,7 +305,7 @@ fn percent_decode(s: &str) -> String {
             let hi = bytes.next().and_then(|b| char::from(b).to_digit(16));
             let lo = bytes.next().and_then(|b| char::from(b).to_digit(16));
             if let (Some(h), Some(l)) = (hi, lo) {
-                out.push((h * 16 + l) as u8);
+                out.push(u8::try_from(h * 16 + l).unwrap_or(b'%'));
             } else {
                 out.push(b'%');
             }
@@ -354,7 +354,7 @@ async fn run_oidc_callback_server(
         tokio::spawn(async move {
             let service = service_fn(move |req| {
                 let state = Arc::clone(&state);
-                async move { Ok::<_, Infallible>(handle_oidc_callback(req, state).await) }
+                async move { Ok::<_, Infallible>(handle_oidc_callback(req, state)) }
             });
 
             if let Err(error) = Builder::new(TokioExecutor::new())
@@ -367,7 +367,7 @@ async fn run_oidc_callback_server(
     }
 }
 
-async fn handle_oidc_callback(
+fn handle_oidc_callback(
     req: hyper::Request<hyper::body::Incoming>,
     state: Arc<CallbackState>,
 ) -> Response<Full<Bytes>> {

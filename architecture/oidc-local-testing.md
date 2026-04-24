@@ -19,6 +19,7 @@ mise run keycloak
 Wait for "Keycloak is ready." The script prints connection info including test users.
 
 Verify:
+
 ```bash
 curl -s http://localhost:8180/realms/openshell/.well-known/openid-configuration | jq .issuer
 # Expected: "http://localhost:8180/realms/openshell"
@@ -37,6 +38,7 @@ cargo run -p openshell-server -- \
 ```
 
 You should see:
+
 ```
 OIDC JWT validation enabled (issuer: http://localhost:8180/realms/openshell)
 Server listening address=0.0.0.0:8080

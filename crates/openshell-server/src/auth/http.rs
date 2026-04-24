@@ -67,14 +67,16 @@ pub fn router(state: Arc<ServerState>) -> Router {
 /// Returns the OIDC issuer and audience when OIDC is configured on the server,
 /// so CLI clients can auto-discover settings during `gateway add`.
 async fn oidc_config_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    match &state.config.oidc {
-        Some(oidc) => Json(serde_json::json!({
-            "issuer": oidc.issuer,
-            "audience": oidc.audience,
-        }))
-        .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
+    state.config.oidc.as_ref().map_or_else(
+        || StatusCode::NOT_FOUND.into_response(),
+        |oidc| {
+            Json(serde_json::json!({
+                "issuer": oidc.issuer,
+                "audience": oidc.audience,
+            }))
+            .into_response()
+        },
+    )
 }
 
 /// Handle the auth connect request.

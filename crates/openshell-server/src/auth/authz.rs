@@ -137,6 +137,7 @@ impl AuthzPolicy {
     /// Returns `Ok(())` if authorized, `Err(PERMISSION_DENIED)` if not.
     /// When both role names are empty, all authenticated callers are authorized
     /// (authentication-only mode for providers like GitHub).
+    #[allow(clippy::result_large_err)]
     pub fn check(&self, identity: &Identity, method: &str) -> Result<(), Status> {
         let required = if ADMIN_METHODS.contains(&method) {
             &self.admin_role
@@ -174,6 +175,7 @@ impl AuthzPolicy {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err, clippy::unused_self)]
     fn check_scope(&self, identity: &Identity, method: &str) -> Result<(), Status> {
         if identity.scopes.iter().any(|s| s == SCOPE_ALL) {
             return Ok(());
@@ -182,8 +184,7 @@ impl AuthzPolicy {
         let required_scope = SCOPED_METHODS
             .iter()
             .find(|(m, _)| *m == method)
-            .map(|(_, s)| *s)
-            .unwrap_or(SCOPE_ALL);
+            .map_or(SCOPE_ALL, |(_, s)| *s);
 
         if identity.scopes.iter().any(|s| s == required_scope) {
             return Ok(());

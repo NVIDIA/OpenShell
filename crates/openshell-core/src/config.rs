@@ -227,7 +227,7 @@ pub struct TlsConfig {
     pub allow_unauthenticated: bool,
 }
 
-/// OIDC (OpenID Connect) configuration for JWT-based authentication.
+/// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
 ///
 /// When configured, the server validates `authorization: Bearer <JWT>`
 /// headers on gRPC requests against the specified issuer's JWKS endpoint.

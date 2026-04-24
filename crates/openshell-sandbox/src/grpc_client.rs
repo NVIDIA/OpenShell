@@ -86,10 +86,10 @@ pub async fn connect_channel_pub(endpoint: &str) -> Result<Channel> {
 
 /// Interceptor that injects the sandbox shared secret into every gRPC request.
 ///
-/// The server validates this header on sandbox-to-server RPCs (GetSandboxConfig,
-/// GetSandboxProviderEnvironment, etc.) instead of requiring an OIDC Bearer token.
+/// The server validates this header on sandbox-to-server RPCs (`GetSandboxConfig`,
+/// `GetSandboxProviderEnvironment`, etc.) instead of requiring an OIDC Bearer token.
 #[derive(Clone)]
-pub(crate) struct SandboxSecretInterceptor {
+pub struct SandboxSecretInterceptor {
     secret: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
 }
 
@@ -116,7 +116,7 @@ fn sandbox_secret_interceptor() -> SandboxSecretInterceptor {
     SandboxSecretInterceptor { secret }
 }
 
-/// Connect to the OpenShell server with sandbox secret authentication.
+/// Connect to the `OpenShell` server with sandbox secret authentication.
 async fn connect(endpoint: &str) -> Result<AuthenticatedClient> {
     let channel = connect_channel(endpoint).await?;
     Ok(OpenShellClient::with_interceptor(
