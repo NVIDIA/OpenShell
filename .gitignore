@@ -197,7 +197,7 @@ mise.local.toml
 architecture/plans
 
 # Claude
-.claude/settings.local.json.claude/worktrees/
+.claude/settings.local.json
 .claude/worktrees/
 rfc.md
 .worktrees

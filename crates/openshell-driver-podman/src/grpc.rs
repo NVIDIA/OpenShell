@@ -253,7 +253,7 @@ mod tests {
                 let (stream, _) = listener.accept().await.expect("test stub should accept");
                 let log = log_for_task.clone();
                 let queue = queue_for_task.clone();
-                http1::Builder::new()
+                let result = http1::Builder::new()
                     .serve_connection(
                         TokioIo::new(stream),
                         service_fn(move |req| {
@@ -282,8 +282,12 @@ mod tests {
                             }
                         }),
                     )
-                    .await
-                    .expect("test stub should serve request");
+                    .await;
+                // The one-shot test client can close the Unix socket after the
+                // response, which Hyper reports as a shutdown error. Let the
+                // request log assertions below decide whether the stub served
+                // the expected API calls.
+                let _ = result;
             }
             let _ = std::fs::remove_file(&socket_path_for_task);
         });

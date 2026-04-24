@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -113,11 +114,48 @@ def is_excluded(rel: Path) -> bool:
             return True
 
     # Prefix exclusions (CI config, editor config).
-    for prefix in EXCLUDE_DIR_PREFIXES:
-        if rel_str.startswith(prefix):
-            return True
+    return any(rel_str.startswith(prefix) for prefix in EXCLUDE_DIR_PREFIXES)
 
-    return False
+
+def git_candidate_files(root: Path) -> list[Path] | None:
+    """Return Git-tracked and unignored files, or None if Git is unavailable."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    files = []
+    for raw_path in result.stdout.split(b"\0"):
+        if raw_path:
+            files.append(Path(os.fsdecode(raw_path)))
+    return files
+
+
+def is_git_ignored(root: Path, rel: Path) -> bool:
+    """Return True if Git ignore rules exclude a path."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "-q", "--", str(rel)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
 
 
 def is_dockerfile(path: Path) -> bool:
@@ -135,6 +173,19 @@ def get_comment_style(path: Path) -> str | None:
 def discover_files(root: Path) -> list[Path]:
     """Walk the repo and return all files that should have headers."""
     results = []
+
+    git_files = git_candidate_files(root)
+    if git_files is not None:
+        for rel in git_files:
+            path = root / rel
+            if not path.is_file():
+                continue
+            if is_excluded(rel):
+                continue
+            if get_comment_style(rel) is not None:
+                results.append(path)
+        return sorted(results)
+
     for dirpath, dirnames, filenames in os.walk(root):
         rel_dir = Path(dirpath).relative_to(root)
 
@@ -161,10 +212,7 @@ SPDX_MARKER = "SPDX-License-Identifier"
 
 def has_header(lines: list[str]) -> bool:
     """Check if the SPDX header is present in the first 10 lines."""
-    for line in lines[:10]:
-        if SPDX_MARKER in line:
-            return True
-    return False
+    return any(SPDX_MARKER in line for line in lines[:10])
 
 
 def find_insertion_point(lines: list[str], path: Path) -> int:
@@ -276,8 +324,11 @@ def main() -> int:
             p = p.resolve()
             if not p.is_file():
                 continue
-            rel = p.relative_to(root)
-            if is_excluded(rel):
+            try:
+                rel = p.relative_to(root)
+            except ValueError:
+                continue
+            if is_excluded(rel) or is_git_ignored(root, rel):
                 continue
             if get_comment_style(rel) is not None:
                 files.append(p)
@@ -301,7 +352,6 @@ def main() -> int:
         print("All files have SPDX headers.")
         return 0
 
-    added = len(missing)  # In non-check mode, missing list is empty; count via verbose
     print("Done.")
     return 0
 
