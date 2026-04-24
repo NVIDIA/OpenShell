@@ -23,6 +23,8 @@
     "MD024": { "siblings_only": true },
     // Bare URLs are fine in changelogs and tables.
     "MD034": false,
+    // Internal docs commonly use bare fences for diagrams and terminal sketches.
+    "MD040": false,
     // First line does not need to be a heading.
     "MD002": false,
     // Repo uses padded table pipes (`| foo | bar |`); rule default is "compact".
