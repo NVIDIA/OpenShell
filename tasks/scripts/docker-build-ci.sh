@@ -18,9 +18,17 @@ elif [[ "${DOCKER_PLATFORM:-}" == *","* ]]; then
   OUTPUT_ARGS=(--push)
 fi
 
+SECRET_ARGS=()
+if [[ -n "${MISE_GITHUB_TOKEN:-}" ]]; then
+  SECRET_ARGS=(--secret id=MISE_GITHUB_TOKEN,env=MISE_GITHUB_TOKEN)
+elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  SECRET_ARGS=(--secret id=MISE_GITHUB_TOKEN,env=GITHUB_TOKEN)
+fi
+
 exec ce_build \
   ${DOCKER_BUILDER:+--builder ${DOCKER_BUILDER}} \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
+  ${SECRET_ARGS[@]+"${SECRET_ARGS[@]}"} \
   -f deploy/docker/Dockerfile.ci \
   -t "openshell/ci:${IMAGE_TAG:-dev}" \
   --provenance=false \
