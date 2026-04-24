@@ -195,7 +195,9 @@ FROM gateway-builder AS gateway-binary-build
 
 FROM scratch AS gateway-binary-prebuilt
 ARG TARGETARCH
-COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /build/out/openshell-gateway
+# --chmod=755 preserves the executable bit through actions/upload-artifact +
+# download-artifact, which strip exec perms during the roundtrip.
+COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /build/out/openshell-gateway
 
 FROM gateway-binary-${BINARY_SOURCE} AS gateway-binary
 
@@ -204,7 +206,9 @@ FROM supervisor-builder AS supervisor-binary-build
 
 FROM scratch AS supervisor-binary-prebuilt
 ARG TARGETARCH
-COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /build/out/openshell-sandbox
+# --chmod=755 preserves the executable bit through actions/upload-artifact +
+# download-artifact, which strip exec perms during the roundtrip.
+COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /build/out/openshell-sandbox
 
 FROM supervisor-binary-${BINARY_SOURCE} AS supervisor-binary
 
