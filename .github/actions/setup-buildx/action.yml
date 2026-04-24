@@ -21,6 +21,15 @@ inputs:
   name:
     description: Builder instance name
     default: openshell
+  buildkitd-config:
+    description: >
+      Path to a buildkitd.toml to configure the builder with (e.g. the
+      nv-gha-runners Docker Hub mirror at /etc/buildkit/buildkitd.toml).
+      Must be readable *from where this action runs* — in a containerized
+      job that means the caller must bind-mount the host path into the job
+      container (e.g. `volumes: [/etc/buildkit:/etc/buildkit:ro]`). Empty
+      disables the config (default).
+    default: ""
 
 runs:
   using: composite
@@ -36,6 +45,7 @@ runs:
         append: |
           - endpoint: ${{ inputs.arm64-endpoint }}
             platforms: linux/arm64
+        buildkitd-config: ${{ inputs.buildkitd-config }}
 
     - name: Set up Docker Buildx (local)
       if: inputs.driver == 'local'
@@ -44,8 +54,4 @@ runs:
         name: ${{ inputs.name }}
         driver: docker-container
         platforms: linux/amd64,linux/arm64
-        # Use the nv-gha-runners Docker Hub mirror to avoid unauthenticated
-        # pull rate limits on shared runners. The TOML is pre-populated on
-        # every nv-gha-runner. Per:
-        # https://docs.gha-runners.nvidia.com/platform/best-practices/#use-docker-cache-for-buildkit
-        buildkitd-config: /etc/buildkit/buildkitd.toml
+        buildkitd-config: ${{ inputs.buildkitd-config }}

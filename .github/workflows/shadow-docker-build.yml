@@ -45,6 +45,11 @@ jobs:
       options: --privileged
       volumes:
         - /var/run/docker.sock:/var/run/docker.sock
+        # Expose the nv-gha-runners buildkitd.toml (registry-mirror config)
+        # inside the container so docker/setup-buildx-action can read it.
+        # The file is pre-populated on every nv-gha-runner per:
+        # https://docs.gha-runners.nvidia.com/platform/best-practices/#use-docker-cache-for-buildkit
+        - /etc/buildkit:/etc/buildkit:ro
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -61,6 +66,10 @@ jobs:
         uses: ./.github/actions/setup-buildx
         with:
           driver: local
+          # Bind-mounted above via container.volumes; without that, the file
+          # is on the host but invisible to the action (which runs inside
+          # the ci:latest container).
+          buildkitd-config: /etc/buildkit/buildkitd.toml
 
       - name: Package Helm chart (cluster only)
         if: matrix.component == 'cluster'
