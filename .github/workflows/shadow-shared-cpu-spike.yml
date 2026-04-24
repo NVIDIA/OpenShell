@@ -31,6 +31,14 @@ jobs:
       matrix:
         runner: [linux-amd64-cpu8, linux-arm64-cpu8]
     runs-on: ${{ matrix.runner }}
+    env:
+      # Partition the GHA sccache cache per-arch. Without this, matrix jobs
+      # collide on the same cache key, and the later-starting job's writes
+      # fail with 409 Conflict while the earlier one's writes land — leaving
+      # subsequent runs with asymmetric and mostly-empty caches.
+      # (Run 1 on 2026-04-24 showed amd64 with 0/1062 writes succeeding
+      # while arm64 got 575/1064.)
+      SCCACHE_GHA_VERSION: ${{ matrix.runner }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
