@@ -585,7 +585,7 @@ The proxy port defaults to `3128` unless the policy specifies a different `http_
 1. Opens `/dev/kmsg` in read mode and seeks to end (skips historical messages)
 2. Reads lines via `BufReader`, filtering for the namespace-specific prefix `openshell:bypass:{namespace_name}:`
 3. Parses iptables LOG format via `parse_kmsg_line()`, extracting `DST`, `DPT`, `SPT`, `PROTO`, and `UID` fields
-4. Resolves process identity for TCP events via `procfs::resolve_tcp_peer_identity()` (best-effort — requires a valid entrypoint PID and non-zero source port)
+4. Resolves process identity for TCP events via multi-owner socket inode lookup (best-effort — requires a valid entrypoint PID and non-zero source port). If multiple processes hold the same socket with different executable identities, the event is marked ambiguous instead of attributing it to one PID.
 5. Emits a structured `tracing::warn!()` event with the tag `BYPASS_DETECT`
 6. Sends a `DenialEvent` to the denial aggregator channel (if available)
 
@@ -1265,21 +1265,25 @@ The TOFU model means:
 
 The proxy resolves which binary is making each network request by inspecting `/proc`.
 
-**`resolve_tcp_peer_identity(entrypoint_pid, peer_port) -> (PathBuf, u32)`**
+**`resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port) -> TcpPeerSocketOwners`**
 
 ```mermaid
 flowchart TD
     A["Parse /proc/{entrypoint}/net/tcp + tcp6"] --> B[Find ESTABLISHED socket with matching local port]
     B --> C[Extract socket inode]
-    C --> D["BFS collect descendants of entrypoint via /proc/{pid}/task/{tid}/children"]
-    D --> E["Scan /proc/{pid}/fd/* for socket:[inode] symlink"]
-    E --> F{Found?}
-    F -- Yes --> G["Read /proc/{pid}/exe -> binary path"]
-    F -- No --> H["Fallback: scan all /proc PIDs"]
-    H --> G
+    C --> D["BFS collect descendants of entrypoint via /proc/{pid}/task/{tid}/children, deduping PIDs"]
+    D --> E["Scan every descendant /proc/{pid}/fd/* for socket:[inode] symlink"]
+    E --> F["Fallback: scan all /proc PIDs not already checked"]
+    F --> G["Return all socket owner PIDs with source/depth metadata"]
+    G --> H["Read /proc/{pid}/exe, TOFU-check each owner and ancestor"]
+    H --> I{All owners same policy identity?}
+    I -- Yes --> J["Evaluate OPA once with the shared identity"]
+    I -- No --> K["Deny as ambiguous shared socket ownership"]
 ```
 
 Both IPv4 (`/proc/{pid}/net/tcp`) and IPv6 (`/proc/{pid}/net/tcp6`) tables are checked because some clients (notably gRPC C-core) use `AF_INET6` sockets with IPv4-mapped addresses.
+
+Multiple processes can hold the same socket inode after `fork()` or fd inheritance across `execve()`. The proxy treats that as ambiguous unless all socket owners resolve to the same policy identity: binary path, TOFU hash, ancestor chain, and cmdline-derived absolute paths. Ambiguous ownership is denied before OPA evaluation so a trusted co-owner cannot accidentally authorize traffic for a different process.
 
 **`collect_ancestor_binaries(pid, stop_pid) -> Vec<PathBuf>`**: Walk the PPid chain via `/proc/{pid}/status`, collecting `binary_path()` for each ancestor. Stops at PID 1, `stop_pid` (entrypoint), or after 64 levels (safety limit). Does not include `pid` itself.
 

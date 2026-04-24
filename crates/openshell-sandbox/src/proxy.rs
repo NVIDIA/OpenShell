@@ -907,6 +907,27 @@ struct ResolvedIdentity {
     bin_hash: String,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Eq, PartialEq)]
+struct PolicyIdentityKey {
+    bin_path: PathBuf,
+    ancestors: Vec<PathBuf>,
+    cmdline_paths: Vec<PathBuf>,
+    bin_hash: String,
+}
+
+#[cfg(target_os = "linux")]
+impl ResolvedIdentity {
+    fn policy_key(&self) -> PolicyIdentityKey {
+        PolicyIdentityKey {
+            bin_path: self.bin_path.clone(),
+            ancestors: self.ancestors.clone(),
+            cmdline_paths: self.cmdline_paths.clone(),
+            bin_hash: self.bin_hash.clone(),
+        }
+    }
+}
+
 /// Error from [`resolve_process_identity`]. Carries the deny reason and
 /// whatever partial identity data was resolved before the failure so the
 /// caller can include it in the [`ConnectDecision`] and OCSF event.
@@ -918,12 +939,64 @@ struct IdentityError {
     ancestors: Vec<PathBuf>,
 }
 
+#[cfg(target_os = "linux")]
+fn resolve_owner_identity(
+    owner_pid: u32,
+    entrypoint_pid: u32,
+    identity_cache: &BinaryIdentityCache,
+) -> std::result::Result<ResolvedIdentity, IdentityError> {
+    let bin_path =
+        crate::procfs::binary_path(owner_pid.cast_signed()).map_err(|e| IdentityError {
+            reason: format!("failed to resolve peer binary for PID {owner_pid}: {e}"),
+            binary: None,
+            binary_pid: Some(owner_pid),
+            ancestors: vec![],
+        })?;
+
+    let bin_hash = identity_cache
+        .verify_or_cache(&bin_path)
+        .map_err(|e| IdentityError {
+            reason: format!("binary integrity check failed: {e}"),
+            binary: Some(bin_path.clone()),
+            binary_pid: Some(owner_pid),
+            ancestors: vec![],
+        })?;
+
+    let ancestors = crate::procfs::collect_ancestor_binaries(owner_pid, entrypoint_pid);
+
+    for ancestor in &ancestors {
+        identity_cache
+            .verify_or_cache(ancestor)
+            .map_err(|e| IdentityError {
+                reason: format!(
+                    "ancestor integrity check failed for {}: {e}",
+                    ancestor.display()
+                ),
+                binary: Some(bin_path.clone()),
+                binary_pid: Some(owner_pid),
+                ancestors: ancestors.clone(),
+            })?;
+    }
+
+    let mut exclude = ancestors.clone();
+    exclude.push(bin_path.clone());
+    let cmdline_paths = crate::procfs::collect_cmdline_paths(owner_pid, entrypoint_pid, &exclude);
+
+    Ok(ResolvedIdentity {
+        bin_path,
+        binary_pid: owner_pid,
+        ancestors,
+        cmdline_paths,
+        bin_hash,
+    })
+}
+
 /// Resolve the identity of the process owning a TCP peer connection.
 ///
 /// Walks `/proc/<entrypoint_pid>/net/tcp` to find the socket inode, locates
-/// the owning PID, reads `/proc/<pid>/exe`, TOFU-verifies the binary hash,
-/// walks the ancestor chain verifying each one, and collects cmdline-derived
-/// absolute paths for script detection.
+/// every owning PID, reads `/proc/<pid>/exe`, TOFU-verifies each binary hash,
+/// walks each ancestor chain verifying every ancestor, and collects
+/// cmdline-derived absolute paths for script detection.
 ///
 /// This is the identity-resolution block of [`evaluate_opa_tcp`] extracted
 /// into a standalone helper so it can be exercised by Linux-only regression
@@ -937,52 +1010,66 @@ fn resolve_process_identity(
     peer_port: u16,
     identity_cache: &BinaryIdentityCache,
 ) -> std::result::Result<ResolvedIdentity, IdentityError> {
-    let (bin_path, binary_pid) =
-        crate::procfs::resolve_tcp_peer_identity(entrypoint_pid, peer_port).map_err(|e| {
-            IdentityError {
-                reason: format!("failed to resolve peer binary: {e}"),
-                binary: None,
-                binary_pid: None,
-                ancestors: vec![],
-            }
-        })?;
-
-    let bin_hash = identity_cache
-        .verify_or_cache(&bin_path)
+    let socket_owners = crate::procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)
         .map_err(|e| IdentityError {
-            reason: format!("binary integrity check failed: {e}"),
-            binary: Some(bin_path.clone()),
-            binary_pid: Some(binary_pid),
+            reason: format!("failed to resolve peer binary: {e}"),
+            binary: None,
+            binary_pid: None,
             ancestors: vec![],
         })?;
 
-    let ancestors = crate::procfs::collect_ancestor_binaries(binary_pid, entrypoint_pid);
-
-    for ancestor in &ancestors {
-        identity_cache
-            .verify_or_cache(ancestor)
-            .map_err(|e| IdentityError {
-                reason: format!(
-                    "ancestor integrity check failed for {}: {e}",
-                    ancestor.display()
-                ),
-                binary: Some(bin_path.clone()),
-                binary_pid: Some(binary_pid),
-                ancestors: ancestors.clone(),
-            })?;
+    let mut identities = Vec::with_capacity(socket_owners.owners.len());
+    for owner in &socket_owners.owners {
+        identities.push(resolve_owner_identity(
+            owner.pid,
+            entrypoint_pid,
+            identity_cache,
+        )?);
     }
 
-    let mut exclude = ancestors.clone();
-    exclude.push(bin_path.clone());
-    let cmdline_paths = crate::procfs::collect_cmdline_paths(binary_pid, entrypoint_pid, &exclude);
+    let Some(first_identity) = identities.first() else {
+        return Err(IdentityError {
+            reason: format!(
+                "failed to resolve peer binary: no process found owning socket inode {}",
+                socket_owners.inode
+            ),
+            binary: None,
+            binary_pid: None,
+            ancestors: vec![],
+        });
+    };
 
-    Ok(ResolvedIdentity {
-        bin_path,
-        binary_pid,
-        ancestors,
-        cmdline_paths,
-        bin_hash,
-    })
+    let first_key = first_identity.policy_key();
+    if identities
+        .iter()
+        .skip(1)
+        .any(|identity| identity.policy_key() != first_key)
+    {
+        let mut pids: Vec<u32> = identities
+            .iter()
+            .map(|identity| identity.binary_pid)
+            .collect();
+        pids.sort_unstable();
+        return Err(IdentityError {
+            reason: format!(
+                "ambiguous shared socket ownership: inode {} is held by PIDs [{}] with different policy identities",
+                socket_owners.inode,
+                pids.iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            binary: None,
+            binary_pid: None,
+            ancestors: vec![],
+        });
+    }
+
+    let mut identity = identities.swap_remove(0);
+    if let Some(lowest_pid) = socket_owners.owners.iter().map(|owner| owner.pid).min() {
+        identity.binary_pid = lowest_pid;
+    }
+    Ok(identity)
 }
 
 /// Evaluate OPA policy for a TCP connection with identity binding via /proc/net/tcp.
@@ -4266,6 +4353,101 @@ mod tests {
                         path.display()
                     );
                 }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_process_identity_denies_fork_exec_shared_socket_ambiguity() {
+        use crate::identity::BinaryIdentityCache;
+        use std::ffi::CString;
+        use std::net::{TcpListener, TcpStream};
+        use std::os::fd::AsRawFd;
+        use std::time::{Duration, Instant};
+
+        if !std::path::Path::new("/bin/sleep").exists() {
+            eprintln!("skipping: /bin/sleep not available");
+            return;
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let listener_port = listener.local_addr().unwrap().port();
+        let stream = TcpStream::connect(("127.0.0.1", listener_port)).expect("connect");
+        let peer_port = stream.local_addr().unwrap().port();
+        let (_accepted, _) = listener.accept().expect("accept");
+
+        let fd = stream.as_raw_fd();
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            assert!(flags >= 0, "F_GETFD failed");
+            assert_eq!(
+                libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
+                0,
+                "F_SETFD failed"
+            );
+        }
+
+        let sleep_path = CString::new("/bin/sleep").unwrap();
+        let arg0 = CString::new("sleep").unwrap();
+        let arg1 = CString::new("30").unwrap();
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork failed");
+        if child_pid == 0 {
+            unsafe {
+                libc::execl(
+                    sleep_path.as_ptr(),
+                    arg0.as_ptr(),
+                    arg1.as_ptr(),
+                    std::ptr::null::<libc::c_char>(),
+                );
+                libc::_exit(127);
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(link) = std::fs::read_link(format!("/proc/{child_pid}/exe"))
+                && link.to_string_lossy().contains("sleep")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child pid {child_pid} did not exec into sleep within 2s"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let cache = BinaryIdentityCache::new();
+        let result = resolve_process_identity(std::process::id(), peer_port, &cache);
+
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+            libc::waitpid(child_pid, std::ptr::null_mut(), 0);
+        }
+
+        match result {
+            Ok(identity) => panic!(
+                "resolve_process_identity unexpectedly succeeded for shared socket owned by PID {}",
+                identity.binary_pid
+            ),
+            Err(err) => {
+                assert!(
+                    err.reason.contains("ambiguous shared socket ownership"),
+                    "expected ambiguous socket ownership error, got: {}",
+                    err.reason
+                );
+                assert!(
+                    err.reason.contains(&std::process::id().to_string()),
+                    "error should include parent PID; got: {}",
+                    err.reason
+                );
+                assert!(
+                    err.reason.contains(&child_pid.to_string()),
+                    "error should include child PID; got: {}",
+                    err.reason
+                );
             }
         }
     }

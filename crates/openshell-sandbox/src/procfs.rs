@@ -7,10 +7,45 @@
 //! for process-identity binding in the OPA proxy policy engine.
 
 use miette::Result;
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use tracing::debug;
+
+/// Where a socket owner was discovered while scanning `/proc`.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SocketOwnerSource {
+    /// Owner was found in the entrypoint process tree at the given BFS depth.
+    Descendant { depth: usize },
+    /// Owner was found by scanning all of `/proc` after the descendant scan.
+    ProcFallback,
+}
+
+/// A process with an fd pointing at a target socket inode.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SocketOwner {
+    pub pid: u32,
+    pub source: SocketOwnerSource,
+}
+
+/// All process owners for a TCP peer socket.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TcpPeerSocketOwners {
+    pub inode: u64,
+    pub owners: Vec<SocketOwner>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DescendantPid {
+    pid: u32,
+    depth: usize,
+}
 
 /// Read the binary path of a process via `/proc/{pid}/exe` symlink.
 ///
@@ -85,9 +120,44 @@ pub fn binary_path(pid: i32) -> Result<PathBuf> {
 /// that socket, and finally reads `/proc/<pid>/exe` to get the binary path.
 #[cfg(target_os = "linux")]
 pub fn resolve_tcp_peer_binary(entrypoint_pid: u32, peer_port: u16) -> Result<PathBuf> {
+    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_port)?;
+    binary_path(owner.pid.cast_signed())
+}
+
+/// Resolve all process owners for the TCP peer inside a sandbox network namespace.
+///
+/// Multiple processes can legitimately hold the same socket inode after `fork()`
+/// or fd passing. Callers that make security decisions must evaluate the full
+/// owner set instead of selecting the first PID returned by `/proc` traversal.
+#[cfg(target_os = "linux")]
+pub fn resolve_tcp_peer_socket_owners(
+    entrypoint_pid: u32,
+    peer_port: u16,
+) -> Result<TcpPeerSocketOwners> {
     let inode = parse_proc_net_tcp(entrypoint_pid, peer_port)?;
-    let pid = find_pid_by_socket_inode(inode, entrypoint_pid)?;
-    binary_path(pid.cast_signed())
+    let owners = find_socket_inode_owners(inode, entrypoint_pid)?;
+    Ok(TcpPeerSocketOwners { inode, owners })
+}
+
+/// Resolve exactly one owner for the TCP peer, failing closed on ambiguity.
+#[cfg(target_os = "linux")]
+fn resolve_single_tcp_peer_owner(entrypoint_pid: u32, peer_port: u16) -> Result<SocketOwner> {
+    let socket_owners = resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)?;
+    match socket_owners.owners.as_slice() {
+        [owner] => Ok(owner.clone()),
+        owners => {
+            let mut pids: Vec<u32> = owners.iter().map(|owner| owner.pid).collect();
+            pids.sort_unstable();
+            Err(miette::miette!(
+                "Ambiguous socket ownership for inode {}: PIDs [{}] all hold the same socket",
+                socket_owners.inode,
+                pids.iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+    }
 }
 
 /// Like `resolve_tcp_peer_binary`, but also returns the PID that owns the socket.
@@ -95,10 +165,9 @@ pub fn resolve_tcp_peer_binary(entrypoint_pid: u32, peer_port: u16) -> Result<Pa
 /// Needed for the ancestor walk: we must know the PID to walk `/proc/<pid>/status` PPid chain.
 #[cfg(target_os = "linux")]
 pub fn resolve_tcp_peer_identity(entrypoint_pid: u32, peer_port: u16) -> Result<(PathBuf, u32)> {
-    let inode = parse_proc_net_tcp(entrypoint_pid, peer_port)?;
-    let pid = find_pid_by_socket_inode(inode, entrypoint_pid)?;
-    let path = binary_path(pid.cast_signed())?;
-    Ok((path, pid))
+    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_port)?;
+    let path = binary_path(owner.pid.cast_signed())?;
+    Ok((path, owner.pid))
 }
 
 /// Read the `PPid` (parent PID) from `/proc/<pid>/status`.
@@ -267,40 +336,59 @@ fn parse_proc_net_tcp(pid: u32, peer_port: u16) -> Result<u64> {
     ))
 }
 
-/// Scan process tree to find which PID owns a given socket inode.
+/// Scan `/proc` to find every PID that owns a given socket inode.
 ///
 /// First scans descendants of `entrypoint_pid` (most likely owners), then falls
 /// back to scanning all of `/proc`. Requires `CAP_SYS_PTRACE` to read
 /// `/proc/<pid>/fd/` for processes running as a different user.
 #[cfg(target_os = "linux")]
-fn find_pid_by_socket_inode(inode: u64, entrypoint_pid: u32) -> Result<u32> {
+fn find_socket_inode_owners(inode: u64, entrypoint_pid: u32) -> Result<Vec<SocketOwner>> {
     let target = format!("socket:[{inode}]");
+    let mut owners = Vec::new();
+    let mut checked = HashSet::new();
 
     // First: scan descendants of the entrypoint process
-    let descendants = collect_descendant_pids(entrypoint_pid);
+    let descendants = collect_descendant_pids_with_depth(entrypoint_pid);
 
-    for &pid in &descendants {
-        if let Some(found) = check_pid_fds(pid, &target) {
-            return Ok(found);
+    for descendant in &descendants {
+        checked.insert(descendant.pid);
+        if check_pid_fds(descendant.pid, &target) {
+            owners.push(SocketOwner {
+                pid: descendant.pid,
+                source: SocketOwnerSource::Descendant {
+                    depth: descendant.depth,
+                },
+            });
         }
     }
 
     // Fallback: scan all of /proc in case the process isn't in the tree
     if let Ok(proc_dir) = std::fs::read_dir("/proc") {
+        let mut proc_pids = Vec::new();
         for entry in proc_dir.flatten() {
             let name = entry.file_name();
-            let pid: u32 = match name.to_string_lossy().parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            // Skip PIDs we already checked
-            if descendants.contains(&pid) {
-                continue;
-            }
-            if let Some(found) = check_pid_fds(pid, &target) {
-                return Ok(found);
+            if let Ok(pid) = name.to_string_lossy().parse::<u32>() {
+                proc_pids.push(pid);
             }
         }
+        proc_pids.sort_unstable();
+
+        for pid in proc_pids {
+            if checked.contains(&pid) {
+                continue;
+            }
+            checked.insert(pid);
+            if check_pid_fds(pid, &target) {
+                owners.push(SocketOwner {
+                    pid,
+                    source: SocketOwnerSource::ProcFallback,
+                });
+            }
+        }
+    }
+
+    if !owners.is_empty() {
+        return Ok(owners);
     }
 
     Err(miette::miette!(
@@ -316,17 +404,19 @@ fn find_pid_by_socket_inode(inode: u64, entrypoint_pid: u32) -> Result<u32> {
 
 /// Check if a PID has an fd pointing to the given socket target string.
 #[cfg(target_os = "linux")]
-fn check_pid_fds(pid: u32, target: &str) -> Option<u32> {
+fn check_pid_fds(pid: u32, target: &str) -> bool {
     let fd_dir = format!("/proc/{pid}/fd");
-    let fds = std::fs::read_dir(&fd_dir).ok()?;
+    let Some(fds) = std::fs::read_dir(&fd_dir).ok() else {
+        return false;
+    };
     for fd_entry in fds.flatten() {
         if let Ok(link) = std::fs::read_link(fd_entry.path())
             && link.to_string_lossy() == target
         {
-            return Some(pid);
+            return true;
         }
     }
-    None
+    false
 }
 
 /// Collect all descendant PIDs of a root process using `/proc/<pid>/task/<tid>/children`.
@@ -335,18 +425,37 @@ fn check_pid_fds(pid: u32, target: &str) -> Option<u32> {
 /// is not available (requires `CONFIG_PROC_CHILDREN`), returns only the root PID.
 #[cfg(target_os = "linux")]
 fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
-    let mut pids = vec![root_pid];
+    collect_descendant_pids_with_depth(root_pid)
+        .into_iter()
+        .map(|descendant| descendant.pid)
+        .collect()
+}
+
+/// Collect descendant PIDs with BFS depth, deduping children reported by multiple tasks.
+#[cfg(target_os = "linux")]
+fn collect_descendant_pids_with_depth(root_pid: u32) -> Vec<DescendantPid> {
+    let mut pids = vec![DescendantPid {
+        pid: root_pid,
+        depth: 0,
+    }];
+    let mut seen = HashSet::from([root_pid]);
     let mut i = 0;
     while i < pids.len() {
-        let pid = pids[i];
+        let pid = pids[i].pid;
+        let child_depth = pids[i].depth + 1;
         let task_dir = format!("/proc/{pid}/task");
         if let Ok(tasks) = std::fs::read_dir(&task_dir) {
             for task_entry in tasks.flatten() {
                 let children_path = task_entry.path().join("children");
                 if let Ok(children_str) = std::fs::read_to_string(&children_path) {
                     for child in children_str.split_whitespace() {
-                        if let Ok(child_pid) = child.parse::<u32>() {
-                            pids.push(child_pid);
+                        if let Ok(child_pid) = child.parse::<u32>()
+                            && seen.insert(child_pid)
+                        {
+                            pids.push(DescendantPid {
+                                pid: child_pid,
+                                depth: child_depth,
+                            });
                         }
                     }
                 }
@@ -636,6 +745,75 @@ mod tests {
         let pid = std::process::id();
         let pids = collect_descendant_pids(pid);
         assert!(pids.contains(&pid));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn collect_descendants_dedupes_pids() {
+        let pid = std::process::id();
+        let pids = collect_descendant_pids(pid);
+        let unique = pids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(pids.len(), unique.len());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_tcp_peer_socket_owners_returns_all_forked_socket_holders() {
+        use std::net::{TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let listener_port = listener.local_addr().unwrap().port();
+        let stream = TcpStream::connect(("127.0.0.1", listener_port)).expect("connect");
+        let peer_port = stream.local_addr().unwrap().port();
+        let (_accepted, _) = listener.accept().expect("accept");
+
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork failed");
+        if child_pid == 0 {
+            unsafe {
+                libc::sleep(30);
+                libc::_exit(0);
+            }
+        }
+
+        let child_pid_u32 = child_pid as u32;
+        let entrypoint_pid = std::process::id();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let owners = loop {
+            let owners = resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)
+                .expect("resolve socket owners");
+            let owner_pids = owners
+                .owners
+                .iter()
+                .map(|owner| owner.pid)
+                .collect::<std::collections::HashSet<_>>();
+            if owner_pids.contains(&entrypoint_pid) && owner_pids.contains(&child_pid_u32) {
+                break owners;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for forked child to appear as a socket owner; got {:?}",
+                owner_pids
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+            libc::waitpid(child_pid, std::ptr::null_mut(), 0);
+        }
+
+        let owner_pids = owners
+            .owners
+            .iter()
+            .map(|owner| owner.pid)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(owner_pids.contains(&entrypoint_pid));
+        assert!(owner_pids.contains(&child_pid_u32));
     }
 
     #[cfg(target_os = "linux")]
