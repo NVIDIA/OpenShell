@@ -5,17 +5,7 @@
 ```bash
 mise run test          # Rust + Python unit tests
 mise run e2e           # End-to-end tests (requires a running cluster)
-mise run e2e:docker    # Docker-driver smoke test
 mise run ci            # Everything: lint, compile checks, and tests
-```
-
-For manual Docker-driver testing without the k3s cluster, start a standalone
-gateway:
-
-```bash
-mise run gateway:docker
-OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:18080 openshell status
-OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:18080 openshell sandbox create --name docker-smoke -- echo smoke-ok
 ```
 
 ## Test Layout

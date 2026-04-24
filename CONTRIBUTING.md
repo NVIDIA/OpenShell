@@ -194,7 +194,6 @@ These are the primary `mise` tasks for day-to-day development:
 | Task               | Purpose                                                 |
 | ------------------ | ------------------------------------------------------- |
 | `mise run cluster` | Bootstrap or incremental deploy                         |
-| `mise run gateway:docker` | Start a standalone local gateway with the Docker compute driver |
 | `mise run sandbox` | Create a sandbox on the running cluster                 |
 | `mise run test`    | Default test suite                                      |
 | `mise run e2e`     | Default end-to-end test lane                            |
