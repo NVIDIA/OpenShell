@@ -64,7 +64,7 @@ jobs:
         run: docker pull ghcr.io/nvidia/openshell/cluster:${{ inputs.image-tag }}
 
       - name: Install Python dependencies and generate protobuf stubs
-        run: uv sync --frozen && mise run --no-prepare python:proto
+        run: uv sync --frozen && mise run --no-deps python:proto
 
       - name: Bootstrap GPU cluster
         env:
@@ -76,7 +76,7 @@ jobs:
           SKIP_IMAGE_PUSH: "1"
           SKIP_CLUSTER_IMAGE_BUILD: "1"
           OPENSHELL_CLUSTER_IMAGE: ghcr.io/nvidia/openshell/cluster:${{ inputs.image-tag }}
-        run: mise run --no-prepare --skip-deps cluster
+        run: mise run --no-deps --skip-deps cluster
 
       - name: Run tests
-        run: mise run --no-prepare --skip-deps e2e:python:gpu
+        run: mise run --no-deps --skip-deps e2e:python:gpu

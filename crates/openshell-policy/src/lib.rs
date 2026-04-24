@@ -9,6 +9,8 @@
 //! policy schema. Both parsing (YAML→proto) and serialization (proto→YAML) use
 //! these types, ensuring round-trip fidelity.
 
+mod merge;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
@@ -19,6 +21,11 @@ use openshell_core::proto::{
     NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
+
+pub use merge::{
+    PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning, generated_rule_name,
+    merge_policy,
+};
 
 // ---------------------------------------------------------------------------
 // YAML serde types (canonical — used for both parsing and serialization)
@@ -102,6 +109,12 @@ struct NetworkEndpointDef {
     allowed_ips: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     deny_rules: Vec<L7DenyRuleDef>,
+    /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
+    /// rather than rejected by the L7 path canonicalizer. Required for
+    /// upstreams like GitLab that embed `%2F` in namespaced resource paths.
+    /// Defaults to false (strict).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    allow_encoded_slash: bool,
 }
 
 fn is_zero(v: &u16) -> bool {
@@ -254,6 +267,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                         .collect(),
                                 })
                                 .collect(),
+                            allow_encoded_slash: e.allow_encoded_slash,
                         }
                     })
                     .collect(),
@@ -393,6 +407,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                         .collect(),
                                 })
                                 .collect(),
+                            allow_encoded_slash: e.allow_encoded_slash,
                         }
                     })
                     .collect(),

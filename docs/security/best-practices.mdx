@@ -24,11 +24,11 @@ If you use [NemoClaw](https://github.com/NVIDIA/NemoClaw) to run OpenClaw assist
 
 OpenShell applies security controls at two enforcement points.
 OpenShell locks static controls at sandbox creation and requires destroying and recreating the sandbox to change them.
-You can update dynamic controls on a running sandbox with `openshell policy set`.
+You can update dynamic controls on a running sandbox with `openshell policy update` or `openshell policy set`.
 
 | Layer | What it protects | Enforcement point | Changeable at runtime |
 | --- | --- | --- | --- |
-| Network | Unauthorized outbound connections and data exfiltration. | CONNECT proxy + OPA policy engine | Yes. Use `openshell policy set` or operator approval in the TUI. |
+| Network | Unauthorized outbound connections and data exfiltration. | CONNECT proxy + OPA policy engine | Yes. Use `openshell policy update`, `openshell policy set`, or operator approval in the TUI. |
 | Filesystem | System binary tampering, credential theft, config manipulation. | Landlock LSM (kernel level) | No. Requires sandbox re-creation. |
 | Process | Privilege escalation, fork bombs, dangerous syscalls. | Seccomp BPF + privilege drop (`setuid`/`setgid`) | No. Requires sandbox re-creation. |
 | Inference | Credential exposure, unauthorized model access. | Proxy intercept of `inference.local` | Yes. Use `openshell inference set`. |
@@ -46,7 +46,7 @@ If no `network_policies` entry matches the destination host, port, and calling b
 | Aspect | Detail |
 |---|---|
 | Default | All egress denied. Only endpoints listed in `network_policies` can receive traffic. |
-| What you can change | Add entries to `network_policies` in the policy YAML. Apply statically at creation (`--policy`) or dynamically (`openshell policy set`). |
+| What you can change | Add entries to `network_policies` in the policy YAML. Apply statically at creation (`--policy`) or dynamically (`openshell policy update` for incremental changes, `openshell policy set` for full replacement). |
 | Risk if relaxed | Each allowed endpoint is a potential data exfiltration path. The agent can send workspace content, credentials, or conversation history to any reachable host. |
 | Recommendation | Add only endpoints the agent needs for its task. Start with a minimal policy and use denied-request logs (`openshell logs <name> --source sandbox`) to identify missing endpoints. |
 
@@ -118,9 +118,9 @@ After OPA policy allows a connection, the proxy resolves DNS and rejects connect
 | Aspect | Detail |
 |---|---|
 | Default | The proxy blocks all private IPs. Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), and unspecified (`0.0.0.0`) addresses are always blocked and cannot be overridden with `allowed_ips`. |
-| What you can change | Add `allowed_ips` (CIDR notation) to an endpoint to permit connections to specific private IP ranges. Policies with `allowed_ips` entries that overlap loopback, link-local, or unspecified addresses fail to load with a clear validation error. |
+| What you can change | Add `allowed_ips` (CIDR notation) to an endpoint to permit connections to specific private IP ranges. On Linux, the proxy consults the sandbox's `/etc/hosts` before DNS, so Kubernetes `hostAliases` can make LAN-only hostnames resolvable. Policies with `allowed_ips` entries that overlap loopback, link-local, or unspecified addresses fail to load with a clear validation error. |
 | Risk if relaxed | Without SSRF protection, a misconfigured policy could allow the agent to reach cloud metadata services (`169.254.169.254`), internal databases, or other infrastructure endpoints through DNS rebinding. |
-| Recommendation | Use `allowed_ips` only for known internal services. Scope the CIDR as narrowly as possible (for example, `10.0.5.20/32` for a single host). Loopback, link-local, and unspecified addresses are always blocked regardless of `allowed_ips`. The policy advisor does not propose rules for always-blocked destinations. |
+| Recommendation | Use `allowed_ips` only for known internal services. Scope the CIDR as narrowly as possible (for example, `10.0.5.20/32` for a single host). Loopback, link-local, and unspecified addresses are always blocked regardless of `allowed_ips`. `hostAliases` change resolution, not authorization: `host: searxng.local` with `/etc/hosts` mapping to `192.168.1.105` still needs `allowed_ips: ["192.168.1.105/32"]`. The policy advisor does not propose rules for always-blocked destinations. |
 
 ### Operator Approval
 
@@ -194,12 +194,13 @@ The sandbox process runs as a non-root user after explicit privilege dropping.
 
 ### Seccomp Filters
 
-A BPF seccomp filter restricts which socket domains the sandbox process can use and blocks a denylist of syscalls that enable container escape, privilege escalation, or host observation. The sandbox sets `PR_SET_NO_NEW_PRIVS` before applying the filter.
+OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude runs before CLI parsing and async runtime initialization, then the child process receives the broader runtime seccomp filter after privilege drop.
 
 | Aspect | Detail |
 |---|---|
+| Startup prelude | After privileged bootstrap helpers complete, the supervisor sets `PR_SET_NO_NEW_PRIVS` and synchronizes a seccomp filter across all runtime threads that blocks `mount`, the new mount API syscalls, `pivot_root`, `umount2`, `bpf`, `perf_event_open`, `userfaultfd`, module-loading syscalls, and kexec. This closes the long-lived privileged remount and kernel-surface window while leaving required setup syscalls such as `setns` available. |
 | Socket domains | The filter allows `AF_INET` and `AF_INET6` (for proxy communication) and blocks `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` with `EPERM`. |
-| Unconditional syscall blocks | `memfd_create`, `ptrace`, `bpf`, `process_vm_readv`, `process_vm_writev`, `pidfd_open`, `pidfd_getfd`, `pidfd_send_signal`, `io_uring_setup`, `mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `setns`, `umount2`, `pivot_root`, `userfaultfd`, `perf_event_open`. |
+| Runtime unconditional syscall blocks | `memfd_create`, `ptrace`, `bpf`, `process_vm_readv`, `process_vm_writev`, `pidfd_open`, `pidfd_getfd`, `pidfd_send_signal`, `io_uring_setup`, `mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `setns`, `umount2`, `pivot_root`, `userfaultfd`, `perf_event_open`. |
 | Conditional syscall blocks | `execveat` with `AT_EMPTY_PATH`, `unshare` and `clone` with `CLONE_NEWUSER`, and `seccomp(SECCOMP_SET_MODE_FILTER)` are denied with `EPERM`. |
 | What you can change | This is not a user-facing knob. OpenShell enforces it automatically. |
 | Risk if relaxed | The blocked syscalls support container escape (`mount`, `pivot_root`, `move_mount`, namespace creation), cross-process observation (`ptrace`, `process_vm_readv`, `pidfd_*`), raw kernel bypass (`bpf`, `io_uring_setup`, `perf_event_open`), and filter evasion (`seccomp`, `userfaultfd`). |
@@ -208,13 +209,15 @@ A BPF seccomp filter restricts which socket domains the sandbox process can use 
 ### Enforcement Application Order
 
 The sandbox supervisor applies enforcement in a specific order during process startup.
-This ordering is intentional: privilege dropping needs `/etc/group` and `/etc/passwd`, which Landlock subsequently restricts.
+This ordering is intentional: named network-namespace setup still relies on privileged helpers, and privilege dropping still needs `/etc/group` and `/etc/passwd`, which Landlock subsequently restricts.
 
-1. Network namespace entry (`setns`).
-2. Privilege drop (`initgroups` + `setgid` + `setuid`).
-3. Core-dump hardening (`RLIMIT_CORE=0`, plus `PR_SET_DUMPABLE=0` on Linux).
-4. Landlock filesystem restrictions.
-5. Seccomp socket domain filters.
+1. Privileged supervisor bootstrap helpers, including network-namespace setup and optional `iptables` probes.
+2. Supervisor startup prelude seccomp (`PR_SET_NO_NEW_PRIVS` plus the early syscall denylist) synchronized across runtime threads.
+3. Network namespace entry (`setns`) in child `pre_exec`.
+4. Privilege drop (`initgroups` + `setgid` + `setuid`).
+5. Core-dump hardening (`RLIMIT_CORE=0`, plus `PR_SET_DUMPABLE=0` on Linux).
+6. Landlock filesystem restrictions.
+7. Runtime seccomp socket domain and syscall filters.
 
 ## Inference Controls
 
@@ -251,7 +254,7 @@ OpenShell generates a cluster CA at bootstrap and distributes it through Kuberne
 
 ### SSH Tunnel Authentication
 
-SSH connections to sandboxes pass through the gateway's HTTP CONNECT tunnel with token-based authentication and HMAC-SHA256 handshake verification (NSSH1 protocol).
+SSH connections to sandboxes travel through the gateway over the sandbox's existing mTLS session. On top of the gateway's transport authentication (mTLS by default), each SSH connect call also carries a short-lived session token scoped to a specific sandbox. The sandbox never exposes an SSH port on the network — its SSH daemon listens on a local Unix socket that only the sandbox's own supervisor process can reach.
 
 | Aspect | Detail |
 |---|---|

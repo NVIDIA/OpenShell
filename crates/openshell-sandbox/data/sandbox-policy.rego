@@ -328,6 +328,13 @@ method_matches(actual, expected) if {
 }
 
 # Path matching: "**" matches everything; otherwise glob.match with "/" delimiter.
+#
+# INVARIANT: `input.request.path` is canonicalized by the sandbox before
+# policy evaluation — percent-decoded, dot-segments resolved, doubled
+# slashes collapsed, `;params` stripped, `%2F` rejected (unless an
+# endpoint opts in). Patterns here must therefore match canonical paths;
+# do not attempt defensive matching against `..` or `%2e%2e` — those
+# inputs are rejected at the L7 parser boundary before this rule runs.
 path_matches(_, "**") if true
 
 path_matches(actual, pattern) if {
@@ -394,8 +401,8 @@ command_matches(actual, expected) if {
 
 # --- Matched endpoint config (for L7 and allowed_ips extraction) ---
 # Returns the raw endpoint object for the matched policy + host:port.
-# Used by Rust to extract L7 config (protocol, tls, enforcement) and/or
-# allowed_ips for SSRF allowlist validation.
+# Used by Rust to extract L7 config (protocol, tls, enforcement,
+# allow_encoded_slash) and/or allowed_ips for SSRF allowlist validation.
 
 # Per-policy helper: returns matching endpoint configs for a single policy.
 _policy_endpoint_configs(policy) := [ep |

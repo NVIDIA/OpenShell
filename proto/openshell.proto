@@ -91,6 +91,27 @@ service OpenShell {
   // Push sandbox supervisor logs to the server (client-streaming).
   rpc PushSandboxLogs(stream PushSandboxLogsRequest) returns (PushSandboxLogsResponse);
 
+  // Persistent supervisor-to-gateway session (bidirectional streaming).
+  //
+  // The supervisor opens this stream at startup and keeps it alive for the
+  // sandbox lifetime. The gateway uses it to coordinate relay channels for
+  // SSH connect and ExecSandbox. Raw SSH bytes flow over RelayStream calls
+  // (separate HTTP/2 streams on the same connection), not over this stream.
+  rpc ConnectSupervisor(stream SupervisorMessage) returns (stream GatewayMessage);
+
+  // Raw byte relay between supervisor and gateway.
+  //
+  // The supervisor initiates this call after receiving a RelayOpen message
+  // on its ConnectSupervisor stream. The first RelayFrame carries a
+  // RelayInit with the channel_id to associate the new HTTP/2 stream with
+  // the pending relay slot on the gateway. Subsequent frames carry raw bytes in either
+  // direction between the gateway-side waiter (ssh_tunnel / exec handler)
+  // and the supervisor-side local SSH daemon bridge.
+  //
+  // This rides the same TCP+TLS+HTTP/2 connection as ConnectSupervisor —
+  // no new TLS handshake, no reverse HTTP CONNECT.
+  rpc RelayStream(stream RelayFrame) returns (stream RelayFrame);
+
   // Watch a sandbox and stream updates.
   //
   // This stream can include:
@@ -315,26 +336,38 @@ message CreateSshSessionRequest {
 }
 
 // Create SSH session response.
+//
+// Fields are interpolated into an SSH `ProxyCommand` string that OpenSSH
+// executes through `/bin/sh -c` on the caller's workstation. Servers MUST
+// uphold the charset contract below; clients MUST reject responses that
+// violate it. The client's own escaping provides defense-in-depth, but
+// narrow charsets close injection vectors at the trust boundary.
 message CreateSshSessionResponse {
-  // Sandbox id.
+  // Sandbox id. [A-Za-z0-9._-]{1,128}.
   string sandbox_id = 1;
 
-  // Session token for the gateway tunnel.
+  // Session token for the gateway tunnel. URL-safe ASCII
+  // ([A-Za-z0-9._~+/=-]) up to 4096 bytes. No shell metacharacters or
+  // whitespace.
   string token = 2;
 
-  // Gateway host for SSH proxy connection.
+  // Gateway host for SSH proxy connection. IPv4 address, bracketed IPv6
+  // address, or DNS hostname (Punycode-encoded for IDN). Alphanumeric plus
+  // `.-:[]` only, up to 253 bytes.
   string gateway_host = 3;
 
-  // Gateway port for SSH proxy connection.
+  // Gateway port for SSH proxy connection. Must be in range 1..=65535.
   uint32 gateway_port = 4;
 
-  // Gateway scheme (http or https).
+  // Gateway scheme. Must be exactly "http" or "https".
   string gateway_scheme = 5;
 
-  // HTTP path for the CONNECT/upgrade endpoint.
+  // HTTP path for the CONNECT/upgrade endpoint. Must begin with `/`. RFC
+  // 3986 path charset only ([A-Za-z0-9._~!$&'()*+,;=:@/-] plus %HH).
+  // Must not contain `?`, `#`, whitespace, backtick, or backslash.
   string connect_path = 6;
 
-  // Optional host key fingerprint.
+  // Optional host key fingerprint. If non-empty, [A-Za-z0-9:+/=-] only.
   string host_key_fingerprint = 7;
 
   // Expiry timestamp in milliseconds since epoch. 0 means no expiry.
@@ -574,6 +607,51 @@ message UpdateConfigRequest {
   bool delete_setting = 5;
   // Apply mutation at gateway-global scope.
   bool global = 6;
+  // Batched incremental policy merge operations. Sandbox-scoped only.
+  repeated PolicyMergeOperation merge_operations = 7;
+}
+
+message PolicyMergeOperation {
+  oneof operation {
+    AddNetworkRule add_rule = 1;
+    RemoveNetworkEndpoint remove_endpoint = 2;
+    RemoveNetworkRule remove_rule = 3;
+    AddDenyRules add_deny_rules = 4;
+    AddAllowRules add_allow_rules = 5;
+    RemoveNetworkBinary remove_binary = 6;
+  }
+}
+
+message AddNetworkRule {
+  string rule_name = 1;
+  openshell.sandbox.v1.NetworkPolicyRule rule = 2;
+}
+
+message RemoveNetworkEndpoint {
+  string rule_name = 1;
+  string host = 2;
+  uint32 port = 3;
+}
+
+message RemoveNetworkRule {
+  string rule_name = 1;
+}
+
+message AddDenyRules {
+  string host = 1;
+  uint32 port = 2;
+  repeated openshell.sandbox.v1.L7DenyRule deny_rules = 3;
+}
+
+message AddAllowRules {
+  string host = 1;
+  uint32 port = 2;
+  repeated openshell.sandbox.v1.L7Rule rules = 3;
+}
+
+message RemoveNetworkBinary {
+  string rule_name = 1;
+  string binary_path = 2;
 }
 
 // Update sandbox policy response.
@@ -702,6 +780,105 @@ message GetSandboxLogsResponse {
   repeated SandboxLogLine logs = 1;
   // Total number of lines in the server's buffer for this sandbox.
   uint32 buffer_total = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor session messages
+// ---------------------------------------------------------------------------
+
+// Envelope for supervisor-to-gateway messages on the ConnectSupervisor stream.
+message SupervisorMessage {
+  oneof payload {
+    SupervisorHello hello = 1;
+    SupervisorHeartbeat heartbeat = 2;
+    RelayOpenResult relay_open_result = 3;
+    RelayClose relay_close = 4;
+  }
+}
+
+// Envelope for gateway-to-supervisor messages on the ConnectSupervisor stream.
+message GatewayMessage {
+  oneof payload {
+    SessionAccepted session_accepted = 1;
+    SessionRejected session_rejected = 2;
+    GatewayHeartbeat heartbeat = 3;
+    RelayOpen relay_open = 4;
+    RelayClose relay_close = 5;
+  }
+}
+
+// Supervisor identifies itself and the sandbox it manages.
+message SupervisorHello {
+  // Sandbox ID this supervisor manages.
+  string sandbox_id = 1;
+  // Supervisor instance ID (e.g. boot id or process epoch).
+  string instance_id = 2;
+}
+
+// Gateway accepts the supervisor session.
+message SessionAccepted {
+  // Gateway-assigned session ID for this connection.
+  string session_id = 1;
+  // Recommended heartbeat interval in seconds.
+  uint32 heartbeat_interval_secs = 2;
+}
+
+// Gateway rejects the supervisor session.
+message SessionRejected {
+  // Human-readable rejection reason.
+  string reason = 1;
+}
+
+// Supervisor heartbeat.
+message SupervisorHeartbeat {}
+
+// Gateway heartbeat.
+message GatewayHeartbeat {}
+
+// Gateway requests the supervisor to open a relay channel.
+//
+// On receiving this, the supervisor should initiate a RelayStream RPC to
+// the gateway, sending a RelayInit in the first RelayFrame to associate
+// the new HTTP/2 stream with the pending relay slot. The supervisor
+// bridges that stream to the local SSH daemon.
+message RelayOpen {
+  // Gateway-allocated channel identifier (UUID).
+  string channel_id = 1;
+}
+
+// Initial RelayStream frame sent by the supervisor to claim a pending relay.
+message RelayInit {
+  // Gateway-allocated channel identifier (UUID).
+  string channel_id = 1;
+}
+
+// A single frame on the RelayStream RPC.
+//
+// The supervisor MUST send `init` as the first frame. All subsequent frames
+// in either direction carry raw bytes in `data`.
+message RelayFrame {
+  oneof payload {
+    RelayInit init = 1;
+    bytes data = 2;
+  }
+}
+
+// Supervisor reports the result of a relay open request.
+message RelayOpenResult {
+  // Channel identifier from the RelayOpen request.
+  string channel_id = 1;
+  // True if the relay was successfully established.
+  bool success = 2;
+  // Error message if success is false.
+  string error = 3;
+}
+
+// Either side requests closure of a relay channel.
+message RelayClose {
+  // Channel identifier to close.
+  string channel_id = 1;
+  // Optional reason for closure.
+  string reason = 2;
 }
 
 // ---------------------------------------------------------------------------

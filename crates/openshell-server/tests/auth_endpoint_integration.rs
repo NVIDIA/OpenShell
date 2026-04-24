@@ -528,6 +528,9 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     type ExecSandboxStream = tokio_stream::wrappers::ReceiverStream<
         Result<openshell_core::proto::ExecSandboxEvent, tonic::Status>,
     >;
+    type ConnectSupervisorStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::GatewayMessage, tonic::Status>,
+    >;
 
     async fn watch_sandbox(
         &self,
@@ -661,6 +664,24 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
         _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
     ) -> Result<tonic::Response<openshell_core::proto::GetDraftHistoryResponse>, tonic::Status>
     {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
+
+    async fn connect_supervisor(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::SupervisorMessage>>,
+    ) -> Result<tonic::Response<Self::ConnectSupervisorStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
+
+    type RelayStreamStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::RelayFrame, tonic::Status>,
+    >;
+
+    async fn relay_stream(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
+    ) -> Result<tonic::Response<Self::RelayStreamStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("not implemented in test"))
     }
 }

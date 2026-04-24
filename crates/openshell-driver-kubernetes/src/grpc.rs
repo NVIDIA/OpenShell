@@ -5,8 +5,7 @@ use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, ResolveSandboxEndpointRequest,
-    ResolveSandboxEndpointResponse, StopSandboxRequest, StopSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
     ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
     WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
@@ -126,21 +125,6 @@ impl ComputeDriver for ComputeDriverService {
             .await
             .map_err(Status::internal)?;
         Ok(Response::new(DeleteSandboxResponse { deleted }))
-    }
-
-    async fn resolve_sandbox_endpoint(
-        &self,
-        request: Request<ResolveSandboxEndpointRequest>,
-    ) -> Result<Response<ResolveSandboxEndpointResponse>, Status> {
-        let sandbox = request
-            .into_inner()
-            .sandbox
-            .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        self.driver
-            .resolve_sandbox_endpoint(&sandbox)
-            .await
-            .map(Response::new)
-            .map_err(status_from_driver_error)
     }
 
     type WatchSandboxesStream =

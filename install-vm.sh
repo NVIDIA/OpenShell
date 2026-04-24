@@ -2,7 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Install the openshell-vm binary.
+# Install the OpenShell gateway + VM compute driver for local MicroVM sandboxes.
+#
+# This installs two binaries:
+#   - openshell-gateway       — control-plane server (from the `dev` release).
+#   - openshell-driver-vm     — libkrun-backed VM compute driver (from the
+#                               `vm-dev` release). The gateway auto-detects
+#                               this driver via its driver directory.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-vm.sh | sh
@@ -11,14 +17,28 @@
 #   ./install-vm.sh
 #
 # Environment variables:
-#   OPENSHELL_VM_INSTALL_DIR - Directory to install into (default: ~/.local/bin)
+#   OPENSHELL_INSTALL_DIR        Directory for the gateway binary
+#                                (default: ~/.local/bin).
+#   OPENSHELL_DRIVER_DIR         Directory for compute-driver binaries
+#                                (default: ~/.local/libexec/openshell).
+#                                If you install elsewhere, pass the same
+#                                directory via the gateway's --driver-dir flag.
 #
 set -eu
 
-APP_NAME="openshell-vm"
 REPO="NVIDIA/OpenShell"
 GITHUB_URL="https://github.com/${REPO}"
-RELEASE_TAG="vm-dev"
+
+# Release tags
+GATEWAY_RELEASE_TAG="dev"
+DRIVER_VM_RELEASE_TAG="vm-dev"
+
+# Binary names (must match what the gateway expects to find).
+GATEWAY_BIN="openshell-gateway"
+DRIVER_VM_BIN="openshell-driver-vm"
+
+# Logging label.
+APP_NAME="openshell-vm-install"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -38,7 +58,7 @@ error() {
 }
 
 # ---------------------------------------------------------------------------
-# HTTP helpers
+# HTTP helpers — prefer curl, fall back to wget
 # ---------------------------------------------------------------------------
 
 has_cmd() {
@@ -73,7 +93,6 @@ resolve_redirect() {
   if has_cmd curl; then
     curl -fLsS -o /dev/null -w '%{url_effective}' "$_url"
   elif has_cmd wget; then
-    # wget --spider follows redirects; capture the final Location from stderr
     wget --spider --max-redirect=10 "$_url" 2>&1 | sed -n 's/^.*Location: \([^ ]*\).*/\1/p' | tail -1
   fi
 }
@@ -100,6 +119,7 @@ validate_download_origin() {
 # Platform detection
 # ---------------------------------------------------------------------------
 
+# Both binaries ship the same set of triples under the same naming scheme.
 get_target() {
   _arch="$(uname -m)"
   _os="$(uname -s)"
@@ -149,14 +169,24 @@ verify_checksum() {
 }
 
 # ---------------------------------------------------------------------------
-# Install location
+# Install locations
 # ---------------------------------------------------------------------------
 
-get_install_dir() {
-  if [ -n "${OPENSHELL_VM_INSTALL_DIR:-}" ]; then
-    echo "$OPENSHELL_VM_INSTALL_DIR"
+get_gateway_install_dir() {
+  if [ -n "${OPENSHELL_INSTALL_DIR:-}" ]; then
+    echo "$OPENSHELL_INSTALL_DIR"
   else
     echo "${HOME}/.local/bin"
+  fi
+}
+
+# Default per-user install dir for the VM compute driver. Newer gateways also
+# auto-discover conventional system installs under `/usr/local/libexec`.
+get_driver_install_dir() {
+  if [ -n "${OPENSHELL_DRIVER_DIR:-}" ]; then
+    echo "$OPENSHELL_DRIVER_DIR"
+  else
+    echo "${HOME}/.local/libexec/openshell"
   fi
 }
 
@@ -168,10 +198,11 @@ is_on_path() {
 }
 
 # ---------------------------------------------------------------------------
-# macOS codesign
+# macOS codesign — the VM driver runs libkrun and needs the hypervisor
+# entitlement. The gateway does not.
 # ---------------------------------------------------------------------------
 
-codesign_binary() {
+codesign_driver_vm() {
   _binary="$1"
   _cs_tmpdir="$2"  # reuse caller's tmpdir for cleanup-safe temp files
 
@@ -180,11 +211,11 @@ codesign_binary() {
   fi
 
   if ! has_cmd codesign; then
-    warn "codesign not found; the binary will fail without the Hypervisor entitlement"
+    warn "codesign not found; ${DRIVER_VM_BIN} will fail without the Hypervisor entitlement"
     return 0
   fi
 
-  info "codesigning with Hypervisor entitlement..."
+  info "codesigning ${DRIVER_VM_BIN} with Hypervisor entitlement..."
   _entitlements="${_cs_tmpdir}/entitlements.plist"
   cat > "$_entitlements" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -200,15 +231,65 @@ PLIST
 }
 
 # ---------------------------------------------------------------------------
+# Download + install a single binary release asset
+# ---------------------------------------------------------------------------
+
+# Args:
+#   $1  binary name (e.g. openshell-gateway)
+#   $2  release tag (e.g. dev, vm-dev)
+#   $3  target triple (e.g. aarch64-apple-darwin)
+#   $4  checksums filename in the release (e.g. openshell-gateway-checksums-sha256.txt)
+#   $5  destination directory
+#   $6  tmp working dir (caller-owned; will be cleaned up outside)
+install_release_binary() {
+  _bin="$1"
+  _tag="$2"
+  _target="$3"
+  _checksums_name="$4"
+  _dest_dir="$5"
+  _work_dir="$6"
+
+  _filename="${_bin}-${_target}.tar.gz"
+  _download_url="${GITHUB_URL}/releases/download/${_tag}/${_filename}"
+  _checksums_url="${GITHUB_URL}/releases/download/${_tag}/${_checksums_name}"
+
+  info "downloading ${_bin} from release '${_tag}' (${_target})..."
+
+  validate_download_origin "$_download_url"
+
+  if ! download "$_download_url" "${_work_dir}/${_filename}"; then
+    error "failed to download ${_download_url}"
+  fi
+
+  if ! download "$_checksums_url" "${_work_dir}/${_bin}-checksums.txt"; then
+    error "failed to download checksums file from ${_checksums_url}"
+  fi
+
+  info "verifying ${_bin} checksum..."
+  if ! verify_checksum "${_work_dir}/${_filename}" "${_work_dir}/${_bin}-checksums.txt" "$_filename"; then
+    error "checksum verification failed for ${_filename}"
+  fi
+
+  info "extracting ${_bin}..."
+  tar -xzf "${_work_dir}/${_filename}" -C "${_work_dir}" --no-same-owner --no-same-permissions "${_bin}"
+
+  # Install into destination dir, escalating with sudo if needed.
+  if mkdir -p "$_dest_dir" 2>/dev/null && [ -w "$_dest_dir" ]; then
+    install -m 755 "${_work_dir}/${_bin}" "${_dest_dir}/${_bin}"
+  else
+    info "elevated permissions required to install to ${_dest_dir}"
+    sudo mkdir -p "$_dest_dir"
+    sudo install -m 755 "${_work_dir}/${_bin}" "${_dest_dir}/${_bin}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-main() {
-  for arg in "$@"; do
-    case "$arg" in
-      --help)
-        cat <<EOF
-install-vm.sh — Install the openshell-vm MicroVM runtime
+usage() {
+  cat <<EOF
+install-vm.sh — Install the OpenShell gateway + VM compute driver
 
 USAGE:
     curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-vm.sh | sh
@@ -218,15 +299,29 @@ OPTIONS:
     --help    Print this help message
 
 ENVIRONMENT VARIABLES:
-    OPENSHELL_VM_INSTALL_DIR   Directory to install into (default: ~/.local/bin)
+    OPENSHELL_INSTALL_DIR   Directory for the gateway binary
+                            (default: ~/.local/bin).
+    OPENSHELL_DRIVER_DIR    Directory for compute-driver binaries
+                            (default: ~/.local/libexec/openshell).
+                            If you install elsewhere, pass the same directory
+                            via the gateway's --driver-dir flag.
 
 EXAMPLES:
-    # Install latest dev build
+    # Install into defaults
     curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-vm.sh | sh
 
-    # Install to /usr/local/bin
-    curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-vm.sh | OPENSHELL_VM_INSTALL_DIR=/usr/local/bin sh
+    # Install gateway to /usr/local/bin and driver to /usr/local/libexec/openshell
+    curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-vm.sh \\
+      | OPENSHELL_INSTALL_DIR=/usr/local/bin \\
+        OPENSHELL_DRIVER_DIR=/usr/local/libexec/openshell sh
 EOF
+}
+
+main() {
+  for arg in "$@"; do
+    case "$arg" in
+      --help)
+        usage
         exit 0
         ;;
       *) error "unknown option: $arg" ;;
@@ -236,53 +331,41 @@ EOF
   check_downloader
 
   _target="$(get_target)"
-  _filename="${APP_NAME}-${_target}.tar.gz"
-  _download_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${_filename}"
-  _checksums_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/vm-binary-checksums-sha256.txt"
-  _install_dir="$(get_install_dir)"
-
-  info "downloading ${APP_NAME} (${_target})..."
-
-  # Validate that the download URL resolves to the expected GitHub origin.
-  validate_download_origin "$_download_url"
+  _gateway_dir="$(get_gateway_install_dir)"
+  _driver_dir="$(get_driver_install_dir)"
 
   _tmpdir="$(mktemp -d)"
   trap 'rm -rf "$_tmpdir"' EXIT
 
-  if ! download "$_download_url" "${_tmpdir}/${_filename}"; then
-    error "failed to download ${_download_url}"
-  fi
+  # 1. Gateway — from the rolling `dev` release.
+  install_release_binary \
+    "$GATEWAY_BIN" \
+    "$GATEWAY_RELEASE_TAG" \
+    "$_target" \
+    "${GATEWAY_BIN}-checksums-sha256.txt" \
+    "$_gateway_dir" \
+    "$_tmpdir"
 
-  info "verifying checksum..."
-  if ! download "$_checksums_url" "${_tmpdir}/checksums.txt"; then
-    error "failed to download checksums file from ${_checksums_url}"
-  fi
-  if ! verify_checksum "${_tmpdir}/${_filename}" "${_tmpdir}/checksums.txt" "$_filename"; then
-    error "checksum verification failed for ${_filename}"
-  fi
+  # 2. VM compute driver — from the rolling `vm-dev` release. Shares the
+  #    checksum file with openshell-vm (`vm-binary-checksums-sha256.txt`).
+  install_release_binary \
+    "$DRIVER_VM_BIN" \
+    "$DRIVER_VM_RELEASE_TAG" \
+    "$_target" \
+    "vm-binary-checksums-sha256.txt" \
+    "$_driver_dir" \
+    "$_tmpdir"
 
-  info "extracting..."
-  tar -xzf "${_tmpdir}/${_filename}" -C "${_tmpdir}" --no-same-owner --no-same-permissions "${APP_NAME}"
+  codesign_driver_vm "${_driver_dir}/${DRIVER_VM_BIN}" "$_tmpdir"
 
-  mkdir -p "$_install_dir" 2>/dev/null || true
+  _gateway_version="$("${_gateway_dir}/${GATEWAY_BIN}" --version 2>/dev/null || echo "${GATEWAY_RELEASE_TAG}")"
+  info "installed ${_gateway_version} to ${_gateway_dir}/${GATEWAY_BIN}"
+  info "installed ${DRIVER_VM_BIN} to ${_driver_dir}/${DRIVER_VM_BIN}"
 
-  if [ -w "$_install_dir" ] || mkdir -p "$_install_dir" 2>/dev/null; then
-    install -m 755 "${_tmpdir}/${APP_NAME}" "${_install_dir}/${APP_NAME}"
-  else
-    info "elevated permissions required to install to ${_install_dir}"
-    sudo mkdir -p "$_install_dir"
-    sudo install -m 755 "${_tmpdir}/${APP_NAME}" "${_install_dir}/${APP_NAME}"
-  fi
-
-  codesign_binary "${_install_dir}/${APP_NAME}" "$_tmpdir"
-
-  _installed_version="$("${_install_dir}/${APP_NAME}" --version 2>/dev/null || echo "${RELEASE_TAG}")"
-  info "installed ${_installed_version} to ${_install_dir}/${APP_NAME}"
-
-  # If the install directory isn't on PATH, print instructions
-  if ! is_on_path "$_install_dir"; then
+  # Warn if the gateway dir isn't on PATH.
+  if ! is_on_path "$_gateway_dir"; then
     echo ""
-    info "${_install_dir} is not on your PATH."
+    info "${_gateway_dir} is not on your PATH."
     info ""
     info "Add it by appending the following to your shell configuration file"
     info "(e.g. ~/.bashrc, ~/.zshrc, or ~/.config/fish/config.fish):"
@@ -290,17 +373,54 @@ EOF
 
     _current_shell="$(basename "${SHELL:-sh}" 2>/dev/null || echo "sh")"
     case "$_current_shell" in
-      fish)
-        info "    fish_add_path ${_install_dir}"
-        ;;
-      *)
-        info "    export PATH=\"${_install_dir}:\$PATH\""
-        ;;
+      fish) info "    fish_add_path ${_gateway_dir}" ;;
+      *)    info "    export PATH=\"${_gateway_dir}:\$PATH\"" ;;
     esac
 
     info ""
     info "Then restart your shell or run the command above in your current session."
   fi
+
+  # ---------------------------------------------------------------------------
+  # Next steps — print a working command to start the gateway.
+  #
+  # The VM compute driver requires:
+  #   * --driver-dir           — only needed when the driver is installed
+  #                               outside the built-in search paths:
+  #                               ~/.local/libexec/openshell,
+  #                               /usr/local/libexec/openshell,
+  #                               /usr/local/libexec, or next to the gateway.
+  #   * --grpc-endpoint         — URL the VM guest uses to call the gateway
+  #                               back. Loopback is accepted; scheme must
+  #                               match TLS mode.
+  #   * --ssh-handshake-secret  — shared secret for gateway↔sandbox SSH.
+  # ---------------------------------------------------------------------------
+
+  echo ""
+  info "Next steps — start the gateway with the VM compute driver:"
+  echo ""
+
+  _driver_dir_arg=""
+  case "$_driver_dir" in
+    "${HOME}/.local/libexec/openshell"|"/usr/local/libexec/openshell"|"/usr/local/libexec") ;;
+    *)
+      _driver_dir_arg="      --driver-dir '${_driver_dir}' \\
+"
+      ;;
+  esac
+
+  cat >&2 <<EOF
+    ${GATEWAY_BIN} \\
+      --drivers vm \\
+${_driver_dir_arg}      --disable-tls \\
+      --disable-gateway-auth \\
+      --db-url 'sqlite::memory:' \\
+      --grpc-endpoint 'http://127.0.0.1:8080' \\
+      --ssh-handshake-secret "\$(openssl rand -hex 32)"
+EOF
+
+  echo ""
+  info "See '${GATEWAY_BIN} --help' for TLS, persistence, and sandbox flags."
 }
 
 main "$@"

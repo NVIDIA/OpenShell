@@ -22,14 +22,33 @@ const RELAY_BUF_SIZE: usize = 8192;
 const RELAY_EOF_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// HTTP/1.1 REST protocol provider.
-pub struct RestProvider;
+///
+/// Carries the path-canonicalization options derived from the endpoint
+/// config so that different endpoints (e.g. one backed by GitLab that needs
+/// `%2F` in paths and one backed by a strict API) can apply different
+/// canonicalization strictness to the same `RestProvider` call surface.
+#[derive(Debug, Clone, Default)]
+pub struct RestProvider {
+    canonicalize_options: crate::l7::path::CanonicalizeOptions,
+}
+
+impl RestProvider {
+    /// Construct a provider with explicit canonicalization options. Used by
+    /// `relay_rest` so endpoint config can opt in to looser behavior such
+    /// as `allow_encoded_slash`.
+    pub fn with_options(canonicalize_options: crate::l7::path::CanonicalizeOptions) -> Self {
+        Self {
+            canonicalize_options,
+        }
+    }
+}
 
 impl L7Provider for RestProvider {
     async fn parse_request<C: AsyncRead + AsyncWrite + Unpin + Send>(
         &self,
         client: &mut C,
     ) -> Result<Option<L7Request>> {
-        parse_http_request(client).await
+        parse_http_request(client, &self.canonicalize_options).await
     }
 
     async fn relay<C, U>(
@@ -78,7 +97,10 @@ impl RestProvider {
 /// forwarded upstream without L7 policy evaluation -- a request
 /// smuggling vulnerability.  Byte-at-a-time overhead is negligible for
 /// the typical 200-800 byte headers on L7-inspected REST endpoints.
-async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Option<L7Request>> {
+async fn parse_http_request<C: AsyncRead + Unpin>(
+    client: &mut C,
+    canonicalize_options: &crate::l7::path::CanonicalizeOptions,
+) -> Result<Option<L7Request>> {
     let mut buf = Vec::with_capacity(4096);
 
     loop {
@@ -149,15 +171,66 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
 
     // Determine body framing from headers
     let body_length = parse_body_length(header_str)?;
-    let (path, query_params) = parse_target_query(&target)?;
+
+    // Canonicalize the request-target before OPA evaluation AND before
+    // forwarding. This closes the parser-differential between the policy
+    // engine (which matches on segments) and the upstream server (which
+    // resolves `..` / `%2e%2e` / `%2F` before dispatch). If canonicalization
+    // fails, the request is rejected as a protocol violation — consistent
+    // with how duplicate Content-Length, bare LF, and invalid UTF-8 are
+    // handled by this parser.
+    let (canonical, raw_query) =
+        crate::l7::path::canonicalize_request_target(&target, canonicalize_options)
+            .map_err(|e| miette!("HTTP request-target rejected: {e}"))?;
+
+    let query_params = match raw_query.as_deref() {
+        Some(q) => parse_query_params(q)?,
+        None => HashMap::new(),
+    };
+
+    if canonical.rewritten {
+        buf = rewrite_request_line_target(
+            &buf,
+            &method,
+            &canonical.path,
+            raw_query.as_deref(),
+            version,
+        )?;
+    }
 
     Ok(Some(L7Request {
         action: method,
-        target: path,
+        target: canonical.path,
         query_params,
         raw_header: buf, // exact header bytes up to and including \r\n\r\n
         body_length,
     }))
+}
+
+/// Rebuild the request line in a raw HTTP header block with a canonicalized
+/// target. Called when the canonical path differs from what the client sent,
+/// so the upstream dispatches on the exact bytes the policy engine evaluated.
+fn rewrite_request_line_target(
+    raw: &[u8],
+    method: &str,
+    canonical_path: &str,
+    raw_query: Option<&str>,
+    version: &str,
+) -> Result<Vec<u8>> {
+    let eol = raw
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .ok_or_else(|| miette!("request line missing CRLF"))?;
+    let rest = &raw[eol..];
+    let new_target = match raw_query {
+        Some(q) if !q.is_empty() => format!("{canonical_path}?{q}"),
+        _ => canonical_path.to_string(),
+    };
+    let new_request_line = format!("{method} {new_target} {version}");
+    let mut out = Vec::with_capacity(new_request_line.len() + rest.len());
+    out.extend_from_slice(new_request_line.as_bytes());
+    out.extend_from_slice(rest);
+    Ok(out)
 }
 
 pub(crate) fn parse_target_query(target: &str) -> Result<(String, HashMap<String, Vec<String>>)> {
@@ -167,7 +240,7 @@ pub(crate) fn parse_target_query(target: &str) -> Result<(String, HashMap<String
     }
 }
 
-fn parse_query_params(query: &str) -> Result<HashMap<String, Vec<String>>> {
+pub(crate) fn parse_query_params(query: &str) -> Result<HashMap<String, Vec<String>>> {
     let mut params: HashMap<String, Vec<String>> = HashMap::new();
     if query.is_empty() {
         return Ok(params);
@@ -1064,7 +1137,11 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let result = parse_http_request(&mut client).await;
+        let result = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await;
         assert!(result.is_err(), "Must reject headers with bare LF");
     }
 
@@ -1077,7 +1154,11 @@ mod tests {
             raw.extend_from_slice(b"GET /api HTTP/1.1\r\nHost: x\r\nX-Bad: \xc0\xaf\r\n\r\n");
             writer.write_all(&raw).await.unwrap();
         });
-        let result = parse_http_request(&mut client).await;
+        let result = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await;
         assert!(result.is_err(), "Must reject headers with invalid UTF-8");
     }
 
@@ -1091,8 +1172,178 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let result = parse_http_request(&mut client).await;
+        let result = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await;
         assert!(result.is_err(), "Must reject unsupported HTTP version");
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_canonicalizes_target_and_rewrites_raw_header() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /public/../secret HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let req = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .expect("request should parse")
+        .expect("request should exist");
+        // Path fed to OPA evaluation is canonical.
+        assert_eq!(req.target, "/secret");
+        // raw_header (forwarded byte-for-byte to upstream) is also canonical
+        // — this is the invariant the L7 canonicalization PR must uphold.
+        assert_eq!(
+            req.raw_header, b"GET /secret HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+            "outbound request line must carry the canonical path"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_canonicalization_preserves_query_string() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /public/../v1/list?limit=10&sort=asc HTTP/1.1\r\nHost: h\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let req = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(req.target, "/v1/list");
+        assert_eq!(
+            req.raw_header, b"GET /v1/list?limit=10&sort=asc HTTP/1.1\r\nHost: h\r\n\r\n",
+            "canonical rewrite must preserve the query string verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_leaves_canonical_input_byte_for_byte() {
+        // When the input is already canonical, the raw_header must pass
+        // through unchanged — otherwise legitimate traffic pays a rewrite
+        // cost on every request.
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /api/v1/users HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let req = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(req.target, "/api/v1/users");
+        assert_eq!(
+            req.raw_header,
+            b"GET /api/v1/users HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_rejects_traversal_above_root() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /.. HTTP/1.1\r\nHost: h\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let result = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a target that escapes the path root must be rejected at the parser"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_accepts_encoded_slash_when_endpoint_opts_in() {
+        // GitLab-style endpoints legitimately embed `%2F` in path segments
+        // (e.g. `/api/v4/projects/group%2Fproject`). Passing a provider
+        // constructed with `allow_encoded_slash: true` models the
+        // endpoint-config wiring that flows from `L7EndpointConfig`.
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /api/v4/projects/group%2Fproject HTTP/1.1\r\nHost: g\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let options = crate::l7::path::CanonicalizeOptions {
+            allow_encoded_slash: true,
+            ..Default::default()
+        };
+        let req = parse_http_request(&mut client, &options)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(req.target, "/api/v4/projects/group%2Fproject");
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_rejects_encoded_slash_by_default() {
+        // Default strict options must reject `%2F` — this is the security
+        // posture for endpoints where an encoded slash would let an
+        // attacker disagree with the upstream on segment boundaries.
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /api/v4/projects/group%2Fproject HTTP/1.1\r\nHost: g\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let result = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "default options must reject encoded slashes in the path"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_preserves_http_10_version_on_rewrite() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /a/./b HTTP/1.0\r\nHost: h\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let req = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(req.target, "/a/b");
+        assert!(
+            req.raw_header.starts_with(b"GET /a/b HTTP/1.0\r\n"),
+            "rewrite must preserve the original HTTP version, got: {:?}",
+            String::from_utf8_lossy(&req.raw_header)
+        );
     }
 
     #[tokio::test]
@@ -1106,10 +1357,13 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let req = parse_http_request(&mut client)
-            .await
-            .expect("request should parse")
-            .expect("request should exist");
+        let req = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .expect("request should parse")
+        .expect("request should exist");
         assert_eq!(req.target, "/download");
         assert_eq!(
             req.query_params.get("slug").cloned(),
@@ -1139,10 +1393,13 @@ mod tests {
                 .unwrap();
         });
 
-        let first = parse_http_request(&mut client)
-            .await
-            .expect("first request should parse")
-            .expect("expected first request");
+        let first = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .expect("first request should parse")
+        .expect("expected first request");
         assert_eq!(first.action, "GET");
         assert_eq!(first.target, "/allowed");
         assert!(first.query_params.is_empty());
@@ -1151,10 +1408,13 @@ mod tests {
             "raw_header must contain only the first request's headers"
         );
 
-        let second = parse_http_request(&mut client)
-            .await
-            .expect("second request should parse")
-            .expect("expected second request");
+        let second = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .expect("second request should parse")
+        .expect("expected second request");
         assert_eq!(second.action, "POST");
         assert_eq!(second.target, "/blocked");
         assert!(second.query_params.is_empty());

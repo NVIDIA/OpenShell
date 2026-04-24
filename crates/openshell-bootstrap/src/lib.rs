@@ -521,7 +521,10 @@ where
                 .collect();
             if !images.is_empty() {
                 log("[status] Deploying components".to_string());
-                let local_docker = Docker::connect_with_local_defaults().into_diagnostic()?;
+                // Long-timeout client: `docker save` of multi-GB component
+                // images streams past bollard's 120s default. See
+                // docker::connect_local_for_large_transfers().
+                let local_docker = docker::connect_local_for_large_transfers().into_diagnostic()?;
                 let container = container_name(&name);
                 let on_log_ref = Arc::clone(&on_log);
                 let mut push_log = move |msg: String| {

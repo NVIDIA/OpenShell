@@ -9,6 +9,7 @@
 //! evaluated against OPA policy, and either forwarded or denied.
 
 pub mod inference;
+pub mod path;
 pub mod provider;
 pub mod relay;
 pub mod rest;
@@ -59,6 +60,10 @@ pub struct L7EndpointConfig {
     pub protocol: L7Protocol,
     pub tls: TlsMode,
     pub enforcement: EnforcementMode,
+    /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
+    /// rather than rejected at the parser. Needed by upstreams like GitLab
+    /// that embed `%2F` in namespaced project paths. Defaults to false.
+    pub allow_encoded_slash: bool,
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -122,10 +127,13 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         _ => EnforcementMode::Audit,
     };
 
+    let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
+
     Some(L7EndpointConfig {
         protocol,
         tls,
         enforcement,
+        allow_encoded_slash,
     })
 }
 
@@ -138,6 +146,19 @@ pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
         Some("skip") => TlsMode::Skip,
         Some("terminate") | Some("passthrough") => TlsMode::Auto, // deprecation logged by parse_l7_config
         _ => TlsMode::Auto,
+    }
+}
+
+/// Extract a bool value from a regorus object. Returns `None` when the key
+/// is absent or not a boolean.
+fn get_object_bool(val: &regorus::Value, key: &str) -> Option<bool> {
+    let key_val = regorus::Value::String(key.into());
+    match val {
+        regorus::Value::Object(map) => match map.get(&key_val) {
+            Some(regorus::Value::Bool(b)) => Some(*b),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -744,6 +765,26 @@ mod tests {
         let val =
             regorus::Value::from_json_str(r#"{"host": "api.example.com", "port": 443}"#).unwrap();
         assert!(parse_l7_config(&val).is_none());
+    }
+
+    #[test]
+    fn parse_l7_config_allow_encoded_slash_defaults_false() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "host": "api.example.com", "port": 443}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(!config.allow_encoded_slash);
+    }
+
+    #[test]
+    fn parse_l7_config_allow_encoded_slash_opt_in() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "host": "gitlab.example.com", "port": 443, "allow_encoded_slash": true}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(config.allow_encoded_slash);
     }
 
     #[test]

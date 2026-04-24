@@ -6,7 +6,8 @@ use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_vm::{
-    VM_RUNTIME_DIR_ENV, VmDriver, VmDriverConfig, VmLaunchConfig, configured_runtime_dir, run_vm,
+    VM_RUNTIME_DIR_ENV, VmDriver, VmDriverConfig, VmLaunchConfig, configured_runtime_dir,
+    procguard, run_vm,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -33,9 +34,6 @@ struct Args {
 
     #[arg(long, hide = true)]
     vm_env: Vec<String>,
-
-    #[arg(long, hide = true)]
-    vm_port: Vec<String>,
 
     #[arg(long, hide = true)]
     vm_console_output: Option<PathBuf>,
@@ -101,6 +99,14 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     if args.internal_run_vm {
+        // We intentionally defer procguard arming until `run_vm()` so
+        // that the only arm is the one that knows how to clean up
+        // gvproxy. Racing two watchers against the same parent-death
+        // event causes the bare arm's `exit(1)` to win, skipping the
+        // gvproxy cleanup and leaking the helper. The risk window
+        // before `run_vm` arms procguard is ~a few syscalls long
+        // (`build_vm_launch_config`, `configured_runtime_dir`), which
+        // is negligible next to the parent gRPC server's uptime.
         maybe_reexec_internal_vm_with_runtime_env()?;
         let config = build_vm_launch_config(&args).map_err(|err| miette::miette!("{err}"))?;
         run_vm(&config).map_err(|err| miette::miette!("{err}"))?;
@@ -112,6 +118,18 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
         )
         .init();
+
+    // Arm procguard so that if the gateway is killed (SIGKILL or crash)
+    // we also die. Without this the driver is reparented to init and
+    // keeps its per-sandbox VM launchers alive forever. Launchers have
+    // their own procguards (armed in `run_vm`) which cascade cleanup of
+    // gvproxy and the libkrun worker the moment this driver exits.
+    if let Err(err) = procguard::die_with_parent() {
+        tracing::warn!(
+            error = %err,
+            "procguard arm failed; gateway crashes may orphan this driver"
+        );
+    }
 
     let driver = VmDriver::new(VmDriverConfig {
         openshell_endpoint: args
@@ -183,7 +201,6 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         args: Vec::new(),
         env: args.vm_env.clone(),
         workdir: args.vm_workdir.clone(),
-        port_map: args.vm_port.clone(),
         log_level: args.vm_krun_log_level,
         console_output,
     })
@@ -191,6 +208,8 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
 
 #[cfg(target_os = "macos")]
 fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+
     const REEXEC_ENV: &str = "__OPENSHELL_DRIVER_VM_REEXEC";
 
     if std::env::var_os(REEXEC_ENV).is_some() {
@@ -213,14 +232,23 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
         .map_err(|err| miette::miette!("join DYLD_LIBRARY_PATH: {err}"))?;
     let exe = std::env::current_exe().into_diagnostic()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let status = std::process::Command::new(exe)
+
+    // Use execvp() so the current process is *replaced* by the re-exec'd
+    // binary — no wrapper process sits between the compute driver and
+    // the actually-running VM launcher. That avoids two problems:
+    //   1. An extra process level that survives SIGKILL of the driver
+    //      (the wrapper was reparenting the re-exec'd child to init).
+    //   2. Signal forwarding: with a wrapper, a SIGTERM to the wrapper
+    //      doesn't reach the child unless we hand-roll forwarding.
+    // After exec, the child inherits our PID and our procguard arming.
+    let err = std::process::Command::new(exe)
         .args(&args)
         .env("DYLD_LIBRARY_PATH", &joined)
         .env(VM_RUNTIME_DIR_ENV, runtime_dir)
         .env(REEXEC_ENV, "1")
-        .status()
-        .into_diagnostic()?;
-    std::process::exit(status.code().unwrap_or(1));
+        .exec();
+    // `exec()` only returns on failure.
+    Err(miette::miette!("failed to re-exec with runtime env: {err}"))
 }
 
 #[cfg(not(target_os = "macos"))]

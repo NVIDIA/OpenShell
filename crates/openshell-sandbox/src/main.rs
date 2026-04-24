@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use clap::Parser;
-use miette::Result;
+use miette::{IntoDiagnostic, Result};
 use openshell_ocsf::{OcsfJsonlLayer, OcsfShorthandLayer};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -69,9 +69,11 @@ struct Args {
     #[arg(long, default_value = "warn", env = "OPENSHELL_LOG_LEVEL")]
     log_level: String,
 
-    /// SSH listen address for sandbox access.
-    #[arg(long, env = "OPENSHELL_SSH_LISTEN_ADDR")]
-    ssh_listen_addr: Option<String>,
+    /// Filesystem path to the Unix socket the embedded SSH daemon binds.
+    /// The supervisor bridges `RelayStream` traffic from the gateway onto
+    /// this socket; nothing else should connect to it.
+    #[arg(long, env = "OPENSHELL_SSH_SOCKET_PATH")]
+    ssh_socket_path: Option<String>,
 
     /// Shared secret for gateway-to-sandbox SSH handshake.
     #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
@@ -96,11 +98,10 @@ struct Args {
     health_port: u16,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Try to open a rolling log file; fall back to stdout-only logging if it fails
+    // Try to open a rolling log file; fall back to stderr-only logging if it fails
     // (e.g., /var/log is not writable in custom workload images).
     // Rotates daily, keeps the 3 most recent files to bound disk usage.
     let file_logging = tracing_appender::rolling::RollingFileAppender::builder()
@@ -115,119 +116,128 @@ async fn main() -> Result<()> {
             (writer, guard)
         });
 
-    let stdout_filter =
+    let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
 
-    // Install rustls crypto provider before any TLS connections (including log push).
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .into_diagnostic()?;
 
-    // Set up optional log push layer (gRPC mode only).
-    let log_push_state = if let (Some(sandbox_id), Some(endpoint)) =
-        (&args.sandbox_id, &args.openshell_endpoint)
-    {
-        let (tx, handle) =
-            openshell_sandbox::log_push::spawn_log_push_task(endpoint.clone(), sandbox_id.clone());
-        let layer = openshell_sandbox::log_push::LogPushLayer::new(sandbox_id.clone(), tx);
-        Some((layer, handle))
-    } else {
-        None
-    };
-    let push_layer = log_push_state.as_ref().map(|(layer, _)| layer.clone());
-    let _log_push_handle = log_push_state.map(|(_, handle)| handle);
+    let exit_code = runtime.block_on(async move {
+        // Install rustls crypto provider before any TLS connections (including log push).
+        let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Shared flag: the sandbox poll loop toggles this when the
-    // `ocsf_json_enabled` setting changes. The JSONL layer checks it
-    // on each event and short-circuits when false.
-    let ocsf_enabled = Arc::new(AtomicBool::new(false));
+        // Set up optional log push layer (gRPC mode only).
+        let log_push_state = if let (Some(sandbox_id), Some(endpoint)) =
+            (&args.sandbox_id, &args.openshell_endpoint)
+        {
+            let (tx, handle) = openshell_sandbox::log_push::spawn_log_push_task(
+                endpoint.clone(),
+                sandbox_id.clone(),
+            );
+            let layer = openshell_sandbox::log_push::LogPushLayer::new(sandbox_id.clone(), tx);
+            Some((layer, handle))
+        } else {
+            None
+        };
+        let push_layer = log_push_state.as_ref().map(|(layer, _)| layer.clone());
+        let _log_push_handle = log_push_state.map(|(_, handle)| handle);
 
-    // Keep guards alive for the entire process. When a guard is dropped the
-    // non-blocking writer flushes remaining logs.
-    let (_file_guard, _jsonl_guard) = if let Some((file_writer, file_guard)) = file_logging {
-        let file_filter = EnvFilter::new("info");
+        // Shared flag: the sandbox poll loop toggles this when the
+        // `ocsf_json_enabled` setting changes. The JSONL layer checks it
+        // on each event and short-circuits when false.
+        let ocsf_enabled = Arc::new(AtomicBool::new(false));
 
-        // OCSF JSONL file: rolling appender matching the main log file
-        // (daily rotation, 3 files max). Created eagerly but gated by the
-        // enabled flag — no JSONL is written until ocsf_json_enabled is set.
-        let jsonl_logging = tracing_appender::rolling::RollingFileAppender::builder()
-            .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix("openshell-ocsf")
-            .filename_suffix("log")
-            .max_log_files(3)
-            .build("/var/log")
-            .ok()
-            .map(|roller| {
-                let (writer, guard) = tracing_appender::non_blocking(roller);
-                let layer = OcsfJsonlLayer::new(writer).with_enabled_flag(ocsf_enabled.clone());
-                (layer, guard)
-            });
-        let (jsonl_layer, jsonl_guard) = match jsonl_logging {
-            Some((layer, guard)) => (Some(layer), Some(guard)),
-            None => (None, None),
+        // Keep guards alive for the entire process. When a guard is dropped the
+        // non-blocking writer flushes remaining logs.
+        let (_file_guard, _jsonl_guard) = if let Some((file_writer, file_guard)) = file_logging {
+            let file_filter = EnvFilter::new("info");
+
+            // OCSF JSONL file: rolling appender matching the main log file
+            // (daily rotation, 3 files max). Created eagerly but gated by the
+            // enabled flag — no JSONL is written until ocsf_json_enabled is set.
+            let jsonl_logging = tracing_appender::rolling::RollingFileAppender::builder()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("openshell-ocsf")
+                .filename_suffix("log")
+                .max_log_files(3)
+                .build("/var/log")
+                .ok()
+                .map(|roller| {
+                    let (writer, guard) = tracing_appender::non_blocking(roller);
+                    let layer = OcsfJsonlLayer::new(writer).with_enabled_flag(ocsf_enabled.clone());
+                    (layer, guard)
+                });
+            let (jsonl_layer, jsonl_guard) = match jsonl_logging {
+                Some((layer, guard)) => (Some(layer), Some(guard)),
+                None => (None, None),
+            };
+
+            tracing_subscriber::registry()
+                .with(
+                    OcsfShorthandLayer::new(std::io::stderr())
+                        .with_non_ocsf(true)
+                        .with_filter(console_filter),
+                )
+                .with(
+                    OcsfShorthandLayer::new(file_writer)
+                        .with_non_ocsf(true)
+                        .with_filter(file_filter),
+                )
+                .with(jsonl_layer.with_filter(LevelFilter::INFO))
+                .with(push_layer.clone())
+                .init();
+            (Some(file_guard), jsonl_guard)
+        } else {
+            tracing_subscriber::registry()
+                .with(
+                    OcsfShorthandLayer::new(std::io::stderr())
+                        .with_non_ocsf(true)
+                        .with_filter(console_filter),
+                )
+                .with(push_layer)
+                .init();
+            // Log the warning after the subscriber is initialized
+            warn!("Could not open /var/log for log rotation; using stderr-only logging");
+            (None, None)
         };
 
-        tracing_subscriber::registry()
-            .with(
-                OcsfShorthandLayer::new(std::io::stdout())
-                    .with_non_ocsf(true)
-                    .with_filter(stdout_filter),
-            )
-            .with(
-                OcsfShorthandLayer::new(file_writer)
-                    .with_non_ocsf(true)
-                    .with_filter(file_filter),
-            )
-            .with(jsonl_layer.with_filter(LevelFilter::INFO))
-            .with(push_layer.clone())
-            .init();
-        (Some(file_guard), jsonl_guard)
-    } else {
-        tracing_subscriber::registry()
-            .with(
-                OcsfShorthandLayer::new(std::io::stdout())
-                    .with_non_ocsf(true)
-                    .with_filter(stdout_filter),
-            )
-            .with(push_layer)
-            .init();
-        // Log the warning after the subscriber is initialized
-        warn!("Could not open /var/log for log rotation; using stdout-only logging");
-        (None, None)
-    };
+        // Get command - either from CLI args, environment variable, or default to /bin/bash
+        let command = if !args.command.is_empty() {
+            args.command
+        } else if let Ok(c) = std::env::var("OPENSHELL_SANDBOX_COMMAND") {
+            // Simple shell-like splitting on whitespace
+            c.split_whitespace().map(String::from).collect()
+        } else {
+            vec!["/bin/bash".to_string()]
+        };
 
-    // Get command - either from CLI args, environment variable, or default to /bin/bash
-    let command = if !args.command.is_empty() {
-        args.command
-    } else if let Ok(c) = std::env::var("OPENSHELL_SANDBOX_COMMAND") {
-        // Simple shell-like splitting on whitespace
-        c.split_whitespace().map(String::from).collect()
-    } else {
-        vec!["/bin/bash".to_string()]
-    };
+        info!(command = ?command, "Starting sandbox");
+        // Note: "Starting sandbox" stays as plain info!() since the OCSF context
+        // is not yet initialized at this point (run_sandbox hasn't been called).
+        // The shorthand layer will render it in fallback format.
 
-    info!(command = ?command, "Starting sandbox");
-    // Note: "Starting sandbox" stays as plain info!() since the OCSF context
-    // is not yet initialized at this point (run_sandbox hasn't been called).
-    // The shorthand layer will render it in fallback format.
-
-    let exit_code = run_sandbox(
-        command,
-        args.workdir,
-        args.timeout,
-        args.interactive,
-        args.sandbox_id,
-        args.sandbox,
-        args.openshell_endpoint,
-        args.policy_rules,
-        args.policy_data,
-        args.ssh_listen_addr,
-        args.ssh_handshake_secret,
-        args.ssh_handshake_skew_secs,
-        args.health_check,
-        args.health_port,
-        args.inference_routes,
-        ocsf_enabled,
-    )
-    .await?;
+        run_sandbox(
+            command,
+            args.workdir,
+            args.timeout,
+            args.interactive,
+            args.sandbox_id,
+            args.sandbox,
+            args.openshell_endpoint,
+            args.policy_rules,
+            args.policy_data,
+            args.ssh_socket_path,
+            args.ssh_handshake_secret,
+            args.ssh_handshake_skew_secs,
+            args.health_check,
+            args.health_port,
+            args.inference_routes,
+            ocsf_enabled,
+        )
+        .await
+    })?;
 
     std::process::exit(exit_code);
 }

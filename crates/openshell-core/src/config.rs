@@ -9,6 +9,39 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+// ── Public default constants ────────────────────────────────────────────
+//
+// Canonical source for default values used across multiple crates.
+// Clap `default_value_t` annotations and runtime fallbacks should
+// reference these constants instead of hardcoding literals.
+
+/// Default SSH port inside sandbox containers.
+pub const DEFAULT_SSH_PORT: u16 = 2222;
+
+/// Default server / SSH gateway port.
+pub const DEFAULT_SERVER_PORT: u16 = 8080;
+
+/// Default container stop timeout in seconds (SIGTERM → SIGKILL).
+pub const DEFAULT_STOP_TIMEOUT_SECS: u32 = 10;
+
+/// Default allowed clock skew for SSH handshake validation, in seconds.
+pub const DEFAULT_SSH_HANDSHAKE_SKEW_SECS: u64 = 300;
+
+/// Default Podman bridge network name.
+pub const DEFAULT_NETWORK_NAME: &str = "openshell";
+
+/// Default OCI image for the openshell-sandbox supervisor binary.
+pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
+
+/// Default image pull policy for sandbox images.
+pub const DEFAULT_IMAGE_PULL_POLICY: &str = "missing";
+
+/// Default Kubernetes namespace for sandbox resources.
+pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
+
+/// CDI device identifier for requesting all NVIDIA GPUs.
+pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
+
 /// Compute backends the gateway can orchestrate sandboxes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -57,6 +90,18 @@ pub struct Config {
     #[serde(default = "default_bind_address")]
     pub bind_address: SocketAddr,
 
+    /// Address to bind the unauthenticated health endpoint to.
+    ///
+    /// When `None`, the dedicated health listener is disabled.
+    #[serde(default)]
+    pub health_bind_address: Option<SocketAddr>,
+
+    /// Address to bind the Prometheus metrics endpoint to.
+    ///
+    /// When `None`, the dedicated metrics listener is disabled.
+    #[serde(default)]
+    pub metrics_bind_address: Option<SocketAddr>,
+
     /// Log level (trace, debug, info, warn, error).
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -80,7 +125,7 @@ pub struct Config {
     pub sandbox_namespace: String,
 
     /// Default container image for sandboxes.
-    #[serde(default)]
+    #[serde(default = "default_sandbox_image")]
     pub sandbox_image: String,
 
     /// Kubernetes `imagePullPolicy` for sandbox pods (e.g. `Always`,
@@ -107,9 +152,21 @@ pub struct Config {
     #[serde(default = "default_ssh_connect_path")]
     pub ssh_connect_path: String,
 
-    /// SSH listen port inside sandbox pods.
+    /// SSH listen port inside sandbox containers that expose a TCP endpoint.
     #[serde(default = "default_sandbox_ssh_port")]
     pub sandbox_ssh_port: u16,
+
+    /// Filesystem path where the sandbox supervisor binds its SSH Unix
+    /// socket. The supervisor is passed this path via
+    /// `OPENSHELL_SSH_SOCKET_PATH` / `--ssh-socket-path` and connects its
+    /// relay bridge to the same path.
+    ///
+    /// When the gateway orchestrates sandboxes that each live in their own
+    /// filesystem (K8s pod, libkrun VM, etc.), the default is safe. For
+    /// local dev where multiple supervisors share `/run`, override this to
+    /// something unique per sandbox.
+    #[serde(default = "default_sandbox_ssh_socket_path")]
+    pub sandbox_ssh_socket_path: String,
 
     /// Shared secret for gateway-to-sandbox SSH handshake.
     #[serde(default)]
@@ -168,18 +225,21 @@ impl Config {
     pub fn new(tls: Option<TlsConfig>) -> Self {
         Self {
             bind_address: default_bind_address(),
+            health_bind_address: None,
+            metrics_bind_address: None,
             log_level: default_log_level(),
             tls,
             database_url: String::new(),
             compute_drivers: default_compute_drivers(),
             sandbox_namespace: default_sandbox_namespace(),
-            sandbox_image: String::new(),
+            sandbox_image: default_sandbox_image(),
             sandbox_image_pull_policy: String::new(),
             grpc_endpoint: String::new(),
             ssh_gateway_host: default_ssh_gateway_host(),
             ssh_gateway_port: default_ssh_gateway_port(),
             ssh_connect_path: default_ssh_connect_path(),
             sandbox_ssh_port: default_sandbox_ssh_port(),
+            sandbox_ssh_socket_path: default_sandbox_ssh_socket_path(),
             ssh_handshake_secret: String::new(),
             ssh_handshake_skew_secs: default_ssh_handshake_skew_secs(),
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
@@ -192,6 +252,18 @@ impl Config {
     #[must_use]
     pub const fn with_bind_address(mut self, addr: SocketAddr) -> Self {
         self.bind_address = addr;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_health_bind_address(mut self, addr: SocketAddr) -> Self {
+        self.health_bind_address = Some(addr);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_metrics_bind_address(mut self, addr: SocketAddr) -> Self {
+        self.metrics_bind_address = Some(addr);
         self
     }
 
@@ -323,6 +395,10 @@ fn default_sandbox_namespace() -> String {
     "default".to_string()
 }
 
+fn default_sandbox_image() -> String {
+    format!("{}/base:latest", crate::image::DEFAULT_COMMUNITY_REGISTRY)
+}
+
 fn default_compute_drivers() -> Vec<ComputeDriverKind> {
     vec![ComputeDriverKind::Kubernetes]
 }
@@ -332,19 +408,23 @@ fn default_ssh_gateway_host() -> String {
 }
 
 const fn default_ssh_gateway_port() -> u16 {
-    8080
+    DEFAULT_SERVER_PORT
 }
 
 fn default_ssh_connect_path() -> String {
     "/connect/ssh".to_string()
 }
 
+fn default_sandbox_ssh_socket_path() -> String {
+    "/run/openshell/ssh.sock".to_string()
+}
+
 const fn default_sandbox_ssh_port() -> u16 {
-    2222
+    DEFAULT_SSH_PORT
 }
 
 const fn default_ssh_handshake_skew_secs() -> u64 {
-    300
+    DEFAULT_SSH_HANDSHAKE_SKEW_SECS
 }
 
 const fn default_ssh_session_ttl_secs() -> u64 {
@@ -354,6 +434,7 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{ComputeDriverKind, Config};
+    use std::net::SocketAddr;
 
     #[test]
     fn compute_driver_kind_parses_supported_values() {
@@ -383,5 +464,18 @@ mod tests {
             Config::new(None).compute_drivers,
             vec![ComputeDriverKind::Kubernetes]
         );
+    }
+
+    #[test]
+    fn config_new_disables_health_bind_by_default() {
+        let cfg = Config::new(None);
+        assert!(cfg.health_bind_address.is_none());
+    }
+
+    #[test]
+    fn config_with_health_bind_address_sets_address() {
+        let addr: SocketAddr = "0.0.0.0:9090".parse().expect("valid address");
+        let cfg = Config::new(None).with_health_bind_address(addr);
+        assert_eq!(cfg.health_bind_address, Some(addr));
     }
 }

@@ -30,10 +30,12 @@ mod persistence;
 mod sandbox_index;
 mod sandbox_watch;
 mod ssh_tunnel;
+pub mod supervisor_session;
 mod tls;
 pub mod tracing_bus;
 mod ws_tunnel;
 
+use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -44,7 +46,7 @@ use tracing::{debug, error, info};
 
 use compute::{ComputeRuntime, VmComputeConfig};
 pub use grpc::OpenShellService;
-pub use http::{health_router, http_router};
+pub use http::{health_router, http_router, metrics_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
 use openshell_driver_kubernetes::KubernetesComputeConfig;
 use persistence::Store;
@@ -85,6 +87,9 @@ pub struct ServerState {
     /// set/delete operation, including the precedence check on sandbox
     /// mutations that reads global state.
     pub settings_mutex: tokio::sync::Mutex<()>,
+
+    /// Registry of active supervisor sessions and pending relay channels.
+    pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -104,6 +109,7 @@ impl ServerState {
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
     ) -> Self {
         Self {
             config,
@@ -115,6 +121,7 @@ impl ServerState {
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
+            supervisor_sessions,
         }
     }
 }
@@ -145,6 +152,7 @@ pub async fn run_server(
 
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
+    let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
     let compute = build_compute_runtime(
         &config,
         &vm_config,
@@ -152,6 +160,7 @@ pub async fn run_server(
         sandbox_index.clone(),
         sandbox_watch_bus.clone(),
         tracing_log_bus.clone(),
+        supervisor_sessions.clone(),
     )
     .await?;
     let state = Arc::new(ServerState::new(
@@ -161,10 +170,12 @@ pub async fn run_server(
         sandbox_index,
         sandbox_watch_bus,
         tracing_log_bus,
+        supervisor_sessions,
     ));
 
     state.compute.spawn_watchers();
     ssh_tunnel::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
+    supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
@@ -175,6 +186,50 @@ pub async fn run_server(
         .map_err(|e| Error::transport(format!("failed to bind to {}: {e}", config.bind_address)))?;
 
     info!(address = %config.bind_address, "Server listening");
+
+    // Bind the unauthenticated health endpoint on a separate port when configured.
+    if let Some(health_bind_address) = config.health_bind_address {
+        let health_listener = TcpListener::bind(health_bind_address).await.map_err(|e| {
+            Error::transport(format!(
+                "failed to bind health port {}: {e}",
+                health_bind_address
+            ))
+        })?;
+        info!(address = %health_bind_address, "Health server listening");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(health_listener, health_router().into_make_service()).await
+            {
+                error!("Health server error: {e}");
+            }
+        });
+    } else {
+        info!("Health server disabled");
+    }
+
+    // Bind the Prometheus metrics endpoint on a dedicated port when configured.
+    if let Some(metrics_bind_address) = config.metrics_bind_address {
+        let prometheus_handle = PrometheusBuilder::new()
+            .install_recorder()
+            .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+        let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
+            Error::transport(format!(
+                "failed to bind metrics port {metrics_bind_address}: {e}",
+            ))
+        })?;
+        info!(address = %metrics_bind_address, "Metrics server listening");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(
+                metrics_listener,
+                metrics_router(prometheus_handle).into_make_service(),
+            )
+            .await
+            {
+                error!("Metrics server error: {e}");
+            }
+        });
+    } else {
+        info!("Metrics server disabled");
+    }
 
     // Build TLS acceptor when TLS is configured; otherwise serve plaintext.
     let tls_acceptor = if let Some(tls) = &config.tls {
@@ -236,6 +291,7 @@ async fn build_compute_runtime(
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
+    supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 ) -> Result<ComputeRuntime> {
     let driver = configured_compute_driver(config)?;
     info!(driver = %driver, "Using compute driver");
@@ -247,8 +303,13 @@ async fn build_compute_runtime(
                 default_image: config.sandbox_image.clone(),
                 image_pull_policy: config.sandbox_image_pull_policy.clone(),
                 grpc_endpoint: config.grpc_endpoint.clone(),
-                ssh_listen_addr: format!("0.0.0.0:{}", config.sandbox_ssh_port),
-                ssh_port: config.sandbox_ssh_port,
+                // Filesystem path to the supervisor's Unix-socket SSH daemon.
+                // The path lives in a root-only directory so only the
+                // supervisor can connect; the gateway reaches it through the
+                // RelayStream bridge, not directly. Override via
+                // `sandbox_ssh_socket_path` in the config for deployments
+                // where multiple supervisors share a filesystem.
+                ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
                 ssh_handshake_secret: config.ssh_handshake_secret.clone(),
                 ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
                 client_tls_secret_name: config.client_tls_secret_name.clone(),
@@ -258,6 +319,7 @@ async fn build_compute_runtime(
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
+            supervisor_sessions.clone(),
         )
         .await
         .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
@@ -270,13 +332,58 @@ async fn build_compute_runtime(
                 sandbox_index,
                 sandbox_watch_bus,
                 tracing_log_bus,
+                supervisor_sessions,
             )
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
-        ComputeDriverKind::Podman => Err(Error::config(
-            "compute driver 'podman' is not implemented yet",
-        )),
+        ComputeDriverKind::Podman => {
+            let socket_path = std::env::var("OPENSHELL_PODMAN_SOCKET")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(openshell_driver_podman::PodmanComputeConfig::default_socket_path);
+
+            let network_name = std::env::var("OPENSHELL_NETWORK_NAME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| openshell_core::config::DEFAULT_NETWORK_NAME.to_string());
+
+            let stop_timeout_secs: u32 = std::env::var("OPENSHELL_STOP_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS);
+
+            let supervisor_image = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string());
+
+            ComputeRuntime::new_podman(
+                openshell_driver_podman::PodmanComputeConfig {
+                    socket_path,
+                    default_image: config.sandbox_image.clone(),
+                    image_pull_policy: config.sandbox_image_pull_policy.parse().unwrap_or_default(),
+                    grpc_endpoint: config.grpc_endpoint.clone(),
+                    gateway_port: config.bind_address.port(),
+                    sandbox_ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
+                    network_name,
+                    ssh_listen_addr: format!("0.0.0.0:{}", config.sandbox_ssh_port),
+                    ssh_port: config.sandbox_ssh_port,
+                    ssh_handshake_secret: config.ssh_handshake_secret.clone(),
+                    ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
+                    stop_timeout_secs,
+                    supervisor_image,
+                },
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
     }
 }
 
@@ -285,10 +392,11 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
         [] => Err(Error::config(
             "at least one compute driver must be configured",
         )),
-        [driver @ ComputeDriverKind::Kubernetes] | [driver @ ComputeDriverKind::Vm] => Ok(*driver),
-        [ComputeDriverKind::Podman] => Err(Error::config(
-            "compute driver 'podman' is not implemented yet",
-        )),
+        [
+            driver @ (ComputeDriverKind::Kubernetes
+            | ComputeDriverKind::Vm
+            | ComputeDriverKind::Podman),
+        ] => Ok(*driver),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
             drivers
@@ -327,15 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_compute_driver_defaults_to_kubernetes() {
-        assert_eq!(
-            configured_compute_driver(&Config::new(None)).unwrap(),
-            ComputeDriverKind::Kubernetes
-        );
-    }
-
-    #[test]
-    fn configured_compute_driver_requires_at_least_one_entry() {
+    fn configured_compute_driver_rejects_empty_drivers() {
         let config = Config::new(None).with_compute_drivers([]);
         let err = configured_compute_driver(&config).unwrap_err();
         assert!(err.to_string().contains("at least one compute driver"));
@@ -354,12 +454,11 @@ mod tests {
     }
 
     #[test]
-    fn configured_compute_driver_rejects_unimplemented_driver() {
+    fn configured_compute_driver_accepts_podman() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Podman]);
-        let err = configured_compute_driver(&config).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("compute driver 'podman' is not implemented yet")
+        assert_eq!(
+            configured_compute_driver(&config).unwrap(),
+            ComputeDriverKind::Podman
         );
     }
 

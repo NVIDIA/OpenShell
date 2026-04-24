@@ -5,7 +5,7 @@
 
 use crate::config::KubernetesComputeConfig;
 use futures::{Stream, StreamExt, TryStreamExt};
-use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node, Pod};
+use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
@@ -15,12 +15,10 @@ use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
     DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
-    GetCapabilitiesResponse, ResolveSandboxEndpointResponse, SandboxEndpoint,
-    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
-    WatchSandboxesSandboxEvent, sandbox_endpoint, watch_sandboxes_event,
+    GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use std::collections::BTreeMap;
-use std::net::IpAddr;
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -104,6 +102,7 @@ const WORKSPACE_SENTINEL: &str = ".workspace-initialized";
 #[derive(Clone)]
 pub struct KubernetesComputeDriver {
     client: Client,
+    watch_client: Client,
     config: KubernetesComputeConfig,
 }
 
@@ -119,17 +118,30 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 
 impl KubernetesComputeDriver {
     pub async fn new(config: KubernetesComputeConfig) -> Result<Self, KubeError> {
-        let mut kube_config = match kube::Config::incluster() {
+        let base_config = match kube::Config::incluster() {
             Ok(c) => c,
             Err(_) => kube::Config::infer()
                 .await
                 .map_err(kube::Error::InferConfig)?,
         };
+
+        let mut kube_config = base_config.clone();
         kube_config.connect_timeout = Some(Duration::from_secs(10));
         kube_config.read_timeout = Some(Duration::from_secs(30));
         kube_config.write_timeout = Some(Duration::from_secs(30));
         let client = Client::try_from(kube_config)?;
-        Ok(Self { client, config })
+
+        let mut watch_kube_config = base_config;
+        watch_kube_config.connect_timeout = Some(Duration::from_secs(10));
+        watch_kube_config.read_timeout = None;
+        watch_kube_config.write_timeout = Some(Duration::from_secs(30));
+        let watch_client = Client::try_from(watch_kube_config)?;
+
+        Ok(Self {
+            client,
+            watch_client,
+            config,
+        })
     }
 
     pub async fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
@@ -149,12 +161,18 @@ impl KubernetesComputeDriver {
         &self.config.namespace
     }
 
-    pub fn ssh_listen_addr(&self) -> &str {
-        &self.config.ssh_listen_addr
+    pub fn ssh_socket_path(&self) -> &str {
+        &self.config.ssh_socket_path
     }
 
     pub const fn ssh_handshake_skew_secs(&self) -> u64 {
         self.config.ssh_handshake_skew_secs
+    }
+
+    fn watch_api(&self) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, SANDBOX_VERSION, SANDBOX_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        Api::namespaced_with(self.watch_client.clone(), &self.config.namespace, &resource)
     }
 
     fn api(&self) -> Api<DynamicObject> {
@@ -271,21 +289,6 @@ impl KubernetesComputeDriver {
         &self.config.ssh_handshake_secret
     }
 
-    async fn agent_pod_ip(&self, pod_name: &str) -> Result<Option<IpAddr>, KubeError> {
-        let api: Api<Pod> = Api::namespaced(self.client.clone(), &self.config.namespace);
-        match api.get(pod_name).await {
-            Ok(pod) => {
-                let ip = pod
-                    .status
-                    .and_then(|status| status.pod_ip)
-                    .and_then(|ip| ip.parse().ok());
-                Ok(ip)
-            }
-            Err(KubeError::Api(err)) if err.code == 404 => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
         let name = sandbox.name.as_str();
         info!(
@@ -311,7 +314,7 @@ impl KubernetesComputeDriver {
             &sandbox.id,
             &sandbox.name,
             &self.config.grpc_endpoint,
-            self.ssh_listen_addr(),
+            self.ssh_socket_path(),
             self.ssh_handshake_secret(),
             self.ssh_handshake_skew_secs(),
             &self.config.client_tls_secret_name,
@@ -407,56 +410,10 @@ impl KubernetesComputeDriver {
         }
     }
 
-    pub async fn resolve_sandbox_endpoint(
-        &self,
-        sandbox: &Sandbox,
-    ) -> Result<ResolveSandboxEndpointResponse, KubernetesDriverError> {
-        if let Some(status) = sandbox.status.as_ref()
-            && !status.instance_id.is_empty()
-        {
-            match self.agent_pod_ip(&status.instance_id).await {
-                Ok(Some(ip)) => {
-                    return Ok(ResolveSandboxEndpointResponse {
-                        endpoint: Some(SandboxEndpoint {
-                            target: Some(sandbox_endpoint::Target::Ip(ip.to_string())),
-                            port: u32::from(self.config.ssh_port),
-                        }),
-                    });
-                }
-                Ok(None) => {
-                    return Err(KubernetesDriverError::Precondition(
-                        "sandbox agent pod IP is not available".to_string(),
-                    ));
-                }
-                Err(err) => {
-                    return Err(KubernetesDriverError::Message(format!(
-                        "failed to resolve agent pod IP: {err}"
-                    )));
-                }
-            }
-        }
-
-        if sandbox.name.is_empty() {
-            return Err(KubernetesDriverError::Precondition(
-                "sandbox has no name".to_string(),
-            ));
-        }
-
-        Ok(ResolveSandboxEndpointResponse {
-            endpoint: Some(SandboxEndpoint {
-                target: Some(sandbox_endpoint::Target::Host(format!(
-                    "{}.{}.svc.cluster.local",
-                    sandbox.name, self.config.namespace
-                ))),
-                port: u32::from(self.config.ssh_port),
-            }),
-        })
-    }
-
     pub async fn watch_sandboxes(&self) -> Result<WatchStream, String> {
         let namespace = self.config.namespace.clone();
-        let sandbox_api = self.api();
-        let event_api: Api<KubeEventObj> = Api::namespaced(self.client.clone(), &namespace);
+        let sandbox_api = self.watch_api();
+        let event_api: Api<KubeEventObj> = Api::namespaced(self.watch_client.clone(), &namespace);
         let mut sandbox_stream = watcher::watcher(sandbox_api, watcher::Config::default()).boxed();
         let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
         let (tx, rx) = mpsc::channel(256);
@@ -925,7 +882,7 @@ fn sandbox_to_k8s_spec(
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
-    ssh_listen_addr: &str,
+    ssh_socket_path: &str,
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
     client_tls_secret_name: &str,
@@ -965,7 +922,7 @@ fn sandbox_to_k8s_spec(
                     sandbox_id,
                     sandbox_name,
                     grpc_endpoint,
-                    ssh_listen_addr,
+                    ssh_socket_path,
                     ssh_handshake_secret,
                     ssh_handshake_skew_secs,
                     &spec.environment,
@@ -1011,7 +968,7 @@ fn sandbox_to_k8s_spec(
                 sandbox_id,
                 sandbox_name,
                 grpc_endpoint,
-                ssh_listen_addr,
+                ssh_socket_path,
                 ssh_handshake_secret,
                 ssh_handshake_skew_secs,
                 spec_env,
@@ -1036,7 +993,7 @@ fn sandbox_template_to_k8s(
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
-    ssh_listen_addr: &str,
+    ssh_socket_path: &str,
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
     spec_environment: &std::collections::HashMap<String, String>,
@@ -1089,7 +1046,7 @@ fn sandbox_template_to_k8s(
         sandbox_id,
         sandbox_name,
         grpc_endpoint,
-        ssh_listen_addr,
+        ssh_socket_path,
         ssh_handshake_secret,
         ssh_handshake_skew_secs,
         !client_tls_secret_name.is_empty(),
@@ -1239,7 +1196,7 @@ fn build_env_list(
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
-    ssh_listen_addr: &str,
+    ssh_socket_path: &str,
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
@@ -1252,7 +1209,7 @@ fn build_env_list(
         sandbox_id,
         sandbox_name,
         grpc_endpoint,
-        ssh_listen_addr,
+        ssh_socket_path,
         ssh_handshake_secret,
         ssh_handshake_skew_secs,
         tls_enabled,
@@ -1274,7 +1231,7 @@ fn apply_required_env(
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
-    ssh_listen_addr: &str,
+    ssh_socket_path: &str,
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
@@ -1283,8 +1240,8 @@ fn apply_required_env(
     upsert_env(env, "OPENSHELL_SANDBOX", sandbox_name);
     upsert_env(env, "OPENSHELL_ENDPOINT", grpc_endpoint);
     upsert_env(env, "OPENSHELL_SANDBOX_COMMAND", "sleep infinity");
-    if !ssh_listen_addr.is_empty() {
-        upsert_env(env, "OPENSHELL_SSH_LISTEN_ADDR", ssh_listen_addr);
+    if !ssh_socket_path.is_empty() {
+        upsert_env(env, "OPENSHELL_SSH_SOCKET_PATH", ssh_socket_path);
     }
     upsert_env(env, "OPENSHELL_SSH_HANDSHAKE_SECRET", ssh_handshake_secret);
     upsert_env(

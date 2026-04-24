@@ -33,7 +33,11 @@ async fn connect_channel(endpoint: &str) -> Result<Channel> {
         .connect_timeout(Duration::from_secs(10))
         .http2_keep_alive_interval(Duration::from_secs(10))
         .keep_alive_while_idle(true)
-        .keep_alive_timeout(Duration::from_secs(20));
+        .keep_alive_timeout(Duration::from_secs(20))
+        // Match the gateway-side HTTP/2 flow control (see `multiplex.rs`).
+        // Adaptive sizing lets idle streams stay tiny while bulk
+        // RelayStream data flows get a BDP-sized window.
+        .http2_adaptive_window(true);
 
     let tls_enabled = endpoint.starts_with("https://");
 
@@ -72,6 +76,11 @@ async fn connect_channel(endpoint: &str) -> Result<Channel> {
         .await
         .into_diagnostic()
         .wrap_err("failed to connect to OpenShell server")
+}
+
+/// Create a channel to the OpenShell server (public for use by supervisor_session).
+pub async fn connect_channel_pub(endpoint: &str) -> Result<Channel> {
+    connect_channel(endpoint).await
 }
 
 /// Connect to the OpenShell server (mTLS or plaintext based on endpoint scheme).
@@ -133,6 +142,7 @@ async fn sync_policy_with_client(
             setting_value: None,
             delete_setting: false,
             global: false,
+            merge_operations: vec![],
         })
         .await
         .into_diagnostic()

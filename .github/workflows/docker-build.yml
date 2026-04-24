@@ -93,4 +93,4 @@ jobs:
           # Enable dev-settings feature for test settings (dummy_bool, dummy_int)
           # used by e2e tests.
           EXTRA_CARGO_FEATURES: openshell-core/dev-settings
-        run: mise run --no-prepare build:docker:${{ inputs.component }}
+        run: mise run --no-deps build:docker:${{ inputs.component }}

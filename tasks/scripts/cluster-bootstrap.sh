@@ -5,6 +5,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/container-engine.sh"
+
 # Normalize cluster name: lowercase, replace invalid chars with hyphens
 normalize_name() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
@@ -142,28 +145,35 @@ wait_for_registry_ready() {
 }
 
 ensure_local_registry() {
-  if docker inspect "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1; then
+  if ce inspect "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1; then
     local proxy_remote_url
-    proxy_remote_url=$(docker inspect "${LOCAL_REGISTRY_CONTAINER}" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | awk -F= '/^REGISTRY_PROXY_REMOTEURL=/{print $2; exit}' || true)
+    proxy_remote_url=$(ce inspect "${LOCAL_REGISTRY_CONTAINER}" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | awk -F= '/^REGISTRY_PROXY_REMOTEURL=/{print $2; exit}' || true)
     if [ -n "${proxy_remote_url}" ]; then
-      docker rm -f "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1 || true
+      ce rm -f "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1 || true
     fi
   fi
 
-  if ! docker inspect "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1; then
-    docker run -d --restart=always --name "${LOCAL_REGISTRY_CONTAINER}" -p 5000:5000 registry:2 >/dev/null
+  if ! ce inspect "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1; then
+    # --restart=always: on Docker this is managed by the Docker daemon and
+    # survives reboots when the daemon is enabled at boot.  On rootless Podman
+    # it is handled by conmon within the current login session; it does NOT
+    # survive user logout or reboot without a systemd user unit.  This is
+    # acceptable here because ensure_local_registry() recreates the container
+    # on every cluster bootstrap invocation if it is missing.
+    ce run -d --restart=always --name "${LOCAL_REGISTRY_CONTAINER}" -p 5000:5000 registry:2 >/dev/null
   else
-    if ! docker ps --filter "name=^${LOCAL_REGISTRY_CONTAINER}$" --filter "status=running" -q | grep -q .; then
-      docker start "${LOCAL_REGISTRY_CONTAINER}" >/dev/null
+    if ! ce ps --filter "name=^${LOCAL_REGISTRY_CONTAINER}$" --filter "status=running" -q | grep -q .; then
+      ce start "${LOCAL_REGISTRY_CONTAINER}" >/dev/null
     fi
 
-    port_map=$(docker port "${LOCAL_REGISTRY_CONTAINER}" 5000/tcp 2>/dev/null || true)
+    port_map=$(ce port "${LOCAL_REGISTRY_CONTAINER}" 5000/tcp 2>/dev/null || true)
     case "${port_map}" in
       *:5000*)
         ;;
       *)
-        docker rm -f "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1 || true
-        docker run -d --restart=always --name "${LOCAL_REGISTRY_CONTAINER}" -p 5000:5000 registry:2 >/dev/null
+        ce rm -f "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1 || true
+        # See --restart=always note above in this function.
+        ce run -d --restart=always --name "${LOCAL_REGISTRY_CONTAINER}" -p 5000:5000 registry:2 >/dev/null
         ;;
     esac
   fi
@@ -177,9 +187,9 @@ ensure_local_registry() {
   fi
 
   echo "Error: local registry is not reachable at ${REGISTRY_HOST}." >&2
-  echo "       Ensure a registry is running on port 5000 (e.g. docker run -d --name openshell-local-registry -p 5000:5000 registry:2)." >&2
-  docker ps -a >&2 || true
-  docker logs "${LOCAL_REGISTRY_CONTAINER}" >&2 || true
+  echo "       Ensure a registry is running on port 5000 (e.g. ${CONTAINER_ENGINE} run -d --name openshell-local-registry -p 5000:5000 registry:2)." >&2
+  ce ps -a >&2 || true
+  ce logs "${LOCAL_REGISTRY_CONTAINER}" >&2 || true
   exit 1
 }
 
@@ -201,7 +211,7 @@ export IMAGE_REPO_BASE
 export IMAGE_TAG
 
 if [ -n "${CI:-}" ] && [ -n "${CI_REGISTRY:-}" ] && [ -n "${CI_REGISTRY_USER:-}" ] && [ -n "${CI_REGISTRY_PASSWORD:-}" ]; then
-  printf '%s' "${CI_REGISTRY_PASSWORD}" | docker login -u "${CI_REGISTRY_USER}" --password-stdin "${CI_REGISTRY}"
+  printf '%s' "${CI_REGISTRY_PASSWORD}" | ce login -u "${CI_REGISTRY_USER}" --password-stdin "${CI_REGISTRY}"
   export OPENSHELL_REGISTRY_USERNAME=${OPENSHELL_REGISTRY_USERNAME:-${CI_REGISTRY_USER}}
   export OPENSHELL_REGISTRY_PASSWORD=${OPENSHELL_REGISTRY_PASSWORD:-${CI_REGISTRY_PASSWORD}}
 fi
@@ -214,7 +224,7 @@ CONTAINER_NAME="openshell-cluster-${CLUSTER_NAME}"
 VOLUME_NAME="openshell-cluster-${CLUSTER_NAME}"
 
 if [ "${MODE}" = "fast" ]; then
-  if docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1 || docker volume inspect "${VOLUME_NAME}" >/dev/null 2>&1; then
+  if ce inspect "${CONTAINER_NAME}" >/dev/null 2>&1 || ce volume inspect "${VOLUME_NAME}" >/dev/null 2>&1; then
     echo "Recreating cluster '${CLUSTER_NAME}' from scratch..."
     openshell gateway destroy --name "${CLUSTER_NAME}"
   fi
@@ -255,7 +265,7 @@ if [ -n "${GATEWAY_HOST:-}" ]; then
   # (it's a Docker Desktop feature). If the hostname doesn't resolve,
   # add it via the Docker bridge gateway IP.
   if ! getent hosts "${GATEWAY_HOST}" >/dev/null 2>&1; then
-    BRIDGE_IP=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)
+    BRIDGE_IP=$(ce_network_gateway)
     if [ -n "${BRIDGE_IP}" ]; then
       echo "Adding /etc/hosts entry: ${BRIDGE_IP} ${GATEWAY_HOST}"
       echo "${BRIDGE_IP} ${GATEWAY_HOST}" >> /etc/hosts

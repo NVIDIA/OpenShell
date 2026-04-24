@@ -15,7 +15,8 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `opa.rs` | OPA/Rego policy engine using `regorus` crate -- network evaluation, sandbox config queries, L7 endpoint queries |
 | `process.rs` | `ProcessHandle` for spawning child processes, privilege dropping, signal handling |
 | `proxy.rs` | HTTP CONNECT proxy with OPA evaluation, process-identity binding, inference interception, and L7 dispatch |
-| `ssh.rs` | Embedded SSH server (`russh` crate) with PTY support and handshake verification |
+| `ssh.rs` | Embedded SSH server (`russh` crate) listening on a Unix socket, with PTY support |
+| `supervisor_session.rs` | Persistent outbound `ConnectSupervisor` gRPC session to the gateway; bridges `RelayStream` calls to the local SSH daemon's Unix socket |
 | `identity.rs` | `BinaryIdentityCache` -- SHA256 trust-on-first-use binary integrity |
 | `procfs.rs` | `/proc` filesystem reading for TCP peer identity resolution and ancestor chain walking |
 | `grpc_client.rs` | gRPC client for fetching policy, provider environment, inference route bundles, policy polling/status reporting, proposal submission, and log push (`CachedOpenShellClient`) |
@@ -32,6 +33,7 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `l7/tls.rs` | Ephemeral CA generation (`SandboxCa`), per-hostname leaf cert cache (`CertCache`), TLS termination/connection helpers, `looks_like_tls()` auto-detection |
 | `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation, credential-injection-only passthrough relay |
 | `l7/rest.rs` | HTTP/1.1 request/response parsing, body framing (Content-Length, chunked), deny response generation |
+| `l7/path.rs` | Request-target canonicalization: percent-decoding, dot-segment resolution, `;params` stripping, encoded-slash policy (opt-in per endpoint via `allow_encoded_slash: true` for upstreams like GitLab that embed `%2F` in paths). Single source of truth for the path both OPA evaluates and the upstream receives. |
 | `l7/provider.rs` | `L7Provider` trait and `L7Request`/`BodyLength` types |
 | `secrets.rs` | `SecretResolver` credential placeholder system — placeholder generation, multi-location rewriting (headers, query params, path segments, Basic auth), fail-closed scanning, secret validation, percent-encoding |
 
@@ -64,9 +66,12 @@ flowchart TD
     L --> L2[Spawn bypass monitor]
     L2 --> N{SSH enabled?}
     M --> N
-    N -- Yes --> O[Spawn SSH server task]
-    N -- No --> P[Spawn child process]
-    O --> P
+    N -- Yes --> O[Spawn SSH server task on Unix socket]
+    N -- No --> P0{gRPC mode + socket?}
+    O --> P0
+    P0 -- Yes --> P1[Spawn supervisor session task]
+    P0 -- No --> P[Spawn child process]
+    P1 --> P
     P --> Q[Store entrypoint PID]
     Q --> R{gRPC mode?}
     R -- Yes --> T[Spawn policy poll task]
@@ -109,7 +114,9 @@ flowchart TD
    - Build `InferenceContext` via `build_inference_context()` which resolves routes from one of two sources (see [Inference routing context](#inference-routing-context) below)
    - `ProxyHandle::start_with_bind_addr()` binds a `TcpListener` and spawns an accept loop, passing the inference context to each connection handler
 
-8. **SSH server** (optional): If `--ssh-listen-addr` is provided, spawn an async task running `ssh::run_ssh_server()` with the policy, workdir, netns FD, proxy URL, CA paths, and provider env.
+8. **SSH server** (optional): If `--ssh-socket-path` is provided, spawn an async task running `ssh::run_ssh_server()` with the policy, workdir, netns FD, proxy URL, CA paths, and provider env. The value is a filesystem path to the Unix socket the embedded sshd binds. The supervisor waits on a readiness `oneshot` channel before proceeding so that exec requests arriving immediately after pod-ready cannot race against socket bind.
+
+8a. **Supervisor session** (gRPC mode + SSH socket only): If `--sandbox-id`, `--openshell-endpoint`, and an SSH socket path are all set, spawn `supervisor_session::spawn()`. This task opens a persistent outbound bidirectional gRPC stream to the gateway and bridges inbound relay requests to the local SSH daemon. See [Supervisor Session](#supervisor-session) for the full protocol.
 
 9. **Child process spawning** (`ProcessHandle::spawn()`):
    - Build `tokio::process::Command` with inherited stdio and `kill_on_drop(true)`
@@ -445,7 +452,7 @@ Kernel-level error behavior (e.g., Landlock ABI unavailable) depends on `Landloc
 - `BestEffort`: Log a warning and continue without filesystem isolation
 - `HardRequirement`: Return a fatal error, aborting the sandbox
 
-**Baseline path filtering**: System-injected baseline paths (e.g., `/app`) are pre-filtered by `enrich_proto_baseline_paths()` / `enrich_sandbox_baseline_paths()` using `Path::exists()` before they reach Landlock. User-specified paths are not pre-filtered -- they are evaluated at Landlock apply time so misconfigurations surface as warnings or errors.
+**Baseline path filtering**: System-injected baseline paths (e.g., `/app`) are pre-filtered by `enrich_proto_baseline_paths()` / `enrich_sandbox_baseline_paths()` using `Path::exists()` before they reach Landlock. If a baseline `read_write` path is already present in `read_only`, enrichment skips the promotion so explicit policy intent is preserved. User-specified paths are not pre-filtered -- they are evaluated at Landlock apply time so misconfigurations surface as warnings or errors.
 
 ### Seccomp syscall filtering
 
@@ -801,7 +808,7 @@ Every CONNECT request to a non-`inference.local` target produces an `info!()` lo
 
 ### SSRF protection (internal IP rejection)
 
-After OPA allows a connection, the proxy resolves DNS and rejects any host that resolves to an internal IP address (loopback, RFC 1918 private, link-local, or IPv4-mapped IPv6 equivalents). This defense-in-depth measure prevents SSRF attacks where an allowed hostname is pointed at internal infrastructure. The check is implemented by `resolve_and_reject_internal()` which calls `tokio::net::lookup_host()` and validates every resolved address via `is_internal_ip()`. If any resolved IP is internal, the connection receives a `403 Forbidden` response and a warning is logged. See [SSRF Protection](security-policy.md#ssrf-protection-internal-ip-rejection) for the full list of blocked ranges.
+After OPA allows a connection, the proxy resolves the host using the sandbox's `/etc/hosts` first on Linux (via `/proc/<pid>/root/etc/hosts`, which picks up Kubernetes `hostAliases`), then falls back to DNS. It rejects any host that resolves to an internal IP address (loopback, RFC 1918 private, link-local, or IPv4-mapped IPv6 equivalents). This defense-in-depth measure prevents SSRF attacks where an allowed hostname is pointed at internal infrastructure. The check is implemented by `resolve_and_reject_internal()`, which validates every resolved address via `is_internal_ip()`. If any resolved IP is internal, the connection receives a `403 Forbidden` response and a warning is logged. `hostAliases` only affect name resolution — private destinations still need `allowed_ips`. See [SSRF Protection](security-policy.md#ssrf-protection-internal-ip-rejection) for the full list of blocked ranges.
 
 IP classification helpers (`is_always_blocked_ip`, `is_always_blocked_net`, `is_internal_ip`) are shared from `openshell_core::net`. The `parse_allowed_ips` function rejects entries overlapping always-blocked ranges (loopback, link-local, unspecified) at load time with a hard error, and `implicit_allowed_ips_for_ip_host` skips synthesis for always-blocked literal IP hosts. The mechanistic mapper filters proposals for always-blocked destinations to prevent infinite TUI notification loops.
 
@@ -1313,30 +1320,24 @@ Exit code is `code` if the process exited normally, or `128 + signal` if killed 
 
 **File:** `crates/openshell-sandbox/src/ssh.rs`
 
-The embedded SSH server provides remote shell access to the sandbox. It uses the `russh` crate and allocates PTYs for interactive sessions.
+The embedded SSH server provides remote shell access to the sandbox. It uses the `russh` crate and allocates PTYs for interactive sessions. The daemon listens on a **Unix domain socket** rather than a TCP port -- the gateway never dials the sandbox pod directly. All SSH traffic arrives through the [supervisor session](#supervisor-session)'s `RelayStream` RPC, which the supervisor bridges into the socket.
 
 ### Startup
 
-`run_ssh_server()`:
-1. Generate an ephemeral Ed25519 host key via `russh::keys::PrivateKey::random()`
-2. Bind a `TcpListener` to the configured address
-3. Accept connections in a loop, spawning per-connection handlers
+`ssh_server_init()` (called from `run_ssh_server()`):
 
-### Handshake verification
+1. Generate an ephemeral Ed25519 host key via `russh::keys::PrivateKey::random()`.
+2. Ensure the socket's parent directory exists and is owned by root with mode `0700`. The sandbox entrypoint runs as an unprivileged user, so it cannot enter this directory.
+3. Remove any stale socket file from a prior run, then `UnixListener::bind(listen_path)`.
+4. Set the socket file's mode to `0600` so only the supervisor (root) can connect to it.
+5. Signal readiness back to `lib.rs` via a `oneshot` channel.
+6. Accept connections in a loop and spawn `handle_connection()` per connection.
 
-Before the SSH protocol begins, the server reads a preface line:
+The socket path is taken from `--ssh-socket-path` / `OPENSHELL_SSH_SOCKET_PATH`. The Kubernetes compute driver sets this to `/run/openshell/ssh.sock` by default (see `crates/openshell-driver-kubernetes/src/main.rs`); the VM driver pins it to the same path inside the guest.
 
-```
-NSSH1 {token} {timestamp} {nonce} {hmac_hex}\n
-```
+### Access control
 
-`verify_preface()`:
-1. Verify magic is `NSSH1` and exactly 5 fields
-2. Verify `|now - timestamp|` is within `--ssh-handshake-skew-secs` (default 300s)
-3. Compute `HMAC-SHA256(secret, "{token}|{timestamp}|{nonce}")` and compare with `{hmac_hex}`
-4. Send `OK\n` on success, `ERR\n` on failure
-
-This pre-SSH handshake authenticates the gateway-to-sandbox tunnel. After it succeeds, the SSH session uses permissive authentication (`auth_none` and `auth_publickey` both return `Accept`) since the transport is already verified.
+The filesystem permissions on the parent directory (`0700`) and the socket itself (`0600`) are the sole authentication boundary. Only the supervisor, which runs as root inside the container, can open the socket. The sandboxed entrypoint process -- dropped to the unprivileged `sandbox` user and further constrained by Landlock -- cannot reach `/run/openshell/` at all. Consequently, the SSH session handler's `auth_none` and `auth_publickey` callbacks both return `Auth::Accept` unconditionally; any byte stream that reaches the daemon has already passed the trust check via the socket's permission bits.
 
 ### Shell/exec handling
 
@@ -1363,6 +1364,90 @@ The `SshHandler` implements `russh::server::Handler`:
    - **Writer thread**: Reads from `mpsc::Receiver`, writes to PTY master
    - **Reader thread**: Reads from PTY master, sends SSH channel data, sends EOF when done, signals the exit thread
    - **Exit thread**: Waits for child to exit, waits for reader to finish (ensures correct SSH protocol ordering: data -> EOF -> exit-status -> close), sends exit status and closes the channel
+
+## Supervisor Session
+
+**File:** `crates/openshell-sandbox/src/supervisor_session.rs`
+
+The sandbox pod has no inbound network surface. Instead, the supervisor opens a single persistent outbound gRPC stream to the gateway and the gateway uses that stream to request on-demand byte relays back into the sandbox. All SSH connect traffic and `ExecSandbox` calls ride this connection -- there is no reverse HTTP CONNECT, no TCP listener on the pod, and no per-session TLS handshake.
+
+### Connection model
+
+```mermaid
+sequenceDiagram
+    participant S as Supervisor (sandbox)
+    participant GW as Gateway
+    participant SSHD as Local sshd (Unix socket)
+    participant Client as Operator / CLI
+
+    S->>GW: ConnectSupervisor stream (mTLS, HTTP/2)
+    S->>GW: SupervisorMessage::Hello{sandbox_id, instance_id}
+    GW-->>S: GatewayMessage::SessionAccepted{session_id, heartbeat_interval_secs}
+    loop Heartbeats (max(accepted.heartbeat_interval_secs, 5))
+        S-->>GW: SupervisorHeartbeat
+        GW-->>S: GatewayHeartbeat
+    end
+
+    Client->>GW: sandbox connect / ExecSandbox
+    GW-->>S: GatewayMessage::RelayOpen{channel_id}
+    S->>GW: RelayStream RPC (new HTTP/2 stream on same Channel)
+    S->>GW: RelayFrame::Init{channel_id}
+    S->>SSHD: UnixStream::connect(ssh_socket_path)
+    loop Relay active
+        GW-->>S: RelayFrame::Data (raw SSH bytes from operator)
+        S->>SSHD: write_all
+        SSHD-->>S: read chunk (up to 16 KiB)
+        S-->>GW: RelayFrame::Data
+    end
+```
+
+One TCP+TLS+HTTP/2 connection carries both the long-lived control stream and every concurrent relay. The sandbox-side `Endpoint` uses `adaptive_window(true)` so HTTP/2 flow control does not throttle bulk transfers (SFTP, `sandbox rsync`) to the 64 KiB default window.
+
+### Session lifecycle
+
+`spawn(endpoint, sandbox_id, ssh_socket_path)` launches `run_session_loop()`, which runs for the lifetime of the supervisor:
+
+1. **Connect**: `grpc_client::connect_channel_pub(endpoint)` builds an mTLS `tonic::transport::Channel`. The same `Channel` is cloned into every subsequent `RelayStream` call so no additional TLS handshakes occur.
+2. **Hello**: The supervisor sends `SupervisorMessage::Hello { sandbox_id, instance_id }` as the first envelope, where `instance_id` is a fresh UUID per session. The gateway uses the sandbox ID and instance ID to supersede a stale prior session (see [Supersede](#session-supersede)).
+3. **Wait for `SessionAccepted` / `SessionRejected`**: If rejected, the loop returns an error and backs off. On accept, the supervisor clamps `heartbeat_interval_secs` to a minimum of 5 seconds.
+4. **Main select loop**: Concurrently reads inbound `GatewayMessage`s and fires heartbeat ticks. Inbound `Heartbeat` messages are acknowledged by the supervisor's outbound heartbeat cadence; `RelayOpen` and `RelayClose` are dispatched to `handle_gateway_message()`.
+5. **Reconnect**: Any error in the session (stream error, connect failure, rejected hello) is reported as an OCSF event and the loop sleeps with exponential backoff (`INITIAL_BACKOFF = 1s`, doubled up to `MAX_BACKOFF = 30s`) before redialing.
+
+### Relay bridge loop
+
+`handle_gateway_message()` is a synchronous dispatcher. When a `RelayOpen { channel_id }` arrives, it spawns a dedicated task running `handle_relay_open()`. That task:
+
+1. Creates an outbound `mpsc::channel::<RelayFrame>(16)` wrapped in a `ReceiverStream`.
+2. Sends `RelayFrame { payload: RelayInit { channel_id } }` as the first frame -- this claims the matching pending-relay slot on the gateway.
+3. Calls `OpenShellClient::relay_stream(outbound)` on the shared `Channel`. This opens a new HTTP/2 stream on the existing connection -- no new TCP or TLS handshake.
+4. `UnixStream::connect(ssh_socket_path)` dials the local sshd. The split read/write halves become the local endpoints of the bridge.
+5. Spawns a task that reads from the Unix socket in 16 KiB chunks (`RELAY_CHUNK_SIZE`, matching the default HTTP/2 frame size) and forwards each chunk as `RelayFrame::Data` on the outbound stream.
+6. The main loop drains inbound `RelayFrame::Data` messages and writes them to the socket. Non-data inbound frames (e.g. a second `Init`) are treated as protocol errors.
+7. On any side closing, the bridge calls `ssh_w.shutdown()` to propagate EOF, drops the outbound sender to close the gRPC stream, and joins the reader task.
+
+The supervisor has no SSH or HTTP awareness -- it is purely a byte bridge. The protocol on top of the relay is whatever the gateway's caller (interactive `sandbox connect`, `ExecSandbox`, `rsync`-over-ssh) speaks to the sshd.
+
+### Session supersede
+
+If the gateway restarts or the sandbox restarts and reconnects with a new `instance_id` for the same `sandbox_id`, the gateway atomically replaces any prior session it has recorded. The new supervisor continues normally; the old stream (if still live on the gateway side) is torn down by the gateway's `remove_if_current` logic. Supervisors never need to coordinate between themselves -- each just keeps trying to connect, and the most recent `Hello` wins.
+
+If the gateway closes the stream cleanly (`inbound.message()` returns `Ok(None)`), `run_single_session` returns `Ok(())` and a `session_closed` event is emitted. Otherwise the loop reconnects.
+
+### OCSF telemetry
+
+Every session and relay transition emits an OCSF `NetworkActivity` event via `ocsf_emit!()` so operators can audit the control-plane connection from the sandbox's own logs. All events are built in `supervisor_session.rs` and covered by unit tests in the `ocsf_event_tests` module.
+
+| Helper | `activity_id` | `severity` | `status` | Fires when |
+|--------|---------------|------------|----------|------------|
+| `session_established_event` | `Open` | `Informational` | `Success` | After `SessionAccepted`, includes `session_id` and `heartbeat_secs` in the message |
+| `session_closed_event` | `Close` | `Informational` | `Success` | Gateway closed the stream cleanly (`Ok(None)`) |
+| `session_failed_event` | `Fail` | `Low` | `Failure` | Connect failed, hello rejected, or stream errored. Includes reconnect attempt counter |
+| `relay_open_event` | `Open` | `Informational` | `Success` | `RelayOpen` received from the gateway |
+| `relay_closed_event` | `Close` | `Informational` | `Success` | Relay bridge task exited without error |
+| `relay_failed_event` | `Fail` | `Low` | `Failure` | Bridge task returned an error (e.g., socket write failure, inbound non-data frame) |
+| `relay_close_from_gateway_event` | `Close` | `Informational` | -- | Gateway sent an explicit `RelayClose` on the control stream, with its `reason` |
+
+The `dst_endpoint` on session events is parsed from the gateway URI by `ocsf_gateway_endpoint()`. Relay events omit a destination (the bridge is sandbox-internal).
 
 ## Zombie Reaping (PID 1 Init Duties)
 
@@ -1394,9 +1479,7 @@ This two-phase approach (peek with `WNOWAIT`, then selectively reap) avoids `ECH
 | `OPENSHELL_LOG_LEVEL` | `--log-level` | `warn` | Log level (trace/debug/info/warn/error) |
 | `OPENSHELL_POLICY_POLL_INTERVAL_SECS` | | `30` | Poll interval for gRPC policy updates (seconds). Only active in gRPC mode. |
 | `OPENSHELL_LOG_PUSH_LEVEL` | | `info` | Maximum tracing level for log push to gateway. Events above this level are not streamed. Only active in gRPC mode. |
-| `OPENSHELL_SSH_LISTEN_ADDR` | `--ssh-listen-addr` | | SSH server bind address |
-| `OPENSHELL_SSH_HANDSHAKE_SECRET` | `--ssh-handshake-secret` | | HMAC secret for SSH handshake |
-| `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS` | `--ssh-handshake-skew-secs` | `300` | Allowed clock skew for handshake |
+| `OPENSHELL_SSH_SOCKET_PATH` | `--ssh-socket-path` | | Filesystem path to the Unix socket the embedded sshd binds (e.g. `/run/openshell/ssh.sock`). |
 | `OPENSHELL_INFERENCE_ROUTES` | `--inference-routes` | | Path to YAML inference routes file for standalone routing |
 
 ### Injected into child process
@@ -1473,7 +1556,15 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 | Credential injection: path credential contains traversal/separator | HTTP 500, connection closed (fail-closed) |
 | Credential injection: percent-encoded placeholder bypass attempt | HTTP 500, connection closed (fail-closed) |
 | L7 parse error | Close the connection |
-| SSH server failure | Async task error logged, main process unaffected |
+| SSH socket bind failure | Fatal -- reported through the readiness channel and aborts startup |
+| SSH server accept failure | Async task error logged, main process unaffected |
+| Supervisor session: connect failure | Emit `session_failed` OCSF event, sleep with exponential backoff (1s -> 30s) and reconnect |
+| Supervisor session: `SessionRejected` | Emit `session_failed` event with rejection reason; backoff and reconnect |
+| Supervisor session: stream error mid-session | Emit `session_failed` event; backoff and reconnect |
+| Supervisor session: gateway closes stream cleanly | Emit `session_closed` event and exit the task (no reconnect) |
+| Relay bridge: `RelayStream` RPC failure | Emit `relay_failed` event; the individual relay is abandoned, the session stays up |
+| Relay bridge: Unix socket connect failure | Emit `relay_failed` event; gateway observes EOF on the RelayStream |
+| Relay bridge: non-data inbound frame after Init | Emit `relay_failed` event with protocol error |
 | Process timeout | Kill process, return exit code 124 |
 
 ## Logging
@@ -1486,6 +1577,7 @@ Key structured log events:
 - `CONNECT`: One per proxy CONNECT request (for non-`inference.local` targets) with full identity context. Inference interception failures produce a separate `info!()` log with `action=deny` and the denial reason.
 - `BYPASS_DETECT`: One per detected direct connection attempt that bypassed the HTTP CONNECT proxy. Includes destination, protocol, process identity (best-effort), and remediation hint. Emitted at `warn` level.
 - `L7_REQUEST`: One per L7-inspected request with method, path, and decision
+- Supervisor session / relay OCSF events: `session_established`, `session_closed`, `session_failed`, `relay_open`, `relay_closed`, `relay_failed`, `relay_close_from_gateway` (see [Supervisor Session](#supervisor-session)).
 - Sandbox lifecycle events: process start, exit, namespace creation/cleanup, bypass rule installation
 - Policy reload events: new version detected, reload success/failure, status report outcomes
 

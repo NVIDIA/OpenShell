@@ -37,7 +37,6 @@ type KrunSetExec = unsafe extern "C" fn(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> i32;
-type KrunSetPortMap = unsafe extern "C" fn(ctx_id: u32, port_map: *const *const c_char) -> i32;
 type KrunSetConsoleOutput = unsafe extern "C" fn(ctx_id: u32, filepath: *const c_char) -> i32;
 type KrunStartEnter = unsafe extern "C" fn(ctx_id: u32) -> i32;
 type KrunDisableImplicitVsock = unsafe extern "C" fn(ctx_id: u32) -> i32;
@@ -68,7 +67,6 @@ pub struct LibKrun {
     pub krun_set_root: KrunSetRoot,
     pub krun_set_workdir: KrunSetWorkdir,
     pub krun_set_exec: KrunSetExec,
-    pub krun_set_port_map: KrunSetPortMap,
     pub krun_set_console_output: KrunSetConsoleOutput,
     pub krun_start_enter: KrunStartEnter,
     pub krun_disable_implicit_vsock: KrunDisableImplicitVsock,
@@ -121,7 +119,6 @@ impl LibKrun {
             krun_set_root: load_symbol(library, b"krun_set_root\0", &libkrun_path)?,
             krun_set_workdir: load_symbol(library, b"krun_set_workdir\0", &libkrun_path)?,
             krun_set_exec: load_symbol(library, b"krun_set_exec\0", &libkrun_path)?,
-            krun_set_port_map: load_symbol(library, b"krun_set_port_map\0", &libkrun_path)?,
             krun_set_console_output: load_symbol(
                 library,
                 b"krun_set_console_output\0",

@@ -24,14 +24,17 @@ pub(crate) fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
 pub(crate) fn tls_env_vars(
     ca_cert_path: &Path,
     combined_bundle_path: &Path,
-) -> [(&'static str, String); 4] {
+) -> [(&'static str, String); 5] {
     let ca_cert_path = ca_cert_path.display().to_string();
     let combined_bundle_path = combined_bundle_path.display().to_string();
     [
         ("NODE_EXTRA_CA_CERTS", ca_cert_path.clone()),
         ("SSL_CERT_FILE", combined_bundle_path.clone()),
         ("REQUESTS_CA_BUNDLE", combined_bundle_path.clone()),
-        ("CURL_CA_BUNDLE", combined_bundle_path),
+        ("CURL_CA_BUNDLE", combined_bundle_path.clone()),
+        // Ubuntu Noble's git links against libcurl-gnutls, which ignores SSL_CERT_FILE.
+        // git reads GIT_SSL_CAINFO (or http.sslCAInfo) to locate the CA bundle.
+        ("GIT_SSL_CAINFO", combined_bundle_path),
     ]
 }
 
@@ -79,5 +82,8 @@ mod tests {
 
         assert!(stdout.contains("NODE_EXTRA_CA_CERTS=/etc/openshell-tls/openshell-ca.pem"));
         assert!(stdout.contains("SSL_CERT_FILE=/etc/openshell-tls/ca-bundle.pem"));
+        assert!(stdout.contains("REQUESTS_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem"));
+        assert!(stdout.contains("CURL_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem"));
+        assert!(stdout.contains("GIT_SSL_CAINFO=/etc/openshell-tls/ca-bundle.pem"));
     }
 }

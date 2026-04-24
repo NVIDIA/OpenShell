@@ -6,6 +6,9 @@
 use clap::{Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::ComputeDriverKind;
+use openshell_core::config::{
+    DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS, DEFAULT_SSH_PORT,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::info;
@@ -20,8 +23,18 @@ use crate::{run_server, tracing_bus::TracingLogBus};
 #[command(about = "OpenShell gRPC/HTTP server", long_about = None)]
 struct Args {
     /// Port to bind the server to (all interfaces).
-    #[arg(long, default_value_t = 8080, env = "OPENSHELL_SERVER_PORT")]
+    #[arg(long, default_value_t = DEFAULT_SERVER_PORT, env = "OPENSHELL_SERVER_PORT")]
     port: u16,
+
+    /// Port for unauthenticated health endpoints (healthz, readyz).
+    /// Set to 0 to disable the dedicated health listener.
+    #[arg(long, default_value_t = 0, env = "OPENSHELL_HEALTH_PORT")]
+    health_port: u16,
+
+    /// Port for the Prometheus metrics endpoint (/metrics).
+    /// Set to 0 to disable the dedicated metrics listener.
+    #[arg(long, default_value_t = 0, env = "OPENSHELL_METRICS_PORT")]
+    metrics_port: u16,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info", env = "OPENSHELL_LOG_LEVEL")]
@@ -80,7 +93,7 @@ struct Args {
     ssh_gateway_host: String,
 
     /// Public port for the SSH gateway.
-    #[arg(long, env = "OPENSHELL_SSH_GATEWAY_PORT", default_value_t = 8080)]
+    #[arg(long, env = "OPENSHELL_SSH_GATEWAY_PORT", default_value_t = DEFAULT_SERVER_PORT)]
     ssh_gateway_port: u16,
 
     /// HTTP path for SSH CONNECT/upgrade.
@@ -92,15 +105,14 @@ struct Args {
     ssh_connect_path: String,
 
     /// SSH port inside sandbox pods.
-    #[arg(long, env = "OPENSHELL_SANDBOX_SSH_PORT", default_value_t = 2222)]
+    #[arg(long, env = "OPENSHELL_SANDBOX_SSH_PORT", default_value_t = DEFAULT_SSH_PORT)]
     sandbox_ssh_port: u16,
-
     /// Shared secret for gateway-to-sandbox SSH handshake.
     #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
     ssh_handshake_secret: Option<String>,
 
     /// Allowed clock skew in seconds for SSH handshake.
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS", default_value_t = 300)]
+    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS", default_value_t = DEFAULT_SSH_HANDSHAKE_SKEW_SECS)]
     ssh_handshake_skew_secs: u64,
 
     /// Kubernetes secret name containing client TLS materials for sandbox pods.
@@ -121,9 +133,13 @@ struct Args {
     )]
     vm_driver_state_dir: PathBuf,
 
-    /// VM compute-driver binary spawned by the gateway.
-    #[arg(long, env = "OPENSHELL_VM_COMPUTE_DRIVER_BIN")]
-    vm_compute_driver_bin: Option<PathBuf>,
+    /// Directory searched for compute-driver binaries (e.g.
+    /// `openshell-driver-vm`) when an explicit binary override isn't
+    /// configured. When unset, the gateway searches
+    /// `$HOME/.local/libexec/openshell`, `/usr/local/libexec/openshell`,
+    /// `/usr/local/libexec`, then a sibling of the gateway binary.
+    #[arg(long, env = "OPENSHELL_DRIVER_DIR")]
+    driver_dir: Option<PathBuf>,
 
     /// libkrun log level used by the VM helper.
     #[arg(
@@ -226,6 +242,34 @@ async fn run_from_args(args: Args) -> Result<()> {
         .with_bind_address(bind)
         .with_log_level(&args.log_level);
 
+    if args.health_port != 0 {
+        if args.port == args.health_port {
+            return Err(miette::miette!(
+                "--port and --health-port must be different (both set to {})",
+                args.port
+            ));
+        }
+        let health_bind = SocketAddr::from(([0, 0, 0, 0], args.health_port));
+        config = config.with_health_bind_address(health_bind);
+    }
+
+    if args.metrics_port != 0 {
+        if args.port == args.metrics_port {
+            return Err(miette::miette!(
+                "--port and --metrics-port must be different (both set to {})",
+                args.port
+            ));
+        }
+        if args.health_port != 0 && args.health_port == args.metrics_port {
+            return Err(miette::miette!(
+                "--health-port and --metrics-port must be different (both set to {})",
+                args.health_port
+            ));
+        }
+        let metrics_bind = SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
+        config = config.with_metrics_bind_address(metrics_bind);
+    }
+
     config = config
         .with_database_url(args.db_url)
         .with_compute_drivers(args.drivers)
@@ -262,7 +306,7 @@ async fn run_from_args(args: Args) -> Result<()> {
 
     let vm_config = VmComputeConfig {
         state_dir: args.vm_driver_state_dir,
-        compute_driver_bin: args.vm_compute_driver_bin,
+        driver_dir: args.driver_dir,
         krun_log_level: args.vm_krun_log_level,
         vcpus: args.vm_vcpus,
         mem_mib: args.vm_mem_mib,

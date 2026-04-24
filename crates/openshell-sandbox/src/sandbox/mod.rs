@@ -38,3 +38,17 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
         Ok(())
     }
 }
+
+/// Apply seccomp hardening for the long-lived supervisor process itself.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
+pub fn apply_supervisor_startup_hardening() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::apply_supervisor_prelude()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+}

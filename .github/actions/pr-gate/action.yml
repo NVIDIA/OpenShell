@@ -1,0 +1,56 @@
+name: PR Gate
+description: >
+  Resolve PR metadata for a `pull-request/<N>` push from copy-pr-bot and decide
+  whether the workflow should run. Sets `should-run=true` only when the pushed
+  SHA still matches the PR head SHA and the PR carries the required label. For
+  non-`push` events (e.g. `workflow_dispatch`), always sets `should-run=true`.
+
+inputs:
+  required_label:
+    description: PR label required to enable the run (e.g. "test:e2e").
+    required: true
+
+outputs:
+  should_run:
+    description: "true if the workflow should proceed, false otherwise"
+    value: ${{ steps.gate.outputs.should_run }}
+
+runs:
+  using: composite
+  steps:
+    - id: get_pr_info
+      if: github.event_name == 'push'
+      continue-on-error: true
+      uses: nv-gha-runners/get-pr-info@main
+
+    - id: gate
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        GITHUB_SHA_VALUE: ${{ github.sha }}
+        GET_PR_INFO_OUTCOME: ${{ steps.get_pr_info.outcome }}
+        PR_INFO: ${{ steps.get_pr_info.outputs.pr-info }}
+        REQUIRED_LABEL: ${{ inputs.required_label }}
+      run: |
+        if [ "$EVENT_NAME" != "push" ]; then
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [ "$GET_PR_INFO_OUTCOME" != "success" ]; then
+          echo "should_run=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        head_sha="$(jq -r '.head.sha' <<< "$PR_INFO")"
+        has_label="$(jq -r --arg L "$REQUIRED_LABEL" '[.labels[].name] | index($L) != null' <<< "$PR_INFO")"
+
+        # Only trust copied pull-request/* pushes that still match the PR head
+        # SHA and carry the required label.
+        if [ "$head_sha" = "$GITHUB_SHA_VALUE" ] && [ "$has_label" = "true" ]; then
+          should_run=true
+        else
+          should_run=false
+        fi
+
+        echo "should_run=$should_run" >> "$GITHUB_OUTPUT"

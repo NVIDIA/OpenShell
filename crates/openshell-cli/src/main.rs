@@ -254,6 +254,8 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell policy get my-sandbox
   $ openshell policy set my-sandbox --policy policy.yaml
+  $ openshell policy update my-sandbox --add-endpoint api.github.com:443:read-only:rest:enforce
+  $ openshell policy update my-sandbox --add-allow 'api.github.com:443:GET:/repos/**'
   $ openshell policy set --global --policy policy.yaml
   $ openshell policy delete --global
   $ openshell policy list my-sandbox
@@ -1083,7 +1085,7 @@ enum SandboxCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Optional sandbox name (auto-generated when omitted).
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
         /// Sandbox source: a community sandbox name (e.g., `openclaw`), a path
@@ -1196,7 +1198,7 @@ enum SandboxCommands {
         no_auto_providers: bool,
 
         /// Command to run after "--" (defaults to an interactive shell).
-        #[arg(trailing_var_arg = true)]
+        #[arg(last = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
 
@@ -1206,6 +1208,10 @@ enum SandboxCommands {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
+
+        /// Print only the active policy YAML (same policy as the default view; stdout only).
+        #[arg(long)]
+        policy_only: bool,
     },
 
     /// List sandboxes.
@@ -1438,6 +1444,54 @@ enum PolicyCommands {
         timeout: u64,
     },
 
+    /// Incrementally update policy on a live sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Update {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement]]].
+        #[arg(long = "add-endpoint")]
+        add_endpoints: Vec<String>,
+
+        /// Remove an endpoint: host:port.
+        #[arg(long = "remove-endpoint")]
+        remove_endpoints: Vec<String>,
+
+        /// Add a REST allow rule: host:port:METHOD:path_glob.
+        #[arg(long = "add-allow")]
+        add_allow: Vec<String>,
+
+        /// Add a REST deny rule: host:port:METHOD:path_glob.
+        #[arg(long = "add-deny")]
+        add_deny: Vec<String>,
+
+        /// Remove a network rule by name.
+        #[arg(long = "remove-rule")]
+        remove_rules: Vec<String>,
+
+        /// Add binaries to each --add-endpoint rule.
+        #[arg(long = "binary", value_hint = ValueHint::FilePath)]
+        binaries: Vec<String>,
+
+        /// Override the generated rule name when exactly one --add-endpoint is provided.
+        #[arg(long = "rule-name")]
+        rule_name: Option<String>,
+
+        /// Preview the merged policy without sending it to the gateway.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Wait for the sandbox to load the policy revision.
+        #[arg(long)]
+        wait: bool,
+
+        /// Timeout for --wait in seconds.
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+    },
+
     /// Show current active policy for a sandbox or the global policy.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
@@ -1634,6 +1688,23 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
         )
         .init();
+
+    // Propagate verbosity to the OpenSSH LogLevel used by SSH subprocesses.
+    // Only set the env var when it hasn't been explicitly overridden by the
+    // user, so `OPENSHELL_SSH_LOG_LEVEL=DEBUG openshell ...` still wins.
+    if std::env::var("OPENSHELL_SSH_LOG_LEVEL").is_err() {
+        let ssh_log_level = match cli.verbose {
+            0 => "ERROR",
+            1 => "INFO",
+            _ => "DEBUG",
+        };
+        // SAFETY: Called early in main() before spawning async tasks that
+        // read the environment, so no concurrent readers exist.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("OPENSHELL_SSH_LOG_LEVEL", ssh_log_level);
+        }
+    }
 
     match cli.command {
         // -----------------------------------------------------------
@@ -1987,6 +2058,37 @@ async fn main() -> Result<()> {
                         run::sandbox_policy_set(&ctx.endpoint, &name, &policy, wait, timeout, &tls)
                             .await?;
                     }
+                }
+                PolicyCommands::Update {
+                    name,
+                    add_endpoints,
+                    remove_endpoints,
+                    add_allow,
+                    add_deny,
+                    remove_rules,
+                    binaries,
+                    rule_name,
+                    dry_run,
+                    wait,
+                    timeout,
+                } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_policy_update(
+                        &ctx.endpoint,
+                        &name,
+                        &add_endpoints,
+                        &remove_endpoints,
+                        &add_deny,
+                        &add_allow,
+                        &remove_rules,
+                        &binaries,
+                        rule_name.as_deref(),
+                        dry_run,
+                        wait,
+                        timeout,
+                        &tls,
+                    )
+                    .await?;
                 }
                 PolicyCommands::Get {
                     name,
@@ -2380,9 +2482,9 @@ async fn main() -> Result<()> {
                         | SandboxCommands::Download { .. } => {
                             unreachable!()
                         }
-                        SandboxCommands::Get { name } => {
+                        SandboxCommands::Get { name, policy_only } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
-                            run::sandbox_get(endpoint, &name, &tls).await?;
+                            run::sandbox_get(endpoint, &name, policy_only, &tls).await?;
                         }
                         SandboxCommands::List {
                             limit,
@@ -3270,6 +3372,58 @@ mod tests {
                 assert!(yes);
             }
             other => panic!("expected settings delete command, got: {other:?}"),
+        }
+    }
+
+    // ── sandbox create arg-shape tests ───────────────────────────────────
+
+    /// Verify that `sandbox create --name <value>` still parses as a named
+    /// option rather than a positional argument.  The `ArgValueCompleter`
+    /// attribute must be combined with `long` on the `name` field; without
+    /// `long`, clap treats the field as positional and `--name` is rejected.
+    #[test]
+    fn sandbox_create_name_is_a_named_flag() {
+        // Build the CLI app and try to parse `sandbox create --name foo`.
+        // `try_parse_from` returns Err if clap rejects the arguments.
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--name", "my-sb"]);
+        assert!(
+            result.is_ok(),
+            "sandbox create --name should parse as a named flag: {:?}",
+            result.err()
+        );
+        if let Ok(cli) = result {
+            if let Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { name, .. }),
+                ..
+            }) = cli.command
+            {
+                assert_eq!(name.as_deref(), Some("my-sb"));
+            } else {
+                panic!("expected SandboxCommands::Create");
+            }
+        }
+    }
+
+    /// Verify that `sandbox create` without `--name` still works (name is
+    /// optional and auto-generated when omitted).
+    #[test]
+    fn sandbox_create_name_is_optional() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create"]);
+        assert!(
+            result.is_ok(),
+            "sandbox create without --name should be accepted: {:?}",
+            result.err()
+        );
+        if let Ok(cli) = result {
+            if let Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { name, .. }),
+                ..
+            }) = cli.command
+            {
+                assert_eq!(name, None);
+            } else {
+                panic!("expected SandboxCommands::Create");
+            }
         }
     }
 

@@ -21,6 +21,7 @@ pub mod proxy;
 mod sandbox;
 mod secrets;
 mod ssh;
+mod supervisor_session;
 
 use miette::{IntoDiagnostic, Result};
 #[cfg(target_os = "linux")]
@@ -97,6 +98,7 @@ use crate::proxy::ProxyHandle;
 use crate::sandbox::linux::netns::NetworkNamespace;
 use crate::secrets::SecretResolver;
 pub use process::{ProcessHandle, ProcessStatus};
+pub use sandbox::apply_supervisor_startup_hardening;
 
 /// Default interval (seconds) for re-fetching the inference route bundle from
 /// the gateway in cluster mode. Override at runtime with the
@@ -208,7 +210,7 @@ pub async fn run_sandbox(
     openshell_endpoint: Option<String>,
     policy_rules: Option<String>,
     policy_data: Option<String>,
-    ssh_listen_addr: Option<String>,
+    ssh_socket_path: Option<String>,
     ssh_handshake_secret: Option<String>,
     ssh_handshake_skew_secs: u64,
     _health_check: bool,
@@ -416,6 +418,11 @@ pub async fn run_sandbox(
     #[allow(clippy::no_effect_underscore_binding)]
     let _netns: Option<()> = None;
 
+    // Install the supervisor seccomp prelude after privileged startup helpers
+    // (network namespace setup, iptables probes) complete, but before the SSH
+    // listener and workload process are exposed.
+    apply_supervisor_startup_hardening()?;
+
     // Shared PID: set after process spawn so the proxy can look up
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
@@ -603,18 +610,12 @@ pub async fn run_sandbox(
         }
     });
 
-    if let Some(listen_addr) = ssh_listen_addr {
-        let addr: SocketAddr = listen_addr.parse().into_diagnostic()?;
+    let ssh_socket_path: Option<std::path::PathBuf> = ssh_socket_path.map(std::path::PathBuf::from);
+    if let Some(listen_path) = ssh_socket_path.clone() {
         let policy_clone = policy.clone();
         let workdir_clone = workdir.clone();
-        let secret = ssh_handshake_secret
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                miette::miette!(
-                    "OPENSHELL_SSH_HANDSHAKE_SECRET is required when SSH is enabled.\n\
-                     Set --ssh-handshake-secret or the OPENSHELL_SSH_HANDSHAKE_SECRET env var."
-                )
-            })?;
+        let _ = ssh_handshake_secret; // retained in the signature for compat; unused
+        let _ = ssh_handshake_skew_secs;
         let proxy_url = ssh_proxy_url;
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
@@ -624,12 +625,10 @@ pub async fn run_sandbox(
 
         tokio::spawn(async move {
             if let Err(err) = ssh::run_ssh_server(
-                addr,
+                listen_path,
                 ssh_ready_tx,
                 policy_clone,
                 workdir_clone,
-                secret,
-                ssh_handshake_skew_secs,
                 netns_fd,
                 proxy_url,
                 ca_paths,
@@ -676,6 +675,18 @@ pub async fn run_sandbox(
                 ));
             }
         }
+    }
+
+    // Spawn the persistent supervisor session if we have a gateway endpoint
+    // and sandbox identity. The session provides relay channels for SSH
+    // connect and ExecSandbox through the gateway.
+    if let (Some(endpoint), Some(id), Some(socket)) = (
+        openshell_endpoint.as_ref(),
+        sandbox_id.as_ref(),
+        ssh_socket_path.as_ref(),
+    ) {
+        supervisor_session::spawn(endpoint.clone(), id.clone(), socket.clone());
+        info!("supervisor session task spawned");
     }
 
     #[cfg(target_os = "linux")]
@@ -1336,17 +1347,18 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
         }
     }
     for path in &rw {
-        if !fs.read_write.iter().any(|p| p == path) {
-            if !std::path::Path::new(path).exists() {
-                debug!(
-                    path,
-                    "Baseline read-write path does not exist, skipping enrichment"
-                );
-                continue;
-            }
-            fs.read_write.push(path.clone());
-            modified = true;
+        if fs.read_only.iter().any(|p| p == path) || fs.read_write.iter().any(|p| p == path) {
+            continue;
         }
+        if !std::path::Path::new(path).exists() {
+            debug!(
+                path,
+                "Baseline read-write path does not exist, skipping enrichment"
+            );
+            continue;
+        }
+        fs.read_write.push(path.clone());
+        modified = true;
     }
 
     if modified {
@@ -1390,17 +1402,18 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
     }
     for path in &rw {
         let p = std::path::PathBuf::from(path);
-        if !policy.filesystem.read_write.contains(&p) {
-            if !p.exists() {
-                debug!(
-                    path,
-                    "Baseline read-write path does not exist, skipping enrichment"
-                );
-                continue;
-            }
-            policy.filesystem.read_write.push(p);
-            modified = true;
+        if policy.filesystem.read_only.contains(&p) || policy.filesystem.read_write.contains(&p) {
+            continue;
         }
+        if !p.exists() {
+            debug!(
+                path,
+                "Baseline read-write path does not exist, skipping enrichment"
+            );
+            continue;
+        }
+        policy.filesystem.read_write.push(p);
+        modified = true;
     }
 
     if modified {
@@ -1418,6 +1431,7 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
 #[cfg(test)]
 mod baseline_tests {
     use super::*;
+    use crate::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
 
     #[test]
     fn proc_not_in_both_read_only_and_read_write_when_gpu_present() {
@@ -1481,6 +1495,75 @@ mod baseline_tests {
                 "path {path} appears in both read_only and read_write"
             );
         }
+    }
+
+    #[test]
+    fn proto_enrichment_preserves_explicit_read_only_for_baseline_read_write_paths() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec!["/tmp".to_string()],
+            read_write: vec![],
+            include_workdir: false,
+        });
+        policy.network_policies.insert(
+            "test".into(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "test-rule".into(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "example.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        enrich_proto_baseline_paths(&mut policy);
+
+        let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(
+            filesystem.read_only.contains(&"/tmp".to_string()),
+            "explicit read_only baseline path should be preserved"
+        );
+        assert!(
+            !filesystem.read_write.contains(&"/tmp".to_string()),
+            "baseline enrichment must not promote explicit read_only /tmp to read_write"
+        );
+    }
+
+    #[test]
+    fn local_enrichment_preserves_explicit_read_only_for_baseline_read_write_paths() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy {
+                read_only: vec![std::path::PathBuf::from("/tmp")],
+                read_write: vec![],
+                include_workdir: false,
+            },
+            network: NetworkPolicy {
+                mode: NetworkMode::Proxy,
+                proxy: Some(ProxyPolicy { http_addr: None }),
+            },
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy::default(),
+        };
+
+        enrich_sandbox_baseline_paths(&mut policy);
+
+        assert!(
+            policy
+                .filesystem
+                .read_only
+                .contains(&std::path::PathBuf::from("/tmp")),
+            "explicit read_only baseline path should be preserved"
+        );
+        assert!(
+            !policy
+                .filesystem
+                .read_write
+                .contains(&std::path::PathBuf::from("/tmp")),
+            "baseline enrichment must not promote explicit read_only /tmp to read_write"
+        );
     }
 }
 

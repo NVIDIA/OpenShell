@@ -4,19 +4,24 @@
 #![allow(unsafe_code)]
 
 use std::ffi::CString;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child as StdChild, Command as StdCommand, Stdio};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::{GUEST_SSH_PORT, embedded_runtime, ffi};
+use crate::{embedded_runtime, ffi, procguard};
 
 pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
 
+/// PID of the forked libkrun worker (the VM's PID 1). Zero when not running.
+/// Used by the SIGTERM/SIGINT handler to forward signals to the VM.
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+
+/// PID of the gvproxy helper process. Zero when not running. Used by the
+/// SIGTERM/SIGINT handler to make sure gvproxy doesn't survive the
+/// launcher on macOS (where we can't use `PR_SET_PDEATHSIG`).
+static GVPROXY_PID: AtomicI32 = AtomicI32::new(0);
 
 pub struct VmLaunchConfig {
     pub rootfs: PathBuf,
@@ -26,21 +31,8 @@ pub struct VmLaunchConfig {
     pub args: Vec<String>,
     pub env: Vec<String>,
     pub workdir: String,
-    pub port_map: Vec<String>,
     pub log_level: u32,
     pub console_output: PathBuf,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PortMapping {
-    host_port: u16,
-    guest_port: u16,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GvproxyPortPlan {
-    ssh_port: u16,
-    forwarded_ports: Vec<String>,
 }
 
 pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
@@ -49,6 +41,47 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
             "rootfs directory not found: {}",
             config.rootfs.display()
         ));
+    }
+
+    // Arm procguard first, BEFORE we spawn gvproxy or fork libkrun, so
+    // that the launcher can't be orphaned during setup. The cleanup
+    // callback reads the GVPROXY_PID atomic (initially 0 — no-op) and
+    // the CHILD_PID atomic (the libkrun fork), so it stays correct as
+    // those slots get populated later in this function. Only ONE arm
+    // per process: racing two watchers for the same NOTE_EXIT event
+    // would cause whichever wins to skip the cleanup.
+    if let Err(err) = procguard::die_with_parent_cleanup(|| {
+        // Cleanup order: SIGTERM gvproxy and the libkrun fork first so
+        // they can drain cleanly, then SIGKILL after a brief grace
+        // window. We can't rely on Rust destructors here; when
+        // procguard's watcher thread returns we call `std::process::exit`
+        // and the process tears down. Only async-signal-safe calls here:
+        // atomic loads and `kill(2)` are both on the POSIX list.
+        let gv_pid = GVPROXY_PID.load(Ordering::Relaxed);
+        let child_pid = CHILD_PID.load(Ordering::Relaxed);
+        if gv_pid > 0 {
+            unsafe {
+                libc::kill(gv_pid, libc::SIGTERM);
+            }
+        }
+        if child_pid > 0 {
+            unsafe {
+                libc::kill(child_pid, libc::SIGTERM);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        if gv_pid > 0 {
+            unsafe {
+                libc::kill(gv_pid, libc::SIGKILL);
+            }
+        }
+        if child_pid > 0 {
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+            }
+        }
+    }) {
+        return Err(format!("procguard arm failed: {err}"));
     }
 
     #[cfg(target_os = "linux")]
@@ -64,10 +97,40 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
     vm.set_root(&config.rootfs)?;
     vm.set_workdir(&config.workdir)?;
 
-    let mut forwarded_port_map = config.port_map.clone();
-    let mut gvproxy_guard = None;
-    let mut gvproxy_api_sock = None;
-    if !config.port_map.is_empty() {
+    // Run gvproxy strictly as the guest's virtual NIC / DHCP / router.
+    //
+    // After the supervisor-initiated relay migration (#867), the driver
+    // no longer forwards any host-side ports into the guest — all ingress
+    // traffic for SSH and exec rides the outbound `ConnectSupervisor`
+    // gRPC stream the guest opens to the gateway. What gvproxy still
+    // provides here is the TCP/IP *plane* the guest kernel needs:
+    //
+    //   * a virtio-net backend attached to libkrun via a Unix
+    //     SOCK_STREAM (Linux) or SOCK_DGRAM (macOS vfkit), which
+    //     surfaces as `eth0` inside the guest;
+    //   * the DHCP server + default router the guest's udhcpc client
+    //     talks to on boot (IPs 192.168.127.1 / .2, defaults for
+    //     gvisor-tap-vsock);
+    //   * the host-facing gateway identity the guest uses for callbacks:
+    //     the init script seeds `/etc/hosts` with
+    //     `host.openshell.internal` pointing at 192.168.127.1 while
+    //     leaving gvproxy's legacy `host.containers.internal` /
+    //     `host.docker.internal` DNS answers intact, which is how the guest's
+    //     `rewrite_openshell_endpoint_if_needed` probe reaches the host
+    //     gateway when the bare loopback address doesn't resolve from
+    //     inside the VM.
+    //
+    // That network plane is also what the sandbox supervisor's
+    // per-sandbox netns (veth pair + iptables, see
+    // `openshell-sandbox/src/sandbox/linux/netns.rs`) branches off of;
+    // libkrun's built-in TSI socket impersonation would not satisfy
+    // those kernel-level primitives.
+    //
+    // The `-listen` API socket and `-ssh-port` forwarder are both
+    // deliberately omitted: nothing in the driver enqueues port
+    // forwards on the API any more, and the host-side SSH listener is
+    // dead plumbing.
+    let gvproxy_guard = {
         let gvproxy_binary = runtime_dir.join("gvproxy");
         if !gvproxy_binary.is_file() {
             return Err(format!(
@@ -76,22 +139,15 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
             ));
         }
 
-        kill_stale_gvproxy_by_port_map(&config.port_map);
-
         let sock_base = gvproxy_socket_base(&config.rootfs)?;
         let net_sock = sock_base.with_extension("v");
-        let api_sock = sock_base.with_extension("a");
         let _ = std::fs::remove_file(&net_sock);
-        let _ = std::fs::remove_file(&api_sock);
         let _ = std::fs::remove_file(sock_base.with_extension("v-krun.sock"));
 
         let run_dir = config.rootfs.parent().unwrap_or(&config.rootfs);
         let gvproxy_log = run_dir.join("gvproxy.log");
         let gvproxy_log_file = std::fs::File::create(&gvproxy_log)
             .map_err(|e| format!("create gvproxy log {}: {e}", gvproxy_log.display()))?;
-
-        let gvproxy_ports = plan_gvproxy_ports(&config.port_map)?;
-        forwarded_port_map = gvproxy_ports.forwarded_ports;
 
         #[cfg(target_os = "linux")]
         let (gvproxy_net_flag, gvproxy_net_url) =
@@ -102,18 +158,51 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
             format!("unixgram://{}", net_sock.display()),
         );
 
-        let child = StdCommand::new(&gvproxy_binary)
+        // `-ssh-port -1` tells gvproxy to skip its default SSH forward
+        // (127.0.0.1:2222 → guest:22). We don't use it — all gateway
+        // ingress rides the supervisor-initiated relay — and leaving
+        // the default on would bind a host-side TCP listener per
+        // sandbox, racing concurrent sandboxes for port 2222 and
+        // surfacing a misleading "sshd is reachable" endpoint. See
+        // https://github.com/containers/gvisor-tap-vsock `cmd/gvproxy/main.go`
+        // (`getForwardsMap` returns an empty map when `sshPort == -1`).
+        let mut gvproxy_cmd = StdCommand::new(&gvproxy_binary);
+        gvproxy_cmd
             .arg(gvproxy_net_flag)
             .arg(&gvproxy_net_url)
-            .arg("-listen")
-            .arg(format!("unix://{}", api_sock.display()))
             .arg("-ssh-port")
-            .arg(gvproxy_ports.ssh_port.to_string())
+            .arg("-1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(gvproxy_log_file)
+            .stderr(gvproxy_log_file);
+
+        // On Linux the kernel will SIGKILL gvproxy the moment this
+        // launcher dies (or is SIGKILLed). `pre_exec` runs in the child
+        // between fork and execve, so the PR_SET_PDEATHSIG flag is
+        // inherited across execve and applies to gvproxy proper. On
+        // macOS/BSDs there is no equivalent; we fall back to killing
+        // gvproxy explicitly from the launcher's procguard cleanup
+        // callback (see `run_vm` above) and SIGTERM handler
+        // (see `install_signal_forwarding` below).
+        #[cfg(target_os = "linux")]
+        {
+            use nix::sys::signal::Signal;
+            use std::os::unix::process::CommandExt as _;
+            unsafe {
+                gvproxy_cmd.pre_exec(|| {
+                    nix::sys::prctl::set_pdeathsig(Signal::SIGKILL)
+                        .map_err(|err| std::io::Error::other(format!("pdeathsig: {err}")))
+                });
+            }
+        }
+
+        let child = gvproxy_cmd
             .spawn()
             .map_err(|e| format!("failed to start gvproxy {}: {e}", gvproxy_binary.display()))?;
+        // The procguard cleanup reads GVPROXY_PID atomically. Storing it
+        // here makes the callback able to SIGTERM gvproxy if the driver
+        // dies from this moment onward.
+        GVPROXY_PID.store(child.id() as i32, Ordering::Relaxed);
 
         wait_for_path(&net_sock, Duration::from_secs(5), "gvproxy data socket")?;
 
@@ -142,13 +231,9 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
             vm.add_net_unixgram(&net_sock, &mac, COMPAT_NET_FEATURES, NET_FLAG_VFKIT)?;
         }
 
-        gvproxy_guard = Some(GvproxyGuard::new(child));
-        gvproxy_api_sock = Some(api_sock);
-    }
+        Some(GvproxyGuard::new(child))
+    };
 
-    if !config.port_map.is_empty() && gvproxy_api_sock.is_none() {
-        vm.set_port_map(&config.port_map)?;
-    }
     vm.set_console_output(&config.console_output)?;
 
     let env = if config.env.is_empty() {
@@ -166,6 +251,20 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
     match pid {
         -1 => Err(format!("fork failed: {}", std::io::Error::last_os_error())),
         0 => {
+            // We are the libkrun worker (the VM's PID 1 inside the guest
+            // kernel, but a normal host process until krun_start_enter
+            // fires). Arm procguard so this fork is SIGKILLed if the
+            // parent launcher dies abruptly. On Linux this uses
+            // `PR_SET_PDEATHSIG`; on macOS this spawns a kqueue
+            // NOTE_EXIT watcher thread. Either way it closes the same
+            // leak gvproxy does above.
+            //
+            // We also SIGKILL ourselves if arming fails — there's no
+            // safe way to continue if we can't guarantee cleanup.
+            if let Err(err) = procguard::die_with_parent() {
+                eprintln!("libkrun worker: procguard arm failed: {err}");
+                std::process::exit(1);
+            }
             let ret = vm.start_enter();
             eprintln!("krun_start_enter failed: {ret}");
             std::process::exit(1);
@@ -173,24 +272,10 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
         _ => {
             install_signal_forwarding(pid);
 
-            let port_forward_result = if let Some(api_sock) = gvproxy_api_sock.as_ref() {
-                expose_port_map(api_sock, &forwarded_port_map)
-            } else {
-                Ok(())
-            };
-
-            if let Err(err) = port_forward_result {
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
-                let _ = wait_for_child(pid);
-                cleanup_gvproxy(gvproxy_guard);
-                return Err(err);
-            }
-
             let status = wait_for_child(pid)?;
             CHILD_PID.store(0, Ordering::Relaxed);
             cleanup_gvproxy(gvproxy_guard);
+            GVPROXY_PID.store(0, Ordering::Relaxed);
 
             if libc::WIFEXITED(status) {
                 match libc::WEXITSTATUS(status) {
@@ -399,15 +484,6 @@ impl VmContext {
         )
     }
 
-    fn set_port_map(&self, port_map: &[String]) -> Result<(), String> {
-        let port_strs: Vec<&str> = port_map.iter().map(String::as_str).collect();
-        let (_owners, ptrs) = c_string_array(&port_strs)?;
-        check(
-            unsafe { (self.krun.krun_set_port_map)(self.ctx_id, ptrs.as_ptr()) },
-            "krun_set_port_map",
-        )
-    }
-
     fn set_console_output(&self, path: &Path) -> Result<(), String> {
         let console_c = path_to_cstring(path)?;
         check(
@@ -474,126 +550,6 @@ impl Drop for GvproxyGuard {
             let _ = child.wait();
         }
     }
-}
-
-fn expose_port_map(api_sock: &Path, port_map: &[String]) -> Result<(), String> {
-    wait_for_path(api_sock, Duration::from_secs(2), "gvproxy API socket")?;
-    let guest_ip = "192.168.127.2";
-
-    for pm in port_map {
-        let mapping = parse_port_mapping(pm)?;
-
-        let expose_body = format!(
-            r#"{{"local":":{}","remote":"{guest_ip}:{}","protocol":"tcp"}}"#,
-            mapping.host_port, mapping.guest_port
-        );
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut retry_interval = Duration::from_millis(100);
-        loop {
-            match gvproxy_expose(api_sock, &expose_body) {
-                Ok(()) => break,
-                Err(err) if Instant::now() < deadline => {
-                    std::thread::sleep(retry_interval);
-                    retry_interval = (retry_interval * 2).min(Duration::from_secs(1));
-                    if retry_interval == Duration::from_secs(1) {
-                        eprintln!("retrying gvproxy port expose {pm}: {err}");
-                    }
-                }
-                Err(err) => {
-                    return Err(format!(
-                        "failed to forward port {} via gvproxy: {err}",
-                        mapping.host_port
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn gvproxy_expose(api_sock: &Path, body: &str) -> Result<(), String> {
-    let mut stream =
-        UnixStream::connect(api_sock).map_err(|e| format!("connect to gvproxy API socket: {e}"))?;
-
-    let request = format!(
-        "POST /services/forwarder/expose HTTP/1.1\r\n\
-         Host: localhost\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body.len(),
-        body,
-    );
-
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| format!("write to gvproxy API: {e}"))?;
-
-    let mut buf = [0u8; 1024];
-    let n = stream
-        .read(&mut buf)
-        .map_err(|e| format!("read from gvproxy API: {e}"))?;
-    let response = String::from_utf8_lossy(&buf[..n]);
-    let status = response
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("0");
-
-    match status {
-        "200" | "204" => Ok(()),
-        _ => Err(format!(
-            "gvproxy API: {}",
-            response.lines().next().unwrap_or("<empty>")
-        )),
-    }
-}
-
-fn plan_gvproxy_ports(port_map: &[String]) -> Result<GvproxyPortPlan, String> {
-    let mut ssh_port = None;
-    let mut forwarded_ports = Vec::with_capacity(port_map.len());
-
-    for pm in port_map {
-        let mapping = parse_port_mapping(pm)?;
-        if ssh_port.is_none() && mapping.guest_port == GUEST_SSH_PORT && mapping.host_port >= 1024 {
-            ssh_port = Some(mapping.host_port);
-            continue;
-        }
-        forwarded_ports.push(pm.clone());
-    }
-
-    Ok(GvproxyPortPlan {
-        ssh_port: match ssh_port {
-            Some(port) => port,
-            None => pick_gvproxy_ssh_port()?,
-        },
-        forwarded_ports,
-    })
-}
-
-fn parse_port_mapping(pm: &str) -> Result<PortMapping, String> {
-    let parts: Vec<&str> = pm.split(':').collect();
-    let (host, guest) = match parts.as_slice() {
-        [host, guest] => (*host, *guest),
-        [port] => (*port, *port),
-        _ => return Err(format!("invalid port mapping '{pm}'")),
-    };
-
-    let host_port = host
-        .parse::<u16>()
-        .map_err(|_| format!("invalid port mapping '{pm}'"))?;
-    let guest_port = guest
-        .parse::<u16>()
-        .map_err(|_| format!("invalid port mapping '{pm}'"))?;
-
-    Ok(PortMapping {
-        host_port,
-        guest_port,
-    })
 }
 
 fn wait_for_path(path: &Path, timeout: Duration, label: &str) -> Result<(), String> {
@@ -674,92 +630,6 @@ fn gvproxy_socket_base(rootfs: &Path) -> Result<PathBuf, String> {
     Ok(secure_socket_base("osd-gv")?.join(hash_path_id(rootfs)))
 }
 
-fn pick_gvproxy_ssh_port() -> Result<u16, String> {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|e| format!("allocate gvproxy ssh port on localhost: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("read gvproxy ssh port: {e}"))?
-        .port();
-    drop(listener);
-    Ok(port)
-}
-
-fn kill_stale_gvproxy_by_port_map(port_map: &[String]) {
-    for pm in port_map {
-        if let Some(host_port) = pm
-            .split(':')
-            .next()
-            .and_then(|port| port.parse::<u16>().ok())
-        {
-            kill_stale_gvproxy_by_port(host_port);
-        }
-    }
-}
-
-fn kill_stale_gvproxy_by_port(port: u16) {
-    let output = StdCommand::new("lsof")
-        .args(["-ti", &format!(":{port}")])
-        .output();
-
-    let pids = match output {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).to_string()
-        }
-        _ => return,
-    };
-
-    for line in pids.lines() {
-        if let Ok(pid) = line.trim().parse::<u32>()
-            && is_process_named(pid as libc::pid_t, "gvproxy")
-        {
-            kill_gvproxy_pid(pid);
-        }
-    }
-}
-
-fn kill_gvproxy_pid(pid: u32) {
-    let pid = pid as libc::pid_t;
-    if unsafe { libc::kill(pid, 0) } != 0 {
-        return;
-    }
-    if !is_process_named(pid, "gvproxy") {
-        return;
-    }
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-    }
-    std::thread::sleep(Duration::from_millis(200));
-}
-
-#[cfg(target_os = "macos")]
-fn is_process_named(pid: libc::pid_t, expected: &str) -> bool {
-    StdCommand::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .ok()
-        .and_then(|output| {
-            if output.status.success() {
-                String::from_utf8(output.stdout).ok()
-            } else {
-                None
-            }
-        })
-        .is_some_and(|name| name.trim().contains(expected))
-}
-
-#[cfg(target_os = "linux")]
-fn is_process_named(pid: libc::pid_t, expected: &str) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|name| name.trim().contains(expected))
-        .unwrap_or(false)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn is_process_named(_pid: libc::pid_t, _expected: &str) -> bool {
-    false
-}
-
 fn install_signal_forwarding(pid: i32) {
     unsafe {
         libc::signal(
@@ -774,11 +644,28 @@ fn install_signal_forwarding(pid: i32) {
     CHILD_PID.store(pid, Ordering::Relaxed);
 }
 
+/// Async-signal-safe handler that forwards SIGTERM to every process we
+/// own: the libkrun VM worker and the gvproxy helper. We cannot rely on
+/// Rust destructors (`GvproxyGuard::drop`, `ManagedDriverProcess::drop`)
+/// running on signal-driven exit, so we explicitly deliver the signal
+/// here. The `wait_for_child` loop reaps libkrun and `cleanup_gvproxy`
+/// reaps gvproxy before `run_vm` returns.
+///
+/// Only async-signal-safe libc calls are used — `kill(2)` is listed in
+/// POSIX.1-2017 as async-signal-safe, atomic loads are lock-free on the
+/// platforms we target.
 extern "C" fn forward_signal(_sig: libc::c_int) {
-    let pid = CHILD_PID.load(Ordering::Relaxed);
-    if pid > 0 {
+    let vm_pid = CHILD_PID.load(Ordering::Relaxed);
+    if vm_pid > 0 {
         unsafe {
-            libc::kill(pid, libc::SIGTERM);
+            libc::kill(vm_pid, libc::SIGTERM);
+        }
+    }
+    let gv_pid = GVPROXY_PID.load(Ordering::Relaxed);
+    if gv_pid > 0 {
+        // gvproxy handles SIGTERM cleanly; no need for SIGKILL.
+        unsafe {
+            libc::kill(gv_pid, libc::SIGTERM);
         }
     }
 }
@@ -839,39 +726,4 @@ fn check_kvm_access() -> Result<(), String> {
         .map_err(|e| {
             format!("cannot open /dev/kvm: {e}\nKVM access is required to run microVMs on Linux.")
         })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plan_gvproxy_ports_reuses_sandbox_ssh_mapping() {
-        let plan = plan_gvproxy_ports(&["64739:2222".to_string()]).expect("plan should succeed");
-
-        assert_eq!(plan.ssh_port, 64739);
-        assert!(plan.forwarded_ports.is_empty());
-    }
-
-    #[test]
-    fn plan_gvproxy_ports_keeps_non_ssh_mappings_for_forwarder() {
-        let plan = plan_gvproxy_ports(&["64739:8080".to_string()]).expect("plan should succeed");
-
-        assert_ne!(plan.ssh_port, 64739);
-        assert_eq!(plan.forwarded_ports, vec!["64739:8080".to_string()]);
-    }
-
-    #[test]
-    fn plan_gvproxy_ports_ignores_privileged_host_ports_for_direct_ssh() {
-        let plan = plan_gvproxy_ports(&["22:2222".to_string()]).expect("plan should succeed");
-
-        assert_ne!(plan.ssh_port, 22);
-        assert_eq!(plan.forwarded_ports, vec!["22:2222".to_string()]);
-    }
-
-    #[test]
-    fn parse_port_mapping_rejects_invalid_entries() {
-        let err = parse_port_mapping("bad:mapping").expect_err("invalid mapping should fail");
-        assert!(err.contains("invalid port mapping"));
-    }
 }

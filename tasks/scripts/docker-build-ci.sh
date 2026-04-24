@@ -8,6 +8,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/container-engine.sh"
+
 OUTPUT_ARGS=(--load)
 if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
   OUTPUT_ARGS=(--push)
@@ -15,7 +18,7 @@ elif [[ "${DOCKER_PLATFORM:-}" == *","* ]]; then
   OUTPUT_ARGS=(--push)
 fi
 
-exec docker buildx build \
+exec ce_build \
   ${DOCKER_BUILDER:+--builder ${DOCKER_BUILDER}} \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
   -f deploy/docker/Dockerfile.ci \

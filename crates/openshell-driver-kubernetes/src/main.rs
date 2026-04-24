@@ -39,8 +39,12 @@ struct Args {
     #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
     grpc_endpoint: Option<String>,
 
-    #[arg(long, env = "OPENSHELL_SANDBOX_SSH_PORT", default_value_t = 2222)]
-    sandbox_ssh_port: u16,
+    #[arg(
+        long,
+        env = "OPENSHELL_SANDBOX_SSH_SOCKET_PATH",
+        default_value = "/run/openshell/ssh.sock"
+    )]
+    sandbox_ssh_socket_path: String,
 
     #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
     ssh_handshake_secret: String,
@@ -69,8 +73,7 @@ async fn main() -> Result<()> {
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
-        ssh_listen_addr: format!("0.0.0.0:{}", args.sandbox_ssh_port),
-        ssh_port: args.sandbox_ssh_port,
+        ssh_socket_path: args.sandbox_ssh_socket_path,
         ssh_handshake_secret: args.ssh_handshake_secret,
         ssh_handshake_skew_secs: args.ssh_handshake_skew_secs,
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),

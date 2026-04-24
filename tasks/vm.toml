@@ -5,22 +5,25 @@
 #
 # Workflow:
 #   mise run vm:setup          # one-time: download pre-built runtime (~30s)
-#   mise run vm                # build + run the VM
+#   mise run gateway:vm        # start openshell-gateway with the VM driver
+#   mise run vm                # build + run the standalone openshell-vm microVM
 #   mise run vm:clean          # wipe everything and start over
 #
-# See crates/openshell-vm/README.md for full documentation.
+# See crates/openshell-driver-vm/README.md for the `gateway:vm` flow and
+# crates/openshell-vm/README.md for the standalone microVM path.
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Commands
 # ═══════════════════════════════════════════════════════════════════════════
 
+["gateway:vm"]
+description = "Build openshell-gateway + openshell-driver-vm and start the gateway with the VM driver"
+run = "crates/openshell-driver-vm/start.sh"
+
 [vm]
-description = "Build and run the openshell-vm microVM"
+description = "Build and run the standalone openshell-vm microVM"
 depends = ["build:docker:gateway"]
-run = [
-  "mise run vm:build",
-  "tasks/scripts/vm/run-vm.sh",
-]
+run = ["mise run vm:build", "tasks/scripts/vm/run-vm.sh"]
 
 ["vm:build"]
 description = "Build the openshell-vm binary with embedded runtime"
@@ -42,3 +45,7 @@ run = "tasks/scripts/vm/build-rootfs-tarball.sh"
 ["vm:clean"]
 description = "Remove all VM cached artifacts (runtime, rootfs, builds)"
 run = "tasks/scripts/vm/vm-clean.sh"
+
+["vm:smoke:orphan-cleanup"]
+description = "Smoke test: start gateway+driver, create a sandbox, signal the gateway, assert no orphaned processes survive"
+run = "tasks/scripts/vm/smoke-orphan-cleanup.sh"

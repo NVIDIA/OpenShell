@@ -53,6 +53,9 @@ webpki-roots = { workspace = true }
 # HTTP
 bytes = { workspace = true }
 
+# UUID
+uuid = { workspace = true }
+
 # Encoding
 base64 = { workspace = true }
 

@@ -78,5 +78,7 @@ kubectl -n openshell get secret openshell-ssh-handshake >/dev/null 2>&1 || exit 
 # iptables rules for NodePort routing.  Without this check the health check
 # can pass before the port is routable, causing "Connection refused" on the
 # host-mapped port.
+# Use </dev/tcp (no echo) to avoid sending plaintext bytes into the TLS
+# listener, which would log InvalidContentType errors in the gateway.
 # ---------------------------------------------------------------------------
-timeout 2 bash -c 'echo >/dev/tcp/127.0.0.1/30051' 2>/dev/null || exit 1
+timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/30051 && exec 3>&-' 2>/dev/null || exit 1

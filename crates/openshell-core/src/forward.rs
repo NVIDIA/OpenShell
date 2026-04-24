@@ -487,6 +487,188 @@ pub fn shell_escape(value: &str) -> String {
     format!("'{escaped}'")
 }
 
+/// Build the SSH `ProxyCommand` string used to tunnel to a sandbox.
+///
+/// Every interpolated argument is shell-escaped so that server-supplied values
+/// (gateway URL, sandbox id, token, gateway name) cannot inject shell
+/// metacharacters into the command that OpenSSH executes via `/bin/sh -c`.
+pub fn build_proxy_command(
+    exe: &str,
+    gateway_url: &str,
+    sandbox_id: &str,
+    token: &str,
+    gateway_name: &str,
+) -> String {
+    format!(
+        "{} ssh-proxy --gateway {} --sandbox-id {} --token {} --gateway-name {}",
+        shell_escape(exe),
+        shell_escape(gateway_url),
+        shell_escape(sandbox_id),
+        shell_escape(token),
+        shell_escape(gateway_name),
+    )
+}
+
+/// Error returned when a `CreateSshSessionResponse` fails validation.
+///
+/// The response fields flow into a `ProxyCommand` string executed by
+/// `/bin/sh -c`; any deviation from the documented charset is rejected at the
+/// gRPC trust boundary before escaping is attempted.
+#[derive(Debug, thiserror::Error)]
+pub enum SshSessionResponseError {
+    #[error("{field} is empty")]
+    Empty { field: &'static str },
+    #[error("{field} exceeds maximum length of {max} bytes")]
+    TooLong { field: &'static str, max: usize },
+    #[error("{field} contains invalid characters")]
+    InvalidChars { field: &'static str },
+    #[error("gateway_scheme must be 'http' or 'https'")]
+    InvalidScheme,
+    #[error("gateway_port must be in range 1..=65535")]
+    InvalidPort,
+    #[error("connect_path must start with '/'")]
+    ConnectPathNotAbsolute,
+}
+
+const MAX_SANDBOX_ID_LEN: usize = 128;
+const MAX_TOKEN_LEN: usize = 4096;
+const MAX_GATEWAY_HOST_LEN: usize = 253;
+const MAX_CONNECT_PATH_LEN: usize = 2048;
+const MAX_FINGERPRINT_LEN: usize = 256;
+
+fn is_sandbox_id_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')
+}
+
+fn is_token_byte(b: u8) -> bool {
+    // URL-safe base64 + common token charset. No shell metacharacters, no
+    // whitespace, no control bytes.
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'~' | b'+' | b'/' | b'=')
+}
+
+fn is_gateway_host_byte(b: u8) -> bool {
+    // DNS hostname (alphanumeric + `.-`), IPv4, or bracketed IPv6 (`[::1]`).
+    // Rejects Unicode — callers must Punycode-encode IDN hosts before emitting.
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']')
+}
+
+fn is_connect_path_byte(b: u8) -> bool {
+    // RFC 3986 path charset (pchar) without `?`, `#`, space, backtick, or
+    // backslash. `%` is permitted so percent-encoded segments round-trip.
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+                | b'/'
+                | b'%'
+        )
+}
+
+fn is_fingerprint_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b':' | b'+' | b'/' | b'=' | b'-')
+}
+
+/// Validate a `CreateSshSessionResponse` before any of its fields are used to
+/// build a shell command or config file.
+///
+/// This is a belt-and-suspenders pair to [`build_proxy_command`]: escaping
+/// alone is sufficient to prevent injection, but rejecting malformed fields
+/// at the trust boundary fails loudly before the string is assembled and
+/// catches gateway bugs or tampering early.
+pub fn validate_ssh_session_response(
+    resp: &crate::proto::CreateSshSessionResponse,
+) -> std::result::Result<(), SshSessionResponseError> {
+    validate_field(
+        "sandbox_id",
+        &resp.sandbox_id,
+        MAX_SANDBOX_ID_LEN,
+        is_sandbox_id_byte,
+    )?;
+    validate_field("token", &resp.token, MAX_TOKEN_LEN, is_token_byte)?;
+    validate_field(
+        "gateway_host",
+        &resp.gateway_host,
+        MAX_GATEWAY_HOST_LEN,
+        is_gateway_host_byte,
+    )?;
+    match resp.gateway_scheme.as_str() {
+        "http" | "https" => {}
+        _ => return Err(SshSessionResponseError::InvalidScheme),
+    }
+    if resp.gateway_port == 0 || resp.gateway_port > u32::from(u16::MAX) {
+        return Err(SshSessionResponseError::InvalidPort);
+    }
+    if resp.connect_path.is_empty() {
+        return Err(SshSessionResponseError::Empty {
+            field: "connect_path",
+        });
+    }
+    if !resp.connect_path.starts_with('/') {
+        return Err(SshSessionResponseError::ConnectPathNotAbsolute);
+    }
+    if resp.connect_path.len() > MAX_CONNECT_PATH_LEN {
+        return Err(SshSessionResponseError::TooLong {
+            field: "connect_path",
+            max: MAX_CONNECT_PATH_LEN,
+        });
+    }
+    if !resp.connect_path.bytes().all(is_connect_path_byte) {
+        return Err(SshSessionResponseError::InvalidChars {
+            field: "connect_path",
+        });
+    }
+    if !resp.host_key_fingerprint.is_empty() {
+        if resp.host_key_fingerprint.len() > MAX_FINGERPRINT_LEN {
+            return Err(SshSessionResponseError::TooLong {
+                field: "host_key_fingerprint",
+                max: MAX_FINGERPRINT_LEN,
+            });
+        }
+        if !resp.host_key_fingerprint.bytes().all(is_fingerprint_byte) {
+            return Err(SshSessionResponseError::InvalidChars {
+                field: "host_key_fingerprint",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_field(
+    name: &'static str,
+    value: &str,
+    max_len: usize,
+    byte_ok: fn(u8) -> bool,
+) -> std::result::Result<(), SshSessionResponseError> {
+    if value.is_empty() {
+        return Err(SshSessionResponseError::Empty { field: name });
+    }
+    if value.len() > max_len {
+        return Err(SshSessionResponseError::TooLong {
+            field: name,
+            max: max_len,
+        });
+    }
+    if !value.bytes().all(byte_ok) {
+        return Err(SshSessionResponseError::InvalidChars { field: name });
+    }
+    Ok(())
+}
+
 /// Build notes string for a sandbox based on active forwards.
 ///
 /// Returns a string like `fwd:8080,3000` or an empty string if no forwards
@@ -567,6 +749,202 @@ mod tests {
     #[test]
     fn shell_escape_special_chars() {
         assert_eq!(shell_escape("it's"), "'it'\"'\"'s'");
+    }
+
+    fn valid_session_response() -> crate::proto::CreateSshSessionResponse {
+        crate::proto::CreateSshSessionResponse {
+            sandbox_id: "sb-1234".to_string(),
+            token: "abcDEF-123_456.789".to_string(),
+            gateway_scheme: "https".to_string(),
+            gateway_host: "gateway.example.com".to_string(),
+            gateway_port: 443,
+            connect_path: "/connect/ssh".to_string(),
+            host_key_fingerprint: String::new(),
+            expires_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn validate_ssh_session_response_accepts_realistic_response() {
+        assert!(validate_ssh_session_response(&valid_session_response()).is_ok());
+    }
+
+    #[test]
+    fn validate_ssh_session_response_accepts_bracketed_ipv6_host() {
+        let mut r = valid_session_response();
+        r.gateway_host = "[::1]".to_string();
+        assert!(validate_ssh_session_response(&r).is_ok());
+    }
+
+    #[test]
+    fn validate_ssh_session_response_accepts_optional_fingerprint() {
+        let mut r = valid_session_response();
+        r.host_key_fingerprint = "SHA256:abcd+/=".to_string();
+        assert!(validate_ssh_session_response(&r).is_ok());
+    }
+
+    #[test]
+    fn validate_ssh_session_response_rejects_empty_sandbox_id() {
+        let mut r = valid_session_response();
+        r.sandbox_id.clear();
+        assert!(matches!(
+            validate_ssh_session_response(&r),
+            Err(SshSessionResponseError::Empty {
+                field: "sandbox_id"
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_ssh_session_response_rejects_shell_metachars_in_sandbox_id() {
+        for bad in ["a;b", "a b", "a$(id)", "a`id`", "a|b", "a&b", "a\nb"] {
+            let mut r = valid_session_response();
+            r.sandbox_id = bad.to_string();
+            assert!(
+                validate_ssh_session_response(&r).is_err(),
+                "expected reject for sandbox_id={bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ssh_session_response_rejects_shell_metachars_in_token() {
+        for bad in ["$(id)", "`id`", "a;b", "a b", "a\tb", "a\0b"] {
+            let mut r = valid_session_response();
+            r.token = bad.to_string();
+            assert!(
+                validate_ssh_session_response(&r).is_err(),
+                "expected reject for token={bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ssh_session_response_rejects_invalid_gateway_host() {
+        for bad in ["evil; cmd", "evil host", "ev$(id)il", "ev\nil", "evil/x"] {
+            let mut r = valid_session_response();
+            r.gateway_host = bad.to_string();
+            assert!(
+                validate_ssh_session_response(&r).is_err(),
+                "expected reject for gateway_host={bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ssh_session_response_rejects_unknown_scheme() {
+        for bad in ["javascript", "file", "", "HTTPS", "ftp"] {
+            let mut r = valid_session_response();
+            r.gateway_scheme = bad.to_string();
+            assert!(
+                matches!(
+                    validate_ssh_session_response(&r),
+                    Err(SshSessionResponseError::InvalidScheme)
+                ),
+                "expected InvalidScheme for scheme={bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ssh_session_response_rejects_out_of_range_port() {
+        for bad in [0u32, 65_536, 100_000] {
+            let mut r = valid_session_response();
+            r.gateway_port = bad;
+            assert!(matches!(
+                validate_ssh_session_response(&r),
+                Err(SshSessionResponseError::InvalidPort)
+            ));
+        }
+    }
+
+    #[test]
+    fn validate_ssh_session_response_rejects_connect_path_without_leading_slash() {
+        let mut r = valid_session_response();
+        r.connect_path = "connect/ssh".to_string();
+        assert!(matches!(
+            validate_ssh_session_response(&r),
+            Err(SshSessionResponseError::ConnectPathNotAbsolute)
+        ));
+    }
+
+    #[test]
+    fn validate_ssh_session_response_rejects_injected_connect_path() {
+        // `$`, `(`, `)` are valid RFC 3986 sub-delims (pchar) so the validator
+        // permits them; shell_escape is the second defensive layer. The
+        // following characters are rejected at the validator boundary because
+        // they are either unambiguously hostile in a shell context or invalid
+        // per RFC 3986 in the path component.
+        for bad in ["/x`id`y", "/x y", "/x\nb", "/x\\b", "/x?q=1", "/x#frag"] {
+            let mut r = valid_session_response();
+            r.connect_path = bad.to_string();
+            assert!(
+                validate_ssh_session_response(&r).is_err(),
+                "expected reject for connect_path={bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_proxy_command_escapes_shell_metacharacters() {
+        // Attacker-controlled values in every escapable position.
+        let cmd = build_proxy_command(
+            "/usr/local/bin/openshell",
+            "https://gw:443/connect",
+            "x$(touch /tmp/pwn)x",
+            "tok`id`",
+            "gw-name",
+        );
+
+        // The `$` / backtick must only appear inside single-quoted regions.
+        // A simple grep-based check: split on single-quoted runs and assert
+        // no shell metacharacter remains in the unquoted remainder.
+        assert!(!outside_single_quotes(&cmd).contains('$'));
+        assert!(!outside_single_quotes(&cmd).contains('`'));
+        assert!(!outside_single_quotes(&cmd).contains('|'));
+        assert!(!outside_single_quotes(&cmd).contains(';'));
+        assert!(!outside_single_quotes(&cmd).contains('&'));
+        assert!(!outside_single_quotes(&cmd).contains('\n'));
+    }
+
+    #[test]
+    fn build_proxy_command_empty_values_quote_rather_than_vanish() {
+        // An empty value must become `''` rather than disappearing — otherwise
+        // downstream argv splitting would misalign.
+        let cmd = build_proxy_command("exe", "gw", "", "tok", "name");
+        assert!(cmd.contains("--sandbox-id ''"));
+    }
+
+    #[test]
+    fn build_proxy_command_safe_values_pass_through_unquoted() {
+        let cmd = build_proxy_command(
+            "/usr/local/bin/openshell",
+            "gw",
+            "sb-123",
+            "tok.456",
+            "name_1",
+        );
+        assert_eq!(
+            cmd,
+            "/usr/local/bin/openshell ssh-proxy --gateway gw --sandbox-id sb-123 --token tok.456 --gateway-name name_1"
+        );
+    }
+
+    /// Helper: return the concatenation of characters that appear outside
+    /// POSIX single-quoted runs. Used by the metacharacter assertions above.
+    fn outside_single_quotes(s: &str) -> String {
+        let mut out = String::new();
+        let mut inside = false;
+        for c in s.chars() {
+            if c == '\'' {
+                inside = !inside;
+                continue;
+            }
+            if !inside {
+                out.push(c);
+            }
+        }
+        out
     }
 
     #[test]

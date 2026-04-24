@@ -421,10 +421,14 @@ Watch for `deny` actions that indicate the user's work is being blocked by polic
 
 When denied actions are observed:
 
-1. Pull current policy: `openshell policy get work-session --full > policy.yaml`
-2. Modify the policy to allow the blocked actions (use `generate-sandbox-policy` skill for content)
-3. Push the update: `openshell policy set work-session --policy policy.yaml --wait`
-4. Verify: `openshell policy list work-session`
+1. Prefer incremental updates for additive network changes:
+   `openshell policy update work-session --add-endpoint api.github.com:443:read-only:rest:enforce --binary /usr/bin/gh --wait`
+   `openshell policy update work-session --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
+2. Use full YAML replacement when the change is broad or touches non-network fields:
+   `openshell policy get work-session --full > policy.yaml`
+   Modify the policy to allow the blocked actions (use `generate-sandbox-policy` skill for content)
+   `openshell policy set work-session --policy policy.yaml --wait`
+3. Verify: `openshell policy list work-session`
 
 The user does not need to disconnect -- policy updates are hot-reloaded within ~30 seconds (or immediately when using `--wait`, which polls for confirmation).
 
@@ -543,6 +547,7 @@ $ openshell sandbox upload --help
 | Create with custom policy | `openshell sandbox create --policy ./p.yaml` |
 | Connect to sandbox | `openshell sandbox connect <name>` |
 | Stream live logs | `openshell logs <name> --tail` |
+| Incremental policy update | `openshell policy update <name> --add-endpoint host:443:read-only:rest:enforce --binary /usr/bin/curl --wait` |
 | Pull current policy | `openshell policy get <name> --full > p.yaml` |
 | Push updated policy | `openshell policy set <name> --policy p.yaml --wait` |
 | Policy revision history | `openshell policy list <name>` |

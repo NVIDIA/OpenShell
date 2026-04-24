@@ -9,6 +9,7 @@
 set -euo pipefail
 
 BOOT_START=$(date +%s%3N 2>/dev/null || date +%s)
+GVPROXY_GATEWAY_IP="192.168.127.1"
 
 ts() {
     local now
@@ -72,6 +73,20 @@ tcp_probe() {
     fi
 }
 
+ensure_host_gateway_aliases() {
+    local hosts_tmp="/tmp/openshell-hosts.$$"
+
+    if [ -f /etc/hosts ]; then
+        grep -vE '(^|[[:space:]])host\.openshell\.internal([[:space:]]|$)' /etc/hosts > "$hosts_tmp" || true
+    else
+        : > "$hosts_tmp"
+    fi
+
+    printf '%s host.openshell.internal\n' "$GVPROXY_GATEWAY_IP" >> "$hosts_tmp"
+    cat "$hosts_tmp" > /etc/hosts
+    rm -f "$hosts_tmp"
+}
+
 rewrite_openshell_endpoint_if_needed() {
     local endpoint="${OPENSHELL_ENDPOINT:-}"
     [ -n "$endpoint" ] || return 0
@@ -92,7 +107,7 @@ rewrite_openshell_endpoint_if_needed() {
         return 0
     fi
 
-    for candidate in host.containers.internal host.docker.internal 192.168.127.1; do
+    for candidate in host.openshell.internal host.containers.internal host.docker.internal "$GVPROXY_GATEWAY_IP"; do
         if [ "$candidate" = "$host" ]; then
             continue
         fi
@@ -163,18 +178,20 @@ DHCP_SCRIPT
         if ! udhcpc -i eth0 -f -q -n -T 1 -t 3 -A 1 -s "$UDHCPC_SCRIPT" 2>&1; then
             ts "WARNING: DHCP failed, falling back to static config"
             ip addr add 192.168.127.2/24 dev eth0 2>/dev/null || true
-            ip route add default via 192.168.127.1 2>/dev/null || true
+            ip route add default via "$GVPROXY_GATEWAY_IP" 2>/dev/null || true
         fi
     else
         ts "no DHCP client, using static config"
         ip addr add 192.168.127.2/24 dev eth0 2>/dev/null || true
-        ip route add default via 192.168.127.1 2>/dev/null || true
+        ip route add default via "$GVPROXY_GATEWAY_IP" 2>/dev/null || true
     fi
 
     if [ ! -s /etc/resolv.conf ]; then
         echo "nameserver 8.8.8.8" > /etc/resolv.conf
         echo "nameserver 8.8.4.4" >> /etc/resolv.conf
     fi
+
+    ensure_host_gateway_aliases
 else
     ts "WARNING: eth0 not found; supervisor will start without guest egress"
 fi

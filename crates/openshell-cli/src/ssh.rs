@@ -8,7 +8,8 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use openshell_core::forward::{
-    find_ssh_forward_pid, resolve_ssh_gateway, shell_escape, write_forward_pid,
+    build_proxy_command, find_ssh_forward_pid, resolve_ssh_gateway, shell_escape,
+    validate_ssh_session_response, write_forward_pid,
 };
 use openshell_core::proto::{CreateSshSessionRequest, GetSandboxRequest};
 use owo_colors::OwoColorize;
@@ -86,11 +87,13 @@ async fn ssh_session_config(
         .await
         .into_diagnostic()?;
     let session = response.into_inner();
+    validate_ssh_session_response(&session)
+        .map_err(|err| miette::miette!("gateway returned invalid SSH session response: {err}"))?;
 
     let exe = std::env::current_exe()
         .into_diagnostic()
         .wrap_err("failed to resolve OpenShell executable")?;
-    let exe_command = shell_escape(&exe.to_string_lossy());
+    let exe_command = exe.to_string_lossy().into_owned();
 
     // When using Cloudflare bearer auth, the SSH CONNECT must go through the
     // external tunnel endpoint (the cluster URL), not the server's internal
@@ -114,12 +117,12 @@ async fn ssh_session_config(
     let gateway_name = tls
         .gateway_name()
         .ok_or_else(|| miette::miette!("gateway name is required to build SSH proxy command"))?;
-    let proxy_command = format!(
-        "{exe_command} ssh-proxy --gateway {} --sandbox-id {} --token {} --gateway-name {}",
-        gateway_url,
-        session.sandbox_id,
-        session.token,
-        shell_escape(gateway_name),
+    let proxy_command = build_proxy_command(
+        &exe_command,
+        &gateway_url,
+        &session.sandbox_id,
+        &session.token,
+        gateway_name,
     );
 
     Ok(SshSessionConfig {
@@ -131,6 +134,11 @@ async fn ssh_session_config(
 }
 
 fn ssh_base_command(proxy_command: &str) -> Command {
+    // SSH log level follows the program's verbosity.  main() maps the `-v`
+    // count to OPENSHELL_SSH_LOG_LEVEL; an explicit env-var override wins.
+    let ssh_log_level =
+        std::env::var("OPENSHELL_SSH_LOG_LEVEL").unwrap_or_else(|_| "ERROR".to_string());
+
     let mut command = Command::new("ssh");
     command
         .arg("-o")
@@ -142,7 +150,15 @@ fn ssh_base_command(proxy_command: &str) -> Command {
         .arg("-o")
         .arg("GlobalKnownHostsFile=/dev/null")
         .arg("-o")
-        .arg("LogLevel=ERROR");
+        .arg(format!("LogLevel={ssh_log_level}"))
+        // Detect a dead relay within ~45s. The relay rides on a TCP connection
+        // that the client has no way to observe silently dropping (gateway
+        // restart, supervisor restart, cluster failover), so fall back to
+        // SSH-level keepalives instead of hanging forever.
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3");
     command
 }
 
@@ -516,7 +532,9 @@ async fn ssh_tar_upload(
                         .append_path_with_name(&local_path, &tar_name)
                         .into_diagnostic()?;
                 } else if local_path.is_dir() {
-                    archive.append_dir_all(".", &local_path).into_diagnostic()?;
+                    archive
+                        .append_dir_all(&tar_name, &local_path)
+                        .into_diagnostic()?;
                 } else {
                     return Err(miette::miette!(
                         "local path does not exist: {}",
@@ -654,8 +672,11 @@ pub async fn sandbox_sync_up(
             .ok_or_else(|| miette::miette!("path has no file name"))?
             .to_os_string()
     } else {
-        // For directories the tar_name is unused — append_dir_all uses "."
-        ".".into()
+        // For directories, wrap contents under the source basename so uploads
+        // land at `<dest>/<dirname>/...` — matches `scp -r` and `cp -r`. Falls
+        // back to "." for paths with no meaningful basename (`.`, `/`), which
+        // preserves the legacy flatten behavior in those edge cases.
+        directory_upload_prefix(local_path)
     };
 
     ssh_tar_upload(
@@ -669,6 +690,19 @@ pub async fn sandbox_sync_up(
         tls,
     )
     .await
+}
+
+/// Compute the tar entry prefix for a directory upload.
+///
+/// Returns the directory's basename for any path with a meaningful basename;
+/// callers extracting at `<dest>` will see contents wrapped under
+/// `<dest>/<basename>/...`. Returns `"."` for paths without a basename
+/// (e.g. `.` or `/`), which produces flat extraction at `<dest>`.
+fn directory_upload_prefix(local_path: &Path) -> std::ffi::OsString {
+    local_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| ".".into())
 }
 
 /// Pull a path from a sandbox to a local destination using tar-over-SSH.
@@ -867,10 +901,14 @@ fn render_ssh_config(gateway: &str, name: &str) -> String {
     let exe = std::env::current_exe().expect("failed to resolve OpenShell executable");
     let exe = shell_escape(&exe.to_string_lossy());
 
-    let proxy_cmd = format!("{exe} ssh-proxy --gateway-name {gateway} --name {name}");
+    let proxy_cmd = format!(
+        "{exe} ssh-proxy --gateway-name {} --name {}",
+        shell_escape(gateway),
+        shell_escape(name),
+    );
     let host_alias = host_alias(name);
     format!(
-        "Host {host_alias}\n    User sandbox\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    GlobalKnownHostsFile /dev/null\n    LogLevel ERROR\n    ProxyCommand {proxy_cmd}\n"
+        "Host {host_alias}\n    User sandbox\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    GlobalKnownHostsFile /dev/null\n    LogLevel ERROR\n    ServerAliveInterval 15\n    ServerAliveCountMax 3\n    ProxyCommand {proxy_cmd}\n"
     )
 }
 
@@ -1263,6 +1301,34 @@ mod tests {
             ("/sandbox/sub", "file")
         );
         assert_eq!(split_sandbox_path("/a/b/c/d.txt"), ("/a/b/c", "d.txt"));
+    }
+
+    #[test]
+    fn directory_upload_prefix_uses_basename_for_named_directories() {
+        assert_eq!(
+            directory_upload_prefix(Path::new("/tmp/upload-test")),
+            std::ffi::OsString::from("upload-test")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("foo")),
+            std::ffi::OsString::from("foo")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("./parent/nested")),
+            std::ffi::OsString::from("nested")
+        );
+    }
+
+    #[test]
+    fn directory_upload_prefix_falls_back_to_dot_for_basename_less_paths() {
+        assert_eq!(
+            directory_upload_prefix(Path::new(".")),
+            std::ffi::OsString::from(".")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("/")),
+            std::ffi::OsString::from(".")
+        );
     }
 
     #[test]

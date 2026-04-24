@@ -143,6 +143,8 @@ run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
+source tasks/scripts/container-engine.sh
+
 sha256_16() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print substr($1, 1, 16)}'
@@ -172,7 +174,7 @@ CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "$CACHE_SCOPE_INPUT" | sha256_16_stdin)
 
 mkdir -p target/wheels
 
-docker build \
+ce build \
   -f deploy/docker/Dockerfile.python-wheels-macos \
   --target wheels \
   --build-arg "OSXCROSS_IMAGE=${OSXCROSS_IMAGE_REF}" \

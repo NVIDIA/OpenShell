@@ -27,6 +27,8 @@ The CLI receives logs from the gateway over gRPC. Each line includes a timestamp
 
 OCSF structured events show `OCSF` as the level. Standard tracing events show `INFO`, `WARN`, or `ERROR`.
 
+Gateway-originated policy mutations also appear in this stream. When the gateway merges `openshell policy update` operations or approves or removes draft policy chunks, it emits `gateway` `OCSF` `CONFIG:*` lines for the affected sandbox so you can see the exact logical change that produced a new policy revision.
+
 ## TUI
 
 The TUI dashboard displays sandbox logs in real time. Logs appear in the log panel with the same format as the CLI.

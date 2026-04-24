@@ -47,7 +47,7 @@ network_policies:
 ```
 
 Static sections are locked at sandbox creation. Changing them requires destroying and recreating the sandbox.
-Dynamic sections can be updated on a running sandbox with `openshell policy set` and take effect without restarting.
+Dynamic sections can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
 
 | Section | Type | Description |
 |---|---|---|
@@ -121,25 +121,264 @@ The following steps outline the hot-reload policy update workflow.
    openshell logs <name> --tail --source sandbox
    ```
 
-3. Pull the current policy. Strip the metadata header (Version, Hash, Status) before reusing the file.
+3. For additive network changes, use `openshell policy update`. This is the fastest path for adding endpoints, binaries, or REST allow/deny rules without replacing the full policy. The full option and format reference is in [Incremental Policy Updates](#incremental-policy-updates).
+
+   ```shell
+   openshell policy update <name> \
+     --add-endpoint api.github.com:443:read-only:rest:enforce \
+     --binary /usr/bin/gh \
+     --wait
+
+   openshell policy update <name> \
+     --add-allow 'api.github.com:443:POST:/repos/*/issues' \
+     --wait
+   ```
+
+   `--add-allow` and `--add-deny` currently target existing `protocol: rest` endpoints only. If you pass multiple update flags in one command, OpenShell applies them as one atomic merge batch and persists at most one new revision.
+
+4. For larger edits, pull the current policy and edit the YAML directly. Strip the metadata header (Version, Hash, Status) before reusing the file.
 
    ```shell
    openshell policy get <name> --full > current-policy.yaml
    ```
 
-4. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, or `rules`.
+5. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, or `rules`.
 
-5. Push the updated policy. Exit codes: 0 = loaded, 1 = validation failed, 124 = timeout.
+6. Push the updated policy when you need a full replacement. Exit codes: 0 = loaded, 1 = validation failed, 124 = timeout.
 
    ```shell
    openshell policy set <name> --policy current-policy.yaml --wait
    ```
 
-6. Verify the new revision. If status is `loaded`, repeat from step 2 as needed; if `failed`, fix the policy and repeat from step 4.
+7. Verify the new revision. If status is `loaded`, repeat from step 2 as needed; if `failed`, fix the policy and repeat from step 4.
 
    ```shell
    openshell policy list <name>
    ```
+
+## Incremental Policy Updates
+
+Use `openshell policy update` when you want to merge network policy changes into the current live policy instead of replacing the whole YAML document. This command only updates the dynamic `network_policies` section.
+
+`openshell policy update` is useful when you want to:
+
+- add a new endpoint for an existing binary without touching other policy sections.
+- add a few REST allow or deny rules after you see a blocked request in the logs.
+- remove one endpoint or one named rule without rewriting the rest of the file.
+- preview a merged result locally with `--dry-run` before you send it to the gateway.
+
+Use `openshell policy set` instead when you want to replace the full policy, update static sections, or make broader edits that are easier to express in YAML.
+
+### Update Commands
+
+The incremental update surface is split into endpoint-level operations and REST rule-level operations.
+
+| Flag | What it changes | Typical use |
+|---|---|---|
+| `--add-endpoint <SPEC>` | Creates or merges a network rule and endpoint. | Allow a new host and port, optionally with `access`, `protocol`, `enforcement`, and binaries. |
+| `--remove-endpoint <SPEC>` | Removes one host and port match from the current policy. | Drop a stale endpoint or remove one port from a multi-port endpoint. |
+| `--remove-rule <NAME>` | Deletes a named `network_policies` entry. | Remove a whole rule by name when you no longer need it. |
+| `--add-allow <SPEC>` | Appends REST allow rules to an existing endpoint. | Permit one additional method and path on a REST API that is already configured. |
+| `--add-deny <SPEC>` | Appends REST deny rules to an existing endpoint. | Block a sensitive REST path under an endpoint that is otherwise allowed. |
+| `--binary <PATH>` | Adds binaries to every `--add-endpoint` rule in the same command. | Bind a new endpoint to one or more executables. |
+| `--rule-name <NAME>` | Overrides the generated rule name. | Keep a stable human-chosen rule name when adding exactly one endpoint. |
+| `--dry-run` | Shows the merged policy locally and does not call the gateway. | Review the result before persisting it. |
+| `--wait` | Polls until the sandbox reports that the new revision loaded. | Confirm the change took effect before continuing. |
+| `--timeout <SECS>` | Sets the timeout for `--wait`. | Extend the wait window for slower sandboxes. |
+
+`--wait` and `--dry-run` cannot be used together.
+
+### Add Endpoint Compared to Allow and Deny
+
+`--add-endpoint` works at the endpoint and rule level. It creates a new `network_policies` entry when needed, or merges into an existing rule that already covers the same host and port. Use it when you are defining where traffic may go and which binaries may send it.
+
+`--add-allow` and `--add-deny` work at the REST request level. They do not create binaries, and they do not create a new endpoint. They modify an existing endpoint that already has `protocol: rest`.
+
+This is the practical difference:
+
+- Use `--add-endpoint` to say "allow this binary to reach `api.github.com:443`."
+- Use `--add-allow` to say "for that existing REST endpoint, also allow `POST /repos/*/issues`."
+- Use `--add-deny` to say "for that existing REST endpoint, explicitly deny `POST /admin/**`."
+
+In the first pass of this feature:
+
+- `--add-allow` and `--add-deny` only work on `protocol: rest` endpoints.
+- `--add-deny` requires the endpoint to already have an allow base, either an `access` preset or explicit allow `rules`.
+- `protocol: sql` is not a practical incremental workflow today. OpenShell does not do full SQL parsing, and SQL enforcement is not meaningfully supported yet.
+
+### Endpoint Specs
+
+`--add-endpoint` uses this format:
+
+```text
+host:port[:access[:protocol[:enforcement]]]
+```
+
+Each segment has a fixed meaning:
+
+| Segment | Required | Meaning |
+|---|---|---|
+| `host` | Yes | Destination hostname. |
+| `port` | Yes | Destination port, `1` through `65535`. |
+| `access` | No | Access preset for REST endpoints: `read-only`, `read-write`, or `full`. |
+| `protocol` | No | L7 inspection mode: `rest` or `sql`. In practice, incremental updates are designed around `rest`. `sql` is audit-only and not a recommended workflow today. |
+| `enforcement` | No | Enforcement mode for inspected traffic: `enforce` or `audit`. |
+
+Examples:
+
+| Example | Meaning |
+|---|---|
+| `pypi.org:443` | Add a plain L4 endpoint. The proxy allows the TCP stream and does not inspect HTTP requests. |
+| `api.github.com:443:read-only:rest:enforce` | Add a REST endpoint with the `read-only` preset expanded by the policy engine into GET, HEAD, and OPTIONS access. |
+
+If you set `protocol: rest`, you also need an allow shape. With incremental updates, that means you should provide an `access` preset on `--add-endpoint`, then use `--add-allow` or `--add-deny` to refine it later.
+
+For example:
+
+- `api.github.com:443:read-only:rest` is valid.
+- `api.github.com:443::rest` is invalid. It does not mean "allow all traffic." A REST endpoint with `protocol` but no `access` or `rules` is rejected when the policy loads.
+
+When you pass multiple `--add-endpoint` flags in one command, every `--binary` value applies to every added endpoint in that command. If different endpoints need different binaries, use separate `policy update` commands.
+
+If you do not pass `--rule-name`, OpenShell generates one from the host and port, such as `allow_api_github_com_443`.
+
+### REST Rule Specs
+
+`--add-allow` and `--add-deny` use this format:
+
+```text
+host:port:METHOD:path_glob
+```
+
+This string identifies an existing REST endpoint and the request pattern you want to add.
+
+In shell commands, quote the full `SPEC` when it contains `*` or `**` so your shell passes it literally instead of expanding it as a local file glob.
+
+| Segment | Meaning |
+|---|---|
+| `host` | Existing endpoint host. |
+| `port` | Existing endpoint port. |
+| `METHOD` | HTTP method. The CLI normalizes it to uppercase. |
+| `path_glob` | URL path glob. It must start with `/`, or be `**`, or start with `**/`. |
+
+This example:
+
+```text
+api.github.com:443:POST:/repos/*/issues
+```
+
+means:
+
+- match the endpoint `api.github.com:443`.
+- match HTTP method `POST`.
+- match paths like `/repos/acme/issues`.
+- do not match deeper paths like `/repos/acme/project/issues/123` because `*` matches one path segment.
+
+Path globs follow the same semantics as YAML allow and deny rules:
+
+- `*` matches one path segment.
+- `**` matches any number of segments.
+- `/repos/*/issues` matches one repository owner or name segment in the middle.
+- `/repos/**` matches everything under `/repos/`.
+
+The rule-level commands only modify method and path constraints. They do not change binaries, hostnames, ports, or protocol settings.
+
+### Common Workflows
+
+Use these patterns as starting points when you decide whether to update an endpoint or append REST rules.
+
+#### Add a new L4 endpoint
+
+Use `--add-endpoint` when you need a new host and port and do not need REST inspection.
+
+```shell
+openshell policy update demo \
+  --add-endpoint pypi.org:443 \
+  --add-endpoint files.pythonhosted.org:443 \
+  --binary /usr/bin/pip \
+  --binary /usr/local/bin/uv \
+  --wait
+```
+
+This creates or merges endpoint entries and binds them to the listed binaries. It does not create per-path REST rules.
+
+#### Create a REST endpoint with a base allow set
+
+Use `--add-endpoint` first when the endpoint does not exist yet.
+
+```shell
+openshell policy update demo \
+  --add-endpoint api.github.com:443:read-only:rest:enforce \
+  --binary /usr/bin/gh \
+  --wait
+```
+
+This creates a REST endpoint and sets its base allow behavior through the `read-only` access preset.
+
+#### Add one more REST allow rule
+
+Use `--add-allow` after the REST endpoint already exists.
+
+```shell
+openshell policy update demo \
+  --add-allow 'api.github.com:443:POST:/repos/*/issues' \
+  --wait
+```
+
+This keeps the existing endpoint definition and appends one new allow rule. It does not add binaries or change the endpoint host and port.
+
+#### Add a REST deny rule under an allowed endpoint
+
+Use `--add-deny` when you want to carve out a blocked subtree under an existing REST endpoint.
+
+```shell
+openshell policy update demo \
+  --add-deny 'api.github.com:443:POST:/admin/**' \
+  --wait
+```
+
+This adds a deny rule to the existing REST endpoint. The endpoint must already have an allow base.
+
+#### Remove one endpoint or rule
+
+Use `--remove-endpoint` to remove one host and port pair, or `--remove-rule` to delete the whole named rule.
+
+```shell
+openshell policy update demo --remove-endpoint pypi.org:443 --wait
+openshell policy update demo --remove-rule github_repos --wait
+```
+
+If the target endpoint is part of a multi-port endpoint, `--remove-endpoint` removes only the specified port and keeps the rest.
+
+### Merge Semantics
+
+OpenShell applies all update flags from one `openshell policy update` command as one merge batch. The gateway validates the full merged result and persists at most one new policy revision.
+
+This means:
+
+- one command is atomic at the revision level.
+- multiple flags in one command succeed or fail together.
+- concurrent writers do not partially interleave one batch with another.
+
+When two updates race, the gateway uses optimistic retry. It fetches the latest revision, reapplies the full batch, validates the result again, and retries the write. This preserves the intent of each individual command while still allowing concurrent sandbox policy updates.
+
+### Preview and Validation
+
+Use `--dry-run` when you want to inspect the merged YAML before you send it to the gateway.
+
+```shell
+openshell policy update demo \
+  --add-allow 'api.github.com:443:GET:/repos/**' \
+  --dry-run
+```
+
+The CLI validates the argument shapes before it sends the request. The gateway then validates the merged policy against the current live policy and returns clear errors when:
+
+- a required segment is missing.
+- a port is outside `1` through `65535`.
+- `--add-allow` or `--add-deny` points at an endpoint that does not exist.
+- `--add-allow` or `--add-deny` targets a non-REST endpoint.
+- `--add-deny` targets an endpoint that has no base allow set.
 
 ## Global Policy Override
 
@@ -178,9 +417,15 @@ When triaging denied requests, check:
 
 Then push the updated policy as described above.
 
+For small changes, prefer `openshell policy update` over rewriting the full YAML:
+
+```shell
+openshell policy update <name> --add-allow 'api.github.com:443:GET:/repos/**' --wait
+```
+
 ## Examples
 
-Add these blocks to the `network_policies` section of your sandbox policy. Apply with `openshell policy set <name> --policy <file> --wait`.
+Add these blocks to the `network_policies` section of your sandbox policy. Apply with `openshell policy update` for incremental additions or `openshell policy set <name> --policy <file> --wait` for full replacement.
 Use **Simple endpoint** for host-level allowlists and **Granular rules** for method/path control.
 
 <Tabs>

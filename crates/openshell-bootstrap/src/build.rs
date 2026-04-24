@@ -46,7 +46,10 @@ pub async fn build_and_push_image(
     on_log(format!(
         "Pushing image {tag} into gateway \"{gateway_name}\""
     ));
-    let local_docker = Docker::connect_with_local_defaults()
+    // Use the long-timeout Docker client so `docker save` of multi-GB images
+    // doesn't trip the 120s bollard default mid-stream. Override with
+    // OPENSHELL_DOCKER_TIMEOUT_SECS=<secs>.
+    let local_docker = crate::docker::connect_local_for_large_transfers()
         .into_diagnostic()
         .wrap_err("failed to connect to local Docker daemon")?;
     let container = container_name(gateway_name);

@@ -20,7 +20,7 @@ pub mod proto;
 pub mod settings;
 
 pub use config::{ComputeDriverKind, Config, TlsConfig};
-pub use error::{Error, Result};
+pub use error::{ComputeDriverError, Error, Result};
 
 /// Build version string derived from git metadata.
 ///

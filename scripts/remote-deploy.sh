@@ -215,8 +215,8 @@ echo "==> Installing tools via mise..."
 mise trust --yes
 mise install --yes
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo "ERROR: Docker is not installed on the remote host." >&2
+if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
+  echo "ERROR: Neither podman nor docker is installed on the remote host." >&2
   exit 1
 fi
 
@@ -232,7 +232,7 @@ install -m 0755 target/release/openshell scripts/bin/openshell
 # Prevent a stale repo-local .env from changing the deployment unexpectedly.
 rm -f .env
 
-echo "==> Building Docker images (tag=${IMAGE_TAG})..."
+echo "==> Building container images (tag=${IMAGE_TAG})..."
 export OPENSHELL_CARGO_VERSION="${CARGO_VERSION}"
 export IMAGE_TAG
 mise exec -- tasks/scripts/docker-build-image.sh cluster

@@ -22,13 +22,11 @@ use openshell_core::proto::{
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use prost::Message;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use russh::ChannelMsg;
 use russh::client::AuthResult;
@@ -438,27 +436,55 @@ pub(super) async fn handle_exec_sandbox(
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
-    let (target_host, target_port) = resolve_sandbox_exec_target(state, &sandbox).await?;
+    // Open a relay channel through the supervisor session. Use a 15s
+    // session-wait timeout — enough to cover a transient supervisor
+    // reconnect, but shorter than `/connect/ssh` since `ExecSandbox` is
+    // typically called during normal operation (not right after create).
+    let (channel_id, relay_rx) = state
+        .supervisor_sessions
+        .open_relay(&sandbox.id, std::time::Duration::from_secs(15))
+        .await
+        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let stdin_payload = req.stdin;
     let timeout_seconds = req.timeout_seconds;
     let request_tty = req.tty;
     let sandbox_id = sandbox.id;
-    let handshake_secret = state.config.ssh_handshake_secret.clone();
 
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
-        if let Err(err) = stream_exec_over_ssh(
+        // Wait for the supervisor's reverse CONNECT to deliver the relay stream.
+        let relay_stream = match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx)
+            .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(_)) => {
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ExecSandbox: relay channel dropped");
+                let _ = tx
+                    .send(Err(Status::unavailable("relay channel dropped")))
+                    .await;
+                return;
+            }
+            Err(_) => {
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ExecSandbox: relay open timed out");
+                let _ = tx
+                    .send(Err(Status::deadline_exceeded("relay open timed out")))
+                    .await;
+                return;
+            }
+        };
+
+        if let Err(err) = stream_exec_over_relay(
             tx.clone(),
             &sandbox_id,
-            &target_host,
-            target_port,
+            &channel_id,
+            relay_stream,
             &command_str,
             stdin_payload,
             timeout_seconds,
             request_tty,
-            &handshake_secret,
         )
         .await
         {
@@ -584,16 +610,6 @@ fn resolve_gateway(config: &openshell_core::Config) -> (String, u16) {
     (host, port)
 }
 
-async fn resolve_sandbox_exec_target(
-    state: &ServerState,
-    sandbox: &Sandbox,
-) -> Result<(String, u16), Status> {
-    match state.compute.resolve_sandbox_endpoint(sandbox).await? {
-        crate::compute::ResolvedEndpoint::Ip(ip, port) => Ok((ip.to_string(), port)),
-        crate::compute::ResolvedEndpoint::Host(host, port) => Ok((host, port)),
-    }
-}
-
 /// Shell-escape a value for embedding in a POSIX shell command.
 ///
 /// Wraps unsafe values in single quotes with the standard `'\''` idiom for
@@ -646,133 +662,72 @@ fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String>
     Ok(result)
 }
 
-/// Maximum number of attempts when establishing the SSH transport to a sandbox.
-const SSH_CONNECT_MAX_ATTEMPTS: u32 = 6;
-
-/// Initial backoff duration between SSH connection retries.
-const SSH_CONNECT_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// Maximum backoff duration between SSH connection retries.
-const SSH_CONNECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Returns `true` if the gRPC status represents a transient SSH connection error.
-fn is_retryable_ssh_error(status: &Status) -> bool {
-    if status.code() != tonic::Code::Internal {
-        return false;
-    }
-    let msg = status.message();
-    msg.contains("Connection reset by peer")
-        || msg.contains("Connection refused")
-        || msg.contains("failed to establish ssh transport")
-        || msg.contains("failed to connect to ssh proxy")
-        || msg.contains("failed to start ssh proxy")
-}
-
+/// Execute a command over an SSH transport relayed through a supervisor session.
+///
+/// This is the relay equivalent of `stream_exec_over_ssh`. Instead of dialing a
+/// sandbox endpoint directly, the SSH transport runs over a `DuplexStream` that
+/// is bridged to the supervisor's local SSH daemon via a reverse HTTP CONNECT
+/// tunnel.
 #[allow(clippy::too_many_arguments)]
-async fn stream_exec_over_ssh(
+async fn stream_exec_over_relay(
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
     sandbox_id: &str,
-    target_host: &str,
-    target_port: u16,
+    channel_id: &str,
+    relay_stream: tokio::io::DuplexStream,
     command: &str,
     stdin_payload: Vec<u8>,
     timeout_seconds: u32,
     request_tty: bool,
-    handshake_secret: &str,
 ) -> Result<(), Status> {
     let command_preview: String = command.chars().take(120).collect();
     info!(
         sandbox_id = %sandbox_id,
-        target_host = %target_host,
-        target_port,
+        channel_id = %channel_id,
         command_len = command.len(),
         stdin_len = stdin_payload.len(),
         command_preview = %command_preview,
-        "ExecSandbox command started"
+        "ExecSandbox (relay): command started"
     );
 
-    let (exit_code, proxy_task) = {
-        let mut last_err: Option<Status> = None;
+    let (local_proxy_port, proxy_task) = start_single_use_ssh_proxy_over_relay(relay_stream)
+        .await
+        .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
 
-        let mut result = None;
-        for attempt in 0..SSH_CONNECT_MAX_ATTEMPTS {
-            if attempt > 0 {
-                let backoff = (SSH_CONNECT_INITIAL_BACKOFF * 2u32.pow(attempt - 1))
-                    .min(SSH_CONNECT_MAX_BACKOFF);
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    attempt = attempt + 1,
-                    backoff_ms = %backoff.as_millis(),
-                    error = %last_err.as_ref().unwrap(),
-                    "Retrying SSH transport establishment"
-                );
-                tokio::time::sleep(backoff).await;
-            }
+    let exec = run_exec_with_russh(
+        local_proxy_port,
+        command,
+        stdin_payload,
+        request_tty,
+        tx.clone(),
+    );
 
-            let (local_proxy_port, proxy_task) = match start_single_use_ssh_proxy(
-                target_host,
-                target_port,
-                handshake_secret,
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    last_err = Some(Status::internal(format!("failed to start ssh proxy: {e}")));
-                    continue;
-                }
-            };
+    let exec_result = if timeout_seconds == 0 {
+        exec.await
+    } else if let Ok(r) = tokio::time::timeout(
+        std::time::Duration::from_secs(u64::from(timeout_seconds)),
+        exec,
+    )
+    .await
+    {
+        r
+    } else {
+        let _ = tx
+            .send(Ok(ExecSandboxEvent {
+                payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
+                    ExecSandboxExit { exit_code: 124 },
+                )),
+            }))
+            .await;
+        let _ = proxy_task.await;
+        return Ok(());
+    };
 
-            let exec = run_exec_with_russh(
-                local_proxy_port,
-                command,
-                stdin_payload.clone(),
-                request_tty,
-                tx.clone(),
-            );
-
-            let exec_result = if timeout_seconds == 0 {
-                exec.await
-            } else if let Ok(r) = tokio::time::timeout(
-                std::time::Duration::from_secs(u64::from(timeout_seconds)),
-                exec,
-            )
-            .await
-            {
-                r
-            } else {
-                let _ = tx
-                    .send(Ok(ExecSandboxEvent {
-                        payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
-                            ExecSandboxExit { exit_code: 124 },
-                        )),
-                    }))
-                    .await;
-                let _ = proxy_task.await;
-                return Ok(());
-            };
-
-            match exec_result {
-                Ok(exit_code) => {
-                    result = Some((exit_code, proxy_task));
-                    break;
-                }
-                Err(status) => {
-                    let _ = proxy_task.await;
-                    if is_retryable_ssh_error(&status) && attempt + 1 < SSH_CONNECT_MAX_ATTEMPTS {
-                        last_err = Some(status);
-                        continue;
-                    }
-                    return Err(status);
-                }
-            }
+    let exit_code = match exec_result {
+        Ok(code) => code,
+        Err(status) => {
+            let _ = proxy_task.await;
+            return Err(status);
         }
-
-        result.ok_or_else(|| {
-            last_err.unwrap_or_else(|| {
-                Status::internal("ssh connection failed after exhausting retries")
-            })
-        })?
     };
 
     let _ = proxy_task.await;
@@ -786,6 +741,28 @@ async fn stream_exec_over_ssh(
         .await;
 
     Ok(())
+}
+
+/// Create a localhost SSH proxy that bridges to a relay DuplexStream.
+///
+/// The proxy forwards raw SSH bytes between the `russh` client and the relay.
+/// The supervisor bridges the relay to its Unix-socket SSH daemon; filesystem
+/// permissions on that socket are the only access-control boundary.
+async fn start_single_use_ssh_proxy_over_relay(
+    mut relay_stream: tokio::io::DuplexStream,
+) -> Result<(u16, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let port = listener.local_addr()?.port();
+
+    let task = tokio::spawn(async move {
+        let Ok((mut client_conn, _)) = listener.accept().await else {
+            warn!("SSH relay proxy: failed to accept local connection");
+            return;
+        };
+        let _ = tokio::io::copy_bidirectional(&mut client_conn, &mut relay_stream).await;
+    });
+
+    Ok((port, task))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -914,158 +891,6 @@ async fn run_exec_with_russh(
     Ok(exit_code.unwrap_or(1))
 }
 
-/// Check whether an IP address is safe to use as an SSH proxy target.
-fn is_safe_ssh_proxy_target(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => {
-            if v6.is_loopback() {
-                return false;
-            }
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return !v4.is_loopback() && !v4.is_link_local();
-            }
-            true
-        }
-    }
-}
-
-fn is_explicit_loopback_exec_target(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    host.parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
-}
-
-async fn start_single_use_ssh_proxy(
-    target_host: &str,
-    target_port: u16,
-    handshake_secret: &str,
-) -> Result<(u16, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-    let port = listener.local_addr()?.port();
-    let target_host = target_host.to_string();
-    let allow_explicit_loopback = is_explicit_loopback_exec_target(target_host.as_str());
-    let handshake_secret = handshake_secret.to_string();
-
-    let task = tokio::spawn(async move {
-        let Ok((mut client_conn, _)) = listener.accept().await else {
-            warn!("SSH proxy: failed to accept local connection");
-            return;
-        };
-
-        let addr_str = format!("{target_host}:{target_port}");
-        let resolved = match tokio::net::lookup_host(&addr_str).await {
-            Ok(mut addrs) => {
-                if let Some(addr) = addrs.next() {
-                    addr
-                } else {
-                    warn!(target_host = %target_host, "SSH proxy: DNS resolution returned no addresses");
-                    return;
-                }
-            }
-            Err(e) => {
-                warn!(target_host = %target_host, error = %e, "SSH proxy: DNS resolution failed");
-                return;
-            }
-        };
-
-        if !allow_explicit_loopback && !is_safe_ssh_proxy_target(resolved.ip()) {
-            warn!(
-                target_host = %target_host,
-                resolved_ip = %resolved.ip(),
-                "SSH proxy: target resolved to blocked IP range (loopback or link-local)"
-            );
-            return;
-        }
-
-        debug!(
-            target_host = %target_host,
-            resolved_ip = %resolved.ip(),
-            target_port,
-            "SSH proxy: connecting to validated target"
-        );
-
-        let Ok(mut sandbox_conn) = TcpStream::connect(resolved).await else {
-            warn!(target_host = %target_host, resolved_ip = %resolved.ip(), target_port, "SSH proxy: failed to connect to sandbox");
-            return;
-        };
-        let Ok(preface) = build_preface(&uuid::Uuid::new_v4().to_string(), &handshake_secret)
-        else {
-            warn!("SSH proxy: failed to build handshake preface");
-            return;
-        };
-        if let Err(e) = sandbox_conn.write_all(preface.as_bytes()).await {
-            warn!(error = %e, "SSH proxy: failed to send handshake preface");
-            return;
-        }
-        let mut response = String::new();
-        if let Err(e) = read_line(&mut sandbox_conn, &mut response).await {
-            warn!(error = %e, "SSH proxy: failed to read handshake response");
-            return;
-        }
-        if response.trim() != "OK" {
-            warn!(response = %response.trim(), "SSH proxy: handshake rejected by sandbox");
-            return;
-        }
-        let _ = tokio::io::copy_bidirectional(&mut client_conn, &mut sandbox_conn).await;
-    });
-
-    Ok((port, task))
-}
-
-fn build_preface(
-    token: &str,
-    secret: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let timestamp = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| "time error")?
-            .as_secs(),
-    )
-    .map_err(|_| "time error")?;
-    let nonce = uuid::Uuid::new_v4().to_string();
-    let payload = format!("{token}|{timestamp}|{nonce}");
-    let signature = hmac_sha256(secret.as_bytes(), payload.as_bytes());
-    Ok(format!("NSSH1 {token} {timestamp} {nonce} {signature}\n"))
-}
-
-async fn read_line(
-    stream: &mut TcpStream,
-    buf: &mut String,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut bytes = Vec::new();
-    loop {
-        let mut byte = [0_u8; 1];
-        let n = stream.read(&mut byte).await?;
-        if n == 0 {
-            break;
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        bytes.push(byte[0]);
-        if bytes.len() > 1024 {
-            break;
-        }
-    }
-    *buf = String::from_utf8_lossy(&bytes).to_string();
-    Ok(())
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
-    mac.update(data);
-    let result = mac.finalize().into_bytes();
-    hex::encode(result)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1169,74 +994,6 @@ mod tests {
             ..Default::default()
         };
         assert!(build_remote_exec_command(&req).is_err());
-    }
-
-    // ---- is_safe_ssh_proxy_target ----
-
-    #[test]
-    fn ssh_proxy_target_allows_pod_network_ips() {
-        use std::net::{IpAddr, Ipv4Addr};
-        assert!(is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
-            10, 0, 0, 5
-        ))));
-        assert!(is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
-            172, 16, 0, 1
-        ))));
-        assert!(is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
-            192, 168, 1, 100
-        ))));
-    }
-
-    #[test]
-    fn ssh_proxy_target_blocks_loopback() {
-        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-        assert!(!is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
-            127, 0, 0, 1
-        ))));
-        assert!(!is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
-            127, 0, 0, 2
-        ))));
-        assert!(!is_safe_ssh_proxy_target(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-    }
-
-    #[test]
-    fn ssh_proxy_target_blocks_link_local() {
-        use std::net::{IpAddr, Ipv4Addr};
-        assert!(!is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
-            169, 254, 169, 254
-        ))));
-        assert!(!is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
-            169, 254, 0, 1
-        ))));
-    }
-
-    #[test]
-    fn ssh_proxy_target_blocks_ipv4_mapped_ipv6_loopback() {
-        use std::net::IpAddr;
-        let ip: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
-        assert!(!is_safe_ssh_proxy_target(ip));
-    }
-
-    #[test]
-    fn ssh_proxy_target_blocks_ipv4_mapped_ipv6_link_local() {
-        use std::net::IpAddr;
-        let ip: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
-        assert!(!is_safe_ssh_proxy_target(ip));
-    }
-
-    #[test]
-    fn explicit_loopback_exec_target_is_allowed() {
-        assert!(is_explicit_loopback_exec_target("127.0.0.1"));
-        assert!(is_explicit_loopback_exec_target("::1"));
-        assert!(is_explicit_loopback_exec_target("localhost"));
-    }
-
-    #[test]
-    fn non_loopback_exec_target_is_not_treated_as_explicit_loopback() {
-        assert!(!is_explicit_loopback_exec_target("10.0.0.5"));
-        assert!(!is_explicit_loopback_exec_target(
-            "sandbox.default.svc.cluster.local"
-        ));
     }
 
     // ---- petname / generate_name ----

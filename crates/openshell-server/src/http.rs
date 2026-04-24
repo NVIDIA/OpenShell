@@ -3,7 +3,8 @@
 
 //! HTTP health endpoints using Axum.
 
-use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -45,10 +46,20 @@ pub fn health_router() -> Router {
         .route("/readyz", get(readyz))
 }
 
+/// Create the metrics router for the dedicated metrics port.
+pub fn metrics_router(handle: PrometheusHandle) -> Router {
+    Router::new()
+        .route("/metrics", get(render_metrics))
+        .with_state(handle)
+}
+
+async fn render_metrics(State(handle): State<PrometheusHandle>) -> impl IntoResponse {
+    handle.render()
+}
+
 /// Create the HTTP router.
 pub fn http_router(state: Arc<crate::ServerState>) -> Router {
-    health_router()
-        .merge(crate::ssh_tunnel::router(state.clone()))
+    crate::ssh_tunnel::router(state.clone())
         .merge(crate::ws_tunnel::router(state.clone()))
         .merge(crate::auth::router(state))
 }

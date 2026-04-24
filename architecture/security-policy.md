@@ -162,6 +162,24 @@ This guarantees that the same logical policy always produces the same hash regar
 
 **Idempotent updates**: `UpdateSandboxPolicy` compares the deterministic hash of the submitted policy against the latest stored revision's hash. If they match, the handler returns the existing version and hash without creating a new revision. The CLI detects this (the returned version equals the pre-call version) and prints `Policy unchanged` instead of `Policy version N submitted`. This makes repeated `policy set` calls safe and idempotent.
 
+### Incremental Merge Updates
+
+`UpdateConfigRequest.merge_operations` supports batched incremental changes to the dynamic `network_policies` section. The CLI exposes this as `openshell policy update`.
+
+Supported first-pass operations:
+
+- `--add-endpoint host:port[:access[:protocol[:enforcement]]]`
+- `--remove-endpoint host:port`
+- `--remove-rule <name>`
+- `--add-allow host:port:METHOD:path_glob`
+- `--add-deny host:port:METHOD:path_glob`
+
+`--add-allow` and `--add-deny` target existing `protocol: rest` endpoints only. `--binary` may be repeated with `--add-endpoint`, and `--rule-name` is allowed only when exactly one `--add-endpoint` is present.
+
+Each `openshell policy update` invocation is atomic at the revision level: the CLI sends one `merge_operations` batch, the server merges the whole batch into the latest policy, validates the result, and persists at most one new revision. Concurrency is handled with optimistic retries on the `(sandbox_id, version)` uniqueness boundary. If another writer wins first, the server refetches the latest policy, reapplies the full batch, revalidates it, and retries. This preserves batch atomicity without serializing all sandbox policy writes behind a sandbox-global mutex.
+
+The gateway emits per-sandbox OCSF `CONFIG:*` audit lines when incremental merge operations are applied and when draft chunks are approved or removed. These audit lines are streamed through the existing gateway log path, so operators can inspect the exact logical mutation that produced a policy revision without waiting for the sandbox poll loop to reload that revision.
+
 ### Policy Revision Statuses
 
 | Status | Meaning |
@@ -206,9 +224,20 @@ Failure scenarios that trigger LKG behavior include:
 
 ### CLI Commands
 
-The `openshell policy` subcommand group manages live policy updates:
+The `openshell policy` subcommand group manages live policy updates through full replacement (`policy set`) and incremental merges (`policy update`):
 
 ```bash
+# Merge endpoint/rule changes into the current sandbox policy
+openshell policy update <sandbox-name> \
+  --add-endpoint api.github.com:443:read-only:rest:enforce \
+  --binary /usr/bin/gh \
+  --wait
+
+# Add a REST allow rule to an existing endpoint
+openshell policy update <sandbox-name> \
+  --add-allow api.github.com:443:POST:/repos/*/issues \
+  --wait
+
 # Push a new policy to a running sandbox
 openshell policy set <sandbox-name> --policy updated-policy.yaml
 
@@ -255,6 +284,7 @@ Both `set` and `delete` require interactive confirmation (or `--yes` to bypass).
 
 When a global policy is active, sandbox-scoped policy mutations are blocked:
 - `policy set <sandbox>` returns `FailedPrecondition: "policy is managed globally"`
+- `policy update <sandbox>` returns `FailedPrecondition: "policy is managed globally"`
 - `rule approve`, `rule approve-all` return `FailedPrecondition: "cannot approve rules while a global policy is active"`
 - Revoking a previously approved draft chunk is blocked (it would modify the sandbox policy)
 - Rejecting pending chunks is allowed (does not modify the sandbox policy)
@@ -270,7 +300,7 @@ See [Gateway Settings Channel](gateway-settings.md#global-policy-lifecycle) for 
 
 When `--full` is specified, the server includes the deserialized `SandboxPolicy` protobuf in the `SandboxPolicyRevision.policy` field (see `crates/openshell-server/src/grpc.rs` -- `policy_record_to_revision()` with `include_policy: true`). The CLI converts this proto back to YAML via `policy_to_yaml()`, which uses a `BTreeMap` for `network_policies` to produce deterministic key ordering. See `crates/openshell-cli/src/run.rs` -- `policy_to_yaml()`, `policy_get()`.
 
-See `crates/openshell-cli/src/main.rs` -- `PolicyCommands` enum, `crates/openshell-cli/src/run.rs` -- `policy_set()`, `policy_get()`, `policy_list()`.
+See `crates/openshell-cli/src/main.rs` -- `PolicyCommands` enum, `crates/openshell-cli/src/run.rs` -- `policy_update()`, `policy_set()`, `policy_get()`, `policy_list()`.
 
 ---
 
@@ -363,7 +393,7 @@ Controls Landlock LSM compatibility behavior. **Static field** -- immutable afte
 
 **Per-path error handling**: `PathFd::new()` (which wraps `open(path, O_PATH | O_CLOEXEC)`) can fail for several reasons beyond path non-existence: `EACCES` (permission denied), `ELOOP` (symlink loop), `ENAMETOOLONG`, `ENOTDIR`. Each failure is classified with a human-readable reason in logs. In `best_effort` mode, the path is skipped and ruleset construction continues. In `hard_requirement` mode, the error is fatal.
 
-**Baseline path filtering**: The enrichment functions (`enrich_proto_baseline_paths`, `enrich_sandbox_baseline_paths`) pre-filter system-injected baseline paths (e.g., `/app`) by checking `Path::exists()` before adding them to the policy. This prevents missing baseline paths from reaching Landlock at all. User-specified paths are not pre-filtered — they are evaluated at Landlock apply time so that misconfigurations surface as warnings (`best_effort`) or errors (`hard_requirement`).
+**Baseline path filtering**: The enrichment functions (`enrich_proto_baseline_paths`, `enrich_sandbox_baseline_paths`) pre-filter system-injected baseline paths (e.g., `/app`) by checking `Path::exists()` before adding them to the policy. This prevents missing baseline paths from reaching Landlock at all. If a baseline `read_write` path is explicitly configured in `read_only`, enrichment skips the promotion and preserves the stricter policy intent. User-specified paths are not pre-filtered — they are evaluated at Landlock apply time so that misconfigurations surface as warnings (`best_effort`) or errors (`hard_requirement`).
 
 **Zero-rule safety check**: If all paths in the ruleset fail to open, `apply()` returns an error rather than calling `restrict_self()` on an empty ruleset. An empty Landlock ruleset with `restrict_self()` would block all filesystem access — the inverse of the intended degradation behavior. This error is caught by the outer `BestEffort` handler, which logs a warning and continues without Landlock.
 
@@ -1074,9 +1104,9 @@ IP classification helpers live in `crates/openshell-core/src/net.rs` and are sha
 
 Runtime resolution and enforcement functions remain in `crates/openshell-sandbox/src/proxy.rs`:
 
-- **`resolve_and_reject_internal(host, port) -> Result<Vec<SocketAddr>, String>`**: Default SSRF check. Resolves DNS via `tokio::net::lookup_host()`, then checks every resolved address against `is_internal_ip()`. If any address is internal, the entire connection is rejected.
+- **`resolve_and_reject_internal(host, port, entrypoint_pid) -> Result<Vec<SocketAddr>, String>`**: Default SSRF check. Resolves the host using the sandbox's `/etc/hosts` first on Linux (via `/proc/<pid>/root/etc/hosts`, which captures Kubernetes `hostAliases`), then falls back to `tokio::net::lookup_host()`. It checks every resolved address against `is_internal_ip()`. If any address is internal, the entire connection is rejected.
 
-- **`resolve_and_check_allowed_ips(host, port, allowed_ips) -> Result<Vec<SocketAddr>, String>`**: Allowlist-based SSRF check. Resolves DNS, rejects any always-blocked IPs, then verifies every resolved address matches at least one entry in the `allowed_ips` list.
+- **`resolve_and_check_allowed_ips(host, port, allowed_ips, entrypoint_pid) -> Result<Vec<SocketAddr>, String>`**: Allowlist-based SSRF check. Resolves the host using the sandbox's `/etc/hosts` first on Linux, rejects any always-blocked IPs, then verifies every resolved address matches at least one entry in the `allowed_ips` list.
 
 - **`parse_allowed_ips(raw) -> Result<Vec<IpNet>, String>`**: Parses CIDR/IP strings into typed `IpNet` values. **Rejects entries at load time** that overlap always-blocked ranges (loopback, link-local, unspecified) via `is_always_blocked_net`. Accepts both CIDR notation (`10.0.5.0/24`) and bare IPs (`10.0.5.20`, treated as `/32`). This prevents confusing UX where an entry is accepted in policy but silently denied at runtime.
 
@@ -1132,6 +1162,8 @@ The `allowed_ips` field on a `NetworkEndpoint` enables controlled access to priv
 
 **Load-time validation**: `parse_allowed_ips` rejects entries that overlap always-blocked ranges with a hard error at policy load time. This catches misconfigurations early — an entry like `127.0.0.0/8` or `0.0.0.0/0` in `allowed_ips` would be silently un-enforceable at runtime, so it is rejected before the policy is applied. The same validation runs in both file mode (sandbox startup) and gRPC mode (live policy updates via `OpaEngine::reload_from_proto`).
 
+**Sandbox `/etc/hosts` and `hostAliases`**: On Linux, the proxy consults the sandbox's `/etc/hosts` before falling back to DNS. This gives policy evaluation the same hostname-to-IP view that sandboxed tools see when Kubernetes `hostAliases` populate `/etc/hosts`. This is resolver input only. It does **not** synthesize `allowed_ips`, and it does not bypass the private-IP SSRF check. If `searxng.local` resolves to `192.168.1.105`, the request still needs `allowed_ips: ["192.168.1.105/32"]` to succeed.
+
 **Implicit `allowed_ips` for IP hosts**: When a policy endpoint has a literal IP address as its host (e.g., `host: 10.0.5.20`), the proxy synthesizes an `allowed_ips` entry automatically via `implicit_allowed_ips_for_ip_host`. If the host is an always-blocked address (e.g., `127.0.0.1`, `169.254.169.254`, `0.0.0.0`), the function returns empty and logs a warning — no `allowed_ips` entry is synthesized, so the standard SSRF rejection applies.
 
 This supports three usage modes:
@@ -1141,6 +1173,23 @@ This supports three usage modes:
 | **Default** | `host` only, no `allowed_ips` | Standard SSRF protection: all private IPs blocked |
 | **Host + allowlist** | `host` + `allowed_ips` | Domain must match `host` AND resolve to an IP in `allowed_ips` |
 | **Hostless allowlist** | `allowed_ips` only (no `host`) | Any domain allowed on the specified `port`, as long as it resolves to an IP in `allowed_ips` |
+
+Example:
+
+```yaml
+network_policies:
+  websearch:
+    name: websearch
+    endpoints:
+      - host: searxng.local
+        port: 8080
+        allowed_ips:
+          - "192.168.1.105/32"
+    binaries:
+      - path: /usr/bin/curl
+```
+
+With a matching sandbox `/etc/hosts` entry such as `192.168.1.105 searxng.local`, this policy works. Without the `allowed_ips` entry, the request stays blocked because the resolved destination is private.
 
 #### `allowed_ips` Format
 

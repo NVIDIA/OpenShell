@@ -33,6 +33,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Source container engine abstraction (provides ce, ce_build, etc.)
+_CE_SEARCH="${SCRIPT_DIR}/../../../tasks/scripts/container-engine.sh"
+if [ -f "${_CE_SEARCH}" ]; then
+    source "${_CE_SEARCH}"
+else
+    # Fallback: if run from a different working directory, try repo root.
+    source "$(cd "${SCRIPT_DIR}/../../.." && pwd)/tasks/scripts/container-engine.sh"
+fi
+
 # Source pinned dependency versions (digests, checksums, commit SHAs).
 # Environment variables override pins — see pins.env for details.
 PINS_FILE="${SCRIPT_DIR}/../pins.env"
@@ -119,6 +128,65 @@ verify_checksum() {
     fi
 }
 
+ensure_build_nofile_limit() {
+    local desired="${OPENSHELL_VM_BUILD_NOFILE_LIMIT:-8192}"
+    local minimum=1024
+    local current=""
+    local hard=""
+    local target=""
+
+    [ "$(uname -s)" = "Darwin" ] || return 0
+    command -v cargo-zigbuild >/dev/null 2>&1 || return 0
+
+    current="$(ulimit -n 2>/dev/null || echo "")"
+    case "${current}" in
+        ''|*[!0-9]*)
+            return 0
+            ;;
+    esac
+
+    if [ "${current}" -ge "${desired}" ]; then
+        return 0
+    fi
+
+    hard="$(ulimit -Hn 2>/dev/null || echo "")"
+    target="${desired}"
+    case "${hard}" in
+        ''|unlimited|infinity)
+            ;;
+        *[!0-9]*)
+            ;;
+        *)
+            if [ "${hard}" -lt "${target}" ]; then
+                target="${hard}"
+            fi
+            ;;
+    esac
+
+    if [ "${target}" -gt "${current}" ] && ulimit -n "${target}" 2>/dev/null; then
+        echo "==> Raised open file limit for cargo-zigbuild: ${current} -> $(ulimit -n)"
+    fi
+
+    current="$(ulimit -n 2>/dev/null || echo "${current}")"
+    case "${current}" in
+        ''|*[!0-9]*)
+            return 0
+            ;;
+    esac
+
+    if [ "${current}" -lt "${desired}" ]; then
+        echo "WARNING: Open file limit is ${current}; cargo-zigbuild is more reliable at ${desired}+ on macOS."
+    fi
+
+    if [ "${current}" -lt "${minimum}" ]; then
+        echo "ERROR: Open file limit (${current}) is too low for cargo-zigbuild on macOS."
+        echo "       Zig 0.14+ can fail with ProcessFdQuotaExceeded while linking large binaries."
+        echo "       Run: ulimit -n ${desired}"
+        echo "       Then re-run this script."
+        exit 1
+    fi
+}
+
 if [ "$BASE_ONLY" = true ]; then
     echo "==> Building base openshell-vm rootfs"
     echo "    Guest arch:  ${GUEST_ARCH}"
@@ -134,6 +202,10 @@ else
     echo "    Mode:        full (pre-loaded images, pre-initialized)"
 fi
 echo ""
+
+# cargo-zigbuild on macOS can exhaust the default per-process file descriptor
+# limit while linking larger targets with Zig 0.14+.
+ensure_build_nofile_limit
 
 # ── Check for running VM ────────────────────────────────────────────────
 # If an openshell-vm is using this rootfs via virtio-fs, wiping the rootfs
@@ -219,10 +291,10 @@ fi
 # ── Build base image with dependencies ─────────────────────────────────
 
 # Clean up any previous run
-docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+ce rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 
 echo "==> Building base image..."
-docker build --platform "${DOCKER_PLATFORM}" -t "${BASE_IMAGE_TAG}" \
+ce build --platform "${DOCKER_PLATFORM}" -t "${BASE_IMAGE_TAG}" \
     --build-arg "BASE_IMAGE=${VM_BASE_IMAGE}" -f - . <<'DOCKERFILE'
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
@@ -246,7 +318,7 @@ DOCKERFILE
 
 # Create a container and export the filesystem
 echo "==> Creating container..."
-docker create --platform "${DOCKER_PLATFORM}" --name "${CONTAINER_NAME}" "${BASE_IMAGE_TAG}" /bin/true
+ce create --platform "${DOCKER_PLATFORM}" --name "${CONTAINER_NAME}" "${BASE_IMAGE_TAG}" /bin/true
 
 echo "==> Exporting filesystem..."
 # Previous builds may leave overlayfs work/ dirs with permissions that
@@ -256,9 +328,9 @@ if [ -d "${ROOTFS_DIR}" ]; then
     rm -rf "${ROOTFS_DIR}"
 fi
 mkdir -p "${ROOTFS_DIR}"
-docker export "${CONTAINER_NAME}" | tar -C "${ROOTFS_DIR}" -xf -
+ce export "${CONTAINER_NAME}" | tar -C "${ROOTFS_DIR}" -xf -
 
-docker rm "${CONTAINER_NAME}"
+ce rm "${CONTAINER_NAME}"
 
 # ── Inject k3s binary ────────────────────────────────────────────────
 
@@ -302,16 +374,29 @@ SUPERVISOR_TARGET="${RUST_TARGET}"
 SUPERVISOR_BIN="${PROJECT_ROOT}/target/${SUPERVISOR_TARGET}/release/openshell-sandbox"
 
 echo "==> Building openshell-sandbox supervisor binary (${SUPERVISOR_TARGET})..."
-if command -v cargo-zigbuild >/dev/null 2>&1; then
-    cargo zigbuild --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}" \
-        --manifest-path "${PROJECT_ROOT}/Cargo.toml" 2>&1 | tail -5
+SUPERVISOR_BUILD_LOG="$(mktemp -t openshell-supervisor-build.XXXXXX.log)"
+run_supervisor_build() {
+    if command -v cargo-zigbuild >/dev/null 2>&1; then
+        cargo zigbuild --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}" \
+            --manifest-path "${PROJECT_ROOT}/Cargo.toml"
+    else
+        # Fallback: use plain cargo build when cargo-zigbuild is not available.
+        # This works for native builds (e.g. building x86_64 on x86_64) but
+        # will fail for true cross-compilation without a cross toolchain.
+        echo "    cargo-zigbuild not found, falling back to cargo build..."
+        cargo build --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}" \
+            --manifest-path "${PROJECT_ROOT}/Cargo.toml"
+    fi
+}
+if run_supervisor_build >"${SUPERVISOR_BUILD_LOG}" 2>&1; then
+    tail -5 "${SUPERVISOR_BUILD_LOG}"
+    rm -f "${SUPERVISOR_BUILD_LOG}"
 else
-    # Fallback: use plain cargo build when cargo-zigbuild is not available.
-    # This works for native builds (e.g. building x86_64 on x86_64) but
-    # will fail for true cross-compilation without a cross toolchain.
-    echo "    cargo-zigbuild not found, falling back to cargo build..."
-    cargo build --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}" \
-        --manifest-path "${PROJECT_ROOT}/Cargo.toml" 2>&1 | tail -5
+    status=$?
+    echo "ERROR: supervisor build failed. Full output:" >&2
+    cat "${SUPERVISOR_BUILD_LOG}" >&2
+    echo "    (log saved at ${SUPERVISOR_BUILD_LOG})" >&2
+    exit "${status}"
 fi
 
 if [ ! -f "${SUPERVISOR_BIN}" ]; then
@@ -429,9 +514,9 @@ pull_and_save() {
     # Try to pull; if the registry is unavailable, fall back to the
     # local Docker image cache (image may exist from a previous pull).
     echo "    pulling: ${image}..."
-    if ! docker pull --platform "${DOCKER_PLATFORM}" "${image}" --quiet 2>/dev/null; then
-        echo "    pull failed, checking local Docker cache..."
-        if ! docker image inspect "${image}" >/dev/null 2>&1; then
+    if ! ce pull --platform "${DOCKER_PLATFORM}" "${image}" --quiet 2>/dev/null; then
+        echo "    pull failed, checking local image cache..."
+        if ! ce image inspect "${image}" >/dev/null 2>&1; then
             echo "ERROR: image ${image} not available locally or from registry"
             exit 1
         fi
@@ -442,7 +527,7 @@ pull_and_save() {
     # Pipe through zstd for faster decompression and smaller tarballs.
     # k3s auto-imports .tar.zst files from the airgap images directory.
     # -T0 uses all CPU cores; -3 is a good speed/ratio tradeoff.
-    docker save "${image}" | zstd -T0 -3 -o "${output}"
+    ce save "${image}" | zstd -T0 -3 -o "${output}"
     # Cache for next rebuild.
     cp "${output}" "${cache}"
 }

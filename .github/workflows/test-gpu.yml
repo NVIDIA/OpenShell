@@ -7,57 +7,30 @@ on:
   workflow_dispatch: {}
   # Add `schedule:` here when we want nightly coverage from the same workflow.
 
-permissions:
-  contents: read
-  pull-requests: read
-  packages: write
+permissions: {}
 
 jobs:
   pr_metadata:
     name: Resolve PR metadata
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
     steps:
-      - id: get_pr_info
-        if: github.event_name == 'push'
-        continue-on-error: true
-        uses: nv-gha-runners/get-pr-info@main
-
+      - uses: actions/checkout@v4
       - id: gate
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          GITHUB_SHA_VALUE: ${{ github.sha }}
-          GET_PR_INFO_OUTCOME: ${{ steps.get_pr_info.outcome }}
-          PR_INFO: ${{ steps.get_pr_info.outputs.pr-info }}
-        run: |
-          if [ "$EVENT_NAME" != "push" ]; then
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ "$GET_PR_INFO_OUTCOME" != "success" ]; then
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          head_sha="$(jq -r '.head.sha' <<< "$PR_INFO")"
-          has_gpu_label="$(jq -r '[.labels[].name] | index("test:e2e-gpu") != null' <<< "$PR_INFO")"
-
-          # Only trust copied pull-request/* pushes that still match the PR head SHA
-          # and are explicitly labeled for GPU coverage.
-          if [ "$head_sha" = "$GITHUB_SHA_VALUE" ] && [ "$has_gpu_label" = "true" ]; then
-            should_run=true
-          else
-            should_run=false
-          fi
-
-          echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/pr-gate
+        with:
+          required_label: test:e2e-gpu
 
   build-gateway:
     needs: [pr_metadata]
     if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/docker-build.yml
     with:
       component: gateway
@@ -65,6 +38,9 @@ jobs:
   build-cluster:
     needs: [pr_metadata]
     if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/docker-build.yml
     with:
       component: cluster
@@ -72,6 +48,9 @@ jobs:
   e2e-gpu:
     needs: [pr_metadata, build-gateway, build-cluster]
     if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: read
     uses: ./.github/workflows/e2e-gpu-test.yaml
     with:
       image-tag: ${{ github.sha }}

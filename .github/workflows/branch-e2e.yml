@@ -1,16 +1,35 @@
 name: Branch E2E Checks
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+  workflow_dispatch: {}
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}
 
 jobs:
+  pr_metadata:
+    name: Resolve PR metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: gate
+        uses: ./.github/actions/pr-gate
+        with:
+          required_label: test:e2e
+
   build-gateway:
-    if: contains(github.event.pull_request.labels.*.name, 'test:e2e')
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/docker-build.yml
     with:
       component: gateway
@@ -18,7 +37,11 @@ jobs:
       runner: build-arm64
 
   build-cluster:
-    if: contains(github.event.pull_request.labels.*.name, 'test:e2e')
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/docker-build.yml
     with:
       component: cluster
@@ -26,7 +49,11 @@ jobs:
       runner: build-arm64
 
   e2e:
-    needs: [build-gateway, build-cluster]
+    needs: [pr_metadata, build-gateway, build-cluster]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: read
     uses: ./.github/workflows/e2e-test.yml
     with:
       image-tag: ${{ github.sha }}
