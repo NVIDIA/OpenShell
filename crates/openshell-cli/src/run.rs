@@ -2849,15 +2849,29 @@ fn image_requests_gpu(image: &str) -> bool {
     image_name.contains("gpu")
 }
 
-/// Build a Dockerfile and push the resulting image into the gateway.
+fn dockerfile_sources_supported_for_gateway(metadata: Option<&GatewayMetadata>) -> bool {
+    !metadata.is_some_and(|metadata| metadata.is_remote)
+}
+
+/// Build a Dockerfile and make the resulting image available to the gateway.
 ///
-/// Returns the image tag that was built so the caller can use it for sandbox
-/// creation.
+/// For local Kubernetes gateways running in Docker, this imports the built image
+/// into the gateway runtime and returns the Docker tag. For local VM gateways,
+/// this exports the built image as a rootfs tar artifact and returns an internal
+/// pseudo-image URI understood by the VM driver.
 async fn build_from_dockerfile(
     dockerfile: &Path,
     context: &Path,
     gateway_name: &str,
 ) -> Result<String> {
+    let metadata = get_gateway_metadata(gateway_name);
+    if !dockerfile_sources_supported_for_gateway(metadata.as_ref()) {
+        return Err(miette!(
+            "local Dockerfile sources are only supported for local gateways; gateway '{}' is remote",
+            gateway_name
+        ));
+    }
+
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -2886,15 +2900,39 @@ async fn build_from_dockerfile(
     )
     .await?;
 
+    let existing_gateway = openshell_bootstrap::check_existing_deployment(gateway_name, None)
+        .await
+        .wrap_err("failed to inspect local gateway deployment state")?;
+    let pushed_into_gateway = existing_gateway
+        .is_some_and(|gateway| gateway.container_exists && gateway.container_running);
+    if pushed_into_gateway {
+        openshell_bootstrap::build::push_image_into_gateway(&tag, gateway_name, &mut on_log)
+            .await?;
+        eprintln!();
+        eprintln!(
+            "{} Image {} is available in the gateway.",
+            "✓".green().bold(),
+            tag.cyan(),
+        );
+        eprintln!();
+        return Ok(tag);
+    }
+
+    let rootfs_tar = openshell_bootstrap::build::export_local_image_rootfs(&tag, &mut on_log)
+        .await
+        .wrap_err("failed to export built image as a VM rootfs artifact")?;
+    let artifact_ref = openshell_bootstrap::build::encode_rootfs_tar_image_ref(&rootfs_tar)?;
+
     eprintln!();
     eprintln!(
-        "{} Image {} is available in the local Docker daemon.",
+        "{} VM rootfs artifact {} is ready for gateway '{}'.",
         "✓".green().bold(),
-        tag.cyan(),
+        rootfs_tar.display().to_string().cyan(),
+        gateway_name,
     );
     eprintln!();
 
-    Ok(tag)
+    Ok(artifact_ref)
 }
 
 /// Load sandbox policy YAML.
@@ -5711,13 +5749,13 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GatewayControlTarget, TlsOptions, format_gateway_select_header,
-        format_gateway_select_items, gateway_add, gateway_auth_label, gateway_select_with,
-        gateway_type_label, git_sync_files, http_health_check, image_requests_gpu,
-        inferred_provider_type, parse_cli_setting_value, parse_credential_pairs,
-        plaintext_gateway_is_remote, provisioning_timeout_message, ready_false_condition_message,
-        resolve_gateway_control_target_from, sandbox_should_persist, shell_escape,
-        source_requests_gpu, validate_gateway_name, validate_ssh_host,
+        GatewayControlTarget, TlsOptions, dockerfile_sources_supported_for_gateway,
+        format_gateway_select_header, format_gateway_select_items, gateway_add, gateway_auth_label,
+        gateway_select_with, gateway_type_label, git_sync_files, http_health_check,
+        image_requests_gpu, inferred_provider_type, parse_cli_setting_value,
+        parse_credential_pairs, plaintext_gateway_is_remote, provisioning_timeout_message,
+        ready_false_condition_message, resolve_gateway_control_target_from, sandbox_should_persist,
+        shell_escape, source_requests_gpu, validate_gateway_name, validate_ssh_host,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -5961,6 +5999,41 @@ mod tests {
     fn source_requests_gpu_detects_known_community_gpu_name() {
         assert!(source_requests_gpu("nvidia-gpu"));
         assert!(!source_requests_gpu("base"));
+    }
+
+    #[test]
+    fn dockerfile_sources_are_rejected_for_remote_gateways() {
+        let metadata = GatewayMetadata {
+            name: "remote".to_string(),
+            gateway_endpoint: "https://gateway.example.com".to_string(),
+            is_remote: true,
+            gateway_port: 443,
+            remote_host: Some("user@gateway.example.com".to_string()),
+            resolved_host: Some("gateway.example.com".to_string()),
+            auth_mode: None,
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+
+        assert!(!dockerfile_sources_supported_for_gateway(Some(&metadata)));
+    }
+
+    #[test]
+    fn dockerfile_sources_are_allowed_for_local_gateways() {
+        let metadata = GatewayMetadata {
+            name: "local".to_string(),
+            gateway_endpoint: "http://127.0.0.1:8080".to_string(),
+            is_remote: false,
+            gateway_port: 8080,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: None,
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+
+        assert!(dockerfile_sources_supported_for_gateway(Some(&metadata)));
+        assert!(dockerfile_sources_supported_for_gateway(None));
     }
 
     #[test]

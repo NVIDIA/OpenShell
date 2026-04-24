@@ -21,6 +21,7 @@ path = "src/main.rs"
 [dependencies]
 openshell-core = { path = "../openshell-core" }
 openshell-vfio = { path = "../openshell-vfio" }
+openshell-bootstrap = { path = "../openshell-bootstrap" }
 
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
@@ -35,9 +36,12 @@ miette = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+oci-client = "0.16"
 libc = "0.2"
 libloading = "0.8"
 tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
 zstd = "0.13"
 
 # smol-rs/polling drives the BSD/macOS parent-death detection in

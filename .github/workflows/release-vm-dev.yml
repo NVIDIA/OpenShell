@@ -421,7 +421,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-driver-vm-linux:
     name: Build Driver VM (Linux ${{ matrix.arch }})
-    needs: [compute-versions, download-kernel-runtime, build-rootfs]
+    needs: [compute-versions, download-kernel-runtime]
     strategy:
       matrix:
         include:
@@ -477,12 +477,6 @@ jobs:
           name: kernel-runtime-tarballs
           path: runtime-download/
 
-      - name: Download rootfs tarball
-        uses: actions/download-artifact@v4
-        with:
-          name: rootfs-${{ matrix.arch }}
-          path: rootfs-download/
-
       - name: Stage compressed runtime for embedding
         run: |
           set -euo pipefail
@@ -504,11 +498,14 @@ jobs:
             zstd -19 -f -q -T0 -o "${COMPRESSED_DIR}/${name}.zst" "$file"
           done
 
-          # Copy rootfs tarball (already zstd-compressed)
-          cp rootfs-download/rootfs.tar.zst "${COMPRESSED_DIR}/rootfs.tar.zst"
-
           echo "Staged compressed artifacts:"
           ls -lah "$COMPRESSED_DIR"
+
+      - name: Build bundled supervisor
+        run: |
+          set -euo pipefail
+          OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${PWD}/target/vm-runtime-compressed" \
+            tasks/scripts/vm/build-supervisor-bundle.sh --arch "${{ matrix.guest_arch }}"
 
       - name: Scope workspace to driver-vm crates
         run: |
@@ -551,7 +548,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-driver-vm-macos:
     name: Build Driver VM (macOS)
-    needs: [compute-versions, download-kernel-runtime, build-rootfs]
+    needs: [compute-versions, download-kernel-runtime]
     runs-on: build-amd64
     timeout-minutes: 60
     container:
@@ -591,12 +588,6 @@ jobs:
           name: kernel-runtime-tarballs
           path: runtime-download/
 
-      - name: Download rootfs tarball (arm64)
-        uses: actions/download-artifact@v4
-        with:
-          name: rootfs-arm64
-          path: rootfs-download/
-
       - name: Prepare compressed runtime directory
         run: |
           set -euo pipefail
@@ -619,11 +610,23 @@ jobs:
             zstd -19 -f -q -T0 -o "${COMPRESSED_DIR}/${name}.zst" "$file"
           done
 
-          # The macOS VM guest is always Linux ARM64, so use the arm64 rootfs
-          cp rootfs-download/rootfs.tar.zst "${COMPRESSED_DIR}/rootfs.tar.zst"
-
           echo "Staged macOS compressed artifacts:"
           ls -lah "$COMPRESSED_DIR"
+
+      - name: Build bundled supervisor
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file deploy/docker/Dockerfile.images \
+            --platform linux/arm64 \
+            --build-arg OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" \
+            --build-arg OPENSHELL_IMAGE_TAG=dev \
+            --target supervisor-output \
+            --output type=local,dest=supervisor-out/ \
+            .
+
+          zstd -19 -T0 -f supervisor-out/openshell-sandbox \
+            -o "${PWD}/target/vm-runtime-compressed-macos/openshell-sandbox.zst"
 
       - name: Build macOS binary via Docker (osxcross)
         run: |
@@ -776,7 +779,7 @@ jobs:
 
             ### VM Compute Driver Binaries
 
-            `openshell-driver-vm` binaries with embedded kernel runtime and sandbox rootfs.
+            `openshell-driver-vm` binaries with embedded kernel runtime and bundled sandbox supervisor.
             Launched by the gateway when `--drivers=vm` is configured. Rebuilt on every
             push to main alongside the openshell-vm binaries.
 
