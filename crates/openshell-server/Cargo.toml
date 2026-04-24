@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 openshell-core = { path = "../openshell-core" }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
+openshell-driver-podman = { path = "../openshell-driver-podman" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-router = { path = "../openshell-router" }

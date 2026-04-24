@@ -7,16 +7,16 @@ description: Debug why a openshell cluster failed to start or is unhealthy. Use 
 
 Diagnose why a openshell cluster failed to start after `openshell gateway start`.
 
-Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor logs`, `openshell doctor exec`) to inspect and fix the cluster. Do **not** use raw `docker`, `ssh`, or `kubectl` commands directly — always go through the `openshell doctor` interface. The CLI auto-resolves local vs remote gateways, so the same commands work everywhere.
+Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor logs`, `openshell doctor exec`) to inspect and fix the cluster. Do **not** use raw `docker`, `podman`, `ssh`, or `kubectl` commands directly — always go through the `openshell doctor` interface. The CLI auto-resolves local vs remote gateways, so the same commands work everywhere.
 
 ## Overview
 
-`openshell gateway start` creates a Docker container running k3s with the OpenShell server deployed via Helm. The deployment stages, in order, are:
+`openshell gateway start` creates a container (via Docker or Podman) running k3s with the OpenShell server deployed via Helm. The build and deploy scripts use a container-engine abstraction layer (`tasks/scripts/container-engine.sh`) that auto-detects Docker or Podman and provides a unified `ce` command interface. Set `CONTAINER_ENGINE=docker` or `CONTAINER_ENGINE=podman` to override auto-detection. The deployment stages, in order, are:
 
 1. **Pre-deploy check**: `openshell gateway start` in interactive mode prompts to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start). `mise run cluster` always recreates before deploy.
 2. Ensure cluster image is available (local build or remote pull)
-3. Create Docker network (`openshell-cluster`) and volume (`openshell-cluster-{name}`)
-4. Create and start a privileged Docker container (`openshell-cluster-{name}`)
+3. Create container network (`openshell-cluster`) and volume (`openshell-cluster-{name}`)
+4. Create and start a privileged container (`openshell-cluster-{name}`)
 5. Wait for k3s to generate kubeconfig (up to 60s)
 6. **Clean stale nodes**: Remove any `NotReady` k3s nodes left over from previous container instances that reused the same persistent volume
 7. **Prepare local images** (if `OPENSHELL_PUSH_IMAGES` is set): In `internal` registry mode, bootstrap waits for the in-cluster registry and pushes tagged images there. In `external` mode, bootstrap uses legacy `ctr -n k8s.io images import` push-mode behavior.
@@ -28,10 +28,11 @@ Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor log
     - TLS secrets `openshell-server-tls` and `openshell-client-tls` exist in `openshell` namespace
     - Sandbox supervisor binary exists at `/opt/openshell/bin/openshell-sandbox` (emits `HEALTHCHECK_MISSING_SUPERVISOR` marker if absent)
 
-For local deploys, metadata endpoint selection now depends on Docker connectivity:
+For local deploys, metadata endpoint selection depends on the container engine and its connectivity:
 
 - default local Docker socket (`unix:///var/run/docker.sock`): `https://127.0.0.1:{port}` (default port 8080)
 - TCP Docker daemon (`DOCKER_HOST=tcp://<host>:<port>`): `https://<host>:{port}` for non-loopback hosts
+- Podman (rootless): `https://127.0.0.1:{port}` via `host.containers.internal` (the Podman equivalent of `host.docker.internal`)
 
 The host port is configurable via `--port` on `openshell gateway start` (default 8080) and is stored in `ClusterMetadata.gateway_port`.
 
@@ -41,7 +42,8 @@ The default cluster name is `openshell`. The container is `openshell-cluster-{na
 
 ## Prerequisites
 
-- Docker must be running (locally or on the remote host)
+- Docker or Podman must be running (locally or on the remote host). The build system auto-detects which engine is available; set `CONTAINER_ENGINE=docker` or `CONTAINER_ENGINE=podman` to override.
+- For rootless Podman: ensure the Podman socket is active (`systemctl --user start podman.socket`) and subuid/subgid ranges are configured (`sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami)`)
 - The `openshell` CLI must be available
 - For remote clusters: SSH access to the remote host
 
@@ -300,10 +302,10 @@ Common issues:
 DNS misconfiguration is a common root cause, especially on remote/Linux hosts:
 
 ```bash
-# Check the resolv.conf k3s is using
+# Check the resolv.conf k3s is using for pod DNS
 openshell doctor exec -- cat /etc/rancher/k3s/resolv.conf
 
-# Test DNS resolution from inside the container
+# Test DNS from inside the container
 openshell doctor exec -- sh -c 'nslookup google.com || wget -q -O /dev/null http://google.com && echo "network ok" || echo "network unreachable"'
 ```
 
@@ -313,14 +315,22 @@ Check the entrypoint's DNS decision in the container logs:
 openshell doctor logs --lines 20
 ```
 
-The entrypoint script selects DNS resolvers in this priority:
+The entrypoint (`cluster-entrypoint.sh`) sets k3s pod DNS via a single strategy with one fallback:
 
-1. Viable nameservers from `/etc/resolv.conf` (not loopback/link-local)
-2. Docker `ExtServers` from `/etc/resolv.conf` comments
-3. Host gateway IP (Docker Desktop only, `192.168.*`)
-4. Fallback to `8.8.8.8` / `8.8.4.4`
+1. **Docker DNS proxy** (`setup_dns_proxy()`): reads the `DOCKER_OUTPUT` iptables chain to discover where Docker's embedded DNS (`127.0.0.11`) is actually listening, installs DNAT rules so k3s pods can reach it via the container's `eth0` IP, and writes `nameserver <eth0-ip>` to `/etc/rancher/k3s/resolv.conf`. On success logs: `Setting up DNS proxy: <ip>:53 -> 127.0.0.11`.
+2. **Public DNS fallback**: if `setup_dns_proxy()` fails for any reason, logs `Warning: Could not discover Docker DNS ports from iptables` and writes `nameserver 8.8.8.8` / `nameserver 8.8.4.4` to `/etc/rancher/k3s/resolv.conf`.
+
+After either path, `verify_dns()` runs `nslookup` (5 retries) against the configured registry host (default `ghcr.io`). On failure it emits `DNS_PROBE_FAILED` into the logs. The Rust-side bootstrap (`runtime.rs` / `lib.rs`) watches for this marker and aborts early rather than spinning for the full 6-minute timeout.
+
+**Important:** there are two independent DNS paths inside the cluster container. The entrypoint only writes `/etc/rancher/k3s/resolv.conf` (pod DNS). The container's system `/etc/resolv.conf` (used by containerd for image pulls and by `nslookup`) is set by Docker or Podman at container start and is never touched by the entrypoint. These can point at different nameservers.
+
+**Under Podman:** `setup_dns_proxy()` always fails — Podman does not create a `DOCKER_OUTPUT` chain. k3s pod DNS always falls back to `8.8.8.8`/`8.8.4.4`. The cluster container runs on a named Podman bridge network, which uses **netavark + aardvark-dns**. Aardvark-dns listens on the bridge gateway IP (e.g. `10.89.x.1`) and forwards external queries to the host resolver. Podman sets the container's system `/etc/resolv.conf` to that address — so `nslookup ghcr.io` works fine even when `8.8.8.8` is blocked. This means **`DNS_PROBE_FAILED` is never emitted under Podman** even when pod-level DNS is broken: the entrypoint's `verify_dns()` and the Rust-side `probe_container_dns()` both call bare `nslookup`, which hits aardvark-dns via the system resolv.conf, not the k3s resolv.conf. Pod DNS failures surface later as CoreDNS upstream forwarding timeouts, not as an early bootstrap abort.
+
+To debug Podman pod DNS failures: check `/etc/rancher/k3s/resolv.conf` confirms `8.8.8.8` is there, then verify `8.8.8.8:53` UDP is reachable from the host with `nc -vzu 8.8.8.8 53`.
 
 If DNS is broken, all image pulls from the distribution registry will fail, as will pods that need external network access.
+
+**Sandbox agent DNS is a separate enforcement layer.** The cluster DNS above controls what k3s pods and containerd can resolve. It has no bearing on what agent workloads inside sandboxes can reach. The sandbox supervisor (`openshell-sandbox`) creates an isolated Linux network namespace for each agent process with a veth pair, then installs iptables rules inside that namespace that REJECT all outbound UDP — including port 53 — except traffic destined for the supervisor's CONNECT proxy. Agent workloads cannot make raw DNS queries regardless of what nameservers are configured anywhere in the cluster. DNS must go through the HTTP CONNECT proxy. This is a kernel-enforced boundary at the netns level, not a configuration setting. The bypass monitor detects and logs any direct DNS attempt with the hint: `"DNS queries should route through the sandbox proxy; check resolver configuration"`.
 
 ## Common Failure Patterns
 
@@ -329,7 +339,7 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | `tls handshake eof` from `openshell status` | Server not running or mTLS credentials missing/mismatched | Check StatefulSet replicas (Step 3) and mTLS files (Step 6) |
 | StatefulSet `0/0` replicas | StatefulSet scaled to zero (failed deploy, manual scale-down, or Helm misconfiguration) | `openshell doctor exec -- kubectl -n openshell scale statefulset openshell --replicas=1` |
 | Local mTLS files missing | Deploy was interrupted before credentials were persisted | Extract from cluster secret `openshell-client-tls` (Step 6) |
-| Container not found | Image not built | `mise run docker:build:cluster` (local) or re-deploy (remote) |
+| Container not found | Image not built | `mise run docker:build:cluster` (local, works with both Docker and Podman) or re-deploy (remote) |
 | Container exited, OOMKilled | Insufficient memory | Increase host memory or reduce workload |
 | Container exited, non-zero exit | k3s crash, port conflict, privilege issue | Check `openshell doctor logs` for details |
 | `/readyz` fails | k3s still starting or crashed | Wait longer or check container logs for k3s errors |
@@ -343,10 +353,15 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | mTLS mismatch after redeploy | PKI rotated but workload not restarted, or rollout failed | Check that all three TLS secrets exist and that the openshell pod restarted after cert rotation (Step 6) |
 | Helm install job failed | Chart values error or dependency issue | `openshell doctor exec -- kubectl -n kube-system logs -l job-name=helm-install-openshell` |
 | NFD/GFD DaemonSets present (`node-feature-discovery`, `gpu-feature-discovery`) | Cluster was deployed before NFD/GFD were disabled (pre-simplify-device-plugin change) | These are harmless but add overhead. Clean up: `openshell doctor exec -- kubectl delete daemonset -n nvidia-device-plugin -l app.kubernetes.io/name=node-feature-discovery` and similarly for GFD. The `nvidia.com/gpu.present` node label is no longer applied; device plugin scheduling no longer requires it. |
+| Podman socket not found | Rootless Podman service not started | `systemctl --user start podman.socket` and verify with `podman info` |
+| Container creation fails with subuid/subgid error (Podman) | Missing user namespace ID mappings | `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami)` then `podman system migrate` |
+| Cgroups v1 detected (Podman) | Podman driver requires unified cgroup hierarchy | Set `systemd.unified_cgroup_hierarchy=1` kernel parameter and reboot |
+| `--restart=always` ignored (Podman rootless) | Rootless Podman does not support `--restart=always` for containers | Use a systemd user service instead: `loginctl enable-linger $(whoami)` then create a `~/.config/systemd/user/` unit |
 | Architecture mismatch (remote) | Built on arm64, deploying to amd64 | Cross-build the image for the target architecture |
 | Port conflict | Another service on the configured gateway host port (default 8080) | Stop conflicting service or use `--port` on `openshell gateway start` to pick a different host port |
 | gRPC connect refused to `127.0.0.1:443` in CI | Docker daemon is remote (`DOCKER_HOST=tcp://...`) but metadata still points to loopback | Verify metadata endpoint host matches `DOCKER_HOST` and includes non-loopback host |
-| DNS failures inside container | Entrypoint DNS detection failed | `openshell doctor exec -- cat /etc/rancher/k3s/resolv.conf` and `openshell doctor logs --lines 20` |
+| DNS failures inside container (Docker) | `setup_dns_proxy()` failed to find `DOCKER_OUTPUT` iptables chain | `openshell doctor logs --lines 20` for `Warning: Could not discover Docker DNS ports`; try `docker network prune -f` and redeploy |
+| Pod external name resolution fails (Podman) | `setup_dns_proxy()` always fails under Podman; k3s resolv.conf falls back to `8.8.8.8`/`8.8.4.4`, which is blocked on this network | `DNS_PROBE_FAILED` will NOT appear — entrypoint and Rust-side probes resolve via aardvark-dns (system `/etc/resolv.conf`), not the k3s resolv.conf; check `openshell doctor exec -- cat /etc/rancher/k3s/resolv.conf` to confirm fallback; verify `8.8.8.8:53` UDP reachable from host via `nc -vzu 8.8.8.8 53` |
 | Pods can't reach kube-dns / ClusterIP services | `br_netfilter` not loaded; bridge traffic bypasses iptables DNAT rules | `sudo modprobe br_netfilter` on the host, then `echo br_netfilter \| sudo tee /etc/modules-load.d/br_netfilter.conf` to persist. Known to be required on Jetson Linux 5.15-tegra; other kernels (e.g. standard x86/aarch64 Linux) may have bridge netfilter built in and work without the module. The entrypoint logs a warning when `/proc/sys/net/bridge/bridge-nf-call-iptables` is absent but does not abort — only act on it if DNS or service connectivity is actually broken. |
 | Node DiskPressure / MemoryPressure / PIDPressure | Insufficient disk, memory, or PIDs on host | Free disk (`docker system prune -a --volumes`), increase memory, or expand host resources. Bootstrap auto-detects via `HEALTHCHECK_NODE_PRESSURE` marker |
 | Pods evicted with "The node had condition: [DiskPressure]" | Host disk full, kubelet evicting pods | Free disk space on host, then `openshell gateway destroy <name> && openshell gateway start` |

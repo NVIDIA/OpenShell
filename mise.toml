@@ -39,7 +39,8 @@ UV_CACHE_DIR = "{{config_root}}/.cache/uv"
 RUSTC_WRAPPER = "sccache"
 SCCACHE_DIR = "{{config_root}}/.cache/sccache"
 
-# Shared build constants (overridable via environment)
+# Shared build constants (overridable via environment).
+# DOCKER_BUILDKIT enables BuildKit for Docker; ignored by podman.
 DOCKER_BUILDKIT = "1"
 
 [vars]

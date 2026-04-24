@@ -21,6 +21,8 @@
 
 set -euo pipefail
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/container-engine.sh"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 ROOTFS_BUILD_DIR="${ROOT}/target/rootfs-build"
 OUTPUT_DIR="${ROOT}/target/vm-runtime-compressed"
@@ -49,17 +51,10 @@ for arg in "$@"; do
     esac
 done
 
-# Check for Docker
-if ! command -v docker &>/dev/null; then
-    echo "Error: Docker is required to build the rootfs" >&2
-    echo "Please install Docker and try again" >&2
-    exit 1
-fi
-
-# Check if Docker daemon is running
-if ! docker info &>/dev/null; then
-    echo "Error: Docker daemon is not running" >&2
-    echo "Please start Docker and try again" >&2
+# Check if container engine is running
+if ! ce info &>/dev/null; then
+    echo "Error: container engine is not running" >&2
+    echo "Please start your container engine and try again" >&2
     exit 1
 fi
 

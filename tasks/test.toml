@@ -48,6 +48,11 @@ depends = ["python:proto", "CLUSTER_GPU=1 cluster"]
 env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
 run = "uv run pytest -o python_files='test_*.py' -m gpu -n ${E2E_PARALLEL:-1} e2e/python"
 
+["e2e:podman"]
+description = "Start a Podman-backed gateway and run smoke e2e (requires rootless Podman; pass -- --port=N to override)"
+depends = ["build:docker:supervisor-sideload"]
+run = "e2e/rust/e2e-podman.sh"
+
 ["e2e:vm"]
 description = "Start openshell-gateway with the VM compute driver and run the cluster-agnostic smoke e2e"
 run = "e2e/rust/e2e-vm.sh"

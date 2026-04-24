@@ -48,7 +48,7 @@ finally:
 
 #[tokio::test]
 async fn sandbox_bypasses_proxy_for_localhost_http() {
-    let guard = SandboxGuard::create(&["python3", "-c", localhost_bypass_script()])
+    let guard = SandboxGuard::create(&["--", "python3", "-c", localhost_bypass_script()])
         .await
         .expect("sandbox create with localhost proxy bypass check");
 

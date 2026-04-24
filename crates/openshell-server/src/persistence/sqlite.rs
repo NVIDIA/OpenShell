@@ -18,19 +18,27 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub async fn connect(url: &str) -> Result<Self> {
-        let max_connections = if url.contains(":memory:") || url.contains("mode=memory") {
-            1
-        } else {
-            5
-        };
+        let is_in_memory = url.contains(":memory:") || url.contains("mode=memory");
+        let max_connections = if is_in_memory { 1 } else { 5 };
 
         let options = SqliteConnectOptions::from_str(url)
             .map_err(|e| map_db_error(&e))?
             .create_if_missing(true);
 
-        let pool = SqlitePoolOptions::new()
+        let mut pool_options = SqlitePoolOptions::new()
             .max_connections(max_connections)
-            .min_connections(max_connections)
+            .min_connections(max_connections);
+
+        // In-memory SQLite databases exist only while at least one connection
+        // is open. SQLx's default `max_lifetime` (30 min) and `idle_timeout`
+        // (10 min) would recycle the sole connection, destroying the database
+        // and all its tables. Disable both timeouts so the connection (and
+        // therefore the database) lives for the entire process lifetime.
+        if is_in_memory {
+            pool_options = pool_options.idle_timeout(None).max_lifetime(None);
+        }
+
+        let pool = pool_options
             .connect_with(options)
             .await
             .map_err(|e| map_db_error(&e))?;
