@@ -44,3 +44,8 @@ runs:
         name: ${{ inputs.name }}
         driver: docker-container
         platforms: linux/amd64,linux/arm64
+        # Use the nv-gha-runners Docker Hub mirror to avoid unauthenticated
+        # pull rate limits on shared runners. The TOML is pre-populated on
+        # every nv-gha-runner. Per:
+        # https://docs.gha-runners.nvidia.com/platform/best-practices/#use-docker-cache-for-buildkit
+        buildkitd-config: /etc/buildkit/buildkitd.toml
