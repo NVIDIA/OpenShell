@@ -217,7 +217,7 @@ info "Removing unused volumes..."
 # Identify volumes in use by running containers
 in_use_volumes=$(ce ps -q 2>/dev/null \
   | xargs -r ce inspect --format '{{range .Mounts}}{{.Name}} {{end}}' 2>/dev/null \
-  | tr ' ' '\n' | sort -u | grep -v '^$')
+  | tr ' ' '\n' | sort -u | grep -v '^$' || true)
 
 unused_volumes=()
 while read -r vol; do
