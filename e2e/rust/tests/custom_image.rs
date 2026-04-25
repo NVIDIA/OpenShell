@@ -22,8 +22,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Create the sandbox user/group so the supervisor can switch to it.
-RUN groupadd -g 1000 sandbox && \
-    useradd -m -u 1000 -g sandbox sandbox
+# Use a high UID range to avoid conflicts with host users when running without
+# user namespace remapping (UID in container = UID on host).
+RUN groupadd -g 1000660000 sandbox && \
+    useradd -m -u 1000660000 -g sandbox sandbox
 
 # Write a marker file so we can verify this is our custom image.
 RUN echo "custom-image-e2e-marker" > /opt/marker.txt
