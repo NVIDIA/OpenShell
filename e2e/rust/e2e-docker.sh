@@ -89,6 +89,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+run_cargo_cross() {
+  # cargo-zigbuild on macOS can exhaust file descriptors inside sccache while
+  # hashing the cross-target dependency graph. Keep sccache for the regular
+  # host builds, but disable it for the Linux supervisor cross-build.
+  if [ -n "${RUSTC_WRAPPER:-}" ] && [ "$(basename "${RUSTC_WRAPPER}")" = "sccache" ]; then
+    env -u RUSTC_WRAPPER cargo "$@"
+  else
+    cargo "$@"
+  fi
+}
+
 # ── Preflight ────────────────────────────────────────────────────────
 if ! command -v docker >/dev/null 2>&1; then
   echo "ERROR: docker CLI is required to run e2e:docker" >&2
@@ -132,10 +143,10 @@ cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
 
 echo "Cross-compiling openshell-sandbox for ${SUPERVISOR_TARGET}..."
 if ! command -v cargo-zigbuild >/dev/null 2>&1; then
-  cargo install --locked cargo-zigbuild
+  run_cargo_cross install --locked cargo-zigbuild
 fi
 rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
-cargo zigbuild ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
+run_cargo_cross zigbuild ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
   --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
 
 if [ ! -f "${SUPERVISOR_BIN}" ]; then

@@ -13,7 +13,10 @@ use futures::StreamExt;
 use http_body_util::Full;
 use hyper::{Request, StatusCode};
 use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use hyper_util::{
+    client::legacy::{Client, connect::HttpConnector},
+    rt::TokioExecutor,
+};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
@@ -1256,24 +1259,7 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
     let base = server.trim_end_matches('/');
     let uri: hyper::Uri = format!("{base}/healthz").parse().into_diagnostic()?;
 
-    let scheme = uri.scheme_str().unwrap_or("https");
-    let https = if scheme.eq_ignore_ascii_case("http") || tls.is_bearer_auth() {
-        HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .into_diagnostic()?
-            .https_or_http()
-            .enable_http1()
-            .build()
-    } else {
-        let materials = require_tls_materials(server, tls)?;
-        let tls_config = build_rustls_config(&materials)?;
-        HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
-            .https_only()
-            .enable_http1()
-            .build()
-    };
-    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+    let scheme = uri.scheme_str().unwrap_or("https").to_string();
     let mut req_builder = Request::builder().method("GET").uri(uri);
     // Inject edge authentication headers when an edge token is configured.
     if let Some(ref token) = tls.edge_token {
@@ -1284,8 +1270,32 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
     let req = req_builder
         .body(Full::new(Bytes::new()))
         .into_diagnostic()?;
-    let resp = client.request(req).await.into_diagnostic()?;
-    Ok(Some(resp.status()))
+
+    let status = if scheme.eq_ignore_ascii_case("http") {
+        let http = HttpConnector::new();
+        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(http);
+        client.request(req).await.into_diagnostic()?.status()
+    } else if tls.is_bearer_auth() {
+        let https = HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .into_diagnostic()?
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+        client.request(req).await.into_diagnostic()?.status()
+    } else {
+        let materials = require_tls_materials(server, tls)?;
+        let tls_config = build_rustls_config(&materials)?;
+        let https = HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config)
+            .https_only()
+            .enable_http1()
+            .build();
+        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+        client.request(req).await.into_diagnostic()?.status()
+    };
+    Ok(Some(status))
 }
 
 /// Deploy a gateway with the rich progress panel (interactive) or simple

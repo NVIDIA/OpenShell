@@ -207,7 +207,7 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
-        allows_loopback_endpoints: bool,
+        _allows_loopback_endpoints: bool,
     ) -> Result<Self, ComputeError> {
         let default_image = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
@@ -235,10 +235,14 @@ impl ComputeRuntime {
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
-        supervisor_readiness: Arc<dyn docker::SupervisorReadiness>,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
         let driver =
-            docker::DockerComputeDriver::new(&config, &docker_config, supervisor_readiness)
+            docker::DockerComputeDriver::new(
+                &config,
+                &docker_config,
+                supervisor_sessions.clone(),
+            )
                 .await
                 .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(driver);
@@ -249,6 +253,8 @@ impl ComputeRuntime {
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
+            supervisor_sessions,
+            true,
         )
         .await
     }
