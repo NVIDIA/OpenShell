@@ -1034,6 +1034,12 @@ fn sandbox_template_to_k8s(
 
     if use_user_namespaces {
         spec.insert("hostUsers".to_string(), serde_json::json!(false));
+        if gpu {
+            warn!(
+                "GPU sandbox with user namespaces enabled — \
+                 NVIDIA device plugin compatibility is unverified"
+            );
+        }
     }
 
     let mut container = serde_json::Map::new();
