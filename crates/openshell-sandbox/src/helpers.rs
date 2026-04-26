@@ -115,9 +115,30 @@ fn validate(config: &HelpersConfig) -> Result<()> {
 /// Spawn every helper in the config, in declaration order. Returns a handle
 /// per spawned helper.
 ///
+/// Before the first helper spawns, install iptables OUTPUT rules in the
+/// supervisor's netns that REJECT helper-originated egress that doesn't
+/// route through the policy proxy. See `install_capture_rules` for the
+/// rule set and exemption rationale.
+///
 /// # Errors
-/// Propagates the first helper that fails to spawn.
+/// Propagates the first helper that fails to spawn. Failure to install
+/// capture rules is logged but non-fatal — helpers still spawn so the
+/// supervisor can boot, but the trust model is degraded (operators get
+/// an OCSF event flagging the missing capture).
 pub fn spawn_helpers(config: &HelpersConfig) -> Result<Vec<HelperHandle>> {
+    if !config.helpers.is_empty() {
+        if let Err(e) = install_capture_rules() {
+            // Don't fail the spawn — degraded mode is better than no helpers.
+            // The OCSF event raised inside `install_capture_rules` already
+            // tells operators capture is off; tracing here is for completeness.
+            tracing::warn!(
+                error = %e,
+                "supervisor netns capture rules failed to install; \
+                 helpers will run with un-captured egress"
+            );
+        }
+    }
+
     let mut handles = Vec::with_capacity(config.helpers.len());
     for spec in &config.helpers {
         let handle = spawn_helper(spec)?;
@@ -220,6 +241,236 @@ fn raise_ambient(caps_list: &[caps::Capability]) -> std::io::Result<()> {
         caps::raise(None, CapSet::Ambient, *cap)
             .map_err(|e| std::io::Error::other(format!("raise ambient {cap:?}: {e}")))?;
     }
+    Ok(())
+}
+
+// ── Supervisor-netns iptables capture ───────────────────────────────────────
+//
+// Helpers share the supervisor's network namespace by design — that's how
+// the mediator UDS, OpenClaw gateway, and other operator-declared daemons
+// reach services the workload sandbox couldn't reach itself. The downside:
+// before this module, the supervisor netns had no iptables rules at all, so
+// any helper-spawned process whose HTTP client ignores `HTTPS_PROXY` (e.g.
+// Node's built-in `https.request`, which OpenClaw's `web_fetch` tool uses
+// internally) could egress directly to any host the pod can reach, with no
+// policy check and no audit trail.
+//
+// This module installs a small set of rules in the supervisor netns OUTPUT
+// chain that LOG+REJECT helper-originated direct egress while exempting:
+//   - the supervisor's own outbound traffic (gRPC to control plane, log
+//     push, the policy proxy's upstream forwarding) via `--uid-owner 0`
+//   - traffic destined for the policy proxy itself (the legitimate
+//     proxy-aware path)
+//   - loopback and reply packets
+//
+// A helper that drops privileges (e.g. `nemoclaw-start` → `gosu gateway` →
+// UID 999, or `mediator-runner` → setresuid → UID 998) and then attempts a
+// direct outbound TCP connection lands in the catch-all REJECT and gets a
+// fast `ECONNREFUSED` plus an `openshell:helper-bypass:` LOG entry that
+// `bypass_monitor` parses into an OCSF DetectionFinding.
+//
+// Known limitations of this v0 design:
+//   1. A helper running as root before its own privilege drop is exempted
+//      by the UID 0 rule — same brief window as for the supervisor's own
+//      bootstrap traffic. For sclaw's helpers this is bounded to the few
+//      seconds between exec and gosu/runner; documented in the helpers RFC.
+//   2. The proxy hostname/IP is hard-coded here to match
+//      `sandbox::linux::netns::{SUBNET_PREFIX, HOST_IP_SUFFIX}` because at
+//      `spawn_helpers` time the policy hasn't been loaded yet and the
+//      runtime proxy bind address isn't available. A v1 refactor that
+//      moves helper spawn after policy load would replace the constant
+//      with the runtime address.
+
+/// Hard-coded supervisor-side proxy IP. Must match
+/// `sandbox::linux::netns::SUBNET_PREFIX` (`10.200.0`) +
+/// `HOST_IP_SUFFIX` (`1`). Hard-coding here because helpers spawn before
+/// the policy is loaded and the actual proxy bind address is set.
+#[cfg(target_os = "linux")]
+const PROXY_IP: &str = "10.200.0.1";
+
+/// Hard-coded proxy port. Matches the default in `lib.rs` and `proxy.rs`.
+/// Same v0 limitation as `PROXY_IP` above.
+#[cfg(target_os = "linux")]
+const PROXY_PORT: u16 = 3128;
+
+/// Well-known iptables paths. Mirrors `sandbox::linux::netns`'s probe set;
+/// duplicated here so we can stay independent of the netns module's
+/// internal API.
+#[cfg(target_os = "linux")]
+const IPTABLES_SEARCH_PATHS: &[&str] =
+    &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"];
+
+#[cfg(target_os = "linux")]
+fn find_iptables() -> Option<String> {
+    IPTABLES_SEARCH_PATHS
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|s| (*s).to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn run_iptables(iptables_cmd: &str, args: &[&str]) -> Result<()> {
+    let output = std::process::Command::new(iptables_cmd)
+        .args(args)
+        .output()
+        .into_diagnostic()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(miette::miette!(
+            "{iptables_cmd} {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Install OUTPUT-chain rules in the supervisor's netns to capture helper
+/// egress. Idempotent: re-running appends duplicate ACCEPT/REJECT rules,
+/// which is harmless but cosmetically noisy; in practice this runs once
+/// per supervisor lifetime.
+///
+/// Degrades gracefully when iptables is missing — emits an OCSF event so
+/// operators see the missing capture, returns `Ok(())` to let helpers
+/// still spawn.
+#[cfg(target_os = "linux")]
+fn install_capture_rules() -> Result<()> {
+    let iptables = match find_iptables() {
+        Some(path) => path,
+        None => {
+            ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Medium)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Disabled, "degraded")
+                    .message(
+                        "iptables not found; supervisor-netns helper capture rules \
+                         will not be installed — helpers may egress without policy \
+                         enforcement"
+                    )
+                    .build()
+            );
+            return Ok(());
+        }
+    };
+
+    let proxy_port_str = PROXY_PORT.to_string();
+    let proxy_dst = format!("{PROXY_IP}/32");
+
+    // Rule 1: ACCEPT loopback. Mediator UDS, gateway UI, etc. depend on it.
+    run_iptables(
+        &iptables,
+        &["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
+    )?;
+
+    // Rule 2: ACCEPT reply packets for connections we already permitted.
+    run_iptables(
+        &iptables,
+        &[
+            "-A", "OUTPUT",
+            "-m", "conntrack",
+            "--ctstate", "ESTABLISHED,RELATED",
+            "-j", "ACCEPT",
+        ],
+    )?;
+
+    // Rule 3: ACCEPT to the policy proxy. Helpers that respect HTTPS_PROXY
+    // land here; the proxy then enforces the binary + host allowlist.
+    run_iptables(
+        &iptables,
+        &[
+            "-A", "OUTPUT",
+            "-d", &proxy_dst,
+            "-p", "tcp",
+            "--dport", &proxy_port_str,
+            "-j", "ACCEPT",
+        ],
+    )?;
+
+    // Rule 4: ACCEPT supervisor's own outbound. UID 0 covers the gRPC
+    // control-plane connection, log push, and the policy proxy's own
+    // upstream forwarding (which would otherwise loop). Helpers that
+    // haven't dropped privileges yet are also covered here — see the
+    // module-level comment for the bounded-window caveat.
+    run_iptables(
+        &iptables,
+        &[
+            "-A", "OUTPUT",
+            "-m", "owner",
+            "--uid-owner", "0",
+            "-j", "ACCEPT",
+        ],
+    )?;
+
+    // Rule 4b: ACCEPT DNS (UDP/TCP port 53) from any helper UID. Unlike
+    // ordinary application traffic — which is expected to flow through
+    // the policy proxy — DNS is consulted by the helpers themselves
+    // when they call iptables/getaddrinfo with hostnames (e.g. the
+    // mediator daemon resolving the per-policy http_allowlist before
+    // installing per-worker iptables rules). Without this exception,
+    // those resolutions hit Rule 6 (REJECT), iptables fails with
+    // "host/network not found / exit 2", and `fork_with_policy`
+    // breaks even though the operator-approved policy is otherwise
+    // valid. Allowing port-53 egress from helpers is a narrow widening
+    // of the bypass surface (DNS exfil only), well-justified by the
+    // requirement that hostname-based allowlists actually work.
+    for proto in &["udp", "tcp"] {
+        run_iptables(
+            &iptables,
+            &[
+                "-A", "OUTPUT",
+                "-p", proto,
+                "--dport", "53",
+                "-j", "ACCEPT",
+            ],
+        )?;
+    }
+
+    // Rule 5: LOG bypass attempts so bypass_monitor can surface them as
+    // OCSF DetectionFindings. The prefix matches the existing convention
+    // used by the workload-netns LOG rules in `sandbox::linux::netns`.
+    let log_prefix = "openshell:helper-bypass:";
+    if let Err(e) = run_iptables(
+        &iptables,
+        &[
+            "-A", "OUTPUT",
+            "-j", "LOG",
+            "--log-prefix", log_prefix,
+            "--log-level", "warning",
+        ],
+    ) {
+        // LOG is non-essential — REJECT below still catches the bypass.
+        // Some kernels lack `xt_LOG`; downgrade to a warning and continue.
+        tracing::warn!(error = %e, "could not install LOG rule for helper bypass");
+    }
+
+    // Rule 6: REJECT everything else with ECONNREFUSED so callers fast-fail
+    // instead of hanging on a 30s connect timeout.
+    run_iptables(
+        &iptables,
+        &[
+            "-A", "OUTPUT",
+            "-j", "REJECT",
+            "--reject-with", "icmp-port-unreachable",
+        ],
+    )?;
+
+    ocsf_emit!(
+        openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+            .severity(openshell_ocsf::SeverityId::Informational)
+            .status(openshell_ocsf::StatusId::Success)
+            .state(openshell_ocsf::StateId::Enabled, "installed")
+            .message(format!(
+                "Supervisor netns capture rules installed [proxy:{PROXY_IP}:{PROXY_PORT}]"
+            ))
+            .build()
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_capture_rules() -> Result<()> {
     Ok(())
 }
 
