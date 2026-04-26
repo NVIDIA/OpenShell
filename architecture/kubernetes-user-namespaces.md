@@ -120,6 +120,21 @@ This is a kernel/filesystem constraint, not an OpenShell bug. The pod spec is ge
 
 The e2e test (`e2e/rust/tests/user_namespaces.rs`) accounts for this by verifying only the pod spec fields (`hostUsers`, capabilities) rather than attempting to run a command inside the sandbox.
 
+## Deploying to a real cluster with Helm
+
+User namespaces can be tested end-to-end on any Kubernetes 1.33+ cluster (beta, enabled by default) or 1.36+ (GA) with a supporting container runtime. Deploy the gateway with Helm and set `server.enableUserNamespaces=true`:
+
+```shell
+helm install openshell deploy/helm/openshell -n openshell \
+  --set server.enableUserNamespaces=true \
+  --set server.sandboxImage="ghcr.io/nvidia/openshell-community/sandboxes/base:latest" \
+  ...
+```
+
+The supervisor binary must be present at `/opt/openshell/bin/openshell-sandbox` on every node (hostPath mount). On SELinux-enforcing nodes (RHEL, CoreOS), label it with `chcon -t container_file_t`.
+
+This has been validated end-to-end on OCP 4.22 (K8s 1.35.3, CRI-O 1.35, RHEL CoreOS, kernel 5.14) with full SSH tunnel, workspace init, and sandbox command execution under user namespace isolation. See [kubernetes-user-namespaces-ocp-testing.md](kubernetes-user-namespaces-ocp-testing.md) for the complete step-by-step reproduction guide.
+
 ## Verification
 
 1. `mise run pre-commit` -- lint and format pass
@@ -129,4 +144,4 @@ The e2e test (`e2e/rust/tests/user_namespaces.rs`) accounts for this by verifyin
    - `platform_config_bool` helper
    - `Directory` type on supervisor volume
 3. `mise run e2e` -- the `user_namespaces` test verifies pod spec correctness against the local dev cluster
-4. On a bare-metal or VM-based K8s 1.33+ cluster: `cat /proc/self/uid_map` inside a sandbox should show a non-identity mapping (UID 0 maps to a high host UID)
+4. On a Kubernetes 1.33+ cluster (OCP, GKE, EKS, bare-metal): deploy with Helm, create a sandbox, and verify `cat /proc/self/uid_map` shows a non-identity mapping (UID 0 maps to a high host UID)
