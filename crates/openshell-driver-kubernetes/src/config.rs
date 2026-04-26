@@ -12,4 +12,5 @@ pub struct KubernetesComputeConfig {
     pub ssh_handshake_skew_secs: u64,
     pub client_tls_secret_name: String,
     pub host_gateway_ip: String,
+    pub enable_user_namespaces: bool,
 }

@@ -96,6 +96,11 @@ server:
   # to this IP, allowing them to reach services running on the Docker host.
   # Auto-detected by the cluster entrypoint script.
   hostGatewayIP: ""
+  # Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox
+  # pods. Requires Kubernetes 1.36+ with a supporting container runtime and
+  # Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host
+  # UID and capabilities become namespaced.
+  enableUserNamespaces: false
   # Disable gateway authentication (mTLS client certificate requirement).
   # Set to true when the gateway sits behind a reverse proxy (e.g.
   # Cloudflare Tunnel) that terminates TLS.

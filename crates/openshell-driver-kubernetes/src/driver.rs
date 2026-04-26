@@ -320,6 +320,7 @@ impl KubernetesComputeDriver {
             self.ssh_handshake_skew_secs(),
             &self.config.client_tls_secret_name,
             &self.config.host_gateway_ip,
+            self.config.enable_user_namespaces,
         );
         let api = self.api();
 
@@ -676,7 +677,7 @@ fn supervisor_volume() -> serde_json::Value {
         "name": SUPERVISOR_VOLUME_NAME,
         "hostPath": {
             "path": SUPERVISOR_HOST_PATH,
-            "type": "DirectoryOrCreate"
+            "type": "Directory"
         }
     })
 }
@@ -889,6 +890,7 @@ fn sandbox_to_k8s_spec(
     ssh_handshake_skew_secs: u64,
     client_tls_secret_name: &str,
     host_gateway_ip: &str,
+    enable_user_namespaces: bool,
 ) -> serde_json::Value {
     let mut root = serde_json::Map::new();
 
@@ -931,6 +933,7 @@ fn sandbox_to_k8s_spec(
                     client_tls_secret_name,
                     host_gateway_ip,
                     inject_workspace,
+                    enable_user_namespaces,
                 ),
             );
             if !template.agent_socket_path.is_empty() {
@@ -977,6 +980,7 @@ fn sandbox_to_k8s_spec(
                 client_tls_secret_name,
                 host_gateway_ip,
                 inject_workspace,
+                enable_user_namespaces,
             ),
         );
     }
@@ -1002,6 +1006,7 @@ fn sandbox_template_to_k8s(
     client_tls_secret_name: &str,
     host_gateway_ip: &str,
     inject_workspace: bool,
+    enable_user_namespaces: bool,
 ) -> serde_json::Value {
     // The supervisor binary is always side-loaded from the node filesystem
     // via a hostPath volume, regardless of which sandbox image is used.
@@ -1020,6 +1025,15 @@ fn sandbox_template_to_k8s(
             "runtimeClassName".to_string(),
             serde_json::json!(runtime_class),
         );
+    }
+
+    // Per-sandbox platform_config.host_users overrides the cluster-wide default.
+    let use_user_namespaces = platform_config_bool(template, "host_users")
+        .map(|host_users| !host_users)
+        .unwrap_or(enable_user_namespaces);
+
+    if use_user_namespaces {
+        spec.insert("hostUsers".to_string(), serde_json::json!(false));
     }
 
     let mut container = serde_json::Map::new();
@@ -1056,17 +1070,19 @@ fn sandbox_template_to_k8s(
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
 
-    // The sandbox process needs SYS_ADMIN (for seccomp filter installation and
-    // network namespace creation), NET_ADMIN (for network namespace veth setup),
-    // SYS_PTRACE (for the CONNECT proxy to read /proc/<pid>/fd/ of sandbox-user
-    // processes to resolve binary identity for network policy enforcement),
-    // and SYSLOG (for reading /dev/kmsg to surface bypass detection diagnostics).
-    // This mirrors the capabilities used by `mise run sandbox`.
+    let mut capabilities: Vec<&str> = vec!["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"];
+    if use_user_namespaces {
+        // In a user namespace the bounding set is reset. SETUID/SETGID are
+        // needed for the supervisor to drop privileges to the sandbox user.
+        // DAC_READ_SEARCH is needed for cross-UID /proc/<pid>/fd/ access
+        // for process identity resolution in network policy enforcement.
+        capabilities.extend(["SETUID", "SETGID", "DAC_READ_SEARCH"]);
+    }
     container.insert(
         "securityContext".to_string(),
         serde_json::json!({
             "capabilities": {
-                "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
+                "add": capabilities
             }
         }),
     );
@@ -1290,6 +1306,15 @@ fn platform_config_string(template: &SandboxTemplate, key: &str) -> Option<Strin
     }
 }
 
+fn platform_config_bool(template: &SandboxTemplate, key: &str) -> Option<bool> {
+    let config = template.platform_config.as_ref()?;
+    let value = config.fields.get(key)?;
+    match value.kind.as_ref() {
+        Some(prost_types::value::Kind::BoolValue(b)) => Some(*b),
+        _ => None,
+    }
+}
+
 /// Extract a nested Struct value from the template's `platform_config`,
 /// converting it to `serde_json::Value`.
 fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde_json::Value> {
@@ -1496,7 +1521,7 @@ mod tests {
         assert_eq!(volumes.len(), 1);
         assert_eq!(volumes[0]["name"], SUPERVISOR_VOLUME_NAME);
         assert_eq!(volumes[0]["hostPath"]["path"], SUPERVISOR_HOST_PATH);
-        assert_eq!(volumes[0]["hostPath"]["type"], "DirectoryOrCreate");
+        assert_eq!(volumes[0]["hostPath"]["type"], "Directory");
 
         // Agent container command should be overridden
         let command = pod_template["spec"]["containers"][0]["command"]
@@ -1582,6 +1607,7 @@ mod tests {
             "",
             "",
             true,
+            false,
         );
 
         assert_eq!(
@@ -1624,6 +1650,7 @@ mod tests {
             "",
             "",
             true,
+            false,
         );
 
         assert_eq!(
@@ -1662,6 +1689,7 @@ mod tests {
             "",
             "",
             true,
+            false,
         );
 
         assert_eq!(
@@ -1696,6 +1724,7 @@ mod tests {
             "",
             "",
             true,
+            false,
         );
 
         let limits = &pod_template["spec"]["containers"][0]["resources"]["limits"];
@@ -1723,6 +1752,7 @@ mod tests {
             "",
             "172.17.0.1",
             true,
+            false,
         );
 
         let host_aliases = pod_template["spec"]["hostAliases"]
@@ -1754,6 +1784,7 @@ mod tests {
             "",
             "",
             true,
+            false,
         );
 
         assert!(
@@ -1780,6 +1811,7 @@ mod tests {
             "my-tls-secret",
             "",
             true,
+            false,
         );
 
         let volumes = pod_template["spec"]["volumes"]
@@ -1923,6 +1955,7 @@ mod tests {
             "",
             "",
             false, // user provided custom VCTs
+            false,
         );
 
         // No init container should be present
@@ -1941,6 +1974,207 @@ mod tests {
         assert!(
             !has_workspace_mount,
             "workspace mount must NOT be present when inject_workspace is false"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // User namespace tests
+    // -----------------------------------------------------------------------
+
+    fn default_template_to_k8s(enable_user_namespaces: bool) -> serde_json::Value {
+        sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+            "",
+            true,
+            enable_user_namespaces,
+        )
+    }
+
+    #[test]
+    fn user_namespaces_disabled_by_default() {
+        let pod_template = default_template_to_k8s(false);
+        assert!(
+            pod_template["spec"]["hostUsers"].is_null(),
+            "hostUsers must not be set when user namespaces are disabled"
+        );
+        let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
+            .as_array()
+            .unwrap();
+        assert_eq!(caps.len(), 4);
+        assert!(!caps.contains(&serde_json::json!("SETUID")));
+    }
+
+    #[test]
+    fn user_namespaces_enabled_by_cluster_default() {
+        let pod_template = default_template_to_k8s(true);
+        assert_eq!(
+            pod_template["spec"]["hostUsers"],
+            serde_json::json!(false),
+            "hostUsers must be false when user namespaces are enabled"
+        );
+    }
+
+    #[test]
+    fn user_namespaces_adds_extra_capabilities() {
+        let pod_template = default_template_to_k8s(true);
+        let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
+            .as_array()
+            .unwrap();
+        assert!(caps.contains(&serde_json::json!("SYS_ADMIN")));
+        assert!(caps.contains(&serde_json::json!("NET_ADMIN")));
+        assert!(caps.contains(&serde_json::json!("SYS_PTRACE")));
+        assert!(caps.contains(&serde_json::json!("SYSLOG")));
+        assert!(caps.contains(&serde_json::json!("SETUID")));
+        assert!(caps.contains(&serde_json::json!("SETGID")));
+        assert!(caps.contains(&serde_json::json!("DAC_READ_SEARCH")));
+        assert_eq!(caps.len(), 7);
+    }
+
+    #[test]
+    fn user_namespaces_per_sandbox_override_enables() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: [(
+                    "host_users".to_string(),
+                    Value {
+                        kind: Some(Kind::BoolValue(false)),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+            "",
+            true,
+            false, // cluster default is off
+        );
+
+        assert_eq!(
+            pod_template["spec"]["hostUsers"],
+            serde_json::json!(false),
+            "per-sandbox host_users: false must enable user namespaces"
+        );
+        let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
+            .as_array()
+            .unwrap();
+        assert!(caps.contains(&serde_json::json!("SETUID")));
+    }
+
+    #[test]
+    fn user_namespaces_per_sandbox_override_disables() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: [(
+                    "host_users".to_string(),
+                    Value {
+                        kind: Some(Kind::BoolValue(true)),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+            "",
+            true,
+            true, // cluster default is on
+        );
+
+        assert!(
+            pod_template["spec"]["hostUsers"].is_null(),
+            "per-sandbox host_users: true must disable user namespaces even when cluster default is on"
+        );
+        let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
+            .as_array()
+            .unwrap();
+        assert_eq!(caps.len(), 4, "extra capabilities must not be added when user namespaces are disabled");
+    }
+
+    #[test]
+    fn platform_config_bool_extracts_value() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: [(
+                    "my_bool".to_string(),
+                    Value {
+                        kind: Some(Kind::BoolValue(true)),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        assert_eq!(platform_config_bool(&template, "my_bool"), Some(true));
+        assert_eq!(platform_config_bool(&template, "missing"), None);
+    }
+
+    #[test]
+    fn platform_config_bool_returns_none_for_non_bool() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: [(
+                    "a_string".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("hello".to_string())),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        assert_eq!(platform_config_bool(&template, "a_string"), None);
+    }
+
+    #[test]
+    fn supervisor_volume_uses_directory_type() {
+        let vol = supervisor_volume();
+        assert_eq!(
+            vol["hostPath"]["type"], "Directory",
+            "supervisor hostPath must use Directory (not DirectoryOrCreate) for user namespace compatibility"
         );
     }
 }
