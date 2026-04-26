@@ -96,6 +96,29 @@ Add `#[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]` and pass to config 
 | hostPath volume ownership with ID-mapped mounts | Step 7 changes to `Directory` type; mount is read-only so ownership doesn't matter for execution |
 | sysfs remount in netns setup | Already avoided -- code uses `nsenter` instead of `ip netns exec` (documented at `netns.rs:685`) |
 | Requires Linux 5.12+ and supporting runtime | Feature defaults to `false`; failure mode is a clear Kubernetes pod event |
+| Nested container environments (DinD / k3s-in-Docker) | Does not work in the local dev cluster; see section below |
+
+## Nested k3s / Docker-in-Docker limitation
+
+User namespaces require **ID-mapped mounts** (Linux 5.12+) so the kernel can transparently remap file ownership between the container's UID space and the host's UID space. When k3s runs inside a Docker container (the `mise run cluster` dev environment), the inner container's root filesystem sits on an overlayfs layer managed by the outer Docker daemon. The overlayfs driver in this nested configuration does not support `MOUNT_ATTR_IDMAP`, so `runc` fails at container init:
+
+```
+failed to set MOUNT_ATTR_IDMAP on .../etc-hosts: invalid argument
+(maybe the filesystem used doesn't support idmap mounts on this kernel?)
+```
+
+This is a kernel/filesystem constraint, not an OpenShell bug. The pod spec is generated correctly (`hostUsers: false`, extended capabilities), but the container runtime cannot fulfil the mount request.
+
+**Where user namespaces work:**
+- Bare-metal or VM-based Kubernetes clusters where the node's root filesystem is ext4/xfs/btrfs (all support ID-mapped mounts since Linux 5.12-5.19).
+- Managed Kubernetes services (EKS, GKE, AKS) on nodes running a supported kernel.
+
+**Where they do not work:**
+- k3s-in-Docker / kind / Docker-in-Docker dev clusters where the inner container uses overlayfs on top of the outer container's overlayfs. The nested overlayfs does not support `MOUNT_ATTR_IDMAP`.
+- Nodes running kernels older than 5.12.
+- Nodes using filesystems that have not added ID-mapped mount support (e.g., NFS on older kernels).
+
+The e2e test (`e2e/rust/tests/user_namespaces.rs`) accounts for this by verifying only the pod spec fields (`hostUsers`, capabilities) rather than attempting to run a command inside the sandbox.
 
 ## Verification
 
@@ -105,5 +128,5 @@ Add `#[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]` and pass to config 
    - Extended capability list when user namespaces enabled
    - `platform_config_bool` helper
    - `Directory` type on supervisor volume
-3. `mise run e2e` on a K8s 1.36+ cluster with user namespace support -- sandbox creation, SSH, policy enforcement work with `enableUserNamespaces: true`
-4. Manual: verify `cat /proc/self/uid_map` inside sandbox shows non-identity mapping
+3. `mise run e2e` -- the `user_namespaces` test verifies pod spec correctness against the local dev cluster
+4. On a bare-metal or VM-based K8s 1.33+ cluster: `cat /proc/self/uid_map` inside a sandbox should show a non-identity mapping (UID 0 maps to a high host UID)
