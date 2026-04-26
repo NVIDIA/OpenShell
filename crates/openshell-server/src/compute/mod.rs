@@ -48,6 +48,26 @@ type DriverWatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, S
 type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
 
+#[tonic::async_trait]
+trait ShutdownCleanup: Send + Sync {
+    async fn cleanup_on_shutdown(&self) -> Result<(), String>;
+}
+
+#[tonic::async_trait]
+impl ShutdownCleanup for docker::DockerComputeDriver {
+    async fn cleanup_on_shutdown(&self) -> Result<(), String> {
+        let stopped = self
+            .stop_managed_containers_on_shutdown()
+            .await
+            .map_err(|err| err.to_string())?;
+        info!(
+            stopped_containers = stopped,
+            "Stopped Docker sandbox containers during gateway shutdown"
+        );
+        Ok(())
+    }
+}
+
 /// Interval between store-vs-backend reconciliation sweeps.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -182,6 +202,7 @@ impl ComputeDriver for RemoteComputeDriver {
 #[derive(Clone)]
 pub struct ComputeRuntime {
     driver: SharedComputeDriver,
+    shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
     _driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
     store: Arc<Store>,
@@ -201,6 +222,7 @@ impl fmt::Debug for ComputeRuntime {
 impl ComputeRuntime {
     async fn from_driver(
         driver: SharedComputeDriver,
+        shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
         driver_process: Option<Arc<ManagedDriverProcess>>,
         store: Arc<Store>,
         sandbox_index: SandboxIndex,
@@ -217,6 +239,7 @@ impl ComputeRuntime {
             .default_image;
         Ok(Self {
             driver,
+            shutdown_cleanup,
             _driver_process: driver_process,
             default_image,
             store,
@@ -237,17 +260,16 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
-        let driver =
-            docker::DockerComputeDriver::new(
-                &config,
-                &docker_config,
-                supervisor_sessions.clone(),
-            )
+        let driver = Arc::new(
+            docker::DockerComputeDriver::new(&config, &docker_config, supervisor_sessions.clone())
                 .await
-                .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let driver: SharedComputeDriver = Arc::new(driver);
+                .map_err(|err| ComputeError::Message(err.to_string()))?,
+        );
+        let shutdown_cleanup: Arc<dyn ShutdownCleanup> = driver.clone();
+        let driver: SharedComputeDriver = driver;
         Self::from_driver(
             driver,
+            Some(shutdown_cleanup),
             None,
             store,
             sandbox_index,
@@ -274,6 +296,7 @@ impl ComputeRuntime {
         Self::from_driver(
             driver,
             None,
+            None,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -296,6 +319,7 @@ impl ComputeRuntime {
         let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
         Self::from_driver(
             driver,
+            None,
             driver_process,
             store,
             sandbox_index,
@@ -321,6 +345,7 @@ impl ComputeRuntime {
         let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
         Self::from_driver(
             driver,
+            None,
             None,
             store,
             sandbox_index,
@@ -477,6 +502,13 @@ impl ComputeRuntime {
         tokio::spawn(async move {
             runtime.reconcile_loop().await;
         });
+    }
+
+    pub async fn cleanup_on_shutdown(&self) -> Result<(), String> {
+        let Some(cleanup) = &self.shutdown_cleanup else {
+            return Ok(());
+        };
+        cleanup.cleanup_on_shutdown().await
     }
 
     async fn watch_loop(self: Arc<Self>) {
@@ -1412,6 +1444,7 @@ mod tests {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
             driver,
+            shutdown_cleanup: None,
             _driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
             store,

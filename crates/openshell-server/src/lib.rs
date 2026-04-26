@@ -42,7 +42,7 @@ use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
 pub use grpc::OpenShellService;
@@ -250,13 +250,24 @@ pub async fn run_server(
         None
     };
 
-    // Accept connections
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    // Accept connections until the gateway receives a graceful shutdown signal.
     loop {
-        let (stream, addr) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                error!(error = %e, "Failed to accept connection");
-                continue;
+        let (stream, addr) = tokio::select! {
+            _ = &mut shutdown => {
+                info!("Shutdown signal received; stopping gateway");
+                break;
+            }
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        error!(error = %e, "Failed to accept connection");
+                        continue;
+                    }
+                }
             }
         };
 
@@ -288,6 +299,47 @@ pub async fn run_server(
             });
         }
     }
+
+    state
+        .compute
+        .cleanup_on_shutdown()
+        .await
+        .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
+
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        tokio::select! {
+            _ = ctrl_c_signal() => {}
+            _ = terminate_signal() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c_signal().await;
+    }
+}
+
+async fn ctrl_c_signal() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        warn!(error = %err, "Failed to install Ctrl-C signal handler");
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_signal() {
+    let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    else {
+        warn!("Failed to install SIGTERM signal handler");
+        std::future::pending::<()>().await;
+        return;
+    };
+    let _ = signal.recv().await;
 }
 
 async fn build_compute_runtime(

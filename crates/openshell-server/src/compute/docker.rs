@@ -11,7 +11,7 @@ use bollard::models::{
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
-    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
+    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -343,17 +343,7 @@ impl DockerComputeDriver {
         else {
             return Ok(false);
         };
-        // Prefer the container ID: it's always populated in ContainerSummary,
-        // remains valid while the container exists, and is accepted by
-        // `remove_container` just like a name. Falling back to the parsed
-        // name covers any transient where `id` is missing.
-        let Some(target) = container
-            .id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-            .or_else(|| summary_container_name(&container))
-        else {
+        let Some(target) = summary_container_target(&container) else {
             return Ok(false);
         };
 
@@ -369,6 +359,64 @@ impl DockerComputeDriver {
             Err(err) if is_not_found_error(&err) => Ok(false),
             Err(err) => Err(internal_status("delete docker sandbox container", err)),
         }
+    }
+
+    pub(crate) async fn stop_managed_containers_on_shutdown(&self) -> Result<usize, Status> {
+        let containers = self.list_managed_container_summaries().await?;
+        let targets = containers
+            .into_iter()
+            .filter_map(|container| {
+                let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
+                if container_state_needs_shutdown_stop(state) {
+                    summary_container_target(&container)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let target_count = targets.len();
+        let mut stopped = 0usize;
+        let mut failures = Vec::new();
+
+        let mut stop_results = futures::stream::iter(targets.into_iter().map(|target| {
+            let docker = self.docker.clone();
+            async move {
+                let result = docker
+                    .stop_container(
+                        &target,
+                        Some(StopContainerOptionsBuilder::default().t(10).build()),
+                    )
+                    .await;
+                (target, result)
+            }
+        }))
+        .buffer_unordered(16);
+
+        while let Some((target, result)) = stop_results.next().await {
+            match result {
+                Ok(()) => {
+                    stopped += 1;
+                }
+                Err(err) if is_not_found_error(&err) || is_not_modified_error(&err) => {}
+                Err(err) => {
+                    warn!(
+                        container = %target,
+                        error = %err,
+                        "Failed to stop Docker sandbox container during shutdown"
+                    );
+                    failures.push(target);
+                }
+            }
+        }
+
+        if !failures.is_empty() {
+            return Err(Status::internal(format!(
+                "failed to stop {} of {target_count} Docker sandbox containers during shutdown",
+                failures.len()
+            )));
+        }
+
+        Ok(stopped)
     }
 
     async fn poll_loop(self) {
@@ -1030,6 +1078,27 @@ fn summary_container_name(summary: &ContainerSummary) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+fn summary_container_target(summary: &ContainerSummary) -> Option<String> {
+    // Prefer the container ID: it's stable while the container exists and is
+    // accepted by Docker APIs just like a name. Fall back to the parsed name
+    // for transient summaries that do not include an ID.
+    summary
+        .id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| summary_container_name(summary))
+}
+
+fn container_state_needs_shutdown_stop(state: ContainerSummaryStateEnum) -> bool {
+    matches!(
+        state,
+        ContainerSummaryStateEnum::RUNNING
+            | ContainerSummaryStateEnum::RESTARTING
+            | ContainerSummaryStateEnum::PAUSED
+    )
+}
+
 fn emit_snapshot_diff(
     events: &broadcast::Sender<WatchSandboxesEvent>,
     previous: &HashMap<String, DriverSandbox>,
@@ -1558,6 +1627,16 @@ fn is_not_found_error(err: &BollardError) -> bool {
         err,
         BollardError::DockerResponseServerError {
             status_code: 404,
+            ..
+        }
+    )
+}
+
+fn is_not_modified_error(err: &BollardError) -> bool {
+    matches!(
+        err,
+        BollardError::DockerResponseServerError {
+            status_code: 304,
             ..
         }
     )
