@@ -51,8 +51,6 @@ const SANDBOX_NAME_LABEL_KEY: &str = "openshell.ai/sandbox-name";
 const SANDBOX_NAMESPACE_LABEL_KEY: &str = "openshell.ai/sandbox-namespace";
 
 const SUPERVISOR_MOUNT_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
-#[cfg(test)]
-const TLS_MOUNT_DIR: &str = "/etc/openshell/tls/client";
 const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
@@ -65,22 +63,48 @@ const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 /// explicit `--docker-supervisor-bin` override or local build is available.
 const DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
 
-/// Image tag baked in at compile time to pair the gateway with a matching
-/// supervisor image. Mirrors the pattern used by `openshell-bootstrap`:
-/// defaults to `"dev"`; CI overrides with a release version via the
-/// `OPENSHELL_IMAGE_TAG` env var during `cargo build`.
-const DEFAULT_DOCKER_SUPERVISOR_IMAGE_TAG: &str = match option_env!("OPENSHELL_IMAGE_TAG") {
-    Some(tag) => tag,
-    None => "dev",
-};
-
 /// Path to the supervisor binary inside the `openshell/supervisor` image.
 const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/usr/local/bin/openshell-sandbox";
 
 /// Return the default `ghcr.io/nvidia/openshell/supervisor:<tag>` reference
 /// used when no supervisor binary override is provided.
 pub fn default_docker_supervisor_image() -> String {
-    format!("{DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO}:{DEFAULT_DOCKER_SUPERVISOR_IMAGE_TAG}")
+    format!(
+        "{DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO}:{}",
+        default_docker_supervisor_image_tag()
+    )
+}
+
+/// Image tag baked in at compile time to pair the gateway with a matching
+/// supervisor image.
+///
+/// Build pipelines pass `OPENSHELL_IMAGE_TAG` explicitly. The `IMAGE_TAG`
+/// fallback covers image build wrappers that already tag the gateway and
+/// supervisor together. Standalone release binaries also patch the Cargo
+/// package version, so use it when it has been set to a real release value.
+fn default_docker_supervisor_image_tag() -> &'static str {
+    resolve_default_docker_supervisor_image_tag(
+        option_env!("OPENSHELL_IMAGE_TAG"),
+        option_env!("IMAGE_TAG"),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn resolve_default_docker_supervisor_image_tag(
+    openshell_image_tag: Option<&'static str>,
+    image_tag: Option<&'static str>,
+    cargo_pkg_version: &'static str,
+) -> &'static str {
+    openshell_image_tag
+        .filter(|tag| !tag.is_empty())
+        .or_else(|| image_tag.filter(|tag| !tag.is_empty()))
+        .unwrap_or_else(|| {
+            if cargo_pkg_version.is_empty() || cargo_pkg_version == "0.0.0" {
+                "dev"
+            } else {
+                cargo_pkg_version
+            }
+        })
 }
 
 /// Queried by the Docker driver to decide when a sandbox's supervisor
@@ -103,7 +127,7 @@ pub struct DockerComputeConfig {
     /// Optional override for the image the gateway pulls to extract the
     /// Linux `openshell-sandbox` binary when no explicit binary path or
     /// local build is available. Defaults to
-    /// `ghcr.io/nvidia/openshell/supervisor:<OPENSHELL_IMAGE_TAG>`.
+    /// `ghcr.io/nvidia/openshell/supervisor:<gateway-image-tag>`.
     pub supervisor_image: Option<String>,
 
     /// Host-side CA certificate for Docker sandbox mTLS.
@@ -389,6 +413,43 @@ impl DockerComputeDriver {
             Err(err) if is_not_modified_error(&err) => Ok(()),
             Err(err) if is_not_found_error(&err) => Err(Status::not_found("sandbox not found")),
             Err(err) => Err(internal_status("stop docker sandbox container", err)),
+        }
+    }
+
+    /// Start a managed sandbox container that was previously stopped. Used
+    /// by the gateway to resume sandboxes after a restart so that running
+    /// state in the gateway store is matched by an actually-running
+    /// container.
+    ///
+    /// Returns `Ok(true)` when a container existed and was started (or was
+    /// already running), `Ok(false)` when no managed container is found for
+    /// the sandbox, and `Err(...)` for any Docker failure.
+    pub async fn resume_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+    ) -> Result<bool, Status> {
+        let Some(container) = self
+            .find_managed_container_summary(sandbox_id, sandbox_name)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let Some(target) = summary_container_target(&container) else {
+            return Ok(false);
+        };
+        let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
+        if !container_state_needs_resume(state) {
+            return Ok(true);
+        }
+
+        match self.docker.start_container(&target, None).await {
+            Ok(()) => Ok(true),
+            // Already running — race with another resume path or the
+            // restart policy. Treat as success.
+            Err(err) if is_not_modified_error(&err) => Ok(true),
+            Err(err) if is_not_found_error(&err) => Ok(false),
+            Err(err) => Err(internal_status("start docker sandbox container", err)),
         }
     }
 
@@ -1133,6 +1194,17 @@ fn container_state_needs_shutdown_stop(state: ContainerSummaryStateEnum) -> bool
         ContainerSummaryStateEnum::RUNNING
             | ContainerSummaryStateEnum::RESTARTING
             | ContainerSummaryStateEnum::PAUSED
+    )
+}
+
+/// States from which a managed container can be brought back to running by
+/// `start_container`. Skip `Restarting` (already coming up), `Removing`,
+/// `Dead` (terminal), `Paused` (needs `unpause`, not `start`), and
+/// `Running` (nothing to do).
+fn container_state_needs_resume(state: ContainerSummaryStateEnum) -> bool {
+    matches!(
+        state,
+        ContainerSummaryStateEnum::EXITED | ContainerSummaryStateEnum::CREATED
     )
 }
 

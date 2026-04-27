@@ -1,9 +1,14 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
 };
 use std::fs;
 use tempfile::TempDir;
+
+const TLS_MOUNT_DIR: &str = "/etc/openshell/tls/client";
 
 fn test_sandbox() -> DriverSandbox {
     DriverSandbox {
@@ -382,6 +387,26 @@ fn default_docker_supervisor_image_uses_nvidia_ghcr_repo() {
 }
 
 #[test]
+fn docker_supervisor_image_tag_prefers_explicit_build_tags() {
+    assert_eq!(
+        resolve_default_docker_supervisor_image_tag(Some("1.2.3"), Some("sha"), "0.0.0"),
+        "1.2.3",
+    );
+    assert_eq!(
+        resolve_default_docker_supervisor_image_tag(None, Some("sha"), "0.0.0"),
+        "sha",
+    );
+    assert_eq!(
+        resolve_default_docker_supervisor_image_tag(None, None, "1.2.3"),
+        "1.2.3",
+    );
+    assert_eq!(
+        resolve_default_docker_supervisor_image_tag(Some(""), Some(""), "0.0.0"),
+        "dev",
+    );
+}
+
+#[test]
 fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
     let base = PathBuf::from("/var/cache/share");
     let path =
@@ -470,4 +495,31 @@ fn extract_first_tar_entry_rejects_empty_archive() {
     tar::Builder::new(&mut tar_buf).finish().unwrap();
     let err = extract_first_tar_entry(&tar_buf).unwrap_err();
     assert!(err.contains("empty"), "unexpected error message: {err}");
+}
+
+#[test]
+fn container_state_needs_resume_matches_startable_states() {
+    for state in [
+        ContainerSummaryStateEnum::EXITED,
+        ContainerSummaryStateEnum::CREATED,
+    ] {
+        assert!(
+            container_state_needs_resume(state),
+            "{state:?} should be resumed with Docker start",
+        );
+    }
+
+    for state in [
+        ContainerSummaryStateEnum::RUNNING,
+        ContainerSummaryStateEnum::RESTARTING,
+        ContainerSummaryStateEnum::PAUSED,
+        ContainerSummaryStateEnum::DEAD,
+        ContainerSummaryStateEnum::REMOVING,
+        ContainerSummaryStateEnum::EMPTY,
+    ] {
+        assert!(
+            !container_state_needs_resume(state),
+            "{state:?} should not be resumed with Docker start",
+        );
+    }
 }

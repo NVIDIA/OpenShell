@@ -180,6 +180,14 @@ pub async fn run_server(
         supervisor_sessions,
     ));
 
+    // Resume sandboxes that were stopped during the previous gateway
+    // shutdown so the running compute state matches the persisted store.
+    // Runs before watchers spawn so the watch loop sees the post-resume
+    // snapshot on its first poll.
+    if let Err(err) = state.compute.resume_persisted_sandboxes().await {
+        warn!(error = %err, "Failed to resume persisted sandboxes during startup");
+    }
+
     state.compute.spawn_watchers();
     ssh_tunnel::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
@@ -465,10 +473,8 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
         )),
         [driver @ ComputeDriverKind::Kubernetes]
         | [driver @ ComputeDriverKind::Vm]
-        | [driver @ ComputeDriverKind::Docker] => Ok(*driver),
-        [ComputeDriverKind::Podman] => Err(Error::config(
-            "compute driver 'podman' is not implemented yet",
-        )),
+        | [driver @ ComputeDriverKind::Docker]
+        | [driver @ ComputeDriverKind::Podman] => Ok(*driver),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
             drivers

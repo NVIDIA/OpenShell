@@ -7,27 +7,29 @@
 # local manual testing.
 #
 # Defaults:
-# - Plaintext HTTP on 127.0.0.1:18080 (falls back to a free port if occupied)
-# - No dedicated health listener unless OPENSHELL_HEALTH_PORT is set
+# - Plaintext HTTP on 127.0.0.1:18080
 # - Dedicated sandbox namespace "docker-dev"
 # - Persistent state under .cache/gateway-docker
 #
 # Common overrides:
 #   OPENSHELL_SERVER_PORT=19080 mise run gateway:docker
+#   OPENSHELL_DOCKER_GATEWAY_NAME=my-docker-gateway mise run gateway:docker
 #   OPENSHELL_SANDBOX_NAMESPACE=my-ns mise run gateway:docker
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:docker
+#
+# After the gateway is running, point the CLI at it with either:
+#   openshell --gateway docker-dev <command>
+#   openshell gateway use docker-dev   # then plain `openshell <command>`
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-DEFAULT_PORT=18080
-PORT="${OPENSHELL_SERVER_PORT:-${DEFAULT_PORT}}"
-HEALTH_PORT="${OPENSHELL_HEALTH_PORT:-}"
+PORT="${OPENSHELL_SERVER_PORT:-18080}"
+GATEWAY_NAME="${OPENSHELL_DOCKER_GATEWAY_NAME:-docker-dev}"
 STATE_DIR="${OPENSHELL_DOCKER_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-docker}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-docker-dev}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
 SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
-SSH_GATEWAY_HOST="${OPENSHELL_SSH_GATEWAY_HOST:-127.0.0.1}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 
@@ -50,40 +52,44 @@ linux_target_triple() {
   esac
 }
 
-
-
 port_is_in_use() {
   local port=$1
   if command -v lsof >/dev/null 2>&1; then
     lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
     return $?
   fi
-
   if command -v nc >/dev/null 2>&1; then
     nc -z 127.0.0.1 "${port}" >/dev/null 2>&1
     return $?
   fi
-
   (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
 }
 
-pick_random_port() {
-  local lower=20000
-  local upper=60999
-  local attempts=256
-  local port
+register_gateway_metadata() {
+  local name=$1
+  local endpoint=$2
+  local port=$3
+  local config_home gateway_dir
 
-  for _ in $(seq 1 "${attempts}"); do
-    port=$((RANDOM % (upper - lower + 1) + lower))
-    if ! port_is_in_use "${port}"; then
-      echo "${port}"
-      return 0
-    fi
-  done
+  config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+  gateway_dir="${config_home}/openshell/gateways/${name}"
 
-  echo "ERROR: could not find a free port after ${attempts} attempts" >&2
-  exit 2
+  mkdir -p "${gateway_dir}"
+  cat >"${gateway_dir}/metadata.json" <<EOF
+{
+  "name": "${name}",
+  "gateway_endpoint": "${endpoint}",
+  "is_remote": false,
+  "gateway_port": ${port},
+  "auth_mode": "plaintext"
 }
+EOF
+}
+
+if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "ERROR: OPENSHELL_DOCKER_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
+  exit 2
+fi
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "ERROR: docker CLI is required" >&2
@@ -94,33 +100,12 @@ if ! docker info >/dev/null 2>&1; then
   exit 2
 fi
 
-PORT_WAS_DEFAULT=1
-if [[ -n "${OPENSHELL_SERVER_PORT:-}" ]]; then
-  PORT_WAS_DEFAULT=0
-fi
-
-PORT_AUTO_SELECTED=0
-
-if [[ "${PORT_WAS_DEFAULT}" == "0" ]] && port_is_in_use "${PORT}"; then
-  echo "ERROR: OPENSHELL_SERVER_PORT ${PORT} is already in use" >&2
-  exit 2
-fi
-if [[ "${PORT_WAS_DEFAULT}" == "1" ]] && port_is_in_use "${PORT}"; then
-  PORT="$(pick_random_port)"
-  PORT_AUTO_SELECTED=1
-fi
-
-if [[ -n "${HEALTH_PORT}" ]] && [[ "${HEALTH_PORT}" != "0" ]] && port_is_in_use "${HEALTH_PORT}"; then
-  echo "ERROR: OPENSHELL_HEALTH_PORT ${HEALTH_PORT} is already in use" >&2
-  exit 2
-fi
-if [[ -n "${HEALTH_PORT}" ]] && [[ "${HEALTH_PORT}" != "0" ]] && [[ "${PORT}" == "${HEALTH_PORT}" ]]; then
-  echo "ERROR: OPENSHELL_SERVER_PORT and OPENSHELL_HEALTH_PORT must differ" >&2
+if port_is_in_use "${PORT}"; then
+  echo "ERROR: port ${PORT} is already in use; free it or set OPENSHELL_SERVER_PORT" >&2
   exit 2
 fi
 
 GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-http://host.openshell.internal:${PORT}}"
-SSH_GATEWAY_PORT="${OPENSHELL_SSH_GATEWAY_PORT:-${PORT}}"
 
 DAEMON_ARCH="$(normalize_arch "$(docker info --format '{{.Architecture}}' 2>/dev/null || true)")"
 HOST_OS="$(uname -s)"
@@ -148,9 +133,8 @@ if [[ "${HOST_OS}" == "Linux" && "${HOST_ARCH}" == "${DAEMON_ARCH}" ]]; then
   rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
   cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
     -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
-  CARGO_SUPERVISOR_BIN="${ROOT}/target/${SUPERVISOR_TARGET}/debug/openshell-sandbox"
   mkdir -p "${SUPERVISOR_OUT_DIR}"
-  cp "${CARGO_SUPERVISOR_BIN}" "${SUPERVISOR_BIN}"
+  cp "${ROOT}/target/${SUPERVISOR_TARGET}/debug/openshell-sandbox" "${SUPERVISOR_BIN}"
 else
   # Cross-compile via the existing Docker pipeline. The supervisor-output
   # stage in deploy/docker/Dockerfile.images extracts just the openshell-
@@ -175,41 +159,28 @@ chmod +x "${SUPERVISOR_BIN}"
 
 mkdir -p "${STATE_DIR}"
 
-if [[ "${PORT_AUTO_SELECTED}" == "1" ]]; then
-  echo "Default port ${DEFAULT_PORT} is in use; using ${PORT} instead."
-fi
+GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
+register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
 
 echo "Starting standalone Docker gateway..."
-echo "  endpoint: http://127.0.0.1:${PORT}"
-if [[ -n "${HEALTH_PORT}" ]] && [[ "${HEALTH_PORT}" != "0" ]]; then
-  echo "  health:   http://127.0.0.1:${HEALTH_PORT}/healthz"
-fi
+echo "  gateway:   ${GATEWAY_NAME}"
+echo "  endpoint:  ${GATEWAY_ENDPOINT}"
 echo "  namespace: ${SANDBOX_NAMESPACE}"
 echo "  state dir: ${STATE_DIR}"
 echo
-echo "Example CLI commands:"
-echo "  OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:${PORT} openshell status"
-echo "  OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:${PORT} openshell sandbox create --name docker-smoke -- echo smoke-ok"
+echo "Point the CLI at this gateway with one of:"
+echo "  openshell --gateway ${GATEWAY_NAME} status"
+echo "  openshell gateway select ${GATEWAY_NAME}"
 echo
 
-ARGS=(
-  --port "${PORT}"
-  --log-level "${LOG_LEVEL}"
-  --drivers docker
-  --disable-tls
-  --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
-  --sandbox-namespace "${SANDBOX_NAMESPACE}"
-  --sandbox-image "${SANDBOX_IMAGE}"
-  --sandbox-image-pull-policy "${SANDBOX_IMAGE_PULL_POLICY}"
-  --grpc-endpoint "${GRPC_ENDPOINT}"
-  --docker-supervisor-bin "${SUPERVISOR_BIN}"
-  --ssh-gateway-host "${SSH_GATEWAY_HOST}"
-  --ssh-gateway-port "${SSH_GATEWAY_PORT}"
-)
-
-if [[ -n "${HEALTH_PORT}" ]] && [[ "${HEALTH_PORT}" != "0" ]]; then
-  ARGS+=(--health-port "${HEALTH_PORT}")
-fi
-
 exec "${GATEWAY_BIN}" \
-  "${ARGS[@]}"
+  --port "${PORT}" \
+  --log-level "${LOG_LEVEL}" \
+  --drivers docker \
+  --disable-tls \
+  --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc" \
+  --sandbox-namespace "${SANDBOX_NAMESPACE}" \
+  --sandbox-image "${SANDBOX_IMAGE}" \
+  --sandbox-image-pull-policy "${SANDBOX_IMAGE_PULL_POLICY}" \
+  --grpc-endpoint "${GRPC_ENDPOINT}" \
+  --docker-supervisor-bin "${SUPERVISOR_BIN}"

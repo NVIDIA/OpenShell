@@ -102,29 +102,31 @@ if ! command -v openssl >/dev/null 2>&1; then
   exit 2
 fi
 
+normalize_arch() {
+  case "$1" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+linux_target_triple() {
+  case "$1" in
+    amd64) echo "x86_64-unknown-linux-gnu" ;;
+    arm64) echo "aarch64-unknown-linux-gnu" ;;
+    *)
+      echo "ERROR: unsupported Docker daemon architecture '$1'" >&2
+      exit 2
+      ;;
+  esac
+}
+
 # Detect Linux arch of the Docker daemon so we build the matching
 # openshell-sandbox binary.
-DAEMON_ARCH=$(docker info --format '{{.Architecture}}' 2>/dev/null || true)
-case "${DAEMON_ARCH}" in
-  aarch64|arm64)
-    DAEMON_ARCH="arm64"
-    SUPERVISOR_TARGET="aarch64-unknown-linux-gnu"
-    ;;
-  x86_64|amd64)
-    DAEMON_ARCH="amd64"
-    SUPERVISOR_TARGET="x86_64-unknown-linux-gnu"
-    ;;
-  *)
-    echo "ERROR: unsupported Docker daemon architecture '${DAEMON_ARCH}'" >&2
-    exit 2
-    ;;
-esac
+DAEMON_ARCH="$(normalize_arch "$(docker info --format '{{.Architecture}}' 2>/dev/null || true)")"
+SUPERVISOR_TARGET="$(linux_target_triple "${DAEMON_ARCH}")"
 HOST_OS="$(uname -s)"
-case "$(uname -m)" in
-  aarch64|arm64) HOST_ARCH="arm64" ;;
-  x86_64|amd64)  HOST_ARCH="amd64" ;;
-  *)             HOST_ARCH="$(uname -m)" ;;
-esac
+HOST_ARCH="$(normalize_arch "$(uname -m)")"
 SUPERVISOR_OUT_DIR="${WORKDIR}/supervisor/${DAEMON_ARCH}"
 SUPERVISOR_BIN="${SUPERVISOR_OUT_DIR}/openshell-sandbox"
 
@@ -138,8 +140,7 @@ fi
 
 echo "Building openshell-gateway and openshell-cli..."
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-server --bin openshell-gateway
-cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
+  -p openshell-server --bin openshell-gateway \
   -p openshell-cli --features openshell-core/dev-settings
 
 echo "Building openshell-sandbox for ${SUPERVISOR_TARGET}..."
@@ -212,15 +213,11 @@ openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
 
 cd "${ROOT}"
 
-# ── Pick free ports ──────────────────────────────────────────────────
+# ── Pick a free port ─────────────────────────────────────────────────
 pick_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
 }
 HOST_PORT=$(pick_port)
-HEALTH_PORT=$(pick_port)
-while [ "${HEALTH_PORT}" = "${HOST_PORT}" ]; do
-  HEALTH_PORT=$(pick_port)
-done
 
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
@@ -230,11 +227,9 @@ mkdir -p "${STATE_DIR}"
 # gateway itself binds to 0.0.0.0:${HOST_PORT}.
 GATEWAY_ENDPOINT="https://host.openshell.internal:${HOST_PORT}"
 
-echo "Starting openshell-gateway on port ${HOST_PORT} (health :${HEALTH_PORT})..."
-# shellcheck disable=SC2086
+echo "Starting openshell-gateway on port ${HOST_PORT}..."
 "${GATEWAY_BIN}" \
   --port "${HOST_PORT}" \
-  --health-port "${HEALTH_PORT}" \
   --drivers docker \
   --tls-cert "${PKI_DIR}/server.crt" \
   --tls-key "${PKI_DIR}/server.key" \
@@ -247,21 +242,29 @@ echo "Starting openshell-gateway on port ${HOST_PORT} (health :${HEALTH_PORT})..
   --docker-tls-key "${PKI_DIR}/client.key" \
   --sandbox-image "${SANDBOX_IMAGE}" \
   --sandbox-image-pull-policy IfNotPresent \
-  --ssh-gateway-host 127.0.0.1 \
-  --ssh-gateway-port "${HOST_PORT}" \
   >"${GATEWAY_LOG}" 2>&1 &
 GATEWAY_PID=$!
 
-# ── Install mTLS material for the CLI ────────────────────────────────
+# ── Register the gateway with the CLI ────────────────────────────────
+# Writes both metadata.json (for `--gateway <name>` lookup) and the mTLS
+# bundle the CLI uses to authenticate to the gateway.
 GATEWAY_NAME="openshell-e2e-docker-${HOST_PORT}"
+CLI_GATEWAY_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
 GATEWAY_CONFIG_DIR="${HOME}/.config/openshell/gateways/${GATEWAY_NAME}"
 mkdir -p "${GATEWAY_CONFIG_DIR}/mtls"
 cp "${PKI_DIR}/ca.crt"     "${GATEWAY_CONFIG_DIR}/mtls/ca.crt"
 cp "${PKI_DIR}/client.crt" "${GATEWAY_CONFIG_DIR}/mtls/tls.crt"
 cp "${PKI_DIR}/client.key" "${GATEWAY_CONFIG_DIR}/mtls/tls.key"
+cat >"${GATEWAY_CONFIG_DIR}/metadata.json" <<EOF
+{
+  "name": "${GATEWAY_NAME}",
+  "gateway_endpoint": "${CLI_GATEWAY_ENDPOINT}",
+  "is_remote": false,
+  "gateway_port": ${HOST_PORT}
+}
+EOF
 
 export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
-export OPENSHELL_GATEWAY_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
 export OPENSHELL_PROVISION_TIMEOUT=180
 
 # ── Wait for gateway readiness ───────────────────────────────────────
@@ -286,7 +289,7 @@ if [ "${elapsed}" -ge "${timeout}" ]; then
 fi
 
 # ── Run the smoke test ───────────────────────────────────────────────
-echo "Running e2e smoke test (gateway: ${OPENSHELL_GATEWAY}, endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})..."
+echo "Running e2e smoke test (gateway: ${OPENSHELL_GATEWAY}, endpoint: ${CLI_GATEWAY_ENDPOINT})..."
 cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test smoke -- --nocapture
 
 echo "Smoke test passed."
