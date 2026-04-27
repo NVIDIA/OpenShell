@@ -33,15 +33,28 @@ impl PostgresStore {
             .map_err(|e| map_migrate_error(&e))
     }
 
-    pub async fn put(&self, object_type: &str, id: &str, name: &str, payload: &[u8]) -> Result<()> {
+    pub async fn put(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> Result<()> {
         let now_ms = current_time_ms()?;
+        let labels_jsonb: Option<serde_json::Value> = labels
+            .map(|s| serde_json::from_str(s))
+            .transpose()
+            .map_err(|e| openshell_core::Error::execution(format!("invalid labels JSON: {e}")))?;
+
         sqlx::query(
             r"
-INSERT INTO objects (object_type, id, name, payload, created_at_ms, updated_at_ms)
-VALUES ($1, $2, $3, $4, $5, $5)
+INSERT INTO objects (object_type, id, name, payload, created_at_ms, updated_at_ms, labels)
+VALUES ($1, $2, $3, $4, $5, $5, COALESCE($6, '{}'::jsonb))
 ON CONFLICT (id) DO UPDATE SET
     payload = EXCLUDED.payload,
-    updated_at_ms = EXCLUDED.updated_at_ms
+    updated_at_ms = EXCLUDED.updated_at_ms,
+    labels = EXCLUDED.labels
 WHERE objects.object_type = EXCLUDED.object_type
 ",
         )
@@ -50,6 +63,7 @@ WHERE objects.object_type = EXCLUDED.object_type
         .bind(name)
         .bind(payload)
         .bind(now_ms)
+        .bind(labels_jsonb)
         .execute(&self.pool)
         .await
         .map_err(|e| map_db_error(&e))?;
@@ -59,7 +73,7 @@ WHERE objects.object_type = EXCLUDED.object_type
     pub async fn get(&self, object_type: &str, id: &str) -> Result<Option<ObjectRecord>> {
         let row = sqlx::query(
             r"
-SELECT object_type, id, name, payload, created_at_ms, updated_at_ms
+SELECT object_type, id, name, payload, created_at_ms, updated_at_ms, labels
 FROM objects
 WHERE object_type = $1 AND id = $2
 ",
@@ -70,20 +84,26 @@ WHERE object_type = $1 AND id = $2
         .await
         .map_err(|e| map_db_error(&e))?;
 
-        Ok(row.map(|row| ObjectRecord {
-            object_type: row.get("object_type"),
-            id: row.get("id"),
-            name: row.get("name"),
-            payload: row.get("payload"),
-            created_at_ms: row.get("created_at_ms"),
-            updated_at_ms: row.get("updated_at_ms"),
+        Ok(row.map(|row| {
+            let labels_jsonb: Option<serde_json::Value> = row.get("labels");
+            let labels = labels_jsonb.map(|v| v.to_string());
+
+            ObjectRecord {
+                object_type: row.get("object_type"),
+                id: row.get("id"),
+                name: row.get("name"),
+                payload: row.get("payload"),
+                created_at_ms: row.get("created_at_ms"),
+                updated_at_ms: row.get("updated_at_ms"),
+                labels,
+            }
         }))
     }
 
     pub async fn get_by_name(&self, object_type: &str, name: &str) -> Result<Option<ObjectRecord>> {
         let row = sqlx::query(
             r"
-SELECT object_type, id, name, payload, created_at_ms, updated_at_ms
+SELECT object_type, id, name, payload, created_at_ms, updated_at_ms, labels
 FROM objects
 WHERE object_type = $1 AND name = $2
 ",
@@ -94,13 +114,19 @@ WHERE object_type = $1 AND name = $2
         .await
         .map_err(|e| map_db_error(&e))?;
 
-        Ok(row.map(|row| ObjectRecord {
-            object_type: row.get("object_type"),
-            id: row.get("id"),
-            name: row.get("name"),
-            payload: row.get("payload"),
-            created_at_ms: row.get("created_at_ms"),
-            updated_at_ms: row.get("updated_at_ms"),
+        Ok(row.map(|row| {
+            let labels_jsonb: Option<serde_json::Value> = row.get("labels");
+            let labels = labels_jsonb.map(|v| v.to_string());
+
+            ObjectRecord {
+                object_type: row.get("object_type"),
+                id: row.get("id"),
+                name: row.get("name"),
+                payload: row.get("payload"),
+                created_at_ms: row.get("created_at_ms"),
+                updated_at_ms: row.get("updated_at_ms"),
+                labels,
+            }
         }))
     }
 
@@ -132,7 +158,7 @@ WHERE object_type = $1 AND name = $2
     ) -> Result<Vec<ObjectRecord>> {
         let rows = sqlx::query(
             r"
-SELECT object_type, id, name, payload, created_at_ms, updated_at_ms
+SELECT object_type, id, name, payload, created_at_ms, updated_at_ms, labels
 FROM objects
 WHERE object_type = $1
 ORDER BY created_at_ms ASC, name ASC
@@ -148,13 +174,75 @@ LIMIT $2 OFFSET $3
 
         let records = rows
             .into_iter()
-            .map(|row| ObjectRecord {
-                object_type: row.get("object_type"),
-                id: row.get("id"),
-                name: row.get("name"),
-                payload: row.get("payload"),
-                created_at_ms: row.get("created_at_ms"),
-                updated_at_ms: row.get("updated_at_ms"),
+            .map(|row| {
+                let labels_jsonb: Option<serde_json::Value> = row.get("labels");
+                let labels = labels_jsonb.map(|v| v.to_string());
+
+                ObjectRecord {
+                    object_type: row.get("object_type"),
+                    id: row.get("id"),
+                    name: row.get("name"),
+                    payload: row.get("payload"),
+                    created_at_ms: row.get("created_at_ms"),
+                    updated_at_ms: row.get("updated_at_ms"),
+                    labels,
+                }
+            })
+            .collect();
+
+        Ok(records)
+    }
+
+    pub async fn list_with_selector(
+        &self,
+        object_type: &str,
+        label_selector: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<ObjectRecord>> {
+        use super::parse_label_selector;
+
+        // Parse the label selector into key-value pairs
+        let required_labels = parse_label_selector(label_selector)?;
+
+        // Convert to JSONB for containment check
+        let labels_jsonb = serde_json::to_value(&required_labels).map_err(|e| {
+            openshell_core::Error::execution(format!("failed to serialize labels: {e}"))
+        })?;
+
+        // Use Postgres native JSONB containment operator @>
+        let rows = sqlx::query(
+            r"
+SELECT object_type, id, name, payload, created_at_ms, updated_at_ms, labels
+FROM objects
+WHERE object_type = $1 AND labels @> $2
+ORDER BY created_at_ms ASC, name ASC
+LIMIT $3 OFFSET $4
+",
+        )
+        .bind(object_type)
+        .bind(&labels_jsonb)
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        let records = rows
+            .into_iter()
+            .map(|row| {
+                let labels_jsonb: Option<serde_json::Value> = row.get("labels");
+                let labels = labels_jsonb.map(|v| v.to_string());
+
+                ObjectRecord {
+                    object_type: row.get("object_type"),
+                    id: row.get("id"),
+                    name: row.get("name"),
+                    payload: row.get("payload"),
+                    created_at_ms: row.get("created_at_ms"),
+                    updated_at_ms: row.get("updated_at_ms"),
+                    labels,
+                }
             })
             .collect();
 

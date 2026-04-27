@@ -64,7 +64,7 @@ def provider(
     stub.CreateProvider(
         openshell_pb2.CreateProviderRequest(
             provider=datamodel_pb2.Provider(
-                name=name,
+                metadata=datamodel_pb2.ObjectMeta(name=name),
                 type=provider_type,
                 credentials=credentials,
             )
@@ -260,7 +260,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
                 provider=datamodel_pb2.Provider(
-                    name=name,
+                    metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="generic",
                     credentials={"KEY_A": "val-a", "KEY_B": "val-b"},
                     config={"BASE_URL": "https://example.com"},
@@ -271,7 +271,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
                 provider=datamodel_pb2.Provider(
-                    name=name,
+                    metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
                     credentials={"KEY_A": "rotated-a"},
                 )
@@ -305,7 +305,7 @@ def test_update_provider_empty_maps_preserves_all(
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
                 provider=datamodel_pb2.Provider(
-                    name=name,
+                    metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="generic",
                     credentials={"TOKEN": "secret"},
                     config={"URL": "https://api.example.com"},
@@ -316,7 +316,7 @@ def test_update_provider_empty_maps_preserves_all(
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
                 provider=datamodel_pb2.Provider(
-                    name=name,
+                    metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
                 )
             )
@@ -347,7 +347,7 @@ def test_update_provider_merges_config_preserves_credentials(
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
                 provider=datamodel_pb2.Provider(
-                    name=name,
+                    metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="generic",
                     credentials={"API_KEY": "original-key"},
                     config={"ENDPOINT": "https://old.example.com"},
@@ -358,7 +358,7 @@ def test_update_provider_merges_config_preserves_credentials(
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
                 provider=datamodel_pb2.Provider(
-                    name=name,
+                    metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
                     config={"ENDPOINT": "https://new.example.com"},
                 )
@@ -390,7 +390,7 @@ def test_update_provider_rejects_type_change(
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
                 provider=datamodel_pb2.Provider(
-                    name=name,
+                    metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="generic",
                     credentials={"KEY": "val"},
                 )
@@ -401,7 +401,7 @@ def test_update_provider_rejects_type_change(
             stub.UpdateProvider(
                 openshell_pb2.UpdateProviderRequest(
                     provider=datamodel_pb2.Provider(
-                        name=name,
+                        metadata=datamodel_pb2.ObjectMeta(name=name),
                         type="nvidia",
                     )
                 )

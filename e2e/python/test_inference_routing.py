@@ -66,7 +66,7 @@ def _upsert_managed_inference(
     base_url: str,
 ) -> None:
     provider = datamodel_pb2.Provider(
-        name=provider_name,
+        metadata=datamodel_pb2.ObjectMeta(name=provider_name),
         type=provider_type,
         credentials={credential_key: "mock"},
         config={

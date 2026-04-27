@@ -54,6 +54,12 @@ pub(super) async fn handle_create_sandbox(
     // Validate field sizes before any I/O (fail fast on oversized payloads).
     validate_sandbox_spec(&request.name, &spec)?;
 
+    // Validate labels (keys and values must meet Kubernetes requirements).
+    for (key, value) in &request.labels {
+        crate::grpc::validation::validate_label_key(key)?;
+        crate::grpc::validation::validate_label_value(value)?;
+    }
+
     // Validate provider names exist (fail fast).
     for name in &spec.providers {
         state
@@ -84,17 +90,26 @@ pub(super) async fn handle_create_sandbox(
     } else {
         request.name.clone()
     };
-    let namespace = state.config.sandbox_namespace.clone();
+
+    use crate::persistence::current_time_ms;
+    let now_ms = current_time_ms()
+        .map_err(|e| Status::internal(format!("failed to get current time: {e}")))?;
 
     let sandbox = Sandbox {
-        id: id.clone(),
-        name: name.clone(),
-        namespace,
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: id.clone(),
+            name: name.clone(),
+            created_at_ms: now_ms,
+            labels: request.labels.clone(),
+        }),
         spec: Some(spec),
         status: None,
         phase: SandboxPhase::Provisioning as i32,
-        ..Default::default()
+        current_policy_version: 0,
     };
+
+    // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
+    super::validation::validate_object_metadata(sandbox.metadata.as_ref(), "sandbox")?;
 
     state
         .compute
@@ -108,8 +123,8 @@ pub(super) async fn handle_create_sandbox(
     let sandbox = state.compute.create_sandbox(sandbox).await?;
 
     info!(
-        sandbox_id = %sandbox.id,
-        sandbox_name = %sandbox.name,
+        sandbox_id = %id,
+        sandbox_name = %name,
         "CreateSandbox request completed successfully"
     );
     Ok(Response::new(SandboxResponse {
@@ -144,17 +159,32 @@ pub(super) async fn handle_list_sandboxes(
 ) -> Result<Response<ListSandboxesResponse>, Status> {
     let request = request.into_inner();
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
-    let records = state
-        .store
-        .list(Sandbox::object_type(), limit, request.offset)
-        .await
-        .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+
+    // If label selector is provided, validate and use filtered list
+    let records = if !request.label_selector.is_empty() {
+        crate::grpc::validation::validate_label_selector(&request.label_selector)?;
+        state
+            .store
+            .list_with_selector(
+                Sandbox::object_type(),
+                &request.label_selector,
+                limit,
+                request.offset,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("list sandboxes with selector failed: {e}")))?
+    } else {
+        state
+            .store
+            .list(Sandbox::object_type(), limit, request.offset)
+            .await
+            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
+    };
 
     let mut sandboxes = Vec::with_capacity(records.len());
     for record in records {
-        let mut sandbox = Sandbox::decode(record.payload.as_slice())
+        let sandbox = Sandbox::decode(record.payload.as_slice())
             .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
-        sandbox.created_at_ms = record.created_at_ms;
         sandboxes.push(sandbox);
     }
 
@@ -442,7 +472,7 @@ pub(super) async fn handle_exec_sandbox(
     // typically called during normal operation (not right after create).
     let (channel_id, relay_rx) = state
         .supervisor_sessions
-        .open_relay(&sandbox.id, std::time::Duration::from_secs(15))
+        .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
         .await
         .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
@@ -451,7 +481,9 @@ pub(super) async fn handle_exec_sandbox(
     let stdin_payload = req.stdin;
     let timeout_seconds = req.timeout_seconds;
     let request_tty = req.tty;
-    let sandbox_id = sandbox.id;
+
+    use openshell_core::ObjectId;
+    let sandbox_id = sandbox.object_id().to_string();
 
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
@@ -529,14 +561,20 @@ pub(super) async fn handle_create_ssh_session(
         0
     };
     let session = SshSession {
-        id: token.clone(),
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: token.clone(),
+            name: generate_name(),
+            created_at_ms: now_ms,
+            labels: std::collections::HashMap::new(),
+        }),
         sandbox_id: req.sandbox_id.clone(),
         token: token.clone(),
-        created_at_ms: now_ms,
         revoked: false,
-        name: generate_name(),
         expires_at_ms,
     };
+
+    // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
+    super::validation::validate_object_metadata(session.metadata.as_ref(), "ssh_session")?;
 
     state
         .store

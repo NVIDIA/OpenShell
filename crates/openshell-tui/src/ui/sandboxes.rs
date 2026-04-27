@@ -16,6 +16,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
         Cell::from(Span::styled("CREATED", t.muted)),
         Cell::from(Span::styled("AGE", t.muted)),
         Cell::from(Span::styled("IMAGE", t.muted)),
+        Cell::from(Span::styled("LABELS", t.muted)),
         Cell::from(Span::styled("NOTES", t.muted)),
     ])
     .bottom_margin(1);
@@ -27,6 +28,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             let created = app.sandbox_created.get(i).map_or("", String::as_str);
             let age = app.sandbox_ages.get(i).map_or("", String::as_str);
             let image = app.sandbox_images.get(i).map_or("", String::as_str);
+            let labels = app.sandbox_labels.get(i).map_or("", String::as_str);
             let notes = app.sandbox_notes.get(i).map_or("", String::as_str);
             let draft_count = app.sandbox_draft_counts.get(i).copied().unwrap_or(0);
 
@@ -64,6 +66,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
                 Cell::from(Span::styled(created, t.muted)),
                 Cell::from(Span::styled(age, t.muted)),
                 Cell::from(Span::styled(image, t.muted)),
+                Cell::from(Span::styled(labels, t.muted)),
                 Cell::from(Span::styled(notes, t.muted)),
             ])
         })
@@ -74,8 +77,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
         Constraint::Percentage(10),
         Constraint::Percentage(15),
         Constraint::Percentage(8),
-        Constraint::Percentage(27),
         Constraint::Percentage(20),
+        Constraint::Percentage(15),
+        Constraint::Percentage(12),
     ];
 
     let border_style = if focused { t.border_focused } else { t.border };

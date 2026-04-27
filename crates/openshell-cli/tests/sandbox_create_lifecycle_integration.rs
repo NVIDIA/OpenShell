@@ -20,6 +20,7 @@ use openshell_core::proto::{
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
 };
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -112,9 +113,12 @@ impl OpenShell for TestOpenShell {
 
         Ok(Response::new(SandboxResponse {
             sandbox: Some(Sandbox {
-                id: format!("id-{sandbox_name}"),
-                name: sandbox_name,
-                namespace: "default".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("id-{sandbox_name}"),
+                    name: sandbox_name,
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 phase: SandboxPhase::Provisioning as i32,
                 ..Sandbox::default()
             }),
@@ -128,9 +132,12 @@ impl OpenShell for TestOpenShell {
         let name = request.into_inner().name;
         Ok(Response::new(SandboxResponse {
             sandbox: Some(Sandbox {
-                id: format!("id-{name}"),
-                name,
-                namespace: "default".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("id-{name}"),
+                    name,
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 phase: SandboxPhase::Ready as i32,
                 ..Sandbox::default()
             }),
@@ -254,9 +261,12 @@ impl OpenShell for TestOpenShell {
 
         tokio::spawn(async move {
             let provisioning = Sandbox {
-                id: sandbox_id.clone(),
-                name: sandbox_id.trim_start_matches("id-").to_string(),
-                namespace: "default".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: sandbox_id.clone(),
+                    name: sandbox_id.trim_start_matches("id-").to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 phase: SandboxPhase::Provisioning as i32,
                 ..Sandbox::default()
             };
@@ -571,6 +581,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         Some(false),
         Some(false),
         Some(false),
+        &HashMap::new(),
         &tls,
     )
     .await
@@ -611,6 +622,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         Some(false),
         Some(false),
         Some(false),
+        &HashMap::new(),
         &tls,
     )
     .await
@@ -654,6 +666,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         Some(true),
         Some(false),
         Some(false),
+        &HashMap::new(),
         &tls,
     )
     .await
@@ -697,6 +710,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         Some(false),
         Some(false),
         Some(false),
+        &HashMap::new(),
         &tls,
     )
     .await
@@ -737,6 +751,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         Some(false),
         Some(false),
         Some(false),
+        &HashMap::new(),
         &tls,
     )
     .await

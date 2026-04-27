@@ -23,6 +23,8 @@ pub struct ObjectRecord {
     pub payload: Vec<u8>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// JSON-serialized labels (key-value pairs).
+    pub labels: Option<String>,
 }
 
 /// Stored sandbox policy revision record.
@@ -51,15 +53,9 @@ pub trait ObjectType {
     fn object_type() -> &'static str;
 }
 
-/// Trait for extracting an object id from a message instance.
-pub trait ObjectId {
-    fn object_id(&self) -> &str;
-}
-
-/// Trait for extracting an object name from a message instance.
-pub trait ObjectName {
-    fn object_name(&self) -> &str;
-}
+// Import object metadata accessor traits from openshell-core
+// (implementations for all proto types are in openshell-core::metadata)
+pub use openshell_core::{ObjectId, ObjectLabels, ObjectName};
 
 /// Generate a random 6-character lowercase alphabetic name.
 pub fn generate_name() -> String {
@@ -88,10 +84,17 @@ impl Store {
     }
 
     /// Insert or update an object.
-    pub async fn put(&self, object_type: &str, id: &str, name: &str, payload: &[u8]) -> Result<()> {
+    pub async fn put(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> Result<()> {
         match self {
-            Self::Postgres(store) => store.put(object_type, id, name, payload).await,
-            Self::Sqlite(store) => store.put(object_type, id, name, payload).await,
+            Self::Postgres(store) => store.put(object_type, id, name, payload, labels).await,
+            Self::Sqlite(store) => store.put(object_type, id, name, payload, labels).await,
         }
     }
 
@@ -137,6 +140,29 @@ impl Store {
         match self {
             Self::Postgres(store) => store.list(object_type, limit, offset).await,
             Self::Sqlite(store) => store.list(object_type, limit, offset).await,
+        }
+    }
+
+    /// List objects by type with label selector filtering.
+    /// Label selector format: "key1=value1,key2=value2" (comma-separated equality matches).
+    pub async fn list_with_selector(
+        &self,
+        object_type: &str,
+        label_selector: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<ObjectRecord>> {
+        match self {
+            Self::Postgres(store) => {
+                store
+                    .list_with_selector(object_type, label_selector, limit, offset)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .list_with_selector(object_type, label_selector, limit, offset)
+                    .await
+            }
         }
     }
 
@@ -256,21 +282,33 @@ impl Store {
     // -----------------------------------------------------------------------
 
     /// Insert or update a protobuf message using its inferred object type, id, and name.
-    pub async fn put_message<T: Message + ObjectType + ObjectId + ObjectName>(
+    pub async fn put_message<T: Message + ObjectType + ObjectId + ObjectName + ObjectLabels>(
         &self,
         message: &T,
     ) -> Result<()> {
+        // Serialize labels to JSON
+        let labels_map = message.object_labels();
+        let labels_json = if labels_map.as_ref().map_or(true, |m| m.is_empty()) {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&labels_map)
+                    .map_err(|e| Error::execution(format!("failed to serialize labels: {e}")))?,
+            )
+        };
+
         self.put(
             T::object_type(),
             message.object_id(),
             message.object_name(),
             &message.encode_to_vec(),
+            labels_json.as_deref(),
         )
         .await
     }
 
     /// Fetch and decode a protobuf message by id.
-    pub async fn get_message<T: Message + Default + ObjectType>(
+    pub async fn get_message<T: Message + Default + ObjectType + ObjectLabels>(
         &self,
         id: &str,
     ) -> Result<Option<T>> {
@@ -279,13 +317,16 @@ impl Store {
             return Ok(None);
         };
 
-        T::decode(record.payload.as_slice())
-            .map(Some)
-            .map_err(|e| Error::execution(format!("protobuf decode error: {e}")))
+        let message = T::decode(record.payload.as_slice())
+            .map_err(|e| Error::execution(format!("protobuf decode error: {e}")))?;
+
+        // Note: labels are already in the proto message from the payload
+        // The database `labels` column is for filtering only
+        Ok(Some(message))
     }
 
     /// Fetch and decode a protobuf message by name.
-    pub async fn get_message_by_name<T: Message + Default + ObjectType>(
+    pub async fn get_message_by_name<T: Message + Default + ObjectType + ObjectLabels>(
         &self,
         name: &str,
     ) -> Result<Option<T>> {
@@ -294,9 +335,12 @@ impl Store {
             return Ok(None);
         };
 
-        T::decode(record.payload.as_slice())
-            .map(Some)
-            .map_err(|e| Error::execution(format!("protobuf decode error: {e}")))
+        let message = T::decode(record.payload.as_slice())
+            .map_err(|e| Error::execution(format!("protobuf decode error: {e}")))?;
+
+        // Note: labels are already in the proto message from the payload
+        // The database `labels` column is for filtering only
+        Ok(Some(message))
     }
 
     // -----------------------------------------------------------------------
@@ -405,7 +449,7 @@ pub struct DraftChunkRecord {
     pub last_seen_ms: i64,
 }
 
-fn current_time_ms() -> Result<i64> {
+pub fn current_time_ms() -> Result<i64> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| Error::execution(format!("time error: {e}")))?;
@@ -419,6 +463,47 @@ fn map_db_error(error: &sqlx::Error) -> Error {
 
 fn map_migrate_error(error: &sqlx::migrate::MigrateError) -> Error {
     Error::execution(format!("migration error: {error}"))
+}
+
+/// Parse a simple label selector string into key-value pairs.
+/// Format: "key1=value1,key2=value2"
+/// Returns a HashMap of label requirements.
+///
+/// Note: Input validation should be performed at the gRPC layer using
+/// `grpc::validation::validate_label_selector()` before calling this function.
+/// Errors returned here indicate unexpected internal errors, not user input errors.
+pub fn parse_label_selector(selector: &str) -> Result<std::collections::HashMap<String, String>> {
+    if selector.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let mut labels = std::collections::HashMap::new();
+    for pair in selector.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = pair.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            return Err(Error::execution(format!(
+                "invalid label selector: expected 'key=value', got '{pair}'"
+            )));
+        }
+
+        let key = parts[0].trim();
+        let value = parts[1].trim();
+
+        if key.is_empty() {
+            return Err(Error::execution(format!(
+                "invalid label selector: key cannot be empty in '{pair}'"
+            )));
+        }
+
+        labels.insert(key.to_string(), value.to_string());
+    }
+
+    Ok(labels)
 }
 
 #[cfg(test)]

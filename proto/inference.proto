@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package openshell.inference.v1;
 
+import "datamodel.proto";
+
 // Inference service provides cluster inference configuration and bundle delivery.
 service Inference {
   // Return the resolved inference route bundle for sandbox-local execution.
@@ -38,13 +40,10 @@ message ClusterInferenceConfig {
 
 // Storage envelope for the managed cluster inference route.
 message InferenceRoute {
-  string id = 1;
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
   ClusterInferenceConfig config = 2;
-  // Object name ("inference.local" for the user-facing route,
-  // "sandbox-system" for the sandbox system-level route).
-  string name = 3;
   // Monotonic version incremented on every update.
-  uint64 version = 4;
+  uint64 version = 3;
 }
 
 message SetClusterInferenceRequest {

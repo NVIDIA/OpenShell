@@ -7,6 +7,7 @@ use crate::tls::{TlsOptions, build_rustls_config, grpc_client, require_tls_mater
 use miette::{IntoDiagnostic, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+use openshell_core::ObjectId;
 use openshell_core::forward::{
     build_proxy_command, find_ssh_forward_pid, resolve_ssh_gateway, shell_escape,
     validate_ssh_session_response, write_forward_pid,
@@ -82,7 +83,7 @@ async fn ssh_session_config(
 
     let response = client
         .create_ssh_session(CreateSshSessionRequest {
-            sandbox_id: sandbox.id,
+            sandbox_id: sandbox.object_id().to_string(),
         })
         .await
         .into_diagnostic()?;
