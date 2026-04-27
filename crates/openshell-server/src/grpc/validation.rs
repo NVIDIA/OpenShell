@@ -267,6 +267,36 @@ pub(super) fn validate_provider_fields(provider: &Provider) -> Result<(), Status
         MAX_MAP_VALUE_LEN,
         "provider.config",
     )?;
+    validate_string_map(
+        &provider.credential_placeholders,
+        MAX_PROVIDER_CREDENTIALS_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        "provider.credential_placeholders",
+    )?;
+    if provider.passthrough_credentials.len() > MAX_PROVIDER_CREDENTIALS_ENTRIES {
+        return Err(Status::invalid_argument(format!(
+            "provider.passthrough_credentials has too many entries ({} > {MAX_PROVIDER_CREDENTIALS_ENTRIES})",
+            provider.passthrough_credentials.len()
+        )));
+    }
+    for key in &provider.passthrough_credentials {
+        if key.is_empty() {
+            return Err(Status::invalid_argument(
+                "provider.passthrough_credentials contains an empty key",
+            ));
+        }
+        if key.len() > MAX_MAP_KEY_LEN {
+            return Err(Status::invalid_argument(format!(
+                "provider.passthrough_credentials key exceeds {MAX_MAP_KEY_LEN} byte limit"
+            )));
+        }
+        if provider.credential_placeholders.contains_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "provider credential '{key}' is in both credential_placeholders and passthrough_credentials; pick one"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -626,6 +656,8 @@ mod tests {
             credentials: one_credential(),
             config: std::iter::once(("endpoint".to_string(), "https://example.com".to_string()))
                 .collect(),
+            credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
         assert!(validate_provider_fields(&provider).is_ok());
     }
@@ -638,6 +670,8 @@ mod tests {
             r#type: "claude".to_string(),
             credentials: one_credential(),
             config: HashMap::new(),
+            credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
@@ -652,6 +686,8 @@ mod tests {
             r#type: "x".repeat(MAX_PROVIDER_TYPE_LEN + 1),
             credentials: one_credential(),
             config: HashMap::new(),
+            credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
@@ -669,6 +705,8 @@ mod tests {
             r#type: "claude".to_string(),
             credentials: creds,
             config: HashMap::new(),
+            credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
@@ -686,6 +724,8 @@ mod tests {
             r#type: "claude".to_string(),
             credentials: one_credential(),
             config,
+            credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
@@ -700,6 +740,8 @@ mod tests {
             r#type: "claude".to_string(),
             credentials: one_credential(),
             config: HashMap::new(),
+            credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
         assert!(validate_provider_fields(&provider).is_ok());
     }
@@ -714,6 +756,8 @@ mod tests {
             r#type: "claude".to_string(),
             credentials: creds,
             config: HashMap::new(),
+            credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
@@ -730,6 +774,8 @@ mod tests {
             r#type: "claude".to_string(),
             credentials: one_credential(),
             config,
+            credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);

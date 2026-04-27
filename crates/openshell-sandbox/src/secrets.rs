@@ -5,9 +5,13 @@ use base64::Engine as _;
 use std::collections::HashMap;
 use std::fmt;
 
+/// Default placeholder prefix used when a credential has no override.
+///
+/// The full placeholder grammar is `openshell:resolve:env:<ENV_VAR_NAME>`,
+/// where the env var name matches `[A-Za-z_][A-Za-z0-9_]*`.
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 
-/// Public access to the placeholder prefix for fail-closed scanning in other modules.
+/// Public access to the default placeholder prefix for fail-closed scanning in other modules.
 pub(crate) const PLACEHOLDER_PREFIX_PUBLIC: &str = PLACEHOLDER_PREFIX;
 
 /// Characters that are valid in an env var key name (used to extract
@@ -64,26 +68,127 @@ pub(crate) struct RewriteTargetResult {
 #[derive(Debug, Clone, Default)]
 pub struct SecretResolver {
     by_placeholder: HashMap<String, String>,
+    /// Whether any registered placeholder uses a non-canonical (custom) form.
+    /// When false, fast-path scans can short-circuit on the canonical prefix.
+    has_custom_placeholders: bool,
 }
 
 impl SecretResolver {
+    /// Build a resolver from credential values, using only canonical
+    /// placeholders. Test-only convenience wrapper around
+    /// [`Self::from_provider_env_with_modes`].
+    #[cfg(test)]
     pub(crate) fn from_provider_env(
         provider_env: HashMap<String, String>,
+    ) -> (HashMap<String, String>, Option<Self>) {
+        Self::from_provider_env_with_modes(provider_env, HashMap::new(), &[])
+    }
+
+    /// Build a resolver from credential values and optional per-credential
+    /// placeholder overrides. Test-only convenience wrapper around
+    /// [`Self::from_provider_env_with_modes`] for tests that pre-date the
+    /// passthrough opt-in.
+    #[cfg(test)]
+    pub(crate) fn from_provider_env_with_overrides(
+        provider_env: HashMap<String, String>,
+        placeholder_overrides: HashMap<String, String>,
+    ) -> (HashMap<String, String>, Option<Self>) {
+        Self::from_provider_env_with_modes(provider_env, placeholder_overrides, &[])
+    }
+
+    /// Build a resolver from credential values, optional per-credential
+    /// placeholder overrides, and an opt-in list of passthrough credentials.
+    ///
+    /// For each credential, the value placed in the child environment is:
+    /// - **Passthrough** (`key` appears in `passthrough_keys`): the REAL
+    ///   credential value. The credential is NOT registered with the
+    ///   resolver — there is no on-the-wire placeholder for it. Use this
+    ///   only for credentials that an SDK consumes in-process and for which
+    ///   no L7 substitution is possible.
+    /// - **Custom placeholder** (`placeholder_overrides` has a valid entry):
+    ///   the override string. The resolver maps `override -> real_value`
+    ///   for exact-match substitution at the L7 proxy.
+    /// - **Default**: the canonical `openshell:resolve:env:<KEY>` placeholder.
+    ///   The resolver maps it to the real value for substitution.
+    ///
+    /// Override strings that are empty or contain prohibited characters
+    /// (CR, LF, NUL) are silently dropped — the credential falls back to the
+    /// canonical placeholder. Validation happens upstream at the gateway, so
+    /// this is a defence-in-depth check. Passthrough takes precedence over
+    /// any placeholder override on the same key.
+    pub(crate) fn from_provider_env_with_modes(
+        provider_env: HashMap<String, String>,
+        placeholder_overrides: HashMap<String, String>,
+        passthrough_keys: &[String],
     ) -> (HashMap<String, String>, Option<Self>) {
         if provider_env.is_empty() {
             return (HashMap::new(), None);
         }
 
+        let passthrough: std::collections::HashSet<&str> =
+            passthrough_keys.iter().map(String::as_str).collect();
+
         let mut child_env = HashMap::with_capacity(provider_env.len());
         let mut by_placeholder = HashMap::with_capacity(provider_env.len());
+        let mut has_custom_placeholders = false;
 
         for (key, value) in provider_env {
-            let placeholder = placeholder_for_env_key(&key);
+            if passthrough.contains(key.as_str()) {
+                // Inject the real value directly. Do NOT register with the
+                // resolver — passthrough credentials have no placeholder
+                // and must not be substituted by the L7 proxy.
+                child_env.insert(key, value);
+                continue;
+            }
+            let placeholder = match placeholder_overrides.get(&key) {
+                Some(override_value) if is_valid_placeholder(override_value) => {
+                    has_custom_placeholders = true;
+                    override_value.clone()
+                }
+                _ => placeholder_for_env_key(&key),
+            };
             child_env.insert(key, placeholder.clone());
             by_placeholder.insert(placeholder, value);
         }
 
-        (child_env, Some(Self { by_placeholder }))
+        if by_placeholder.is_empty() {
+            // All credentials were passthrough; no resolver needed.
+            return (child_env, None);
+        }
+
+        (
+            child_env,
+            Some(Self {
+                by_placeholder,
+                has_custom_placeholders,
+            }),
+        )
+    }
+
+    /// Returns true if any registered placeholder is a custom (non-canonical)
+    /// form. Test-only — production code reads `self.has_custom_placeholders`
+    /// directly inside [`Self::contains_any_placeholder`].
+    #[cfg(test)]
+    pub(crate) fn has_custom_placeholders(&self) -> bool {
+        self.has_custom_placeholders
+    }
+
+    /// Return true if the given haystack contains any registered placeholder
+    /// string, or any canonical-form placeholder (the latter so that scans
+    /// catch unresolved canonical placeholders even when the resolver has
+    /// only custom-form entries).
+    pub(crate) fn contains_any_placeholder(&self, haystack: &str) -> bool {
+        if haystack.contains(PLACEHOLDER_PREFIX) {
+            return true;
+        }
+        if self.has_custom_placeholders {
+            for placeholder in self.by_placeholder.keys() {
+                if !placeholder.starts_with(PLACEHOLDER_PREFIX) && haystack.contains(placeholder) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Resolve a placeholder string to the real secret value.
@@ -142,8 +247,8 @@ impl SecretResolver {
         let decoded_bytes = b64.decode(encoded.trim()).ok()?;
         let decoded = std::str::from_utf8(&decoded_bytes).ok()?;
 
-        // Check if the decoded string contains any placeholder
-        if !decoded.contains(PLACEHOLDER_PREFIX) {
+        // Check if the decoded string contains any registered placeholder.
+        if !self.contains_any_placeholder(decoded) {
             return None;
         }
 
@@ -174,6 +279,14 @@ impl SecretResolver {
 
 pub(crate) fn placeholder_for_env_key(key: &str) -> String {
     format!("{PLACEHOLDER_PREFIX}{key}")
+}
+
+/// Reject placeholder strings that would corrupt HTTP framing or that an empty
+/// string would silently disable. Mirrors the gateway-side check so that the
+/// supervisor never registers an unsafe override even if the gateway is
+/// outdated or misbehaves.
+fn is_valid_placeholder(value: &str) -> bool {
+    !value.is_empty() && !value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0))
 }
 
 // ---------------------------------------------------------------------------
@@ -352,8 +465,11 @@ fn rewrite_request_line(
         }
     };
 
-    // Only rewrite if the URI contains a placeholder
-    if !uri.contains(PLACEHOLDER_PREFIX) {
+    // Only rewrite if the URI contains a registered placeholder (canonical
+    // or custom). Custom placeholders only resolve in query params, but the
+    // fast-path enters processing so the post-scan can fail closed on a
+    // custom placeholder that leaks into a URL path.
+    if !resolver.contains_any_placeholder(uri) {
         return Ok(RewriteLineResult {
             line: line.to_string(),
             redacted_target: None,
@@ -511,7 +627,7 @@ fn rewrite_uri_query_params(
     query: &str,
     resolver: &SecretResolver,
 ) -> Result<Option<(String, String)>, UnresolvedPlaceholderError> {
-    if !query.contains(PLACEHOLDER_PREFIX) {
+    if !resolver.contains_any_placeholder(query) {
         return Ok(None);
     }
 
@@ -608,16 +724,17 @@ pub(crate) fn rewrite_http_header_block(
     output.extend_from_slice(&raw[header_end..]);
 
     // Fail-closed scan: check for any remaining unresolved placeholders
-    // in both raw form and percent-decoded form of the output header block.
+    // (canonical or custom) in both raw form and percent-decoded form of the
+    // output header block.
     let output_header = String::from_utf8_lossy(&output[..output.len().min(header_end + 256)]);
-    if output_header.contains(PLACEHOLDER_PREFIX) {
+    if resolver.contains_any_placeholder(&output_header) {
         return Err(UnresolvedPlaceholderError { location: "header" });
     }
 
     // Also check percent-decoded form of the request line (F5 — encoded placeholder bypass)
     let rewritten_rl = output_header.split("\r\n").next().unwrap_or("");
     let decoded_rl = percent_decode(rewritten_rl);
-    if decoded_rl.contains(PLACEHOLDER_PREFIX) {
+    if resolver.contains_any_placeholder(&decoded_rl) {
         return Err(UnresolvedPlaceholderError { location: "path" });
     }
 
@@ -646,10 +763,12 @@ pub(crate) fn rewrite_target_for_eval(
     target: &str,
     resolver: &SecretResolver,
 ) -> Result<RewriteTargetResult, UnresolvedPlaceholderError> {
-    if !target.contains(PLACEHOLDER_PREFIX) {
-        // Also check percent-decoded form
+    if !resolver.contains_any_placeholder(target) {
+        // Also check percent-decoded form for canonical placeholders
+        // (encoded-bypass guard); custom placeholders contain no special
+        // ASCII so percent-encoding does not alter them.
         let decoded = percent_decode(target);
-        if decoded.contains(PLACEHOLDER_PREFIX) {
+        if resolver.contains_any_placeholder(&decoded) {
             return Err(UnresolvedPlaceholderError { location: "path" });
         }
         return Ok(RewriteTargetResult {
@@ -686,6 +805,13 @@ pub(crate) fn rewrite_target_for_eval(
         Some(q) => format!("{redacted_path}?{q}"),
         None => redacted_path,
     };
+
+    // Fail-closed scan: catch any registered placeholder that survived
+    // rewriting (e.g. a custom-format placeholder that landed in a path
+    // segment, where only canonical placeholders are substituted).
+    if resolver.contains_any_placeholder(&resolved) {
+        return Err(UnresolvedPlaceholderError { location: "path" });
+    }
 
     Ok(RewriteTargetResult { resolved, redacted })
 }
@@ -1472,5 +1598,234 @@ mod tests {
 
         assert_eq!(result.resolved, "/bottok123/method?key=key456");
         assert_eq!(result.redacted, "/bot[CREDENTIAL]/method?key=[CREDENTIAL]");
+    }
+
+    // === Custom placeholder overrides (issue #894) ===
+
+    #[test]
+    fn custom_placeholder_overrides_replace_canonical_form() {
+        let (child_env, resolver) = SecretResolver::from_provider_env_with_overrides(
+            [(
+                "SLACK_BOT_TOKEN".to_string(),
+                "xoxb-real-secret".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            [(
+                "SLACK_BOT_TOKEN".to_string(),
+                "xoxb-OPENSHELL-PLACEHOLDER".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        // Child sees the format-preserving override, not the canonical placeholder.
+        assert_eq!(
+            child_env.get("SLACK_BOT_TOKEN"),
+            Some(&"xoxb-OPENSHELL-PLACEHOLDER".to_string())
+        );
+        assert_eq!(
+            resolver.resolve_placeholder("xoxb-OPENSHELL-PLACEHOLDER"),
+            Some("xoxb-real-secret")
+        );
+        // Canonical form is NOT registered when an override is present.
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:SLACK_BOT_TOKEN"),
+            None
+        );
+        assert!(resolver.has_custom_placeholders());
+    }
+
+    #[test]
+    fn custom_placeholder_falls_back_to_canonical_for_credentials_without_override() {
+        let (child_env, resolver) = SecretResolver::from_provider_env_with_overrides(
+            [
+                ("SLACK_BOT_TOKEN".to_string(), "xoxb-real".to_string()),
+                ("ANTHROPIC_API_KEY".to_string(), "sk-real".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            std::iter::once(("SLACK_BOT_TOKEN".to_string(), "xoxb-OPENSHELL".to_string()))
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        assert_eq!(
+            child_env.get("SLACK_BOT_TOKEN"),
+            Some(&"xoxb-OPENSHELL".to_string())
+        );
+        assert_eq!(
+            child_env.get("ANTHROPIC_API_KEY"),
+            Some(&"openshell:resolve:env:ANTHROPIC_API_KEY".to_string())
+        );
+        assert_eq!(
+            resolver.resolve_placeholder("xoxb-OPENSHELL"),
+            Some("xoxb-real")
+        );
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:ANTHROPIC_API_KEY"),
+            Some("sk-real")
+        );
+    }
+
+    #[test]
+    fn empty_or_unsafe_overrides_fall_back_to_canonical() {
+        let (child_env, resolver) = SecretResolver::from_provider_env_with_overrides(
+            [
+                ("EMPTY_OVERRIDE".to_string(), "v1".to_string()),
+                ("CRLF_OVERRIDE".to_string(), "v2".to_string()),
+                ("NUL_OVERRIDE".to_string(), "v3".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            [
+                ("EMPTY_OVERRIDE".to_string(), String::new()),
+                ("CRLF_OVERRIDE".to_string(), "bad\r\nvalue".to_string()),
+                ("NUL_OVERRIDE".to_string(), "bad\0value".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        for key in ["EMPTY_OVERRIDE", "CRLF_OVERRIDE", "NUL_OVERRIDE"] {
+            assert_eq!(
+                child_env.get(key),
+                Some(&format!("openshell:resolve:env:{key}")),
+                "{key} should fall back to canonical placeholder"
+            );
+        }
+        assert!(!resolver.has_custom_placeholders());
+    }
+
+    #[test]
+    fn custom_placeholder_substitutes_in_bearer_authorization_header() {
+        let (child_env, resolver) = SecretResolver::from_provider_env_with_overrides(
+            std::iter::once((
+                "SLACK_BOT_TOKEN".to_string(),
+                "xoxb-real-secret".to_string(),
+            ))
+            .collect(),
+            std::iter::once((
+                "SLACK_BOT_TOKEN".to_string(),
+                "xoxb-OPENSHELL-PLACEHOLDER".to_string(),
+            ))
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let placeholder = child_env.get("SLACK_BOT_TOKEN").unwrap();
+        assert_eq!(placeholder, "xoxb-OPENSHELL-PLACEHOLDER");
+
+        let raw = format!(
+            "POST /api/chat.postMessage HTTP/1.1\r\nAuthorization: Bearer {placeholder}\r\nContent-Length: 0\r\n\r\n"
+        );
+        let result = rewrite_http_header_block(raw.as_bytes(), Some(&resolver))
+            .expect("rewrite should succeed");
+        let rewritten = String::from_utf8(result.rewritten).expect("utf8");
+
+        assert!(rewritten.contains("Authorization: Bearer xoxb-real-secret"));
+        assert!(!rewritten.contains("xoxb-OPENSHELL-PLACEHOLDER"));
+    }
+
+    #[test]
+    fn custom_placeholder_substitutes_in_query_param() {
+        let (child_env, resolver) = SecretResolver::from_provider_env_with_overrides(
+            std::iter::once(("API_KEY".to_string(), "real-api-key".to_string())).collect(),
+            std::iter::once(("API_KEY".to_string(), "MOCK-API-KEY-XYZ".to_string())).collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let placeholder = child_env.get("API_KEY").unwrap();
+
+        let target = format!("/v1/list?key={placeholder}&format=json");
+        let result = rewrite_target_for_eval(&target, &resolver).expect("rewrite should succeed");
+
+        assert_eq!(result.resolved, "/v1/list?key=real-api-key&format=json");
+        assert_eq!(result.redacted, "/v1/list?key=[CREDENTIAL]&format=json");
+    }
+
+    #[test]
+    fn custom_placeholder_in_path_segment_fails_closed() {
+        // Custom-format placeholders are NOT substituted in URL path segments
+        // (path-segment extraction relies on the canonical env-var-name grammar).
+        // A custom placeholder that ends up in a path must be rejected by the
+        // post-rewrite scan rather than silently leaking upstream.
+        let (child_env, resolver) = SecretResolver::from_provider_env_with_overrides(
+            std::iter::once(("BOT_TOKEN".to_string(), "real-token".to_string())).collect(),
+            std::iter::once(("BOT_TOKEN".to_string(), "MOCK-BOT-TOKEN".to_string())).collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let placeholder = child_env.get("BOT_TOKEN").unwrap();
+
+        let target = format!("/bot{placeholder}/sendMessage");
+        let err = rewrite_target_for_eval(&target, &resolver)
+            .expect_err("must fail closed when custom placeholder lands in path");
+        assert_eq!(err.location, "path");
+    }
+
+    #[test]
+    fn mixed_canonical_and_custom_placeholders_round_trip() {
+        let (child_env, resolver) = SecretResolver::from_provider_env_with_overrides(
+            [
+                ("ANTHROPIC_API_KEY".to_string(), "sk-anthropic".to_string()),
+                ("SLACK_BOT_TOKEN".to_string(), "xoxb-slack".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            std::iter::once(("SLACK_BOT_TOKEN".to_string(), "xoxb-OPENSHELL".to_string()))
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let anthropic_ph = child_env.get("ANTHROPIC_API_KEY").unwrap().clone();
+        let slack_ph = child_env.get("SLACK_BOT_TOKEN").unwrap().clone();
+
+        let raw = format!(
+            "POST /v1 HTTP/1.1\r\nx-api-key: {anthropic_ph}\r\nAuthorization: Bearer {slack_ph}\r\n\r\n"
+        );
+        let result = rewrite_http_header_block(raw.as_bytes(), Some(&resolver))
+            .expect("rewrite should succeed");
+        let rewritten = String::from_utf8(result.rewritten).expect("utf8");
+
+        assert!(rewritten.contains("x-api-key: sk-anthropic"));
+        assert!(rewritten.contains("Authorization: Bearer xoxb-slack"));
+        assert!(!rewritten.contains("openshell:resolve:env:"));
+        assert!(!rewritten.contains("xoxb-OPENSHELL"));
+    }
+
+    #[test]
+    fn unresolved_custom_placeholder_in_header_fails_closed() {
+        // Register a custom placeholder, then send a request whose header
+        // contains a different (unregistered) custom-shaped string. Exact
+        // match fails, so the registered string never appears in output —
+        // request passes through. But a header carrying the *registered*
+        // placeholder unresolved (e.g. via a bug in rewriting) must be
+        // caught by the post-scan.
+        let (child_env, resolver) = SecretResolver::from_provider_env_with_overrides(
+            std::iter::once(("BOT_TOKEN".to_string(), "real".to_string())).collect(),
+            std::iter::once(("BOT_TOKEN".to_string(), "MOCK-OPENSHELL-BOT".to_string())).collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let placeholder = child_env.get("BOT_TOKEN").unwrap();
+
+        // Embed the registered placeholder in a header position rewrite_header_value
+        // does not currently substitute (e.g. inside an `X-Notes:` free-form field
+        // followed by other text). The exact-match lookup fails (value is not
+        // exactly the placeholder), Bearer split fails (no whitespace separator
+        // before the placeholder), so the header passes through. The post-scan
+        // must then reject because the registered placeholder still appears.
+        let raw = format!("POST / HTTP/1.1\r\nX-Notes: token-is-{placeholder}-keep-secret\r\n\r\n");
+        let err = rewrite_http_header_block(raw.as_bytes(), Some(&resolver))
+            .expect_err("post-scan must reject unresolved custom placeholder");
+        assert_eq!(err.location, "header");
+    }
+
+    #[test]
+    fn no_overrides_does_not_set_custom_placeholders_flag() {
+        let (_, resolver) = SecretResolver::from_provider_env_with_overrides(
+            std::iter::once(("KEY".to_string(), "val".to_string())).collect(),
+            HashMap::new(),
+        );
+        let resolver = resolver.expect("resolver");
+        assert!(!resolver.has_custom_placeholders());
     }
 }

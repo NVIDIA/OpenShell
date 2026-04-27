@@ -1563,6 +1563,8 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
                     config: Default::default(),
+                    credential_placeholders: Default::default(),
+                    passthrough_credentials: Default::default(),
                 }),
             };
 
@@ -1642,6 +1644,8 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                 r#type: ptype,
                 credentials,
                 config: Default::default(),
+                credential_placeholders: Default::default(),
+                passthrough_credentials: Default::default(),
             }),
         };
 

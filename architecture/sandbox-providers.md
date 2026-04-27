@@ -35,6 +35,13 @@ Provider is defined in `proto/datamodel.proto`:
 - `type`: canonical provider slug (`claude`, `gitlab`, `github`, etc.)
 - `credentials`: `map<string, string>` for secret values
 - `config`: `map<string, string>` for non-secret settings
+- `credential_placeholders`: optional `map<string, string>` keyed by the same
+  env var name as `credentials`. When present, the supervisor injects this
+  literal string into the child environment instead of the canonical
+  `openshell:resolve:env:<KEY>` placeholder. Used to satisfy SDKs that
+  validate credential format in-process before any network call (for
+  example, Slack's `xoxb-` / `xapp-` prefix check). See
+  [Custom Placeholder Formats](#custom-placeholder-formats) below.
 
 The gRPC surface is defined in `proto/openshell.proto`:
 
@@ -320,16 +327,66 @@ request is forwarded upstream. Placeholders are resolved in four locations:
 This applies to forward-proxy HTTP requests, L7-inspected REST requests inside CONNECT
 tunnels, and credential-injection-only passthrough relays on TLS-terminated connections.
 
-All rewriting fails closed: if any `openshell:resolve:env:*` placeholder is detected but
-cannot be resolved, the proxy rejects the request with HTTP 500 instead of forwarding the
-raw placeholder upstream. Resolved secret values are validated for prohibited control
-characters (CR, LF, null byte) to prevent header injection (CWE-113). Path segment
+All rewriting fails closed: if any registered placeholder string is detected in the output
+but cannot be resolved, the proxy rejects the request with HTTP 500 instead of forwarding
+the raw placeholder upstream. The fail-closed scan covers both canonical
+`openshell:resolve:env:*` placeholders and custom-format placeholders registered via
+`credential_placeholders` (see below). Resolved secret values are validated for prohibited
+control characters (CR, LF, null byte) to prevent header injection (CWE-113). Path segment
 credentials are additionally validated to reject traversal sequences, path separators, and
 URI delimiters (CWE-22).
 
 The real secret value remains in supervisor memory only; it is not re-injected into the
 child process environment. See [Credential injection](sandbox.md#credential-injection) for
 the full implementation details, encoding rules, and security properties.
+
+### Custom Placeholder Formats
+
+The default canonical placeholder `openshell:resolve:env:<KEY>` is distinctive and easy to
+detect, but some SDKs validate credential format in-process before the request reaches the
+network — and therefore before the proxy can substitute the real value. Slack's
+`@slack/web-api` rejects bot tokens that do not start with `xoxb-`; AWS, Google, and several
+OAuth libraries do similar prefix or charset checks. For those SDKs the canonical placeholder
+fails validation and the request is never made.
+
+To handle this, a provider may declare a `credential_placeholders` entry per credential
+env var. When set:
+
+- the supervisor injects the literal override string into the child environment instead of
+  the canonical placeholder;
+- the supervisor's resolver registers `<override> -> <real value>` so the L7 proxy can
+  substitute it on the wire by exact-match lookup;
+- the fail-closed scan also rejects requests in which the override survives rewriting.
+
+The override string must be:
+
+- non-empty;
+- free of CR, LF, and NUL bytes (HTTP framing safety);
+- distinctive enough not to collide with legitimate user data on the wire — the proxy
+  substitutes by exact-match against the registered string, so any header value, query
+  parameter, or path segment that exactly equals the override is replaced.
+
+**Substitution scope for custom-format placeholders.** Custom-format placeholders are
+substituted in:
+
+- HTTP header values (full-value, `Bearer <override>` prefix, and Basic-auth-decoded forms);
+- URL query parameter values.
+
+They are **not** substituted in URL path segments. Path-segment extraction relies on the
+canonical env-var-name grammar (`[A-Za-z_][A-Za-z0-9_]*`) to find placeholder boundaries
+inside concatenated paths like Telegram's `/bot<token>/sendMessage`; arbitrary custom shapes
+do not fit that grammar. If a credential is consumed in a path-embedded position, leave its
+`credential_placeholders` entry unset so the canonical placeholder applies. Custom-format
+placeholders that end up in a path are caught by the fail-closed post-rewrite scan and
+rejected; they never leak upstream.
+
+**When to use it.** Custom placeholders are a security trade-off. The canonical form
+guarantees that no real-credential-shaped string appears in the agent process at all.
+Custom placeholders look like real credentials but contain no real value, which is what
+the SDK's format check needs to pass — and is still useless to anything that obtains it
+(prompt injection, crash dumps, accidental logs) because the L7 proxy is the only path
+that can substitute it. Use a custom placeholder only when an in-process SDK forces the
+issue; otherwise the canonical form is preferable.
 
 ### End-to-End Flow
 

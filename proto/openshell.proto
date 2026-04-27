@@ -578,6 +578,18 @@ message GetSandboxProviderEnvironmentRequest {
 message GetSandboxProviderEnvironmentResponse {
   // Provider credential environment variables.
   map<string, string> environment = 1;
+  // Optional per-credential placeholder overrides keyed by env var name.
+  // When present, the supervisor injects this literal value into the child
+  // environment instead of the canonical `openshell:resolve:env:<KEY>`
+  // placeholder. The L7 proxy registers it and substitutes the real value
+  // on the wire.
+  map<string, string> placeholder_overrides = 2;
+  // Optional list of env var names whose REAL credential value is injected
+  // directly into the agent process, bypassing the placeholder/L7-proxy
+  // substitution path entirely. The supervisor must NOT register passthrough
+  // keys with the secret resolver. Used for credentials that an SDK consumes
+  // in-process and for which no on-the-wire substitution is possible.
+  repeated string passthrough_keys = 3;
 }
 
 // ---------------------------------------------------------------------------

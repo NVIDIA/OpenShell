@@ -674,6 +674,22 @@ enum ProviderCommands {
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
         config: Vec<String>,
+
+        /// Per-credential format-preserving placeholder shown to the agent
+        /// process instead of the canonical `openshell:resolve:env:<KEY>`.
+        /// Use this when an SDK rejects the canonical placeholder by format
+        /// (for example, Slack expects `xoxb-` / `xapp-` prefixes). The L7
+        /// proxy still substitutes the real value on the wire.
+        #[arg(long = "credential-placeholder", value_name = "KEY=VALUE")]
+        credential_placeholders: Vec<String>,
+
+        /// Mark a credential as passthrough: inject the REAL value into the
+        /// agent process, with no placeholder and no L7 proxy substitution.
+        /// Use only when the SDK consumes the credential in-process and no
+        /// on-the-wire substitution is possible. This drops the
+        /// "agent never sees the real value" invariant for the listed key.
+        #[arg(long = "credential-passthrough", value_name = "KEY")]
+        credential_passthrough: Vec<String>,
     },
 
     /// Fetch a provider by name.
@@ -722,6 +738,26 @@ enum ProviderCommands {
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
         config: Vec<String>,
+
+        /// Per-credential format-preserving placeholder shown to the agent
+        /// process. Pass `KEY=` (empty value) to remove an existing override.
+        #[arg(long = "credential-placeholder", value_name = "KEY=VALUE")]
+        credential_placeholders: Vec<String>,
+
+        /// Mark credentials as passthrough (inject real value into the agent
+        /// process). Repeats build the new full list, replacing any prior
+        /// passthrough configuration. Pass `--clear-credential-passthrough`
+        /// to clear without replacing.
+        #[arg(
+            long = "credential-passthrough",
+            value_name = "KEY",
+            conflicts_with = "clear_credential_passthrough"
+        )]
+        credential_passthrough: Vec<String>,
+
+        /// Clear the passthrough credential list on this provider.
+        #[arg(long)]
+        clear_credential_passthrough: bool,
     },
 
     /// Delete providers by name.
@@ -2564,6 +2600,8 @@ async fn main() -> Result<()> {
                     from_existing,
                     credentials,
                     config,
+                    credential_placeholders,
+                    credential_passthrough,
                 } => {
                     run::provider_create(
                         endpoint,
@@ -2572,6 +2610,8 @@ async fn main() -> Result<()> {
                         from_existing,
                         &credentials,
                         &config,
+                        &credential_placeholders,
+                        &credential_passthrough,
                         &tls,
                     )
                     .await?;
@@ -2591,6 +2631,9 @@ async fn main() -> Result<()> {
                     from_existing,
                     credentials,
                     config,
+                    credential_placeholders,
+                    credential_passthrough,
+                    clear_credential_passthrough,
                 } => {
                     run::provider_update(
                         endpoint,
@@ -2598,6 +2641,9 @@ async fn main() -> Result<()> {
                         from_existing,
                         &credentials,
                         &config,
+                        &credential_placeholders,
+                        &credential_passthrough,
+                        clear_credential_passthrough,
                         &tls,
                     )
                     .await?;

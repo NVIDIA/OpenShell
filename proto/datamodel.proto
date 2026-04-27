@@ -15,4 +15,25 @@ message Provider {
   map<string, string> credentials = 4;
   // Non-secret provider configuration.
   map<string, string> config = 5;
+  // Optional per-credential placeholder strings, keyed by the same env var
+  // name as `credentials`. When set, this literal string (instead of the
+  // canonical `openshell:resolve:env:<KEY>`) is what the agent process sees
+  // in its environment, while the L7 proxy still substitutes the real value
+  // on the wire. Used for SDKs that validate credential format in-process
+  // before any network call (for example, Slack's `xoxb-` prefix check).
+  // Missing entries fall back to the canonical placeholder.
+  map<string, string> credential_placeholders = 6;
+  // Optional per-credential passthrough opt-in: env var names whose REAL
+  // credential value is injected directly into the agent process, with no
+  // placeholder and no L7 proxy substitution. Use this only for credentials
+  // that an SDK consumes in-process (signature computation, checksum
+  // verification, non-HTTP transports) where neither the canonical
+  // placeholder nor a custom-format placeholder can be substituted on the
+  // wire. This drops the "agent never sees the real value" invariant for
+  // the listed keys; treat it as a per-credential security trade-off and
+  // prefer canonical or custom placeholders whenever the SDK can tolerate
+  // them. A key MUST NOT appear in both `credential_placeholders` and
+  // `passthrough_credentials`. Keys not present in `credentials` are
+  // ignored.
+  repeated string passthrough_credentials = 7;
 }
