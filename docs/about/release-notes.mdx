@@ -16,19 +16,3 @@ NVIDIA OpenShell follows a frequent release cadence. Use the following GitHub re
 | [Release comparison](https://github.com/NVIDIA/OpenShell/compare) | Diff between any two tags or branches. |
 | [Merged pull requests](https://github.com/NVIDIA/OpenShell/pulls?q=is%3Apr+is%3Amerged) | Individual changes with review discussion. |
 | [Commit history](https://github.com/NVIDIA/OpenShell/commits/main) | Full commit log on `main`. |
-
-## Week of April 20 2026
-
-This weekly refresh summarizes user-facing changes merged to `main` between April 20, 2026 and April 27, 2026.
-
-| Pull request | Merged change | Documentation update |
-|---|---|---|
-| [#919](https://github.com/NVIDIA/OpenShell/pull/919) `feat(server): add object meta convention to top-level objects` | Adds sandbox labels at creation time and label-selector filtering in `openshell sandbox list`. | Added label and selector examples to [Manage Sandboxes](/sandboxes/manage-sandboxes). |
-| [#952](https://github.com/NVIDIA/OpenShell/pull/952) `fix(cli): preserve directory basename when uploading to sandbox` | Changes directory uploads to keep the source basename, matching `scp -r` and `cp -r` for named directories. | Clarified directory upload behavior in [Manage Sandboxes](/sandboxes/manage-sandboxes). |
-| [#918](https://github.com/NVIDIA/OpenShell/pull/918) `fix(sandbox): inject GIT_SSL_CAINFO so git clone trusts the sandbox CA` | Extends the injected sandbox trust-store variables so HTTPS `git clone` uses the same combined CA bundle as other TLS-aware tooling. | Updated the TLS trust-store description in [Security Best Practices](/security/best-practices). |
-| [#880](https://github.com/NVIDIA/OpenShell/pull/880) `fix(cli): sandbox get returns currently active runtime policy` | Makes `openshell sandbox get` show the currently active policy and adds `--policy-only` for scripts. | The current [Manage Sandboxes](/sandboxes/manage-sandboxes) page already reflects this behavior. |
-| [#903](https://github.com/NVIDIA/OpenShell/pull/903) `feat(server): serve health endpoints on separate unauthenticated port` | Moves `/health`, `/healthz`, and `/readyz` to a dedicated plaintext port so probes do not require mTLS client certificates. | No published operator page covers standalone gateway listener ports yet. |
-| [#915](https://github.com/NVIDIA/OpenShell/pull/915) `feat(server): allow disabling health check listener` | Lets operators disable the dedicated health listener by setting the server health port to `0`. | No published operator page covers standalone gateway listener ports yet. |
-| [#914](https://github.com/NVIDIA/OpenShell/pull/914) `feat: add configurable timeout for image transfer to gateway containerd` | Adds a configurable timeout for large image transfers into the gateway's containerd runtime. | No published task page covers this bootstrap setting yet. |
-| [#887](https://github.com/NVIDIA/OpenShell/pull/887) `feat(install-vm): install gateway + vm driver, add --driver-dir resolution` | Updates `install-vm.sh` to install both the gateway binary and VM driver, and documents `--driver-dir` resolution in repo architecture docs. | No published install guide covers `install-vm.sh` yet. |
-| [#904](https://github.com/NVIDIA/OpenShell/pull/904) `feat: Openshell driver podman` | Adds a Podman compute driver for rootless local sandbox management and related architecture documentation. | No published guide covers Podman driver setup yet. |
