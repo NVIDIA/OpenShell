@@ -511,6 +511,8 @@ mod tests {
             r#type: provider_type.to_string(),
             credentials: std::iter::once((key_name.to_string(), key_value.to_string())).collect(),
             config: std::collections::HashMap::new(),
+            profile_id: String::new(),
+            profile_policy_enabled: false,
         }
     }
 
@@ -675,6 +677,8 @@ mod tests {
                 "https://station.example.com/v1".to_string(),
             ))
             .collect(),
+            profile_id: String::new(),
+            profile_policy_enabled: false,
         };
         store
             .put_message(&provider)
@@ -749,6 +753,8 @@ mod tests {
             credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-rotated".to_string()))
                 .collect(),
             config: provider.config.clone(),
+            profile_id: provider.profile_id.clone(),
+            profile_policy_enabled: provider.profile_policy_enabled,
         };
         store
             .put_message(&rotated_provider)

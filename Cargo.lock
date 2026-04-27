@@ -3637,6 +3637,7 @@ dependencies = [
  "openshell-driver-podman",
  "openshell-ocsf",
  "openshell-policy",
+ "openshell-providers",
  "openshell-router",
  "petname",
  "pin-project-lite",

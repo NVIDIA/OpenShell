@@ -201,6 +201,20 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(ListProvidersResponse { providers }))
     }
 
+    async fn list_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn update_provider(
         &self,
         request: tonic::Request<UpdateProviderRequest>,
@@ -243,6 +257,8 @@ impl OpenShell for TestOpenShell {
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
             config: merge(existing.config, provider.config),
+            profile_id: existing.profile_id,
+            profile_policy_enabled: existing.profile_policy_enabled,
         };
         let updated_name = updated.object_name().to_string();
         providers.insert(updated_name, updated.clone());

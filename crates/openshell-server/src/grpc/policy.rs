@@ -33,7 +33,7 @@ use openshell_core::proto::{
     UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
 };
 use openshell_core::proto::{
-    L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Sandbox,
+    L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
     SandboxPolicy as ProtoSandboxPolicy,
 };
 use openshell_core::{
@@ -43,7 +43,10 @@ use openshell_core::{
 use openshell_ocsf::{
     ConfigStateChangeBuilder, OCSF_TARGET, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
 };
-use openshell_policy::{PolicyMergeOp, merge_policy};
+use openshell_policy::{
+    PolicyMergeOp, ProviderPolicyLayer, compose_effective_policy, merge_policy,
+};
+use openshell_providers::get_default_profile;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -351,6 +354,11 @@ pub(super) async fn handle_get_sandbox_config(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox_provider_names = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.clone())
+        .unwrap_or_default();
 
     // Try to get the latest policy from the policy history table.
     let latest = state
@@ -447,6 +455,18 @@ pub(super) async fn handle_get_sandbox_config(
         }
     }
 
+    if policy_source == PolicySource::Sandbox
+        && let Some(source_policy) = policy.as_ref()
+    {
+        let provider_layers =
+            profile_provider_policy_layers(state.store.as_ref(), &sandbox_provider_names).await?;
+        if !provider_layers.is_empty() {
+            let effective_policy = compose_effective_policy(source_policy, &provider_layers);
+            policy_hash = deterministic_policy_hash(&effective_policy);
+            policy = Some(effective_policy);
+        }
+    }
+
     let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
     let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
 
@@ -459,6 +479,51 @@ pub(super) async fn handle_get_sandbox_config(
         policy_source: policy_source.into(),
         global_policy_version,
     }))
+}
+
+async fn profile_provider_policy_layers(
+    store: &Store,
+    provider_names: &[String],
+) -> Result<Vec<ProviderPolicyLayer>, Status> {
+    let mut layers = Vec::new();
+
+    for name in provider_names {
+        let provider = store
+            .get_message_by_name::<Provider>(name)
+            .await
+            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
+            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
+
+        if !provider.profile_policy_enabled {
+            continue;
+        }
+
+        let profile_id = provider.profile_id.trim();
+        if profile_id.is_empty() {
+            warn!(
+                provider_name = %name,
+                "provider profile policy enabled without a profile id; skipping provider policy layer"
+            );
+            continue;
+        }
+
+        let Some(profile) = get_default_profile(profile_id) else {
+            warn!(
+                provider_name = %name,
+                profile_id,
+                "provider profile id is unknown; skipping provider policy layer"
+            );
+            continue;
+        };
+
+        let rule_name = openshell_policy::provider_rule_name(provider.object_name());
+        layers.push(ProviderPolicyLayer {
+            rule_name: rule_name.clone(),
+            rule: profile.network_policy_rule(&rule_name),
+        });
+    }
+
+    Ok(layers)
 }
 
 pub(super) async fn handle_get_gateway_config(
@@ -2698,6 +2763,66 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(loaded.spec.unwrap().policy.is_none());
+    }
+
+    fn test_provider(name: &str, profile_enabled: bool) -> Provider {
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("provider-{name}"),
+                name: name.to_string(),
+                created_at_ms: 1000000,
+                labels: HashMap::new(),
+            }),
+            r#type: "github".to_string(),
+            credentials: std::iter::once(("GITHUB_TOKEN".to_string(), "ghp-test".to_string()))
+                .collect(),
+            config: HashMap::new(),
+            profile_id: if profile_enabled {
+                "github".to_string()
+            } else {
+                String::new()
+            },
+            profile_policy_enabled: profile_enabled,
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_policy_layers_skip_legacy_providers() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        store
+            .put_message(&test_provider("legacy-github", false))
+            .await
+            .unwrap();
+
+        let layers = profile_provider_policy_layers(&store, &["legacy-github".to_string()])
+            .await
+            .unwrap();
+
+        assert!(layers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_policy_layers_include_profile_enabled_providers() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        store
+            .put_message(&test_provider("work-github", true))
+            .await
+            .unwrap();
+
+        let layers = profile_provider_policy_layers(&store, &["work-github".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].rule_name, "_provider_work_github");
+        assert_eq!(layers[0].rule.endpoints.len(), 2);
+        assert!(
+            layers[0]
+                .rule
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.github.com")
+        );
     }
 
     #[tokio::test]
