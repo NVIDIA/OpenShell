@@ -20,15 +20,16 @@ jobs:
             const body = context.payload.issue.body || '';
 
             // Check if the Agent Diagnostic section has substantive content.
-            // The template placeholder starts with "Example:" — if that's still
-            // there or the section is empty, the reporter didn't fill it in.
+            // GitHub issue forms render textarea labels as h3 headings, but
+            // issues created through gh or API clients often use h2 headings.
             const diagnosticMatch = body.match(
-              /### Agent Diagnostic\s*\n([\s\S]*?)(?=\n### |\n$)/
+              /^#{2,4}\s+Agent Diagnostic[s]?\s*\n([\s\S]*?)(?=\n#{2,4}\s+|$)/im
             );
 
-            const hasSubstantiveDiagnostic = diagnosticMatch
-              && diagnosticMatch[1].trim().length > 0
-              && !diagnosticMatch[1].trim().startsWith('Example:');
+            const diagnosticText = diagnosticMatch?.[1].trim() || '';
+            const hasSubstantiveDiagnostic = diagnosticText.length > 0
+              && !diagnosticText.toLowerCase().startsWith('example:')
+              && !['n/a', 'none', 'no', 'not applicable'].includes(diagnosticText.toLowerCase());
 
             if (hasSubstantiveDiagnostic) {
               console.log('Agent diagnostic section found with content. Passing.');
@@ -43,18 +44,4 @@ jobs:
               repo: context.repo.repo,
               issue_number: context.issue.number,
               labels: ['state:triage-needed']
-            });
-
-            // Post redirect comment
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: [
-                'This issue appears to have been opened without an agent investigation.',
-                '',
-                'OpenShell is an agent-first project - please point your coding agent at the repo and have it diagnose this before we triage. Your agent can load skills like `debug-openshell-cluster`, `debug-inference`, `openshell-cli`, and `generate-sandbox-policy`.',
-                '',
-                'See [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#before-you-open-an-issue) for the full workflow.',
-              ].join('\n')
             });
