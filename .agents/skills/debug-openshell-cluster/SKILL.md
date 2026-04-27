@@ -184,7 +184,7 @@ Component images (server, sandbox) can reach kubelet via two paths:
 
 **Local/external pull mode** (default local via `mise run cluster`): Local images are tagged to the configured local registry base (default `127.0.0.1:5000/openshell/*`), pushed to that registry, and pulled by k3s via `registries.yaml` mirror endpoint (typically `host.docker.internal:5000`). The `cluster` task pushes prebuilt local tags (`openshell/*:dev`, falling back to `localhost:5000/openshell/*:dev` or `127.0.0.1:5000/openshell/*:dev`).
 
-Gateway image builds now stage a partial Rust workspace from `deploy/docker/Dockerfile.images`. If cargo fails with a missing manifest under `/build/crates/...`, or an imported symbol exists locally but is missing in the image build, verify that every current gateway dependency crate (including `openshell-driver-kubernetes` and `openshell-ocsf`) is copied into the staged workspace there.
+Gateway image builds now stage a partial Rust workspace from `deploy/docker/Dockerfile.images`. If cargo fails with a missing manifest under `/build/crates/...`, or an imported symbol exists locally but is missing in the image build, verify that every current gateway dependency crate (including `openshell-driver-docker`, `openshell-driver-kubernetes`, and `openshell-ocsf`) is copied into the staged workspace there.
 
 ```bash
 # Verify image refs currently used by openshell deployment

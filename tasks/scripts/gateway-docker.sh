@@ -3,8 +3,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Start a standalone openshell-gateway backed by the bundled Docker compute
-# driver for local manual testing.
+# Start a standalone openshell-gateway backed by the Docker compute driver for
+# local manual testing.
 #
 # Defaults:
 # - Plaintext HTTP on 127.0.0.1:18080 (falls back to a free port if occupied)
@@ -29,7 +29,6 @@ SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/san
 SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
 SSH_GATEWAY_HOST="${OPENSHELL_SSH_GATEWAY_HOST:-127.0.0.1}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
-SECRET_FILE="${STATE_DIR}/ssh-handshake-secret"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 
 normalize_arch() {
@@ -175,15 +174,6 @@ fi
 chmod +x "${SUPERVISOR_BIN}"
 
 mkdir -p "${STATE_DIR}"
-if [[ ! -f "${SECRET_FILE}" ]]; then
-  if ! command -v openssl >/dev/null 2>&1; then
-    echo "ERROR: openssl is required to generate the SSH handshake secret" >&2
-    exit 2
-  fi
-  openssl rand -hex 32 > "${SECRET_FILE}"
-  chmod 600 "${SECRET_FILE}" 2>/dev/null || true
-fi
-SSH_HANDSHAKE_SECRET="$(tr -d '\n' < "${SECRET_FILE}")"
 
 if [[ "${PORT_AUTO_SELECTED}" == "1" ]]; then
   echo "Default port ${DEFAULT_PORT} is in use; using ${PORT} instead."
@@ -213,7 +203,6 @@ ARGS=(
   --sandbox-image-pull-policy "${SANDBOX_IMAGE_PULL_POLICY}"
   --grpc-endpoint "${GRPC_ENDPOINT}"
   --docker-supervisor-bin "${SUPERVISOR_BIN}"
-  --ssh-handshake-secret "${SSH_HANDSHAKE_SECRET}"
   --ssh-gateway-host "${SSH_GATEWAY_HOST}"
   --ssh-gateway-port "${SSH_GATEWAY_PORT}"
 )

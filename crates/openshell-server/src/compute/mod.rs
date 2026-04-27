@@ -3,10 +3,9 @@
 
 //! Gateway-owned compute orchestration over a pluggable compute backend.
 
-pub mod docker;
 pub mod vm;
 
-pub use docker::DockerComputeConfig;
+pub use openshell_driver_docker::DockerComputeConfig;
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::{SANDBOX_SETTINGS_OBJECT_TYPE, sandbox_settings_id};
@@ -28,6 +27,7 @@ use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
     SandboxTemplate, SshSession,
 };
+use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
     ComputeDriverService, KubernetesComputeConfig, KubernetesComputeDriver,
 };
@@ -54,7 +54,7 @@ trait ShutdownCleanup: Send + Sync {
 }
 
 #[tonic::async_trait]
-impl ShutdownCleanup for docker::DockerComputeDriver {
+impl ShutdownCleanup for DockerComputeDriver {
     async fn cleanup_on_shutdown(&self) -> Result<(), String> {
         let stopped = self
             .stop_managed_containers_on_shutdown()
@@ -261,7 +261,7 @@ impl ComputeRuntime {
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
         let driver = Arc::new(
-            docker::DockerComputeDriver::new(&config, &docker_config, supervisor_sessions.clone())
+            DockerComputeDriver::new(&config, &docker_config, supervisor_sessions.clone())
                 .await
                 .map_err(|err| ComputeError::Message(err.to_string()))?,
         );

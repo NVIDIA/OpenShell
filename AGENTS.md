@@ -41,6 +41,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
 | `crates/openshell-vm/` | MicroVM runtime | Experimental, work-in-progress libkrun-based VM execution |
 | `crates/openshell-driver-kubernetes/` | Kubernetes compute driver | In-process `ComputeDriver` backend for K8s sandbox pods |
+| `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
 | `python/openshell/` | Python SDK | Python bindings and CLI packaging |
 | `proto/` | Protobuf definitions | gRPC service contracts |

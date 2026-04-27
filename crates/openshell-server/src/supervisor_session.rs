@@ -61,7 +61,7 @@ struct LiveSession {
 /// Holds a oneshot sender that will deliver the upgraded relay stream.
 type RelayStreamSender = oneshot::Sender<tokio::io::DuplexStream>;
 
-impl crate::compute::docker::SupervisorReadiness for SupervisorSessionRegistry {
+impl openshell_driver_docker::SupervisorReadiness for SupervisorSessionRegistry {
     fn is_supervisor_connected(&self, sandbox_id: &str) -> bool {
         Self::is_connected(self, sandbox_id)
     }

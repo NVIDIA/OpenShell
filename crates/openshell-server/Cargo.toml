@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 openshell-core = { path = "../openshell-core" }
+openshell-driver-docker = { path = "../openshell-driver-docker" }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
 openshell-driver-podman = { path = "../openshell-driver-podman" }
 openshell-ocsf = { path = "../openshell-ocsf" }
@@ -71,8 +72,6 @@ tokio-stream = { workspace = true }
 sqlx = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
-url = { workspace = true }
-bollard = { version = "0.20" }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
@@ -80,7 +79,6 @@ russh = "0.57"
 rand = "0.9"
 petname = "2"
 ipnet = "2"
-tar = "0.4"
 tempfile = "3"
 
 [features]

@@ -76,7 +76,7 @@ graph TD
 | Persistence | `crates/openshell-server/src/persistence/mod.rs` | `Store` enum (SQLite/Postgres), generic object CRUD, protobuf codec |
 | Compute runtime | `crates/openshell-server/src/compute/mod.rs` | `ComputeRuntime`, gateway-owned sandbox lifecycle orchestration over a compute backend |
 | Compute driver: Kubernetes | `crates/openshell-driver-kubernetes/src/driver.rs` | Kubernetes CRD create/delete/watch, pod template translation |
-| Compute driver: Docker | `crates/openshell-server/src/compute/docker.rs` | Gateway-bundled local Docker container create/delete/watch |
+| Compute driver: Docker | `crates/openshell-driver-docker/src/lib.rs` | Local Docker container create/stop/delete/watch |
 | Compute driver: VM | `crates/openshell-driver-vm/src/driver.rs` | Per-sandbox microVM create/delete/watch, supervisor-only guest boot |
 | Sandbox index | `crates/openshell-server/src/sandbox_index.rs` | `SandboxIndex` -- in-memory name/pod-to-id correlation |
 | Watch bus | `crates/openshell-server/src/sandbox_watch.rs` | `SandboxWatchBus` -- in-memory broadcast for persisted sandbox updates |
@@ -104,7 +104,7 @@ The gateway boots in `cli::run_cli` (`crates/openshell-server/src/cli.rs`) and p
    1. Connect to the persistence store (`Store::connect`), which auto-detects SQLite vs Postgres from the URL prefix and runs migrations.
    2. Create `ComputeRuntime` with a `ComputeDriver` implementation selected by `OPENSHELL_DRIVERS`:
       - `kubernetes` wraps `KubernetesComputeDriver` in `ComputeDriverService`, so the gateway uses the `openshell.compute.v1.ComputeDriver` RPC surface even without transport.
-      - `docker` constructs the bundled Docker driver in-process and manages local containers labeled with the configured sandbox namespace.
+      - `docker` constructs `openshell-driver-docker` in-process and manages local containers labeled with the configured sandbox namespace.
       - `vm` spawns the standalone `openshell-driver-vm` binary as a local compute-driver process, resolves it from `--driver-dir`, conventional libexec install paths, or a sibling of the gateway binary, connects to it over a Unix domain socket, and keeps the libkrun/rootfs runtime out of the gateway binary.
    3. Build `ServerState` (shared via `Arc<ServerState>` across all handlers), including a fresh `SupervisorSessionRegistry`.
    4. **Spawn background tasks**:
@@ -118,7 +118,7 @@ The gateway boots in `cli::run_cli` (`crates/openshell-server/src/cli.rs`) and p
 
 ## Configuration
 
-All configuration is via CLI flags with environment variable fallbacks. The `--db-url` and `--ssh-handshake-secret` flags are required.
+All configuration is via CLI flags with environment variable fallbacks. The `--db-url` flag is required. The `--ssh-handshake-secret` flag is required for non-Docker drivers; Docker sandboxes do not receive a handshake secret.
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
@@ -604,12 +604,14 @@ The gateway reaches the sandbox exclusively through the supervisor-initiated `Co
 
 ### Docker Driver
 
-The bundled Docker driver (`crates/openshell-server/src/compute/docker.rs`) is an in-process compute backend for local standalone gateways. It creates one Docker container per sandbox, labels each container with `openshell.ai/managed-by=openshell`, `openshell.ai/sandbox-id`, `openshell.ai/sandbox-name`, and `openshell.ai/sandbox-namespace`, and bind-mounts a Linux `openshell-sandbox` supervisor binary into the container.
+The Docker driver (`crates/openshell-driver-docker/src/lib.rs`) is an in-process compute backend for local standalone gateways. It creates one Docker container per sandbox, labels each container with `openshell.ai/managed-by=openshell`, `openshell.ai/sandbox-id`, `openshell.ai/sandbox-name`, and `openshell.ai/sandbox-namespace`, and bind-mounts a Linux `openshell-sandbox` supervisor binary into the container.
 
 - **Create**: Pulls or validates the sandbox image according to `sandbox_image_pull_policy`, creates a labeled container, mounts the supervisor binary and optional TLS material, and starts the container with the supervisor as entrypoint.
 - **List/Get/Watch**: Reads labeled containers in the configured sandbox namespace and derives driver-native sandbox status from Docker state plus supervisor relay readiness.
+- **Stop**: Stops the matching labeled container without deleting it.
 - **Delete**: Force-removes the matching labeled container.
 - **Gateway shutdown**: On SIGINT or SIGTERM, `run_server()` leaves the accept loop and calls the Docker shutdown cleanup hook. The hook stops all running, restarting, or paused OpenShell-managed containers in the configured sandbox namespace so local sandboxes do not keep running after the gateway exits.
+- **Handshake secret**: The Docker driver does not inject `OPENSHELL_SSH_HANDSHAKE_SECRET` or `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS` into containers. Supervisor relay auth relies on the gateway connection rather than a Docker-visible container env secret.
 
 ### VM Driver
 

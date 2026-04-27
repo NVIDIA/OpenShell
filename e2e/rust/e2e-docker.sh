@@ -11,12 +11,11 @@
 # containers. This script:
 #
 #   1. Builds openshell-gateway, openshell-cli, and a Linux ELF
-#      openshell-sandbox binary (cross-compiled so it can run inside
-#      Docker containers on macOS hosts).
-#   2. Ensures the supervisor image (openshell/supervisor:dev) exists
-#      locally — the sandbox containers launch from it, with the
-#      cross-compiled openshell-sandbox binary bind-mounted over the
-#      image-provided copy.
+#      openshell-sandbox binary (via the Docker image build pipeline on
+#      non-Linux hosts so macOS linker fd limits are avoided).
+#   2. Ensures the sandbox base image exists locally; containers launch
+#      from it with the freshly built openshell-sandbox binary bind-mounted
+#      over the image-provided copy.
 #   3. Generates an ephemeral mTLS PKI (CA, server cert, client cert).
 #   4. Starts openshell-gateway with --drivers=docker, binding to a
 #      random free host port.
@@ -89,17 +88,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-run_cargo_cross() {
-  # cargo-zigbuild on macOS can exhaust file descriptors inside sccache while
-  # hashing the cross-target dependency graph. Keep sccache for the regular
-  # host builds, but disable it for the Linux supervisor cross-build.
-  if [ -n "${RUSTC_WRAPPER:-}" ] && [ "$(basename "${RUSTC_WRAPPER}")" = "sccache" ]; then
-    env -u RUSTC_WRAPPER cargo "$@"
-  else
-    cargo "$@"
-  fi
-}
-
 # ── Preflight ────────────────────────────────────────────────────────
 if ! command -v docker >/dev/null 2>&1; then
   echo "ERROR: docker CLI is required to run e2e:docker" >&2
@@ -118,14 +106,27 @@ fi
 # openshell-sandbox binary.
 DAEMON_ARCH=$(docker info --format '{{.Architecture}}' 2>/dev/null || true)
 case "${DAEMON_ARCH}" in
-  aarch64|arm64) SUPERVISOR_TARGET="aarch64-unknown-linux-gnu" ;;
-  x86_64|amd64)  SUPERVISOR_TARGET="x86_64-unknown-linux-gnu" ;;
+  aarch64|arm64)
+    DAEMON_ARCH="arm64"
+    SUPERVISOR_TARGET="aarch64-unknown-linux-gnu"
+    ;;
+  x86_64|amd64)
+    DAEMON_ARCH="amd64"
+    SUPERVISOR_TARGET="x86_64-unknown-linux-gnu"
+    ;;
   *)
     echo "ERROR: unsupported Docker daemon architecture '${DAEMON_ARCH}'" >&2
     exit 2
     ;;
 esac
-SUPERVISOR_BIN="${ROOT}/target/${SUPERVISOR_TARGET}/release/openshell-sandbox"
+HOST_OS="$(uname -s)"
+case "$(uname -m)" in
+  aarch64|arm64) HOST_ARCH="arm64" ;;
+  x86_64|amd64)  HOST_ARCH="amd64" ;;
+  *)             HOST_ARCH="$(uname -m)" ;;
+esac
+SUPERVISOR_OUT_DIR="${WORKDIR}/supervisor/${DAEMON_ARCH}"
+SUPERVISOR_BIN="${SUPERVISOR_OUT_DIR}/openshell-sandbox"
 
 # ── Build binaries ───────────────────────────────────────────────────
 # Cap build parallelism to avoid OOM when run alongside a docker build or
@@ -141,18 +142,25 @@ cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
   -p openshell-cli --features openshell-core/dev-settings
 
-echo "Cross-compiling openshell-sandbox for ${SUPERVISOR_TARGET}..."
-if ! command -v cargo-zigbuild >/dev/null 2>&1; then
-  run_cargo_cross install --locked cargo-zigbuild
+echo "Building openshell-sandbox for ${SUPERVISOR_TARGET}..."
+mkdir -p "${SUPERVISOR_OUT_DIR}"
+if [ "${HOST_OS}" = "Linux" ] && [ "${HOST_ARCH}" = "${DAEMON_ARCH}" ]; then
+  rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
+  cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
+    --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
+  cp "${ROOT}/target/${SUPERVISOR_TARGET}/release/openshell-sandbox" "${SUPERVISOR_BIN}"
+else
+  CONTAINER_ENGINE=docker \
+  DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
+  DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_OUT_DIR}" \
+    bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output
 fi
-rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
-run_cargo_cross zigbuild ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
 
 if [ ! -f "${SUPERVISOR_BIN}" ]; then
   echo "ERROR: expected supervisor binary at ${SUPERVISOR_BIN}" >&2
   exit 1
 fi
+chmod +x "${SUPERVISOR_BIN}"
 
 # ── Ensure a sandbox base image is available locally ────────────────
 # The bundled openshell-sandbox binary enforces a 'sandbox' user/group
@@ -217,8 +225,6 @@ done
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
 
-SSH_HANDSHAKE_SECRET=$(openssl rand -hex 32)
-
 # Containers started by the docker driver reach the host gateway via
 # host.openshell.internal (mapped to host-gateway by the driver). The
 # gateway itself binds to 0.0.0.0:${HOST_PORT}.
@@ -241,7 +247,6 @@ echo "Starting openshell-gateway on port ${HOST_PORT} (health :${HEALTH_PORT})..
   --docker-tls-key "${PKI_DIR}/client.key" \
   --sandbox-image "${SANDBOX_IMAGE}" \
   --sandbox-image-pull-policy IfNotPresent \
-  --ssh-handshake-secret "${SSH_HANDSHAKE_SECRET}" \
   --ssh-gateway-host 127.0.0.1 \
   --ssh-gateway-port "${HOST_PORT}" \
   >"${GATEWAY_LOG}" 2>&1 &

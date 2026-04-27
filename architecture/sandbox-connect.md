@@ -623,7 +623,7 @@ The sandbox SSH daemon's exit thread waits for the reader thread to finish forwa
 
 ### Sandbox environment variables
 
-These are injected into compute-backed sandboxes by the **Kubernetes** driver (`crates/openshell-driver-kubernetes/src/driver.rs`) and the **Podman** driver (`crates/openshell-driver-podman/src/container.rs`). Together they are required for **persistent `ConnectSupervisor` registration and relay** (see [Podman and relay environment](#podman-and-relay-environment) for the Podman-specific fix):
+These are injected into compute-backed sandboxes by the **Kubernetes** driver (`crates/openshell-driver-kubernetes/src/driver.rs`), the **Podman** driver (`crates/openshell-driver-podman/src/container.rs`), and the **Docker** driver (`crates/openshell-driver-docker/src/lib.rs`). Together they are required for **persistent `ConnectSupervisor` registration and relay** (see [Podman and relay environment](#podman-and-relay-environment) for the Podman-specific fix):
 
 | Variable | Description |
 |---|---|

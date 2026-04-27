@@ -90,8 +90,8 @@ pub struct ServerState {
 
     /// Registry of active supervisor sessions and pending relay channels.
     ///
-    /// Stored as `Arc` so compute drivers (e.g. the bundled Docker
-    /// driver) can be constructed before `ServerState` and still
+    /// Stored as `Arc` so compute drivers (e.g. the Docker driver)
+    /// can be constructed before `ServerState` and still
     /// query session state to surface supervisor readiness.
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 }
@@ -147,7 +147,8 @@ pub async fn run_server(
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
-    if config.ssh_handshake_secret.is_empty() {
+    let driver = configured_compute_driver(&config)?;
+    if config.ssh_handshake_secret.is_empty() && driver != ComputeDriverKind::Docker {
         return Err(Error::config(
             "ssh_handshake_secret is required. Set --ssh-handshake-secret or OPENSHELL_SSH_HANDSHAKE_SECRET",
         ));
