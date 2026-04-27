@@ -230,7 +230,8 @@ message SandboxTemplate {
   google.protobuf.Struct volume_claim_templates = 9;
   // Enable Kubernetes user namespace isolation (hostUsers: false).
   // When true, container UID 0 maps to a non-root host UID and capabilities
-  // become namespaced. Requires Kubernetes 1.36+ with a supporting runtime.
+  // become namespaced. Requires Kubernetes 1.33+ with user namespace support
+  // available (beta through 1.35, GA in 1.36+) and a supporting runtime.
   // When unset, the cluster-wide default is used.
   optional bool user_namespaces = 10;
 }

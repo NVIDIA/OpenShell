@@ -14,7 +14,7 @@ The sandbox supervisor already runs as UID 0 inside the container and performs a
 
 **Capability additions when enabled:** Add `SETUID`, `SETGID`, `DAC_READ_SEARCH` to the pod security context (matching the Podman driver at `crates/openshell-driver-podman/src/container.rs:393-400`) — needed because the bounding set is reset inside a user namespace.
 
-**No changes to:** seccomp filters (CLONE_NEWUSER block stays), Landlock, supervisor privilege-drop logic, init containers, volume mounts (ID-mapped mounts handle ownership transparently).
+**No changes to:** seccomp filters (CLONE_NEWUSER block stays), Landlock, supervisor privilege-drop logic, init containers, and workspace volume ownership semantics (ID-mapped mounts handle ownership transparently). The only mount-related change is the supervisor `hostPath` type in Step 7.
 
 ## Changes
 
@@ -122,7 +122,7 @@ The e2e test (`e2e/rust/tests/user_namespaces.rs`) accounts for this by verifyin
 
 ## Deploying to a real cluster with Helm
 
-User namespaces can be tested end-to-end on any Kubernetes 1.33+ cluster (beta, enabled by default) or 1.36+ (GA) with a supporting container runtime. Deploy the gateway with Helm and set `server.enableUserNamespaces=true`:
+User namespaces can be tested end-to-end on Kubernetes 1.33+ clusters where the feature is available (beta through 1.35, GA in 1.36+) with a supporting container runtime. Deploy the gateway with Helm and set `server.enableUserNamespaces=true`:
 
 ```shell
 helm install openshell deploy/helm/openshell -n openshell \
@@ -144,4 +144,4 @@ This has been validated end-to-end on OCP 4.22 (K8s 1.35.3, CRI-O 1.35, RHEL Cor
    - `platform_config_bool` helper
    - `Directory` type on supervisor volume
 3. `mise run e2e` -- the `user_namespaces` test verifies pod spec correctness against the local dev cluster
-4. On a Kubernetes 1.33+ cluster (OCP, GKE, EKS, bare-metal): deploy with Helm, create a sandbox, and verify `cat /proc/self/uid_map` shows a non-identity mapping (UID 0 maps to a high host UID)
+4. On a Kubernetes 1.33+ cluster with user namespace support available (OCP, GKE, EKS, bare-metal): deploy with Helm, create a sandbox, and verify `cat /proc/self/uid_map` shows a non-identity mapping (UID 0 maps to a high host UID)

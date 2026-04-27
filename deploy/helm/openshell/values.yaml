@@ -97,7 +97,8 @@ server:
   # Auto-detected by the cluster entrypoint script.
   hostGatewayIP: ""
   # Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox
-  # pods. Requires Kubernetes 1.36+ with a supporting container runtime and
+  # pods. Requires Kubernetes 1.33+ with user namespace support available
+  # (beta through 1.35, GA in 1.36+), plus a supporting container runtime and
   # Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host
   # UID and capabilities become namespaced.
   enableUserNamespaces: false

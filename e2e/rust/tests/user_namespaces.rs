@@ -16,9 +16,10 @@
 //! regardless of runtime success.
 
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openshell_e2e::harness::binary::openshell_cmd;
+use tokio::process::Child;
 
 async fn kubectl(args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new("docker")
@@ -66,6 +67,35 @@ async fn delete_sandbox(name: &str) {
     let _ = kubectl(&["delete", "sandbox", name, "-n", "openshell"]).await;
 }
 
+fn unique_sandbox_name() -> String {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("userns-e2e-{suffix}")
+}
+
+async fn stop_child(child: &mut Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+async fn wait_for_sandbox(name: &str, timeout_secs: u64) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(n) = kubectl(&[
+            "get", "sandbox", name, "-n", "openshell",
+            "-o", "jsonpath={.metadata.name}",
+        ]).await {
+            if !n.trim().is_empty() {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    Err(format!("sandbox {name} did not appear within {timeout_secs}s"))
+}
+
 /// Find a sandbox pod by its sandbox CRD name. The CRD controller creates a
 /// pod with the same name as the Sandbox resource.
 async fn wait_for_sandbox_pod(name: &str, timeout_secs: u64) -> Result<(), String> {
@@ -91,68 +121,49 @@ async fn sandbox_pod_spec_has_user_namespace_fields() {
         .await
         .expect("failed to enable user namespaces on gateway");
 
+    let sandbox_name = unique_sandbox_name();
+
     // Start sandbox creation in the background. The pod may never become
     // ready in DinD environments, so we spawn the CLI and inspect the pod
     // spec independently.
     let mut cmd = openshell_cmd();
     cmd.arg("sandbox").arg("create")
+        .arg("--name").arg(&sandbox_name)
         .arg("--").arg("sleep").arg("infinity");
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let child = cmd.spawn().expect("failed to spawn openshell create");
+    let mut child = cmd.spawn().expect("failed to spawn openshell create");
 
-    // Wait for the sandbox CRD to be created by polling.
-    let mut sandbox_name = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while tokio::time::Instant::now() < deadline {
-        if let Ok(names) = kubectl(&[
-            "get", "sandbox", "-n", "openshell",
-            "-o", "jsonpath={.items[*].metadata.name}",
-        ]).await {
-            let latest = names.split_whitespace()
-                .filter(|n| *n != "openshell-0")
-                .last()
-                .map(|s| s.to_string());
-            if latest.is_some() {
-                sandbox_name = latest;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+    if let Err(e) = wait_for_sandbox(&sandbox_name, 60).await {
+        stop_child(&mut child).await;
+        delete_sandbox(&sandbox_name).await;
+        set_user_namespaces(false).await.ok();
+        panic!("{e}");
     }
 
-    let name = match sandbox_name {
-        Some(n) => n,
-        None => {
-            drop(child);
-            set_user_namespaces(false).await.ok();
-            panic!("no sandbox CRD found within 60s");
-        }
-    };
-
     // Wait for the pod to be created (the CRD controller creates it).
-    if let Err(e) = wait_for_sandbox_pod(&name, 60).await {
-        drop(child);
-        delete_sandbox(&name).await;
+    if let Err(e) = wait_for_sandbox_pod(&sandbox_name, 60).await {
+        stop_child(&mut child).await;
+        delete_sandbox(&sandbox_name).await;
         set_user_namespaces(false).await.ok();
         panic!("{e}");
     }
 
     // Inspect the pod spec for hostUsers.
     let host_users = kubectl(&[
-        "get", "pod", &name, "-n", "openshell",
+        "get", "pod", &sandbox_name, "-n", "openshell",
         "-o", "jsonpath={.spec.hostUsers}",
     ]).await;
 
     // Inspect capabilities on the agent container.
     let caps = kubectl(&[
-        "get", "pod", &name, "-n", "openshell",
+        "get", "pod", &sandbox_name, "-n", "openshell",
         "-o", "jsonpath={.spec.containers[?(@.name=='agent')].securityContext.capabilities.add}",
     ]).await;
 
     // Clean up.
-    drop(child);
-    delete_sandbox(&name).await;
+    stop_child(&mut child).await;
+    delete_sandbox(&sandbox_name).await;
     set_user_namespaces(false).await.ok();
 
     // Assert hostUsers is false.

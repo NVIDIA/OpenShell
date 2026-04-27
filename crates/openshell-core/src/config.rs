@@ -198,8 +198,9 @@ pub struct Config {
 
     /// Enable Kubernetes user namespace isolation (`hostUsers: false`) for
     /// sandbox pods.  When enabled, container UID 0 maps to an unprivileged
-    /// host UID and capabilities become namespaced.  Requires Kubernetes 1.36+
-    /// with a supporting container runtime and Linux 5.12+.
+    /// host UID and capabilities become namespaced. Requires Kubernetes 1.33+
+    /// with user namespace support available (beta through 1.35, GA in 1.36+),
+    /// plus a supporting container runtime and Linux 5.12+.
     #[serde(default)]
     pub enable_user_namespaces: bool,
 }
