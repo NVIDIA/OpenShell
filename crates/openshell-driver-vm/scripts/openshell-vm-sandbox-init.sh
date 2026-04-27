@@ -96,15 +96,20 @@ tcp_probe() {
 }
 
 ensure_host_gateway_aliases() {
+    # Pin every host-gateway alias to the gvproxy gateway IP via /etc/hosts so the
+    # supervisor can reach the OpenShell server even when gvproxy's built-in DNS
+    # is not in resolv.conf (e.g. when DHCP fails and we fall back to 8.8.8.8).
     local hosts_tmp="/tmp/openshell-hosts.$$"
+    local aliases="host.openshell.internal host.containers.internal host.docker.internal gateway.containers.internal"
+    local filter='(^|[[:space:]])(host\.openshell\.internal|host\.containers\.internal|host\.docker\.internal|gateway\.containers\.internal)([[:space:]]|$)'
 
     if [ -f /etc/hosts ]; then
-        grep -vE '(^|[[:space:]])host\.openshell\.internal([[:space:]]|$)' /etc/hosts > "$hosts_tmp" || true
+        grep -vE "$filter" /etc/hosts > "$hosts_tmp" || true
     else
         : > "$hosts_tmp"
     fi
 
-    printf '%s host.openshell.internal\n' "$GATEWAY_IP" >> "$hosts_tmp"
+    printf '%s %s\n' "$GATEWAY_IP" "$aliases" >> "$hosts_tmp"
     cat "$hosts_tmp" > /etc/hosts
     rm -f "$hosts_tmp"
 }
