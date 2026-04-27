@@ -9,6 +9,7 @@ The sandbox supervisor already runs as UID 0 inside the container and performs a
 ## Design
 
 **Two-layer configuration:**
+
 - Cluster-wide default: `enable_user_namespaces` on `Config` / `KubernetesComputeConfig` (env var `OPENSHELL_ENABLE_USER_NAMESPACES`, default `false`)
 - Per-sandbox override: `optional bool user_namespaces` on `SandboxTemplate` in the proto, translated to `platform_config.host_users` for the K8s driver
 
@@ -19,26 +20,32 @@ The sandbox supervisor already runs as UID 0 inside the container and performs a
 ## Changes
 
 ### 1. Proto: add `user_namespaces` field to `SandboxTemplate`
+
 **File:** `proto/openshell.proto`
 
 Add `optional bool user_namespaces = 10;` to the `SandboxTemplate` message. Using `optional` distinguishes "not set" (use cluster default) from explicit true/false.
 
 ### 2. Core config: add `enable_user_namespaces` to server config
+
 **File:** `crates/openshell-core/src/config.rs`
 
 Add field to `Config`:
+
 ```rust
 #[serde(default)]
 pub enable_user_namespaces: bool,
 ```
+
 Wire the env var `OPENSHELL_ENABLE_USER_NAMESPACES` (clap handles this on the standalone driver binary; for the in-process server path, `Config` serde does it).
 
 ### 3. K8s driver config: add field
+
 **File:** `crates/openshell-driver-kubernetes/src/config.rs`
 
 Add `pub enable_user_namespaces: bool` to `KubernetesComputeConfig`.
 
 ### 4. Server: wire config and translate proto field
+
 **File:** `crates/openshell-server/src/lib.rs`
 
 Pass `config.enable_user_namespaces` into the `KubernetesComputeConfig` construction.
@@ -46,6 +53,7 @@ Pass `config.enable_user_namespaces` into the `KubernetesComputeConfig` construc
 **File:** `crates/openshell-server/src/compute/mod.rs` (`build_platform_config`)
 
 Translate the new `SandboxTemplate.user_namespaces` field into `platform_config`:
+
 ```rust
 if let Some(user_ns) = template.user_namespaces {
     fields.insert("host_users".into(), Value { kind: Some(Kind::BoolValue(!user_ns)) });
@@ -55,11 +63,13 @@ if let Some(user_ns) = template.user_namespaces {
 The public API uses `user_namespaces: true` (positive sense) while the K8s driver expects `host_users: false` (K8s convention). The driver inverts this back via `!host_users` to resolve the final pod-level `hostUsers` field.
 
 ### 5. K8s driver: add `platform_config_bool` helper
+
 **File:** `crates/openshell-driver-kubernetes/src/driver.rs`
 
 New helper following the existing `platform_config_string` / `platform_config_struct` pattern.
 
 ### 6. K8s driver: apply `hostUsers: false` and extended capabilities
+
 **File:** `crates/openshell-driver-kubernetes/src/driver.rs`
 
 - Pass `enable_user_namespaces` through `sandbox_to_k8s_spec` -> `sandbox_template_to_k8s`
@@ -68,19 +78,23 @@ New helper following the existing `platform_config_string` / `platform_config_st
 - Extend the capability list with `SETUID`, `SETGID`, `DAC_READ_SEARCH` when enabled
 
 ### 7. K8s driver: change hostPath type to `Directory`
+
 **File:** `crates/openshell-driver-kubernetes/src/driver.rs` (`supervisor_volume`)
 
 Change `"type": "DirectoryOrCreate"` to `"type": "Directory"`. The supervisor path is pre-provisioned during cluster setup; `DirectoryOrCreate` could fail under user namespaces when the mapped UID can't create host directories.
 
 ### 8. Standalone driver binary: wire CLI arg
+
 **File:** `crates/openshell-driver-kubernetes/src/main.rs`
 
 Add `#[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]` and pass to config construction.
 
 ### 9. Helm chart
+
 **File:** `deploy/helm/openshell/values.yaml` — add `enableUserNamespaces: false` under `server:`
 
 **File:** `deploy/helm/openshell/templates/statefulset.yaml` — add conditional env var block:
+
 ```yaml
 {{- if .Values.server.enableUserNamespaces }}
 - name: OPENSHELL_ENABLE_USER_NAMESPACES
@@ -110,10 +124,12 @@ failed to set MOUNT_ATTR_IDMAP on .../etc-hosts: invalid argument
 This is a kernel/filesystem constraint, not an OpenShell bug. The pod spec is generated correctly (`hostUsers: false`, extended capabilities), but the container runtime cannot fulfil the mount request.
 
 **Where user namespaces work:**
+
 - Bare-metal or VM-based Kubernetes clusters where the node's root filesystem is ext4/xfs/btrfs (all support ID-mapped mounts since Linux 5.12-5.19).
 - Managed Kubernetes services (EKS, GKE, AKS) on nodes running a supported kernel.
 
 **Where they do not work:**
+
 - k3s-in-Docker / kind / Docker-in-Docker dev clusters where the inner container uses overlayfs on top of the outer container's overlayfs. The nested overlayfs does not support `MOUNT_ATTR_IDMAP`.
 - Nodes running kernels older than 5.12.
 - Nodes using filesystems that have not added ID-mapped mount support (e.g., NFS on older kernels).

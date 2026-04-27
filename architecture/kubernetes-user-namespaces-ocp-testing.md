@@ -315,6 +315,7 @@ uid=998(sandbox) gid=998(sandbox) groups=998(sandbox)
 ```
 
 This confirms:
+
 - UID 0 inside the container maps to a high host UID (non-identity mapping)
 - The sandbox user (UID 998) is active
 - The SSH tunnel through the gateway works end-to-end
