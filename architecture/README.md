@@ -302,3 +302,4 @@ This opens an interactive SSH session into the sandbox, with all provider creden
 | [System Architecture](system-architecture.md) | Top-level system architecture diagram with all deployable components and communication flows. |
 | [Gateway Settings Channel](gateway-settings.md) | Runtime settings channel: two-tier key-value configuration, global policy override, settings registry, CLI/TUI commands. |
 | [TUI](tui.md) | Terminal user interface for sandbox interaction. |
+| [E2E CI Architecture](ci-e2e.md) | Workflows, triggers, and the label-driven E2E gate for self-hosted runners. |
