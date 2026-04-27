@@ -28,6 +28,13 @@ DRIVER_DIR="${OPENSHELL_DRIVER_DIR:-${DRIVER_DIR_DEFAULT}}"
 
 export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${COMPRESSED_DIR}}"
 
+for arg in "$@"; do
+    if [ "${arg}" = "--gpu" ]; then
+        export OPENSHELL_VM_GPU=true
+        break
+    fi
+done
+
 mkdir -p "${STATE_DIR}"
 
 normalize_bool() {
@@ -73,13 +80,19 @@ check_supervisor_cross_toolchain() {
     fi
 }
 
-if [ ! -f "${COMPRESSED_DIR}/rootfs.tar.zst" ]; then
+if [ ! -s "${COMPRESSED_DIR}/rootfs.tar.zst" ]; then
     check_supervisor_cross_toolchain
     echo "==> Building base VM rootfs tarball"
     mise run vm:rootfs -- --base
 fi
 
-if [ ! -f "${COMPRESSED_DIR}/rootfs.tar.zst" ] || ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q .; then
+if [ "${OPENSHELL_VM_GPU:-}" = "true" ] && [ ! -s "${COMPRESSED_DIR}/rootfs-gpu.tar.zst" ]; then
+    check_supervisor_cross_toolchain
+    echo "==> Building GPU VM rootfs tarball"
+    mise run vm:rootfs -- --gpu
+fi
+
+if [ ! -s "${COMPRESSED_DIR}/rootfs.tar.zst" ] || ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q .; then
     echo "==> Preparing embedded VM runtime"
     mise run vm:setup
 fi
@@ -106,12 +119,18 @@ export OPENSHELL_SSH_GATEWAY_PORT="${OPENSHELL_SSH_GATEWAY_PORT:-${SERVER_PORT}}
 export OPENSHELL_SSH_HANDSHAKE_SECRET="${OPENSHELL_SSH_HANDSHAKE_SECRET:-dev-vm-driver-secret}"
 export OPENSHELL_VM_DRIVER_STATE_DIR="${STATE_DIR}"
 
-echo "==> Gateway registration"
+echo "==> Registering gateway"
 echo "    Name: ${GATEWAY_NAME}"
 echo "    Endpoint: ${LOCAL_GATEWAY_ENDPOINT}"
-echo "    Register: ${CLI_BIN} gateway add --name ${GATEWAY_NAME} ${LOCAL_GATEWAY_ENDPOINT}"
-echo "    Select:   ${CLI_BIN} gateway select ${GATEWAY_NAME}"
-echo "    Driver:   ${OPENSHELL_DRIVER_DIR}/openshell-driver-vm"
+echo "    Driver: ${OPENSHELL_DRIVER_DIR}/openshell-driver-vm"
+
+if [ -n "${SUDO_USER:-}" ]; then
+    sudo -u "${SUDO_USER}" "${CLI_BIN}" gateway destroy --name "${GATEWAY_NAME}" 2>/dev/null || true
+    sudo -u "${SUDO_USER}" "${CLI_BIN}" gateway add --name "${GATEWAY_NAME}" "${LOCAL_GATEWAY_ENDPOINT}"
+else
+    "${CLI_BIN}" gateway destroy --name "${GATEWAY_NAME}" 2>/dev/null || true
+    "${CLI_BIN}" gateway add --name "${GATEWAY_NAME}" "${LOCAL_GATEWAY_ENDPOINT}"
+fi
 
 echo "==> Starting OpenShell server with VM compute driver"
 exec "${ROOT}/target/debug/openshell-gateway"

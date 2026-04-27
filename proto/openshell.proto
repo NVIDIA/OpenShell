@@ -204,6 +204,10 @@ message SandboxSpec {
   repeated string providers = 8;
   // Request NVIDIA GPU resources for this sandbox.
   bool gpu = 9;
+  // Optional PCI BDF address (e.g. "0000:2d:00.0") or device index
+  // (e.g. "0", "1"). When empty with gpu=true, the driver assigns the
+  // first available GPU.
+  string gpu_device = 10;
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.

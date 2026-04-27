@@ -150,6 +150,7 @@ impl KubernetesComputeDriver {
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             supports_gpu: self.has_gpu_capacity().await.unwrap_or(false),
+            gpu_count: 0,
         })
     }
 

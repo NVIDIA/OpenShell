@@ -36,8 +36,16 @@ mise run gateway:vm
 ```
 
 First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/gvproxy and `mise run vm:rootfs -- --base` builds the embedded rootfs. Subsequent runs are cached. To keep the Unix socket path under macOS `SUN_LEN`, `mise run gateway:vm` and `start.sh` default the state dir to `/tmp/openshell-vm-driver-dev-$USER-port-$PORT/` (SQLite DB + per-sandbox rootfs + `compute-driver.sock`) unless `OPENSHELL_VM_DRIVER_STATE_DIR` is set.
-The wrapper also prints the recommended gateway name (`vm-driver-port-$PORT` by default) plus the exact repo-local `scripts/bin/openshell gateway add` and `scripts/bin/openshell gateway select` commands to use from another terminal. This avoids accidentally hitting an older `openshell` binary elsewhere on your `PATH`.
+The wrapper auto-registers the gateway with the CLI (`gateway destroy` + `gateway add`) so no manual registration step is needed. When running under `sudo`, it uses `sudo -u $SUDO_USER` for the registration so the config is written under the invoking user's home directory. Re-runs are idempotent.
 It also exports `OPENSHELL_DRIVER_DIR=$PWD/target/debug` before starting the gateway so local dev runs use the freshly built `openshell-driver-vm` instead of an older installed copy from `~/.local/libexec/openshell` or `/usr/local/libexec`.
+
+For GPU passthrough (VFIO), pass `-- --gpu` and run with root privileges:
+
+```shell
+sudo -E env "PATH=$PATH" mise run gateway:vm -- --gpu
+```
+
+See [`architecture/vm-gpu-sandbox-guide.md`](../../architecture/vm-gpu-sandbox-guide.md) for full GPU prerequisites and usage.
 
 Override via environment:
 
@@ -129,13 +137,11 @@ See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the full fl
 
 ## Verifying the gateway
 
-In another terminal:
+The gateway is auto-registered by `start.sh`. In another terminal:
 
 ```shell
-export OPENSHELL_GATEWAY_URL=http://127.0.0.1:8080
-cargo run -p openshell-cli -- gateway register local --url $OPENSHELL_GATEWAY_URL --no-tls
-cargo run -p openshell-cli -- sandbox create --name demo
-cargo run -p openshell-cli -- sandbox connect demo
+scripts/bin/openshell sandbox create --name demo
+scripts/bin/openshell sandbox connect demo
 ```
 
 First sandbox takes 10–30 seconds to boot (rootfs extraction + libkrun + guest init). Subsequent creates reuse the prepared sandbox rootfs.

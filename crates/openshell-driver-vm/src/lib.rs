@@ -4,9 +4,10 @@
 pub mod driver;
 mod embedded_runtime;
 mod ffi;
+pub mod gpu;
 pub mod procguard;
 mod rootfs;
 mod runtime;
 
 pub use driver::{VmDriver, VmDriverConfig};
-pub use runtime::{VM_RUNTIME_DIR_ENV, VmLaunchConfig, configured_runtime_dir, run_vm};
+pub use runtime::{VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, configured_runtime_dir, run_vm};

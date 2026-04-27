@@ -1138,6 +1138,11 @@ enum SandboxCommands {
         #[arg(long)]
         gpu: bool,
 
+        /// Target a specific GPU by PCI address (e.g. "0000:2d:00.0") or index (e.g. "0", "1").
+        /// Only valid with --gpu. When omitted with --gpu, the first available GPU is assigned.
+        #[arg(long, requires = "gpu")]
+        gpu_device: Option<String>,
+
         /// SSH destination for remote bootstrap (e.g., user@hostname).
         /// Only used when no cluster exists yet; ignored if a cluster is
         /// already active.
@@ -2307,6 +2312,7 @@ async fn main() -> Result<()> {
                     no_keep,
                     editor,
                     gpu,
+                    gpu_device,
                     remote,
                     ssh_key,
                     providers,
@@ -2402,6 +2408,7 @@ async fn main() -> Result<()> {
                                 upload_spec.as_ref(),
                                 keep,
                                 gpu,
+                                gpu_device.as_deref(),
                                 editor,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
@@ -2425,6 +2432,7 @@ async fn main() -> Result<()> {
                                 upload_spec.as_ref(),
                                 keep,
                                 gpu,
+                                gpu_device.as_deref(),
                                 editor,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
