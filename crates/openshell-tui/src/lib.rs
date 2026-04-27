@@ -1573,6 +1573,8 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
                     config: Default::default(),
+                    profile_id: ptype.clone(),
+                    profile_policy_enabled: true,
                 }),
             };
 
@@ -1663,6 +1665,8 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                 r#type: ptype,
                 credentials,
                 config: Default::default(),
+                profile_id: String::new(),
+                profile_policy_enabled: false,
             }),
         };
 
