@@ -718,9 +718,12 @@ mod tests {
 
     fn sandbox_record(id: &str, name: &str) -> Sandbox {
         Sandbox {
-            id: id.to_string(),
-            name: name.to_string(),
-            namespace: "default".to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: id.to_string(),
+                name: name.to_string(),
+                created_at_ms: 1000000,
+                labels: std::collections::HashMap::new(),
+            }),
             ..Default::default()
         }
     }

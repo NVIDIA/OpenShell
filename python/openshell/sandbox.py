@@ -38,7 +38,6 @@ class TlsConfig:
 class SandboxRef:
     id: str
     name: str
-    namespace: str
     phase: int
 
 
@@ -193,9 +192,10 @@ class SandboxClient:
             openshell_pb2.CreateSandboxRequest(spec=request_spec),
             timeout=self._timeout,
         )
-        if response.sandbox.id == "":
+        sandbox_ref = _sandbox_ref(response.sandbox)
+        if sandbox_ref.id == "":
             raise SandboxError("CreateSandbox returned empty sandbox id")
-        return _sandbox_ref(response.sandbox)
+        return sandbox_ref
 
     def create_session(
         self,
@@ -577,9 +577,8 @@ def _serialize_python_callable(
 
 def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
     return SandboxRef(
-        id=sandbox.id,
-        name=sandbox.name,
-        namespace=sandbox.namespace,
+        id=sandbox.metadata.id if sandbox.metadata else "",
+        name=sandbox.metadata.name if sandbox.metadata else "",
         phase=sandbox.phase,
     )
 

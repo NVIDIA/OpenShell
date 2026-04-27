@@ -463,6 +463,8 @@ pub struct App {
     pub sandbox_created: Vec<String>,
     pub sandbox_images: Vec<String>,
     pub sandbox_notes: Vec<String>,
+    /// Formatted labels for each sandbox (e.g., "env=prod,team=platform" or empty string).
+    pub sandbox_labels: Vec<String>,
     pub sandbox_policy_versions: Vec<u32>,
     pub sandbox_selected: usize,
     pub sandbox_count: usize,
@@ -544,6 +546,37 @@ pub struct App {
     pub approve_all_confirm_chunks: Vec<openshell_core::proto::PolicyChunk>,
 }
 
+// ---------------------------------------------------------------------------
+// Label formatting utilities
+// ---------------------------------------------------------------------------
+
+/// Sanitize a string for safe terminal display by filtering control characters.
+///
+/// Removes all control characters except newlines to prevent ANSI escape
+/// sequences or other terminal manipulation.
+fn sanitize_for_display(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect()
+}
+
+/// Format object labels as a comma-separated key=value string.
+///
+/// Labels are sorted by key for deterministic output. Returns an empty string
+/// if the map is empty. Values are sanitized to prevent terminal escape sequences.
+pub fn format_labels(labels: &HashMap<String, String>) -> String {
+    if labels.is_empty() {
+        return String::new();
+    }
+    let mut sorted: Vec<_> = labels.iter().collect();
+    sorted.sort_by_key(|(k, _)| *k);
+    sorted
+        .iter()
+        .map(|(k, v)| format!("{}={}", sanitize_for_display(k), sanitize_for_display(v)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 impl App {
     pub fn new(
         client: OpenShellClient<Channel>,
@@ -597,6 +630,7 @@ impl App {
             sandbox_created: Vec::new(),
             sandbox_images: Vec::new(),
             sandbox_notes: Vec::new(),
+            sandbox_labels: Vec::new(),
             sandbox_policy_versions: Vec::new(),
             sandbox_selected: 0,
             sandbox_count: 0,
@@ -2182,6 +2216,7 @@ impl App {
         self.sandbox_created.clear();
         self.sandbox_images.clear();
         self.sandbox_notes.clear();
+        self.sandbox_labels.clear();
         self.sandbox_policy_versions.clear();
         self.sandbox_selected = 0;
         self.sandbox_count = 0;

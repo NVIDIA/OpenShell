@@ -31,13 +31,14 @@ async fn create_with_upload_provides_files_to_command() {
     fs::write(upload_dir.join("src/main.py"), "print('hello')").expect("write main.py");
 
     let upload_str = upload_dir.to_str().expect("upload path is UTF-8");
+    let remote_marker = "/sandbox/data/project/marker.txt";
 
     // The command reads the marker file — if upload worked, its content
     // appears in the output.
     let mut guard = SandboxGuard::create_with_upload(
         upload_str,
         "/sandbox/data",
-        &["cat", "/sandbox/data/marker.txt"],
+        &["cat", remote_marker],
     )
     .await
     .expect("sandbox create --upload");

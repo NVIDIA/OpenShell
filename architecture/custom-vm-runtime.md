@@ -61,7 +61,7 @@ never binds a host-side TCP listener.
 `openshell-driver-vm` embeds the VM runtime libraries and the sandbox rootfs as
 zstd-compressed byte arrays, extracting on demand:
 
-```
+```text
 ~/.local/share/openshell/vm-runtime/<version>/        # libkrun / libkrunfw / gvproxy
 ├── libkrun.{dylib,so}
 ├── libkrunfw.{5.dylib,so.5}

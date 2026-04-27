@@ -7,6 +7,7 @@ use crate::tls::{TlsOptions, build_rustls_config, grpc_client, require_tls_mater
 use miette::{IntoDiagnostic, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+use openshell_core::ObjectId;
 use openshell_core::forward::{
     build_proxy_command, find_ssh_forward_pid, resolve_ssh_gateway, shell_escape,
     validate_ssh_session_response, write_forward_pid,
@@ -82,7 +83,7 @@ async fn ssh_session_config(
 
     let response = client
         .create_ssh_session(CreateSshSessionRequest {
-            sandbox_id: sandbox.id,
+            sandbox_id: sandbox.object_id().to_string(),
         })
         .await
         .into_diagnostic()?;
@@ -134,6 +135,11 @@ async fn ssh_session_config(
 }
 
 fn ssh_base_command(proxy_command: &str) -> Command {
+    // SSH log level follows the program's verbosity.  main() maps the `-v`
+    // count to OPENSHELL_SSH_LOG_LEVEL; an explicit env-var override wins.
+    let ssh_log_level =
+        std::env::var("OPENSHELL_SSH_LOG_LEVEL").unwrap_or_else(|_| "ERROR".to_string());
+
     let mut command = Command::new("ssh");
     command
         .arg("-o")
@@ -145,7 +151,7 @@ fn ssh_base_command(proxy_command: &str) -> Command {
         .arg("-o")
         .arg("GlobalKnownHostsFile=/dev/null")
         .arg("-o")
-        .arg("LogLevel=ERROR")
+        .arg(format!("LogLevel={ssh_log_level}"))
         // Detect a dead relay within ~45s. The relay rides on a TCP connection
         // that the client has no way to observe silently dropping (gateway
         // restart, supervisor restart, cluster failover), so fall back to
@@ -527,7 +533,9 @@ async fn ssh_tar_upload(
                         .append_path_with_name(&local_path, &tar_name)
                         .into_diagnostic()?;
                 } else if local_path.is_dir() {
-                    archive.append_dir_all(".", &local_path).into_diagnostic()?;
+                    archive
+                        .append_dir_all(&tar_name, &local_path)
+                        .into_diagnostic()?;
                 } else {
                     return Err(miette::miette!(
                         "local path does not exist: {}",
@@ -665,8 +673,11 @@ pub async fn sandbox_sync_up(
             .ok_or_else(|| miette::miette!("path has no file name"))?
             .to_os_string()
     } else {
-        // For directories the tar_name is unused — append_dir_all uses "."
-        ".".into()
+        // For directories, wrap contents under the source basename so uploads
+        // land at `<dest>/<dirname>/...` — matches `scp -r` and `cp -r`. Falls
+        // back to "." for paths with no meaningful basename (`.`, `/`), which
+        // preserves the legacy flatten behavior in those edge cases.
+        directory_upload_prefix(local_path)
     };
 
     ssh_tar_upload(
@@ -680,6 +691,19 @@ pub async fn sandbox_sync_up(
         tls,
     )
     .await
+}
+
+/// Compute the tar entry prefix for a directory upload.
+///
+/// Returns the directory's basename for any path with a meaningful basename;
+/// callers extracting at `<dest>` will see contents wrapped under
+/// `<dest>/<basename>/...`. Returns `"."` for paths without a basename
+/// (e.g. `.` or `/`), which produces flat extraction at `<dest>`.
+fn directory_upload_prefix(local_path: &Path) -> std::ffi::OsString {
+    local_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| ".".into())
 }
 
 /// Pull a path from a sandbox to a local destination using tar-over-SSH.
@@ -1278,6 +1302,34 @@ mod tests {
             ("/sandbox/sub", "file")
         );
         assert_eq!(split_sandbox_path("/a/b/c/d.txt"), ("/a/b/c", "d.txt"));
+    }
+
+    #[test]
+    fn directory_upload_prefix_uses_basename_for_named_directories() {
+        assert_eq!(
+            directory_upload_prefix(Path::new("/tmp/upload-test")),
+            std::ffi::OsString::from("upload-test")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("foo")),
+            std::ffi::OsString::from("foo")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("./parent/nested")),
+            std::ffi::OsString::from("nested")
+        );
+    }
+
+    #[test]
+    fn directory_upload_prefix_falls_back_to_dot_for_basename_less_paths() {
+        assert_eq!(
+            directory_upload_prefix(Path::new(".")),
+            std::ffi::OsString::from(".")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("/")),
+            std::ffi::OsString::from(".")
+        );
     }
 
     #[test]

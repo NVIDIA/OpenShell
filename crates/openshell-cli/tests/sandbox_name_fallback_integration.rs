@@ -111,9 +111,12 @@ impl OpenShell for TestOpenShell {
         *self.state.last_get_name.lock().await = Some(name.clone());
         Ok(Response::new(SandboxResponse {
             sandbox: Some(Sandbox {
-                id: "test-id".to_string(),
-                name,
-                namespace: "default".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "test-id".to_string(),
+                    name,
+                    created_at_ms: 0,
+                    labels: std::collections::HashMap::new(),
+                }),
                 ..Default::default()
             }),
         }))

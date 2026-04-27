@@ -5,7 +5,7 @@
 
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
-use crate::persistence::{ObjectId, ObjectName, ObjectType, Store, generate_name};
+use crate::persistence::{ObjectType, Store, generate_name};
 use openshell_core::proto::Provider;
 use prost::Message;
 use tonic::Status;
@@ -33,9 +33,33 @@ pub(super) async fn create_provider_record(
     store: &Store,
     mut provider: Provider,
 ) -> Result<Provider, Status> {
-    if provider.name.is_empty() {
-        provider.name = generate_name();
+    use crate::persistence::{ObjectName, current_time_ms};
+
+    // Initialize metadata if not present
+    if provider.metadata.is_none() {
+        let now_ms = current_time_ms()
+            .map_err(|e| Status::internal(format!("failed to get current time: {e}")))?;
+        provider.metadata = Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: generate_name(),
+            created_at_ms: now_ms,
+            labels: std::collections::HashMap::new(),
+        });
     }
+
+    // Auto-generate name if empty
+    if let Some(metadata) = provider.metadata.as_mut() {
+        if metadata.name.is_empty() {
+            metadata.name = generate_name();
+        }
+        if metadata.id.is_empty() {
+            metadata.id = uuid::Uuid::new_v4().to_string();
+        }
+    }
+
+    // Ensure metadata is present and valid (must be non-None with non-empty id/name)
+    super::validation::validate_object_metadata(provider.metadata.as_ref(), "provider")?;
+
     if provider.r#type.trim().is_empty() {
         return Err(Status::invalid_argument("provider.type is required"));
     }
@@ -49,15 +73,13 @@ pub(super) async fn create_provider_record(
     validate_provider_fields(&provider)?;
 
     let existing = store
-        .get_message_by_name::<Provider>(&provider.name)
+        .get_message_by_name::<Provider>(provider.object_name())
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?;
 
     if existing.is_some() {
         return Err(Status::already_exists("provider already exists"));
     }
-
-    provider.id = uuid::Uuid::new_v4().to_string();
 
     store
         .put_message(&provider)
@@ -104,12 +126,14 @@ pub(super) async fn update_provider_record(
     store: &Store,
     provider: Provider,
 ) -> Result<Provider, Status> {
-    if provider.name.is_empty() {
+    use crate::persistence::ObjectName;
+
+    if provider.object_name().is_empty() {
         return Err(Status::invalid_argument("provider.name is required"));
     }
 
     let existing = store
-        .get_message_by_name::<Provider>(&provider.name)
+        .get_message_by_name::<Provider>(provider.object_name())
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?;
 
@@ -127,12 +151,14 @@ pub(super) async fn update_provider_record(
     }
 
     let updated = Provider {
-        id: existing.id,
-        name: existing.name,
+        metadata: existing.metadata,
         r#type: existing.r#type,
         credentials: merge_map(existing.credentials, provider.credentials),
         config: merge_map(existing.config, provider.config),
     };
+
+    // Ensure metadata is valid (defense in depth - existing.metadata should always be valid)
+    super::validation::validate_object_metadata(updated.metadata.as_ref(), "provider")?;
 
     validate_provider_fields(&updated)?;
 
@@ -241,18 +267,6 @@ impl ObjectType for Provider {
     }
 }
 
-impl ObjectId for Provider {
-    fn object_id(&self) -> &str {
-        &self.id
-    }
-}
-
-impl ObjectName for Provider {
-    fn object_name(&self) -> &str {
-        &self.name
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Handler wrappers called from the trait impl in mod.rs
 // ---------------------------------------------------------------------------
@@ -336,6 +350,7 @@ pub(super) async fn handle_delete_provider(
 mod tests {
     use super::*;
     use crate::grpc::MAX_MAP_KEY_LEN;
+    use openshell_core::{ObjectId, ObjectName};
     use std::collections::HashMap;
     use tonic::Code;
 
@@ -358,8 +373,12 @@ mod tests {
 
     fn provider_with_values(name: &str, provider_type: &str) -> Provider {
         Provider {
-            id: String::new(),
-            name: name.to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: name.to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+            }),
             r#type: provider_type.to_string(),
             credentials: [
                 ("API_TOKEN".to_string(), "token-123".to_string()),
@@ -386,26 +405,30 @@ mod tests {
         let persisted = create_provider_record(&store, created.clone())
             .await
             .unwrap();
-        assert_eq!(persisted.name, "gitlab-local");
+        assert_eq!(persisted.object_name(), "gitlab-local");
         assert_eq!(persisted.r#type, "gitlab");
-        assert!(!persisted.id.is_empty());
-        let provider_id = persisted.id.clone();
+        assert!(!persisted.object_id().is_empty());
+        let provider_id = persisted.object_id().to_string();
 
         let duplicate_err = create_provider_record(&store, created).await.unwrap_err();
         assert_eq!(duplicate_err.code(), Code::AlreadyExists);
 
         let loaded = get_provider_record(&store, "gitlab-local").await.unwrap();
-        assert_eq!(loaded.id, provider_id);
+        assert_eq!(loaded.object_id(), provider_id);
 
         let listed = list_provider_records(&store, 100, 0).await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].name, "gitlab-local");
+        assert_eq!(listed[0].object_name(), "gitlab-local");
 
         let updated = update_provider_record(
             &store,
             Provider {
-                id: String::new(),
-                name: "gitlab-local".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "gitlab-local".to_string(),
+                    created_at_ms: 1000000,
+                    labels: std::collections::HashMap::new(),
+                }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
                     "API_TOKEN".to_string(),
@@ -418,7 +441,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(updated.id, provider_id);
+        assert_eq!(updated.object_id(), provider_id);
         assert_eq!(updated.credentials.len(), 2);
         assert_eq!(
             updated.credentials.get("API_TOKEN"),
@@ -473,8 +496,12 @@ mod tests {
         let create_missing_type = create_provider_record(
             &store,
             Provider {
-                id: String::new(),
-                name: "bad-provider".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "bad-provider".to_string(),
+                    created_at_ms: 1000000,
+                    labels: HashMap::new(),
+                }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
@@ -493,8 +520,12 @@ mod tests {
         let update_missing_err = update_provider_record(
             &store,
             Provider {
-                id: String::new(),
-                name: "missing".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "missing".to_string(),
+                    created_at_ms: 1000000,
+                    labels: HashMap::new(),
+                }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
@@ -517,8 +548,12 @@ mod tests {
         let updated = update_provider_record(
             &store,
             Provider {
-                id: String::new(),
-                name: "noop-test".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "noop-test".to_string(),
+                    created_at_ms: 1000000,
+                    labels: HashMap::new(),
+                }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
@@ -527,7 +562,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(updated.id, persisted.id);
+        assert_eq!(updated.object_id(), persisted.object_id());
         assert_eq!(updated.r#type, "nvidia");
         assert_eq!(updated.credentials.len(), 2);
         assert_eq!(
@@ -560,8 +595,12 @@ mod tests {
         let updated = update_provider_record(
             &store,
             Provider {
-                id: String::new(),
-                name: "delete-key-test".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "delete-key-test".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 r#type: String::new(),
                 credentials: std::iter::once(("SECONDARY".to_string(), String::new())).collect(),
                 config: std::iter::once(("region".to_string(), String::new())).collect(),
@@ -607,8 +646,12 @@ mod tests {
         let updated = update_provider_record(
             &store,
             Provider {
-                id: String::new(),
-                name: "type-preserve-test".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "type-preserve-test".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
@@ -632,8 +675,12 @@ mod tests {
         let err = update_provider_record(
             &store,
             Provider {
-                id: String::new(),
-                name: "type-change-test".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "type-change-test".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 r#type: "openai".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
@@ -659,8 +706,12 @@ mod tests {
         let err = update_provider_record(
             &store,
             Provider {
-                id: String::new(),
-                name: "validate-merge-test".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "validate-merge-test".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 r#type: String::new(),
                 credentials: std::iter::once((oversized_key, "value".to_string())).collect(),
                 config: HashMap::new(),
@@ -683,8 +734,12 @@ mod tests {
     async fn resolve_provider_env_injects_credentials() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         let provider = Provider {
-            id: String::new(),
-            name: "claude-local".to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "claude-local".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+            }),
             r#type: "claude".to_string(),
             credentials: [
                 ("ANTHROPIC_API_KEY".to_string(), "sk-abc".to_string()),
@@ -722,8 +777,12 @@ mod tests {
     async fn resolve_provider_env_skips_invalid_credential_keys() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         let provider = Provider {
-            id: String::new(),
-            name: "test-provider".to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "test-provider".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+            }),
             r#type: "test".to_string(),
             credentials: [
                 ("VALID_KEY".to_string(), "value".to_string()),
@@ -750,8 +809,12 @@ mod tests {
         create_provider_record(
             &store,
             Provider {
-                id: String::new(),
-                name: "claude-local".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "claude-local".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once((
                     "ANTHROPIC_API_KEY".to_string(),
@@ -766,8 +829,12 @@ mod tests {
         create_provider_record(
             &store,
             Provider {
-                id: String::new(),
-                name: "gitlab-local".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "gitlab-local".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once(("GITLAB_TOKEN".to_string(), "glpat-xyz".to_string()))
                     .collect(),
@@ -793,8 +860,12 @@ mod tests {
         create_provider_record(
             &store,
             Provider {
-                id: String::new(),
-                name: "provider-a".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "provider-a".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once(("SHARED_KEY".to_string(), "first-value".to_string()))
                     .collect(),
@@ -806,8 +877,12 @@ mod tests {
         create_provider_record(
             &store,
             Provider {
-                id: String::new(),
-                name: "provider-b".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "provider-b".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
                     "SHARED_KEY".to_string(),
@@ -838,8 +913,12 @@ mod tests {
         create_provider_record(
             &store,
             Provider {
-                id: String::new(),
-                name: "my-claude".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "my-claude".to_string(),
+                    created_at_ms: 1000000,
+                    labels: HashMap::new(),
+                }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once((
                     "ANTHROPIC_API_KEY".to_string(),
@@ -853,9 +932,12 @@ mod tests {
         .unwrap();
 
         let sandbox = Sandbox {
-            id: "sandbox-001".to_string(),
-            name: "test-sandbox".to_string(),
-            namespace: "default".to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sandbox-001".to_string(),
+                name: "test-sandbox".to_string(),
+                created_at_ms: 1000000,
+                labels: std::collections::HashMap::new(),
+            }),
             spec: Some(SandboxSpec {
                 providers: vec!["my-claude".to_string()],
                 ..SandboxSpec::default()
@@ -886,9 +968,12 @@ mod tests {
         let store = Store::connect("sqlite::memory:").await.unwrap();
 
         let sandbox = Sandbox {
-            id: "sandbox-002".to_string(),
-            name: "empty-sandbox".to_string(),
-            namespace: "default".to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sandbox-002".to_string(),
+                name: "empty-sandbox".to_string(),
+                created_at_ms: 1000000,
+                labels: std::collections::HashMap::new(),
+            }),
             spec: Some(SandboxSpec::default()),
             status: None,
             phase: SandboxPhase::Ready as i32,

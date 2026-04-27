@@ -14,9 +14,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl iproute2 iptables \
     && rm -rf /var/lib/apt/lists/*
 
-# Create the sandbox user (uid/gid 1000) for non-root execution.
-RUN groupadd -g 1000 sandbox && \
-    useradd -m -u 1000 -g sandbox sandbox
+# Create the sandbox user for non-root execution.
+# Use a high UID range to avoid conflicts with host users when running without
+# user namespace remapping (UID in container = UID on host).
+RUN groupadd -g 1000660000 sandbox && \
+    useradd -m -u 1000660000 -g sandbox sandbox
 
 WORKDIR /sandbox
 COPY app.py .

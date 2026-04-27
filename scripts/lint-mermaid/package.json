@@ -1,0 +1,11 @@
+{
+  "name": "openshell-lint-mermaid",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Mermaid diagram validation for OpenShell docs. Not published.",
+  "type": "module",
+  "dependencies": {
+    "jsdom": "^25.0.1",
+    "mermaid": "^11.4.0"
+  }
+}

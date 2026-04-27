@@ -18,19 +18,27 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub async fn connect(url: &str) -> Result<Self> {
-        let max_connections = if url.contains(":memory:") || url.contains("mode=memory") {
-            1
-        } else {
-            5
-        };
+        let is_in_memory = url.contains(":memory:") || url.contains("mode=memory");
+        let max_connections = if is_in_memory { 1 } else { 5 };
 
         let options = SqliteConnectOptions::from_str(url)
             .map_err(|e| map_db_error(&e))?
             .create_if_missing(true);
 
-        let pool = SqlitePoolOptions::new()
+        let mut pool_options = SqlitePoolOptions::new()
             .max_connections(max_connections)
-            .min_connections(max_connections)
+            .min_connections(max_connections);
+
+        // In-memory SQLite databases exist only while at least one connection
+        // is open. SQLx's default `max_lifetime` (30 min) and `idle_timeout`
+        // (10 min) would recycle the sole connection, destroying the database
+        // and all its tables. Disable both timeouts so the connection (and
+        // therefore the database) lives for the entire process lifetime.
+        if is_in_memory {
+            pool_options = pool_options.idle_timeout(None).max_lifetime(None);
+        }
+
+        let pool = pool_options
             .connect_with(options)
             .await
             .map_err(|e| map_db_error(&e))?;
@@ -45,16 +53,24 @@ impl SqliteStore {
             .map_err(|e| map_migrate_error(&e))
     }
 
-    pub async fn put(&self, object_type: &str, id: &str, name: &str, payload: &[u8]) -> Result<()> {
+    pub async fn put(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> Result<()> {
         let now_ms = current_time_ms()?;
 
         sqlx::query(
             r#"
-INSERT INTO "objects" ("object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms")
-VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+INSERT INTO "objects" ("object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms", "labels")
+VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)
 ON CONFLICT ("id") DO UPDATE SET
     "payload" = excluded."payload",
-    "updated_at_ms" = excluded."updated_at_ms"
+    "updated_at_ms" = excluded."updated_at_ms",
+    "labels" = excluded."labels"
 WHERE "objects"."object_type" = excluded."object_type"
 "#,
         )
@@ -63,6 +79,7 @@ WHERE "objects"."object_type" = excluded."object_type"
         .bind(name)
         .bind(payload)
         .bind(now_ms)
+        .bind(labels.unwrap_or("{}"))
         .execute(&self.pool)
         .await
         .map_err(|e| map_db_error(&e))?;
@@ -72,7 +89,7 @@ WHERE "objects"."object_type" = excluded."object_type"
     pub async fn get(&self, object_type: &str, id: &str) -> Result<Option<ObjectRecord>> {
         let row = sqlx::query(
             r#"
-SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms"
+SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms", "labels"
 FROM "objects"
 WHERE "object_type" = ?1 AND "id" = ?2
 "#,
@@ -90,13 +107,14 @@ WHERE "object_type" = ?1 AND "id" = ?2
             payload: row.get("payload"),
             created_at_ms: row.get("created_at_ms"),
             updated_at_ms: row.get("updated_at_ms"),
+            labels: row.get("labels"),
         }))
     }
 
     pub async fn get_by_name(&self, object_type: &str, name: &str) -> Result<Option<ObjectRecord>> {
         let row = sqlx::query(
             r#"
-SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms"
+SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms", "labels"
 FROM "objects"
 WHERE "object_type" = ?1 AND "name" = ?2
 "#,
@@ -114,6 +132,7 @@ WHERE "object_type" = ?1 AND "name" = ?2
             payload: row.get("payload"),
             created_at_ms: row.get("created_at_ms"),
             updated_at_ms: row.get("updated_at_ms"),
+            labels: row.get("labels"),
         }))
     }
 
@@ -155,7 +174,7 @@ WHERE "object_type" = ?1 AND "name" = ?2
     ) -> Result<Vec<ObjectRecord>> {
         let rows = sqlx::query(
             r#"
-SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms"
+SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms", "labels"
 FROM "objects"
 WHERE "object_type" = ?1
 ORDER BY "created_at_ms" ASC, "name" ASC
@@ -178,10 +197,47 @@ LIMIT ?2 OFFSET ?3
                 payload: row.get("payload"),
                 created_at_ms: row.get("created_at_ms"),
                 updated_at_ms: row.get("updated_at_ms"),
+                labels: row.get("labels"),
             })
             .collect();
 
         Ok(records)
+    }
+
+    pub async fn list_with_selector(
+        &self,
+        object_type: &str,
+        label_selector: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<ObjectRecord>> {
+        use super::parse_label_selector;
+
+        // Parse the label selector into key-value pairs
+        let required_labels = parse_label_selector(label_selector)?;
+
+        // For SQLite, we parse JSON in application layer since it doesn't have native JSONB
+        let all_records = self.list(object_type, u32::MAX, 0).await?;
+
+        // Filter in memory
+        let filtered: Vec<ObjectRecord> = all_records
+            .into_iter()
+            .filter(|record| {
+                // Parse labels JSON
+                let labels_json = record.labels.as_deref().unwrap_or("{}");
+                let labels: std::collections::HashMap<String, String> =
+                    serde_json::from_str(labels_json).unwrap_or_default();
+
+                // Check if all required labels match
+                required_labels
+                    .iter()
+                    .all(|(key, value)| labels.get(key).map(|v| v == value).unwrap_or(false))
+            })
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+
+        Ok(filtered)
     }
 
     // -------------------------------------------------------------------

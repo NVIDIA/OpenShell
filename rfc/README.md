@@ -93,7 +93,7 @@ Look at the existing RFC folders in this directory and choose the next available
 
 Each RFC lives in its own folder:
 
-```
+```text
 rfc/NNNN-my-feature/
     README.md
     (optional: diagrams, images, supporting files)

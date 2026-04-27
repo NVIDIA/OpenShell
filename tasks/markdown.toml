@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Markdown and Mermaid linting tasks
+
+["markdown:deps"]
+description = "Install Node deps for markdown/mermaid linting from lockfile"
+run = """
+cd scripts/lint-mermaid
+npm ci --no-audit --no-fund --silent
+"""
+hide = true
+sources = ["scripts/lint-mermaid/package.json", "scripts/lint-mermaid/package-lock.json"]
+outputs = ["scripts/lint-mermaid/node_modules/.package-lock.json"]
+
+["markdown:lint:md"]
+description = "Lint Markdown files with markdownlint-cli2"
+run = "markdownlint-cli2"
+hide = true
+
+["markdown:format"]
+description = "Auto-fix Markdown lint issues"
+run = "markdownlint-cli2 --fix"
+
+["markdown:lint:mermaid"]
+description = "Validate Mermaid diagrams in Markdown/MDX files"
+depends = ["markdown:deps"]
+run = "node scripts/lint-mermaid/lint-mermaid.mjs ."
+hide = true
+
+["markdown:lint"]
+description = "Run all Markdown and Mermaid linters"
+depends = ["markdown:lint:md", "markdown:lint:mermaid"]

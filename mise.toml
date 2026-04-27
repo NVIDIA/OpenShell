@@ -19,16 +19,18 @@ lockfile = true
 lockfile_platforms = ["linux-x64", "linux-arm64", "macos-arm64"]
 
 [tools]
-python = "3.13.12"
+python = "3.13.13"
 rust = "stable"
-node = "24"
-kubectl = "1.35.1"
-uv = "0.10.2"
+node = "24.15.0"
+kubectl = "1.35.4"
+uv = "0.10.12"
 protoc = "29.6"
 helm = "4.1.4"
-"github:anchore/syft" = { version = "1.42.3" }
+"github:anchore/syft" = { version = "1.43.0" }
 "github:EmbarkStudios/cargo-about" = { version = "0.8.4", version_prefix = "" }
 zig = "0.14.1"
+"cargo:cargo-zigbuild" = { version = "0.22.3", os = ["macos"] }
+"npm:markdownlint-cli2" = "0.22.0"
 
 [tools."github:mozilla/sccache"]
 version = "0.14.0"
@@ -51,7 +53,8 @@ UV_CACHE_DIR = "{{config_root}}/.cache/uv"
 RUSTC_WRAPPER = "sccache"
 SCCACHE_DIR = "{{config_root}}/.cache/sccache"
 
-# Shared build constants (overridable via environment)
+# Shared build constants (overridable via environment).
+# DOCKER_BUILDKIT enables BuildKit for Docker; ignored by podman.
 DOCKER_BUILDKIT = "1"
 
 [vars]

@@ -56,13 +56,15 @@ PRs that touch `docs/**` or `fern/**` are validated by `.github/workflows/branch
 - Published docs use Fern MDX under `docs/`.
 - Every page starts with YAML frontmatter. Use `title` and `description` on every page, then add page-level metadata like `sidebar-title`, `keywords`, and `position` when the page needs them.
 - Include the SPDX license header as YAML comments inside frontmatter:
-  ```
+
+  ```text
   ---
   # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   # SPDX-License-Identifier: Apache-2.0
   title: "Page Title"
   ---
   ```
+
 - Do not repeat the page title as a body H1. Fern renders the title from frontmatter.
 
 ### Frontmatter Template
@@ -122,9 +124,11 @@ These patterns are common in LLM-generated text and erode trust with technical r
 - End every sentence with a period.
 - Use `code` formatting for CLI commands, file paths, flags, parameter names, and values.
 - Use `shell` code blocks for copyable CLI examples. Do not prefix commands with `$`:
+
   ```shell
   openshell gateway start
   ```
+
 - Use `text` code blocks for transcripts, log output, and examples that should not be copied verbatim.
 - Use tables for structured comparisons. Keep tables simple (no nested formatting).
 - Use Fern components like `<Note>`, `<Tip>`, and `<Warning>` for callouts, not bold text.
@@ -157,13 +161,13 @@ Use these consistently:
 5. Run `mise run pre-commit` to catch formatting issues.
 6. Open a PR with `docs:` as the conventional commit type.
 
-```
+```text
 docs: update gateway deployment instructions
 ```
 
 If your doc change accompanies a code change, include both in the same PR and use the code change's commit type:
 
-```
+```text
 feat(cli): add --gpu flag to gateway start
 ```
 

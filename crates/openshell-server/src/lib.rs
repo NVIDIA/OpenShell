@@ -337,9 +337,53 @@ async fn build_compute_runtime(
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
-        ComputeDriverKind::Podman => Err(Error::config(
-            "compute driver 'podman' is not implemented yet",
-        )),
+        ComputeDriverKind::Podman => {
+            let socket_path = std::env::var("OPENSHELL_PODMAN_SOCKET")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(openshell_driver_podman::PodmanComputeConfig::default_socket_path);
+
+            let network_name = std::env::var("OPENSHELL_NETWORK_NAME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| openshell_core::config::DEFAULT_NETWORK_NAME.to_string());
+
+            let stop_timeout_secs: u32 = std::env::var("OPENSHELL_STOP_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS);
+
+            let supervisor_image = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string());
+
+            ComputeRuntime::new_podman(
+                openshell_driver_podman::PodmanComputeConfig {
+                    socket_path,
+                    default_image: config.sandbox_image.clone(),
+                    image_pull_policy: config.sandbox_image_pull_policy.parse().unwrap_or_default(),
+                    grpc_endpoint: config.grpc_endpoint.clone(),
+                    gateway_port: config.bind_address.port(),
+                    sandbox_ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
+                    network_name,
+                    ssh_listen_addr: format!("0.0.0.0:{}", config.sandbox_ssh_port),
+                    ssh_port: config.sandbox_ssh_port,
+                    ssh_handshake_secret: config.ssh_handshake_secret.clone(),
+                    ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
+                    stop_timeout_secs,
+                    supervisor_image,
+                },
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
     }
 }
 
@@ -348,10 +392,11 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
         [] => Err(Error::config(
             "at least one compute driver must be configured",
         )),
-        [driver @ ComputeDriverKind::Kubernetes] | [driver @ ComputeDriverKind::Vm] => Ok(*driver),
-        [ComputeDriverKind::Podman] => Err(Error::config(
-            "compute driver 'podman' is not implemented yet",
-        )),
+        [
+            driver @ (ComputeDriverKind::Kubernetes
+            | ComputeDriverKind::Vm
+            | ComputeDriverKind::Podman),
+        ] => Ok(*driver),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
             drivers
@@ -390,15 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_compute_driver_defaults_to_kubernetes() {
-        assert_eq!(
-            configured_compute_driver(&Config::new(None)).unwrap(),
-            ComputeDriverKind::Kubernetes
-        );
-    }
-
-    #[test]
-    fn configured_compute_driver_requires_at_least_one_entry() {
+    fn configured_compute_driver_rejects_empty_drivers() {
         let config = Config::new(None).with_compute_drivers([]);
         let err = configured_compute_driver(&config).unwrap_err();
         assert!(err.to_string().contains("at least one compute driver"));
@@ -417,12 +454,11 @@ mod tests {
     }
 
     #[test]
-    fn configured_compute_driver_rejects_unimplemented_driver() {
+    fn configured_compute_driver_accepts_podman() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Podman]);
-        let err = configured_compute_driver(&config).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("compute driver 'podman' is not implemented yet")
+        assert_eq!(
+            configured_compute_driver(&config).unwrap(),
+            ComputeDriverKind::Podman
         );
     }
 

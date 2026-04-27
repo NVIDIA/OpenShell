@@ -101,7 +101,7 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Try to open a rolling log file; fall back to stdout-only logging if it fails
+    // Try to open a rolling log file; fall back to stderr-only logging if it fails
     // (e.g., /var/log is not writable in custom workload images).
     // Rotates daily, keeps the 3 most recent files to bound disk usage.
     let file_logging = tracing_appender::rolling::RollingFileAppender::builder()
@@ -116,7 +116,7 @@ fn main() -> Result<()> {
             (writer, guard)
         });
 
-    let stdout_filter =
+    let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -176,9 +176,9 @@ fn main() -> Result<()> {
 
             tracing_subscriber::registry()
                 .with(
-                    OcsfShorthandLayer::new(std::io::stdout())
+                    OcsfShorthandLayer::new(std::io::stderr())
                         .with_non_ocsf(true)
-                        .with_filter(stdout_filter),
+                        .with_filter(console_filter),
                 )
                 .with(
                     OcsfShorthandLayer::new(file_writer)
@@ -192,14 +192,14 @@ fn main() -> Result<()> {
         } else {
             tracing_subscriber::registry()
                 .with(
-                    OcsfShorthandLayer::new(std::io::stdout())
+                    OcsfShorthandLayer::new(std::io::stderr())
                         .with_non_ocsf(true)
-                        .with_filter(stdout_filter),
+                        .with_filter(console_filter),
                 )
                 .with(push_layer)
                 .init();
             // Log the warning after the subscriber is initialized
-            warn!("Could not open /var/log for log rotation; using stdout-only logging");
+            warn!("Could not open /var/log for log rotation; using stderr-only logging");
             (None, None)
         };
 

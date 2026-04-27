@@ -197,8 +197,11 @@ mise.local.toml
 architecture/plans
 
 # Claude
-.claude/settings.local.json.claude/worktrees/
+.claude/settings.local.json
 .claude/worktrees/
 rfc.md
 .worktrees
 .z3-trace
+
+# Markdown/mermaid lint tooling deps
+scripts/lint-mermaid/node_modules/

@@ -258,7 +258,7 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 
 This project uses [Conventional Commits](https://www.conventionalcommits.org/). All commit messages must follow the format:
 
-```
+```text
 <type>(<scope>): <description>
 
 [optional body]
@@ -279,7 +279,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/). 
 
 **Examples:**
 
-```
+```text
 feat(cli): add --verbose flag to openshell run
 fix(sandbox): handle timeout errors gracefully
 docs: update installation instructions
@@ -293,3 +293,9 @@ All contributions must include a `Signed-off-by` line in each commit message. Th
 ```bash
 git commit -s -m "feat(sandbox): add new capability"
 ```
+
+DCO sign-off is separate from cryptographic commit signing. CI requires signing for org members so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+
+## CI
+
+How E2E runs in CI, the `test:e2e` / `test:e2e-gpu` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).

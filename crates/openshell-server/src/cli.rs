@@ -6,6 +6,9 @@
 use clap::{Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::ComputeDriverKind;
+use openshell_core::config::{
+    DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS, DEFAULT_SSH_PORT,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::info;
@@ -20,7 +23,7 @@ use crate::{run_server, tracing_bus::TracingLogBus};
 #[command(about = "OpenShell gRPC/HTTP server", long_about = None)]
 struct Args {
     /// Port to bind the server to (all interfaces).
-    #[arg(long, default_value_t = 8080, env = "OPENSHELL_SERVER_PORT")]
+    #[arg(long, default_value_t = DEFAULT_SERVER_PORT, env = "OPENSHELL_SERVER_PORT")]
     port: u16,
 
     /// Port for unauthenticated health endpoints (healthz, readyz).
@@ -90,7 +93,7 @@ struct Args {
     ssh_gateway_host: String,
 
     /// Public port for the SSH gateway.
-    #[arg(long, env = "OPENSHELL_SSH_GATEWAY_PORT", default_value_t = 8080)]
+    #[arg(long, env = "OPENSHELL_SSH_GATEWAY_PORT", default_value_t = DEFAULT_SERVER_PORT)]
     ssh_gateway_port: u16,
 
     /// HTTP path for SSH CONNECT/upgrade.
@@ -101,12 +104,15 @@ struct Args {
     )]
     ssh_connect_path: String,
 
+    /// SSH port inside sandbox pods.
+    #[arg(long, env = "OPENSHELL_SANDBOX_SSH_PORT", default_value_t = DEFAULT_SSH_PORT)]
+    sandbox_ssh_port: u16,
     /// Shared secret for gateway-to-sandbox SSH handshake.
     #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
     ssh_handshake_secret: Option<String>,
 
     /// Allowed clock skew in seconds for SSH handshake.
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS", default_value_t = 300)]
+    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS", default_value_t = DEFAULT_SSH_HANDSHAKE_SKEW_SECS)]
     ssh_handshake_skew_secs: u64,
 
     /// Kubernetes secret name containing client TLS materials for sandbox pods.
@@ -271,6 +277,7 @@ async fn run_from_args(args: Args) -> Result<()> {
         .with_ssh_gateway_host(args.ssh_gateway_host)
         .with_ssh_gateway_port(args.ssh_gateway_port)
         .with_ssh_connect_path(args.ssh_connect_path)
+        .with_sandbox_ssh_port(args.sandbox_ssh_port)
         .with_ssh_handshake_skew_secs(args.ssh_handshake_skew_secs);
 
     if let Some(image) = args.sandbox_image {

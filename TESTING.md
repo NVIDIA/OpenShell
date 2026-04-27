@@ -10,7 +10,7 @@ mise run ci            # Everything: lint, compile checks, and tests
 
 ## Test Layout
 
-```
+```text
 crates/*/src/          # Inline #[cfg(test)] modules
 crates/*/tests/        # Rust integration tests
 python/openshell/      # Python unit tests (*_test.py suffix)

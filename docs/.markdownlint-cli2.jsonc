@@ -1,0 +1,10 @@
+{
+  "config": {
+    // MDX pages get their title from Fern frontmatter, not a top-level H1.
+    "MD041": false,
+    // MDX uses JSX components (<Callout>, <CodeBlock>, ...) that look like HTML.
+    "MD033": false,
+    // Published docs should label fenced code blocks for rendering and copy UX.
+    "MD040": true
+  }
+}

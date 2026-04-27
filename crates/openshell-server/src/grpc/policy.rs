@@ -11,7 +11,7 @@
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
 use crate::ServerState;
-use crate::persistence::{DraftChunkRecord, PolicyRecord, Store};
+use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, PolicyRecord, Store};
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -663,7 +663,7 @@ pub(super) async fn handle_update_config(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let sandbox_id = sandbox.id.clone();
+    let sandbox_id = sandbox.object_id().to_string();
 
     if has_setting {
         let _settings_guard = state.settings_mutex.lock().await;
@@ -692,7 +692,7 @@ pub(super) async fn handle_update_config(
                 save_sandbox_settings(
                     state.store.as_ref(),
                     &sandbox_id,
-                    &sandbox.name,
+                    sandbox.object_name(),
                     &sandbox_settings,
                 )
                 .await?;
@@ -725,7 +725,7 @@ pub(super) async fn handle_update_config(
             save_sandbox_settings(
                 state.store.as_ref(),
                 &sandbox_id,
-                &sandbox.name,
+                sandbox.object_name(),
                 &sandbox_settings,
             )
             .await?;
@@ -764,7 +764,7 @@ pub(super) async fn handle_update_config(
         state.sandbox_watch_bus.notify(&sandbox_id);
         emit_gateway_policy_audit_log(
             &sandbox_id,
-            &sandbox.name,
+            sandbox.object_name(),
             "merged",
             format!(
                 "gateway merged {} incremental policy operation(s)",
@@ -776,7 +776,7 @@ pub(super) async fn handle_update_config(
         for operation in &merge_ops {
             emit_gateway_policy_audit_log(
                 &sandbox_id,
-                &sandbox.name,
+                sandbox.object_name(),
                 "merged",
                 format!(
                     "gateway merged incremental policy op: {}",
@@ -913,7 +913,10 @@ pub(super) async fn handle_get_sandbox_policy_status(
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
-        (sandbox.id, sandbox.current_policy_version)
+        (
+            sandbox.object_id().to_string(),
+            sandbox.current_policy_version,
+        )
     };
 
     let record = if req.version == 0 {
@@ -961,7 +964,7 @@ pub(super) async fn handle_list_sandbox_policies(
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
-        sandbox.id
+        sandbox.object_id().to_string()
     };
 
     let limit = clamp_limit(req.limit, 50, MAX_PAGE_SIZE);
@@ -1148,7 +1151,7 @@ pub(super) async fn handle_submit_policy_analysis(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let sandbox_id = sandbox.id.clone();
+    let sandbox_id = sandbox.object_id().to_string();
 
     let current_version = state
         .store
@@ -1263,7 +1266,7 @@ pub(super) async fn handle_get_draft_policy(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let sandbox_id = sandbox.id.clone();
+    let sandbox_id = sandbox.object_id().to_string();
 
     let status_filter = if req.status_filter.is_empty() {
         None
@@ -1325,7 +1328,7 @@ pub(super) async fn handle_approve_draft_chunk(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let sandbox_id = sandbox.id.clone();
+    let sandbox_id = sandbox.object_id().to_string();
 
     let chunk = state
         .store
@@ -1367,7 +1370,7 @@ pub(super) async fn handle_approve_draft_chunk(
     state.sandbox_watch_bus.notify(&sandbox_id);
     emit_gateway_policy_audit_log(
         &sandbox_id,
-        &sandbox.name,
+        sandbox.object_name(),
         "approved",
         format!(
             "gateway approved draft chunk {}: {chunk_summary}",
@@ -1410,7 +1413,7 @@ pub(super) async fn handle_reject_draft_chunk(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let sandbox_id = sandbox.id.clone();
+    let sandbox_id = sandbox.object_id().to_string();
 
     let chunk = state
         .store
@@ -1444,7 +1447,7 @@ pub(super) async fn handle_reject_draft_chunk(
         let (version, hash) = remove_chunk_from_policy(state, &sandbox_id, &chunk).await?;
         emit_gateway_policy_audit_log(
             &sandbox_id,
-            &sandbox.name,
+            sandbox.object_name(),
             "removed",
             format!(
                 "gateway removed previously approved draft chunk {}: remove-binary {} {}",
@@ -1485,7 +1488,7 @@ pub(super) async fn handle_approve_all_draft_chunks(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let sandbox_id = sandbox.id.clone();
+    let sandbox_id = sandbox.object_id().to_string();
 
     let pending_chunks = state
         .store
@@ -1547,7 +1550,7 @@ pub(super) async fn handle_approve_all_draft_chunks(
 
         emit_gateway_policy_audit_log(
             &sandbox_id,
-            &sandbox.name,
+            sandbox.object_name(),
             "approved",
             format!("gateway approved draft chunk {}: {chunk_summary}", chunk.id),
             version,
@@ -1559,7 +1562,7 @@ pub(super) async fn handle_approve_all_draft_chunks(
     state.sandbox_watch_bus.notify(&sandbox_id);
     emit_gateway_policy_audit_log(
         &sandbox_id,
-        &sandbox.name,
+        sandbox.object_name(),
         "merged",
         format!(
             "gateway bulk-approved {chunks_approved} draft chunk(s) and skipped {chunks_skipped}"
@@ -1654,7 +1657,7 @@ pub(super) async fn handle_undo_draft_chunk(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let sandbox_id = sandbox.id.clone();
+    let sandbox_id = sandbox.object_id().to_string();
 
     let chunk = state
         .store
@@ -1690,7 +1693,7 @@ pub(super) async fn handle_undo_draft_chunk(
     state.sandbox_watch_bus.notify(&sandbox_id);
     emit_gateway_policy_audit_log(
         &sandbox_id,
-        &sandbox.name,
+        sandbox.object_name(),
         "removed",
         format!(
             "gateway reverted approved draft chunk {}: remove-binary {} {}",
@@ -1730,7 +1733,7 @@ pub(super) async fn handle_clear_draft_chunks(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let sandbox_id = sandbox.id.clone();
+    let sandbox_id = sandbox.object_id().to_string();
 
     let deleted = state
         .store
@@ -1766,7 +1769,7 @@ pub(super) async fn handle_get_draft_history(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let sandbox_id = sandbox.id.clone();
+    let sandbox_id = sandbox.object_id().to_string();
 
     let all_chunks = state
         .store
@@ -2477,7 +2480,7 @@ async fn save_settings_record(
     let payload = serde_json::to_vec(settings)
         .map_err(|e| Status::internal(format!("encode settings payload failed: {e}")))?;
     store
-        .put(object_type, id, name, &payload)
+        .put(object_type, id, name, &payload, None)
         .await
         .map_err(|e| Status::internal(format!("persist settings failed: {e}")))?;
     Ok(())
@@ -2590,9 +2593,12 @@ mod tests {
         let store = Store::connect("sqlite::memory:").await.unwrap();
 
         let sandbox = Sandbox {
-            id: "sb-no-policy".to_string(),
-            name: "no-policy-sandbox".to_string(),
-            namespace: "default".to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-no-policy".to_string(),
+                name: "no-policy-sandbox".to_string(),
+                created_at_ms: 1000000,
+                labels: std::collections::HashMap::new(),
+            }),
             spec: Some(SandboxSpec {
                 policy: None,
                 ..Default::default()
@@ -2617,9 +2623,12 @@ mod tests {
         let store = Store::connect("sqlite::memory:").await.unwrap();
 
         let sandbox = Sandbox {
-            id: "sb-backfill".to_string(),
-            name: "backfill-sandbox".to_string(),
-            namespace: "default".to_string(),
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-backfill".to_string(),
+                name: "backfill-sandbox".to_string(),
+                created_at_ms: 1000000,
+                labels: std::collections::HashMap::new(),
+            }),
             spec: Some(SandboxSpec {
                 policy: None,
                 ..Default::default()

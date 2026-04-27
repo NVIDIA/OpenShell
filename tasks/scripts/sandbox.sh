@@ -13,6 +13,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/container-engine.sh"
+
 SANDBOX_NAME="dev"
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
 CONTAINER_NAME="openshell-cluster-${CLUSTER_NAME}"
@@ -24,7 +27,7 @@ CMD=(${usage_command:-claude})
 # -------------------------------------------------------------------
 # 1. Ensure the cluster is running; redeploy if dirty
 # -------------------------------------------------------------------
-if ! docker ps -q --filter "name=${CONTAINER_NAME}" | grep -q .; then
+if ! ce ps -q --filter "name=${CONTAINER_NAME}" | grep -q .; then
   echo "No running cluster found. Bootstrapping..."
   mise run cluster
 else

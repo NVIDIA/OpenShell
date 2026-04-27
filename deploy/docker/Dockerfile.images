@@ -22,6 +22,12 @@ ARG K9S_VERSION=v0.50.18
 ARG HELM_VERSION=v3.17.3
 ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
 
+# OS-128 Phase 4: select binary source for final images. `build` (default)
+# compiles Rust inside the builder stages below; `prebuilt` consumes binaries
+# staged at deploy/docker/.build/prebuilt-binaries/<arch>/. Declared at global
+# scope so BuildKit can substitute it in `FROM *-binary-${BINARY_SOURCE}`.
+ARG BINARY_SOURCE=build
+
 # ---------------------------------------------------------------------------
 # Shared Rust build stages
 # ---------------------------------------------------------------------------
@@ -49,6 +55,7 @@ COPY crates/openshell-bootstrap/Cargo.toml crates/openshell-bootstrap/Cargo.toml
 COPY crates/openshell-cli/Cargo.toml crates/openshell-cli/Cargo.toml
 COPY crates/openshell-core/Cargo.toml crates/openshell-core/Cargo.toml
 COPY crates/openshell-driver-kubernetes/Cargo.toml crates/openshell-driver-kubernetes/Cargo.toml
+COPY crates/openshell-driver-podman/Cargo.toml crates/openshell-driver-podman/Cargo.toml
 COPY crates/openshell-ocsf/Cargo.toml crates/openshell-ocsf/Cargo.toml
 COPY crates/openshell-policy/Cargo.toml crates/openshell-policy/Cargo.toml
 COPY crates/openshell-providers/Cargo.toml crates/openshell-providers/Cargo.toml
@@ -66,6 +73,7 @@ RUN mkdir -p \
       crates/openshell-cli/src \
       crates/openshell-core/src \
       crates/openshell-driver-kubernetes/src \
+      crates/openshell-driver-podman/src \
       crates/openshell-ocsf/src \
       crates/openshell-policy/src \
       crates/openshell-providers/src \
@@ -80,6 +88,8 @@ RUN mkdir -p \
     touch crates/openshell-core/src/lib.rs && \
     touch crates/openshell-driver-kubernetes/src/lib.rs && \
     printf 'fn main() {}\n' > crates/openshell-driver-kubernetes/src/main.rs && \
+    touch crates/openshell-driver-podman/src/lib.rs && \
+    printf 'fn main() {}\n' > crates/openshell-driver-podman/src/main.rs && \
     touch crates/openshell-ocsf/src/lib.rs && \
     touch crates/openshell-policy/src/lib.rs && \
     touch crates/openshell-providers/src/lib.rs && \
@@ -115,6 +125,7 @@ ARG OPENSHELL_CARGO_VERSION
 
 COPY crates/openshell-core/ crates/openshell-core/
 COPY crates/openshell-driver-kubernetes/ crates/openshell-driver-kubernetes/
+COPY crates/openshell-driver-podman/ crates/openshell-driver-podman/
 COPY crates/openshell-ocsf/ crates/openshell-ocsf/
 COPY crates/openshell-policy/ crates/openshell-policy/
 COPY crates/openshell-providers/ crates/openshell-providers/
@@ -173,10 +184,43 @@ RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/us
     mkdir -p /build/out && \
     cp "$(cross_output_dir release)/openshell-sandbox" /build/out/
 
+# ---------------------------------------------------------------------------
+# Binary source selector (OS-128 Phase 4)
+# ---------------------------------------------------------------------------
+# `BINARY_SOURCE` is declared at global scope above (near the other version
+# ARGs). `build` (default) routes through the Rust builder stages above;
+# `prebuilt` routes through the scratch stages below, which COPY from
+#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-{gateway,sandbox}
+# in the build context. Prebuilt-artifact production + end-to-end workflow
+# wiring land in later Phase 4 PRs; the `prebuilt` path is inert unless a
+# caller sets BINARY_SOURCE=prebuilt and stages the binaries.
+
+FROM gateway-builder AS gateway-binary-build
+# Inherits /build/out/openshell-gateway from the cargo build stage.
+
+FROM scratch AS gateway-binary-prebuilt
+ARG TARGETARCH
+# --chmod=755 preserves the executable bit through actions/upload-artifact +
+# download-artifact, which strip exec perms during the roundtrip.
+COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /build/out/openshell-gateway
+
+FROM gateway-binary-${BINARY_SOURCE} AS gateway-binary
+
+FROM supervisor-builder AS supervisor-binary-build
+# Inherits /build/out/openshell-sandbox from the cargo build stage.
+
+FROM scratch AS supervisor-binary-prebuilt
+ARG TARGETARCH
+# --chmod=755 preserves the executable bit through actions/upload-artifact +
+# download-artifact, which strip exec perms during the roundtrip.
+COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /build/out/openshell-sandbox
+
+FROM supervisor-binary-${BINARY_SOURCE} AS supervisor-binary
+
 # Minimal extraction stage for fast-deploy: exports only the supervisor
 # binary (~20-40 MB) instead of the entire build environment (~968 MB).
 FROM scratch AS supervisor-output
-COPY --from=supervisor-builder /build/out/openshell-sandbox /openshell-sandbox
+COPY --from=supervisor-binary /build/out/openshell-sandbox /openshell-sandbox
 
 # ---------------------------------------------------------------------------
 # Final gateway image
@@ -192,7 +236,7 @@ RUN useradd --create-home --user-group openshell
 
 WORKDIR /app
 
-COPY --from=gateway-builder /build/out/openshell-gateway /usr/local/bin/
+COPY --from=gateway-binary /build/out/openshell-gateway /usr/local/bin/
 
 RUN mkdir -p /build/crates/openshell-server
 COPY --chmod=755 crates/openshell-server/migrations /build/crates/openshell-server/migrations
@@ -217,7 +261,7 @@ RUN useradd --create-home --user-group openshell
 
 WORKDIR /app
 
-COPY --from=supervisor-builder /build/out/openshell-sandbox /usr/local/bin/
+COPY --from=supervisor-binary /build/out/openshell-sandbox /usr/local/bin/
 
 USER openshell
 
@@ -287,7 +331,7 @@ COPY --from=nvidia-container-toolkit /usr/bin/nvidia-cdi-hook /usr/bin/
 COPY --from=nvidia-container-toolkit /usr/bin/nvidia-container-runtime /usr/bin/
 COPY --from=nvidia-container-toolkit /usr/bin/nvidia-ctk /usr/bin/
 COPY --from=nvidia-container-toolkit /etc/nvidia-container-runtime /etc/nvidia-container-runtime
-COPY --from=supervisor-builder /build/out/openshell-sandbox /opt/openshell/bin/openshell-sandbox
+COPY --from=supervisor-binary /build/out/openshell-sandbox /opt/openshell/bin/openshell-sandbox
 
 RUN mkdir -p /var/lib/rancher/k3s/server/manifests \
              /var/lib/rancher/k3s/server/static/charts \

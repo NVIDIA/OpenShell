@@ -99,7 +99,7 @@ This stores `auth_mode = "plaintext"`, skips mTLS certificate extraction, and by
 
 All connection artifacts are stored under `$XDG_CONFIG_HOME/openshell/` (default `~/.config/openshell/`):
 
-```
+```text
 openshell/
   active_gateway                          # plain text: active gateway name
   gateways/

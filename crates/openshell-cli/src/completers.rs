@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use clap_complete::engine::CompletionCandidate;
 use openshell_bootstrap::{list_gateways, load_active_gateway, load_gateway_metadata};
+use openshell_core::ObjectName;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{ListProvidersRequest, ListSandboxesRequest};
 use tonic::transport::{Channel, Endpoint};
@@ -33,6 +34,7 @@ pub fn complete_sandbox_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
             .list_sandboxes(ListSandboxesRequest {
                 limit: 200,
                 offset: 0,
+                label_selector: String::new(),
             })
             .await
             .ok()?;
@@ -41,7 +43,7 @@ pub fn complete_sandbox_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
                 .into_inner()
                 .sandboxes
                 .into_iter()
-                .map(|s| CompletionCandidate::new(s.name))
+                .map(|s| CompletionCandidate::new(s.object_name()))
                 .collect(),
         )
     })
@@ -64,7 +66,7 @@ pub fn complete_provider_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
                 .into_inner()
                 .providers
                 .into_iter()
-                .map(|p| CompletionCandidate::new(p.name))
+                .map(|p| CompletionCandidate::new(p.object_name()))
                 .collect(),
         )
     })

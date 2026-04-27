@@ -58,7 +58,7 @@ async fn sandbox_file_upload_download_round_trip() {
 
     let download_str = download_dir.to_str().expect("download path is UTF-8");
     guard
-        .download("/sandbox/uploaded", download_str)
+        .download("/sandbox/uploaded/upload", download_str)
         .await
         .expect("download directory");
 
@@ -108,7 +108,7 @@ async fn sandbox_file_upload_download_round_trip() {
 
     let large_down_str = large_down.to_str().expect("large_down path is UTF-8");
     guard
-        .download("/sandbox/large_test", large_down_str)
+        .download("/sandbox/large_test/large_upload", large_down_str)
         .await
         .expect("download large file");
 

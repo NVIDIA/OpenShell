@@ -11,6 +11,8 @@
 
 set -euo pipefail
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/container-engine.sh"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SCRIPT_DIR="${ROOT}/crates/openshell-vm/scripts"
 IMAGE_REPO_BASE="${IMAGE_REPO_BASE:-openshell}"
@@ -148,8 +150,8 @@ patch_vm_helmchart "${ROOTFS_DIR}/var/lib/rancher/k3s/server/manifests/openshell
 # be baked into the rootfs last time it was rebuilt.
 SERVER_IMAGE_TAR="${ROOTFS_DIR}/var/lib/rancher/k3s/agent/images/openshell-server.tar.zst"
 SERVER_IMAGE_ID_FILE="${ROOTFS_DIR}/opt/openshell/.gateway-image-id"
-if command -v docker >/dev/null 2>&1 && docker image inspect "${SERVER_IMAGE}" >/dev/null 2>&1; then
-    current_image_id=$(docker image inspect --format '{{.Id}}' "${SERVER_IMAGE}")
+if ce image inspect "${SERVER_IMAGE}" >/dev/null 2>&1; then
+    current_image_id=$(ce image inspect --format '{{.Id}}' "${SERVER_IMAGE}")
     previous_image_id=""
     if [ -f "${SERVER_IMAGE_ID_FILE}" ]; then
         previous_image_id=$(cat "${SERVER_IMAGE_ID_FILE}")
@@ -158,7 +160,7 @@ if command -v docker >/dev/null 2>&1 && docker image inspect "${SERVER_IMAGE}" >
     if [ "${current_image_id}" != "${previous_image_id}" ] || [ ! -f "${SERVER_IMAGE_TAR}" ]; then
         mkdir -p "$(dirname "${SERVER_IMAGE_TAR}")" "$(dirname "${SERVER_IMAGE_ID_FILE}")"
         tmp_tar=$(mktemp /tmp/openshell-server-image.XXXXXX)
-        docker save "${SERVER_IMAGE}" | zstd -f -T0 -3 -o "${tmp_tar}" >/dev/null
+        ce save "${SERVER_IMAGE}" | zstd -f -T0 -3 -o "${tmp_tar}" >/dev/null
         mv "${tmp_tar}" "${SERVER_IMAGE_TAR}"
         printf '%s\n' "${current_image_id}" > "${SERVER_IMAGE_ID_FILE}"
         echo "  updated: /var/lib/rancher/k3s/agent/images/openshell-server.tar.zst"

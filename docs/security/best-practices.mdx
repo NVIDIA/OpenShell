@@ -106,7 +106,7 @@ This enables credential injection and L7 inspection without explicit configurati
 
 | Aspect | Detail |
 |---|---|
-| Default | Auto-detect and terminate. OpenShell generates the sandbox CA at startup and injects it into the process trust stores (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`). |
+| Default | Auto-detect and terminate. OpenShell generates the sandbox CA at startup and injects it into the process trust stores (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`). |
 | What you can change | Set `tls: skip` on an endpoint to disable TLS detection and termination for that endpoint. Use this for client-certificate mTLS to upstream or non-standard binary protocols. |
 | Risk if relaxed | `tls: skip` disables credential injection and L7 inspection for that endpoint. The proxy relays encrypted traffic without seeing the contents. |
 | Recommendation | Use auto-detect (the default) for most endpoints. Use `tls: skip` only when the upstream requires the client's own TLS certificate (mTLS) or uses a non-HTTP protocol. |

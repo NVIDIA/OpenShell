@@ -74,9 +74,11 @@ impl SandboxGuard {
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        let output = cmd
-            .output()
+        let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())
             .await
+            .map_err(|_| {
+                format!("sandbox create timed out after {SANDBOX_READY_TIMEOUT:?}")
+            })?
             .map_err(|e| format!("failed to spawn openshell: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -226,9 +228,13 @@ impl SandboxGuard {
             .args(command);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        let output = cmd
-            .output()
+        let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())
             .await
+            .map_err(|_| {
+                format!(
+                    "sandbox create --upload timed out after {SANDBOX_READY_TIMEOUT:?}"
+                )
+            })?
             .map_err(|e| format!("failed to spawn openshell: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();

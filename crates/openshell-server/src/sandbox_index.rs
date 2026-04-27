@@ -27,18 +27,20 @@ impl SandboxIndex {
 
     pub fn update_from_sandbox(&self, sandbox: &Sandbox) {
         let mut inner = self.inner.write().expect("sandbox index lock poisoned");
-        if !sandbox.name.is_empty() {
-            inner
-                .sandbox_name_to_id
-                .insert(sandbox.name.clone(), sandbox.id.clone());
-        }
+        if let Some(metadata) = &sandbox.metadata {
+            if !metadata.name.is_empty() {
+                inner
+                    .sandbox_name_to_id
+                    .insert(metadata.name.clone(), metadata.id.clone());
+            }
 
-        if let Some(status) = sandbox.status.as_ref()
-            && !status.agent_pod.is_empty()
-        {
-            inner
-                .agent_pod_to_id
-                .insert(status.agent_pod.clone(), sandbox.id.clone());
+            if let Some(status) = sandbox.status.as_ref()
+                && !status.agent_pod.is_empty()
+            {
+                inner
+                    .agent_pod_to_id
+                    .insert(status.agent_pod.clone(), metadata.id.clone());
+            }
         }
     }
 

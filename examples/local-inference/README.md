@@ -41,7 +41,7 @@ openshell sandbox create \
 
 Expected output (with the streaming buffering bug present):
 
-```
+```text
 ============================================================
 NON-STREAMING REQUEST
 ============================================================
@@ -132,7 +132,7 @@ inference is configured to use.
 
 Expected output:
 
-```
+```text
 model=<backend model name>
 content=NAV_OK
 ```

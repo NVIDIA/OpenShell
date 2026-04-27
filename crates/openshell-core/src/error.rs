@@ -103,3 +103,20 @@ impl Error {
         }
     }
 }
+
+/// Error type shared by all compute driver implementations.
+///
+/// Both the Podman and Kubernetes drivers map their backend-specific
+/// errors into these variants before crossing crate boundaries.
+#[derive(Debug, Error)]
+pub enum ComputeDriverError {
+    /// The requested sandbox already exists.
+    #[error("sandbox already exists")]
+    AlreadyExists,
+    /// A precondition for the operation was not met.
+    #[error("{0}")]
+    Precondition(String),
+    /// Generic error message.
+    #[error("{0}")]
+    Message(String),
+}

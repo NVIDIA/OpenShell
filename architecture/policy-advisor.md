@@ -208,6 +208,7 @@ The TUI sandbox screen includes a "Network Rules" panel accessible via `[r]` fro
 - Expanded detail popup with full binary path, rationale, security notes, and proposed rule
 
 Keybindings are state-aware:
+
 - **Pending** → `[a]` approve, `[x]` reject, `[A]` approve all
 - **Approved** → `[x]` revoke
 - **Rejected** → `[a]` approve

@@ -37,13 +37,13 @@ description = "Clean build artifacts"
 run = "cargo clean"
 
 [fmt]
-description = "Format Rust and Python code"
-depends = ["rust:format", "python:format"]
+description = "Format code"
+depends = ["rust:format", "python:format", "markdown:format"]
 hide = true
 
 [lint]
 description = "Run repository lint checks"
-depends = ["license:check", "rust:format:check", "rust:lint", "python:format:check", "python:lint", "helm:lint"]
+depends = ["license:check", "rust:format:check", "rust:lint", "python:format:check", "python:lint", "helm:lint", "markdown:lint"]
 hide = true
 
 [ci]

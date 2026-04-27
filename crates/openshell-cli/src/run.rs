@@ -34,6 +34,7 @@ use openshell_core::proto::{
     UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
+use openshell_core::{ObjectId, ObjectName};
 use openshell_providers::{
     ProviderRegistry, detect_provider_from_command, normalize_provider_type,
 };
@@ -403,7 +404,7 @@ fn print_sandbox_header(sandbox: &Sandbox, display: Option<&ProvisioningDisplay>
         format!(
             "{} {}",
             "Created sandbox:".cyan().bold(),
-            sandbox.name.bold()
+            sandbox.object_name().bold()
         ),
         String::new(),
     ];
@@ -1963,6 +1964,7 @@ pub async fn sandbox_create_with_bootstrap(
         tty_override,
         Some(false),
         auto_providers_override,
+        &std::collections::HashMap::new(),
         &tls,
     )
     .await
@@ -2018,6 +2020,7 @@ pub async fn sandbox_create(
     tty_override: Option<bool>,
     bootstrap_override: Option<bool>,
     auto_providers_override: Option<bool>,
+    labels: &std::collections::HashMap<String, String>,
     tls: &TlsOptions,
 ) -> Result<()> {
     if editor.is_some() && !command.is_empty() {
@@ -2120,6 +2123,7 @@ pub async fn sandbox_create(
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
+        labels: labels.clone(),
     };
 
     let response = match client.create_sandbox(request).await {
@@ -2139,7 +2143,11 @@ pub async fn sandbox_create(
 
     let interactive = std::io::stdout().is_terminal();
     let persist = sandbox_should_persist(keep, forward.as_ref());
-    let sandbox_name = sandbox.name.clone();
+    let sandbox_name = if sandbox.object_name().is_empty() {
+        "unknown".to_string()
+    } else {
+        sandbox.object_name().to_string()
+    };
 
     // Record this sandbox as the last-used for the active gateway only when it
     // is expected to persist beyond the initial session.
@@ -2174,9 +2182,14 @@ pub async fn sandbox_create(
     // a newly created sandbox.  Instead we handle termination client-side:
     // we wait until we have observed at least one non-Ready phase followed
     // by Ready (a genuine Provisioning → Ready transition).
+    let sandbox_id = if sandbox.object_id().is_empty() {
+        "unknown".to_string()
+    } else {
+        sandbox.object_id().to_string()
+    };
     let mut stream = client
         .watch_sandbox(WatchSandboxRequest {
-            id: sandbox.id.clone(),
+            id: sandbox_id.clone(),
             follow_status: true,
             follow_logs: true,
             follow_events: true,
@@ -2757,10 +2770,14 @@ pub async fn sandbox_get(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
+    let sandbox_id = if sandbox.object_id().is_empty() {
+        return Err(miette::miette!("sandbox missing metadata"));
+    } else {
+        sandbox.object_id().to_string()
+    };
+
     let config = client
-        .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_id: sandbox.id.clone(),
-        })
+        .get_sandbox_config(GetSandboxConfigRequest { sandbox_id })
         .await
         .into_diagnostic()?
         .into_inner();
@@ -2779,10 +2796,31 @@ pub async fn sandbox_get(
 
     println!("{}", "Sandbox:".cyan().bold());
     println!();
-    println!("  {} {}", "Id:".dimmed(), sandbox.id);
-    println!("  {} {}", "Name:".dimmed(), sandbox.name);
-    println!("  {} {}", "Namespace:".dimmed(), sandbox.namespace);
+    let id = if sandbox.object_id().is_empty() {
+        "unknown"
+    } else {
+        sandbox.object_id()
+    };
+    let name = if sandbox.object_name().is_empty() {
+        "unknown"
+    } else {
+        sandbox.object_name()
+    };
+    println!("  {} {}", "Id:".dimmed(), id);
+    println!("  {} {}", "Name:".dimmed(), name);
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase));
+
+    // Display labels if present
+    if let Some(metadata) = &sandbox.metadata {
+        if !metadata.labels.is_empty() {
+            println!("  {} ", "Labels:".dimmed());
+            let mut labels: Vec<_> = metadata.labels.iter().collect();
+            labels.sort_by_key(|(k, _)| *k);
+            for (key, value) in labels {
+                println!("    {}: {}", key, value);
+            }
+        }
+    }
 
     let policy_from_global = config.policy_source == PolicySource::Global as i32;
     println!(
@@ -2889,7 +2927,7 @@ pub async fn sandbox_exec_grpc(
     // Make the streaming gRPC call.
     let mut stream = client
         .exec_sandbox(ExecSandboxRequest {
-            sandbox_id: sandbox.id,
+            sandbox_id: sandbox.object_id().to_string(),
             command: command.to_vec(),
             workdir: workdir.unwrap_or_default().to_string(),
             environment: HashMap::new(),
@@ -2993,12 +3031,17 @@ pub async fn sandbox_list(
     offset: u32,
     ids_only: bool,
     names_only: bool,
+    label_selector: Option<&str>,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
     let response = client
-        .list_sandboxes(ListSandboxesRequest { limit, offset })
+        .list_sandboxes(ListSandboxesRequest {
+            limit,
+            offset,
+            label_selector: label_selector.unwrap_or("").to_string(),
+        })
         .await
         .into_diagnostic()?;
 
@@ -3012,14 +3055,14 @@ pub async fn sandbox_list(
 
     if ids_only {
         for sandbox in sandboxes {
-            println!("{}", sandbox.id);
+            println!("{}", sandbox.object_id());
         }
         return Ok(());
     }
 
     if names_only {
         for sandbox in sandboxes {
-            println!("{}", sandbox.name);
+            println!("{}", sandbox.object_name().to_string());
         }
         return Ok(());
     }
@@ -3027,23 +3070,16 @@ pub async fn sandbox_list(
     // Calculate column widths
     let name_width = sandboxes
         .iter()
-        .map(|s| s.name.len())
+        .map(|s| s.object_name().len())
         .max()
         .unwrap_or(4)
         .max(4);
-    let ns_width = sandboxes
-        .iter()
-        .map(|s| s.namespace.len())
-        .max()
-        .unwrap_or(9)
-        .max(9);
     let created_width = 19; // "YYYY-MM-DD HH:MM:SS"
 
     // Print header
     println!(
-        "{:<name_width$}  {:<ns_width$}  {:<created_width$}  {}",
+        "{:<name_width$}  {:<created_width$}  {}",
         "NAME".bold(),
-        "NAMESPACE".bold(),
         "CREATED".bold(),
         "PHASE".bold(),
     );
@@ -3058,10 +3094,18 @@ pub async fn sandbox_list(
             Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
             _ => phase.to_string(),
         };
-        let created = format_epoch_ms(sandbox.created_at_ms);
+        let created = format_epoch_ms(
+            sandbox
+                .metadata
+                .as_ref()
+                .map(|m| m.created_at_ms)
+                .unwrap_or(0),
+        );
         println!(
-            "{:<name_width$}  {:<ns_width$}  {:<created_width$}  {}",
-            sandbox.name, sandbox.namespace, created, phase_colored,
+            "{:<name_width$}  {:<created_width$}  {}",
+            sandbox.object_name().to_string(),
+            created,
+            phase_colored,
         );
     }
 
@@ -3084,6 +3128,7 @@ pub async fn sandbox_delete(
             .list_sandboxes(ListSandboxesRequest {
                 limit: 1000,
                 offset: 0,
+                label_selector: String::new(),
             })
             .await
             .into_diagnostic()?;
@@ -3092,7 +3137,10 @@ pub async fn sandbox_delete(
             println!("No sandboxes to delete.");
             return Ok(());
         }
-        sandboxes.into_iter().map(|s| s.name).collect()
+        sandboxes
+            .into_iter()
+            .map(|s| s.object_name().to_string())
+            .collect()
     } else {
         names.to_vec()
     };
@@ -3169,12 +3217,12 @@ pub async fn ensure_required_providers(
                 .into_diagnostic()?;
             let providers = response.into_inner().providers;
             for provider in &providers {
-                known_names.insert(provider.name.clone());
+                known_names.insert(provider.object_name().to_string());
                 if !provider.r#type.is_empty() {
                     let type_lower = provider.r#type.to_ascii_lowercase();
                     type_to_name
                         .entry(type_lower)
-                        .or_insert_with(|| provider.name.clone());
+                        .or_insert_with(|| provider.object_name().to_string());
                 }
             }
             if providers.len() < limit as usize {
@@ -3319,8 +3367,12 @@ async fn auto_create_provider(
         // Explicit name: create with exactly that name, no retries.
         let request = CreateProviderRequest {
             provider: Some(Provider {
-                id: String::new(),
-                name: exact_name.to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: exact_name.to_string(),
+                    created_at_ms: 0,
+                    labels: std::collections::HashMap::new(),
+                }),
                 r#type: provider_type.to_string(),
                 credentials: discovered.credentials.clone(),
                 config: discovered.config.clone(),
@@ -3337,11 +3389,11 @@ async fn auto_create_provider(
         eprintln!(
             "{} Created provider {} ({}) from existing local state",
             "✓".green().bold(),
-            provider.name,
+            provider.object_name().to_string(),
             provider.r#type
         );
-        if seen_names.insert(provider.name.clone()) {
-            configured_names.push(provider.name);
+        if seen_names.insert(provider.object_name().to_string()) {
+            configured_names.push(provider.object_name().to_string());
         }
     } else {
         // Inferred type: try type as name, then suffixed variants.
@@ -3355,8 +3407,12 @@ async fn auto_create_provider(
 
             let request = CreateProviderRequest {
                 provider: Some(Provider {
-                    id: String::new(),
-                    name: name.clone(),
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: String::new(),
+                        name: name.clone(),
+                        created_at_ms: 0,
+                        labels: std::collections::HashMap::new(),
+                    }),
                     r#type: provider_type.to_string(),
                     credentials: discovered.credentials.clone(),
                     config: discovered.config.clone(),
@@ -3372,11 +3428,11 @@ async fn auto_create_provider(
                     eprintln!(
                         "{} Created provider {} ({}) from existing local state",
                         "✓".green().bold(),
-                        provider.name,
+                        provider.object_name().to_string(),
                         provider.r#type
                     );
-                    if seen_names.insert(provider.name.clone()) {
-                        configured_names.push(provider.name);
+                    if seen_names.insert(provider.object_name().to_string()) {
+                        configured_names.push(provider.object_name().to_string());
                     }
                     created = true;
                     break;
@@ -3509,8 +3565,12 @@ pub async fn provider_create(
     let response = client
         .create_provider(CreateProviderRequest {
             provider: Some(Provider {
-                id: String::new(),
-                name: name.to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: name.to_string(),
+                    created_at_ms: 0,
+                    labels: std::collections::HashMap::new(),
+                }),
                 r#type: provider_type,
                 credentials: credential_map,
                 config: config_map,
@@ -3524,7 +3584,11 @@ pub async fn provider_create(
         .provider
         .ok_or_else(|| miette::miette!("provider missing from response"))?;
 
-    println!("{} Created provider {}", "✓".green().bold(), provider.name);
+    println!(
+        "{} Created provider {}",
+        "✓".green().bold(),
+        provider.object_name().to_string()
+    );
     Ok(())
 }
 
@@ -3547,8 +3611,12 @@ pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<
 
     println!("{}", "Provider:".cyan().bold());
     println!();
-    println!("  {} {}", "Id:".dimmed(), provider.id);
-    println!("  {} {}", "Name:".dimmed(), provider.name);
+    println!("  {} {}", "Id:".dimmed(), provider.object_id().to_string());
+    println!(
+        "  {} {}",
+        "Name:".dimmed(),
+        provider.object_name().to_string()
+    );
     println!("  {} {}", "Type:".dimmed(), provider.r#type);
     println!(
         "  {} {}",
@@ -3595,14 +3663,14 @@ pub async fn provider_list(
 
     if names_only {
         for provider in providers {
-            println!("{}", provider.name);
+            println!("{}", provider.object_name().to_string());
         }
         return Ok(());
     }
 
     let name_width = providers
         .iter()
-        .map(|provider| provider.name.len())
+        .map(|provider| provider.object_name().len())
         .max()
         .unwrap_or(4)
         .max(4);
@@ -3624,7 +3692,7 @@ pub async fn provider_list(
     for provider in providers {
         println!(
             "{:<name_width$}  {:<type_width$}  {:<16}  {}",
-            provider.name,
+            provider.object_name().to_string(),
             provider.r#type,
             provider.credentials.len(),
             provider.config.len(),
@@ -3687,8 +3755,12 @@ pub async fn provider_update(
     let response = client
         .update_provider(UpdateProviderRequest {
             provider: Some(Provider {
-                id: String::new(),
-                name: name.to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: name.to_string(),
+                    created_at_ms: 0,
+                    labels: std::collections::HashMap::new(),
+                }),
                 r#type: String::new(),
                 credentials: credential_map,
                 config: config_map,
@@ -3702,7 +3774,11 @@ pub async fn provider_update(
         .provider
         .ok_or_else(|| miette::miette!("provider missing from response"))?;
 
-    println!("{} Updated provider {}", "✓".green().bold(), provider.name);
+    println!(
+        "{} Updated provider {}",
+        "✓".green().bold(),
+        provider.object_name().to_string()
+    );
     Ok(())
 }
 
@@ -4275,7 +4351,7 @@ pub async fn sandbox_settings_get(
 
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_id: sandbox.id.clone(),
+            sandbox_id: sandbox.object_id().to_string(),
         })
         .await
         .into_diagnostic()?
@@ -4724,10 +4800,14 @@ pub async fn sandbox_policy_update(
         .sandbox
         .ok_or_else(|| miette!("sandbox not found"))?;
 
+    let sandbox_id = if sandbox.object_id().is_empty() {
+        return Err(miette!("sandbox missing metadata"));
+    } else {
+        sandbox.object_id().to_string()
+    };
+
     let current = client
-        .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_id: sandbox.id.clone(),
-        })
+        .get_sandbox_config(GetSandboxConfigRequest { sandbox_id })
         .await
         .into_diagnostic()?
         .into_inner();
@@ -5084,7 +5164,7 @@ pub async fn sandbox_logs(
         // Streaming mode: use WatchSandbox.
         let mut stream = client
             .watch_sandbox(WatchSandboxRequest {
-                id: sandbox.id.clone(),
+                id: sandbox.object_id().to_string(),
                 follow_status: false,
                 follow_logs: true,
                 follow_events: false,
@@ -5111,7 +5191,7 @@ pub async fn sandbox_logs(
         // One-shot mode: use GetSandboxLogs.
         let resp = client
             .get_sandbox_logs(GetSandboxLogsRequest {
-                sandbox_id: sandbox.id.clone(),
+                sandbox_id: sandbox.object_id().to_string(),
                 lines,
                 since_ms,
                 sources: source_filter,

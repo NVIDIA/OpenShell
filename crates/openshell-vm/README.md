@@ -121,7 +121,7 @@ Each instance gets its own extracted rootfs under `~/.local/share/openshell/open
 
 ## CLI Reference
 
-```
+```text
 openshell-vm [OPTIONS] [COMMAND]
 
 Options:
@@ -179,7 +179,7 @@ FROM_SOURCE=1 mise run vm:setup
 
 ## Architecture
 
-```
+```text
 Host (macOS / Linux)
   openshell-vm binary
     |-- Embedded runtime (libkrun, libkrunfw, gvproxy, rootfs.tar.zst)
