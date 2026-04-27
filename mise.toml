@@ -24,6 +24,7 @@ helm = "4.1.4"
 "github:anchore/syft" = { version = "1.42.3" }
 "github:EmbarkStudios/cargo-about" = { version = "0.8.4", version_prefix = "" }
 zig = "0.14.1"
+"cargo:cargo-zigbuild" = { version = "0.22.3", os = ["macos"] }
 "npm:markdownlint-cli2" = "0.22.0"
 
 [env]
