@@ -682,11 +682,7 @@ impl ComputeDriver for DockerComputeDriver {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
         let request = request.into_inner();
-        if request.sandbox_id.is_empty() && request.sandbox_name.is_empty() {
-            return Err(Status::invalid_argument(
-                "sandbox_id or sandbox_name is required",
-            ));
-        }
+        require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
 
         let sandbox = self
             .get_sandbox_snapshot(&request.sandbox_id, &request.sandbox_name)
@@ -730,11 +726,7 @@ impl ComputeDriver for DockerComputeDriver {
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
         let request = request.into_inner();
-        if request.sandbox_id.is_empty() && request.sandbox_name.is_empty() {
-            return Err(Status::invalid_argument(
-                "sandbox_id or sandbox_name is required",
-            ));
-        }
+        require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
 
         self.stop_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
             .await?;
@@ -746,6 +738,8 @@ impl ComputeDriver for DockerComputeDriver {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let request = request.into_inner();
+        require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
+
         Ok(Response::new(DeleteSandboxResponse {
             deleted: self
                 .delete_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
@@ -901,9 +895,13 @@ fn build_container_create_body(
     );
     labels.insert(SANDBOX_ID_LABEL_KEY.to_string(), sandbox.id.clone());
     labels.insert(SANDBOX_NAME_LABEL_KEY.to_string(), sandbox.name.clone());
+    // The list/get/find paths filter by `config.sandbox_namespace`, so use
+    // the same value here. `DriverSandbox.namespace` is unset on the request
+    // path (the gateway elides it), and using it would produce containers
+    // that the driver itself cannot find afterwards.
     labels.insert(
         SANDBOX_NAMESPACE_LABEL_KEY.to_string(),
-        sandbox.namespace.clone(),
+        config.sandbox_namespace.clone(),
     );
 
     Ok(ContainerCreateBody {
@@ -937,6 +935,20 @@ fn build_container_create_body(
         }),
         ..Default::default()
     })
+}
+
+/// Reject driver requests that arrive with neither a sandbox id nor a
+/// sandbox name. Without this guard, downstream label filters degenerate
+/// to "match every managed container in the namespace", which would let
+/// `delete_sandbox`/`stop_sandbox`/`get_sandbox` pick an arbitrary
+/// sandbox out of the set the driver manages.
+fn require_sandbox_identifier(sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
+    if sandbox_id.is_empty() && sandbox_name.is_empty() {
+        return Err(Status::invalid_argument(
+            "sandbox_id or sandbox_name is required",
+        ));
+    }
+    Ok(())
 }
 
 fn sandbox_log_level(sandbox: &DriverSandbox, default_level: &str) -> String {

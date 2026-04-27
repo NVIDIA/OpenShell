@@ -11,10 +11,13 @@ use tempfile::TempDir;
 const TLS_MOUNT_DIR: &str = "/etc/openshell/tls/client";
 
 fn test_sandbox() -> DriverSandbox {
+    // Mirrors the gateway-supplied request: the public `Sandbox` API no
+    // longer carries `namespace`, so the gateway elides the field and the
+    // driver must source it from its own runtime config.
     DriverSandbox {
         id: "sbx-123".to_string(),
         name: "demo".to_string(),
-        namespace: "default".to_string(),
+        namespace: String::new(),
         spec: Some(DriverSandboxSpec {
             log_level: "debug".to_string(),
             environment: HashMap::from([("SPEC_ENV".to_string(), "spec".to_string())]),
@@ -165,6 +168,45 @@ fn build_container_create_body_clears_inherited_cmd() {
             .as_ref()
             .and_then(|labels| labels.get(SANDBOX_NAMESPACE_LABEL_KEY)),
         Some(&"default".to_string())
+    );
+}
+
+#[test]
+fn require_sandbox_identifier_rejects_when_id_and_name_are_empty() {
+    // Regression test: `delete_sandbox` (and the other identifier-keyed
+    // RPCs) must refuse requests where both the id and the name are
+    // empty. Otherwise the empty filters fed to
+    // `find_managed_container_summary` match the first managed container
+    // in the namespace, allowing an arbitrary sandbox to be deleted.
+    let err = require_sandbox_identifier("", "").unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("sandbox_id or sandbox_name"));
+
+    require_sandbox_identifier("sbx-1", "").expect("id-only is accepted");
+    require_sandbox_identifier("", "demo").expect("name-only is accepted");
+    require_sandbox_identifier("sbx-1", "demo").expect("id and name is accepted");
+}
+
+#[test]
+fn build_container_create_body_uses_runtime_namespace_label() {
+    // Regression test: the namespace label must come from the driver's
+    // runtime config, not from `DriverSandbox.namespace`. The gateway
+    // does not populate `DriverSandbox.namespace`, so a container created
+    // with that empty value would not match subsequent list/get/find
+    // queries (which filter on `config.sandbox_namespace`), leaking
+    // sandboxes that the driver itself cannot observe.
+    let mut config = runtime_config();
+    config.sandbox_namespace = "tenant-a".to_string();
+    let mut sandbox = test_sandbox();
+    sandbox.namespace = "ignored-by-driver".to_string();
+
+    let create_body = build_container_create_body(&sandbox, &config).unwrap();
+    let labels = create_body.labels.expect("labels are populated");
+
+    assert_eq!(
+        labels.get(SANDBOX_NAMESPACE_LABEL_KEY),
+        Some(&"tenant-a".to_string()),
+        "namespace label must reflect the driver's runtime config"
     );
 }
 
