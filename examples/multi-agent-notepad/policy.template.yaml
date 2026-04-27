@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_write: [/sandbox, /tmp, /dev/null]
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_policies:
+  codex:
+    name: codex
+    endpoints:
+      - { host: api.openai.com, port: 443, protocol: rest, enforcement: enforce, access: full }
+      - { host: auth.openai.com, port: 443, protocol: rest, enforcement: enforce, access: full }
+      - { host: chatgpt.com, port: 443, protocol: rest, enforcement: enforce, access: full }
+      - { host: ab.chatgpt.com, port: 443, protocol: rest, enforcement: enforce, access: full }
+    binaries:
+      - { path: /usr/bin/codex }
+      - { path: /usr/bin/node }
+      - { path: "/usr/lib/node_modules/@openai/**" }
+
+  codex_plugins:
+    name: codex-plugins
+    endpoints:
+      - host: github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/openai/plugins.git/info/refs*"
+          - allow:
+              method: POST
+              path: "/openai/plugins.git/git-upload-pack"
+    binaries:
+      - { path: /usr/bin/git }
+      - { path: /usr/lib/git-core/git-remote-http }
+      - { path: "/usr/lib/node_modules/@openai/**" }
+
+  github_memory:
+    name: github-memory
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/repos/__OWNER__/__REPO__"
+          - allow:
+              method: GET
+              path: "/repos/__OWNER__/__REPO__/contents/runs/__RUN_ID__"
+          - allow:
+              method: GET
+              path: "/repos/__OWNER__/__REPO__/contents/runs/__RUN_ID__/**"
+          - allow:
+              method: PUT
+              path: "/repos/__OWNER__/__REPO__/contents/runs/__RUN_ID__/**"
+    binaries:
+      - { path: /usr/bin/curl }
