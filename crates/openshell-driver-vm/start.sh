@@ -163,6 +163,17 @@ check_supervisor_cross_toolchain() {
     fi
 }
 
+build_gateway_and_driver() {
+    local rustc_wrapper_mode="${1:-default}"
+    local cargo_prefix=()
+
+    if [ "${rustc_wrapper_mode}" = "without-rustc-wrapper" ]; then
+        cargo_prefix=(env -u RUSTC_WRAPPER)
+    fi
+
+    "${cargo_prefix[@]}" cargo build -p openshell-server -p openshell-driver-vm
+}
+
 if [ -n "${SERVER_PORT_REQUESTED}" ]; then
     if port_is_in_use "${SERVER_PORT}"; then
         echo "ERROR: requested gateway port ${SERVER_PORT} is already in use." >&2
@@ -212,7 +223,14 @@ if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ]; then
 fi
 
 echo "==> Building gateway and VM compute driver"
-cargo build -p openshell-server -p openshell-driver-vm
+if ! build_gateway_and_driver; then
+    if [ -n "${RUSTC_WRAPPER:-}" ]; then
+        echo "WARNING: gateway/driver build failed through RUSTC_WRAPPER=${RUSTC_WRAPPER}; retrying without RUSTC_WRAPPER." >&2
+        build_gateway_and_driver without-rustc-wrapper
+    else
+        exit 1
+    fi
+fi
 
 if [ "$(uname -s)" = "Darwin" ]; then
     echo "==> Codesigning VM compute driver"
