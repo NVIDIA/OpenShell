@@ -42,6 +42,9 @@ if [ -z "${PORT}" ]; then
   PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
 fi
 
+# Allocate a separate port for the unauthenticated health endpoint.
+HEALTH_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+
 # ── Pre-flight checks ───────────────────────────────────────────────
 
 if ! command -v podman &>/dev/null; then
@@ -73,7 +76,7 @@ if ! podman image exists "${SUPERVISOR_IMAGE}" 2>/dev/null; then
 fi
 
 # ── Generate a unique handshake secret ───────────────────────────────
-HANDSHAKE_SECRET="e2e-podman-$(head -c 16 /dev/urandom | xxd -p)"
+HANDSHAKE_SECRET="e2e-podman-$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 
 # ── Start the gateway ────────────────────────────────────────────────
 GW_LOG=$(mktemp /tmp/openshell-gw-podman-e2e.XXXXXX)
@@ -118,6 +121,8 @@ OPENSHELL_SSH_HANDSHAKE_SECRET="${HANDSHAKE_SECRET}" \
 OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
   "${GATEWAY_BIN}" \
     --port "${PORT}" \
+    --health-port "${HEALTH_PORT}" \
+    --ssh-gateway-port "${PORT}" \
     --drivers podman \
     --disable-tls \
     --db-url "sqlite::memory:" \
@@ -137,9 +142,8 @@ while [ "${elapsed}" -lt "${TIMEOUT}" ]; do
     exit 1
   fi
 
-  # Use curl to check the gateway's gRPC health endpoint.
-  # The gateway serves both gRPC and HTTP on the same port.
-  if curl -sf "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then
+  # Poll the dedicated health port (--health-port).
+  if curl -sf "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
     healthy=true
     break
   fi
