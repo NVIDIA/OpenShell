@@ -377,36 +377,61 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
         // proxy, and configure Landlock/seccomp. This matches the K8s
         // driver's runAsUser: 0.
         user: "0:0".into(),
-        // The sandbox supervisor needs these capabilities during startup:
-        //   SYS_ADMIN       – seccomp filter installation, namespace creation, Landlock
-        //   NET_ADMIN       – network namespace veth setup, IP/route configuration
-        //   SYS_PTRACE      – reading /proc/<pid>/exe and ancestor walk for policy
-        //   SYSLOG          – reading /dev/kmsg for bypass-detection diagnostics
-        //   SETUID          – drop_privileges(): setuid() to the sandbox user
-        //   SETGID          – drop_privileges(): setgid() + initgroups() to the sandbox group
-        //   DAC_READ_SEARCH – reading /proc/<pid>/fd/ across UIDs for process
-        //                     identity resolution. In rootless Podman the supervisor
-        //                     runs as UID 0 inside a user namespace while sandbox
-        //                     processes run as the sandbox user. The kernel's
-        //                     proc_fd_permission() calls generic_permission() which
-        //                     denies cross-UID access to the dr-x------ fd directory
-        //                     unless CAP_DAC_READ_SEARCH is present. Without it the
-        //                     proxy cannot determine which binary made each outbound
-        //                     connection and all traffic is denied.
-        // SETUID/SETGID are needed in rootless Podman: cap_drop:ALL removes them from
-        // the bounding set even though uid=0 owns the user namespace. Without them,
-        // setuid/setgid fail EPERM and the supervisor cannot drop to the sandbox user.
-        cap_drop: vec!["ALL".into()],
+        // Podman's default container capability set is already restricted:
+        //   CHOWN DAC_OVERRIDE FOWNER FSETID KILL SETGID SETUID SETPCAP
+        //   NET_BIND_SERVICE SYS_CHROOT SETFCAP
+        // We add what the supervisor needs and drop what it doesn't.
+        cap_drop: vec![
+            // Not needed: standard file permission bits are sufficient; dropping
+            // prevents the supervisor from bypassing DAC checks it shouldn't need.
+            "DAC_OVERRIDE".into(),
+            // Not needed: the supervisor does not create setuid/setgid executables.
+            "FSETID".into(),
+            // Not needed: the supervisor does not send signals to arbitrary processes.
+            "KILL".into(),
+            // Not needed: the supervisor does not bind privileged ports (<1024).
+            "NET_BIND_SERVICE".into(),
+            // Not in Podman's default set but explicitly denied in case the image
+            // or runtime adds it; raw sockets are not required.
+            "NET_RAW".into(),
+            // Not needed: the supervisor does not manipulate file capabilities.
+            "SETFCAP".into(),
+            // Not needed: the supervisor does not manage its own capability bounding set.
+            "SETPCAP".into(),
+            // Not needed: the supervisor does not call chroot().
+            "SYS_CHROOT".into(),
+        ],
         cap_add: vec![
+            // seccomp filter installation, namespace creation, Landlock setup.
             "SYS_ADMIN".into(),
+            // Network namespace veth setup, IP/route configuration.
             "NET_ADMIN".into(),
+            // Reading /proc/<pid>/exe and ancestor walk for process identity in policy.
             "SYS_PTRACE".into(),
+            // Reading /dev/kmsg for bypass-detection diagnostics.
             "SYSLOG".into(),
-            "SETUID".into(),
-            "SETGID".into(),
+            // Reading /proc/<pid>/fd/ across UIDs for process identity resolution.
+            // In rootless Podman the supervisor runs as UID 0 inside a user namespace
+            // while sandbox processes run as the sandbox user. The kernel's
+            // proc_fd_permission() calls generic_permission() which denies cross-UID
+            // access to the dr-x------ fd directory unless this cap is present.
+            // Without it the proxy cannot determine which binary made each outbound
+            // connection and all traffic is denied.
             "DAC_READ_SEARCH".into(),
         ],
-        // Disable the container-level seccomp profile. The sandbox supervisor
+        // SETUID, SETGID, CHOWN, and FOWNER are intentionally kept from Podman's
+        // default set and not dropped:
+        //   SETUID/SETGID – drop_privileges(): setuid()/setgid()/initgroups() to the
+        //                   sandbox user. In rootless Podman cap_drop:ALL removes them
+        //                   from the bounding set even though uid=0 owns the user
+        //                   namespace — so we keep them by not dropping them explicitly.
+        //   CHOWN         – prepare_filesystem(): chown(path, uid, gid) on newly
+        //                   created read_write directories so the sandbox user can
+        //                   write to them.
+        //   FOWNER        – chown on files where the supervisor is not the owner
+        //                   (e.g. pre-existing directories owned by another user).
+        //
+        // Disable the container-level seccomp profile. The sandbox supervisor The sandbox supervisor
         // installs its own policy-aware BPF seccomp filter at runtime via
         // seccompiler (two-phase: clone3 blocker + main filter). The runtime
         // filter is more restrictive than Podman's default — it blocks 20+
@@ -596,17 +621,46 @@ mod tests {
         let config = test_config();
         let spec = build_container_spec(&sandbox, &config);
 
-        let cap_add = spec["cap_add"]
+        let added: Vec<&str> = spec["cap_add"]
             .as_array()
-            .expect("cap_add should be an array");
-        let caps: Vec<&str> = cap_add.iter().filter_map(|v| v.as_str()).collect();
-        assert!(caps.contains(&"SYS_ADMIN"), "missing SYS_ADMIN");
-        assert!(caps.contains(&"NET_ADMIN"), "missing NET_ADMIN");
-        assert!(caps.contains(&"SYS_PTRACE"), "missing SYS_PTRACE");
-        assert!(caps.contains(&"SYSLOG"), "missing SYSLOG");
-        assert!(caps.contains(&"SETUID"), "missing SETUID");
-        assert!(caps.contains(&"SETGID"), "missing SETGID");
-        assert!(caps.contains(&"DAC_READ_SEARCH"), "missing DAC_READ_SEARCH");
+            .expect("cap_add should be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(added.contains(&"SYS_ADMIN"), "missing SYS_ADMIN");
+        assert!(added.contains(&"NET_ADMIN"), "missing NET_ADMIN");
+        assert!(added.contains(&"SYS_PTRACE"), "missing SYS_PTRACE");
+        assert!(added.contains(&"SYSLOG"), "missing SYSLOG");
+        assert!(
+            added.contains(&"DAC_READ_SEARCH"),
+            "missing DAC_READ_SEARCH"
+        );
+
+        // SETUID and SETGID are NOT in cap_add — they remain available from the
+        // default bounding set because we no longer use cap_drop:ALL. Verify they
+        // are also not explicitly dropped. Similarly CHOWN and FOWNER must not be
+        // dropped because prepare_filesystem() calls chown() on newly created
+        // read_write directories before the supervisor drops privileges.
+        let dropped: Vec<&str> = spec["cap_drop"]
+            .as_array()
+            .expect("cap_drop should be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(!dropped.contains(&"SETUID"), "SETUID must not be dropped");
+        assert!(!dropped.contains(&"SETGID"), "SETGID must not be dropped");
+        assert!(
+            !dropped.contains(&"CHOWN"),
+            "CHOWN must not be dropped (needed for prepare_filesystem chown)"
+        );
+        assert!(
+            !dropped.contains(&"FOWNER"),
+            "FOWNER must not be dropped (needed for chown on non-owned files)"
+        );
+        assert!(
+            !dropped.contains(&"ALL"),
+            "must not use cap_drop:ALL in rootless Podman"
+        );
     }
 
     #[test]
