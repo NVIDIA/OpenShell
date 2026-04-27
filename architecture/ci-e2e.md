@@ -6,7 +6,7 @@ This document describes the architecture of the E2E CI flow: every workflow invo
 
 Three independent goals shape the design:
 
-1. **Self-hosted runner safety.** E2E runs on `build-arm64` and on GPU runners. Standard `pull_request`-triggered workflows would let any PR author execute code on those hosts. GitHub's recommended pattern for self-hosted CI is "never trigger workflows directly from `pull_request`", and we follow it via copy-pr-bot mirroring to `pull-request/<N>` branches.
+1. **Self-hosted runner safety.** E2E runs on `build-arm64` and on GPU runners. GitHub's [security hardening guide](https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#hardening-for-self-hosted-runners) states bluntly: "Self-hosted runners should almost never be used for public repositories on GitHub, because any user can open pull requests against the repository and compromise the environment." Our workaround is the same one used elsewhere in NVIDIA's GHA infrastructure: copy-pr-bot mirrors trusted PRs into `pull-request/<N>` branches inside this repository, and the self-hosted workflows trigger on `push` to those mirror branches rather than on `pull_request`.
 2. **Label as a hard merge gate.** When a PR carries `test:e2e` (or `test:e2e-gpu`), the corresponding suite *must* have actually executed and passed for the PR head SHA. The label has to be enforcing, not advisory: it blocks merge unless the suite ran with the label set.
 3. **Per-job least privilege on the GitHub token.** Each workflow declares `permissions: {}` at the top, and each job declares only what it needs. This follows the hardening pattern described at <https://astral.sh/blog/open-source-security-at-astral>.
 
