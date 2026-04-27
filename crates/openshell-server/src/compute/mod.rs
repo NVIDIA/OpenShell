@@ -588,11 +588,14 @@ impl ComputeRuntime {
                 continue;
             }
 
-            match resume.resume_sandbox(&sandbox.id, &sandbox.name).await {
+            match resume
+                .resume_sandbox(sandbox.object_id(), sandbox.object_name())
+                .await
+            {
                 Ok(true) => {
                     info!(
-                        sandbox_id = %sandbox.id,
-                        sandbox_name = %sandbox.name,
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
                         ?phase,
                         "Resumed sandbox during gateway startup"
                     );
@@ -605,8 +608,8 @@ impl ComputeRuntime {
                     // will eventually prune it after the orphan grace
                     // period.
                     warn!(
-                        sandbox_id = %sandbox.id,
-                        sandbox_name = %sandbox.name,
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
                         "Cannot resume sandbox: backend resource is missing"
                     );
                     self.mark_sandbox_error(
@@ -619,8 +622,8 @@ impl ComputeRuntime {
                 }
                 Err(err) => {
                     warn!(
-                        sandbox_id = %sandbox.id,
-                        sandbox_name = %sandbox.name,
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
                         error = %err,
                         "Failed to resume sandbox during gateway startup"
                     );
@@ -650,9 +653,10 @@ impl ComputeRuntime {
         let _guard = self.sync_lock.lock().await;
         let mut updated = sandbox.clone();
         updated.phase = SandboxPhase::Error as i32;
+        let updated_name = updated.object_name().to_string();
         upsert_ready_condition(
             &mut updated.status,
-            &updated.name,
+            &updated_name,
             SandboxCondition {
                 r#type: "Ready".to_string(),
                 status: "False".to_string(),
@@ -664,13 +668,13 @@ impl ComputeRuntime {
         self.sandbox_index.update_from_sandbox(&updated);
         if let Err(err) = self.store.put_message(&updated).await {
             warn!(
-                sandbox_id = %sandbox.id,
+                sandbox_id = %sandbox.object_id(),
                 error = %err,
                 "Failed to persist sandbox error state during startup resume"
             );
             return;
         }
-        self.sandbox_watch_bus.notify(&sandbox.id);
+        self.sandbox_watch_bus.notify(sandbox.object_id());
     }
 
     async fn watch_loop(self: Arc<Self>) {
