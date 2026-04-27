@@ -1,0 +1,64 @@
+name: E2E Label Help
+
+# When a `test:e2e` / `test:e2e-gpu` label is applied, post a PR comment
+# telling the maintainer the next manual step. We don't dispatch the workflow
+# ourselves: a workflow_dispatch-triggered run does not surface in the PR's
+# Checks tab, so we'd lose in-progress visibility. Instead we point the
+# maintainer at either the existing run (re-run from the UI) or the
+# `/ok to test <SHA>` command needed to refresh the mirror.
+#
+# Uses `pull_request_target` so forked PRs get a token capable of posting
+# comments. The job never checks out PR code; it only calls the GitHub API.
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions: {}
+
+jobs:
+  hint:
+    name: Post next-step hint for E2E label
+    if: github.event.label.name == 'test:e2e' || github.event.label.name == 'test:e2e-gpu'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABEL_NAME: ${{ github.event.label.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$LABEL_NAME" in
+            test:e2e) workflow_file=branch-e2e.yml; workflow_name="Branch E2E Checks" ;;
+            test:e2e-gpu) workflow_file=test-gpu.yml; workflow_name="GPU Test" ;;
+            *) echo "Unrecognized label $LABEL_NAME"; exit 1 ;;
+          esac
+
+          mirror_ref="pull-request/$PR_NUMBER"
+          mirror_sha=$(gh api "repos/$GH_REPO/branches/$mirror_ref" --jq '.commit.sha' 2>/dev/null || echo "")
+          short_pr=${PR_HEAD_SHA:0:7}
+
+          if [ -z "$mirror_sha" ]; then
+            body="Label \`$LABEL_NAME\` applied, but \`$mirror_ref\` does not exist yet. A maintainer needs to comment \`/ok to test $PR_HEAD_SHA\` to mirror this PR. Once the mirror exists, re-apply the label or re-run [$workflow_name](https://github.com/$GH_REPO/actions/workflows/$workflow_file) from the Actions tab."
+          elif [ "$mirror_sha" != "$PR_HEAD_SHA" ]; then
+            short_mirror=${mirror_sha:0:7}
+            body="Label \`$LABEL_NAME\` applied, but \`$mirror_ref\` is at \`$short_mirror\` while the PR head is \`$short_pr\`. A maintainer needs to comment \`/ok to test $PR_HEAD_SHA\` to refresh the mirror. Once the mirror catches up, re-run [$workflow_name](https://github.com/$GH_REPO/actions/workflows/$workflow_file) from the Actions tab."
+          else
+            run_id=$(gh api "repos/$GH_REPO/actions/workflows/$workflow_file/runs?head_sha=$PR_HEAD_SHA&event=push" \
+              --jq '.workflow_runs | sort_by(.created_at) | reverse | .[0].id // empty')
+            if [ -n "$run_id" ]; then
+              run_link="[the existing run](https://github.com/$GH_REPO/actions/runs/$run_id)"
+            else
+              run_link="[$workflow_name](https://github.com/$GH_REPO/actions/workflows/$workflow_file)"
+            fi
+            body="Label \`$LABEL_NAME\` applied for \`$short_pr\`. Open $run_link and click **Re-run all jobs** to execute with the label set. The \`E2E Gate\` check on this PR will flip green automatically once the run finishes."
+          fi
+
+          gh pr comment "$PR_NUMBER" --body "$body"

@@ -63,10 +63,11 @@ Prerequisites:
 Flow:
 
 1. Open the PR. copy-pr-bot mirrors it to `pull-request/<N>` automatically.
-2. A maintainer applies `test:e2e` and/or `test:e2e-gpu`.
-3. `E2E Label Dispatch` detects the label and triggers the matching workflow against the mirror.
-4. Results post as checks on your PR head SHA.
-5. New commits push to the mirror automatically; gated workflows re-run on their own. No re-labeling needed.
+2. The first push of `pull-request/<N>` runs `Branch E2E Checks`, but it skips the build/E2E jobs because no label is set yet. The PR's `E2E Gate` check stays neutral (no label, no requirement).
+3. A maintainer applies `test:e2e` and/or `test:e2e-gpu`. `E2E Label Help` posts a comment with a link to the existing `Branch E2E Checks` run.
+4. The maintainer opens that link and clicks **Re-run all jobs**. This time `pr_metadata` sees the label and the build/E2E jobs run.
+5. When the run finishes, the `E2E Gate` check on the PR flips to green automatically.
+6. New commits push to the mirror automatically and re-trigger `Branch E2E Checks`. Because the label is still set, those runs execute the build/E2E jobs without manual re-run.
 
 ### Forked PR
 
@@ -79,11 +80,9 @@ Flow:
 
 1. Open the PR. The vouch check confirms you are vouched (otherwise the PR is auto-closed).
 2. copy-pr-bot does not mirror forks automatically. A maintainer reviews the diff and comments `/ok to test <SHA>` with your latest commit SHA.
-3. After `/ok to test`, copy-pr-bot mirrors to `pull-request/<N>`.
-4. A maintainer applies `test:e2e` / `test:e2e-gpu`. The dispatcher runs the matching workflow against the mirror.
-5. Results post as checks on your PR.
+3. After `/ok to test`, copy-pr-bot mirrors to `pull-request/<N>`. From here the flow is identical to internal PRs: maintainer applies the label, follows the comment from `E2E Label Help`, and re-runs the workflow.
 
-Important: every new commit you push requires another `/ok to test <new-SHA>` from a maintainer before E2E will run on it. If a label is applied while the mirror is stale, `E2E Label Dispatch` will post a comment explaining what's needed.
+Important: every new commit you push requires another `/ok to test <new-SHA>` from a maintainer before E2E will run on it. If a label is applied while the mirror is stale, `E2E Label Help` will post a comment explaining what's needed.
 
 ## copy-pr-bot
 
@@ -108,4 +107,4 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set. |
 | `.github/workflows/e2e-gate.yml` | Posts the required `E2E Gate` check on the PR. Re-evaluates after the gated workflow completes. |
 | `.github/workflows/e2e-gate-check.yml` | Reusable gate logic shared by E2E and GPU E2E. |
-| `.github/workflows/e2e-label-dispatch.yml` | Triggers gated workflows when a `test:e2e*` label is applied. Posts a comment if the mirror is missing or stale. |
+| `.github/workflows/e2e-label-help.yml` | When a `test:e2e*` label is applied, posts a PR comment telling the maintainer the next manual step (re-run an existing workflow run, or `/ok to test <SHA>` to refresh the mirror). |

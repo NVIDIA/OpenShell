@@ -22,7 +22,7 @@ These three goals do not compose cleanly: the safety goal forces `push: pull-req
 | `.github/actions/pr-gate/action.yml` | (composite) | Resolves PR metadata for a `pull-request/<N>` push and decides whether the run should proceed. Used by the two workflows above. |
 | `.github/workflows/e2e-gate.yml` | `pull_request` + `workflow_run` | Posts the required `E2E Gate` check on the PR. Re-evaluates after the gated workflow completes. |
 | `.github/workflows/e2e-gate-check.yml` | `workflow_call` | Reusable gate logic shared by E2E and GPU E2E. |
-| `.github/workflows/e2e-label-dispatch.yml` | `pull_request_target: [labeled]` | Dispatches the gated workflow when a `test:e2e*` label is applied after the mirror already exists. |
+| `.github/workflows/e2e-label-help.yml` | `pull_request_target: [labeled]` | Posts a PR comment when a `test:e2e*` label is applied, telling the maintainer the next manual step (re-run an existing run, or `/ok to test <SHA>` to refresh the mirror). Does *not* dispatch the workflow itself - see "Why we don't auto-dispatch" below. |
 | `.github/workflows/e2e-test.yml`, `e2e-gpu-test.yaml`, `docker-build.yml` | `workflow_call` | Reusable worker workflows. Unchanged by this design - called from the gated workflows and from release workflows. |
 
 ## Trigger taxonomy
@@ -33,13 +33,13 @@ Five GitHub Actions trigger types appear in this flow. Each one was chosen for a
 |---|---|---|---|
 | `push: pull-request/[0-9]+` | The pushed commit (mirror branch) | Repo-default | Only fires for branches copy-pr-bot created. Decouples test execution from PR author actions: the author cannot create a `pull-request/<N>` branch themselves. |
 | `pull_request` | The PR head SHA, but actions checkout the *base* branch's workflow files | Read-only for forks | Lets us post a status check on the PR's head SHA (so branch protection sees it). Used by the `E2E Gate` evaluation jobs. |
-| `pull_request_target` | Base branch | Write-capable, even for forks | Needed for the label dispatcher: a forked PR's `GITHUB_TOKEN` is read-only on `pull_request`, so it cannot dispatch workflows or post comments. The dispatcher never checks out PR code, so the `pull_request_target` foot-gun does not apply. |
-| `workflow_run` | Default branch | Repo-default | Fires when the gated workflow finishes. Lets us run a re-evaluation step in a trusted (default-branch) context. |
-| `workflow_dispatch` | Caller's ref | Repo-default | Maintainer escape hatch and the mechanism the label dispatcher uses to call the gated workflow (`gh workflow run --ref pull-request/<N>`). |
+| `pull_request_target` | Base branch | Write-capable, even for forks | Needed for `e2e-label-help.yml` to post a comment on a forked PR. The workflow never checks out PR code, so the standard `pull_request_target` foot-gun does not apply. |
+| `workflow_run` | Default branch | Repo-default | Fires when the gated workflow finishes. Lets us run a gate re-evaluation step in a trusted (default-branch) context. |
+| `workflow_dispatch` | Caller's ref | Repo-default | Maintainer-only manual re-run (clicking "Re-run all jobs" in the Actions UI). We deliberately do not call this from another workflow - see "Why we don't auto-dispatch" below. |
 
-The non-obvious move here is that the same logical "did E2E pass for this PR" check has to be posted from at least two of these trigger contexts: a `pull_request`-triggered run (which can attach a check to the PR head SHA) and a `workflow_run`-triggered run (which knows the gated workflow finished but can only attach checks to `main`). The flow stitches them together by re-running the original `pull_request`-triggered run after the gated workflow completes.
+The non-obvious move here is that the same logical "did E2E pass for this PR" check has to be posted from two of these trigger contexts: a `pull_request`-triggered run (which can attach a check to the PR head SHA) and a `workflow_run`-triggered run (which knows the gated workflow finished but can only attach checks to `main`). The flow stitches them together by re-running the original `pull_request`-triggered run after the gated workflow completes.
 
-## Happy-path flow (trusted PR with label set up-front)
+## Happy-path flow (trusted PR, label applied after mirror)
 
 ```mermaid
 sequenceDiagram
@@ -49,7 +49,7 @@ sequenceDiagram
     participant Bot as copy-pr-bot
     participant BranchE2E as Branch E2E Checks<br/>(self-hosted)
     participant Gate as E2E Gate<br/>(github-hosted)
-    participant Dispatcher as E2E Label Dispatch<br/>(github-hosted)
+    participant Help as E2E Label Help<br/>(github-hosted)
     participant Maintainer
 
     Author->>GH: Open PR (signed commits)
@@ -65,9 +65,10 @@ sequenceDiagram
     Maintainer->>GH: apply test:e2e label
     GH->>Gate: pull_request labeled
     Gate->>Gate: label set,<br/>upstream only ran metadata<br/>→ FAIL (red)
-    GH->>Dispatcher: pull_request_target labeled
-    Dispatcher->>GH: gh workflow run branch-e2e.yml<br/>--ref pull-request/N
-    GH->>BranchE2E: workflow_dispatch
+    GH->>Help: pull_request_target labeled
+    Help->>GH: comment on PR with link<br/>to existing Branch E2E Checks run
+    Maintainer->>GH: open the linked run, click "Re-run all jobs"
+    GH->>BranchE2E: re-run (push event replayed)
     BranchE2E->>BranchE2E: pr_metadata: should_run = true<br/>(label set, SHA matches)
     BranchE2E->>BranchE2E: build + e2e jobs run
 
@@ -78,7 +79,7 @@ sequenceDiagram
     Gate->>Gate: label set,<br/>upstream success + non-gate jobs ran<br/>→ PASS (green)
 ```
 
-The key moment is step 11: the dispatcher closes the loop that the `push` trigger doesn't. Without it, applying the label leaves the gate stuck red until a maintainer manually re-runs the gated workflow.
+The label-help workflow is intentionally a comment-only nudge: it never dispatches the workflow itself, so the maintainer's re-run goes through the same `push`-event run-id that originally fired on the mirror. This preserves in-progress visibility on the PR's Checks tab.
 
 ## Forked PR flow
 
@@ -97,7 +98,7 @@ sequenceDiagram
     Bot->>Bot: not trusted, wait
     Maintainer->>GH: comment "/ok to test <SHA>"
     Bot->>GH: push pull-request/N
-    Note over Bot,GH: From here, identical to the trusted flow:<br/>label → dispatcher → gated workflow → rerun gate
+    Note over Bot,GH: From here, identical to the trusted flow:<br/>label → help comment → maintainer re-runs → gate flips green
     Author->>GH: push new commit
     Bot->>Bot: still untrusted, wait again
     Maintainer->>GH: comment "/ok to test <new-SHA>"
@@ -115,19 +116,27 @@ The gated workflows always start with a `pr_metadata` job. When the label is mis
 
 ### Why `workflow_run` is needed for the gate flip
 
-Once the label dispatcher kicks off `branch-e2e.yml`, the workflow runs and finishes - but the `pull_request`-triggered gate check posted earlier still says "fail". `workflow_run` is the only event that fires when an arbitrary other workflow completes, and it's how we know to re-evaluate the gate. But `workflow_run` runs in the *default branch context*, so a check posted from there lands on `main` instead of the PR. Workaround: instead of posting a new check, look up the most recent `pull_request`-triggered gate run for the same head SHA and call `POST /actions/runs/<id>/rerun`. The re-run replays the original `pull_request` event, so the new check posts against the PR's head SHA and branch protection picks it up.
+Once the gated workflow runs and finishes, the `pull_request`-triggered gate check posted earlier still says "fail". `workflow_run` is the only event that fires when an arbitrary other workflow completes, and it's how we know to re-evaluate the gate. But `workflow_run` runs in the *default branch context*, so a check posted from there lands on `main` instead of the PR. Workaround: instead of posting a new check, look up the most recent `pull_request`-triggered gate run for the same head SHA and call `POST /actions/runs/<id>/rerun`. The re-run replays the original `pull_request` event, so the new check posts against the PR's head SHA and branch protection picks it up.
 
-### Why `pull_request_target` for the label dispatcher
+### Why `pull_request_target` for the label-help workflow
 
-A `pull_request` workflow on a forked PR receives a read-only `GITHUB_TOKEN`. That's intentional: it prevents PR-supplied workflow code from escalating. But our dispatcher doesn't *run* PR code - it never checks out the PR head, only the workflow file from `main`. It needs `actions: write` to dispatch the gated workflow and `pull-requests: write` to post a status comment. `pull_request_target` provides a write-capable token while still loading the workflow definition from `main`. The standard `pull_request_target` warning ("don't check out PR code with this token") doesn't apply here because we don't check out anything.
+A `pull_request` workflow on a forked PR receives a read-only `GITHUB_TOKEN`. That's intentional: it prevents PR-supplied workflow code from escalating. But the help workflow doesn't *run* PR code - it never checks out the PR head, only the workflow file from `main`. It needs `pull-requests: write` to post a comment. `pull_request_target` provides a write-capable token while still loading the workflow definition from `main`. The standard `pull_request_target` warning ("don't check out PR code with this token") doesn't apply because we don't check out anything.
+
+### Why we don't auto-dispatch the gated workflow
+
+An earlier iteration of this design auto-dispatched the gated workflow via `gh workflow run --ref pull-request/<N>` from a `pull_request_target: [labeled]` workflow. It worked, but produced a worse UX: `workflow_dispatch`-triggered runs do not appear in the PR's Checks tab. The check-runs are technically attached to the PR head SHA (visible via `gh api commits/<sha>/check-runs`), but the PR UI filters them out because the run isn't associated with a PR-context event. The maintainer would see "Dispatched" comment, then no progress on the PR until the gate eventually flipped from red to green many minutes later.
+
+We considered alternatives:
+
+- **Push an empty marker commit to `pull-request/<N>` to fire a fresh `push` event.** Changes the SHA, breaks the gate's head-SHA equivalence, and writes to a branch copy-pr-bot owns. Architecturally bad.
+- **Re-trigger copy-pr-bot programmatically.** copy-pr-bot only listens for `pull_request.*` and `issue_comment.created` events ([source](https://github.com/NVIDIA/gha-runners-apps/blob/main/packages/copy-pr-bot/src/app.ts)). Even commenting `/ok to test <SHA>` is a no-op when the mirror is already at that SHA - the bot calls `git.updateRef` with the same SHA and GitHub fires no new push event. There is no way to make copy-pr-bot re-fire a push without an actual SHA change.
+- **Have the dispatcher post mirror Check Runs against the PR head SHA via the Checks API.** Possible, but adds a polling/webhook loop to keep the mirror checks in sync with the actual run. Not worth the complexity for a flow a maintainer goes through manually anyway.
+
+The current design takes the pragmatic path: when a label is applied, the help workflow posts a comment with a deep link to the existing `Branch E2E Checks` run on the mirror. The maintainer clicks **Re-run all jobs**. That re-run replays the original `push` event, so its check-runs surface on the PR's Checks tab in real time. The cost is one human click per label application, in exchange for live progress visibility.
 
 ### Why labels and not comment commands
 
 Labels persist as PR metadata and survive re-runs and force-pushes. Comment-based commands like `/ok to test` don't survive the same way: a comment from yesterday doesn't enable today's commit. Branch protection rules can require a check be present; they cannot require a comment. The label is the merge gate's primary signal because it is the only thing GitHub's branch protection knows how to look at.
-
-### Why a separate `E2E Label Dispatch` workflow instead of dispatching from the gate
-
-The gate runs on `pull_request`. If we tried to dispatch the gated workflow from the gate, the dispatch call would fail on forked PRs because the gate's token is read-only. Splitting the dispatcher into its own `pull_request_target` workflow gives it the write-capable token without giving it to the gate evaluation logic.
 
 ## Permission posture
 
@@ -141,16 +150,11 @@ Every workflow declares `permissions: {}` at the top. Per-job grants are the min
 | `e2e-gate.yml` | `e2e`, `gpu` (`workflow_call`) | inherits via the called workflow |
 | | `rerun-on-completion` | `actions: write` |
 | `e2e-gate-check.yml` | `check` | `contents: read`, `pull-requests: read`, `actions: read` |
-| `e2e-label-dispatch.yml` | `dispatch` | `actions: write`, `pull-requests: write` |
+| `e2e-label-help.yml` | `hint` | `pull-requests: write` |
 
 The reusable worker workflows (`e2e-test.yml`, `e2e-gpu-test.yaml`, `docker-build.yml`) declare their own internal permissions; the calling job grants are an upper bound for them.
 
-Two workflows hold "interesting" tokens:
-
-- `rerun-on-completion` in `e2e-gate.yml` has `actions: write`. It calls one specific endpoint - `POST /actions/runs/<id>/rerun` for an `e2e-gate.yml` run on the same head SHA - and never executes PR code.
-- `dispatch` in `e2e-label-dispatch.yml` has `actions: write` + `pull-requests: write`. It calls `gh workflow run` against `branch-e2e.yml` or `test-gpu.yml` (only) and posts a comment on the PR. It never executes PR code.
-
-Both are small, github-hosted workflows whose source lives only on `main`.
+Only one workflow holds an "interesting" token: `rerun-on-completion` in `e2e-gate.yml` has `actions: write`. It calls one specific endpoint - `POST /actions/runs/<id>/rerun` for an `e2e-gate.yml` run on the same head SHA - and never executes PR code. The label-help workflow holds only `pull-requests: write` for posting the comment, also without checking out PR code.
 
 ## Release flow
 
@@ -162,11 +166,11 @@ Permissions on the release workflows are not yet scoped per-job. Tracked separat
 
 | Case | What happens |
 |---|---|
-| Label applied before copy-pr-bot mirrors the PR | Dispatcher detects no `pull-request/<N>` branch and posts a comment telling the maintainer to wait or run `/ok to test <SHA>`. |
-| Label applied while mirror is stale (new commit pending `/ok to test`) | Dispatcher detects mirror SHA != PR head SHA and posts the corresponding comment with the SHA the maintainer needs to vet. |
-| Label removed | No dispatcher reaction. The next PR event (push, label, etc.) re-evaluates the gate, which now sees no label and passes as a no-op. |
-| Author force-pushes after label set | copy-pr-bot re-mirrors the new SHA → gated workflow fires on `push` → finishes → `workflow_run` fires the gate re-run → new green check on the new SHA. No re-labeling needed. |
-| Maintainer re-runs the gated workflow manually from the Actions UI | Same as above without the force-push. |
+| Label applied before copy-pr-bot mirrors the PR | Help workflow detects no `pull-request/<N>` branch and posts a comment telling the maintainer to wait or run `/ok to test <SHA>`. |
+| Label applied while mirror is stale (new commit pending `/ok to test`) | Help workflow detects mirror SHA != PR head SHA and posts the corresponding comment with the SHA the maintainer needs to vet. |
+| Label removed | No reaction. The next PR event (push, label, etc.) re-evaluates the gate, which now sees no label and passes as a no-op. |
+| Author force-pushes after label set | copy-pr-bot re-mirrors the new SHA → gated workflow fires on `push` → because the label is still on the PR, `pr_metadata` runs the build/E2E jobs without manual re-run → `workflow_run` fires the gate re-run → new green check on the new SHA. |
+| Maintainer re-runs the gated workflow manually from the Actions UI | Same as above without the force-push. This is the path the help workflow points the maintainer at. |
 | Gate's first evaluation fails (label set, upstream not yet started) | Email-on-failure noise. The check eventually flips to success once upstream finishes and `workflow_run` re-runs the gate. Tracked as a known rough edge; possible fix is posting `neutral` until the upstream completes. |
 
 ## References
