@@ -35,6 +35,12 @@ STATE_DIR=""
 GATEWAY_CONFIG_DIR=""
 GATEWAY_PID=""
 GATEWAY_LOG="${WORKDIR}/gateway.log"
+# Unique sandbox namespace for this test run. Set just before the gateway
+# is started so cleanup can filter Docker containers strictly to ones
+# this run created, even when other OpenShell sandboxes are present on
+# the host. Empty until assigned -- cleanup treats an empty namespace as
+# "do nothing" so an early-exit trap never touches unrelated containers.
+E2E_NAMESPACE=""
 
 cleanup() {
   local exit_code=$?
@@ -45,10 +51,18 @@ cleanup() {
   fi
 
   # On failure, preserve sandbox container logs for post-mortem
-  # debugging before removing the containers.
-  if [ "${exit_code}" -ne 0 ] && command -v docker >/dev/null 2>&1; then
+  # debugging before removing the containers. Filter strictly to
+  # containers this test run created (managed-by + this run's unique
+  # sandbox namespace) so we never touch unrelated OpenShell sandboxes
+  # the developer may be running in parallel.
+  if [ "${exit_code}" -ne 0 ] \
+     && [ -n "${E2E_NAMESPACE}" ] \
+     && command -v docker >/dev/null 2>&1; then
     local ids
-    ids=$(docker ps -aq --filter "label=openshell.ai/managed-by=openshell" 2>/dev/null || true)
+    ids=$(docker ps -aq \
+      --filter "label=openshell.ai/managed-by=openshell" \
+      --filter "label=openshell.ai/sandbox-namespace=${E2E_NAMESPACE}" \
+      2>/dev/null || true)
     if [ -n "${ids}" ]; then
       echo "=== sandbox container logs (preserved for debugging) ==="
       for id in ${ids}; do
@@ -62,10 +76,14 @@ cleanup() {
   fi
 
   # Remove any lingering sandbox containers the gateway failed to clean
-  # up. The driver labels its containers with openshell.ai/managed-by.
-  if command -v docker >/dev/null 2>&1; then
+  # up. Scope the filter to this run's namespace so we don't force-remove
+  # sandboxes belonging to other gateways or test runs on the same host.
+  if [ -n "${E2E_NAMESPACE}" ] && command -v docker >/dev/null 2>&1; then
     local stale
-    stale=$(docker ps -aq --filter "label=openshell.ai/managed-by=openshell" 2>/dev/null || true)
+    stale=$(docker ps -aq \
+      --filter "label=openshell.ai/managed-by=openshell" \
+      --filter "label=openshell.ai/sandbox-namespace=${E2E_NAMESPACE}" \
+      2>/dev/null || true)
     if [ -n "${stale}" ]; then
       # shellcheck disable=SC2086
       docker rm -f ${stale} >/dev/null 2>&1 || true
@@ -227,10 +245,17 @@ mkdir -p "${STATE_DIR}"
 # gateway itself binds to 0.0.0.0:${HOST_PORT}.
 GATEWAY_ENDPOINT="https://host.openshell.internal:${HOST_PORT}"
 
-echo "Starting openshell-gateway on port ${HOST_PORT}..."
+# Unique per-run sandbox namespace. The Docker driver stamps every
+# container with `openshell.ai/sandbox-namespace=<ns>`, so cleanup can
+# filter on this value and never touch sandboxes belonging to other
+# gateways or test runs on the same host.
+E2E_NAMESPACE="e2e-docker-$$-${HOST_PORT}"
+
+echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
 "${GATEWAY_BIN}" \
   --port "${HOST_PORT}" \
   --drivers docker \
+  --sandbox-namespace "${E2E_NAMESPACE}" \
   --tls-cert "${PKI_DIR}/server.crt" \
   --tls-key "${PKI_DIR}/server.key" \
   --tls-client-ca "${PKI_DIR}/ca.crt" \
