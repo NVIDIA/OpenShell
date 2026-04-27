@@ -51,6 +51,21 @@ openshell sandbox create --from my-registry.example.com/my-image:latest
 
 The CLI resolves community names against the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog, pulls the bundled Dockerfile and policy, builds the image locally, and creates the sandbox. For the full catalog and how to contribute your own, refer to [Community Sandboxes](/sandboxes/community-sandboxes).
 
+### Label a Sandbox
+
+Attach labels when you create a sandbox to track ownership, environment, or workflow grouping:
+
+```shell
+openshell sandbox create --label env=dev --label team=platform -- claude
+```
+
+List only the sandboxes that match a label selector:
+
+```shell
+openshell sandbox list --selector env=dev
+openshell sandbox list --selector env=dev,team=platform
+```
+
 ## Connect to a Sandbox
 
 Open an SSH session into a running sandbox:
@@ -108,6 +123,12 @@ List all sandboxes:
 
 ```shell
 openshell sandbox list
+```
+
+Filter the list by labels when you want a narrower view:
+
+```shell
+openshell sandbox list --selector team=platform
 ```
 
 Get detailed information about a specific sandbox. The output lists **Policy source** (`sandbox` or `global`), **Revision** (the active policy’s row version for that source), and the formatted active policy YAML:
@@ -185,6 +206,8 @@ Upload files from your host into the sandbox:
 ```shell
 openshell sandbox upload my-sandbox ./src /sandbox/src
 ```
+
+When the local path is a named directory, OpenShell preserves that basename at the destination, matching `scp -r` and `cp -r`. The example above creates `/sandbox/src/src`.
 
 Download files from the sandbox to your host:
 
