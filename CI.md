@@ -50,12 +50,6 @@ If you already use an SSH key for `git push`, you can reuse it as a signing key.
 
    Push the branch and confirm GitHub shows the commit as **Verified**.
 
-If you have older unsigned commits on a branch, sign them by rebasing:
-
-```shell
-git rebase --exec 'git commit --amend --no-edit -S' origin/main
-```
-
 ## Pull request flows
 
 ### Internal contributor PR
