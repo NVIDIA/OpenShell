@@ -2133,7 +2133,11 @@ mod tests {
         let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
             .as_array()
             .unwrap();
-        assert_eq!(caps.len(), 4, "extra capabilities must not be added when user namespaces are disabled");
+        assert_eq!(
+            caps.len(),
+            4,
+            "extra capabilities must not be added when user namespaces are disabled"
+        );
     }
 
     #[test]
