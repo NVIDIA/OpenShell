@@ -150,7 +150,7 @@ Every workflow declares `permissions: {}` at the top. Per-job grants are the min
 | `e2e-gate.yml` | `e2e`, `gpu` (`workflow_call`) | inherits via the called workflow |
 | | `rerun-on-completion` | `actions: write` |
 | `e2e-gate-check.yml` | `check` | `contents: read`, `pull-requests: read`, `actions: read` |
-| `e2e-label-help.yml` | `hint` | `pull-requests: write` |
+| `e2e-label-help.yml` | `hint` | `pull-requests: write`, `actions: read`, `contents: read` |
 
 The reusable worker workflows (`e2e-test.yml`, `e2e-gpu-test.yaml`, `docker-build.yml`) declare their own internal permissions; the calling job grants are an upper bound for them.
 

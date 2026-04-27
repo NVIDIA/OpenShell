@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
+      actions: read
+      contents: read
     steps:
       - name: Post comment
         env:
