@@ -3324,6 +3324,8 @@ async fn auto_create_provider(
                 r#type: provider_type.to_string(),
                 credentials: discovered.credentials.clone(),
                 config: discovered.config.clone(),
+                credential_placeholders: std::collections::HashMap::new(),
+                passthrough_credentials: Vec::new(),
             }),
         };
 
@@ -3360,6 +3362,7 @@ async fn auto_create_provider(
                     r#type: provider_type.to_string(),
                     credentials: discovered.credentials.clone(),
                     config: discovered.config.clone(),
+                    credential_placeholders: std::collections::HashMap::new(),
                 }),
             };
 
@@ -3420,6 +3423,51 @@ fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String,
     Ok(map)
 }
 
+fn parse_passthrough_keys(items: &[String]) -> Result<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let key = item.trim();
+        if key.is_empty() {
+            return Err(miette::miette!(
+                "--credential-passthrough key cannot be empty"
+            ));
+        }
+        if !seen.insert(key.to_string()) {
+            continue;
+        }
+        out.push(key.to_string());
+    }
+    Ok(out)
+}
+
+fn validate_placeholder_and_passthrough_consistency(
+    credentials: &HashMap<String, String>,
+    placeholders: &HashMap<String, String>,
+    passthrough: &[String],
+) -> Result<()> {
+    for key in placeholders.keys() {
+        if !credentials.contains_key(key) {
+            return Err(miette::miette!(
+                "--credential-placeholder {key} has no matching --credential"
+            ));
+        }
+    }
+    for key in passthrough {
+        if !credentials.contains_key(key) {
+            return Err(miette::miette!(
+                "--credential-passthrough {key} has no matching --credential"
+            ));
+        }
+        if placeholders.contains_key(key) {
+            return Err(miette::miette!(
+                "credential '{key}' cannot be both --credential-placeholder and --credential-passthrough"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
 
@@ -3463,6 +3511,8 @@ pub async fn provider_create(
     from_existing: bool,
     credentials: &[String],
     config: &[String],
+    credential_placeholders: &[String],
+    credential_passthrough: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
     if from_existing && !credentials.is_empty() {
@@ -3479,6 +3529,9 @@ pub async fn provider_create(
 
     let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
+    let placeholder_map =
+        parse_key_value_pairs(credential_placeholders, "--credential-placeholder")?;
+    let passthrough_list = parse_passthrough_keys(credential_passthrough)?;
 
     if from_existing {
         let registry = ProviderRegistry::new();
@@ -3506,6 +3559,12 @@ pub async fn provider_create(
         ));
     }
 
+    validate_placeholder_and_passthrough_consistency(
+        &credential_map,
+        &placeholder_map,
+        &passthrough_list,
+    )?;
+
     let response = client
         .create_provider(CreateProviderRequest {
             provider: Some(Provider {
@@ -3514,6 +3573,8 @@ pub async fn provider_create(
                 r#type: provider_type,
                 credentials: credential_map,
                 config: config_map,
+                credential_placeholders: placeholder_map,
+                passthrough_credentials: passthrough_list,
             }),
         })
         .await
@@ -3640,6 +3701,9 @@ pub async fn provider_update(
     from_existing: bool,
     credentials: &[String],
     config: &[String],
+    credential_placeholders: &[String],
+    credential_passthrough: &[String],
+    clear_credential_passthrough: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
     if from_existing && !credentials.is_empty() {
@@ -3652,6 +3716,14 @@ pub async fn provider_update(
 
     let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
+    let placeholder_map =
+        parse_key_value_pairs(credential_placeholders, "--credential-placeholder")?;
+    let mut passthrough_list = parse_passthrough_keys(credential_passthrough)?;
+    if clear_credential_passthrough {
+        // Sentinel: a single empty-string entry tells the server to clear
+        // the existing passthrough list. See merge_passthrough on the server.
+        passthrough_list = vec![String::new()];
+    }
 
     if from_existing {
         // Fetch the existing provider to discover its type for credential lookup.
@@ -3684,6 +3756,23 @@ pub async fn provider_update(
         }
     }
 
+    // Best-effort cross-field validation: the server's authoritative check
+    // runs after the merge against the persisted provider, but failing fast
+    // here on the obvious case (the same key on both flags) gives a better
+    // error than waiting for the round trip.
+    if !placeholder_map.is_empty() && !passthrough_list.is_empty() {
+        for key in &passthrough_list {
+            if key.is_empty() {
+                continue;
+            }
+            if placeholder_map.contains_key(key) {
+                return Err(miette::miette!(
+                    "credential '{key}' cannot be both --credential-placeholder and --credential-passthrough"
+                ));
+            }
+        }
+    }
+
     let response = client
         .update_provider(UpdateProviderRequest {
             provider: Some(Provider {
@@ -3692,6 +3781,8 @@ pub async fn provider_update(
                 r#type: String::new(),
                 credentials: credential_map,
                 config: config_map,
+                credential_placeholders: placeholder_map,
+                passthrough_credentials: passthrough_list,
             }),
         })
         .await

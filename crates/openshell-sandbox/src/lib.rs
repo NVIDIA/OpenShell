@@ -267,41 +267,48 @@ pub async fn run_sandbox(
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
-    let provider_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-        match grpc_client::fetch_provider_environment(endpoint, id).await {
-            Ok(env) => {
-                ocsf_emit!(
+    let provider_environment =
+        if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+            match grpc_client::fetch_provider_environment(endpoint, id).await {
+                Ok(env) => {
+                    ocsf_emit!(
                     ConfigStateChangeBuilder::new(ocsf_ctx())
                         .severity(SeverityId::Informational)
                         .status(StatusId::Success)
                         .state(StateId::Enabled, "loaded")
                         .message(format!(
-                            "Fetched provider environment [env_count:{}]",
-                            env.len()
+                            "Fetched provider environment [env_count:{} placeholder_overrides:{} passthrough:{}]",
+                            env.env.len(),
+                            env.placeholder_overrides.len(),
+                            env.passthrough_keys.len(),
                         ))
                         .build()
                 );
-                env
+                    env
+                }
+                Err(e) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .state(StateId::Other, "degraded")
+                            .message(format!(
+                                "Failed to fetch provider environment, continuing without: {e}"
+                            ))
+                            .build()
+                    );
+                    grpc_client::ProviderEnvironment::default()
+                }
             }
-            Err(e) => {
-                ocsf_emit!(
-                    ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .state(StateId::Other, "degraded")
-                        .message(format!(
-                            "Failed to fetch provider environment, continuing without: {e}"
-                        ))
-                        .build()
-                );
-                std::collections::HashMap::new()
-            }
-        }
-    } else {
-        std::collections::HashMap::new()
-    };
+        } else {
+            grpc_client::ProviderEnvironment::default()
+        };
 
-    let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
+    let (provider_env, secret_resolver) = SecretResolver::from_provider_env_with_modes(
+        provider_environment.env,
+        provider_environment.placeholder_overrides,
+        &provider_environment.passthrough_keys,
+    );
     let secret_resolver = secret_resolver.map(Arc::new);
 
     // Create identity cache for SHA256 TOFU when OPA is active

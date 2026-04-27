@@ -110,6 +110,8 @@ impl TestOpenShell {
                 r#type: provider_type.to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
+                credential_placeholders: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         );
     }
@@ -273,12 +275,36 @@ impl OpenShell for TestOpenShell {
             }
             base
         };
+        let merge_passthrough = |existing: Vec<String>, incoming: Vec<String>| -> Vec<String> {
+            if incoming.is_empty() {
+                return existing;
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Vec::with_capacity(incoming.len());
+            for k in incoming {
+                if k.is_empty() {
+                    continue;
+                }
+                if seen.insert(k.clone()) {
+                    out.push(k);
+                }
+            }
+            out
+        };
         let updated = Provider {
             id: existing.id,
             name: provider.name,
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
             config: merge(existing.config, provider.config),
+            credential_placeholders: merge(
+                existing.credential_placeholders,
+                provider.credential_placeholders,
+            ),
+            passthrough_credentials: merge_passthrough(
+                existing.passthrough_credentials,
+                provider.passthrough_credentials,
+            ),
         };
         providers.insert(updated.name.clone(), updated.clone());
         Ok(Response::new(ProviderResponse {

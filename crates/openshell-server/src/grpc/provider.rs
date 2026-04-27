@@ -132,6 +132,14 @@ pub(super) async fn update_provider_record(
         r#type: existing.r#type,
         credentials: merge_map(existing.credentials, provider.credentials),
         config: merge_map(existing.config, provider.config),
+        credential_placeholders: merge_map(
+            existing.credential_placeholders,
+            provider.credential_placeholders,
+        ),
+        passthrough_credentials: merge_passthrough(
+            existing.passthrough_credentials,
+            provider.passthrough_credentials,
+        ),
     };
 
     validate_provider_fields(&updated)?;
@@ -177,25 +185,69 @@ fn merge_map(
     existing
 }
 
+/// Merge an incoming passthrough credential list into the existing one.
+///
+/// `repeated string` has no field presence, so we use a sentinel:
+/// - If `incoming` is empty, the merge is a no-op (preserve existing).
+/// - Otherwise, the incoming list replaces the existing list verbatim.
+/// - To clear the list explicitly, callers send a single empty-string entry,
+///   which is filtered out and produces an empty result.
+///
+/// Duplicate entries are de-duplicated while preserving first-occurrence order.
+fn merge_passthrough(existing: Vec<String>, incoming: Vec<String>) -> Vec<String> {
+    if incoming.is_empty() {
+        return existing;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(incoming.len());
+    for key in incoming {
+        if key.is_empty() {
+            continue;
+        }
+        if seen.insert(key.clone()) {
+            out.push(key);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Provider environment resolution
 // ---------------------------------------------------------------------------
 
+/// Resolved provider environment for sandbox injection.
+#[derive(Debug, Default)]
+pub(super) struct ResolvedProviderEnvironment {
+    /// Real credential values keyed by env var name.
+    pub env: std::collections::HashMap<String, String>,
+    /// Optional placeholder overrides keyed by env var name. Missing entries
+    /// fall back to the canonical `openshell:resolve:env:<KEY>` form.
+    pub placeholder_overrides: std::collections::HashMap<String, String>,
+    /// Env var names whose REAL credential value must be injected directly
+    /// into the agent process, bypassing placeholder substitution. The
+    /// supervisor must NOT register passthrough keys with the secret
+    /// resolver — there is no on-the-wire placeholder for them.
+    pub passthrough_keys: Vec<String>,
+}
+
 /// Resolve provider credentials into environment variables.
 ///
 /// For each provider name in the list, fetches the provider from the store and
-/// collects credential key-value pairs. Returns a map of environment variables
-/// to inject into the sandbox. When duplicate keys appear across providers, the
-/// first provider's value wins.
+/// collects credential key-value pairs along with any placeholder overrides.
+/// Returns both maps for sandbox injection. When duplicate keys appear across
+/// providers, the first provider's value (and override) wins.
 pub(super) async fn resolve_provider_environment(
     store: &Store,
     provider_names: &[String],
-) -> Result<std::collections::HashMap<String, String>, Status> {
+) -> Result<ResolvedProviderEnvironment, Status> {
     if provider_names.is_empty() {
-        return Ok(std::collections::HashMap::new());
+        return Ok(ResolvedProviderEnvironment::default());
     }
 
     let mut env = std::collections::HashMap::new();
+    let mut placeholder_overrides = std::collections::HashMap::new();
+    let mut passthrough_keys = Vec::new();
+    let mut passthrough_seen = std::collections::HashSet::new();
 
     for name in provider_names {
         let provider = store
@@ -204,20 +256,68 @@ pub(super) async fn resolve_provider_environment(
             .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
 
+        let passthrough_set: std::collections::HashSet<&String> =
+            provider.passthrough_credentials.iter().collect();
+
         for (key, value) in &provider.credentials {
-            if is_valid_env_key(key) {
-                env.entry(key.clone()).or_insert_with(|| value.clone());
-            } else {
+            if !is_valid_env_key(key) {
                 warn!(
                     provider_name = %name,
                     key = %key,
                     "skipping credential with invalid env var key"
                 );
+                continue;
+            }
+            // First provider's value wins.
+            if env.contains_key(key) {
+                continue;
+            }
+            env.insert(key.clone(), value.clone());
+
+            if passthrough_set.contains(key) {
+                // Passthrough credentials bypass placeholder substitution
+                // entirely. A key cannot be both passthrough and have a
+                // placeholder override (validate_provider_fields rejects it
+                // at write time); double-check here as defence in depth.
+                if provider.credential_placeholders.contains_key(key) {
+                    warn!(
+                        provider_name = %name,
+                        key = %key,
+                        "credential is both passthrough and has placeholder override; treating as passthrough"
+                    );
+                }
+                if passthrough_seen.insert(key.clone()) {
+                    passthrough_keys.push(key.clone());
+                }
+                continue;
+            }
+
+            if let Some(placeholder) = provider.credential_placeholders.get(key) {
+                if is_valid_placeholder(placeholder) {
+                    placeholder_overrides.insert(key.clone(), placeholder.clone());
+                } else {
+                    warn!(
+                        provider_name = %name,
+                        key = %key,
+                        "skipping placeholder override with prohibited characters"
+                    );
+                }
             }
         }
     }
 
-    Ok(env)
+    Ok(ResolvedProviderEnvironment {
+        env,
+        placeholder_overrides,
+        passthrough_keys,
+    })
+}
+
+/// Reject placeholder strings that would corrupt HTTP framing or be empty.
+/// CRLF and NUL bytes are forbidden; the supervisor's placeholder scanner
+/// also relies on the value being a non-empty stable string.
+fn is_valid_placeholder(value: &str) -> bool {
+    !value.is_empty() && !value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0))
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {
@@ -373,6 +473,8 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         }
     }
 
@@ -414,6 +516,8 @@ mod tests {
                 .collect(),
                 config: std::iter::once(("endpoint".to_string(), "https://gitlab.com".to_string()))
                     .collect(),
+                credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -478,6 +582,8 @@ mod tests {
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
+                credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -498,6 +604,8 @@ mod tests {
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
+                credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -522,6 +630,8 @@ mod tests {
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
+                credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -565,6 +675,8 @@ mod tests {
                 r#type: String::new(),
                 credentials: std::iter::once(("SECONDARY".to_string(), String::new())).collect(),
                 config: std::iter::once(("region".to_string(), String::new())).collect(),
+                credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -612,6 +724,8 @@ mod tests {
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
+                credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -637,6 +751,8 @@ mod tests {
                 r#type: "openai".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
+                credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -664,6 +780,8 @@ mod tests {
                 r#type: String::new(),
                 credentials: std::iter::once((oversized_key, "value".to_string())).collect(),
                 config: HashMap::new(),
+                credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -676,7 +794,8 @@ mod tests {
     async fn resolve_provider_env_empty_list_returns_empty() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         let result = resolve_provider_environment(&store, &[]).await.unwrap();
-        assert!(result.is_empty());
+        assert!(result.env.is_empty());
+        assert!(result.placeholder_overrides.is_empty());
     }
 
     #[tokio::test]
@@ -697,15 +816,23 @@ mod tests {
                 "https://api.anthropic.com".to_string(),
             ))
             .collect(),
+            credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
         create_provider_record(&store, provider).await.unwrap();
 
         let result = resolve_provider_environment(&store, &["claude-local".to_string()])
             .await
             .unwrap();
-        assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
-        assert_eq!(result.get("CLAUDE_API_KEY"), Some(&"sk-abc".to_string()));
-        assert!(!result.contains_key("endpoint"));
+        assert_eq!(
+            result.env.get("ANTHROPIC_API_KEY"),
+            Some(&"sk-abc".to_string())
+        );
+        assert_eq!(
+            result.env.get("CLAUDE_API_KEY"),
+            Some(&"sk-abc".to_string())
+        );
+        assert!(!result.env.contains_key("endpoint"));
     }
 
     #[tokio::test]
@@ -733,15 +860,17 @@ mod tests {
             .into_iter()
             .collect(),
             config: HashMap::new(),
+            credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
         create_provider_record(&store, provider).await.unwrap();
 
         let result = resolve_provider_environment(&store, &["test-provider".to_string()])
             .await
             .unwrap();
-        assert_eq!(result.get("VALID_KEY"), Some(&"value".to_string()));
-        assert!(!result.contains_key("nested.api_key"));
-        assert!(!result.contains_key("bad-key"));
+        assert_eq!(result.env.get("VALID_KEY"), Some(&"value".to_string()));
+        assert!(!result.env.contains_key("nested.api_key"));
+        assert!(!result.env.contains_key("bad-key"));
     }
 
     #[tokio::test]
@@ -759,6 +888,8 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
+                credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -772,6 +903,8 @@ mod tests {
                 credentials: std::iter::once(("GITLAB_TOKEN".to_string(), "glpat-xyz".to_string()))
                     .collect(),
                 config: HashMap::new(),
+                credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -783,8 +916,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
-        assert_eq!(result.get("GITLAB_TOKEN"), Some(&"glpat-xyz".to_string()));
+        assert_eq!(
+            result.env.get("ANTHROPIC_API_KEY"),
+            Some(&"sk-abc".to_string())
+        );
+        assert_eq!(
+            result.env.get("GITLAB_TOKEN"),
+            Some(&"glpat-xyz".to_string())
+        );
     }
 
     #[tokio::test]
@@ -799,6 +938,8 @@ mod tests {
                 credentials: std::iter::once(("SHARED_KEY".to_string(), "first-value".to_string()))
                     .collect(),
                 config: HashMap::new(),
+                credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -815,6 +956,8 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
+                credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -826,7 +969,105 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.get("SHARED_KEY"), Some(&"first-value".to_string()));
+        assert_eq!(
+            result.env.get("SHARED_KEY"),
+            Some(&"first-value".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_returns_placeholder_overrides() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        create_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "slack-local".to_string(),
+                r#type: "slack".to_string(),
+                credentials: [
+                    ("SLACK_BOT_TOKEN".to_string(), "xoxb-real".to_string()),
+                    ("SLACK_APP_TOKEN".to_string(), "xapp-real".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                config: HashMap::new(),
+                credential_placeholders: [
+                    (
+                        "SLACK_BOT_TOKEN".to_string(),
+                        "xoxb-OPENSHELL-PLACEHOLDER".to_string(),
+                    ),
+                    (
+                        "SLACK_APP_TOKEN".to_string(),
+                        "xapp-OPENSHELL-PLACEHOLDER".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                passthrough_credentials: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["slack-local".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.placeholder_overrides.get("SLACK_BOT_TOKEN"),
+            Some(&"xoxb-OPENSHELL-PLACEHOLDER".to_string())
+        );
+        assert_eq!(
+            result.placeholder_overrides.get("SLACK_APP_TOKEN"),
+            Some(&"xapp-OPENSHELL-PLACEHOLDER".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_drops_unsafe_placeholder_overrides() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        create_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "broken-provider".to_string(),
+                r#type: "test".to_string(),
+                credentials: [
+                    ("OK_KEY".to_string(), "v1".to_string()),
+                    ("CRLF_KEY".to_string(), "v2".to_string()),
+                    ("EMPTY_KEY".to_string(), "v3".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                config: HashMap::new(),
+                credential_placeholders: [
+                    ("OK_KEY".to_string(), "ok-PLACEHOLDER".to_string()),
+                    ("CRLF_KEY".to_string(), "bad\r\ninjected".to_string()),
+                    ("EMPTY_KEY".to_string(), String::new()),
+                ]
+                .into_iter()
+                .collect(),
+                passthrough_credentials: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["broken-provider".to_string()])
+            .await
+            .unwrap();
+
+        // Safe override is preserved.
+        assert_eq!(
+            result.placeholder_overrides.get("OK_KEY"),
+            Some(&"ok-PLACEHOLDER".to_string())
+        );
+        // Unsafe overrides are dropped — the credential falls back to the
+        // canonical placeholder downstream.
+        assert!(!result.placeholder_overrides.contains_key("CRLF_KEY"));
+        assert!(!result.placeholder_overrides.contains_key("EMPTY_KEY"));
+        // All credentials are still present in env.
+        assert_eq!(result.env.len(), 3);
     }
 
     #[tokio::test]
@@ -847,6 +1088,8 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
+                credential_placeholders: HashMap::new(),
+            passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -876,7 +1119,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&"sk-test".to_string()));
+        assert_eq!(
+            env.env.get("ANTHROPIC_API_KEY"),
+            Some(&"sk-test".to_string())
+        );
     }
 
     #[tokio::test]
@@ -906,7 +1152,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(env.is_empty());
+        assert!(env.env.is_empty());
     }
 
     #[tokio::test]

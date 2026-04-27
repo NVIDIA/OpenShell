@@ -191,15 +191,30 @@ pub async fn sync_policy(endpoint: &str, sandbox: &str, policy: &ProtoSandboxPol
     sync_policy_with_client(&mut client, sandbox, policy).await
 }
 
+/// Provider environment fetched from the gateway: credential values plus any
+/// per-credential placeholder overrides and passthrough opt-ins.
+#[derive(Debug, Default, Clone)]
+pub struct ProviderEnvironment {
+    /// Real credential values keyed by env var name.
+    pub env: HashMap<String, String>,
+    /// Optional placeholder overrides keyed by env var name. Missing entries
+    /// fall back to the canonical `openshell:resolve:env:<KEY>` form.
+    pub placeholder_overrides: HashMap<String, String>,
+    /// Env var names whose REAL credential value is injected directly into
+    /// the agent process, with no placeholder substitution. The supervisor
+    /// must NOT register passthrough keys with the secret resolver.
+    pub passthrough_keys: Vec<String>,
+}
+
 /// Fetch provider environment variables for a sandbox from OpenShell server via gRPC.
 ///
-/// Returns a map of environment variable names to values derived from provider
-/// credentials configured on the sandbox. Returns an empty map if the sandbox
+/// Returns the credential map, per-credential placeholder overrides, and the
+/// list of passthrough credential keys. Returns empty values if the sandbox
 /// has no providers or the call fails.
 pub async fn fetch_provider_environment(
     endpoint: &str,
     sandbox_id: &str,
-) -> Result<HashMap<String, String>> {
+) -> Result<ProviderEnvironment> {
     debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Fetching provider environment");
 
     let mut client = connect(endpoint).await?;
@@ -209,9 +224,14 @@ pub async fn fetch_provider_environment(
             sandbox_id: sandbox_id.to_string(),
         })
         .await
-        .into_diagnostic()?;
+        .into_diagnostic()?
+        .into_inner();
 
-    Ok(response.into_inner().environment)
+    Ok(ProviderEnvironment {
+        env: response.environment,
+        placeholder_overrides: response.placeholder_overrides,
+        passthrough_keys: response.passthrough_keys,
+    })
 }
 
 /// A reusable gRPC client for the OpenShell service.
