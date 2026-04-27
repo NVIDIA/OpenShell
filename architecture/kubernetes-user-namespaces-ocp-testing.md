@@ -5,19 +5,10 @@ Step-by-step guide to deploy OpenShell with user namespace isolation on an OpenS
 ## Prerequisites
 
 - An OCP cluster (tested on OCP 4.22 / K8s 1.35.3 / CRI-O 1.35 / RHEL CoreOS / kernel 5.14)
-- `KUBECONFIG` pointing at the cluster (e.g., `export KUBECONFIG=/path/to/kubeconfig`)
-- `kubectl` binary (the examples below use the full path; adjust as needed)
-- `helm` binary
+- `kubectl` and `helm` on your `PATH`
 - `podman` for building and pushing images
+- `KUBECONFIG` set to point at the cluster
 - The OpenShell repo checked out with the user namespace branch built
-
-Throughout this guide:
-
-```shell
-K=/home/mrunalp/repos/kubernetes/_output/local/bin/linux/amd64/kubectl
-HELM=/home/mrunalp/.local/share/mise/installs/helm/4.1.4/linux-amd64/helm
-export KUBECONFIG=/path/to/your/kubeconfig
-```
 
 ## 1. Build binaries
 
@@ -30,15 +21,15 @@ cargo build -p openshell-cli --features openshell-core/dev-settings
 ## 2. Create namespace and install the Sandbox CRD
 
 ```shell
-$K create ns openshell
-$K apply -f deploy/kube/manifests/agent-sandbox.yaml
+kubectl create ns openshell
+kubectl apply -f deploy/kube/manifests/agent-sandbox.yaml
 ```
 
 Label the namespace to allow privileged pods:
 
 ```shell
-$K label ns openshell pod-security.kubernetes.io/enforce=privileged --overwrite
-$K label ns openshell pod-security.kubernetes.io/warn=privileged --overwrite
+kubectl label ns openshell pod-security.kubernetes.io/enforce=privileged --overwrite
+kubectl label ns openshell pod-security.kubernetes.io/warn=privileged --overwrite
 ```
 
 ## 3. Grant SCCs
@@ -46,15 +37,15 @@ $K label ns openshell pod-security.kubernetes.io/warn=privileged --overwrite
 The gateway pod needs `anyuid` (runs as UID 1000) and sandbox pods need `privileged` (capabilities for supervisor):
 
 ```shell
-$K create clusterrolebinding openshell-sa-anyuid \
+kubectl create clusterrolebinding openshell-sa-anyuid \
   --clusterrole=system:openshift:scc:anyuid \
   --serviceaccount=openshell:openshell
 
-$K create clusterrolebinding openshell-sa-privileged \
+kubectl create clusterrolebinding openshell-sa-privileged \
   --clusterrole=system:openshift:scc:privileged \
   --serviceaccount=openshell:openshell
 
-$K create clusterrolebinding openshell-default-privileged \
+kubectl create clusterrolebinding openshell-default-privileged \
   --clusterrole=system:openshift:scc:privileged \
   --serviceaccount=openshell:default
 ```
@@ -62,7 +53,7 @@ $K create clusterrolebinding openshell-default-privileged \
 Grant the sandbox CRD controller full permissions (it needs to set ownerReferences with blockOwnerDeletion):
 
 ```shell
-$K create clusterrolebinding agent-sandbox-admin \
+kubectl create clusterrolebinding agent-sandbox-admin \
   --clusterrole=cluster-admin \
   --serviceaccount=agent-sandbox-system:agent-sandbox-controller
 ```
@@ -101,18 +92,18 @@ openssl x509 -req -in $TLSDIR/client.csr \
 Create Kubernetes secrets:
 
 ```shell
-$K create secret tls openshell-server-tls -n openshell \
+kubectl create secret tls openshell-server-tls -n openshell \
   --cert=$TLSDIR/server.crt --key=$TLSDIR/server.key
 
-$K create secret generic openshell-server-client-ca -n openshell \
+kubectl create secret generic openshell-server-client-ca -n openshell \
   --from-file=ca.crt=$TLSDIR/ca.crt
 
-$K create secret generic openshell-client-tls -n openshell \
+kubectl create secret generic openshell-client-tls -n openshell \
   --from-file=ca.crt=$TLSDIR/ca.crt \
   --from-file=tls.crt=$TLSDIR/client.crt \
   --from-file=tls.key=$TLSDIR/client.key
 
-$K create secret generic openshell-ssh-handshake -n openshell \
+kubectl create secret generic openshell-ssh-handshake -n openshell \
   --from-literal=secret=$(openssl rand -hex 32)
 ```
 
@@ -122,12 +113,12 @@ Note: the `openshell-client-tls` secret must include `ca.crt`, `tls.crt`, and `t
 
 ```shell
 # Enable the default route for the internal registry
-$K patch configs.imageregistry.operator.openshift.io/cluster \
+kubectl patch configs.imageregistry.operator.openshift.io/cluster \
   --type merge -p '{"spec":{"defaultRoute":true}}'
 
 sleep 5
-REGISTRY=$($K get route default-route -n openshift-image-registry -o jsonpath='{.spec.host}')
-TOKEN=$($K create token builder -n openshell)
+REGISTRY=$(kubectl get route default-route -n openshift-image-registry -o jsonpath='{.spec.host}')
+TOKEN=$(kubectl create token builder -n openshell)
 
 podman login --tls-verify=false -u kubeadmin -p "$TOKEN" "$REGISTRY"
 ```
@@ -177,7 +168,7 @@ Deploy the installer DaemonSet:
 ```shell
 INTERNAL_REG="image-registry.openshift-image-registry.svc:5000"
 
-cat <<EOF | $K apply -f -
+cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -226,7 +217,7 @@ EOF
 Wait for all pods to be Running:
 
 ```shell
-$K get pods -n openshell -l app=openshell-supervisor-installer -o wide
+kubectl get pods -n openshell -l app=openshell-supervisor-installer -o wide
 ```
 
 The `chcon -t container_file_t` step is required on RHEL/CoreOS nodes where SELinux enforces file labels. Without it, the container runtime cannot access the supervisor binary through the hostPath mount.
@@ -236,7 +227,7 @@ The `chcon -t container_file_t` step is required on RHEL/CoreOS nodes where SELi
 ```shell
 INTERNAL_REG="image-registry.openshift-image-registry.svc:5000"
 
-$HELM install openshell deploy/helm/openshell -n openshell \
+helm install openshell deploy/helm/openshell -n openshell \
   --set image.repository=$INTERNAL_REG/openshell/gateway \
   --set image.tag=dev \
   --set image.pullPolicy=Always \
@@ -251,7 +242,7 @@ $HELM install openshell deploy/helm/openshell -n openshell \
 Wait for the gateway to be ready:
 
 ```shell
-$K rollout status statefulset/openshell -n openshell --timeout=120s
+kubectl rollout status statefulset/openshell -n openshell --timeout=120s
 ```
 
 Note: `server.dbUrl` is set to `/tmp/openshell.db` to avoid PVC permission issues on clusters without a properly configured storage class. For production, use a PVC-backed path.
@@ -261,7 +252,7 @@ Note: `server.dbUrl` is set to `/tmp/openshell.db` to avoid PVC permission issue
 Port-forward the gateway service to localhost:
 
 ```shell
-nohup $K port-forward svc/openshell -n openshell 18443:8080 >/tmp/pf.log 2>&1 &
+nohup kubectl port-forward svc/openshell -n openshell 18443:8080 >/tmp/pf.log 2>&1 &
 ```
 
 Set up the CLI gateway configuration with mTLS:
@@ -333,23 +324,23 @@ This confirms:
 
 ```shell
 # Delete all sandboxes
-$K delete sandbox --all -n openshell
+kubectl delete sandbox --all -n openshell
 
 # Uninstall the Helm release
-$HELM uninstall openshell -n openshell
+helm uninstall openshell -n openshell
 
 # Remove the supervisor installer
-$K delete daemonset openshell-supervisor-installer -n openshell
+kubectl delete daemonset openshell-supervisor-installer -n openshell
 
 # Remove RBAC
-$K delete clusterrolebinding openshell-sa-anyuid openshell-sa-privileged \
+kubectl delete clusterrolebinding openshell-sa-anyuid openshell-sa-privileged \
   openshell-default-privileged agent-sandbox-admin 2>/dev/null
 
 # Remove the Sandbox CRD and its controller
-$K delete -f deploy/kube/manifests/agent-sandbox.yaml
+kubectl delete -f deploy/kube/manifests/agent-sandbox.yaml
 
 # Remove the namespace
-$K delete ns openshell
+kubectl delete ns openshell
 
 # Kill port-forward
 pkill -f "port-forward.*18443"
