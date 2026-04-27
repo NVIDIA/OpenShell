@@ -42,22 +42,13 @@ If you already use an SSH key for `git push`, you can reuse it as a signing key.
    git config --global tag.gpgsign true
    ```
 
-4. (Recommended) Tell git to verify your own signatures locally by listing your key as trusted:
-
-   ```shell
-   echo "$(git config user.email) $(cat ~/.ssh/id_ed25519_signing.pub)" \
-     >> ~/.ssh/allowed_signers
-   git config --global gpg.ssh.allowedSignersFile ~/.ssh/allowed_signers
-   ```
-
-5. Verify on a test commit:
+4. Verify on a test commit:
 
    ```shell
    git commit --allow-empty -s -m "test: signing"
-   git log --show-signature -1
    ```
 
-   You should see `Good "git" signature for you@example.com`.
+   Push the branch and confirm GitHub shows the commit as **Verified**.
 
 If you have older unsigned commits on a branch, sign them by rebasing:
 
