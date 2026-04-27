@@ -700,6 +700,10 @@ enum ProviderCommands {
         names: bool,
     },
 
+    /// List available provider types.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    ListTypes,
+
     /// Update an existing provider's credentials or config.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Update {
@@ -2618,6 +2622,9 @@ async fn main() -> Result<()> {
                     names,
                 } => {
                     run::provider_list(endpoint, limit, offset, names, &tls).await?;
+                }
+                ProviderCommands::ListTypes => {
+                    run::provider_list_types(endpoint, &tls).await?;
                 }
                 ProviderCommands::Update {
                     name,

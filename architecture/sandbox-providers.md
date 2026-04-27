@@ -35,14 +35,62 @@ Provider is defined in `proto/datamodel.proto`:
 - `type`: canonical provider slug (`claude`, `gitlab`, `github`, etc.)
 - `credentials`: `map<string, string>` for secret values
 - `config`: `map<string, string>` for non-secret settings
+- `profile_id`: provider type profile used for profile-backed policy composition
+- `profile_policy_enabled`: explicit opt-in for provider-generated policy entries
 
 The gRPC surface is defined in `proto/openshell.proto`:
 
 - `CreateProvider`
 - `GetProvider`
 - `ListProviders`
+- `ListProviderProfiles`
+- `GetProviderProfile`
 - `UpdateProvider`
 - `DeleteProvider`
+
+## Provider Type Profiles
+
+Provider type profiles are declarative metadata for provider types. Profiles live in
+`crates/openshell-providers` and are exposed through `ListProviderProfiles` and
+`GetProviderProfile`. They describe credential names and environment variables,
+known network endpoints, expected binaries, category, and whether the provider is
+inference-capable.
+
+Profiles are additive to provider records. A provider record with only `type`,
+`credentials`, and `config` remains a legacy credential-only provider. The gateway
+does not infer provider-managed network policy from `provider.type` alone. A provider
+contributes profile-generated policy only when `profile_policy_enabled` is true and
+`profile_id` names a known profile. Existing stored provider records deserialize with
+`profile_policy_enabled = false`, so OpenShell upgrades do not silently broaden network
+access for existing sandboxes.
+
+New providers created by current clients can set `profile_id` to the provider type and
+enable `profile_policy_enabled`. This makes the compatibility boundary explicit while
+keeping the normal CLI experience simple.
+
+### Provider Policy Composition
+
+Sandbox policy fetch uses just-in-time composition:
+
+```text
+effective policy = base/static policy + enabled provider profile rules + user rules
+```
+
+The composed policy is derived data. The sandbox still receives one normal
+`SandboxPolicy`, but provider-generated entries are not persisted as user-authored
+policy revisions. Full policy replacement and incremental policy updates continue to
+mutate the user-authored policy layer. Provider-generated rules are re-added during
+composition for each attached provider whose profile policy is enabled.
+
+Provider-generated network rules use reserved `_provider_*` names derived from the
+provider record name. If a user policy already has the same key, composition keeps the
+user entry and adds a numeric suffix to the provider entry. Duplicate host/port
+endpoints across user and provider rules are valid; OPA evaluates all rules, so allow
+decisions are the union of matching allows and deny rules continue to win globally.
+
+Gateway-global policy remains a full override. When a global policy is active, the
+gateway serves the global policy as-is rather than composing provider layers into it,
+and the existing blocks on sandbox-scoped policy mutations remain unchanged.
 
 ## Components
 
@@ -174,6 +222,7 @@ Also supported:
 
 - `openshell provider get <name>`
 - `openshell provider list`
+- `openshell provider list-types`
 - `openshell provider update <name> ...`
 - `openshell provider delete <name> [<name>...]`
 
@@ -232,6 +281,8 @@ Key behaviors:
 - Only `credentials` are injected, not `config`.
 - Invalid env var keys (containing `.`, `-`, spaces, etc.) are skipped.
 - Credentials are never persisted in the sandbox spec's environment map.
+- Provider profiles do not change credential injection in the first iteration.
+  Injection still uses the existing placeholder environment path.
 
 ### Sandbox Supervisor: Fetching Credentials
 
