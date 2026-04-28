@@ -15,7 +15,20 @@ if [ -f /srv/openshell-env.sh ]; then
 fi
 
 BOOT_START=$(date +%s%3N 2>/dev/null || date +%s)
+# gvisor-tap-vsock subnet layout:
+#   192.168.127.1   — gateway: gvproxy's DNS / DHCP / HTTP API. Does NOT
+#                     proxy arbitrary host ports.
+#   192.168.127.254 — host-loopback: NAT-rewritten to host's 127.0.0.1 by
+#                     gvproxy's TCP/UDP/ICMP forwarder. Use this address
+#                     (or any of the host.* hostnames below) to reach a
+#                     service the host is listening on.
+# The host.containers.internal / host.docker.internal DNS records served
+# by gvproxy's embedded resolver point at 192.168.127.254. We mirror that
+# in /etc/hosts so the supervisor can reach the gateway even when
+# gvproxy's DNS is not in resolv.conf (e.g. DHCP failed and we fell
+# back to 8.8.8.8).
 GVPROXY_GATEWAY_IP="192.168.127.1"
+GVPROXY_HOST_LOOPBACK_IP="192.168.127.254"
 GATEWAY_IP="$GVPROXY_GATEWAY_IP"
 
 # Parse kernel cmdline for GPU and TAP networking parameters
@@ -96,11 +109,19 @@ tcp_probe() {
 }
 
 ensure_host_gateway_aliases() {
-    # Pin every host-gateway alias to the gvproxy gateway IP via /etc/hosts so the
-    # supervisor can reach the OpenShell server even when gvproxy's built-in DNS
-    # is not in resolv.conf (e.g. when DHCP fails and we fall back to 8.8.8.8).
+    # Seed /etc/hosts with the well-known gvproxy hostnames so the supervisor
+    # can reach the OpenShell server even when gvproxy's built-in DNS is not
+    # in resolv.conf (e.g. when DHCP fails and we fall back to 8.8.8.8).
+    #
+    # Critical distinction: host.* aliases point at the gvproxy *host-loopback*
+    # IP (192.168.127.254), not the gateway IP (192.168.127.1). Only the
+    # host-loopback IP carries NAT rewriting to the host's 127.0.0.1 — the
+    # gateway IP only listens on gvproxy's own service ports (DNS:53, DHCP,
+    # HTTP API:80). Pinning host.containers.internal to the gateway IP
+    # silently breaks guest→host port reachability for arbitrary ports.
     local hosts_tmp="/tmp/openshell-hosts.$$"
-    local aliases="host.openshell.internal host.containers.internal host.docker.internal gateway.containers.internal"
+    local host_aliases="host.openshell.internal host.containers.internal host.docker.internal"
+    local gateway_aliases="gateway.containers.internal"
     local filter='(^|[[:space:]])(host\.openshell\.internal|host\.containers\.internal|host\.docker\.internal|gateway\.containers\.internal)([[:space:]]|$)'
 
     if [ -f /etc/hosts ]; then
@@ -109,7 +130,18 @@ ensure_host_gateway_aliases() {
         : > "$hosts_tmp"
     fi
 
-    printf '%s %s\n' "$GATEWAY_IP" "$aliases" >> "$hosts_tmp"
+    # In TAP/GPU mode, GATEWAY_IP is overridden to VM_NET_GW (the host-side
+    # of the TAP), and the gateway is reachable directly there. In gvproxy
+    # mode, host.openshell.internal etc. need GVPROXY_HOST_LOOPBACK_IP
+    # (192.168.127.254) which is gvproxy's host-NAT entry, while
+    # gateway.containers.internal points at the gvproxy gateway itself.
+    if [ "${GATEWAY_IP}" = "${GVPROXY_GATEWAY_IP}" ]; then
+        printf '%s %s\n' "$GVPROXY_HOST_LOOPBACK_IP" "$host_aliases" >> "$hosts_tmp"
+        printf '%s %s\n' "$GVPROXY_GATEWAY_IP" "$gateway_aliases" >> "$hosts_tmp"
+    else
+        # TAP networking: gateway and host are both reachable at GATEWAY_IP.
+        printf '%s %s %s\n' "$GATEWAY_IP" "$host_aliases" "$gateway_aliases" >> "$hosts_tmp"
+    fi
     cat "$hosts_tmp" > /etc/hosts
     rm -f "$hosts_tmp"
 }
@@ -134,7 +166,15 @@ rewrite_openshell_endpoint_if_needed() {
         return 0
     fi
 
-    for candidate in host.openshell.internal host.containers.internal host.docker.internal "$GATEWAY_IP"; do
+    # Probe candidates in preference order. Hostnames first for informative
+    # log output, then a bare IP as a final safety net. In gvproxy mode the
+    # bare IP is the host-loopback (192.168.127.254). In TAP/GPU mode it's
+    # the TAP host gateway.
+    local fallback_ip="$GVPROXY_HOST_LOOPBACK_IP"
+    if [ "${GATEWAY_IP}" != "${GVPROXY_GATEWAY_IP}" ]; then
+        fallback_ip="$GATEWAY_IP"
+    fi
+    for candidate in host.openshell.internal host.containers.internal host.docker.internal "$fallback_ip"; do
         if [ "$candidate" = "$host" ]; then
             continue
         fi

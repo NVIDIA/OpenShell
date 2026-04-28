@@ -167,13 +167,20 @@ echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STA
 # `~/.local/libexec/openshell/openshell-driver-vm` when present
 # (install-vm.sh installs there), which silently shadows development
 # builds — a subtle source of stale-binary bugs in e2e runs.
+# --grpc-endpoint is the URL the VM driver passes into each guest as
+# OPENSHELL_ENDPOINT. The supervisor inside the VM dials this address.
+# Use `host.containers.internal` rather than `127.0.0.1` so gvproxy's
+# host-loopback proxy carries the connection — gvproxy's bare gateway IP
+# (192.168.127.1) does NOT forward arbitrary host ports. The driver also
+# rewrites loopback URLs to this hostname as a safety net, so this matches
+# what the guest will actually see and aligns with `tasks/scripts/gateway-vm.sh`.
 "${GATEWAY_BIN}" \
   --drivers vm \
   --disable-tls \
   --disable-gateway-auth \
   --db-url 'sqlite::memory:' \
   --port "${HOST_PORT}" \
-  --grpc-endpoint "http://127.0.0.1:${HOST_PORT}" \
+  --grpc-endpoint "http://host.containers.internal:${HOST_PORT}" \
   --ssh-handshake-secret "${SSH_HANDSHAKE_SECRET}" \
   --driver-dir "${ROOT}/target/debug" \
   --vm-driver-state-dir "${RUN_STATE_DIR}" \

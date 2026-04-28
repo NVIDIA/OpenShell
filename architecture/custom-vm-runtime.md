@@ -220,8 +220,8 @@ graph LR
 The `vm-runtime-<platform>.tar.zst` artifact is consumed by
 `openshell-driver-vm`'s `build.rs`, which embeds the library set into the
 binary via `include_bytes!()`. Setting `OPENSHELL_VM_RUNTIME_COMPRESSED_DIR`
-at build time (wired up by `crates/openshell-driver-vm/start.sh`) points the
-build at the staged artifacts.
+at build time (wired up by `tasks/scripts/gateway-vm.sh`, registered as
+`mise run gateway:vm`) points the build at the staged artifacts.
 
 ## Kernel Config Fragment
 
@@ -315,14 +315,15 @@ cross-compiled via osxcross (no macOS runner needed for the binary build —
 only for the kernel build).
 
 macOS driver binaries produced via osxcross are not codesigned. Development
-builds are signed automatically by `crates/openshell-driver-vm/start.sh`; a
-packaged release needs signing in CI.
+builds are signed automatically by `tasks/scripts/gateway-vm.sh`
+(registered as `mise run gateway:vm`); a packaged release needs signing in
+CI.
 
 ## Rollout Strategy
 
 1. Custom runtime is embedded by default when building `openshell-driver-vm`
    with `OPENSHELL_VM_RUNTIME_COMPRESSED_DIR` set (wired up by
-   `crates/openshell-driver-vm/start.sh`).
+   `tasks/scripts/gateway-vm.sh`).
 2. The sandbox init script validates kernel capabilities at boot and fails
    fast if missing.
 3. For development, override with `OPENSHELL_VM_RUNTIME_DIR` to use a local

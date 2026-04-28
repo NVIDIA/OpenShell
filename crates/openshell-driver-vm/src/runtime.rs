@@ -705,13 +705,15 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
     //     talks to on boot (IPs 192.168.127.1 / .2, defaults for
     //     gvisor-tap-vsock);
     //   * the host-facing gateway identity the guest uses for callbacks:
-    //     the init script seeds `/etc/hosts` with
-    //     `host.openshell.internal` pointing at 192.168.127.1 while
-    //     leaving gvproxy's legacy `host.containers.internal` /
-    //     `host.docker.internal` DNS answers intact, which is how the guest's
-    //     `rewrite_openshell_endpoint_if_needed` probe reaches the host
-    //     gateway when the bare loopback address doesn't resolve from
-    //     inside the VM.
+    //     gvproxy installs a default NAT entry rewriting `192.168.127.254`
+    //     (the subnet's HostIP) to the host's `127.0.0.1`, and serves
+    //     `host.containers.internal` / `host.docker.internal` /
+    //     `host.openshell.internal` in its embedded DNS pointing at that
+    //     same HostIP. The guest init script seeds /etc/hosts with the
+    //     same mapping so the supervisor reaches the host gateway even
+    //     when gvproxy's DNS isn't in resolv.conf. The gateway IP
+    //     (192.168.127.1) is NOT a host-loopback proxy — it only listens
+    //     on its own service ports (DNS:53, DHCP, HTTP API:80).
     //
     // That network plane is also what the sandbox supervisor's
     // per-sandbox netns (veth pair + iptables, see
