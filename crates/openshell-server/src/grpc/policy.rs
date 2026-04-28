@@ -167,6 +167,16 @@ fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
     }
 }
 
+fn ensure_chunk_belongs_to_sandbox(
+    chunk: &DraftChunkRecord,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    if chunk.sandbox_id != sandbox_id {
+        return Err(Status::not_found("chunk not found"));
+    }
+    Ok(())
+}
+
 fn summarize_add_endpoint(rule_name: &str, rule: &NetworkPolicyRule) -> String {
     let endpoints = rule
         .endpoints
@@ -1336,6 +1346,7 @@ pub(super) async fn handle_approve_draft_chunk(
         .await
         .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
         .ok_or_else(|| Status::not_found("chunk not found"))?;
+    ensure_chunk_belongs_to_sandbox(&chunk, &sandbox_id)?;
 
     if chunk.status != "pending" && chunk.status != "rejected" {
         return Err(Status::failed_precondition(format!(
@@ -1421,6 +1432,7 @@ pub(super) async fn handle_reject_draft_chunk(
         .await
         .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
         .ok_or_else(|| Status::not_found("chunk not found"))?;
+    ensure_chunk_belongs_to_sandbox(&chunk, &sandbox_id)?;
 
     if chunk.status != "pending" && chunk.status != "approved" {
         return Err(Status::failed_precondition(format!(
@@ -1603,12 +1615,13 @@ pub(super) async fn handle_edit_draft_chunk(
         .proposed_rule
         .ok_or_else(|| Status::invalid_argument("proposed_rule is required"))?;
 
-    let _sandbox = state
+    let sandbox = state
         .store
         .get_message_by_name::<Sandbox>(&req.name)
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox_id = sandbox.object_id().to_string();
 
     let chunk = state
         .store
@@ -1616,6 +1629,7 @@ pub(super) async fn handle_edit_draft_chunk(
         .await
         .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
         .ok_or_else(|| Status::not_found("chunk not found"))?;
+    ensure_chunk_belongs_to_sandbox(&chunk, &sandbox_id)?;
 
     if chunk.status != "pending" {
         return Err(Status::failed_precondition(format!(
@@ -1665,6 +1679,7 @@ pub(super) async fn handle_undo_draft_chunk(
         .await
         .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
         .ok_or_else(|| Status::not_found("chunk not found"))?;
+    ensure_chunk_belongs_to_sandbox(&chunk, &sandbox_id)?;
 
     if chunk.status != "approved" {
         return Err(Status::failed_precondition(format!(
@@ -2891,6 +2906,146 @@ mod tests {
         .unwrap()
         .into_inner();
         assert!(history_after_clear.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn draft_chunk_handlers_reject_cross_sandbox_chunk_ids() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let sandbox_a = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-draft-owner".to_string(),
+                name: "draft-owner".to_string(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        let sandbox_b = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-draft-other".to_string(),
+                name: "draft-other".to_string(),
+                created_at_ms: 1_000_001,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox_a).await.unwrap();
+        state.store.put_message(&sandbox_b).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "allow_example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_a.object_name().to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "allow_example".to_string(),
+                    proposed_rule: Some(proposed_rule.clone()),
+                    rationale: "observed denied request".to_string(),
+                    confidence: 0.85,
+                    hit_count: 3,
+                    first_seen_ms: 100,
+                    last_seen_ms: 200,
+                    binary: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft_policy = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_a.object_name().to_string(),
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = draft_policy.chunks[0].id.clone();
+        let other_name = sandbox_b.object_name().to_string();
+
+        let approve_err = handle_approve_draft_chunk(
+            &state,
+            Request::new(ApproveDraftChunkRequest {
+                name: other_name.clone(),
+                chunk_id: chunk_id.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(approve_err.code(), Code::NotFound);
+
+        let reject_err = handle_reject_draft_chunk(
+            &state,
+            Request::new(RejectDraftChunkRequest {
+                name: other_name.clone(),
+                chunk_id: chunk_id.clone(),
+                reason: "wrong sandbox".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reject_err.code(), Code::NotFound);
+
+        let edit_err = handle_edit_draft_chunk(
+            &state,
+            Request::new(EditDraftChunkRequest {
+                name: other_name.clone(),
+                chunk_id: chunk_id.clone(),
+                proposed_rule: Some(proposed_rule.clone()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(edit_err.code(), Code::NotFound);
+
+        handle_approve_draft_chunk(
+            &state,
+            Request::new(ApproveDraftChunkRequest {
+                name: sandbox_a.object_name().to_string(),
+                chunk_id: chunk_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let undo_err = handle_undo_draft_chunk(
+            &state,
+            Request::new(UndoDraftChunkRequest {
+                name: other_name,
+                chunk_id,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(undo_err.code(), Code::NotFound);
     }
 
     #[test]
