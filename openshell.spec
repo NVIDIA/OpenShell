@@ -9,7 +9,7 @@
 
 Name:           openshell
 Version:        0.0.37
-Release:        1.20260427180107195036.rpm.23.gcde20dc3%{?dist}
+Release:        1.20260428102251900262.rpm.24.gf5a444a0%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
@@ -127,6 +127,12 @@ StateDirectory=openshell
 Restart=on-failure
 RestartSec=5
 
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -145,15 +151,31 @@ Wants=podman.socket
 
 [Service]
 Type=exec
-# Read system defaults (optional) -- driver, images, TLS settings.
-EnvironmentFile=-/etc/sysconfig/openshell-gateway
-# Override the DB path for user-level state directory.
-# %%S expands to $XDG_STATE_HOME (~/.local/state) in user units.
+# Self-contained defaults for rootless operation.
+# Set OPENSHELL_SSH_HANDSHAKE_SECRET before starting:
+#   systemctl --user edit openshell-gateway.service
+# and add:
+#   [Service]
+#   Environment=OPENSHELL_SSH_HANDSHAKE_SECRET=<your-secret>
+#
+# WARNING: TLS is disabled. The gateway has NO authentication and
+# listens on all interfaces. For network-exposed setups, configure
+# mTLS certificates and remove OPENSHELL_DISABLE_TLS.
+Environment=OPENSHELL_DRIVERS=podman
 Environment=OPENSHELL_DB_URL=sqlite://%%S/openshell/gateway.db
+Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
+Environment=OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+Environment=OPENSHELL_DISABLE_TLS=true
 ExecStart=/usr/bin/openshell-gateway
 StateDirectory=openshell
 Restart=on-failure
 RestartSec=5
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=default.target
@@ -161,17 +183,32 @@ EOF
 
 # --- Gateway environment file ---
 # Provides defaults for the Podman driver and GHCR image references.
+# Mode 0640: contains the SSH handshake secret -- must not be world-readable.
 # Admins can override these values by editing this file.
 install -d %{buildroot}%{_sysconfdir}/sysconfig
+install -pm 0640 /dev/null %{buildroot}%{_sysconfdir}/sysconfig/%{name}-gateway
 cat > %{buildroot}%{_sysconfdir}/sysconfig/%{name}-gateway << 'EOF'
 # OpenShell Gateway configuration
 # See: openshell-gateway --help for all available options.
 
-# Compute driver: use Podman for sandbox container lifecycle.
-OPENSHELL_DRIVERS=podman
+# ---- Required settings ----
+
+# Shared secret for gateway-to-sandbox SSH handshake authentication.
+# REQUIRED: Generate a value before starting the service:
+#   openssl rand -hex 32
+# The same secret must be shared with every sandbox that connects to
+# this gateway.
+OPENSHELL_SSH_HANDSHAKE_SECRET=
 
 # Database URL for gateway state persistence.
+# For the system unit this defaults to /var/lib/openshell/gateway.db.
+# The user unit overrides this to ~/.local/state/openshell/gateway.db.
 OPENSHELL_DB_URL=sqlite:///var/lib/openshell/gateway.db
+
+# ---- Optional settings ----
+
+# Compute driver: use Podman for sandbox container lifecycle.
+OPENSHELL_DRIVERS=podman
 
 # Supervisor image mounted into sandbox containers.
 OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
@@ -179,9 +216,17 @@ OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
 # Default sandbox base image.
 OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 
-# Disable TLS for local single-node operation.
-# For production, comment this out and configure --tls-cert, --tls-key,
-# and --tls-client-ca.
+# ---- SECURITY WARNING ----
+# TLS is disabled by default for ease of initial setup. With TLS
+# disabled, the gateway has NO authentication and listens on ALL
+# network interfaces (0.0.0.0:8080). Any host that can reach this
+# port has full unauthenticated access to the API, including sandbox
+# creation, command execution, and credential retrieval.
+#
+# For any deployment beyond single-user localhost testing:
+#   1. Generate mTLS certificates (see OpenShell docs)
+#   2. Set OPENSHELL_TLS_CERT, OPENSHELL_TLS_KEY, OPENSHELL_TLS_CLIENT_CA
+#   3. Comment out OPENSHELL_DISABLE_TLS below
 OPENSHELL_DISABLE_TLS=true
 EOF
 
@@ -232,6 +277,13 @@ touch %{buildroot}%{python3_sitelib}/%{name}-%{version}.dist-info/RECORD
 PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata import version; v = version('openshell'); print(v); assert v == '%{version}', f'expected %{version}, got {v}'"
 
 %post gateway
+# Generate SSH handshake secret on fresh install if not already set.
+# Uses /dev/urandom to avoid requiring openssl at install time.
+SYSCONFIG=%{_sysconfdir}/sysconfig/%{name}-gateway
+if [ -f "$SYSCONFIG" ] && grep -q '^OPENSHELL_SSH_HANDSHAKE_SECRET=$' "$SYSCONFIG" 2>/dev/null; then
+    SECRET=$(head -c 32 /dev/urandom | od -A n -t x1 | tr -d ' \n')
+    sed -i "s/^OPENSHELL_SSH_HANDSHAKE_SECRET=$/OPENSHELL_SSH_HANDSHAKE_SECRET=${SECRET}/" "$SYSCONFIG"
+fi
 %systemd_post %{name}-gateway.service
 %systemd_user_post %{name}-gateway.service
 
@@ -253,7 +305,7 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata
 %{_bindir}/%{name}-gateway
 %{_unitdir}/%{name}-gateway.service
 %{_userunitdir}/%{name}-gateway.service
-%config(noreplace) %{_sysconfdir}/sysconfig/%{name}-gateway
+%attr(0640,root,root) %config(noreplace) %{_sysconfdir}/sysconfig/%{name}-gateway
 %dir %{_sharedstatedir}/%{name}
 
 %files -n python3-%{name}
