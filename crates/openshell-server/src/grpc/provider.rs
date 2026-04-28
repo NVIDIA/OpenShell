@@ -155,8 +155,6 @@ pub(super) async fn update_provider_record(
         r#type: existing.r#type,
         credentials: merge_map(existing.credentials, provider.credentials),
         config: merge_map(existing.config, provider.config),
-        profile_id: existing.profile_id,
-        profile_policy_enabled: existing.profile_policy_enabled,
     };
 
     // Ensure metadata is valid (defense in depth - existing.metadata should always be valid)
@@ -431,8 +429,6 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            profile_id: String::new(),
-            profile_policy_enabled: false,
         }
     }
 
@@ -478,8 +474,6 @@ mod tests {
                 .collect(),
                 config: std::iter::once(("endpoint".to_string(), "https://gitlab.com".to_string()))
                     .collect(),
-                profile_id: String::new(),
-                profile_policy_enabled: false,
             },
         )
         .await
@@ -548,8 +542,6 @@ mod tests {
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                profile_id: String::new(),
-                profile_policy_enabled: false,
             },
         )
         .await
@@ -574,8 +566,6 @@ mod tests {
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                profile_id: String::new(),
-                profile_policy_enabled: false,
             },
         )
         .await
@@ -604,8 +594,6 @@ mod tests {
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                profile_id: String::new(),
-                profile_policy_enabled: false,
             },
         )
         .await
@@ -653,8 +641,6 @@ mod tests {
                 r#type: String::new(),
                 credentials: std::iter::once(("SECONDARY".to_string(), String::new())).collect(),
                 config: std::iter::once(("region".to_string(), String::new())).collect(),
-                profile_id: String::new(),
-                profile_policy_enabled: false,
             },
         )
         .await
@@ -706,8 +692,6 @@ mod tests {
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                profile_id: String::new(),
-                profile_policy_enabled: false,
             },
         )
         .await
@@ -737,8 +721,6 @@ mod tests {
                 r#type: "openai".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                profile_id: String::new(),
-                profile_policy_enabled: false,
             },
         )
         .await
@@ -770,8 +752,6 @@ mod tests {
                 r#type: String::new(),
                 credentials: std::iter::once((oversized_key, "value".to_string())).collect(),
                 config: HashMap::new(),
-                profile_id: String::new(),
-                profile_policy_enabled: false,
             },
         )
         .await
@@ -809,8 +789,6 @@ mod tests {
                 "https://api.anthropic.com".to_string(),
             ))
             .collect(),
-            profile_id: String::new(),
-            profile_policy_enabled: false,
         };
         create_provider_record(&store, provider).await.unwrap();
 
@@ -851,8 +829,6 @@ mod tests {
             .into_iter()
             .collect(),
             config: HashMap::new(),
-            profile_id: String::new(),
-            profile_policy_enabled: false,
         };
         create_provider_record(&store, provider).await.unwrap();
 
@@ -883,8 +859,6 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                profile_id: String::new(),
-                profile_policy_enabled: false,
             },
         )
         .await
@@ -902,8 +876,6 @@ mod tests {
                 credentials: std::iter::once(("GITLAB_TOKEN".to_string(), "glpat-xyz".to_string()))
                     .collect(),
                 config: HashMap::new(),
-                profile_id: String::new(),
-                profile_policy_enabled: false,
             },
         )
         .await
@@ -935,8 +907,6 @@ mod tests {
                 credentials: std::iter::once(("SHARED_KEY".to_string(), "first-value".to_string()))
                     .collect(),
                 config: HashMap::new(),
-                profile_id: String::new(),
-                profile_policy_enabled: false,
             },
         )
         .await
@@ -957,8 +927,6 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                profile_id: String::new(),
-                profile_policy_enabled: false,
             },
         )
         .await
@@ -995,8 +963,6 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
-                profile_id: String::new(),
-                profile_policy_enabled: false,
             },
         )
         .await
