@@ -9,7 +9,7 @@
 
 Name:           openshell
 Version:        0.0.37
-Release:        1.20260428113138606997.rpm.26.g63d59e2a%{?dist}
+Release:        1.20260428141722522502.rpm.27.g09c857c1%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
@@ -167,7 +167,7 @@ ExecStartPre=/bin/sh -c 'ENV=%%E/openshell/gateway.env; [ -f "$ENV" ] || { mkdir
 EnvironmentFile=-%%E/openshell/gateway.env
 Environment=OPENSHELL_DRIVERS=podman
 Environment=OPENSHELL_DB_URL=sqlite://%%S/openshell/gateway.db
-Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
+Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor-sideload:latest
 Environment=OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 Environment=OPENSHELL_DISABLE_TLS=true
 ExecStart=/usr/bin/openshell-gateway
@@ -215,7 +215,7 @@ OPENSHELL_DB_URL=sqlite:///var/lib/openshell/gateway.db
 OPENSHELL_DRIVERS=podman
 
 # Supervisor image mounted into sandbox containers.
-OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
+OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor-sideload:latest
 
 # Default sandbox base image.
 OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest

@@ -43,7 +43,7 @@ required_prebuilt_binaries() {
 		gateway)
 			echo "openshell-gateway"
 			;;
-		supervisor|cluster|supervisor-output)
+		supervisor|cluster|supervisor-sideload|supervisor-output)
 			echo "openshell-sandbox"
 			;;
 	esac
@@ -90,7 +90,7 @@ ensure_prebuilt_binaries() {
 	fi
 }
 
-TARGET=${1:?"Usage: docker-build-image.sh <gateway|supervisor|cluster|supervisor-output> [extra-args...]"}
+TARGET=${1:?"Usage: docker-build-image.sh <gateway|supervisor|supervisor-sideload|cluster|supervisor-builder|supervisor-output> [extra-args...]"}
 shift
 
 DOCKERFILE="deploy/docker/Dockerfile.images"
@@ -117,6 +117,14 @@ case "${TARGET}" in
     IS_FINAL_IMAGE=1
     IMAGE_NAME="openshell/cluster"
     DOCKER_TARGET="cluster"
+    ;;
+  supervisor-builder)
+    DOCKER_TARGET="supervisor-builder"
+    ;;
+  supervisor-sideload)
+    IS_FINAL_IMAGE=1
+    IMAGE_NAME="openshell/supervisor-sideload"
+    DOCKER_TARGET="supervisor-output"
     ;;
   supervisor-output)
     IS_FINAL_IMAGE=1

@@ -35,7 +35,7 @@ hide = true
 
 ["build:docker:supervisor-sideload"]
 description = "Build the supervisor sideload image (FROM scratch, for Podman image-volume mount)"
-run = "tasks/scripts/docker-build-image.sh supervisor-output"
+run = "tasks/scripts/docker-build-image.sh supervisor-sideload"
 hide = true
 
 ["build:docker:cluster"]

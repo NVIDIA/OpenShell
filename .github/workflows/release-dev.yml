@@ -63,6 +63,13 @@ jobs:
       component: supervisor
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
+  build-supervisor-sideload:
+    needs: [compute-versions]
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: supervisor-sideload
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+
   build-cluster:
     needs: [compute-versions]
     uses: ./.github/workflows/docker-build.yml
@@ -79,7 +86,7 @@ jobs:
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
-    needs: [build-gateway, build-supervisor, build-cluster]
+    needs: [build-gateway, build-supervisor, build-supervisor-sideload, build-cluster]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     steps:
@@ -90,7 +97,7 @@ jobs:
         run: |
           set -euo pipefail
           REGISTRY="ghcr.io/nvidia/openshell"
-          for component in gateway supervisor cluster; do
+          for component in gateway supervisor supervisor-sideload cluster; do
             echo "Tagging ${REGISTRY}/${component}:${{ github.sha }} as dev..."
             docker buildx imagetools create \
               --prefer-index=false \
