@@ -9,9 +9,10 @@
 #   gateway             Final gateway image
 #   supervisor          Final supervisor image
 #   cluster             Final cluster image
-#   gateway-builder     Release openshell-gateway binary
-#   supervisor-builder  Release openshell-sandbox binary
 #   supervisor-output   Minimal stage exporting only the supervisor binary
+#
+# Rust binaries are built natively before the image build and staged at:
+#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-{gateway,sandbox}
 
 # Pin by tag AND manifest-list digest to prevent silent upstream republishes
 # from breaking the build. Update both when bumping k3s versions.
@@ -22,204 +23,20 @@ ARG K9S_VERSION=v0.50.18
 ARG HELM_VERSION=v3.17.3
 ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
 
-# OS-128 Phase 4: select binary source for final images. `build` (default)
-# compiles Rust inside the builder stages below; `prebuilt` consumes binaries
-# staged at deploy/docker/.build/prebuilt-binaries/<arch>/. Declared at global
-# scope so BuildKit can substitute it in `FROM *-binary-${BINARY_SOURCE}`.
-ARG BINARY_SOURCE=build
-
 # ---------------------------------------------------------------------------
-# Shared Rust build stages
+# Per-arch binary stages
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM rust:1.88-slim AS rust-builder-base
-ARG TARGETARCH
-ARG BUILDARCH
-ARG CARGO_TARGET_CACHE_SCOPE=default
-ARG SCCACHE_MEMCACHED_ENDPOINT
-# CI sets this to 1 for maximum optimization; local builds leave it unset
-# so cargo uses the Cargo.toml default (parallel codegen for fast linking).
-ARG CARGO_CODEGEN_UNITS
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake g++ make protobuf-compiler curl && rm -rf /var/lib/apt/lists/*
-
-COPY deploy/docker/cross-build.sh /usr/local/bin/
-RUN . cross-build.sh && install_cross_toolchain && install_sccache && add_rust_target
-
-WORKDIR /build
-
-FROM rust-builder-base AS rust-builder-skeleton
-
-COPY Cargo.toml Cargo.lock ./
-COPY crates/openshell-bootstrap/Cargo.toml crates/openshell-bootstrap/Cargo.toml
-COPY crates/openshell-cli/Cargo.toml crates/openshell-cli/Cargo.toml
-COPY crates/openshell-core/Cargo.toml crates/openshell-core/Cargo.toml
-COPY crates/openshell-driver-docker/Cargo.toml crates/openshell-driver-docker/Cargo.toml
-COPY crates/openshell-driver-kubernetes/Cargo.toml crates/openshell-driver-kubernetes/Cargo.toml
-COPY crates/openshell-driver-podman/Cargo.toml crates/openshell-driver-podman/Cargo.toml
-COPY crates/openshell-ocsf/Cargo.toml crates/openshell-ocsf/Cargo.toml
-COPY crates/openshell-policy/Cargo.toml crates/openshell-policy/Cargo.toml
-COPY crates/openshell-providers/Cargo.toml crates/openshell-providers/Cargo.toml
-COPY crates/openshell-prover/Cargo.toml crates/openshell-prover/Cargo.toml
-COPY crates/openshell-router/Cargo.toml crates/openshell-router/Cargo.toml
-COPY crates/openshell-sandbox/Cargo.toml crates/openshell-sandbox/Cargo.toml
-COPY crates/openshell-server/Cargo.toml crates/openshell-server/Cargo.toml
-COPY crates/openshell-tui/Cargo.toml crates/openshell-tui/Cargo.toml
-COPY crates/openshell-vm/Cargo.toml crates/openshell-vm/Cargo.toml
-COPY crates/openshell-core/build.rs crates/openshell-core/build.rs
-COPY proto/ proto/
-
-RUN mkdir -p \
-      crates/openshell-bootstrap/src \
-      crates/openshell-cli/src \
-      crates/openshell-core/src \
-      crates/openshell-driver-docker/src \
-      crates/openshell-driver-kubernetes/src \
-      crates/openshell-driver-podman/src \
-      crates/openshell-ocsf/src \
-      crates/openshell-policy/src \
-      crates/openshell-providers/src \
-      crates/openshell-prover/src \
-      crates/openshell-router/src \
-      crates/openshell-sandbox/src \
-      crates/openshell-server/src \
-      crates/openshell-tui/src \
-      crates/openshell-vm/src && \
-    touch crates/openshell-bootstrap/src/lib.rs && \
-    printf 'fn main() {}\n' > crates/openshell-cli/src/main.rs && \
-    touch crates/openshell-core/src/lib.rs && \
-    touch crates/openshell-driver-docker/src/lib.rs && \
-    touch crates/openshell-driver-kubernetes/src/lib.rs && \
-    printf 'fn main() {}\n' > crates/openshell-driver-kubernetes/src/main.rs && \
-    touch crates/openshell-driver-podman/src/lib.rs && \
-    printf 'fn main() {}\n' > crates/openshell-driver-podman/src/main.rs && \
-    touch crates/openshell-ocsf/src/lib.rs && \
-    touch crates/openshell-policy/src/lib.rs && \
-    touch crates/openshell-providers/src/lib.rs && \
-    touch crates/openshell-prover/src/lib.rs && \
-    touch crates/openshell-router/src/lib.rs && \
-    touch crates/openshell-sandbox/src/lib.rs && \
-    printf 'fn main() {}\n' > crates/openshell-sandbox/src/main.rs && \
-    touch crates/openshell-server/src/lib.rs && \
-    printf 'fn main() {}\n' > crates/openshell-server/src/main.rs && \
-    touch crates/openshell-tui/src/lib.rs && \
-    touch crates/openshell-vm/src/lib.rs && \
-    printf 'fn main() {}\n' > crates/openshell-vm/src/main.rs
-
-FROM rust-builder-skeleton AS rust-deps
-
-RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
-    --mount=type=cache,id=cargo-target-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    --mount=type=cache,id=sccache-${TARGETARCH},sharing=locked,target=/tmp/sccache \
-    . cross-build.sh && cargo_cross_build --release -p openshell-server -p openshell-sandbox
-
-# ---------------------------------------------------------------------------
-# Per-target workspace stages
-# ---------------------------------------------------------------------------
-# Copy only the crates needed for each target so that a change to
-# openshell-sandbox does not invalidate the gateway build and vice versa.
-# The skeleton stage already has stub Cargo.toml + src/ for every crate,
-# so cargo workspace resolution continues to work — we just overwrite the
-# crates whose real source is needed for compilation.
-
-FROM rust-deps AS gateway-workspace
-ARG OPENSHELL_CARGO_VERSION
-
-COPY crates/openshell-core/ crates/openshell-core/
-COPY crates/openshell-driver-docker/ crates/openshell-driver-docker/
-COPY crates/openshell-driver-kubernetes/ crates/openshell-driver-kubernetes/
-COPY crates/openshell-driver-podman/ crates/openshell-driver-podman/
-COPY crates/openshell-ocsf/ crates/openshell-ocsf/
-COPY crates/openshell-policy/ crates/openshell-policy/
-COPY crates/openshell-providers/ crates/openshell-providers/
-COPY crates/openshell-router/ crates/openshell-router/
-COPY crates/openshell-server/ crates/openshell-server/
-
-RUN touch \
-    crates/openshell-core/build.rs \
-    crates/openshell-server/src/main.rs \
-    proto/*.proto && \
-    if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
-      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
-    fi
-
-FROM gateway-workspace AS gateway-builder
-ARG CARGO_CODEGEN_UNITS
-ARG EXTRA_CARGO_FEATURES=""
-
-RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
-    --mount=type=cache,id=cargo-target-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    --mount=type=cache,id=sccache-${TARGETARCH},sharing=locked,target=/tmp/sccache \
-    . cross-build.sh && \
-    cargo_cross_build --release -p openshell-server ${EXTRA_CARGO_FEATURES:+--features "$EXTRA_CARGO_FEATURES"} && \
-    mkdir -p /build/out && \
-    cp "$(cross_output_dir release)/openshell-gateway" /build/out/
-
-FROM rust-deps AS supervisor-workspace
-ARG OPENSHELL_CARGO_VERSION
-
-COPY crates/openshell-core/ crates/openshell-core/
-COPY crates/openshell-ocsf/ crates/openshell-ocsf/
-COPY crates/openshell-policy/ crates/openshell-policy/
-COPY crates/openshell-router/ crates/openshell-router/
-COPY crates/openshell-sandbox/ crates/openshell-sandbox/
-
-RUN touch \
-    crates/openshell-core/build.rs \
-    crates/openshell-ocsf/src/lib.rs \
-    crates/openshell-sandbox/src/main.rs \
-    proto/*.proto && \
-    if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
-      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
-    fi
-
-FROM supervisor-workspace AS supervisor-builder
-ARG CARGO_CODEGEN_UNITS
-ARG EXTRA_CARGO_FEATURES=""
-
-RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
-    --mount=type=cache,id=cargo-target-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    --mount=type=cache,id=sccache-${TARGETARCH},sharing=locked,target=/tmp/sccache \
-    . cross-build.sh && \
-    cargo_cross_build --release -p openshell-sandbox ${EXTRA_CARGO_FEATURES:+--features "$EXTRA_CARGO_FEATURES"} && \
-    mkdir -p /build/out && \
-    cp "$(cross_output_dir release)/openshell-sandbox" /build/out/
-
-# ---------------------------------------------------------------------------
-# Binary source selector (OS-128 Phase 4)
-# ---------------------------------------------------------------------------
-# `BINARY_SOURCE` is declared at global scope above (near the other version
-# ARGs). `build` (default) routes through the Rust builder stages above;
-# `prebuilt` routes through the scratch stages below, which COPY from
-#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-{gateway,sandbox}
-# in the build context. Prebuilt-artifact production + end-to-end workflow
-# wiring land in later Phase 4 PRs; the `prebuilt` path is inert unless a
-# caller sets BINARY_SOURCE=prebuilt and stages the binaries.
-
-FROM gateway-builder AS gateway-binary-build
-# Inherits /build/out/openshell-gateway from the cargo build stage.
-
-FROM scratch AS gateway-binary-prebuilt
+FROM scratch AS gateway-binary
 ARG TARGETARCH
 # --chmod=755 preserves the executable bit through actions/upload-artifact +
 # download-artifact, which strip exec perms during the roundtrip.
 COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /build/out/openshell-gateway
 
-FROM gateway-binary-${BINARY_SOURCE} AS gateway-binary
-
-FROM supervisor-builder AS supervisor-binary-build
-# Inherits /build/out/openshell-sandbox from the cargo build stage.
-
-FROM scratch AS supervisor-binary-prebuilt
+FROM scratch AS supervisor-binary
 ARG TARGETARCH
 # --chmod=755 preserves the executable bit through actions/upload-artifact +
 # download-artifact, which strip exec perms during the roundtrip.
 COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /build/out/openshell-sandbox
-
-FROM supervisor-binary-${BINARY_SOURCE} AS supervisor-binary
 
 # Minimal extraction stage for fast-deploy: exports only the supervisor
 # binary (~20-40 MB) instead of the entire build environment (~968 MB).
