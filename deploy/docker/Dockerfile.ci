@@ -66,7 +66,7 @@ RUN case "$TARGETARCH" in \
     | tar xz --strip-components=2 -C /usr/local/bin "gh_${GH_VERSION}_linux_${gh_arch}/bin/gh"
 
 # Install mise (NOTE: keep this version in sync with mise.toml)
-ARG MISE_VERSION=v2026.4.20
+ARG MISE_VERSION=v2026.4.25
 RUN curl https://mise.run | MISE_VERSION=$MISE_VERSION sh
 
 # Copy mise.toml and task includes, then install all tools via mise

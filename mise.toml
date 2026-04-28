@@ -7,7 +7,7 @@
 # Tasks are defined in tasks/*.toml — run `mise tasks` to list them all.
 
 # NOTE: keep this version in sync with what CI uses in Dockerfile.ci
-min_version = { soft = "2026.4.20" }
+min_version = { soft = "2026.4.25" }
 
 redactions = ["*_TOKEN", "*_PASSWORD"]
 
