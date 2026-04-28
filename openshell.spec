@@ -9,7 +9,7 @@
 
 Name:           openshell
 Version:        0.0.37
-Release:        1.20260428102251900262.rpm.24.gf5a444a0%{?dist}
+Release:        1.20260428105655427965.rpm.25.gee990b25%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
@@ -152,15 +152,19 @@ Wants=podman.socket
 [Service]
 Type=exec
 # Self-contained defaults for rootless operation.
-# Set OPENSHELL_SSH_HANDSHAKE_SECRET before starting:
-#   systemctl --user edit openshell-gateway.service
-# and add:
-#   [Service]
-#   Environment=OPENSHELL_SSH_HANDSHAKE_SECRET=<your-secret>
 #
 # WARNING: TLS is disabled. The gateway has NO authentication and
 # listens on all interfaces. For network-exposed setups, configure
 # mTLS certificates and remove OPENSHELL_DISABLE_TLS.
+#
+# The SSH handshake secret is auto-generated on first start into
+# ~/.config/openshell/gateway.env (mode 0600). To override, edit
+# that file or use: systemctl --user edit openshell-gateway.service
+
+# Auto-generate SSH handshake secret on first start if not present.
+# %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
+ExecStartPre=/bin/sh -c 'ENV=%%E/openshell/gateway.env; [ -f "$ENV" ] || { mkdir -p %%E/openshell && echo "OPENSHELL_SSH_HANDSHAKE_SECRET=$(od -An -tx1 -N32 /dev/urandom | tr -dc 0-9a-f)" > "$ENV" && chmod 600 "$ENV"; }'
+EnvironmentFile=-%%E/openshell/gateway.env
 Environment=OPENSHELL_DRIVERS=podman
 Environment=OPENSHELL_DB_URL=sqlite://%%S/openshell/gateway.db
 Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
