@@ -24,14 +24,16 @@ use openshell_bootstrap::{
 };
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
-    CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
-    ExecSandboxRequest, GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource, PolicyStatus, Provider,
-    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
-    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
+    CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, DeleteProviderRequest,
+    DeleteSandboxRequest, ExecSandboxRequest, GetClusterInferenceRequest, GetDraftHistoryRequest,
+    GetDraftPolicyRequest, GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource,
+    PolicyStatus, Provider, RejectDraftChunkRequest, RevokeSshSessionRequest, Sandbox,
+    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, SetClusterInferenceRequest,
+    SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
+    setting_value, tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -1964,7 +1966,7 @@ pub async fn sandbox_create_with_bootstrap(
         tty_override,
         Some(false),
         auto_providers_override,
-        &std::collections::HashMap::new(),
+        &HashMap::new(),
         &tls,
     )
     .await
@@ -2020,7 +2022,7 @@ pub async fn sandbox_create(
     tty_override: Option<bool>,
     bootstrap_override: Option<bool>,
     auto_providers_override: Option<bool>,
-    labels: &std::collections::HashMap<String, String>,
+    labels: &HashMap<String, String>,
     tls: &TlsOptions,
 ) -> Result<()> {
     if editor.is_some() && !command.is_empty() {
@@ -2134,7 +2136,7 @@ pub async fn sandbox_create(
                 status.message()
             ));
         }
-        Err(status) => return Err(status).into_diagnostic(),
+        Err(status) => return Err(miette::miette!(status.to_string())),
     };
     let sandbox = response
         .into_inner()
@@ -2967,6 +2969,295 @@ pub async fn sandbox_exec_grpc(
     Ok(exit_code)
 }
 
+pub async fn service_forward_tcp(
+    server: &str,
+    name: &str,
+    local: Option<&str>,
+    target_host: &str,
+    target_port: u16,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
+    let mut client = grpc_client(server, tls).await?;
+
+    let sandbox = fetch_ready_sandbox_for_forward(&mut client, name).await?;
+
+    let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), bind_port))
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to bind local forward on {bind_addr}:{bind_port}"))?;
+    let local_addr = listener
+        .local_addr()
+        .into_diagnostic()
+        .wrap_err("failed to read local forward address")?;
+    eprintln!(
+        "{} Forwarding {} -> {}:{} in sandbox {} via gRPC",
+        "✓".green().bold(),
+        local_addr,
+        target_host,
+        target_port,
+        name,
+    );
+
+    let sandbox_id = sandbox.object_id().to_string();
+    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::channel::<String>(1);
+    let mut health_check = tokio::time::interval(Duration::from_secs(2));
+    health_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            Some(reason) = fatal_rx.recv() => {
+                return Err(miette::miette!("service forward stopped: {reason}"));
+            }
+
+            _ = health_check.tick() => {
+                fetch_ready_sandbox_for_forward(&mut client, name).await?;
+            }
+
+            accepted = listener.accept() => {
+                let (socket, peer) = accepted
+                    .into_diagnostic()
+                    .wrap_err("failed to accept local forward connection")?;
+                let mut client = client.clone();
+                let sandbox_id = sandbox_id.clone();
+                let target_host = target_host.to_string();
+                let service_id = format!("service-forward:{name}:{target_host}:{target_port}");
+                let fatal_tx = fatal_tx.clone();
+                tokio::spawn(async move {
+                    let token = match create_forward_session_token(&mut client, &sandbox_id).await {
+                        Ok(token) => token,
+                        Err(err) => {
+                            tracing::warn!(peer = %peer, error = %err, "service forward session creation failed");
+                            if err.fatal {
+                                let _ = fatal_tx.send(err.message).await;
+                            }
+                            return;
+                        }
+                    };
+                    if let Err(err) = forward_one_tcp_connection(
+                        &mut client,
+                        socket,
+                        sandbox_id,
+                        target_host,
+                        target_port,
+                        service_id,
+                        token.clone(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(peer = %peer, error = %err, "service forward connection failed");
+                        if err.fatal {
+                            let _ = fatal_tx.send(err.message).await;
+                        }
+                    }
+                    let _ = client
+                        .revoke_ssh_session(RevokeSshSessionRequest { token })
+                        .await;
+                });
+            }
+        }
+    }
+}
+
+async fn create_forward_session_token(
+    client: &mut crate::tls::GrpcClient,
+    sandbox_id: &str,
+) -> std::result::Result<String, ForwardTcpConnectionError> {
+    let response = client
+        .create_ssh_session(CreateSshSessionRequest {
+            sandbox_id: sandbox_id.to_string(),
+        })
+        .await
+        .map_err(ForwardTcpConnectionError::from_status)?;
+    Ok(response.into_inner().token)
+}
+
+async fn fetch_ready_sandbox_for_forward(
+    client: &mut crate::tls::GrpcClient,
+    name: &str,
+) -> Result<Sandbox> {
+    let response = match client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(status) if status.code() == Code::NotFound => {
+            return Err(miette::miette!(
+                "sandbox '{name}' no longer exists; stopping service forward"
+            ));
+        }
+        Err(status) => return Err(status).into_diagnostic(),
+    };
+
+    let sandbox = response
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("sandbox '{name}' not found"))?;
+
+    if SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready) {
+        return Err(miette::miette!(
+            "sandbox '{}' is no longer ready (phase: {}); stopping service forward",
+            name,
+            phase_name(sandbox.phase)
+        ));
+    }
+
+    Ok(sandbox)
+}
+
+#[derive(Debug)]
+struct ForwardTcpConnectionError {
+    message: String,
+    fatal: bool,
+}
+
+impl ForwardTcpConnectionError {
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            fatal: false,
+        }
+    }
+
+    fn from_status(status: Status) -> Self {
+        let fatal = matches!(status.code(), Code::NotFound | Code::FailedPrecondition);
+        Self {
+            message: status.to_string(),
+            fatal,
+        }
+    }
+}
+
+impl std::fmt::Display for ForwardTcpConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ForwardTcpConnectionError {}
+
+fn parse_tcp_forward_spec(local: Option<&str>, default_port: u16) -> Result<(String, u16)> {
+    let Some(spec) = local else {
+        return Ok(("127.0.0.1".to_string(), default_port));
+    };
+
+    if let Some(pos) = spec.rfind(':') {
+        let addr = &spec[..pos];
+        let port_str = &spec[pos + 1..];
+        if let Ok(port) = port_str.parse::<u16>() {
+            if addr.is_empty() {
+                return Err(miette::miette!("bind address is required before ':'"));
+            }
+            return Ok((addr.to_string(), port));
+        }
+    }
+
+    let port: u16 = spec.parse().map_err(|_| {
+        miette::miette!("invalid local forward spec '{spec}': expected [bind_address:]port")
+    })?;
+    Ok(("127.0.0.1".to_string(), port))
+}
+
+async fn forward_one_tcp_connection(
+    client: &mut crate::tls::GrpcClient,
+    socket: tokio::net::TcpStream,
+    sandbox_id: String,
+    target_host: String,
+    target_port: u16,
+    service_id: String,
+    authorization_token: String,
+) -> std::result::Result<(), ForwardTcpConnectionError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
+    tx.send(TcpForwardFrame {
+        payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
+            TcpForwardInit {
+                sandbox_id,
+                service_id,
+                target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
+                    host: target_host,
+                    port: u32::from(target_port),
+                })),
+                authorization_token,
+            },
+        )),
+    })
+    .await
+    .map_err(|_| ForwardTcpConnectionError::transient("failed to initialize forward stream"))?;
+
+    let mut response = match client.forward_tcp(ReceiverStream::new(rx)).await {
+        Ok(response) => response.into_inner(),
+        Err(status) => {
+            let err = ForwardTcpConnectionError::from_status(status);
+            drain_and_shutdown_local_socket(socket).await;
+            return Err(err);
+        }
+    };
+
+    let (mut local_read, mut local_write) = socket.into_split();
+
+    let to_gateway = tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = local_read.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            if tx
+                .send(TcpForwardFrame {
+                    payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
+                        buf[..n].to_vec(),
+                    )),
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    });
+
+    while let Some(frame) = response
+        .message()
+        .await
+        .map_err(ForwardTcpConnectionError::from_status)?
+    {
+        let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
+        else {
+            continue;
+        };
+        if data.is_empty() {
+            continue;
+        }
+        local_write
+            .write_all(&data)
+            .await
+            .map_err(|err| ForwardTcpConnectionError::transient(err.to_string()))?;
+    }
+
+    let _ = local_write.shutdown().await;
+    to_gateway.abort();
+    Ok(())
+}
+
+async fn drain_and_shutdown_local_socket(mut socket: tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(Duration::from_millis(25), socket.read(&mut buf)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) => break,
+        }
+    }
+    let _ = socket.shutdown().await;
+}
+
 /// Print a single YAML line with dimmed keys and regular values.
 fn print_yaml_line(line: &str) {
     // Find leading whitespace
@@ -3371,7 +3662,7 @@ async fn auto_create_provider(
                     id: String::new(),
                     name: exact_name.to_string(),
                     created_at_ms: 0,
-                    labels: std::collections::HashMap::new(),
+                    labels: HashMap::new(),
                 }),
                 r#type: provider_type.to_string(),
                 credentials: discovered.credentials.clone(),
@@ -3411,7 +3702,7 @@ async fn auto_create_provider(
                         id: String::new(),
                         name: name.clone(),
                         created_at_ms: 0,
-                        labels: std::collections::HashMap::new(),
+                        labels: HashMap::new(),
                     }),
                     r#type: provider_type.to_string(),
                     credentials: discovered.credentials.clone(),
@@ -3569,7 +3860,7 @@ pub async fn provider_create(
                     id: String::new(),
                     name: name.to_string(),
                     created_at_ms: 0,
-                    labels: std::collections::HashMap::new(),
+                    labels: HashMap::new(),
                 }),
                 r#type: provider_type,
                 credentials: credential_map,
@@ -3759,7 +4050,7 @@ pub async fn provider_update(
                     id: String::new(),
                     name: name.to_string(),
                     created_at_ms: 0,
-                    labels: std::collections::HashMap::new(),
+                    labels: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: credential_map,

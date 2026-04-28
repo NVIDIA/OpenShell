@@ -286,7 +286,6 @@ fn grpc_status_from_response<B>(res: &Response<B>) -> String {
 
 fn normalize_http_path(path: &str) -> &'static str {
     match path {
-        p if p.starts_with("/connect/ssh") => "/connect/ssh",
         p if p.starts_with("/_ws_tunnel") => "/_ws_tunnel",
         p if p.starts_with("/auth/") => "/auth",
         _ => "unknown",
@@ -351,19 +350,6 @@ mod tests {
     #[test]
     fn grpc_method_handles_empty_string() {
         assert_eq!(grpc_method_from_path(""), "");
-    }
-
-    #[test]
-    fn normalize_ssh_path() {
-        assert_eq!(normalize_http_path("/connect/ssh"), "/connect/ssh");
-    }
-
-    #[test]
-    fn normalize_ssh_path_with_trailing_segments() {
-        assert_eq!(
-            normalize_http_path("/connect/ssh?token=abc"),
-            "/connect/ssh"
-        );
     }
 
     #[test]
