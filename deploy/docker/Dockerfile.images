@@ -227,23 +227,30 @@ FROM scratch AS supervisor-output
 COPY --from=supervisor-binary /build/out/openshell-sandbox /openshell-sandbox
 
 # ---------------------------------------------------------------------------
-# Final gateway image
+# Passwd stage – inject an openshell user (UID 1000) into distroless.
+# Distroless has no shell or useradd, so we craft the entry externally and
+# COPY it into the final image.
 # ---------------------------------------------------------------------------
-FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS gateway
+FROM gcr.io/distroless/cc-debian13 AS gateway-base
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates && \
-    apt-get install -y --only-upgrade gpgv && \
-    rm -rf /var/lib/apt/lists/*
+# Copy the minimal /etc/passwd and /etc/group from the distroless base image,
+# so we preserve any existing users/groups and only add the openshell user.
+FROM debian:trixie-slim AS gateway-passwd
+COPY --from=gateway-base /etc/passwd /etc/passwd
+COPY --from=gateway-base /etc/group /etc/group
+RUN echo 'openshell:x:1000:1000::/home/openshell:/sbin/nologin' >> /etc/passwd && \
+    echo 'openshell:x:1000:' >> /etc/group && \
+    mkdir -p /home/openshell && chown 1000:1000 /home/openshell
 
-RUN useradd --create-home --user-group openshell
+FROM gateway-base AS gateway
+
+COPY --from=gateway-passwd /etc/passwd /etc/passwd
+COPY --from=gateway-passwd /etc/group /etc/group
+COPY --from=gateway-passwd --chown=1000:1000 /home/openshell /home/openshell
 
 WORKDIR /app
 
 COPY --from=gateway-binary /build/out/openshell-gateway /usr/local/bin/
-
-RUN mkdir -p /build/crates/openshell-server
-COPY --chmod=755 crates/openshell-server/migrations /build/crates/openshell-server/migrations
 
 USER openshell
 EXPOSE 8080
