@@ -86,7 +86,6 @@ impl StartupResume for DockerComputeDriver {
             .map_err(|err| err.to_string())
     }
 }
-
 /// Interval between store-vs-backend reconciliation sweeps.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -1595,6 +1594,8 @@ impl ComputeDriver for NoopTestDriver {
 pub(crate) async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
     ComputeRuntime {
         driver: Arc::new(NoopTestDriver),
+        shutdown_cleanup: None,
+        startup_resume: None,
         _driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
         store,
