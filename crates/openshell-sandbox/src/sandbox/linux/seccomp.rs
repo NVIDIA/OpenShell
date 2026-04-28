@@ -40,7 +40,8 @@ pub fn apply_supervisor_prelude() -> Result<()> {
 
 pub fn apply(policy: &SandboxPolicy) -> Result<()> {
     let allow_inet = matches!(policy.network.mode, NetworkMode::Proxy | NetworkMode::Allow);
-    let main_filter = build_filter(allow_inet)?;
+    let allow_netlink = allow_netlink_from_env();
+    let main_filter = build_filter(allow_inet, allow_netlink)?;
     let clone3_filter = build_clone3_filter()?;
 
     set_no_new_privs()?;
@@ -49,8 +50,31 @@ pub fn apply(policy: &SandboxPolicy) -> Result<()> {
     Ok(())
 }
 
-fn build_filter(allow_inet: bool) -> Result<seccompiler::BpfProgram> {
-    let rules = build_filter_rules(allow_inet)?;
+/// Read OPENSHELL_ALLOW_NETLINK_ENUMERATE from the environment.
+///
+/// When set to "1" / "true" / "yes" (case-insensitive), AF_NETLINK socket
+/// creation is left out of the seccomp denylist so syscalls like getifaddrs(3)
+/// (used by Node.js's `os.networkInterfaces()` and many language runtimes)
+/// succeed. The default remains the existing fail-safe behavior — block all
+/// AF_NETLINK socket creation.
+///
+/// This is a coarse opt-in: once the AF_NETLINK socket is created the process
+/// can issue any RTM_* netlink message. A more granular policy that filters at
+/// the netlink message level would require an LSM/eBPF hook and is out of
+/// scope for this opt-in. Use only for sandboxes whose workloads need
+/// interface-enumeration capabilities (e.g. Node.js-based agents).
+fn allow_netlink_from_env() -> bool {
+    matches!(
+        std::env::var("OPENSHELL_ALLOW_NETLINK_ENUMERATE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+fn build_filter(allow_inet: bool, allow_netlink: bool) -> Result<seccompiler::BpfProgram> {
+    let rules = build_filter_rules(allow_inet, allow_netlink)?;
     compile_filter(rules, SeccompAction::Errno(libc::EPERM as u32))
 }
 
@@ -148,16 +172,17 @@ fn apply_runtime_filters(
     Ok(())
 }
 
-fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
+fn build_filter_rules(
+    allow_inet: bool,
+    allow_netlink: bool,
+) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
     // --- Socket domain blocks ---
-    let mut blocked_domains = vec![
-        libc::AF_PACKET,
-        libc::AF_BLUETOOTH,
-        libc::AF_VSOCK,
-        libc::AF_NETLINK,
-    ];
+    let mut blocked_domains = vec![libc::AF_PACKET, libc::AF_BLUETOOTH, libc::AF_VSOCK];
+    if !allow_netlink {
+        blocked_domains.push(libc::AF_NETLINK);
+    }
     if !allow_inet {
         blocked_domains.push(libc::AF_INET);
         blocked_domains.push(libc::AF_INET6);
@@ -291,14 +316,56 @@ mod tests {
 
     #[test]
     fn build_filter_proxy_mode_compiles() {
-        let filter = build_filter(true);
-        assert!(filter.is_ok(), "build_filter(true) should succeed");
+        let filter = build_filter(true, false);
+        assert!(filter.is_ok(), "build_filter(true, false) should succeed");
     }
 
     #[test]
     fn build_filter_block_mode_compiles() {
-        let filter = build_filter(false);
-        assert!(filter.is_ok(), "build_filter(false) should succeed");
+        let filter = build_filter(false, false);
+        assert!(filter.is_ok(), "build_filter(false, false) should succeed");
+    }
+
+    #[test]
+    fn build_filter_netlink_allowed_compiles() {
+        let filter = build_filter(true, true);
+        assert!(
+            filter.is_ok(),
+            "build_filter(true, true) should succeed when netlink is allowed"
+        );
+    }
+
+    #[test]
+    fn netlink_blocked_by_default() {
+        // When allow_netlink is false, AF_NETLINK socket creation must
+        // appear in the rules (a SeccompRule on SYS_socket arg 0 == AF_NETLINK).
+        let rules = build_filter_rules(true, false).unwrap();
+        assert!(
+            rules.contains_key(&libc::SYS_socket),
+            "SYS_socket rules must exist for the default-deny path"
+        );
+        // Heuristic: at least one socket-domain rule should be present
+        // (we can't easily decode the SeccompRule contents without the
+        // public seccompiler API, so just assert non-empty here).
+        assert!(
+            !rules[&libc::SYS_socket].is_empty(),
+            "SYS_socket should have at least one rule when netlink is blocked"
+        );
+    }
+
+    #[test]
+    fn netlink_allowed_drops_one_socket_rule() {
+        // The opt-in path should produce strictly fewer SYS_socket rules
+        // than the default path (one less, for the AF_NETLINK domain).
+        let blocked = build_filter_rules(true, false).unwrap();
+        let allowed = build_filter_rules(true, true).unwrap();
+        let blocked_count = blocked.get(&libc::SYS_socket).map_or(0, |r| r.len());
+        let allowed_count = allowed.get(&libc::SYS_socket).map_or(0, |r| r.len());
+        assert_eq!(
+            blocked_count,
+            allowed_count + 1,
+            "allowing netlink must drop exactly one socket-domain rule"
+        );
     }
 
     #[test]
@@ -329,7 +396,7 @@ mod tests {
     #[test]
     fn unconditional_blocks_present_in_filter() {
         // Build a real filter and verify all unconditional blocks are present.
-        let filter_rules = build_filter_rules(true).unwrap();
+        let filter_rules = build_filter_rules(true, false).unwrap();
 
         // Unconditional blocks have an empty Vec (no conditions = always match).
         let expected = [
@@ -372,7 +439,7 @@ mod tests {
     fn conditional_blocks_have_rules() {
         // Build a real filter and verify the conditional syscalls have rule entries
         // (non-empty Vec means conditional match).
-        let filter_rules = build_filter_rules(true).unwrap();
+        let filter_rules = build_filter_rules(true, false).unwrap();
 
         for syscall in [
             libc::SYS_execveat,
