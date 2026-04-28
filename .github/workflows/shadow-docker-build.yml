@@ -12,8 +12,10 @@ name: Shadow — Docker Build (local driver + GHA cache)
 # manually 4–5 times after merge to collect cold + warm numbers.
 
 on:
-  push:
-    branches: [main]
+  # workflow_dispatch only — keeps this shadow off main's required-check
+  # surface and avoids cluttering CI history with non-blocking failures
+  # while we're still collecting Phase 3 data. Dispatch from the Actions
+  # UI to collect cold/warm-cache numbers.
   workflow_dispatch:
 
 permissions:
