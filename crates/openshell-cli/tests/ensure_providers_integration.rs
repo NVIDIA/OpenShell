@@ -115,8 +115,6 @@ impl TestOpenShell {
                 r#type: provider_type.to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                profile_id: String::new(),
-                profile_policy_enabled: false,
             },
         );
     }
@@ -309,8 +307,6 @@ impl OpenShell for TestOpenShell {
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
             config: merge(existing.config, provider.config),
-            profile_id: existing.profile_id,
-            profile_policy_enabled: existing.profile_policy_enabled,
         };
         let updated_name = updated.object_name().to_string();
         providers.insert(updated_name, updated.clone());

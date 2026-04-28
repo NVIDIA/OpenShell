@@ -883,8 +883,6 @@ mod tests {
             r#type: provider_type.to_string(),
             credentials,
             config,
-            profile_id: String::new(),
-            profile_policy_enabled: false,
         }
     }
 
