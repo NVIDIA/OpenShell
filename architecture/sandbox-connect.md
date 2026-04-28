@@ -356,6 +356,8 @@ openshell sandbox download <name> <sandbox-path> [<local-path>]
 ```
 
 - **Upload**: `sandbox_upload()` streams a tar archive of the local path to `ssh ... tar xf - -C <dest>` on the sandbox side. Default destination: `/sandbox`.
+  Named directory uploads preserve the source directory basename at the destination, matching `scp -r` and `cp -r`; uploading `.` remains flat.
+  `.gitignore` filtering only changes which files are included, not the destination layout.
 - **Download**: `sandbox_download()` runs `ssh ... tar cf - -C <dir> <path>` on the sandbox side and extracts the output locally via `tar::Archive`. Default destination: `.` (current directory).
 - No compression for v1 -- the SSH tunnel rides the already-TLS-encrypted gateway connection; compression adds CPU cost with marginal bandwidth savings.
 

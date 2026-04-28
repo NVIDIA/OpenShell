@@ -2465,6 +2465,7 @@ async fn main() -> Result<()> {
                             &name,
                             &base_dir,
                             &files,
+                            local,
                             sandbox_dest,
                             &tls,
                         )
