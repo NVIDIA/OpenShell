@@ -9,7 +9,7 @@
 
 Name:           openshell
 Version:        0.0.37
-Release:        1.20260428105655427965.rpm.25.gee990b25%{?dist}
+Release:        1.20260428113138606997.rpm.26.g63d59e2a%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
@@ -116,8 +116,8 @@ cat > %{buildroot}%{_unitdir}/%{name}-gateway.service << 'EOF'
 [Unit]
 Description=OpenShell Gateway
 Documentation=https://github.com/NVIDIA/OpenShell
-After=network-online.target podman.socket
-Wants=podman.socket
+After=network-online.target podman.service
+Requires=podman.service
 
 [Service]
 Type=exec
@@ -139,15 +139,15 @@ EOF
 
 # --- Gateway systemd user unit (rootless Podman) ---
 # Installed to the systemd user unit directory so any user can run:
-#   systemctl --user start podman.socket
 #   systemctl --user enable --now openshell-gateway.service
+# This will automatically start podman.service via Requires= dependency.
 install -d %{buildroot}%{_userunitdir}
 cat > %{buildroot}%{_userunitdir}/%{name}-gateway.service << 'EOF'
 [Unit]
 Description=OpenShell Gateway (user)
 Documentation=https://github.com/NVIDIA/OpenShell
-After=podman.socket
-Wants=podman.socket
+After=podman.service
+Requires=podman.service
 
 [Service]
 Type=exec
