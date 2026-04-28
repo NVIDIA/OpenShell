@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
+      actions: read
+      contents: read
     steps:
       - name: Post comment
         env:
@@ -54,11 +56,12 @@ jobs:
             run_id=$(gh api "repos/$GH_REPO/actions/workflows/$workflow_file/runs?head_sha=$PR_HEAD_SHA&event=push" \
               --jq '.workflow_runs | sort_by(.created_at) | reverse | .[0].id // empty')
             if [ -n "$run_id" ]; then
-              run_link="[the existing run](https://github.com/$GH_REPO/actions/runs/$run_id)"
+              instructions="Open [the existing run](https://github.com/$GH_REPO/actions/runs/$run_id) and click **Re-run all jobs** to execute with the label set."
             else
-              run_link="[$workflow_name](https://github.com/$GH_REPO/actions/workflows/$workflow_file)"
+              workflow_link="[$workflow_name](https://github.com/$GH_REPO/actions/workflows/$workflow_file)"
+              instructions="Open $workflow_link, find the run for commit \`$short_pr\`, and click **Re-run all jobs** to execute with the label set."
             fi
-            body="Label \`$LABEL_NAME\` applied for \`$short_pr\`. Open $run_link and click **Re-run all jobs** to execute with the label set. The \`E2E Gate\` check on this PR will flip green automatically once the run finishes."
+            body="Label \`$LABEL_NAME\` applied for \`$short_pr\`. $instructions The \`E2E Gate\` check on this PR will flip green automatically once the run finishes."
           fi
 
           gh pr comment "$PR_NUMBER" --body "$body"

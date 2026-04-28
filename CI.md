@@ -63,7 +63,7 @@ Prerequisites:
 Flow:
 
 1. Open the PR. copy-pr-bot mirrors it to `pull-request/<N>` automatically.
-2. The first push of `pull-request/<N>` runs `Branch E2E Checks`, but it skips the build/E2E jobs because no label is set yet. The PR's `E2E Gate` check stays neutral (no label, no requirement).
+2. The first push of `pull-request/<N>` runs `Branch E2E Checks`, but it skips the build/E2E jobs because no label is set yet. The PR's `E2E Gate` check passes as a no-op (no label, no requirement).
 3. A maintainer applies `test:e2e` and/or `test:e2e-gpu`. `E2E Label Help` posts a comment with a link to the existing `Branch E2E Checks` run.
 4. The maintainer opens that link and clicks **Re-run all jobs**. This time `pr_metadata` sees the label and the build/E2E jobs run.
 5. When the run finishes, the `E2E Gate` check on the PR flips to green automatically.
