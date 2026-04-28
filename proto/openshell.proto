@@ -1172,3 +1172,37 @@ message DraftChunkPayload {
   // Current draft version for the owning sandbox.
   int64 draft_version = 10;
 }
+
+// Internal stored policy revision row materialized from the generic objects table.
+message StoredPolicyRevision {
+  string id = 1;
+  string sandbox_id = 2;
+  int64 version = 3;
+  bytes policy_payload = 4;
+  string policy_hash = 5;
+  string status = 6;
+  optional string load_error = 7;
+  int64 created_at_ms = 8;
+  optional int64 loaded_at_ms = 9;
+}
+
+// Internal stored draft chunk row materialized from the generic objects table.
+message StoredDraftChunk {
+  string id = 1;
+  string sandbox_id = 2;
+  int64 draft_version = 3;
+  string status = 4;
+  string rule_name = 5;
+  bytes proposed_rule = 6;
+  string rationale = 7;
+  string security_notes = 8;
+  double confidence = 9;
+  int64 created_at_ms = 10;
+  optional int64 decided_at_ms = 11;
+  string host = 12;
+  int32 port = 13;
+  string binary = 14;
+  int32 hit_count = 15;
+  int64 first_seen_ms = 16;
+  int64 last_seen_ms = 17;
+}

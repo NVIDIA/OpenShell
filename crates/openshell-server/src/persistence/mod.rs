@@ -6,6 +6,10 @@
 mod postgres;
 mod sqlite;
 
+pub use openshell_core::proto::{
+    StoredDraftChunk as DraftChunkRecord, StoredPolicyRevision as PolicyRecord,
+};
+
 use openshell_core::{
     Error as CoreError, Result as CoreResult,
     proto::{
@@ -79,48 +83,6 @@ pub struct ObjectRecord {
     pub updated_at_ms: i64,
     /// JSON-serialized labels (key-value pairs).
     pub labels: Option<String>,
-}
-
-/// Stored sandbox policy revision record.
-#[derive(Debug, Clone)]
-pub struct PolicyRecord {
-    pub id: String,
-    pub sandbox_id: String,
-    pub version: i64,
-    pub policy_payload: Vec<u8>,
-    pub policy_hash: String,
-    pub status: String,
-    pub load_error: Option<String>,
-    pub created_at_ms: i64,
-    pub loaded_at_ms: Option<i64>,
-}
-
-/// Stored draft policy chunk record.
-#[derive(Debug, Clone)]
-pub struct DraftChunkRecord {
-    pub id: String,
-    pub sandbox_id: String,
-    pub draft_version: i64,
-    pub status: String,
-    pub rule_name: String,
-    pub proposed_rule: Vec<u8>,
-    pub rationale: String,
-    pub security_notes: String,
-    pub confidence: f64,
-    pub created_at_ms: i64,
-    pub decided_at_ms: Option<i64>,
-    /// Denormalized endpoint host (lowercase) for DB-level dedup.
-    pub host: String,
-    /// Denormalized endpoint port for DB-level dedup.
-    pub port: i32,
-    /// Binary path that triggered the denial (for per-binary dedup).
-    pub binary: String,
-    /// How many times this endpoint has been seen across denial flush cycles.
-    pub hit_count: i32,
-    /// First time this endpoint was proposed (ms since epoch).
-    pub first_seen_ms: i64,
-    /// Most recent time this endpoint was re-proposed (ms since epoch).
-    pub last_seen_ms: i64,
 }
 
 /// Persistence store implementations.
