@@ -28,7 +28,7 @@ const REGISTRY_NAMESPACE_DEFAULT: &str = "openshell";
 /// `connect_with_local_defaults()` ceiling is 120s, which is far too short for
 /// multi-GB image exports — a 7 GB image on a laptop SSD takes ~4–5 minutes.
 /// One hour is a safe upper bound; override with `OPENSHELL_DOCKER_TIMEOUT_SECS`.
-pub(crate) const DEFAULT_LARGE_TRANSFER_TIMEOUT_SECS: u64 = 3600;
+pub const DEFAULT_LARGE_TRANSFER_TIMEOUT_SECS: u64 = 3600;
 
 /// Build a local-Docker client suitable for large streaming transfers.
 /// Respects `OPENSHELL_DOCKER_TIMEOUT_SECS` (in seconds); falls back to
@@ -50,7 +50,7 @@ pub fn connect_local_for_large_transfers() -> std::result::Result<Docker, Bollar
 /// | `["legacy"]` | `["legacy"]`  — pass through to the non-CDI fallback path    |
 /// | `["auto"]`   | `["nvidia.com/gpu=all"]` if CDI enabled, else `["legacy"]`   |
 /// | `[cdi-ids…]` | unchanged                                                    |
-pub(crate) fn resolve_gpu_device_ids(gpu: &[String], cdi_enabled: bool) -> Vec<String> {
+pub fn resolve_gpu_device_ids(gpu: &[String], cdi_enabled: bool) -> Vec<String> {
     match gpu {
         [] => vec![],
         [v] if v == "auto" => {
@@ -346,22 +346,25 @@ pub async fn find_gateway_container(docker: &Docker, port: Option<u16>) -> Resul
 
     let matches: Vec<String> = containers
         .iter()
-        .filter(|c| is_gateway_image(c) && port.map_or(true, |p| has_port(c, p)))
+        .filter(|c| is_gateway_image(c) && port.is_none_or(|p| has_port(c, p)))
         .filter_map(container_name)
         .collect();
 
     match matches.len() {
         0 => {
-            let hint = if let Some(p) = port {
-                format!(
-                    "No openshell gateway container found listening on port {p}.\n\
+            let hint = port.map_or_else(
+                || {
+                    "No openshell gateway container found.\n\
                      Is the gateway running? Check with: docker ps"
-                )
-            } else {
-                "No openshell gateway container found.\n\
-                 Is the gateway running? Check with: docker ps"
-                    .to_string()
-            };
+                        .to_string()
+                },
+                |p| {
+                    format!(
+                        "No openshell gateway container found listening on port {p}.\n\
+                         Is the gateway running? Check with: docker ps"
+                    )
+                },
+            );
             Err(miette::miette!("{hint}"))
         }
         1 => Ok(matches.into_iter().next().unwrap()),
@@ -488,6 +491,8 @@ pub async fn ensure_image(
 /// Returns the actual host port the container is using.  When an existing
 /// container is reused (same image), this may differ from `gateway_port`
 /// because the container was originally created with a different port.
+// Refactoring this signature would touch many call sites across the workspace.
+#[allow(clippy::too_many_arguments)]
 pub async fn ensure_container(
     docker: &Docker,
     name: &str,
@@ -863,22 +868,22 @@ pub async fn check_port_conflicts(
 
         let ports = container.ports.as_deref().unwrap_or_default();
         for port in ports {
-            if let Some(public) = port.public_port {
-                if needed_ports.contains(&public) {
-                    let cname = names
-                        .first()
-                        .map(|n| n.trim_start_matches('/').to_string())
-                        .unwrap_or_else(|| {
-                            container
-                                .id
-                                .clone()
-                                .unwrap_or_else(|| "<unknown>".to_string())
-                        });
-                    conflicts.push(PortConflict {
-                        container_name: cname,
-                        host_port: public,
-                    });
-                }
+            if let Some(public) = port.public_port
+                && needed_ports.contains(&public)
+            {
+                let cname = names.first().map_or_else(
+                    || {
+                        container
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| "<unknown>".to_string())
+                    },
+                    |n| n.trim_start_matches('/').to_string(),
+                );
+                conflicts.push(PortConflict {
+                    container_name: cname,
+                    host_port: public,
+                });
             }
         }
     }
@@ -1371,6 +1376,9 @@ mod tests {
         );
     }
 
+    // Test-only: mutates DOCKER_HOST env var via std::env::set_var/remove_var,
+    // which require unsafe in the 2024 edition.
+    #[allow(unsafe_code)]
     #[test]
     fn docker_not_reachable_error_with_docker_host() {
         // Simulate: DOCKER_HOST is set but daemon unresponsive.

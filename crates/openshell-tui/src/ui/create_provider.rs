@@ -313,7 +313,6 @@ fn draw_enter_key(
             chunks[idx],
             t,
         );
-        idx += 1;
     } else {
         // Credential rows — env var name + masked value on the same line.
         let max_name_len = form
@@ -330,7 +329,7 @@ fn draw_enter_key(
             .map(|(i, (env_name, value))| {
                 let is_focused =
                     form.key_field == ProviderKeyField::Credential && i == form.cred_cursor;
-                let padded = format!("{:width$}", env_name, width = max_name_len);
+                let padded = format!("{env_name:max_name_len$}");
                 let name_style = if is_focused { t.accent_bold } else { t.text };
                 let mut spans = vec![Span::styled(format!("  {padded}: "), name_style)];
                 if value.is_empty() {
@@ -353,8 +352,8 @@ fn draw_enter_key(
             })
             .collect();
         frame.render_widget(Paragraph::new(lines), chunks[idx]);
-        idx += 1;
     }
+    idx += 1;
 
     // Spacer.
     idx += 1;

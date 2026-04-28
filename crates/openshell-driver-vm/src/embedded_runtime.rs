@@ -134,10 +134,11 @@ fn runtime_cache_key() -> String {
         let sample = &chunk[..chunk.len().min(64)];
         let mut word: u64 = 0;
         for (offset, byte) in sample.iter().enumerate() {
-            word ^= (*byte as u64) << ((offset % 8) * 8);
+            word ^= u64::from(*byte) << ((offset % 8) * 8);
         }
-        fp ^= word.rotate_left((index as u32) * 13 + 7);
-        fp ^= (chunk.len() as u64).rotate_left((index as u32) * 17 + 3);
+        let index_u32 = u32::try_from(index).unwrap_or(u32::MAX);
+        fp ^= word.rotate_left(index_u32 * 13 + 7);
+        fp ^= (chunk.len() as u64).rotate_left(index_u32 * 17 + 3);
     }
     format!("{VERSION}-{fp:016x}")
 }

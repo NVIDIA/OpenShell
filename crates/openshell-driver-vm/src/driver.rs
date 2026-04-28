@@ -270,7 +270,10 @@ impl VmDriver {
         }
     }
 
-    pub async fn validate_sandbox(&self, sandbox: &Sandbox) -> Result<(), Status> {
+    // `tonic::Status` is large but is the standard error type across the
+    // gRPC API surface; boxing here would diverge from every other handler.
+    #[allow(clippy::result_large_err)]
+    pub fn validate_sandbox(&self, sandbox: &Sandbox) -> Result<(), Status> {
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)
     }
 
@@ -547,14 +550,14 @@ impl VmDriver {
         sandbox_name: &str,
     ) -> Result<Option<Sandbox>, Status> {
         let registry = self.registry.lock().await;
-        let sandbox = if !sandbox_id.is_empty() {
-            registry
-                .get(sandbox_id)
-                .map(|record| record.snapshot.clone())
-        } else {
+        let sandbox = if sandbox_id.is_empty() {
             registry
                 .values()
                 .find(|record| record.snapshot.name == sandbox_name)
+                .map(|record| record.snapshot.clone())
+        } else {
+            registry
+                .get(sandbox_id)
                 .map(|record| record.snapshot.clone())
         };
         Ok(sandbox)
@@ -633,10 +636,10 @@ impl VmDriver {
             };
 
             if let Some(status) = exit_status {
-                let message = match status.code() {
-                    Some(code) => format!("VM process exited with status {code}"),
-                    None => "VM process exited".to_string(),
-                };
+                let message = status.code().map_or_else(
+                    || "VM process exited".to_string(),
+                    |code| format!("VM process exited with status {code}"),
+                );
                 if let Some(snapshot) = self
                     .set_snapshot_condition(
                         &sandbox_id,
@@ -727,7 +730,7 @@ impl ComputeDriver for VmDriver {
             .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        self.validate_sandbox(&sandbox).await?;
+        self.validate_sandbox(&sandbox)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
@@ -842,7 +845,7 @@ impl ComputeDriver for VmDriver {
                             return;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -853,7 +856,7 @@ impl ComputeDriver for VmDriver {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
+#[allow(unsafe_code)] // libc::geteuid is a thin syscall wrapper
 fn check_gpu_privileges() -> Result<(), String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(
@@ -865,6 +868,9 @@ fn check_gpu_privileges() -> Result<(), String> {
     Ok(())
 }
 
+// `tonic::Status` is ~176 bytes; it's the standard error type across the
+// gRPC API surface, so boxing here would diverge from every other handler.
+#[allow(clippy::result_large_err)]
 fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Status> {
     let spec = sandbox
         .spec
@@ -1052,7 +1058,7 @@ async fn copy_guest_tls_material(
 
 async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
     if let Some(pid) = child.id()
-        && let Err(err) = kill(Pid::from_raw(pid as i32), Signal::SIGTERM)
+        && let Err(err) = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM)
         && err != Errno::ESRCH
     {
         return Err(std::io::Error::other(format!(
@@ -1146,7 +1152,9 @@ fn platform_event(source: &str, event_type: &str, reason: &str, message: String)
 fn current_time_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as i64)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 #[cfg(test)]
@@ -1210,13 +1218,12 @@ mod tests {
             spec: Some(SandboxSpec {
                 template: Some(SandboxTemplate {
                     platform_config: Some(Struct {
-                        fields: [(
+                        fields: std::iter::once((
                             "runtime_class_name".to_string(),
                             Value {
                                 kind: Some(Kind::StringValue("kata".to_string())),
                             },
-                        )]
-                        .into_iter()
+                        ))
                         .collect(),
                     }),
                     ..Default::default()

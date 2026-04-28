@@ -44,7 +44,7 @@ impl Editor {
         }
     }
 
-    fn remote_target(self, host_alias: &str) -> String {
+    fn remote_target(host_alias: &str) -> String {
         format!("ssh-remote+{host_alias}")
     }
 
@@ -357,12 +357,13 @@ pub async fn sandbox_forward(
         command.status().await.into_diagnostic()?
     } else {
         let mut child = command.spawn().into_diagnostic()?;
-        match tokio::time::timeout(FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD, child.wait()).await {
-            Ok(status) => status.into_diagnostic()?,
-            Err(_) => {
-                eprintln!("{}", foreground_forward_started_message(name, spec));
-                child.wait().await.into_diagnostic()?
-            }
+        if let Ok(status) =
+            tokio::time::timeout(FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD, child.wait()).await
+        {
+            status.into_diagnostic()?
+        } else {
+            eprintln!("{}", foreground_forward_started_message(name, spec));
+            child.wait().await.into_diagnostic()?
         }
     };
 
@@ -556,10 +557,7 @@ async fn ssh_tar_upload(
 
     // When no explicit destination is given, use the unescaped `$HOME` shell
     // variable so the remote shell resolves it at runtime.
-    let escaped_dest = match dest_dir {
-        Some(d) => shell_escape(d),
-        None => "$HOME".to_string(),
-    };
+    let escaped_dest = dest_dir.map_or_else(|| "$HOME".to_string(), shell_escape);
 
     let mut ssh = ssh_base_command(&session.proxy_command);
     ssh.arg("-T")
@@ -598,7 +596,7 @@ async fn ssh_tar_upload(
     Ok(())
 }
 
-/// Split a sandbox path into (parent_directory, basename).
+/// Split a sandbox path into (`parent_directory`, basename).
 ///
 /// Examples:
 ///   `"/sandbox/.bashrc"`  -> `("/sandbox", ".bashrc")`
@@ -666,22 +664,23 @@ pub async fn sandbox_sync_up(
     // passed "/sandbox"), fall through to directory semantics instead.  The
     // sandbox user cannot write to "/" and the intent is almost certainly
     // "put the file inside /sandbox", not "create a file named sandbox in /".
-    if let Some(path) = sandbox_path {
-        if local_path.is_file() && !path.ends_with('/') {
-            let (parent, target_name) = split_sandbox_path(path);
-            if parent != "/" {
-                return ssh_tar_upload(
-                    server,
-                    name,
-                    Some(parent),
-                    UploadSource::SinglePath {
-                        local_path: local_path.to_path_buf(),
-                        tar_name: target_name.into(),
-                    },
-                    tls,
-                )
-                .await;
-            }
+    if let Some(path) = sandbox_path
+        && local_path.is_file()
+        && !path.ends_with('/')
+    {
+        let (parent, target_name) = split_sandbox_path(path);
+        if parent != "/" {
+            return ssh_tar_upload(
+                server,
+                name,
+                Some(parent),
+                UploadSource::SinglePath {
+                    local_path: local_path.to_path_buf(),
+                    tar_name: target_name.into(),
+                },
+                tls,
+            )
+            .await;
         }
     }
 
@@ -720,8 +719,7 @@ pub async fn sandbox_sync_up(
 fn directory_upload_prefix(local_path: &Path) -> std::ffi::OsString {
     local_path
         .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_else(|| ".".into())
+        .map_or_else(|| ".".into(), std::ffi::OsStr::to_os_string)
 }
 
 fn file_list_archive_prefix(local_path: &Path) -> Option<PathBuf> {
@@ -824,6 +822,13 @@ pub async fn sandbox_ssh_proxy(
     token: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
+    // The gateway returns 412 (Precondition Failed) when the sandbox pod
+    // exists but hasn't reached Ready phase yet. This is a transient state
+    // after sandbox allocation — retry with backoff instead of failing
+    // immediately.
+    const MAX_CONNECT_WAIT: Duration = Duration::from_secs(60);
+    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
     let url: url::Url = gateway_url
         .parse()
         .into_diagnostic()
@@ -841,13 +846,6 @@ pub async fn sandbox_ssh_proxy(
     let request = format!(
         "CONNECT {connect_path} HTTP/1.1\r\nHost: {gateway_host}\r\nX-Sandbox-Id: {sandbox_id}\r\nX-Sandbox-Token: {token}\r\n\r\n"
     );
-
-    // The gateway returns 412 (Precondition Failed) when the sandbox pod
-    // exists but hasn't reached Ready phase yet. This is a transient state
-    // after sandbox allocation — retry with backoff instead of failing
-    // immediately.
-    const MAX_CONNECT_WAIT: Duration = Duration::from_secs(60);
-    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
     let start = std::time::Instant::now();
     let mut backoff = INITIAL_BACKOFF;
@@ -1038,8 +1036,7 @@ fn upsert_host_block(contents: &str, alias: &str, block: &str) -> String {
             .enumerate()
             .skip(start + 1)
             .find(|(_, line)| line.trim_start().starts_with("Host "))
-            .map(|(idx, _)| idx)
-            .unwrap_or(lines.len());
+            .map_or(lines.len(), |(idx, _)| idx);
 
         out.extend_from_slice(&lines[..start]);
         if !out.is_empty() && !out.last().is_some_and(|line| line.is_empty()) {
@@ -1088,7 +1085,7 @@ fn launch_editor(editor: Editor, host_alias: &str) -> Result<()> {
     launch_editor_command(
         editor.binary(),
         editor.label(),
-        &editor.remote_target(host_alias),
+        &Editor::remote_target(host_alias),
     )
 }
 
@@ -1244,6 +1241,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
     fn install_ssh_config_adds_include_once_and_updates_managed_file() {
         let _guard = TEST_ENV_LOCK
             .lock()

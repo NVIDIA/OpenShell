@@ -170,17 +170,14 @@ pub fn spawn(
             }
         };
 
-        let stdout = match child.stdout.take() {
-            Some(s) => s,
-            None => {
-                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                    .activity(ActivityId::Other)
-                    .severity(SeverityId::Low)
-                    .message("dmesg --follow produced no stdout; bypass monitor will not run")
-                    .build();
-                ocsf_emit!(event);
-                return;
-            }
+        let Some(stdout) = child.stdout.take() else {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Other)
+                .severity(SeverityId::Low)
+                .message("dmesg --follow produced no stdout; bypass monitor will not run")
+                .build();
+            ocsf_emit!(event);
+            return;
         };
 
         let reader = std::io::BufReader::new(stdout);

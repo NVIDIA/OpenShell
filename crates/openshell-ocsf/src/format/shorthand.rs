@@ -50,7 +50,6 @@ pub fn severity_char(severity_id: u8) -> char {
 #[must_use]
 pub fn severity_tag(severity_id: u8) -> &'static str {
     match severity_id {
-        1 => "[INFO]",
         2 => "[LOW]",
         3 => "[MED]",
         4 => "[HIGH]",

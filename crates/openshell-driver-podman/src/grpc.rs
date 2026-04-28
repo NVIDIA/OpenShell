@@ -35,7 +35,6 @@ impl ComputeDriver for ComputeDriverService {
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         self.driver
             .capabilities()
-            .await
             .map(Response::new)
             .map_err(status_from_driver_error)
     }
@@ -50,7 +49,6 @@ impl ComputeDriver for ComputeDriverService {
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.driver
             .validate_sandbox_create(&sandbox)
-            .await
             .map_err(status_from_driver_error)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
@@ -247,7 +245,7 @@ mod tests {
             .len();
         let socket_path_for_task = socket_path.clone();
         let log_for_task = request_log.clone();
-        let queue_for_task = response_queue.clone();
+        let queue_for_task = response_queue;
         let handle = tokio::spawn(async move {
             for _ in 0..expected {
                 let (stream, _) = listener.accept().await.expect("test stub should accept");
@@ -260,11 +258,10 @@ mod tests {
                             let log = log.clone();
                             let queue = queue.clone();
                             async move {
-                                let path = req
-                                    .uri()
-                                    .path_and_query()
-                                    .map(|pq| pq.as_str().to_string())
-                                    .unwrap_or_else(|| req.uri().path().to_string());
+                                let path = req.uri().path_and_query().map_or_else(
+                                    || req.uri().path().to_string(),
+                                    |pq| pq.as_str().to_string(),
+                                );
                                 log.lock()
                                     .expect("request log lock should not be poisoned")
                                     .push(format!("{} {}", req.method(), path));

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use openshell_core::proto::{
     L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
@@ -387,7 +387,7 @@ fn merge_endpoint(
         .unwrap_or(0);
 
     if existing.host.is_empty() {
-        existing.host = incoming.host.clone();
+        existing.host.clone_from(&incoming.host);
     }
 
     merge_endpoint_ports(existing, incoming);
@@ -446,7 +446,7 @@ fn merge_endpoint(
                 incoming: incoming.access.clone(),
             });
         } else if existing.access.is_empty() {
-            existing.access = incoming.access.clone();
+            existing.access.clone_from(&incoming.access);
         } else if existing.access != incoming.access {
             warnings.push(PolicyMergeWarning::ExistingAccessRetained {
                 host,
@@ -488,8 +488,8 @@ fn merge_endpoint_ports(existing: &mut NetworkEndpoint, incoming: &NetworkEndpoi
     }
     ports.sort_unstable();
     ports.dedup();
-    existing.ports = ports.clone();
     existing.port = ports.first().copied().unwrap_or(0);
+    existing.ports = ports;
 }
 
 fn rules_share_endpoint(
@@ -626,7 +626,7 @@ fn expand_access_preset(access: &str) -> Option<Vec<L7Rule>> {
                     method: method.to_string(),
                     path: "**".to_string(),
                     command: String::new(),
-                    query: Default::default(),
+                    query: HashMap::default(),
                 }),
             })
             .collect(),
@@ -678,8 +678,8 @@ fn normalize_endpoint(endpoint: &mut NetworkEndpoint) {
     let mut ports = canonical_ports(endpoint);
     ports.sort_unstable();
     ports.dedup();
-    endpoint.ports = ports.clone();
     endpoint.port = ports.first().copied().unwrap_or(0);
+    endpoint.ports = ports;
     dedup_strings(&mut endpoint.allowed_ips);
     dedup_l7_rules(&mut endpoint.rules);
     dedup_deny_rules(&mut endpoint.deny_rules);
@@ -745,8 +745,8 @@ fn remove_endpoint(policy: &mut SandboxPolicy, rule_name: Option<&str>, host: &s
                     return false;
                 }
 
-                endpoint.ports = remaining_ports.clone();
                 endpoint.port = remaining_ports[0];
+                endpoint.ports = remaining_ports;
                 true
             });
 

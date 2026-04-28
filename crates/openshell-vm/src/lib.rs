@@ -611,7 +611,7 @@ impl VmContext {
 
         Ok(Self {
             krun,
-            ctx_id: ctx_id as u32,
+            ctx_id: ctx_id.cast_unsigned(),
         })
     }
 
@@ -736,8 +736,8 @@ impl VmContext {
     }
 
     fn set_port_map(&self, port_map: &[String]) -> Result<(), VmError> {
-        let port_strs: Vec<&str> = port_map.iter().map(String::as_str).collect();
-        let (_port_owners, port_ptrs) = c_string_array(&port_strs)?;
+        let port_refs: Vec<&str> = port_map.iter().map(String::as_str).collect();
+        let (_port_owners, port_ptrs) = c_string_array(&port_refs)?;
         unsafe {
             check(
                 (self.krun.krun_set_port_map)(self.ctx_id, port_ptrs.as_ptr()),
@@ -773,10 +773,10 @@ impl VmContext {
 
     fn set_exec(&self, exec_path: &str, args: &[String], env: &[String]) -> Result<(), VmError> {
         let exec_c = CString::new(exec_path)?;
-        let argv_strs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let (_argv_owners, argv_ptrs) = c_string_array(&argv_strs)?;
-        let env_strs: Vec<&str> = env.iter().map(String::as_str).collect();
-        let (_env_owners, env_ptrs) = c_string_array(&env_strs)?;
+        let argv_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (_argv_owners, argv_ptrs) = c_string_array(&argv_refs)?;
+        let env_refs: Vec<&str> = env.iter().map(String::as_str).collect();
+        let (_env_owners, env_ptrs) = c_string_array(&env_refs)?;
 
         unsafe {
             check(
@@ -942,7 +942,7 @@ fn kill_stale_gvproxy_by_port(port: u16) {
 
     for line in pids.lines() {
         if let Ok(pid) = line.trim().parse::<u32>() {
-            let pid_i32 = pid as libc::pid_t;
+            let pid_i32 = pid.cast_signed();
             if is_process_named(pid_i32, "gvproxy") {
                 kill_gvproxy_pid(pid);
             }
@@ -951,7 +951,7 @@ fn kill_stale_gvproxy_by_port(port: u16) {
 }
 
 fn kill_gvproxy_pid(gvproxy_pid: u32) {
-    let pid_i32 = gvproxy_pid as libc::pid_t;
+    let pid_i32 = gvproxy_pid.cast_signed();
     let is_alive = unsafe { libc::kill(pid_i32, 0) } == 0;
     if is_alive {
         // Verify the process is actually gvproxy before killing.
@@ -1090,10 +1090,10 @@ fn state_disk_sync_mode() -> u32 {
 }
 
 fn hash_path_id(path: &Path) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in path.to_string_lossy().as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     format!("{:012x}", hash & 0x0000_ffff_ffff_ffff)
 }
@@ -1104,15 +1104,16 @@ fn hash_path_id(path: &Path) -> String {
 /// falls back to `/tmp`. After `create_dir_all`, validates the directory
 /// is not a symlink and is owned by the current user.
 fn secure_socket_base(subdir: &str) -> Result<PathBuf, VmError> {
-    let base = if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(xdg)
-    } else {
-        let mut base = PathBuf::from("/tmp");
-        if !base.is_dir() {
-            base = std::env::temp_dir();
-        }
-        base
-    };
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
+        || {
+            let mut base = PathBuf::from("/tmp");
+            if !base.is_dir() {
+                base = std::env::temp_dir();
+            }
+            base
+        },
+        PathBuf::from,
+    );
     let dir = base.join(subdir);
 
     // If the path exists, verify it is not a symlink before using it.
@@ -1431,29 +1432,23 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
             // network stack to misroute or drop packets.
             let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
 
-            // COMPAT_NET_FEATURES from libkrun.h
-            const NET_FEATURE_CSUM: u32 = 1 << 0;
-            const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
-            const NET_FEATURE_GUEST_TSO4: u32 = 1 << 7;
-            const NET_FEATURE_GUEST_UFO: u32 = 1 << 10;
-            const NET_FEATURE_HOST_TSO4: u32 = 1 << 11;
-            const NET_FEATURE_HOST_UFO: u32 = 1 << 14;
-            const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
-                | NET_FEATURE_GUEST_CSUM
-                | NET_FEATURE_GUEST_TSO4
-                | NET_FEATURE_GUEST_UFO
-                | NET_FEATURE_HOST_TSO4
-                | NET_FEATURE_HOST_UFO;
+            // COMPAT_NET_FEATURES from libkrun.h:
+            // NET_FEATURE_CSUM (1 << 0) | NET_FEATURE_GUEST_CSUM (1 << 1)
+            //   | NET_FEATURE_GUEST_TSO4 (1 << 7) | NET_FEATURE_GUEST_UFO (1 << 10)
+            //   | NET_FEATURE_HOST_TSO4 (1 << 11) | NET_FEATURE_HOST_UFO (1 << 14).
+            let compat_net_features: u32 =
+                (1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14);
 
             // On Linux use unixstream (SOCK_STREAM) to connect to gvproxy's
             // QEMU listener.  On macOS use unixgram (SOCK_DGRAM) with the vfkit
             // magic byte for the vfkit listener.
             #[cfg(target_os = "linux")]
-            vm.add_net_unixstream(&net_sock, &mac, COMPAT_NET_FEATURES)?;
+            vm.add_net_unixstream(&net_sock, &mac, compat_net_features)?;
             #[cfg(target_os = "macos")]
             {
-                const NET_FLAG_VFKIT: u32 = 1 << 0;
-                vm.add_net_unixgram(&net_sock, &mac, COMPAT_NET_FEATURES, NET_FLAG_VFKIT)?;
+                // NET_FLAG_VFKIT = 1 << 0
+                let net_flag_vfkit: u32 = 1 << 0;
+                vm.add_net_unixgram(&net_sock, &mac, compat_net_features, net_flag_vfkit)?;
             }
 
             eprintln!(
@@ -1761,15 +1756,11 @@ fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Re
         // drift check and the host already has valid certs. If the agent
         // isn't reachable we skip silently rather than blocking boot for
         // 30s.
-        match fetch_pki_over_exec(&exec_socket, std::time::Duration::from_secs(5)) {
-            Ok(bundle) => {
-                if let Err(e) = sync_host_certs_if_stale(gateway_name, &bundle) {
-                    eprintln!("Warning: cert sync check failed: {e}");
-                }
-            }
-            Err(_) => {
-                // Expected on warm boot — exec agent not ready yet.
-            }
+        // Expected on warm boot — exec agent not ready yet.
+        if let Ok(bundle) = fetch_pki_over_exec(&exec_socket, std::time::Duration::from_secs(5))
+            && let Err(e) = sync_host_certs_if_stale(gateway_name, &bundle)
+        {
+            eprintln!("Warning: cert sync check failed: {e}");
         }
 
         eprintln!(

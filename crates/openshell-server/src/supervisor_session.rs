@@ -70,9 +70,9 @@ impl openshell_driver_docker::SupervisorReadiness for SupervisorSessionRegistry 
 /// Registry of active supervisor sessions and pending relay channels.
 #[derive(Default)]
 pub struct SupervisorSessionRegistry {
-    /// sandbox_id -> live session handle.
+    /// `sandbox_id` -> live session handle.
     sessions: Mutex<HashMap<String, LiveSession>>,
-    /// channel_id -> oneshot sender for the reverse CONNECT stream.
+    /// `channel_id` -> oneshot sender for the reverse CONNECT stream.
     pending_relays: Mutex<HashMap<String, PendingRelay>>,
 }
 
@@ -287,10 +287,12 @@ impl SupervisorSessionRegistry {
         Ok((channel_id, relay_rx))
     }
 
-    /// Claim a pending relay channel. Called by the /relay/{channel_id} HTTP handler
+    /// Claim a pending relay channel. Called by the `/relay/{channel_id}` HTTP handler
     /// when the supervisor's reverse CONNECT arrives.
     ///
-    /// Returns the DuplexStream half that the supervisor side should read/write.
+    /// Returns the `DuplexStream` half that the supervisor side should read/write.
+    // `tonic::Status` is large but is the API surface of gRPC handlers.
+    #[allow(clippy::result_large_err)]
     pub fn claim_relay(&self, channel_id: &str) -> Result<tokio::io::DuplexStream, Status> {
         let pending = {
             let mut map = self.pending_relays.lock().unwrap();
@@ -377,15 +379,16 @@ async fn require_persisted_sandbox(
 // RelayStream gRPC handler
 // ---------------------------------------------------------------------------
 
-/// Size of chunks read from the gateway-side DuplexStream when forwarding
+/// Size of chunks read from the gateway-side `DuplexStream` when forwarding
 /// bytes back to the supervisor over the gRPC response stream.
 const RELAY_STREAM_CHUNK_SIZE: usize = 16 * 1024;
 
-/// Handle a RelayStream RPC from a supervisor. The first inbound `RelayFrame`
-/// must carry a `RelayInit` identifying the pending relay; subsequent frames
-/// carry raw bytes forward to the gateway-side waiter. Bytes flowing the other
-/// way are chunked and sent as `RelayFrame::data` messages back over the
-/// response stream.
+/// Handle a `RelayStream` RPC from a supervisor.
+///
+/// The first inbound `RelayFrame` must carry a `RelayInit` identifying the
+/// pending relay; subsequent frames carry raw bytes forward to the
+/// gateway-side waiter. Bytes flowing the other way are chunked and sent as
+/// `RelayFrame::data` messages back over the response stream.
 pub async fn handle_relay_stream(
     registry: &SupervisorSessionRegistry,
     request: Request<tonic::Streaming<RelayFrame>>,
@@ -456,7 +459,7 @@ pub async fn handle_relay_stream(
 
     // Gateway → supervisor: read the DuplexStream and emit RelayFrame::data messages.
     let (out_tx, out_rx) = mpsc::channel::<Result<RelayFrame, Status>>(16);
-    let channel_id_out = channel_id.clone();
+    let channel_id_out = channel_id;
     tokio::spawn(async move {
         let mut buf = vec![0u8; RELAY_STREAM_CHUNK_SIZE];
         loop {
@@ -735,8 +738,8 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
                 name: name.to_string(),
-                created_at_ms: 1000000,
-                labels: std::collections::HashMap::new(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
             }),
             ..Default::default()
         }
@@ -1002,6 +1005,8 @@ mod tests {
 
     #[tokio::test]
     async fn open_relay_uses_newest_session_after_supersede() {
+        use tokio::sync::mpsc::error::TryRecvError;
+
         let registry = SupervisorSessionRegistry::new();
         let (tx_old, mut rx_old) = mpsc::channel::<GatewayMessage>(4);
         let (tx_new, mut rx_new) = mpsc::channel(4);
@@ -1040,7 +1045,6 @@ mod tests {
 
         // The old session must have received no messages — the channel is
         // still open but empty.
-        use tokio::sync::mpsc::error::TryRecvError;
         match rx_old.try_recv() {
             Err(TryRecvError::Empty) => {}
             other => panic!("expected Empty on superseded session, got {other:?}"),
@@ -1191,7 +1195,9 @@ mod tests {
             PendingRelay {
                 sender: relay_tx,
                 sandbox_id: "sbx-test".to_string(),
-                created_at: Instant::now() - Duration::from_secs(60),
+                created_at: Instant::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .expect("test instant subtraction underflow"),
             },
         );
 
@@ -1269,7 +1275,9 @@ mod tests {
             PendingRelay {
                 sender: relay_tx,
                 sandbox_id: "sbx-test".to_string(),
-                created_at: Instant::now() - Duration::from_secs(60),
+                created_at: Instant::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .expect("test instant subtraction underflow"),
             },
         );
 

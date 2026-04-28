@@ -30,6 +30,20 @@ pub enum VmBackend {
     Qemu,
 }
 
+// virtio-net feature bits (see Linux `include/uapi/linux/virtio_net.h`).
+const NET_FEATURE_CSUM: u32 = 1 << 0;
+const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
+const NET_FEATURE_GUEST_TSO4: u32 = 1 << 7;
+const NET_FEATURE_GUEST_UFO: u32 = 1 << 10;
+const NET_FEATURE_HOST_TSO4: u32 = 1 << 11;
+const NET_FEATURE_HOST_UFO: u32 = 1 << 14;
+const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
+    | NET_FEATURE_GUEST_CSUM
+    | NET_FEATURE_GUEST_TSO4
+    | NET_FEATURE_GUEST_UFO
+    | NET_FEATURE_HOST_TSO4
+    | NET_FEATURE_HOST_UFO;
+
 pub struct VmLaunchConfig {
     pub rootfs: PathBuf,
     pub vcpus: u8,
@@ -778,7 +792,7 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
         // The procguard cleanup reads GVPROXY_PID atomically. Storing it
         // here makes the callback able to SIGTERM gvproxy if the driver
         // dies from this moment onward.
-        GVPROXY_PID.store(child.id() as i32, Ordering::Relaxed);
+        GVPROXY_PID.store(child.id().cast_signed(), Ordering::Relaxed);
 
         wait_for_path(&net_sock, Duration::from_secs(5), "gvproxy data socket")?;
 
@@ -786,18 +800,6 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
         vm.add_vsock(0)?;
 
         let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
-        const NET_FEATURE_CSUM: u32 = 1 << 0;
-        const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
-        const NET_FEATURE_GUEST_TSO4: u32 = 1 << 7;
-        const NET_FEATURE_GUEST_UFO: u32 = 1 << 10;
-        const NET_FEATURE_HOST_TSO4: u32 = 1 << 11;
-        const NET_FEATURE_HOST_UFO: u32 = 1 << 14;
-        const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
-            | NET_FEATURE_GUEST_CSUM
-            | NET_FEATURE_GUEST_TSO4
-            | NET_FEATURE_GUEST_UFO
-            | NET_FEATURE_HOST_TSO4
-            | NET_FEATURE_HOST_UFO;
 
         #[cfg(target_os = "linux")]
         vm.add_net_unixstream(&net_sock, &mac, COMPAT_NET_FEATURES)?;
@@ -980,7 +982,7 @@ impl VmContext {
 
         Ok(Self {
             krun,
-            ctx_id: ctx_id as u32,
+            ctx_id: ctx_id.cast_unsigned(),
         })
     }
 
@@ -1078,10 +1080,10 @@ impl VmContext {
 
     fn set_exec(&self, exec_path: &str, args: &[String], env: &[String]) -> Result<(), String> {
         let exec_c = CString::new(exec_path).map_err(|e| format!("invalid exec path: {e}"))?;
-        let argv_strs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let (_argv_owners, argv_ptrs) = c_string_array(&argv_strs)?;
-        let env_strs: Vec<&str> = env.iter().map(String::as_str).collect();
-        let (_env_owners, env_ptrs) = c_string_array(&env_strs)?;
+        let argv_slices: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (_argv_owners, argv_ptrs) = c_string_array(&argv_slices)?;
+        let env_slices: Vec<&str> = env.iter().map(String::as_str).collect();
+        let (_env_owners, env_ptrs) = c_string_array(&env_slices)?;
 
         check(
             unsafe {
@@ -1154,24 +1156,26 @@ fn wait_for_path(path: &Path, timeout: Duration, label: &str) -> Result<(), Stri
 }
 
 fn hash_path_id(path: &Path) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in path.to_string_lossy().as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     format!("{:012x}", hash & 0x0000_ffff_ffff_ffff)
 }
 
 fn secure_socket_base(subdir: &str) -> Result<PathBuf, String> {
-    let base = if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(xdg)
-    } else {
-        let mut base = PathBuf::from("/tmp");
-        if !base.is_dir() {
-            base = std::env::temp_dir();
-        }
-        base
-    };
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
+        || {
+            let fallback = PathBuf::from("/tmp");
+            if fallback.is_dir() {
+                fallback
+            } else {
+                std::env::temp_dir()
+            }
+        },
+        PathBuf::from,
+    );
     let dir = base.join(subdir);
 
     if dir.exists() {
@@ -1298,7 +1302,7 @@ fn path_to_cstring(path: &Path) -> Result<CString, String> {
     let path = path
         .to_str()
         .ok_or_else(|| format!("path is not valid UTF-8: {}", path.display()))?;
-    CString::new(path).map_err(|e| format!("invalid path string {}: {e}", path))
+    CString::new(path).map_err(|e| format!("invalid path string {path}: {e}"))
 }
 
 #[cfg(target_os = "linux")]

@@ -135,18 +135,17 @@ pub fn pid_matches_forward(pid: u32, port: u16, sandbox_id: Option<&str>) -> boo
 /// match is expected.
 pub fn find_forward_by_port(port: u16) -> Result<Option<String>> {
     let dir = forward_pid_dir()?;
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(None),
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(None);
     };
     let suffix = format!("-{port}.pid");
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
-        if let Some(name) = file_name.strip_suffix(&suffix) {
-            if !name.is_empty() {
-                return Ok(Some(name.to_string()));
-            }
+        if let Some(name) = file_name.strip_suffix(&suffix)
+            && !name.is_empty()
+        {
+            return Ok(Some(name.to_string()));
         }
     }
     Ok(None)
@@ -1049,9 +1048,8 @@ mod tests {
         // `python3 -m http.server` which listens on [::] by default.  The
         // IPv4-only TcpListener::bind("127.0.0.1", port) might succeed, but
         // lsof should detect the listener and the check should still fail.
-        let listener = match TcpListener::bind("[::]:0") {
-            Ok(l) => l,
-            Err(_) => return, // IPv6 not available, skip
+        let Ok(listener) = TcpListener::bind("[::]:0") else {
+            return; // IPv6 not available, skip
         };
         let port = listener.local_addr().unwrap().port();
 

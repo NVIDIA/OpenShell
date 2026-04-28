@@ -13,6 +13,7 @@ pub use openshell_core::proto::{
 use openshell_core::{Error as CoreError, Result as CoreResult};
 use prost::Message;
 use rand::Rng;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -233,7 +234,7 @@ impl Store {
     ) -> PersistenceResult<()> {
         // Serialize labels to JSON
         let labels_map = message.object_labels();
-        let labels_json = if labels_map.as_ref().map_or(true, |m| m.is_empty()) {
+        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
             None
         } else {
             Some(serde_json::to_string(&labels_map).map_err(|e| {
@@ -323,19 +324,17 @@ fn map_migrate_error(error: &sqlx::migrate::MigrateError) -> PersistenceError {
 
 /// Parse a simple label selector string into key-value pairs.
 /// Format: "key1=value1,key2=value2"
-/// Returns a HashMap of label requirements.
+/// Returns a `HashMap` of label requirements.
 ///
 /// Note: Input validation should be performed at the gRPC layer using
 /// `grpc::validation::validate_label_selector()` before calling this function.
 /// Errors returned here indicate unexpected internal errors, not user input errors.
-pub fn parse_label_selector(
-    selector: &str,
-) -> PersistenceResult<std::collections::HashMap<String, String>> {
+pub fn parse_label_selector(selector: &str) -> PersistenceResult<HashMap<String, String>> {
     if selector.is_empty() {
-        return Ok(std::collections::HashMap::new());
+        return Ok(HashMap::new());
     }
 
-    let mut labels = std::collections::HashMap::new();
+    let mut labels = HashMap::new();
     for pair in selector.split(',') {
         let pair = pair.trim();
         if pair.is_empty() {

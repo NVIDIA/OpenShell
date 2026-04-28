@@ -78,8 +78,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .sandbox_labels
         .get(idx)
         .filter(|s| !s.is_empty())
-        .map(String::as_str)
-        .unwrap_or("none");
+        .map_or("none", String::as_str);
     let row3 = Line::from(vec![
         Span::styled("  Labels: ", t.muted),
         Span::styled(labels_str, t.text),
@@ -101,8 +100,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .sandbox_notes
         .get(idx)
         .filter(|s| !s.is_empty())
-        .map(String::as_str)
-        .unwrap_or("none");
+        .map_or("none", String::as_str);
     let row5 = Line::from(vec![
         Span::styled("  Forwards: ", t.muted),
         Span::styled(forwards_str, t.text),

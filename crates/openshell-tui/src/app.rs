@@ -359,7 +359,7 @@ pub struct CreateProviderForm {
     pub is_generic: bool,
     /// Status message (errors, validation).
     pub status: Option<String>,
-    /// Warning shown at top of EnterKey modal (e.g. autodetect failure).
+    /// Warning shown at top of `EnterKey` modal (e.g. autodetect failure).
     pub warning: Option<String>,
     /// Animation start time.
     pub anim_start: Option<Instant>,
@@ -578,6 +578,7 @@ pub fn format_labels(labels: &HashMap<String, String>) -> String {
 }
 
 impl App {
+    #[allow(clippy::large_types_passed_by_value)] // Theme is Copy; one-shot ctor
     pub fn new(
         client: OpenShellClient<Channel>,
         gateway_name: String,
@@ -719,18 +720,18 @@ impl App {
         self.sandbox_settings = settings::REGISTERED_SETTINGS
             .iter()
             .map(|reg| {
-                let (value, scope) = settings
-                    .get(reg.key)
-                    .map(|es| {
-                        let v = es.value.as_ref().and_then(|sv| sv.value.clone());
-                        let s = match es.scope {
-                            1 => SettingScope::Sandbox,
-                            2 => SettingScope::Global,
-                            _ => SettingScope::Unset,
-                        };
-                        (v, s)
-                    })
-                    .unwrap_or((None, SettingScope::Unset));
+                let (value, scope) =
+                    settings
+                        .get(reg.key)
+                        .map_or((None, SettingScope::Unset), |es| {
+                            let v = es.value.as_ref().and_then(|sv| sv.value.clone());
+                            let s = match es.scope {
+                                1 => SettingScope::Sandbox,
+                                2 => SettingScope::Global,
+                                _ => SettingScope::Unset,
+                            };
+                            (v, s)
+                        });
                 SandboxSettingEntry {
                     key: reg.key.to_string(),
                     kind: reg.kind,
@@ -1655,7 +1656,8 @@ impl App {
             self.sandbox_log_scroll = self.sandbox_log_scroll.saturating_sub(delta.unsigned_abs());
             self.log_autoscroll = false;
         } else {
-            self.sandbox_log_scroll = (self.sandbox_log_scroll + delta as usize).min(max_scroll);
+            self.sandbox_log_scroll =
+                (self.sandbox_log_scroll + delta.cast_unsigned()).min(max_scroll);
         }
         let visible = filtered_len
             .saturating_sub(self.sandbox_log_scroll)
@@ -1870,7 +1872,7 @@ impl App {
                     form.status = None;
                     form.warning = None;
                 }
-                KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('k') | KeyCode::Up => {
+                KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up => {
                     form.method_cursor = 1 - form.method_cursor;
                 }
                 KeyCode::Enter => {
@@ -2076,7 +2078,7 @@ impl App {
             registry
                 .credential_env_vars(&ptype)
                 .first()
-                .map_or(String::new(), |s| s.to_string())
+                .map_or(String::new(), ToString::to_string)
         } else {
             cred_key
         };

@@ -56,7 +56,7 @@ pub enum Event {
 pub struct EventHandler {
     rx: mpsc::UnboundedReceiver<Event>,
     // Kept alive so the spawned task's `tx` doesn't see a closed channel.
-    _keepalive: mpsc::UnboundedSender<Event>,
+    keepalive: mpsc::UnboundedSender<Event>,
     /// When true, the background reader stops polling stdin.
     paused: Arc<AtomicBool>,
 }
@@ -113,7 +113,7 @@ impl EventHandler {
 
         Self {
             rx,
-            _keepalive: keepalive,
+            keepalive,
             paused,
         }
     }
@@ -124,7 +124,7 @@ impl EventHandler {
 
     /// Get a sender handle for dispatching events from background tasks.
     pub fn sender(&self) -> mpsc::UnboundedSender<Event> {
-        self._keepalive.clone()
+        self.keepalive.clone()
     }
 
     /// Pause stdin polling (call before suspending TUI for a child process).

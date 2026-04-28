@@ -213,7 +213,7 @@ pub fn detect(mode: ThemeMode) -> Theme {
 ///
 /// Uses `terminal-colorsaurus` to send an OSC 11 query to the terminal,
 /// which returns the actual background RGB color. This works reliably on
-/// iTerm2, Terminal.app, WezTerm, Alacritty, and most modern terminals.
+/// iTerm2, Terminal.app, `WezTerm`, Alacritty, and most modern terminals.
 ///
 /// Falls back to `false` (dark) if the terminal doesn't respond to the
 /// query (e.g. `TERM=dumb`, piped output, very old terminals).

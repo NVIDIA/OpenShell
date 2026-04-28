@@ -137,7 +137,7 @@ impl OpaEngine {
                     .severity(openshell_ocsf::SeverityId::Medium)
                     .status(openshell_ocsf::StatusId::Success)
                     .state(openshell_ocsf::StateId::Enabled, "validated")
-                    .unmapped("warning", serde_json::json!(w.to_string()))
+                    .unmapped("warning", serde_json::json!(w.clone()))
                     .message(format!("L7 policy validation warning: {w}"))
                     .build()
             );
@@ -278,15 +278,14 @@ impl OpaEngine {
             Some(value_to_string(&matched))
         };
 
-        match action_str.as_str() {
-            "allow" => Ok(NetworkAction::Allow { matched_policy }),
-            _ => {
-                let reason_val = engine
-                    .eval_rule("data.openshell.sandbox.deny_reason".into())
-                    .map_err(|e| miette::miette!("{e}"))?;
-                let reason = value_to_string(&reason_val);
-                Ok(NetworkAction::Deny { reason })
-            }
+        if action_str == "allow" {
+            Ok(NetworkAction::Allow { matched_policy })
+        } else {
+            let reason_val = engine
+                .eval_rule("data.openshell.sandbox.deny_reason".into())
+                .map_err(|e| miette::miette!("{e}"))?;
+            let reason = value_to_string(&reason_val);
+            Ok(NetworkAction::Deny { reason })
         }
     }
 
@@ -435,10 +434,10 @@ impl OpaEngine {
     /// match. This is used by the proxy to decide between full SSRF blocking
     /// and allowlist-based IP validation.
     pub fn query_allowed_ips(&self, input: &NetworkInput) -> Result<Vec<String>> {
-        match self.query_endpoint_config(input)? {
-            Some(val) => Ok(get_str_array(&val, "allowed_ips")),
-            None => Ok(vec![]),
-        }
+        Ok(self
+            .query_endpoint_config(input)?
+            .map(|val| get_str_array(&val, "allowed_ips"))
+            .unwrap_or_default())
     }
 
     /// Clone the inner regorus engine for per-tunnel L7 evaluation.
@@ -557,7 +556,7 @@ fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
                 .severity(openshell_ocsf::SeverityId::Medium)
                 .status(openshell_ocsf::StatusId::Success)
                 .state(openshell_ocsf::StateId::Enabled, "validated")
-                .unmapped("warning", serde_json::json!(w.to_string()))
+                .unmapped("warning", serde_json::json!(w.clone()))
                 .message(format!("L7 policy validation warning: {w}"))
                 .build()
         );
@@ -594,9 +593,8 @@ fn normalize_endpoint_ports(data: &mut serde_json::Value) {
         };
 
         for ep in endpoints.iter_mut() {
-            let ep_obj = match ep.as_object_mut() {
-                Some(obj) => obj,
-                None => continue,
+            let Some(ep_obj) = ep.as_object_mut() else {
+                continue;
             };
 
             // If "ports" already exists and is non-empty, keep it.
@@ -637,10 +635,12 @@ fn normalize_endpoint_ports(data: &mut serde_json::Value) {
 /// - Path is not a symlink
 /// - Resolution fails (binary doesn't exist in container)
 /// - Resolved path equals the original
+///
 /// Normalize a path by resolving `.` and `..` components without touching
 /// the filesystem. Only works correctly for absolute paths.
-fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
-    let mut result = std::path::PathBuf::new();
+#[cfg(test)]
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
     for component in path.components() {
         match component {
             std::path::Component::ParentDir => {
@@ -946,6 +946,13 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::needless_raw_string_hashes,
+    clippy::similar_names,
+    clippy::doc_markdown,
+    clippy::match_wildcard_for_single_variants,
+    reason = "Test code: test fixtures and panic-on-unexpected matches are idiomatic in tests."
+)]
 mod tests {
     use super::*;
 

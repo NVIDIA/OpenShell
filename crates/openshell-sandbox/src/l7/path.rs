@@ -136,15 +136,12 @@ pub fn canonicalize_request_target(
     };
 
     // 4. Handle absolute-form by stripping scheme://authority.
-    let raw_path = if let Some(idx) = path_part.find("://") {
+    let raw_path = path_part.find("://").map_or(path_part, |idx| {
         let after_scheme = &path_part[idx + 3..];
-        match after_scheme.find('/') {
-            Some(slash) => &after_scheme[slash..],
-            None => "/",
-        }
-    } else {
-        path_part
-    };
+        after_scheme
+            .find('/')
+            .map_or("/", |slash| &after_scheme[slash..])
+    });
 
     // 5. Empty is equivalent to "/".
     let raw_path = if raw_path.is_empty() { "/" } else { raw_path };
@@ -170,7 +167,7 @@ pub fn canonicalize_request_target(
 
     // 10. Reconstruct. Strip `;params` per segment if requested; re-encode
     //     any byte that must be percent-encoded in the pchar set.
-    let canonical = build_canonical_path(&resolved, decoded.last().copied() == Some(b'/'), opts);
+    let canonical = build_canonical_path(&resolved, decoded.last().copied() == Some(b'/'), *opts);
 
     let rewritten = canonical != raw_path;
     Ok((
@@ -270,7 +267,7 @@ fn resolve_dot_segments(segments: Vec<&[u8]>) -> Result<Vec<Vec<u8>>, Canonicali
 fn build_canonical_path(
     segments: &[Vec<u8>],
     _trailing_slash_hint: bool,
-    opts: &CanonicalizeOptions,
+    opts: CanonicalizeOptions,
 ) -> String {
     let mut out = String::from("/");
     for (idx, seg) in segments.iter().enumerate() {

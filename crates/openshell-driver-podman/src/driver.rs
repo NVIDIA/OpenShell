@@ -154,8 +154,8 @@ impl PodmanComputeDriver {
     }
 
     /// Report driver capabilities.
-    pub async fn capabilities(&self) -> Result<GetCapabilitiesResponse, ComputeDriverError> {
-        let supports_gpu = self.has_gpu_capacity();
+    pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, ComputeDriverError> {
+        let supports_gpu = Self::has_gpu_capacity();
         Ok(GetCapabilitiesResponse {
             driver_name: "podman".to_string(),
             driver_version: openshell_core::VERSION.to_string(),
@@ -175,17 +175,17 @@ impl PodmanComputeDriver {
     /// The Podman system info response doesn't directly list CDI devices in all
     /// versions. As a heuristic, check if the NVIDIA device node exists (this
     /// works for both rootful and rootless).
-    fn has_gpu_capacity(&self) -> bool {
+    fn has_gpu_capacity() -> bool {
         std::path::Path::new("/dev/nvidia0").exists()
     }
 
     /// Validate a sandbox before creation.
-    pub async fn validate_sandbox_create(
+    pub fn validate_sandbox_create(
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
         let gpu_requested = sandbox.spec.as_ref().is_some_and(|s| s.gpu);
-        if gpu_requested && !self.has_gpu_capacity() {
+        if gpu_requested && !Self::has_gpu_capacity() {
             return Err(ComputeDriverError::Precondition(
                 "GPU sandbox requested, but no NVIDIA GPU devices are available.".to_string(),
             ));
@@ -664,7 +664,7 @@ mod tests {
             .len();
         let socket_path_for_task = socket_path.clone();
         let log_for_task = request_log.clone();
-        let queue_for_task = response_queue.clone();
+        let queue_for_task = response_queue;
         let handle = tokio::spawn(async move {
             for _ in 0..expected {
                 let (stream, _) = listener.accept().await.expect("test stub should accept");
@@ -677,11 +677,10 @@ mod tests {
                             let log = log.clone();
                             let queue = queue.clone();
                             async move {
-                                let path = req
-                                    .uri()
-                                    .path_and_query()
-                                    .map(|pq| pq.as_str().to_string())
-                                    .unwrap_or_else(|| req.uri().path().to_string());
+                                let path = req.uri().path_and_query().map_or_else(
+                                    || req.uri().path().to_string(),
+                                    |pq| pq.as_str().to_string(),
+                                );
                                 log.lock()
                                     .expect("request log lock should not be poisoned")
                                     .push(format!("{} {}", req.method(), path));

@@ -9,8 +9,11 @@ run = "cargo check --workspace"
 hide = true
 
 ["rust:lint"]
-description = "Lint Rust code with Clippy"
-run = "cargo clippy --workspace --all-targets"
+description = "Lint Rust code with Clippy (deny warnings)"
+run = [
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings",
+]
 hide = true
 
 ["rust:format"]

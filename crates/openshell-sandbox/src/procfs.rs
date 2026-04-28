@@ -480,7 +480,7 @@ pub fn file_sha256(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| miette::miette!("Failed to open {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
+    let mut buf = vec![0u8; 65536].into_boxed_slice();
     let mut total_read = 0u64;
     loop {
         let n = file

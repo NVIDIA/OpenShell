@@ -249,21 +249,11 @@ pub struct NetworkPolicyRule {
 }
 
 /// Filesystem access policy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FilesystemPolicy {
     pub include_workdir: bool,
     pub read_only: Vec<String>,
     pub read_write: Vec<String>,
-}
-
-impl Default for FilesystemPolicy {
-    fn default() -> Self {
-        Self {
-            include_workdir: false,
-            read_only: Vec::new(),
-            read_write: Vec::new(),
-        }
-    }
 }
 
 impl FilesystemPolicy {
@@ -302,7 +292,7 @@ impl Default for PolicyModel {
 }
 
 impl PolicyModel {
-    /// All (policy_name, endpoint) pairs.
+    /// All (`policy_name`, endpoint) pairs.
     pub fn all_endpoints(&self) -> Vec<(&str, &Endpoint)> {
         let mut result = Vec::new();
         for (name, rule) in &self.network_policies {
@@ -327,7 +317,7 @@ impl PolicyModel {
         result
     }
 
-    /// All (binary, policy_name, endpoint) triples.
+    /// All (binary, `policy_name`, endpoint) triples.
     pub fn binary_endpoint_pairs(&self) -> Vec<(&Binary, &str, &Endpoint)> {
         let mut result = Vec::new();
         for (name, rule) in &self.network_policies {
@@ -345,7 +335,7 @@ impl PolicyModel {
 // Parsing
 // ---------------------------------------------------------------------------
 
-/// Parse an OpenShell policy YAML file into a [`PolicyModel`].
+/// Parse an `OpenShell` policy YAML file into a [`PolicyModel`].
 pub fn parse_policy(path: &Path) -> Result<PolicyModel> {
     let contents = std::fs::read_to_string(path)
         .into_diagnostic()

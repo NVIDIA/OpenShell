@@ -32,7 +32,8 @@ pub fn openshell_bin() -> PathBuf {
     let bin = workspace_root().join("target/debug/openshell");
     assert!(
         bin.is_file(),
-        "openshell binary not found at {bin:?} — run `cargo build -p openshell-cli` first"
+        "openshell binary not found at {} — run `cargo build -p openshell-cli` first",
+        bin.display()
     );
     bin
 }

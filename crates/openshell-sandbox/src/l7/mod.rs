@@ -144,7 +144,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
 pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
     match get_object_str(val, "tls").as_deref() {
         Some("skip") => TlsMode::Skip,
-        Some("terminate") | Some("passthrough") => TlsMode::Auto, // deprecation logged by parse_l7_config
+        // "terminate" and "passthrough" are deprecated aliases (logged by parse_l7_config); fall through to Auto.
         _ => TlsMode::Auto,
     }
 }
@@ -252,17 +252,16 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             let host = ep.get("host").and_then(|v| v.as_str()).unwrap_or("");
 
             // Read ports from either "ports" array or scalar "port".
-            let ports: Vec<u64> = ep
-                .get("ports")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
-                .unwrap_or_else(|| {
+            let ports: Vec<u64> = ep.get("ports").and_then(|v| v.as_array()).map_or_else(
+                || {
                     ep.get("port")
                         .and_then(serde_json::Value::as_u64)
                         .filter(|p| *p > 0)
                         .into_iter()
                         .collect()
-                });
+                },
+                |arr| arr.iter().filter_map(serde_json::Value::as_u64).collect(),
+            );
             let loc = format!("{name}.endpoints[{i}]");
 
             // Validate host wildcard patterns.
@@ -392,10 +391,10 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                         }
 
                         // Validate path glob syntax
-                        if let Some(path) = deny_rule.get("path").and_then(|p| p.as_str()) {
-                            if let Some(warning) = check_glob_syntax(path) {
-                                warnings.push(format!("{deny_loc}.path: {warning}"));
-                            }
+                        if let Some(path) = deny_rule.get("path").and_then(|p| p.as_str())
+                            && let Some(warning) = check_glob_syntax(path)
+                        {
+                            warnings.push(format!("{deny_loc}.path: {warning}"));
                         }
 
                         // Validate query matchers — mirrors allow-side validation exactly
@@ -498,12 +497,12 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                         }
 
                         // SQL command validation
-                        if let Some(command) = deny_rule.get("command").and_then(|c| c.as_str()) {
-                            if !command.is_empty() && protocol == "rest" {
-                                warnings.push(format!(
-                                    "{deny_loc}: command is for SQL protocol, not REST"
-                                ));
-                            }
+                        if let Some(command) = deny_rule.get("command").and_then(|c| c.as_str())
+                            && !command.is_empty()
+                            && protocol == "rest"
+                        {
+                            warnings
+                                .push(format!("{deny_loc}: command is for SQL protocol, not REST"));
                         }
                     }
                 }
