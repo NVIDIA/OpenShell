@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: anthropic
+display_name: Anthropic API
+description: Anthropic API access for Claude models
+category: inference
+inference_capable: true
+credentials:
+  - name: api_key
+    description: Anthropic API key
+    env_vars: [ANTHROPIC_API_KEY]
+    required: true
+    auth_style: header
+    header_name: x-api-key
+endpoints:
+  - host: api.anthropic.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/bin/curl, /usr/local/bin/curl]

@@ -48,21 +48,24 @@ The gRPC surface is defined in `proto/openshell.proto`:
 
 ## Provider Type Profiles
 
-Provider type profiles are declarative metadata for provider types. Profiles live in
-`crates/openshell-providers` and are exposed through `ListProviderProfiles` and
-`GetProviderProfile`. They describe credential names and environment variables,
-known network endpoints, expected binaries, category, and whether the provider is
+Provider type profiles are declarative metadata for provider types. Built-in profiles
+live as one YAML document per provider under
+`crates/openshell-providers/profiles/` and are exposed through
+`ListProviderProfiles` and `GetProviderProfile`. The profile loader validates the
+YAML catalog and materializes the same proto-backed shape that future API imports
+will accept. Profiles describe credential names and environment variables, known
+network endpoints, expected binaries, category, and whether the provider is
 inference-capable.
 
 Profiles are additive to provider records. A provider record with only `type`,
 `credentials`, and `config` can be matched to built-in profile metadata by
-`provider.type`. Profile-generated policy is still sandbox-scoped: the gateway composes
-provider profile rules only for sandboxes whose `SandboxSpec.features.provider_profile_policy`
-flag is true.
+`provider.type`. Profile-generated policy is still opt-in: the gateway composes provider
+profile rules only when the gateway-global `use_providers_v2` setting is true.
 
-This keeps the compatibility boundary on the sandbox that consumes effective policy,
-rather than on provider records shared by many sandboxes. A provider can be attached to
-both legacy sandboxes and profile-policy sandboxes at the same time.
+This keeps the compatibility boundary at the gateway. A gateway without
+`use_providers_v2=true` keeps the existing credential-only provider behavior, while a
+gateway with the flag enabled routes all attached known provider types through the
+profile-backed policy path.
 
 ### Provider Policy Composition
 
@@ -79,19 +82,22 @@ mutate the user-authored policy layer. Provider-generated rules are re-added dur
 composition for each attached provider whose type has a built-in profile.
 
 Provider-generated network rules use reserved `_provider_*` names derived from the
-provider record name. If a user policy already has the same key, composition keeps the
-user entry and adds a numeric suffix to the provider entry. Duplicate host/port
-endpoints across user and provider rules are valid; OPA evaluates all rules, so allow
-decisions are the union of matching allows and deny rules continue to win globally.
+provider record name. If a user or global policy already has the same key, composition
+keeps the policy entry and adds a numeric suffix to the provider entry. Duplicate
+host/port endpoints across policy and provider rules are valid; OPA evaluates all
+rules, so allow decisions are the union of matching allows and deny rules continue to
+win globally.
 
-Gateway-global policy remains a full override. When a global policy is active, the
-gateway serves the global policy as-is rather than composing provider layers into it,
-and the existing blocks on sandbox-scoped policy mutations remain unchanged.
+Gateway-global policy still overrides sandbox-authored policy. When `use_providers_v2`
+is true, provider layers compose JIT onto the effective policy source, whether that
+source is sandbox-scoped or global. The composed payload is derived data and is not
+persisted as a policy revision.
 
 ## Components
 
 - `crates/openshell-providers`
   - canonical provider type normalization and command detection,
+  - YAML-backed built-in provider profiles,
   - provider registry and per-provider discovery plugins,
   - shared discovery engine and context abstraction for testability.
 - `crates/openshell-cli`

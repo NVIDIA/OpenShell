@@ -299,11 +299,10 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 const SETTINGS_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell settings get my-sandbox
   $ openshell settings get --global
-  $ openshell settings set my-sandbox --key log_level --value debug
-  $ openshell settings set --global --key log_level --value warn
-  $ openshell settings set --global --key dummy_bool --value yes
-  $ openshell settings set --global --key dummy_int --value 42
-  $ openshell settings delete --global --key log_level
+  $ openshell settings set --global --key use_providers_v2 --value true
+  $ openshell settings set my-sandbox --key ocsf_json_enabled --value true
+  $ openshell settings set --global --key ocsf_json_enabled --value true
+  $ openshell settings delete --global --key use_providers_v2
 ";
 
 const PROVIDER_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
@@ -1305,10 +1304,6 @@ enum SandboxCommands {
         /// Never auto-create providers; error if required providers are missing.
         #[arg(long, overrides_with = "auto_providers")]
         no_auto_providers: bool,
-
-        /// Opt into provider profile network policy composition for this sandbox.
-        #[arg(long)]
-        provider_profile_policy: bool,
 
         /// Attach labels to the sandbox (key=value format, repeatable).
         #[arg(long = "label")]
@@ -2468,7 +2463,6 @@ async fn main() -> Result<()> {
                     no_bootstrap,
                     auto_providers,
                     no_auto_providers,
-                    provider_profile_policy,
                     labels,
                     command,
                 } => {
@@ -2564,7 +2558,6 @@ async fn main() -> Result<()> {
                                 tty_override,
                                 Some(false),
                                 auto_providers_override,
-                                provider_profile_policy,
                                 &labels_map,
                                 &tls,
                             ))
@@ -2589,7 +2582,6 @@ async fn main() -> Result<()> {
                                 tty_override,
                                 bootstrap_override,
                                 auto_providers_override,
-                                provider_profile_policy,
                             ))
                             .await?;
                         }
