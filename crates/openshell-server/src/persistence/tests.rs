@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{ObjectType, Store, generate_name};
+use crate::policy_store::PolicyStoreExt;
 use openshell_core::proto::{ObjectForTest, SandboxPolicy};
 use prost::Message;
 

@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectRecord, PersistenceResult, PolicyRecord, current_time_ms,
-    draft_chunk_payload_from_record, draft_chunk_record_from_parts, map_db_error,
-    map_migrate_error, policy_payload_from_record, policy_record_from_parts,
+    DraftChunkRecord, ObjectRecord, PersistenceResult, PolicyRecord, current_time_ms, map_db_error,
+    map_migrate_error,
+};
+use crate::policy_store::{
+    draft_chunk_payload_from_record, draft_chunk_record_from_parts, policy_payload_from_record,
+    policy_record_from_parts,
 };
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
