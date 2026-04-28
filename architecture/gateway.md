@@ -9,11 +9,12 @@ workloads.
 
 - Authenticate clients and sandbox callbacks.
 - Serve gRPC APIs for sandbox lifecycle, provider management, policy updates,
-  settings, inference configuration, logs, and watch streams.
-- Serve HTTP endpoints for health, SSH tunnel upgrades, and edge-auth flows.
+  settings, inference configuration, logs, watch streams, and relay forwarding.
+- Serve HTTP endpoints for health, WebSocket tunnels, and edge-auth flows.
 - Persist domain objects in SQLite or Postgres.
 - Resolve provider credentials and inference bundles for sandbox supervisors.
-- Coordinate supervisor relay sessions for connect, exec, and file sync.
+- Coordinate supervisor relay sessions for connect, exec, file sync, and
+  service forwarding.
 
 The gateway does not enforce agent network policy at request time. That happens
 inside each sandbox, where the supervisor and proxy can observe local process
@@ -44,7 +45,7 @@ The gateway API is organized around platform objects and operational streams:
 
 | Area | Examples |
 |---|---|
-| Sandbox lifecycle | Create, list, delete, watch, exec, SSH session bootstrap. |
+| Sandbox lifecycle | Create, list, delete, watch, exec, SSH session bootstrap, ForwardTcp service forwarding. |
 | Providers | Store provider records, discover credentials, resolve runtime environment. |
 | Policy and settings | Get effective sandbox config, update sandbox policy, manage global settings. |
 | Inference | Set gateway-level model/provider config and resolve sandbox route bundles. |
@@ -115,22 +116,35 @@ sequenceDiagram
     participant CLI
     participant GW as Gateway
     participant SUP as Sandbox supervisor
-    participant SSH as Sandbox SSH socket
+    participant Target as Sandbox target
 
     SUP->>GW: ConnectSupervisor stream
-    CLI->>GW: connect / exec / sync request
-    GW->>SUP: RelayOpen(channel)
+    CLI->>GW: ForwardTcp / exec / sync request
+    GW->>SUP: RelayOpen(channel, target)
+    SUP->>Target: Dial SSH socket or loopback service
     SUP->>GW: RelayStream(channel)
-    SUP->>SSH: Bridge bytes to Unix socket
     CLI->>GW: Client bytes
     GW-->>CLI: Client bytes
     GW->>SUP: Relay bytes
     SUP-->>GW: Relay bytes
 ```
 
-The same relay pattern backs interactive SSH, command execution, and file sync.
-The gateway tracks live sessions in memory and persists session records so
-tokens can expire or be revoked.
+The same relay pattern backs interactive SSH, command execution, file sync, and
+local service forwarding. The gateway tracks live sessions in memory and
+persists session records so tokens can expire or be revoked.
+
+`ForwardTcp` is the client-facing byte stream for SSH and service forwarding.
+The first frame is a `TcpForwardInit` that carries the sandbox ID, an
+authorization token from `CreateSshSession`, and an explicit target:
+`target.ssh` for the sandbox SSH socket or `target.tcp` for a loopback service
+inside the sandbox. The gateway validates the token and sandbox readiness,
+sends a targeted `RelayOpen` to the supervisor, then bridges
+`TcpForwardFrame::Data` to `RelayFrame::Data` until either side closes.
+
+For `target.tcp`, the gateway only accepts loopback destinations such as
+`localhost`, `127.0.0.0/8`, or `::1`. The gateway never needs to know or dial a
+sandbox pod IP; supervisors connect outbound and bridge only the explicit target
+requested for that relay.
 
 ## PKI Bootstrap
 
@@ -143,13 +157,13 @@ created. Both deployment paths use it:
 | Filesystem | `--output-dir <DIR>` | `<dir>/{ca.crt, ca.key, server/tls.{crt,key}, client/tls.{crt,key}}`. Also copies client materials to `$XDG_CONFIG_HOME/openshell/gateways/openshell/mtls/` for CLI auto-discovery. |
 
 On Kubernetes, the Helm chart runs the command via a pre-install/pre-upgrade
-hook Job using the gateway image itself — no separate cert-generation image,
+hook Job using the gateway image itself -- no separate cert-generation image,
 no extra mirror burden in air-gapped environments. On the RPM gateway, the
 same command runs from the systemd unit's `ExecStartPre` to bootstrap PKI
 into the user's state directory on first start.
 
-Both modes share the same idempotency contract: all targets present → skip;
-partial state → fail with a recovery hint; nothing present → generate and
+Both modes share the same idempotency contract: all targets present -> skip;
+partial state -> fail with a recovery hint; nothing present -> generate and
 write. This guards mTLS continuity across restarts and upgrades while still
 recovering cleanly if an operator deletes everything and starts over.
 

@@ -754,6 +754,21 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     ) -> Result<tonic::Response<Self::RelayStreamStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("not implemented in test"))
     }
+
+    type ForwardTcpStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<
+                    Item = Result<openshell_core::proto::TcpForwardFrame, tonic::Status>,
+                > + Send,
+        >,
+    >;
+
+    async fn forward_tcp(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::TcpForwardFrame>>,
+    ) -> Result<tonic::Response<Self::ForwardTcpStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
 }
 
 /// Test 7: Plaintext server (no TLS) accepts both gRPC and HTTP.

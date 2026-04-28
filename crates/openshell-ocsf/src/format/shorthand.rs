@@ -61,6 +61,7 @@ pub fn severity_tag(severity_id: u8) -> &'static str {
 
 /// Max length for the reason text in `[reason:...]` before truncation.
 const MAX_REASON_LEN: usize = 80;
+const MAX_MESSAGE_LEN: usize = 120;
 
 /// Format a `[reason:...]` tag from `status_detail` (or `message` fallback)
 /// for denied events.  Returns an empty string if neither field is set.
@@ -77,6 +78,19 @@ fn reason_tag(base: &BaseEventData) -> String {
         format!(" [reason:{}...]", &text[..MAX_REASON_LEN])
     } else {
         format!(" [reason:{text}]")
+    }
+}
+
+fn message_tag(base: &BaseEventData) -> String {
+    let text = base.message.as_deref().unwrap_or("");
+    if text.is_empty() {
+        return String::new();
+    }
+    let text = text.replace(['\n', '\r'], " ");
+    if text.len() > MAX_MESSAGE_LEN {
+        format!(" [msg:{}...]", &text[..MAX_MESSAGE_LEN])
+    } else {
+        format!(" [msg:{text}]")
     }
 }
 
@@ -140,7 +154,13 @@ impl OcsfEvent {
                     (false, true) => format!(" {action}"),
                     (false, false) => format!(" {action}{arrow}"),
                 };
-                format!("NET:{activity} {sev}{detail}{rule_ctx}{reason_ctx}")
+                let message_ctx =
+                    if detail.is_empty() && rule_ctx.is_empty() && reason_ctx.is_empty() {
+                        message_tag(&e.base)
+                    } else {
+                        String::new()
+                    };
+                format!("NET:{activity} {sev}{detail}{rule_ctx}{reason_ctx}{message_ctx}")
             }
 
             Self::HttpActivity(e) => {
@@ -538,6 +558,33 @@ mod tests {
         assert!(
             !shorthand.contains("[reason:"),
             "allowed shorthand should NOT contain [reason:]: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_network_activity_shorthand_shows_message_when_no_key_fields() {
+        let event = OcsfEvent::NetworkActivity(NetworkActivityEvent {
+            base: {
+                let mut b = base(4001, "Network Activity", 4, "Network Activity", 1, "Open");
+                b.set_message("relay open (channel_id=ch-42)");
+                b
+            },
+            src_endpoint: None,
+            dst_endpoint: None,
+            proxy_endpoint: None,
+            actor: None,
+            firewall_rule: None,
+            connection_info: None,
+            action: None,
+            disposition: None,
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "NET:OPEN [INFO] [msg:relay open (channel_id=ch-42)]"
         );
     }
 

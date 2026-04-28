@@ -127,14 +127,6 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_SSH_GATEWAY_PORT", default_value_t = DEFAULT_SERVER_PORT)]
     ssh_gateway_port: u16,
 
-    /// HTTP path for SSH CONNECT/upgrade.
-    #[arg(
-        long,
-        env = "OPENSHELL_SSH_CONNECT_PATH",
-        default_value = "/connect/ssh"
-    )]
-    ssh_connect_path: String,
-
     /// SSH port inside sandbox pods.
     #[arg(long, env = "OPENSHELL_SANDBOX_SSH_PORT", default_value_t = DEFAULT_SSH_PORT)]
     sandbox_ssh_port: u16,
@@ -400,7 +392,6 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
         .with_sandbox_namespace(args.sandbox_namespace)
         .with_ssh_gateway_host(args.ssh_gateway_host)
         .with_ssh_gateway_port(args.ssh_gateway_port)
-        .with_ssh_connect_path(args.ssh_connect_path)
         .with_sandbox_ssh_port(args.sandbox_ssh_port)
         .with_ssh_handshake_skew_secs(args.ssh_handshake_skew_secs);
 

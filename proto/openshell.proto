@@ -54,6 +54,9 @@ service OpenShell {
   // Execute a command in a ready sandbox and stream output.
   rpc ExecSandbox(ExecSandboxRequest) returns (stream ExecSandboxEvent);
 
+  // Forward one CLI-side TCP connection to a loopback TCP target in a sandbox.
+  rpc ForwardTcp(stream TcpForwardFrame) returns (stream TcpForwardFrame);
+
   // Create a provider.
   rpc CreateProvider(CreateProviderRequest) returns (ProviderResponse);
 
@@ -127,8 +130,9 @@ service OpenShell {
   //
   // The supervisor opens this stream at startup and keeps it alive for the
   // sandbox lifetime. The gateway uses it to coordinate relay channels for
-  // SSH connect and ExecSandbox. Raw SSH bytes flow over RelayStream calls
-  // (separate HTTP/2 streams on the same connection), not over this stream.
+  // SSH connect, ExecSandbox, and targetable sandbox services. Raw service
+  // bytes flow over RelayStream calls (separate HTTP/2 streams on the same
+  // connection), not over this stream.
   rpc ConnectSupervisor(stream SupervisorMessage) returns (stream GatewayMessage);
 
   // Raw byte relay between supervisor and gateway.
@@ -137,8 +141,8 @@ service OpenShell {
   // on its ConnectSupervisor stream. The first RelayFrame carries a
   // RelayInit with the channel_id to associate the new HTTP/2 stream with
   // the pending relay slot on the gateway. Subsequent frames carry raw bytes in either
-  // direction between the gateway-side waiter (ssh_tunnel / exec handler)
-  // and the supervisor-side local SSH daemon bridge.
+  // direction between the gateway-side waiter (ForwardTcp / exec handler)
+  // and the supervisor-side target bridge.
   //
   // This rides the same TCP+TLS+HTTP/2 connection as ConnectSupervisor —
   // no new TLS handshake, no reverse HTTP CONNECT.
@@ -446,11 +450,6 @@ message CreateSshSessionResponse {
   // Gateway scheme. Must be exactly "http" or "https".
   string gateway_scheme = 5;
 
-  // HTTP path for the CONNECT/upgrade endpoint. Must begin with `/`. RFC
-  // 3986 path charset only ([A-Za-z0-9._~!$&'()*+,;=:@/-] plus %HH).
-  // Must not contain `?`, `#`, whitespace, backtick, or backslash.
-  string connect_path = 6;
-
   // Optional host key fingerprint. If non-empty, [A-Za-z0-9:+/=-] only.
   string host_key_fingerprint = 7;
 
@@ -515,6 +514,30 @@ message ExecSandboxEvent {
     ExecSandboxStdout stdout = 1;
     ExecSandboxStderr stderr = 2;
     ExecSandboxExit exit = 3;
+  }
+}
+
+// Initial frame for one TCP forward stream.
+message TcpForwardInit {
+  // Sandbox id.
+  string sandbox_id = 1;
+  // Optional service identifier for audit/correlation.
+  string service_id = 4;
+  // Target the gateway should request from the supervisor.
+  oneof target {
+    SshRelayTarget ssh = 5;
+    TcpRelayTarget tcp = 6;
+  }
+  // Optional target-specific authorization token. SSH targets use this as the
+  // short-lived SSH session token issued by CreateSshSession.
+  string authorization_token = 7;
+}
+
+// A single frame on the CLI-to-gateway TCP forward stream.
+message TcpForwardFrame {
+  oneof payload {
+    TcpForwardInit init = 1;
+    bytes data = 2;
   }
 }
 
@@ -1030,10 +1053,29 @@ message GatewayHeartbeat {}
 // On receiving this, the supervisor should initiate a RelayStream RPC to
 // the gateway, sending a RelayInit in the first RelayFrame to associate
 // the new HTTP/2 stream with the pending relay slot. The supervisor
-// bridges that stream to the local SSH daemon.
+// bridges that stream to the requested local target.
 message RelayOpen {
   // Gateway-allocated channel identifier (UUID).
   string channel_id = 1;
+  // Target the supervisor should dial inside the sandbox.
+  // If absent, supervisors treat the relay as SSH for compatibility.
+  oneof target {
+    SshRelayTarget ssh = 2;
+    TcpRelayTarget tcp = 3;
+  }
+  // Optional service identifier for audit/correlation.
+  string service_id = 5;
+}
+
+// Built-in SSH relay target.
+message SshRelayTarget {}
+
+// TCP target dialed by the supervisor from inside the sandbox.
+message TcpRelayTarget {
+  // Phase 1 accepts loopback only: 127.0.0.1, ::1, or localhost.
+  string host = 1;
+  // Target port. Must fit in u16 and be non-zero.
+  uint32 port = 2;
 }
 
 // Initial RelayStream frame sent by the supervisor to claim a pending relay.
