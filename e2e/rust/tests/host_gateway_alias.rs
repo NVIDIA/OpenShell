@@ -396,8 +396,12 @@ async fn inference_set_supports_no_verify_for_unreachable_endpoint() {
         verify_err.contains("failed to verify inference endpoint"),
         "expected verification failure output:\n{verify_err}"
     );
+    let normalized_verify_err: String = verify_err
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '│')
+        .collect();
     assert!(
-        verify_err.contains("--no-verify"),
+        normalized_verify_err.contains("--no-verify"),
         "expected retry hint in failure output:\n{verify_err}"
     );
 

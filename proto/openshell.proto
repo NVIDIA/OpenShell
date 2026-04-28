@@ -1136,3 +1136,73 @@ message GetDraftHistoryResponse {
   // Chronological decision history.
   repeated DraftHistoryEntry entries = 1;
 }
+
+// Stored payload for a policy revision row in the generic objects table.
+message PolicyRevisionPayload {
+  // Serialized policy contents.
+  openshell.sandbox.v1.SandboxPolicy policy = 1;
+  // Deterministic hash of the policy payload.
+  string hash = 2;
+  // Load error reported by the sandbox, if any.
+  string load_error = 3;
+  // When the policy version was reported as loaded (ms since epoch). 0 if unset.
+  int64 loaded_at_ms = 4;
+}
+
+// Stored payload for a draft policy chunk row in the generic objects table.
+message DraftChunkPayload {
+  // Proposed network_policies map key.
+  string rule_name = 1;
+  // Proposed network policy rule.
+  openshell.sandbox.v1.NetworkPolicyRule proposed_rule = 2;
+  // Human-readable explanation of why this rule is proposed.
+  string rationale = 3;
+  // Security concerns flagged by analysis (empty if none).
+  string security_notes = 4;
+  // Analysis confidence (0.0-1.0). 0 for mechanistic mode.
+  float confidence = 5;
+  // When the user approved/rejected (ms since epoch). 0 if undecided.
+  int64 decided_at_ms = 6;
+  // Denormalized endpoint host for dedup and display.
+  string host = 7;
+  // Denormalized endpoint port for dedup and display.
+  int32 port = 8;
+  // Binary path that triggered the denial.
+  string binary = 9;
+  // Current draft version for the owning sandbox.
+  int64 draft_version = 10;
+}
+
+// Internal stored policy revision row materialized from the generic objects table.
+message StoredPolicyRevision {
+  string id = 1;
+  string sandbox_id = 2;
+  int64 version = 3;
+  bytes policy_payload = 4;
+  string policy_hash = 5;
+  string status = 6;
+  optional string load_error = 7;
+  int64 created_at_ms = 8;
+  optional int64 loaded_at_ms = 9;
+}
+
+// Internal stored draft chunk row materialized from the generic objects table.
+message StoredDraftChunk {
+  string id = 1;
+  string sandbox_id = 2;
+  int64 draft_version = 3;
+  string status = 4;
+  string rule_name = 5;
+  bytes proposed_rule = 6;
+  string rationale = 7;
+  string security_notes = 8;
+  double confidence = 9;
+  int64 created_at_ms = 10;
+  optional int64 decided_at_ms = 11;
+  string host = 12;
+  int32 port = 13;
+  string binary = 14;
+  int32 hit_count = 15;
+  int64 first_seen_ms = 16;
+  int64 last_seen_ms = 17;
+}

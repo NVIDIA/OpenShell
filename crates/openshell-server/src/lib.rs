@@ -27,6 +27,7 @@ mod http;
 mod inference;
 mod multiplex;
 mod persistence;
+pub(crate) mod policy_store;
 mod sandbox_index;
 mod sandbox_watch;
 mod ssh_tunnel;
