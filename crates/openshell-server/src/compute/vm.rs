@@ -311,9 +311,14 @@ pub async fn spawn(
     if !vm_config.default_image.trim().is_empty() {
         command.arg("--default-image").arg(&vm_config.default_image);
     }
-    command
-        .arg("--ssh-handshake-secret")
-        .arg(&config.ssh_handshake_secret);
+    // Only forward the handshake secret when one is configured. The VM
+    // driver does not consume it, but accepts it for parity with the
+    // Kubernetes/Podman drivers; passing an empty value is noise.
+    if !config.ssh_handshake_secret.is_empty() {
+        command
+            .arg("--ssh-handshake-secret")
+            .arg(&config.ssh_handshake_secret);
+    }
     command
         .arg("--ssh-handshake-skew-secs")
         .arg(config.ssh_handshake_skew_secs.to_string());
