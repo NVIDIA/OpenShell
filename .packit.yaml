@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Packit configuration for OpenShell RPM builds via Fedora COPR.
+# See https://packit.dev/docs/configuration for full reference.
+
+upstream_tag_template: "v{version}"
+upstream_package_name: openshell
+downstream_package_name: openshell
+specfile_path: openshell.spec
+
+# Packages needed in the SRPM build environment to create vendor tarball
+srpm_build_deps:
+  - rust
+  - cargo
+  - git-core
+
+actions:
+  get-current-version:
+    # Derive version from the latest upstream tag on the current branch.
+    - 'bash -c "git describe --tags --match ''v*'' --abbrev=0 HEAD | sed ''s/^v//''"'
+
+  create-archive:
+    # Step 1: Create source tarball from git working tree.
+    # Uses git ls-files + tar instead of git archive so the tarball
+    # reflects any patching that Packit may have done (e.g. version bumps).
+    - 'bash -c "VERSION=${PACKIT_PROJECT_VERSION} && TMPDIR=$(mktemp -d) && DIR=openshell-${VERSION} && mkdir -p ${TMPDIR}/${DIR} && git ls-files -z | xargs -0 tar cf - | tar xf - -C ${TMPDIR}/${DIR}/ && tar -czf openshell-${VERSION}.tar.gz -C ${TMPDIR} ${DIR} && rm -rf ${TMPDIR}"'
+    # Step 2: Create vendored Cargo dependencies tarball for offline RPM build.
+    - 'bash -c "VERSION=${PACKIT_PROJECT_VERSION} && cargo vendor --quiet && tar -cJf openshell-${VERSION}-vendor.tar.xz vendor/ && rm -rf vendor/"'
+    # Step 3: Return BOTH archive names. Packit maps each line to Source0, Source1, etc.
+    - 'bash -c "echo openshell-${PACKIT_PROJECT_VERSION}.tar.gz && echo openshell-${PACKIT_PROJECT_VERSION}-vendor.tar.xz"'
+
+  fix-spec-file:
+    # Update Source0 to the generated tarball name
+    - 'bash -c "sed -i \"s|^Source0:.*|Source0: openshell-${PACKIT_PROJECT_VERSION}.tar.gz|\" openshell.spec"'
+    # Update Source1 to the generated vendor tarball name
+    - 'bash -c "sed -i \"s|^Source1:.*|Source1: openshell-${PACKIT_PROJECT_VERSION}-vendor.tar.xz|\" openshell.spec"'
+    # Update Version
+    - 'bash -c "sed -i -r \"s/^Version:(\\s*)\\S+/Version:\\1${PACKIT_RPMSPEC_VERSION}/\" openshell.spec"'
+    # Update Release
+    - 'bash -c "sed -i -r \"s/^Release:(\\s*)\\S+/Release:\\1${PACKIT_RPMSPEC_RELEASE}%{?dist}/\" openshell.spec"'
+
+jobs:
+  # Build on every pull request targeting main for CI validation
+  - job: copr_build
+    trigger: pull_request
+    branch: main
+    identifier: main-pr
+    targets:
+      - fedora-all
+      - epel-10
+
+  # Build into maxamillion/openshell on every commit to main
+  # for continuous development and testing builds.
+  - job: copr_build
+    trigger: commit
+    branch: main
+    owner: "maxamillion"
+    project: "openshell"
+    identifier: main-commit
+    targets:
+      - fedora-all
+      - epel-10
+    preserve_project: true
+    list_on_homepage: true
+
+  # Build on GitHub releases for publishable RPMs.
+  # See: https://packit.dev/docs/configuration/upstream/copr_build#using-a-custom-copr-project
+  - job: copr_build
+    trigger: release
+    owner: "maxamillion"
+    project: "openshell"
+    targets:
+      - fedora-all
+      - epel-10
+    preserve_project: true
+    list_on_homepage: true
