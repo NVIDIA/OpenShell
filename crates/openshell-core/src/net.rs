@@ -103,12 +103,13 @@ pub fn is_always_blocked_net(net: ipnet::IpNet) -> bool {
             // containment checks below catch broader prefixes that only reach
             // into a blocked range further in — e.g. ::ffff:168.0.0.0/103
             // has a public network address but spans ::ffff:169.254.0.0.
-            if let Some(v4) = network.to_ipv4_mapped() {
-                if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
-                    return true;
-                }
+            if network
+                .to_ipv4_mapped()
+                .is_some_and(|v4| v4.is_loopback() || v4.is_link_local() || v4.is_unspecified())
+            {
+                return true;
             }
-            if v6net.contains(&Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped())
+            if v6net.contains(&Ipv4Addr::LOCALHOST.to_ipv6_mapped())
                 || v6net.contains(&Ipv4Addr::new(169, 254, 0, 0).to_ipv6_mapped())
                 || v6net.contains(&Ipv4Addr::UNSPECIFIED.to_ipv6_mapped())
             {
