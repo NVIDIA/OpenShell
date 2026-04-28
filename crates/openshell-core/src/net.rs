@@ -97,11 +97,22 @@ pub fn is_always_blocked_net(net: ipnet::IpNet) -> bool {
                 return true;
             }
 
-            // Check IPv4-mapped IPv6 (::ffff:127.0.0.1, ::ffff:169.254.x.x, etc.)
+            // Check IPv4-mapped IPv6 addresses. The network-address check covers
+            // ranges whose first address is already in a blocked range
+            // (e.g. ::ffff:127.0.0.1/128, ::ffff:169.254.0.1/128). The
+            // containment checks below catch broader prefixes that only reach
+            // into a blocked range further in — e.g. ::ffff:168.0.0.0/103
+            // has a public network address but spans ::ffff:169.254.0.0.
             if let Some(v4) = network.to_ipv4_mapped() {
                 if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
                     return true;
                 }
+            }
+            if v6net.contains(&Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped())
+                || v6net.contains(&Ipv4Addr::new(169, 254, 0, 0).to_ipv6_mapped())
+                || v6net.contains(&Ipv4Addr::UNSPECIFIED.to_ipv6_mapped())
+            {
+                return true;
             }
 
             false
@@ -330,6 +341,42 @@ mod tests {
     fn test_always_blocked_net_v6_broad_containing_loopback() {
         let net: ipnet::IpNet = "::/0".parse().unwrap();
         assert!(is_always_blocked_net(net));
+    }
+
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_loopback_single() {
+        let net: ipnet::IpNet = "::ffff:127.0.0.1/128".parse().unwrap();
+        assert!(is_always_blocked_net(net));
+    }
+
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_link_local_single() {
+        let net: ipnet::IpNet = "::ffff:169.254.0.1/128".parse().unwrap();
+        assert!(is_always_blocked_net(net));
+    }
+
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_broad_spans_link_local() {
+        // ::ffff:168.0.0.0/103 has a public network address (168.0.0.0) but
+        // the range covers 168.0.0.0–169.255.255.255, which includes the
+        // link-local block 169.254.0.0/16.
+        let net: ipnet::IpNet = "::ffff:168.0.0.0/103".parse().unwrap();
+        assert!(is_always_blocked_net(net));
+    }
+
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_broad_spans_loopback() {
+        // ::ffff:64.0.0.0/98 has a public network address (64.0.0.0) but the
+        // range covers 64.0.0.0–127.255.255.255, which includes loopback.
+        let net: ipnet::IpNet = "::ffff:64.0.0.0/98".parse().unwrap();
+        assert!(is_always_blocked_net(net));
+    }
+
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_allows_public() {
+        // ::ffff:8.8.8.8/128 is a public address — should not be blocked.
+        let net: ipnet::IpNet = "::ffff:8.8.8.8/128".parse().unwrap();
+        assert!(!is_always_blocked_net(net));
     }
 
     // -- is_internal_ip --
