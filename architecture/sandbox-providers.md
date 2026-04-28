@@ -35,8 +35,6 @@ Provider is defined in `proto/datamodel.proto`:
 - `type`: canonical provider slug (`claude`, `gitlab`, `github`, etc.)
 - `credentials`: `map<string, string>` for secret values
 - `config`: `map<string, string>` for non-secret settings
-- `profile_id`: provider type profile used for profile-backed policy composition
-- `profile_policy_enabled`: explicit opt-in for provider-generated policy entries
 
 The gRPC surface is defined in `proto/openshell.proto`:
 
@@ -57,30 +55,28 @@ known network endpoints, expected binaries, category, and whether the provider i
 inference-capable.
 
 Profiles are additive to provider records. A provider record with only `type`,
-`credentials`, and `config` remains a legacy credential-only provider. The gateway
-does not infer provider-managed network policy from `provider.type` alone. A provider
-contributes profile-generated policy only when `profile_policy_enabled` is true and
-`profile_id` names a known profile. Existing stored provider records deserialize with
-`profile_policy_enabled = false`, so OpenShell upgrades do not silently broaden network
-access for existing sandboxes.
+`credentials`, and `config` can be matched to built-in profile metadata by
+`provider.type`. Profile-generated policy is still sandbox-scoped: the gateway composes
+provider profile rules only for sandboxes whose `SandboxSpec.features.provider_profile_policy`
+flag is true.
 
-New providers created by current clients can set `profile_id` to the provider type and
-enable `profile_policy_enabled`. This makes the compatibility boundary explicit while
-keeping the normal CLI experience simple.
+This keeps the compatibility boundary on the sandbox that consumes effective policy,
+rather than on provider records shared by many sandboxes. A provider can be attached to
+both legacy sandboxes and profile-policy sandboxes at the same time.
 
 ### Provider Policy Composition
 
 Sandbox policy fetch uses just-in-time composition:
 
 ```text
-effective policy = base/static policy + enabled provider profile rules + user rules
+effective policy = base/static policy + provider profile rules + user rules
 ```
 
 The composed policy is derived data. The sandbox still receives one normal
 `SandboxPolicy`, but provider-generated entries are not persisted as user-authored
 policy revisions. Full policy replacement and incremental policy updates continue to
 mutate the user-authored policy layer. Provider-generated rules are re-added during
-composition for each attached provider whose profile policy is enabled.
+composition for each attached provider whose type has a built-in profile.
 
 Provider-generated network rules use reserved `_provider_*` names derived from the
 provider record name. If a user policy already has the same key, composition keeps the

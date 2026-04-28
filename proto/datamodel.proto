@@ -34,14 +34,4 @@ message Provider {
   map<string, string> credentials = 3;
   // Non-secret provider configuration.
   map<string, string> config = 4;
-  // Provider type profile used for profile-backed policy composition.
-  //
-  // Empty means the provider is legacy/manual and must not contribute
-  // provider-generated network policy.
-  string profile_id = 5;
-  // Whether this provider contributes its profile's generated policy layer.
-  //
-  // This is explicit for backwards compatibility: existing provider records
-  // deserialize to false and keep the legacy credential-only behavior.
-  bool profile_policy_enabled = 6;
 }

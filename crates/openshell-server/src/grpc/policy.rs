@@ -359,6 +359,7 @@ pub(super) async fn handle_get_sandbox_config(
         .as_ref()
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
+    let provider_profile_policy_enabled = sandbox_uses_provider_profile_policy(&sandbox);
 
     // Try to get the latest policy from the policy history table.
     let latest = state
@@ -456,6 +457,7 @@ pub(super) async fn handle_get_sandbox_config(
     }
 
     if policy_source == PolicySource::Sandbox
+        && provider_profile_policy_enabled
         && let Some(source_policy) = policy.as_ref()
     {
         let provider_layers =
@@ -494,24 +496,12 @@ async fn profile_provider_policy_layers(
             .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
 
-        if !provider.profile_policy_enabled {
-            continue;
-        }
-
-        let profile_id = provider.profile_id.trim();
-        if profile_id.is_empty() {
+        let provider_type = provider.r#type.trim();
+        let Some(profile) = get_default_profile(provider_type) else {
             warn!(
                 provider_name = %name,
-                "provider profile policy enabled without a profile id; skipping provider policy layer"
-            );
-            continue;
-        }
-
-        let Some(profile) = get_default_profile(profile_id) else {
-            warn!(
-                provider_name = %name,
-                profile_id,
-                "provider profile id is unknown; skipping provider policy layer"
+                provider_type,
+                "provider type has no default profile; skipping provider policy layer"
             );
             continue;
         };
@@ -524,6 +514,14 @@ async fn profile_provider_policy_layers(
     }
 
     Ok(layers)
+}
+
+fn sandbox_uses_provider_profile_policy(sandbox: &Sandbox) -> bool {
+    sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.features.as_ref())
+        .is_some_and(|features| features.provider_profile_policy)
 }
 
 pub(super) async fn handle_get_gateway_config(
@@ -2765,7 +2763,7 @@ mod tests {
         assert!(loaded.spec.unwrap().policy.is_none());
     }
 
-    fn test_provider(name: &str, profile_enabled: bool) -> Provider {
+    fn test_provider(name: &str, provider_type: &str) -> Provider {
         Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("provider-{name}"),
@@ -2773,28 +2771,22 @@ mod tests {
                 created_at_ms: 1000000,
                 labels: HashMap::new(),
             }),
-            r#type: "github".to_string(),
+            r#type: provider_type.to_string(),
             credentials: std::iter::once(("GITHUB_TOKEN".to_string(), "ghp-test".to_string()))
                 .collect(),
             config: HashMap::new(),
-            profile_id: if profile_enabled {
-                "github".to_string()
-            } else {
-                String::new()
-            },
-            profile_policy_enabled: profile_enabled,
         }
     }
 
     #[tokio::test]
-    async fn provider_policy_layers_skip_legacy_providers() {
+    async fn provider_policy_layers_skip_unknown_provider_types() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         store
-            .put_message(&test_provider("legacy-github", false))
+            .put_message(&test_provider("custom-provider", "custom"))
             .await
             .unwrap();
 
-        let layers = profile_provider_policy_layers(&store, &["legacy-github".to_string()])
+        let layers = profile_provider_policy_layers(&store, &["custom-provider".to_string()])
             .await
             .unwrap();
 
@@ -2802,10 +2794,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_policy_layers_include_profile_enabled_providers() {
+    async fn provider_policy_layers_include_known_provider_profiles() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         store
-            .put_message(&test_provider("work-github", true))
+            .put_message(&test_provider("work-github", "github"))
             .await
             .unwrap();
 
@@ -2823,6 +2815,31 @@ mod tests {
                 .iter()
                 .any(|endpoint| endpoint.host == "api.github.com")
         );
+    }
+
+    #[test]
+    fn sandbox_provider_profile_policy_requires_feature_flag() {
+        use openshell_core::proto::{SandboxFeatures, SandboxSpec};
+
+        let disabled = Sandbox {
+            spec: Some(SandboxSpec {
+                features: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!sandbox_uses_provider_profile_policy(&disabled));
+
+        let enabled = Sandbox {
+            spec: Some(SandboxSpec {
+                features: Some(SandboxFeatures {
+                    provider_profile_policy: true,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(sandbox_uses_provider_profile_policy(&enabled));
     }
 
     #[tokio::test]

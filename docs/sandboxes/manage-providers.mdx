@@ -54,10 +54,14 @@ openshell provider create --name my-api --type generic --credential API_KEY
 
 This looks up the current value of `$API_KEY` in your shell and stores it.
 
-Providers created by current clients use the default profile for their type when
-one exists. Profile-managed providers add their known network endpoints to the
-sandbox's effective policy when attached at sandbox creation. Providers created
-before profile support remain credential-only until recreated or upgraded.
+Provider profile metadata is available for known provider types. A sandbox uses
+provider profile network policy only when you opt in at sandbox creation:
+
+```shell
+openshell sandbox create --provider my-claude --provider-profile-policy -- claude
+```
+
+Without `--provider-profile-policy`, provider behavior remains credential-only.
 
 ## Manage Providers
 
