@@ -52,8 +52,36 @@ const DRIVER_NAME: &str = "openshell-driver-vm";
 const WATCH_BUFFER: usize = 256;
 const DEFAULT_VCPUS: u8 = 2;
 const DEFAULT_MEM_MIB: u32 = 2048;
+/// gvproxy gateway IP — runs DNS, DHCP, and the gvproxy HTTP API. Does **not**
+/// proxy arbitrary host ports.
 const GVPROXY_GATEWAY_IP: &str = "192.168.127.1";
+/// gvproxy host-loopback IP — gvproxy's TCP/UDP/ICMP forwarder NAT-rewrites
+/// this destination to the host's `127.0.0.1` and dials out from the host
+/// process. This is the only address that transparently reaches host-bound
+/// services without explicit `expose` rules.
+///
+/// See gvisor-tap-vsock `cmd/gvproxy/config.go` (default NAT entry
+/// `HostIP -> 127.0.0.1`) and `pkg/services/forwarder/tcp.go` (NAT lookup
+/// before `net.Dial`).
+///
+/// Code paths route via `GVPROXY_HOST_LOOPBACK_ALIAS` (DNS / /etc/hosts)
+/// instead so logs stay readable; this constant is kept for documentation
+/// and parity with the guest init script.
+#[allow(dead_code)]
+const GVPROXY_HOST_LOOPBACK_IP: &str = "192.168.127.254";
 const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
+/// Hostname gvproxy resolves (via its embedded DNS) to the host-loopback IP.
+///
+/// We rewrite loopback URLs to this hostname rather than the bare IP because:
+///   * the guest init script seeds /etc/hosts with the same mapping, so it
+///     resolves even when gvproxy's DNS is not in resolv.conf;
+///   * keeping a recognisable hostname makes log messages clearer than a bare
+///     192.168.127.254 reference;
+///   * `host.docker.internal` works the same way for Docker-flavoured tooling.
+///
+/// Both names ultimately route through the gvproxy NAT path on
+/// `GVPROXY_HOST_LOOPBACK_IP` — they do **not** go through the gateway IP.
+const GVPROXY_HOST_LOOPBACK_ALIAS: &str = "host.containers.internal";
 const GUEST_SSH_SOCKET_PATH: &str = "/run/openshell/ssh.sock";
 const GUEST_TLS_DIR: &str = "/opt/openshell/tls";
 const GUEST_TLS_CA_PATH: &str = "/opt/openshell/tls/ca.crt";
@@ -1660,6 +1688,25 @@ fn merged_environment(sandbox: &Sandbox) -> HashMap<String, String> {
     environment
 }
 
+/// Rewrites loopback host references in a gateway URL to a hostname the guest
+/// can reach via gvproxy.
+///
+/// The driver receives the gateway endpoint from `--openshell-endpoint`, which
+/// in local/dev/e2e setups is typically `http://127.0.0.1:<port>`. That URL is
+/// useless inside the guest because the guest's loopback interface is its own,
+/// not the host's. Inside the guest we need a name that gvproxy will translate
+/// into the host's loopback address.
+///
+/// We rewrite to `host.containers.internal`, which gvproxy's embedded DNS resolves
+/// to the host-loopback IP `192.168.127.254`. gvproxy installs a default NAT entry
+/// rewriting that destination to the host's `127.0.0.1` and dialing out from the
+/// host process, so any port the host is listening on becomes reachable. The
+/// gateway IP `192.168.127.1` does **not** do this — it only listens on gvproxy's
+/// own service ports (DNS, DHCP, HTTP API). The guest init script also seeds the
+/// hostname in `/etc/hosts` so resolution works even if gvproxy's DNS isn't in
+/// resolv.conf (e.g. when DHCP fails).
+///
+/// Non-loopback URLs are returned unchanged.
 fn guest_visible_openshell_endpoint(endpoint: &str) -> String {
     let Ok(mut url) = Url::parse(endpoint) else {
         return endpoint.to_string();
@@ -1672,7 +1719,7 @@ fn guest_visible_openshell_endpoint(endpoint: &str) -> String {
         None => false,
     };
 
-    if should_rewrite && url.set_host(Some(GVPROXY_GATEWAY_IP)).is_ok() {
+    if should_rewrite && url.set_host(Some(GVPROXY_HOST_LOOPBACK_ALIAS)).is_ok() {
         return url.to_string();
     }
 
@@ -2181,7 +2228,7 @@ mod tests {
         let env = build_guest_environment(&sandbox, &config, None);
         assert!(env.contains(&"HOME=/root".to_string()));
         assert!(env.contains(&format!(
-            "OPENSHELL_ENDPOINT=http://{GVPROXY_GATEWAY_IP}:8080/"
+            "OPENSHELL_ENDPOINT=http://{GVPROXY_HOST_LOOPBACK_ALIAS}:8080/"
         )));
         assert!(env.contains(&"OPENSHELL_SANDBOX_ID=sandbox-123".to_string()));
         assert!(env.contains(&format!(
@@ -2223,18 +2270,18 @@ mod tests {
     }
 
     #[test]
-    fn guest_visible_openshell_endpoint_rewrites_loopback_hosts_to_gvproxy_gateway() {
+    fn guest_visible_openshell_endpoint_rewrites_loopback_hosts_to_gvproxy_host_alias() {
         assert_eq!(
             guest_visible_openshell_endpoint("http://127.0.0.1:8080"),
-            format!("http://{GVPROXY_GATEWAY_IP}:8080/")
+            format!("http://{GVPROXY_HOST_LOOPBACK_ALIAS}:8080/")
         );
         assert_eq!(
             guest_visible_openshell_endpoint("http://localhost:8080"),
-            format!("http://{GVPROXY_GATEWAY_IP}:8080/")
+            format!("http://{GVPROXY_HOST_LOOPBACK_ALIAS}:8080/")
         );
         assert_eq!(
             guest_visible_openshell_endpoint("https://[::1]:8443"),
-            format!("https://{GVPROXY_GATEWAY_IP}:8443/")
+            format!("https://{GVPROXY_HOST_LOOPBACK_ALIAS}:8443/")
         );
     }
 
@@ -2247,8 +2294,10 @@ mod tests {
             format!("http://{OPENSHELL_HOST_GATEWAY_ALIAS}:8080")
         );
         assert_eq!(
-            guest_visible_openshell_endpoint("http://host.containers.internal:8080"),
-            "http://host.containers.internal:8080"
+            guest_visible_openshell_endpoint(&format!(
+                "http://{GVPROXY_HOST_LOOPBACK_ALIAS}:8080"
+            )),
+            format!("http://{GVPROXY_HOST_LOOPBACK_ALIAS}:8080")
         );
         assert_eq!(
             guest_visible_openshell_endpoint(&format!("http://{GVPROXY_GATEWAY_IP}:8080")),
