@@ -8,47 +8,93 @@
 use openshell_core::proto::{
     NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProviderProfile, ProviderProfileCredential,
 };
+use serde::Deserialize;
+use std::collections::HashSet;
+use std::sync::OnceLock;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
+    include_str!("../profiles/anthropic.yaml"),
+    include_str!("../profiles/claude.yaml"),
+    include_str!("../profiles/codex.yaml"),
+    include_str!("../profiles/copilot.yaml"),
+    include_str!("../profiles/generic.yaml"),
+    include_str!("../profiles/github.yaml"),
+    include_str!("../profiles/gitlab.yaml"),
+    include_str!("../profiles/nvidia.yaml"),
+    include_str!("../profiles/openai.yaml"),
+    include_str!("../profiles/opencode.yaml"),
+    include_str!("../profiles/outlook.yaml"),
+];
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProfileError {
+    #[error("failed to parse provider profile YAML: {0}")]
+    Parse(#[from] serde_yml::Error),
+    #[error("provider profile id is required")]
+    MissingId,
+    #[error("duplicate provider profile id: {0}")]
+    DuplicateId(String),
+    #[error("provider profile '{id}' has invalid endpoint '{host}:{port}'")]
+    InvalidEndpoint { id: String, host: String, port: u32 },
+    #[error("provider profile '{id}' has duplicate credential env var '{env_var}'")]
+    DuplicateCredentialEnvVar { id: String, env_var: String },
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CredentialProfile {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub env_vars: &'static [&'static str],
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub env_vars: Vec<String>,
+    #[serde(default)]
     pub required: bool,
-    pub auth_style: &'static str,
-    pub header_name: &'static str,
-    pub query_param: &'static str,
+    #[serde(default)]
+    pub auth_style: String,
+    #[serde(default)]
+    pub header_name: String,
+    #[serde(default)]
+    pub query_param: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct EndpointProfile {
-    pub host: &'static str,
+    pub host: String,
     pub port: u32,
-    pub protocol: &'static str,
-    pub access: &'static str,
-    pub enforcement: &'static str,
+    #[serde(default)]
+    pub protocol: String,
+    #[serde(default)]
+    pub access: String,
+    #[serde(default)]
+    pub enforcement: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ProviderTypeProfile {
-    pub id: &'static str,
-    pub display_name: &'static str,
-    pub description: &'static str,
-    pub category: &'static str,
-    pub credentials: &'static [CredentialProfile],
-    pub endpoints: &'static [EndpointProfile],
-    pub binaries: &'static [&'static str],
+    pub id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub credentials: Vec<CredentialProfile>,
+    #[serde(default)]
+    pub endpoints: Vec<EndpointProfile>,
+    #[serde(default)]
+    pub binaries: Vec<String>,
+    #[serde(default)]
     pub inference_capable: bool,
 }
 
 impl ProviderTypeProfile {
     #[must_use]
-    pub fn credential_env_vars(&self) -> Vec<&'static str> {
+    pub fn credential_env_vars(&self) -> Vec<&str> {
         let mut vars = Vec::new();
-        for credential in self.credentials {
-            for env_var in credential.env_vars {
-                if !vars.contains(env_var) {
-                    vars.push(*env_var);
+        for credential in &self.credentials {
+            for env_var in &credential.env_vars {
+                if !vars.contains(&env_var.as_str()) {
+                    vars.push(env_var.as_str());
                 }
             }
         }
@@ -58,49 +104,29 @@ impl ProviderTypeProfile {
     #[must_use]
     pub fn to_proto(&self) -> ProviderProfile {
         ProviderProfile {
-            id: self.id.to_string(),
-            display_name: self.display_name.to_string(),
-            description: self.description.to_string(),
-            category: self.category.to_string(),
+            id: self.id.clone(),
+            display_name: self.display_name.clone(),
+            description: self.description.clone(),
+            category: self.category.clone(),
             credentials: self
                 .credentials
                 .iter()
                 .map(|credential| ProviderProfileCredential {
-                    name: credential.name.to_string(),
-                    description: credential.description.to_string(),
-                    env_vars: credential
-                        .env_vars
-                        .iter()
-                        .map(|env_var| (*env_var).to_string())
-                        .collect(),
+                    name: credential.name.clone(),
+                    description: credential.description.clone(),
+                    env_vars: credential.env_vars.clone(),
                     required: credential.required,
-                    auth_style: credential.auth_style.to_string(),
-                    header_name: credential.header_name.to_string(),
-                    query_param: credential.query_param.to_string(),
+                    auth_style: credential.auth_style.clone(),
+                    header_name: credential.header_name.clone(),
+                    query_param: credential.query_param.clone(),
                 })
                 .collect(),
-            endpoints: self
-                .endpoints
-                .iter()
-                .map(|endpoint| NetworkEndpoint {
-                    host: endpoint.host.to_string(),
-                    port: endpoint.port,
-                    protocol: endpoint.protocol.to_string(),
-                    tls: String::new(),
-                    enforcement: endpoint.enforcement.to_string(),
-                    access: endpoint.access.to_string(),
-                    rules: Vec::new(),
-                    allowed_ips: Vec::new(),
-                    ports: Vec::new(),
-                    deny_rules: Vec::new(),
-                    allow_encoded_slash: false,
-                })
-                .collect(),
+            endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
             binaries: self
                 .binaries
                 .iter()
                 .map(|path| NetworkBinary {
-                    path: (*path).to_string(),
+                    path: path.clone(),
                     harness: false,
                 })
                 .collect(),
@@ -112,12 +138,12 @@ impl ProviderTypeProfile {
     pub fn network_policy_rule(&self, rule_name: &str) -> NetworkPolicyRule {
         NetworkPolicyRule {
             name: rule_name.to_string(),
-            endpoints: self.to_proto().endpoints,
+            endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
             binaries: self
                 .binaries
                 .iter()
                 .map(|path| NetworkBinary {
-                    path: (*path).to_string(),
+                    path: path.clone(),
                     harness: false,
                 })
                 .collect(),
@@ -125,299 +151,83 @@ impl ProviderTypeProfile {
     }
 }
 
-const CLAUDE_CREDENTIALS: &[CredentialProfile] = &[CredentialProfile {
-    name: "api_key",
-    description: "Anthropic API key used by Claude Code",
-    env_vars: &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
-    required: true,
-    auth_style: "header",
-    header_name: "x-api-key",
-    query_param: "",
-}];
+fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
+    NetworkEndpoint {
+        host: endpoint.host.clone(),
+        port: endpoint.port,
+        protocol: endpoint.protocol.clone(),
+        tls: String::new(),
+        enforcement: endpoint.enforcement.clone(),
+        access: endpoint.access.clone(),
+        rules: Vec::new(),
+        allowed_ips: Vec::new(),
+        ports: Vec::new(),
+        deny_rules: Vec::new(),
+        allow_encoded_slash: false,
+    }
+}
 
-const ANTHROPIC_CREDENTIALS: &[CredentialProfile] = &[CredentialProfile {
-    name: "api_key",
-    description: "Anthropic API key",
-    env_vars: &["ANTHROPIC_API_KEY"],
-    required: true,
-    auth_style: "header",
-    header_name: "x-api-key",
-    query_param: "",
-}];
+pub fn parse_profile_yaml(input: &str) -> Result<ProviderTypeProfile, ProfileError> {
+    Ok(serde_yml::from_str::<ProviderTypeProfile>(input)?)
+}
 
-const OPENAI_CREDENTIALS: &[CredentialProfile] = &[CredentialProfile {
-    name: "api_key",
-    description: "OpenAI API key",
-    env_vars: &["OPENAI_API_KEY"],
-    required: true,
-    auth_style: "bearer",
-    header_name: "authorization",
-    query_param: "",
-}];
+pub fn parse_profile_catalog_yamls(
+    inputs: &[&str],
+) -> Result<Vec<ProviderTypeProfile>, ProfileError> {
+    let mut profiles = inputs
+        .iter()
+        .map(|input| parse_profile_yaml(input))
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_profiles(&profiles)?;
+    profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(profiles)
+}
 
-const OPENCODE_CREDENTIALS: &[CredentialProfile] = &[CredentialProfile {
-    name: "api_key",
-    description: "OpenCode-compatible API key",
-    env_vars: &["OPENCODE_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"],
-    required: true,
-    auth_style: "bearer",
-    header_name: "authorization",
-    query_param: "",
-}];
+fn validate_profiles(profiles: &[ProviderTypeProfile]) -> Result<(), ProfileError> {
+    let mut ids = HashSet::new();
+    for profile in profiles {
+        if profile.id.trim().is_empty() {
+            return Err(ProfileError::MissingId);
+        }
+        if !ids.insert(profile.id.clone()) {
+            return Err(ProfileError::DuplicateId(profile.id.clone()));
+        }
 
-const NVIDIA_CREDENTIALS: &[CredentialProfile] = &[CredentialProfile {
-    name: "api_key",
-    description: "NVIDIA API key",
-    env_vars: &["NVIDIA_API_KEY"],
-    required: true,
-    auth_style: "bearer",
-    header_name: "authorization",
-    query_param: "",
-}];
+        let mut env_vars = HashSet::new();
+        for credential in &profile.credentials {
+            for env_var in &credential.env_vars {
+                if !env_vars.insert(env_var) {
+                    return Err(ProfileError::DuplicateCredentialEnvVar {
+                        id: profile.id.clone(),
+                        env_var: env_var.clone(),
+                    });
+                }
+            }
+        }
 
-const GITHUB_CREDENTIALS: &[CredentialProfile] = &[CredentialProfile {
-    name: "api_token",
-    description: "GitHub token",
-    env_vars: &["GITHUB_TOKEN", "GH_TOKEN"],
-    required: true,
-    auth_style: "bearer",
-    header_name: "authorization",
-    query_param: "",
-}];
+        for endpoint in &profile.endpoints {
+            if endpoint.host.trim().is_empty() || endpoint.port == 0 || endpoint.port > 65_535 {
+                return Err(ProfileError::InvalidEndpoint {
+                    id: profile.id.clone(),
+                    host: endpoint.host.clone(),
+                    port: endpoint.port,
+                });
+            }
+        }
+    }
+    Ok(())
+}
 
-const COPILOT_CREDENTIALS: &[CredentialProfile] = &[CredentialProfile {
-    name: "github_token",
-    description: "GitHub token used by Copilot tooling",
-    env_vars: &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
-    required: true,
-    auth_style: "bearer",
-    header_name: "authorization",
-    query_param: "",
-}];
-
-const GITLAB_CREDENTIALS: &[CredentialProfile] = &[CredentialProfile {
-    name: "api_token",
-    description: "GitLab token",
-    env_vars: &["GITLAB_TOKEN", "GLAB_TOKEN", "CI_JOB_TOKEN"],
-    required: true,
-    auth_style: "bearer",
-    header_name: "authorization",
-    query_param: "",
-}];
-
-const GENERIC_CREDENTIALS: &[CredentialProfile] = &[];
-const OUTLOOK_CREDENTIALS: &[CredentialProfile] = &[];
-
-const CLAUDE_ENDPOINTS: &[EndpointProfile] = &[
-    EndpointProfile {
-        host: "api.anthropic.com",
-        port: 443,
-        protocol: "rest",
-        access: "read-write",
-        enforcement: "enforce",
-    },
-    EndpointProfile {
-        host: "statsig.anthropic.com",
-        port: 443,
-        protocol: "rest",
-        access: "read-write",
-        enforcement: "enforce",
-    },
-    EndpointProfile {
-        host: "sentry.io",
-        port: 443,
-        protocol: "rest",
-        access: "read-write",
-        enforcement: "enforce",
-    },
-];
-
-const ANTHROPIC_ENDPOINTS: &[EndpointProfile] = &[EndpointProfile {
-    host: "api.anthropic.com",
-    port: 443,
-    protocol: "rest",
-    access: "read-write",
-    enforcement: "enforce",
-}];
-
-const OPENAI_ENDPOINTS: &[EndpointProfile] = &[EndpointProfile {
-    host: "api.openai.com",
-    port: 443,
-    protocol: "rest",
-    access: "read-write",
-    enforcement: "enforce",
-}];
-
-const NVIDIA_ENDPOINTS: &[EndpointProfile] = &[EndpointProfile {
-    host: "integrate.api.nvidia.com",
-    port: 443,
-    protocol: "rest",
-    access: "read-write",
-    enforcement: "enforce",
-}];
-
-const GITHUB_ENDPOINTS: &[EndpointProfile] = &[
-    EndpointProfile {
-        host: "api.github.com",
-        port: 443,
-        protocol: "rest",
-        access: "read-write",
-        enforcement: "enforce",
-    },
-    EndpointProfile {
-        host: "github.com",
-        port: 443,
-        protocol: "rest",
-        access: "read-only",
-        enforcement: "enforce",
-    },
-];
-
-const GITLAB_ENDPOINTS: &[EndpointProfile] = &[
-    EndpointProfile {
-        host: "gitlab.com",
-        port: 443,
-        protocol: "rest",
-        access: "read-write",
-        enforcement: "enforce",
-    },
-    EndpointProfile {
-        host: "api.gitlab.com",
-        port: 443,
-        protocol: "rest",
-        access: "read-write",
-        enforcement: "enforce",
-    },
-];
-
-const EMPTY_ENDPOINTS: &[EndpointProfile] = &[];
-
-const DEFAULT_PROFILES: &[ProviderTypeProfile] = &[
-    ProviderTypeProfile {
-        id: "anthropic",
-        display_name: "Anthropic API",
-        description: "Anthropic API access for Claude models",
-        category: "inference",
-        credentials: ANTHROPIC_CREDENTIALS,
-        endpoints: ANTHROPIC_ENDPOINTS,
-        binaries: &["/usr/bin/curl", "/usr/local/bin/curl"],
-        inference_capable: true,
-    },
-    ProviderTypeProfile {
-        id: "claude",
-        display_name: "Claude Code",
-        description: "Claude Code CLI",
-        category: "inference",
-        credentials: CLAUDE_CREDENTIALS,
-        endpoints: CLAUDE_ENDPOINTS,
-        binaries: &["/usr/bin/claude", "/usr/local/bin/claude"],
-        inference_capable: true,
-    },
-    ProviderTypeProfile {
-        id: "codex",
-        display_name: "Codex",
-        description: "Codex CLI using OpenAI-compatible API credentials",
-        category: "inference",
-        credentials: OPENAI_CREDENTIALS,
-        endpoints: OPENAI_ENDPOINTS,
-        binaries: &["/usr/bin/codex", "/usr/local/bin/codex"],
-        inference_capable: true,
-    },
-    ProviderTypeProfile {
-        id: "copilot",
-        display_name: "GitHub Copilot",
-        description: "GitHub Copilot tooling",
-        category: "inference",
-        credentials: COPILOT_CREDENTIALS,
-        endpoints: GITHUB_ENDPOINTS,
-        binaries: &["/usr/bin/copilot", "/usr/local/bin/copilot"],
-        inference_capable: false,
-    },
-    ProviderTypeProfile {
-        id: "generic",
-        display_name: "Generic",
-        description: "Generic provider record without managed policy defaults",
-        category: "custom",
-        credentials: GENERIC_CREDENTIALS,
-        endpoints: EMPTY_ENDPOINTS,
-        binaries: &[],
-        inference_capable: false,
-    },
-    ProviderTypeProfile {
-        id: "github",
-        display_name: "GitHub",
-        description: "GitHub API and Git operations",
-        category: "source-control",
-        credentials: GITHUB_CREDENTIALS,
-        endpoints: GITHUB_ENDPOINTS,
-        binaries: &[
-            "/usr/bin/gh",
-            "/usr/local/bin/gh",
-            "/usr/bin/git",
-            "/usr/local/bin/git",
-        ],
-        inference_capable: false,
-    },
-    ProviderTypeProfile {
-        id: "gitlab",
-        display_name: "GitLab",
-        description: "GitLab API and Git operations",
-        category: "source-control",
-        credentials: GITLAB_CREDENTIALS,
-        endpoints: GITLAB_ENDPOINTS,
-        binaries: &[
-            "/usr/bin/glab",
-            "/usr/local/bin/glab",
-            "/usr/bin/git",
-            "/usr/local/bin/git",
-        ],
-        inference_capable: false,
-    },
-    ProviderTypeProfile {
-        id: "nvidia",
-        display_name: "NVIDIA",
-        description: "NVIDIA inference endpoints",
-        category: "inference",
-        credentials: NVIDIA_CREDENTIALS,
-        endpoints: NVIDIA_ENDPOINTS,
-        binaries: &["/usr/bin/curl", "/usr/local/bin/curl"],
-        inference_capable: true,
-    },
-    ProviderTypeProfile {
-        id: "openai",
-        display_name: "OpenAI",
-        description: "OpenAI API access",
-        category: "inference",
-        credentials: OPENAI_CREDENTIALS,
-        endpoints: OPENAI_ENDPOINTS,
-        binaries: &["/usr/bin/curl", "/usr/local/bin/curl"],
-        inference_capable: true,
-    },
-    ProviderTypeProfile {
-        id: "opencode",
-        display_name: "OpenCode",
-        description: "OpenCode-compatible inference provider",
-        category: "inference",
-        credentials: OPENCODE_CREDENTIALS,
-        endpoints: OPENAI_ENDPOINTS,
-        binaries: &["/usr/bin/opencode", "/usr/local/bin/opencode"],
-        inference_capable: true,
-    },
-    ProviderTypeProfile {
-        id: "outlook",
-        display_name: "Outlook",
-        description: "Outlook provider record without managed policy defaults",
-        category: "messaging",
-        credentials: OUTLOOK_CREDENTIALS,
-        endpoints: EMPTY_ENDPOINTS,
-        binaries: &[],
-        inference_capable: false,
-    },
-];
+static DEFAULT_PROFILES: OnceLock<Vec<ProviderTypeProfile>> = OnceLock::new();
 
 #[must_use]
-pub const fn default_profiles() -> &'static [ProviderTypeProfile] {
+pub fn default_profiles() -> &'static [ProviderTypeProfile] {
     DEFAULT_PROFILES
+        .get_or_init(|| {
+            parse_profile_catalog_yamls(BUILT_IN_PROFILE_YAMLS)
+                .expect("built-in provider profiles must be valid YAML")
+        })
+        .as_slice()
 }
 
 #[must_use]
@@ -429,13 +239,16 @@ pub fn get_default_profile(id: &str) -> Option<&'static ProviderTypeProfile> {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_profiles, get_default_profile};
+    use super::{
+        ProfileError, default_profiles, get_default_profile, parse_profile_catalog_yamls,
+        parse_profile_yaml,
+    };
 
     #[test]
     fn default_profiles_are_sorted_by_id() {
         let ids = default_profiles()
             .iter()
-            .map(|profile| profile.id)
+            .map(|profile| profile.id.as_str())
             .collect::<Vec<_>>();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -460,5 +273,53 @@ mod tests {
             profile.credential_env_vars(),
             vec!["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
         );
+    }
+
+    #[test]
+    fn parse_profile_yaml_reads_single_provider_document() {
+        let profile = parse_profile_yaml(
+            r#"
+id: example
+display_name: Example
+credentials:
+  - name: api_key
+    env_vars: [EXAMPLE_API_KEY]
+"#,
+        )
+        .expect("profile should parse");
+
+        assert_eq!(profile.id, "example");
+        assert_eq!(profile.credential_env_vars(), vec!["EXAMPLE_API_KEY"]);
+    }
+
+    #[test]
+    fn parse_profile_catalog_yamls_rejects_duplicate_ids() {
+        let err = parse_profile_catalog_yamls(&[
+            r#"
+id: duplicate
+display_name: First
+"#,
+            r#"
+id: duplicate
+display_name: Second
+"#,
+        ])
+        .unwrap_err();
+
+        assert!(matches!(err, ProfileError::DuplicateId(id) if id == "duplicate"));
+    }
+
+    #[test]
+    fn parse_profile_catalog_yamls_rejects_invalid_endpoint_ports() {
+        let err = parse_profile_catalog_yamls(&[r#"
+id: bad-endpoint
+display_name: Bad Endpoint
+endpoints:
+  - host: api.example.com
+    port: 0
+"#])
+        .unwrap_err();
+
+        assert!(matches!(err, ProfileError::InvalidEndpoint { id, .. } if id == "bad-endpoint"));
     }
 }

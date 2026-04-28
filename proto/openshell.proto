@@ -212,14 +212,6 @@ message SandboxSpec {
   repeated string providers = 8;
   // Request NVIDIA GPU resources for this sandbox.
   bool gpu = 9;
-  // Optional sandbox behavior flags.
-  SandboxFeatures features = 10;
-}
-
-// Feature flags that opt a sandbox into newer behavior.
-message SandboxFeatures {
-  // Compose provider profile network policy into this sandbox's effective policy.
-  bool provider_profile_policy = 1;
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.

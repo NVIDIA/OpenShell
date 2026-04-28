@@ -329,7 +329,6 @@ pub(super) async fn handle_get_sandbox_config(
         .as_ref()
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
-    let provider_profile_policy_enabled = sandbox_uses_provider_profile_policy(&sandbox);
 
     // Try to get the latest policy from the policy history table.
     let latest = state
@@ -407,6 +406,7 @@ pub(super) async fn handle_get_sandbox_config(
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let sandbox_settings =
         load_sandbox_settings(state.store.as_ref(), sandbox.object_name()).await?;
+    let use_providers_v2 = bool_setting_enabled(&global_settings, settings::USE_PROVIDERS_V2_KEY)?;
 
     let mut global_policy_version: u32 = 0;
 
@@ -426,10 +426,7 @@ pub(super) async fn handle_get_sandbox_config(
         }
     }
 
-    if policy_source == PolicySource::Sandbox
-        && provider_profile_policy_enabled
-        && let Some(source_policy) = policy.as_ref()
-    {
+    if use_providers_v2 && let Some(source_policy) = policy.as_ref() {
         let provider_layers =
             profile_provider_policy_layers(state.store.as_ref(), &sandbox_provider_names).await?;
         if !provider_layers.is_empty() {
@@ -486,12 +483,14 @@ async fn profile_provider_policy_layers(
     Ok(layers)
 }
 
-fn sandbox_uses_provider_profile_policy(sandbox: &Sandbox) -> bool {
-    sandbox
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.features.as_ref())
-        .is_some_and(|features| features.provider_profile_policy)
+fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
+    match settings.settings.get(key) {
+        None => Ok(false),
+        Some(StoredSettingValue::Bool(value)) => Ok(*value),
+        Some(_) => Err(Status::internal(format!(
+            "setting '{key}' has invalid value type; expected bool"
+        ))),
+    }
 }
 
 pub(super) async fn handle_get_gateway_config(
@@ -2741,28 +2740,22 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_provider_profile_policy_requires_feature_flag() {
-        use openshell_core::proto::{SandboxFeatures, SandboxSpec};
+    fn use_providers_v2_defaults_false_when_unset() {
+        assert!(
+            !bool_setting_enabled(&StoredSettings::default(), settings::USE_PROVIDERS_V2_KEY)
+                .unwrap()
+        );
+    }
 
-        let disabled = Sandbox {
-            spec: Some(SandboxSpec {
-                features: None,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(!sandbox_uses_provider_profile_policy(&disabled));
+    #[test]
+    fn use_providers_v2_reads_global_bool_setting() {
+        let mut settings = StoredSettings::default();
+        settings.settings.insert(
+            settings::USE_PROVIDERS_V2_KEY.to_string(),
+            StoredSettingValue::Bool(true),
+        );
 
-        let enabled = Sandbox {
-            spec: Some(SandboxSpec {
-                features: Some(SandboxFeatures {
-                    provider_profile_policy: true,
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(sandbox_uses_provider_profile_policy(&enabled));
+        assert!(bool_setting_enabled(&settings, settings::USE_PROVIDERS_V2_KEY).unwrap());
     }
 
     #[tokio::test]
