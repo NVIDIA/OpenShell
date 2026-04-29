@@ -842,10 +842,7 @@ async fn handle_shell_connect(
     let gateway_port_u16 = session.gateway_port as u16;
     let (gateway_host, gateway_port) =
         resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
-    let gateway_url = format!(
-        "{}://{}:{gateway_port}{}",
-        session.gateway_scheme, gateway_host, session.connect_path
-    );
+    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
 
     // Step 4: Build the ProxyCommand using our own binary.
     let exe = match std::env::current_exe() {
@@ -990,10 +987,7 @@ async fn handle_exec_command(
     let gateway_port_u16 = session.gateway_port as u16;
     let (gateway_host, gateway_port) =
         resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
-    let gateway_url = format!(
-        "{}://{}:{gateway_port}{}",
-        session.gateway_scheme, gateway_host, session.connect_path
-    );
+    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
 
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -1082,7 +1076,8 @@ async fn handle_exec_command(
 
 // SSH utility functions are shared via openshell_core::forward.
 use openshell_core::forward::{
-    build_proxy_command, resolve_ssh_gateway, shell_escape, validate_ssh_session_response,
+    build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
+    validate_ssh_session_response,
 };
 
 /// Convert a `SandboxPolicy` proto into styled ratatui lines for the policy viewer.
@@ -1428,10 +1423,7 @@ async fn start_port_forwards(
     let gateway_port_u16 = session.gateway_port as u16;
     let (gateway_host, gateway_port) =
         resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, endpoint);
-    let gateway_url = format!(
-        "{}://{}:{gateway_port}{}",
-        session.gateway_scheme, gateway_host, session.connect_path
-    );
+    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
 
     // Build ProxyCommand.
     let exe = match std::env::current_exe() {

@@ -180,6 +180,14 @@ openshell forward list
 openshell forward stop 8000 my-sandbox
 ```
 
+Use the gRPC service-forwarding path when you want to test the OS-88 service relay path without SSH port forwarding:
+
+```shell
+openshell service forward my-sandbox --target-port 8000 --local 8000
+```
+
+This binds a local listener and opens one authenticated gRPC stream to the gateway for each accepted local TCP connection. The target must be a loopback TCP service inside the sandbox. Use `--local 127.0.0.1:0` to let OpenShell choose a free local port.
+
 <Tip>
 You can also forward a port at creation time with `--forward`:
 

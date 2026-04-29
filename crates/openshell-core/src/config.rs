@@ -151,10 +151,6 @@ pub struct Config {
     #[serde(default = "default_ssh_gateway_port")]
     pub ssh_gateway_port: u16,
 
-    /// Path for SSH CONNECT/upgrade requests.
-    #[serde(default = "default_ssh_connect_path")]
-    pub ssh_connect_path: String,
-
     /// SSH listen port inside sandbox containers that expose a TCP endpoint.
     #[serde(default = "default_sandbox_ssh_port")]
     pub sandbox_ssh_port: u16,
@@ -240,7 +236,6 @@ impl Config {
             grpc_endpoint: String::new(),
             ssh_gateway_host: default_ssh_gateway_host(),
             ssh_gateway_port: default_ssh_gateway_port(),
-            ssh_connect_path: default_ssh_connect_path(),
             sandbox_ssh_port: default_sandbox_ssh_port(),
             sandbox_ssh_socket_path: default_sandbox_ssh_socket_path(),
             ssh_handshake_secret: String::new(),
@@ -336,13 +331,6 @@ impl Config {
         self
     }
 
-    /// Create a new configuration with the SSH connect path.
-    #[must_use]
-    pub fn with_ssh_connect_path(mut self, path: impl Into<String>) -> Self {
-        self.ssh_connect_path = path.into();
-        self
-    }
-
     /// Create a new configuration with the sandbox SSH port.
     #[must_use]
     pub const fn with_sandbox_ssh_port(mut self, port: u16) -> Self {
@@ -412,10 +400,6 @@ fn default_ssh_gateway_host() -> String {
 
 const fn default_ssh_gateway_port() -> u16 {
     DEFAULT_SERVER_PORT
-}
-
-fn default_ssh_connect_path() -> String {
-    "/connect/ssh".to_string()
 }
 
 fn default_sandbox_ssh_socket_path() -> String {

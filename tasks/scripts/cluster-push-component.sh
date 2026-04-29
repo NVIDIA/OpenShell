@@ -36,27 +36,9 @@ CONTAINER_NAME="openshell-cluster-${CLUSTER_NAME}"
 SOURCE_IMAGE="openshell/${component}:${IMAGE_TAG}"
 TARGET_IMAGE="${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}"
 
-source_candidates=(
-  "openshell/${component}:${IMAGE_TAG}"
-  "localhost:5000/openshell/${component}:${IMAGE_TAG}"
-  "127.0.0.1:5000/openshell/${component}:${IMAGE_TAG}"
-)
+tasks/scripts/docker-build-image.sh "${component}"
 
-resolved_source_image=""
-for candidate in "${source_candidates[@]}"; do
-  if ce image inspect "${candidate}" >/dev/null 2>&1; then
-    resolved_source_image="${candidate}"
-    break
-  fi
-done
-
-if [ -z "${resolved_source_image}" ]; then
-  echo "Local image not found for ${component}:${IMAGE_TAG}, building..."
-  tasks/scripts/docker-build-image.sh "${component}"
-  resolved_source_image="openshell/${component}:${IMAGE_TAG}"
-fi
-
-ce tag "${resolved_source_image}" "${TARGET_IMAGE}"
+ce tag "${SOURCE_IMAGE}" "${TARGET_IMAGE}"
 ce push "${TARGET_IMAGE}"
 
 # Evict the stale image from k3s's containerd cache so new pods pull the

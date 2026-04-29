@@ -234,16 +234,17 @@ The sandbox calls two RPCs over this authenticated channel:
 - `GetSandboxSettings` -- fetches the YAML policy that governs the sandbox's behavior.
 - `GetSandboxProviderEnvironment` -- fetches provider credentials as environment variables.
 
-## SSH Tunnel Authentication
+## SSH Forward Authentication
 
-SSH connections into sandboxes pass through the gateway's HTTP CONNECT tunnel at `/connect/ssh`. This adds a second authentication layer on top of mTLS.
+SSH connections into sandboxes pass through the gateway's bidirectional gRPC `ForwardTcp` stream with `target.ssh`. This adds a second authorization layer on top of gateway mTLS.
 
-### Request Headers
+### Forward Initialization
 
-| Header | Purpose |
+| Field | Purpose |
 |---|---|
-| `x-sandbox-id` | Identifies the target sandbox |
-| `x-sandbox-token` | Session token (created via `CreateSshSession` RPC) |
+| `sandbox_id` | Identifies the target sandbox |
+| `target.ssh` | Requests the built-in SSH Unix-socket target |
+| `authorization_token` | Session token created via `CreateSshSession` |
 
 The gateway validates the token against the stored `SshSession` record and checks:
 
@@ -269,16 +270,16 @@ The gateway enforces two concurrent connection limits to bound the impact of cre
 | Per-token | 10 concurrent tunnels | Limits damage from a single leaked token |
 | Per-sandbox | 20 concurrent tunnels | Prevents bypass via creating many tokens for one sandbox |
 
-These limits are tracked in-memory and decremented when tunnels close. Exceeding either limit returns HTTP 429 (Too Many Requests).
+These limits are tracked in-memory and decremented when streams close. Exceeding either limit returns gRPC `ResourceExhausted`.
 
 ### Supervisor-Initiated Relay Model
 
-The gateway never dials the sandbox. Instead, the sandbox supervisor opens an outbound `ConnectSupervisor` bidirectional gRPC stream to the gateway on startup and keeps it alive for the sandbox lifetime. SSH traffic for `/connect/ssh` (and exec traffic for `ExecSandbox`) rides this same TCP+TLS+HTTP/2 connection as separate multiplexed HTTP/2 streams. The gateway-side registry and `RelayStream` handler live in `crates/openshell-server/src/supervisor_session.rs`; the supervisor-side bridge lives in `crates/openshell-sandbox/src/supervisor_session.rs`.
+The gateway never dials the sandbox. Instead, the sandbox supervisor opens an outbound `ConnectSupervisor` bidirectional gRPC stream to the gateway on startup and keeps it alive for the sandbox lifetime. SSH traffic for `ForwardTcp(target.ssh)` and exec traffic for `ExecSandbox` ride this same TCP+TLS+HTTP/2 connection as separate multiplexed HTTP/2 streams. The gateway-side registry and `RelayStream` handler live in `crates/openshell-server/src/supervisor_session.rs`; the supervisor-side bridge lives in `crates/openshell-sandbox/src/supervisor_session.rs`.
 
 Per-connection flow:
 
-1. CLI presents `x-sandbox-id` + `x-sandbox-token` at `/connect/ssh` and passes gateway token validation.
-2. Gateway calls `SupervisorSessionRegistry::open_relay(sandbox_id, ...)`, which allocates a `channel_id` (UUID) and sends a `RelayOpen` message to the supervisor over the already-established `ConnectSupervisor` stream. If no session is registered yet, it polls with exponential backoff up to a bounded timeout (30 s for `/connect/ssh`, 15 s for `ExecSandbox`).
+1. CLI opens `ForwardTcp` with `TcpForwardInit { sandbox_id, target.ssh, authorization_token }` and passes gateway token validation.
+2. Gateway calls `SupervisorSessionRegistry::open_relay_with_target(sandbox_id, SshRelayTarget, ...)`, which allocates a `channel_id` (UUID) and sends a `RelayOpen` message to the supervisor over the already-established `ConnectSupervisor` stream. If no session is registered yet, it polls with exponential backoff up to a bounded timeout.
 3. The supervisor opens a new `RelayStream` RPC on the same `Channel` — a new HTTP/2 stream, no new TCP connection and no new TLS handshake. The first `RelayFrame` is a `RelayInit { channel_id }` that claims the pending slot on the gateway.
 4. `claim_relay` pairs the gateway-side waiter with the supervisor-side RPC via a `tokio::io::duplex(64 KiB)` pair. Subsequent `RelayFrame::data` frames carry raw SSH bytes in both directions. The supervisor is a dumb byte bridge: it has no protocol awareness of the SSH bytes flowing through.
 5. Inside the sandbox pod, the supervisor connects the relay to sshd over a Unix domain socket at `/run/openshell/ssh.sock` (see `crates/openshell-driver-kubernetes/src/main.rs`).

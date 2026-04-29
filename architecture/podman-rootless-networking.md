@@ -250,9 +250,9 @@ A tmpfs is mounted at `/run/netns` in the container spec (`container.rs:458-463`
 ```
 Client (CLI on user's machine)
   |
-  1. gRPC: CreateSshSession -> gateway (returns token, connect_path)
-  2. HTTP CONNECT /connect/ssh to gateway
-     (headers: x-sandbox-id, x-sandbox-token)
+  1. gRPC: CreateSshSession -> gateway (returns token)
+  2. gRPC: ForwardTcp(target.ssh) to gateway
+     (init: sandbox_id, authorization_token)
   |
 Gateway (host, port 8080)
   |
@@ -364,9 +364,9 @@ Both drivers use the same reverse gRPC relay (`ConnectSupervisor` + `RelayStream
 | `crates/openshell-sandbox/src/sandbox/linux/netns.rs` | Inner network namespace: veth pair, IP addressing, iptables rules |
 | `crates/openshell-sandbox/src/proxy.rs` | HTTP CONNECT proxy: OPA policy, SSRF protection, L7 inspection |
 | `crates/openshell-sandbox/src/ssh.rs` | SSH daemon on Unix socket, shell process netns entry via `setns()` |
-| `crates/openshell-sandbox/src/supervisor_session.rs` | gRPC ConnectSupervisor stream, RelayStream for SSH tunneling |
+| `crates/openshell-sandbox/src/supervisor_session.rs` | gRPC ConnectSupervisor stream, RelayStream for SSH and TCP target bridging |
 | `crates/openshell-sandbox/src/grpc_client.rs` | gRPC channel to gateway (mTLS or plaintext, keep-alive, adaptive windowing) |
-| `crates/openshell-server/src/ssh_tunnel.rs` | Gateway-side SSH tunnel: HTTP CONNECT endpoint, relay bridging |
+| `crates/openshell-server/src/grpc/sandbox.rs` | Gateway-side `ForwardTcp` stream handling for SSH and TCP service forwarding |
 | `crates/openshell-server/src/supervisor_session.rs` | SupervisorSessionRegistry, relay claim/open lifecycle |
 | `crates/openshell-server/src/compute/mod.rs` | `ComputeRuntime::new_podman()` -- Podman compute driver initialization |
 | `crates/openshell-core/src/config.rs` | Default constants: ports, network name |

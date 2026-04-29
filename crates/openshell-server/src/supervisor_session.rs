@@ -13,8 +13,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, Sandbox, SessionAccepted, SupervisorMessage,
-    gateway_message, supervisor_message,
+    GatewayMessage, RelayFrame, RelayInit, RelayOpen, Sandbox, SessionAccepted, SshRelayTarget,
+    SupervisorMessage, gateway_message, relay_open, supervisor_message,
 };
 
 use crate::ServerState;
@@ -58,8 +58,9 @@ struct LiveSession {
     connected_at: Instant,
 }
 
-/// Holds a oneshot sender that will deliver the upgraded relay stream.
-type RelayStreamSender = oneshot::Sender<tokio::io::DuplexStream>;
+/// Holds a oneshot sender that will deliver the upgraded relay stream or a
+/// target-open failure reported by the supervisor.
+type RelayStreamSender = oneshot::Sender<Result<tokio::io::DuplexStream, Status>>;
 
 impl openshell_driver_docker::SupervisorReadiness for SupervisorSessionRegistry {
     fn is_supervisor_connected(&self, sandbox_id: &str) -> bool {
@@ -79,6 +80,7 @@ pub struct SupervisorSessionRegistry {
 struct PendingRelay {
     sender: RelayStreamSender,
     sandbox_id: String,
+    relay_open: RelayOpen,
     created_at: Instant,
 }
 
@@ -234,12 +236,45 @@ impl SupervisorSessionRegistry {
         &self,
         sandbox_id: &str,
         session_wait_timeout: Duration,
-    ) -> Result<(String, oneshot::Receiver<tokio::io::DuplexStream>), Status> {
+    ) -> Result<
+        (
+            String,
+            oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+        ),
+        Status,
+    > {
+        self.open_relay_with_target(
+            sandbox_id,
+            relay_open::Target::Ssh(SshRelayTarget {}),
+            "".to_string(),
+            session_wait_timeout,
+        )
+        .await
+    }
+
+    pub async fn open_relay_with_target(
+        &self,
+        sandbox_id: &str,
+        target: relay_open::Target,
+        service_id: String,
+        session_wait_timeout: Duration,
+    ) -> Result<
+        (
+            String,
+            oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+        ),
+        Status,
+    > {
         let tx = self
             .wait_for_session(sandbox_id, session_wait_timeout)
             .await?;
 
         let channel_id = Uuid::new_v4().to_string();
+        let relay_open = RelayOpen {
+            channel_id: channel_id.clone(),
+            target: Some(target),
+            service_id,
+        };
 
         // Register the pending relay before sending RelayOpen to avoid a race.
         // Both caps are checked and the insert happens under a single lock hold
@@ -267,15 +302,14 @@ impl SupervisorSessionRegistry {
                 PendingRelay {
                     sender: relay_tx,
                     sandbox_id: sandbox_id.to_string(),
+                    relay_open: relay_open.clone(),
                     created_at: Instant::now(),
                 },
             );
         }
 
         let msg = GatewayMessage {
-            payload: Some(gateway_message::Payload::RelayOpen(RelayOpen {
-                channel_id: channel_id.clone(),
-            })),
+            payload: Some(gateway_message::Payload::RelayOpen(relay_open)),
         };
 
         if tx.send(msg).await.is_err() {
@@ -285,6 +319,16 @@ impl SupervisorSessionRegistry {
         }
 
         Ok((channel_id, relay_rx))
+    }
+
+    pub fn fail_pending_relay(&self, channel_id: &str, error: String) -> bool {
+        let pending = self.pending_relays.lock().unwrap().remove(channel_id);
+        if let Some(pending) = pending {
+            let _ = pending.sender.send(Err(Status::unavailable(error)));
+            true
+        } else {
+            false
+        }
     }
 
     /// Claim a pending relay channel. Called by the /relay/{channel_id} HTTP handler
@@ -306,8 +350,8 @@ impl SupervisorSessionRegistry {
         // the supervisor HTTP CONNECT handler.
         let (gateway_stream, supervisor_stream) = tokio::io::duplex(64 * 1024);
 
-        // Send the gateway-side stream to the waiter (ssh_tunnel or exec handler).
-        if pending.sender.send(gateway_stream).is_err() {
+        // Send the gateway-side stream to the waiter (exec handler or forward handler).
+        if pending.sender.send(Ok(gateway_stream)).is_err() {
             return Err(Status::internal("relay requester dropped"));
         }
 
@@ -327,10 +371,17 @@ impl SupervisorSessionRegistry {
 
     pub async fn replay_pending_relays(&self, sandbox_id: &str, tx: &mpsc::Sender<GatewayMessage>) {
         for channel_id in self.pending_channel_ids(sandbox_id) {
+            let relay_open = {
+                let pending = self.pending_relays.lock().unwrap();
+                pending
+                    .get(&channel_id)
+                    .map(|pending| pending.relay_open.clone())
+            };
+            let Some(relay_open) = relay_open else {
+                continue;
+            };
             let msg = GatewayMessage {
-                payload: Some(gateway_message::Payload::RelayOpen(RelayOpen {
-                    channel_id: channel_id.clone(),
-                })),
+                payload: Some(gateway_message::Payload::RelayOpen(relay_open)),
             };
             if tx.send(msg).await.is_err() {
                 warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "supervisor session: failed to replay pending relay to superseding session");
@@ -623,7 +674,7 @@ pub async fn handle_connect_supervisor(
 }
 
 async fn run_session_loop(
-    _state: &Arc<ServerState>,
+    state: &Arc<ServerState>,
     sandbox_id: &str,
     session_id: &str,
     tx: &mpsc::Sender<GatewayMessage>,
@@ -644,7 +695,7 @@ async fn run_session_loop(
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(msg)) => {
-                        handle_supervisor_message(sandbox_id, session_id, msg);
+                        handle_supervisor_message(state, sandbox_id, session_id, msg);
                     }
                     Ok(None) => {
                         info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: stream closed by supervisor");
@@ -671,7 +722,12 @@ async fn run_session_loop(
     }
 }
 
-fn handle_supervisor_message(sandbox_id: &str, session_id: &str, msg: SupervisorMessage) {
+fn handle_supervisor_message(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    session_id: &str,
+    msg: SupervisorMessage,
+) {
     match msg.payload {
         Some(supervisor_message::Payload::Heartbeat(_)) => {
             // Heartbeat received — nothing to do for now.
@@ -685,11 +741,15 @@ fn handle_supervisor_message(sandbox_id: &str, session_id: &str, msg: Supervisor
                     "supervisor session: relay opened successfully"
                 );
             } else {
+                let failed = state
+                    .supervisor_sessions
+                    .fail_pending_relay(&result.channel_id, result.error.clone());
                 warn!(
                     sandbox_id = %sandbox_id,
                     session_id = %session_id,
                     channel_id = %result.channel_id,
                     error = %result.error,
+                    pending_relay_failed = failed,
                     "supervisor session: relay open failed"
                 );
             }
@@ -739,6 +799,23 @@ mod tests {
                 labels: std::collections::HashMap::new(),
             }),
             ..Default::default()
+        }
+    }
+
+    fn pending_relay(
+        sandbox_id: &str,
+        relay_tx: RelayStreamSender,
+        created_at: Instant,
+    ) -> PendingRelay {
+        PendingRelay {
+            sender: relay_tx,
+            sandbox_id: sandbox_id.to_string(),
+            relay_open: RelayOpen {
+                channel_id: "ch-test".to_string(),
+                target: Some(relay_open::Target::Ssh(SshRelayTarget {})),
+                service_id: String::new(),
+            },
+            created_at,
         }
     }
 
@@ -860,6 +937,7 @@ mod tests {
         match msg.payload {
             Some(gateway_message::Payload::RelayOpen(open)) => {
                 assert_eq!(open.channel_id, channel_id);
+                assert!(matches!(open.target, Some(relay_open::Target::Ssh(_))));
             }
             other => panic!("expected RelayOpen, got {other:?}"),
         }
@@ -941,11 +1019,7 @@ mod tests {
                 let sandbox_id = if i % 2 == 0 { "sbx-a" } else { "sbx-b" };
                 pending.insert(
                     format!("channel-{i}"),
-                    PendingRelay {
-                        sender: oneshot_tx,
-                        sandbox_id: sandbox_id.to_string(),
-                        created_at: Instant::now(),
-                    },
+                    pending_relay(sandbox_id, oneshot_tx, Instant::now()),
                 );
             }
         }
@@ -970,11 +1044,7 @@ mod tests {
                 let (oneshot_tx, _) = oneshot::channel();
                 pending.insert(
                     format!("channel-{i}"),
-                    PendingRelay {
-                        sender: oneshot_tx,
-                        sandbox_id: "sbx".to_string(),
-                        created_at: Instant::now(),
-                    },
+                    pending_relay("sbx", oneshot_tx, Instant::now()),
                 );
             }
         }
@@ -1170,16 +1240,36 @@ mod tests {
         let (relay_tx, _relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
             "ch-1".to_string(),
-            PendingRelay {
-                sender: relay_tx,
-                sandbox_id: "sbx-test".to_string(),
-                created_at: Instant::now(),
-            },
+            pending_relay("sbx-test", relay_tx, Instant::now()),
         );
 
         let result = registry.claim_relay("ch-1");
         assert!(result.is_ok());
         assert!(!registry.pending_relays.lock().unwrap().contains_key("ch-1"));
+    }
+
+    #[tokio::test]
+    async fn relay_open_failure_completes_pending_waiter() {
+        let registry = SupervisorSessionRegistry::new();
+        let (relay_tx, relay_rx) = oneshot::channel();
+        registry.pending_relays.lock().unwrap().insert(
+            "ch-fail".to_string(),
+            pending_relay("sbx-test", relay_tx, Instant::now()),
+        );
+
+        assert!(registry.fail_pending_relay("ch-fail", "target refused".to_string()));
+        assert!(
+            !registry
+                .pending_relays
+                .lock()
+                .unwrap()
+                .contains_key("ch-fail")
+        );
+
+        let result = relay_rx.await.expect("failure should wake waiter");
+        let status = result.expect_err("waiter should receive status failure");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "target refused");
     }
 
     #[test]
@@ -1188,11 +1278,11 @@ mod tests {
         let (relay_tx, _relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
             "ch-old".to_string(),
-            PendingRelay {
-                sender: relay_tx,
-                sandbox_id: "sbx-test".to_string(),
-                created_at: Instant::now() - Duration::from_secs(60),
-            },
+            pending_relay(
+                "sbx-test",
+                relay_tx,
+                Instant::now() - Duration::from_secs(60),
+            ),
         );
 
         let err = registry
@@ -1212,15 +1302,11 @@ mod tests {
     #[test]
     fn claim_relay_receiver_dropped_returns_internal() {
         let registry = SupervisorSessionRegistry::new();
-        let (relay_tx, relay_rx) = oneshot::channel::<tokio::io::DuplexStream>();
+        let (relay_tx, relay_rx) = oneshot::channel::<Result<tokio::io::DuplexStream, Status>>();
         drop(relay_rx); // Gateway-side waiter has given up already.
         registry.pending_relays.lock().unwrap().insert(
             "ch-1".to_string(),
-            PendingRelay {
-                sender: relay_tx,
-                sandbox_id: "sbx-test".to_string(),
-                created_at: Instant::now(),
-            },
+            pending_relay("sbx-test", relay_tx, Instant::now()),
         );
 
         let err = registry
@@ -1232,18 +1318,17 @@ mod tests {
     #[tokio::test]
     async fn claim_relay_connects_both_ends() {
         let registry = SupervisorSessionRegistry::new();
-        let (relay_tx, relay_rx) = oneshot::channel::<tokio::io::DuplexStream>();
+        let (relay_tx, relay_rx) = oneshot::channel::<Result<tokio::io::DuplexStream, Status>>();
         registry.pending_relays.lock().unwrap().insert(
             "ch-io".to_string(),
-            PendingRelay {
-                sender: relay_tx,
-                sandbox_id: "sbx-test".to_string(),
-                created_at: Instant::now(),
-            },
+            pending_relay("sbx-test", relay_tx, Instant::now()),
         );
 
         let mut supervisor_side = registry.claim_relay("ch-io").expect("claim should succeed");
-        let mut gateway_side = relay_rx.await.expect("gateway side should receive stream");
+        let mut gateway_side = relay_rx
+            .await
+            .expect("gateway side should receive result")
+            .expect("gateway side should receive stream");
 
         // Supervisor side writes → gateway side reads.
         supervisor_side.write_all(b"hello").await.unwrap();
@@ -1266,11 +1351,11 @@ mod tests {
         let (relay_tx, _relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
             "ch-old".to_string(),
-            PendingRelay {
-                sender: relay_tx,
-                sandbox_id: "sbx-test".to_string(),
-                created_at: Instant::now() - Duration::from_secs(60),
-            },
+            pending_relay(
+                "sbx-test",
+                relay_tx,
+                Instant::now() - Duration::from_secs(60),
+            ),
         );
 
         registry.reap_expired_relays();
@@ -1289,11 +1374,7 @@ mod tests {
         let (relay_tx, _relay_rx) = oneshot::channel();
         registry.pending_relays.lock().unwrap().insert(
             "ch-fresh".to_string(),
-            PendingRelay {
-                sender: relay_tx,
-                sandbox_id: "sbx-test".to_string(),
-                created_at: Instant::now(),
-            },
+            pending_relay("sbx-test", relay_tx, Instant::now()),
         );
 
         registry.reap_expired_relays();

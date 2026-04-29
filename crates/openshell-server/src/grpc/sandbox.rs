@@ -12,15 +12,19 @@
 use crate::ServerState;
 use crate::persistence::{ObjectType, generate_name};
 use futures::future;
+use openshell_core::ObjectId;
 use openshell_core::proto::{
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteSandboxRequest,
     DeleteSandboxResponse, ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest,
     ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest, ListSandboxesRequest,
     ListSandboxesResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
-    SandboxStreamEvent, WatchSandboxRequest,
+    SandboxStreamEvent, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest,
+    relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use prost::Message;
+use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -37,6 +41,8 @@ use super::validation::{
     validate_sandbox_spec,
 };
 use super::{MAX_PAGE_SIZE, clamp_limit, current_time_ms};
+
+const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Sandbox lifecycle handlers
@@ -467,9 +473,8 @@ pub(super) async fn handle_exec_sandbox(
     }
 
     // Open a relay channel through the supervisor session. Use a 15s
-    // session-wait timeout — enough to cover a transient supervisor
-    // reconnect, but shorter than `/connect/ssh` since `ExecSandbox` is
-    // typically called during normal operation (not right after create).
+    // session-wait timeout, enough to cover a transient supervisor reconnect
+    // while still failing quickly during normal operation.
     let (channel_id, relay_rx) = state
         .supervisor_sessions
         .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
@@ -491,7 +496,12 @@ pub(super) async fn handle_exec_sandbox(
         let relay_stream = match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx)
             .await
         {
-            Ok(Ok(stream)) => stream,
+            Ok(Ok(Ok(stream))) => stream,
+            Ok(Ok(Err(status))) => {
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "ExecSandbox: relay target open failed");
+                let _ = tx.send(Err(status)).await;
+                return;
+            }
             Ok(Err(_)) => {
                 warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ExecSandbox: relay channel dropped");
                 let _ = tx
@@ -526,6 +536,329 @@ pub(super) async fn handle_exec_sandbox(
     });
 
     Ok(Response::new(ReceiverStream::new(rx)))
+}
+
+pub(super) async fn handle_forward_tcp(
+    state: &Arc<ServerState>,
+    request: Request<tonic::Streaming<TcpForwardFrame>>,
+) -> Result<
+    Response<
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<TcpForwardFrame, Status>> + Send + 'static>>,
+    >,
+    Status,
+> {
+    let mut inbound = request.into_inner();
+    let first = inbound
+        .message()
+        .await?
+        .ok_or_else(|| Status::invalid_argument("empty ForwardTcp stream"))?;
+    let init = match first.payload {
+        Some(openshell_core::proto::tcp_forward_frame::Payload::Init(init)) => init,
+        _ => {
+            return Err(Status::invalid_argument(
+                "first TcpForwardFrame must be init",
+            ));
+        }
+    };
+
+    let target = validate_tcp_forward_init(&init)?;
+
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&init.sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+    if SandboxPhase::try_from(sandbox.phase).ok() != Some(SandboxPhase::Ready) {
+        return Err(Status::failed_precondition("sandbox is not ready"));
+    }
+
+    let connection_guard = acquire_forward_connection_guard(state, &init, &sandbox).await?;
+    let (channel_id, relay_rx) = state
+        .supervisor_sessions
+        .open_relay_with_target(
+            sandbox.object_id(),
+            target,
+            init.service_id.clone(),
+            std::time::Duration::from_secs(15),
+        )
+        .await
+        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+
+    let sandbox_id = sandbox.object_id().to_string();
+    let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
+    tokio::spawn(async move {
+        let _connection_guard = connection_guard;
+        let relay_stream = match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx)
+            .await
+        {
+            Ok(Ok(Ok(stream))) => stream,
+            Ok(Ok(Err(status))) => {
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "ForwardTcp: relay target open failed");
+                let _ = tx.send(Err(status)).await;
+                return;
+            }
+            Ok(Err(_)) => {
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ForwardTcp: relay channel dropped");
+                let _ = tx
+                    .send(Err(Status::unavailable("relay channel dropped")))
+                    .await;
+                return;
+            }
+            Err(_) => {
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ForwardTcp: relay open timed out");
+                let _ = tx
+                    .send(Err(Status::deadline_exceeded("relay open timed out")))
+                    .await;
+                return;
+            }
+        };
+
+        bridge_forward_tcp_stream(inbound, relay_stream, tx, &sandbox_id, &channel_id).await;
+    });
+
+    let stream: Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<TcpForwardFrame, Status>> + Send + 'static>,
+    > = Box::pin(ReceiverStream::new(rx));
+    Ok(Response::new(stream))
+}
+
+struct ForwardConnectionGuard {
+    state: Arc<ServerState>,
+    token: Option<String>,
+    sandbox_id: String,
+}
+
+impl Drop for ForwardConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.as_deref() {
+            decrement_ssh_connection_count(&self.state.ssh_connections_by_token, token);
+            decrement_ssh_connection_count(
+                &self.state.ssh_connections_by_sandbox,
+                &self.sandbox_id,
+            );
+        }
+    }
+}
+
+async fn acquire_forward_connection_guard(
+    state: &Arc<ServerState>,
+    init: &TcpForwardInit,
+    sandbox: &Sandbox,
+) -> Result<ForwardConnectionGuard, Status> {
+    let sandbox_id = sandbox.object_id().to_string();
+    let token = init.authorization_token.trim();
+    if token.is_empty() {
+        return Err(Status::unauthenticated(
+            "authorization_token is required for ForwardTcp",
+        ));
+    }
+
+    validate_ssh_forward_token(state, token, &sandbox_id).await?;
+    acquire_ssh_connection_slots(
+        &state.ssh_connections_by_token,
+        &state.ssh_connections_by_sandbox,
+        token,
+        &sandbox_id,
+    )?;
+
+    Ok(ForwardConnectionGuard {
+        state: state.clone(),
+        token: Some(token.to_string()),
+        sandbox_id,
+    })
+}
+
+async fn validate_ssh_forward_token(
+    state: &Arc<ServerState>,
+    token: &str,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    let session = state
+        .store
+        .get_message::<SshSession>(token)
+        .await
+        .map_err(|e| Status::internal(format!("fetch SSH session failed: {e}")))?
+        .ok_or_else(|| Status::unauthenticated("SSH session token not found"))?;
+
+    if session.revoked || session.sandbox_id != sandbox_id {
+        return Err(Status::unauthenticated("SSH session token is not valid"));
+    }
+
+    if session.expires_at_ms > 0 {
+        let now_ms = current_time_ms()
+            .map_err(|e| Status::internal(format!("timestamp generation failed: {e}")))?;
+        if now_ms > session.expires_at_ms {
+            return Err(Status::unauthenticated("SSH session token expired"));
+        }
+    }
+
+    Ok(())
+}
+
+fn acquire_ssh_connection_slots(
+    token_counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    sandbox_counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    token: &str,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    const MAX_CONNECTIONS_PER_TOKEN: u32 = 3;
+    const MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
+
+    {
+        let mut counts = token_counts.lock().unwrap();
+        let count = counts.entry(token.to_string()).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_TOKEN {
+            return Err(Status::resource_exhausted(
+                "SSH session connection limit reached",
+            ));
+        }
+        *count += 1;
+    }
+
+    {
+        let mut counts = sandbox_counts.lock().unwrap();
+        let count = counts.entry(sandbox_id.to_string()).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_SANDBOX {
+            decrement_ssh_connection_count(token_counts, token);
+            return Err(Status::resource_exhausted(
+                "sandbox SSH connection limit reached",
+            ));
+        }
+        *count += 1;
+    }
+
+    Ok(())
+}
+
+fn decrement_ssh_connection_count(
+    counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    key: &str,
+) {
+    let mut counts = counts.lock().unwrap();
+    if let Some(count) = counts.get_mut(key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(key);
+        }
+    }
+}
+
+fn validate_tcp_forward_init(init: &TcpForwardInit) -> Result<relay_open::Target, Status> {
+    if init.sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+
+    if let Some(target) = init.target.as_ref() {
+        return match target {
+            tcp_forward_init::Target::Ssh(_) => Ok(relay_open::Target::Ssh(Default::default())),
+            tcp_forward_init::Target::Tcp(target) => Ok(relay_open::Target::Tcp(
+                validate_tcp_forward_target(target)?,
+            )),
+        };
+    }
+
+    Err(Status::invalid_argument("tcp forward target is required"))
+}
+
+fn validate_tcp_forward_target(target: &TcpRelayTarget) -> Result<TcpRelayTarget, Status> {
+    if target.port == 0 || target.port > u32::from(u16::MAX) {
+        return Err(Status::invalid_argument(
+            "tcp target port must be between 1 and 65535",
+        ));
+    }
+
+    validate_tcp_target_parts(target.host.trim(), target.port).map(|host| TcpRelayTarget {
+        host,
+        port: target.port,
+    })
+}
+
+fn validate_tcp_target_parts(host: &str, _port: u32) -> Result<String, Status> {
+    if host.is_empty() {
+        return Err(Status::invalid_argument("tcp target host is required"));
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok("127.0.0.1".to_string());
+    }
+
+    let ip: IpAddr = host
+        .parse()
+        .map_err(|_| Status::invalid_argument("tcp target host must be loopback"))?;
+    if ip.is_loopback() {
+        Ok(ip.to_string())
+    } else {
+        Err(Status::invalid_argument("tcp target host must be loopback"))
+    }
+}
+
+async fn bridge_forward_tcp_stream(
+    mut inbound: tonic::Streaming<TcpForwardFrame>,
+    relay_stream: tokio::io::DuplexStream,
+    tx: mpsc::Sender<Result<TcpForwardFrame, Status>>,
+    sandbox_id: &str,
+    channel_id: &str,
+) {
+    let (mut relay_read, mut relay_write) = tokio::io::split(relay_stream);
+
+    let sandbox_id_in = sandbox_id.to_string();
+    let channel_id_in = channel_id.to_string();
+    tokio::spawn(async move {
+        loop {
+            match inbound.message().await {
+                Ok(Some(frame)) => {
+                    let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) =
+                        frame.payload
+                    else {
+                        warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, "ForwardTcp: received non-data frame after init");
+                        break;
+                    };
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if let Err(err) =
+                        tokio::io::AsyncWriteExt::write_all(&mut relay_write, &data).await
+                    {
+                        warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "ForwardTcp: write to relay failed");
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "ForwardTcp: inbound stream failed");
+                    break;
+                }
+            }
+        }
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut relay_write).await;
+    });
+
+    let mut buf = vec![0u8; TCP_FORWARD_CHUNK_SIZE];
+    loop {
+        match tokio::io::AsyncReadExt::read(&mut relay_read, &mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let frame = TcpForwardFrame {
+                    payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
+                        buf[..n].to_vec(),
+                    )),
+                };
+                if tx.send(Ok(frame)).await.is_err() {
+                    break;
+                }
+            }
+            Err(err) => {
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %err, "ForwardTcp: read from relay failed");
+                let _ = tx
+                    .send(Err(Status::unavailable(format!(
+                        "relay read failed: {err}"
+                    ))))
+                    .await;
+                break;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -595,7 +928,6 @@ pub(super) async fn handle_create_ssh_session(
         gateway_host,
         gateway_port: gateway_port.into(),
         gateway_scheme: scheme.to_string(),
-        connect_path: state.config.ssh_connect_path.clone(),
         host_key_fingerprint: String::new(),
         expires_at_ms,
     }))
@@ -704,8 +1036,7 @@ fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String>
 ///
 /// This is the relay equivalent of `stream_exec_over_ssh`. Instead of dialing a
 /// sandbox endpoint directly, the SSH transport runs over a `DuplexStream` that
-/// is bridged to the supervisor's local SSH daemon via a reverse HTTP CONNECT
-/// tunnel.
+/// is bridged to the supervisor's local SSH daemon via `RelayStream`.
 #[allow(clippy::too_many_arguments)]
 async fn stream_exec_over_relay(
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
@@ -1032,6 +1363,87 @@ mod tests {
             ..Default::default()
         };
         assert!(build_remote_exec_command(&req).is_err());
+    }
+
+    #[test]
+    fn tcp_forward_init_allows_loopback_targets() {
+        for host in ["127.0.0.1", "::1", "localhost"] {
+            let init = TcpForwardInit {
+                sandbox_id: "sbx".to_string(),
+                service_id: String::new(),
+                target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
+                    host: host.to_string(),
+                    port: 8080,
+                })),
+                authorization_token: String::new(),
+            };
+            validate_tcp_forward_init(&init).expect("loopback target should pass");
+        }
+    }
+
+    #[test]
+    fn tcp_forward_init_allows_ssh_target() {
+        let init = TcpForwardInit {
+            sandbox_id: "sbx".to_string(),
+            target: Some(tcp_forward_init::Target::Ssh(Default::default())),
+            ..Default::default()
+        };
+        match validate_tcp_forward_init(&init).expect("ssh target should pass") {
+            relay_open::Target::Ssh(_) => {}
+            other => panic!("expected SSH target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tcp_forward_init_rejects_non_loopback_targets() {
+        let init = TcpForwardInit {
+            sandbox_id: "sbx".to_string(),
+            service_id: String::new(),
+            target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
+                host: "example.com".to_string(),
+                port: 8080,
+            })),
+            authorization_token: String::new(),
+        };
+        assert_eq!(
+            validate_tcp_forward_init(&init)
+                .expect_err("hostname rejected")
+                .message(),
+            "tcp target host must be loopback"
+        );
+    }
+
+    #[test]
+    fn tcp_forward_init_rejects_invalid_port() {
+        let init = TcpForwardInit {
+            sandbox_id: "sbx".to_string(),
+            service_id: String::new(),
+            target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+            })),
+            authorization_token: String::new(),
+        };
+        assert_eq!(
+            validate_tcp_forward_init(&init)
+                .expect_err("zero port rejected")
+                .message(),
+            "tcp target port must be between 1 and 65535"
+        );
+    }
+
+    #[test]
+    fn tcp_forward_init_requires_target() {
+        let init = TcpForwardInit {
+            sandbox_id: "sbx".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_tcp_forward_init(&init)
+                .expect_err("missing target rejected")
+                .message(),
+            "tcp forward target is required"
+        );
     }
 
     // ---- petname / generate_name ----

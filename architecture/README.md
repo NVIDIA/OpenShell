@@ -38,7 +38,7 @@ flowchart TB
     end
 
     CLI -- "gRPC / HTTPS" --> SERVER
-    CLI -- "SSH over HTTP CONNECT" --> SERVER
+    CLI -- "SSH over gRPC ForwardTcp" --> SERVER
     SERVER -- "CRUD + Watch" --> DB
     SERVER -- "Create / Delete Pods" --> SBX
     SUPERVISOR -- "Fetch Policy + Credentials + Inference Bundle" --> SERVER
@@ -129,17 +129,17 @@ The first command installs the CLI. The second command bootstraps the cluster on
 
 For more detail, see [Cluster Bootstrap Architecture](cluster-single-node.md).
 
-### Sandbox Connect (SSH Tunneling)
+### Sandbox Connect (SSH Forwarding)
 
 Users can open interactive terminal sessions into running sandboxes. SSH traffic is tunneled through the gateway rather than exposing sandbox pods directly on the network.
 
 The connection flow works as follows:
 
 1. The CLI requests a session token from the gateway.
-2. The CLI opens an HTTP CONNECT tunnel to the gateway's SSH tunnel endpoint, passing the token and sandbox identifier.
-3. The gateway validates the token, confirms the sandbox is running, resolves the pod's network address, and establishes a TCP connection to the sandbox's embedded SSH server.
-4. A cryptographic handshake (HMAC-verified) confirms the gateway's identity to the sandbox.
-5. The CLI and sandbox exchange SSH traffic bidirectionally through the tunnel.
+2. The CLI opens a bidirectional gRPC `ForwardTcp` stream with `target.ssh`, passing the token and sandbox identifier.
+3. The gateway validates the token, confirms the sandbox is ready, and asks the already-connected supervisor to open an SSH-targeted relay.
+4. The supervisor connects the relay to the sandbox's embedded SSH server over the local Unix socket.
+5. The CLI and sandbox exchange SSH traffic bidirectionally through the gRPC stream and supervisor relay.
 
 This design provides several benefits:
 

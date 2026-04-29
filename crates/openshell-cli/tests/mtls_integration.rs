@@ -346,6 +346,17 @@ impl OpenShell for TestOpenShell {
     ) -> Result<tonic::Response<Self::RelayStreamStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("not implemented in test"))
     }
+
+    type ForwardTcpStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::TcpForwardFrame, tonic::Status>,
+    >;
+
+    async fn forward_tcp(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::TcpForwardFrame>>,
+    ) -> Result<tonic::Response<Self::ForwardTcpStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
 }
 
 fn build_ca() -> (Certificate, KeyPair) {

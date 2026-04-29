@@ -30,7 +30,7 @@ mod persistence;
 pub(crate) mod policy_store;
 mod sandbox_index;
 mod sandbox_watch;
-mod ssh_tunnel;
+mod ssh_sessions;
 pub mod supervisor_session;
 mod tls;
 pub mod tracing_bus;
@@ -190,7 +190,7 @@ pub async fn run_server(
     }
 
     state.compute.spawn_watchers();
-    ssh_tunnel::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
+    ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
 
     // Create the multiplexed service

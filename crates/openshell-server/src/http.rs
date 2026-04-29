@@ -59,7 +59,5 @@ async fn render_metrics(State(handle): State<PrometheusHandle>) -> impl IntoResp
 
 /// Create the HTTP router.
 pub fn http_router(state: Arc<crate::ServerState>) -> Router {
-    crate::ssh_tunnel::router(state.clone())
-        .merge(crate::ws_tunnel::router(state.clone()))
-        .merge(crate::auth::router(state))
+    crate::ws_tunnel::router(state.clone()).merge(crate::auth::router(state))
 }

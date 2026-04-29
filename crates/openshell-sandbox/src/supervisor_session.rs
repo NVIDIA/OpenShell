@@ -4,24 +4,28 @@
 //! Persistent supervisor-to-gateway session.
 //!
 //! Maintains a long-lived `ConnectSupervisor` bidirectional gRPC stream to the
-//! gateway. When the gateway sends `RelayOpen`, the supervisor initiates a
-//! `RelayStream` gRPC call (a new HTTP/2 stream multiplexed over the same
-//! TCP+TLS connection as the control stream) and bridges it to the local SSH
-//! daemon. The supervisor is a dumb byte bridge — it has no protocol awareness
-//! of the SSH or NSSH1 bytes flowing through.
+//! gateway. When the gateway sends `RelayOpen`, the supervisor dials the
+//! requested local target, initiates a `RelayStream` gRPC call (a new HTTP/2
+//! stream multiplexed over the same TCP+TLS connection as the control stream),
+//! and bridges bytes. The supervisor is a dumb byte bridge after target
+//! selection — it has no protocol awareness of the bytes flowing through.
 
+use std::net::IpAddr;
+#[cfg(target_os = "linux")]
+use std::os::fd::RawFd;
 use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, SupervisorHeartbeat, SupervisorHello, SupervisorMessage,
-    gateway_message, supervisor_message,
+    GatewayMessage, RelayFrame, RelayInit, RelayOpen, RelayOpenResult, SupervisorHeartbeat,
+    SupervisorHello, SupervisorMessage, TcpRelayTarget, gateway_message, relay_open,
+    supervisor_message,
 };
 use openshell_ocsf::{
-    ActivityId, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext, SeverityId, StatusId,
-    ocsf_emit,
+    ActivityId, ConnectionInfo, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext,
+    SeverityId, StatusId, ocsf_emit,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
@@ -91,33 +95,103 @@ fn session_failed_event(
         .build()
 }
 
-fn relay_open_event(ctx: &SandboxContext, channel_id: &str) -> OcsfEvent {
-    NetworkActivityBuilder::new(ctx)
+fn relay_target_endpoint(open: &RelayOpen) -> Option<Endpoint> {
+    let relay_open::Target::Tcp(target) = open.target.as_ref()? else {
+        return None;
+    };
+    let host = target.host.trim();
+    let port = u16::try_from(target.port).ok()?;
+    if let Ok(ip) = host.parse() {
+        Some(Endpoint::from_ip(ip, port))
+    } else {
+        Some(Endpoint::from_domain(host, port))
+    }
+}
+
+fn relay_target_kind(open: &RelayOpen) -> &'static str {
+    match open.target.as_ref() {
+        Some(relay_open::Target::Tcp(_)) => "tcp relay",
+        Some(relay_open::Target::Ssh(_)) | None => "ssh relay",
+    }
+}
+
+fn relay_target_message(
+    open: &RelayOpen,
+    state: &str,
+    ssh_socket_path: &std::path::Path,
+) -> String {
+    let target = match open.target.as_ref() {
+        Some(relay_open::Target::Tcp(target)) => {
+            format!("{}:{}", target.host.trim(), target.port)
+        }
+        Some(relay_open::Target::Ssh(_)) | None => {
+            format!("unix:{}", ssh_socket_path.display())
+        }
+    };
+
+    format!(
+        "{} {state} (channel_id={}, target={target})",
+        relay_target_kind(open),
+        open.channel_id
+    )
+}
+
+fn relay_open_event(
+    ctx: &SandboxContext,
+    open: &RelayOpen,
+    ssh_socket_path: &std::path::Path,
+) -> OcsfEvent {
+    let mut builder = NetworkActivityBuilder::new(ctx)
         .activity(ActivityId::Open)
         .severity(SeverityId::Informational)
         .status(StatusId::Success)
-        .message(format!("relay open (channel_id={channel_id})"))
-        .build()
+        .message(relay_target_message(open, "open", ssh_socket_path));
+    if let Some(endpoint) = relay_target_endpoint(open) {
+        builder = builder
+            .dst_endpoint(endpoint)
+            .connection_info(ConnectionInfo::new("tcp"));
+    }
+    builder.build()
 }
 
-fn relay_closed_event(ctx: &SandboxContext, channel_id: &str) -> OcsfEvent {
-    NetworkActivityBuilder::new(ctx)
+fn relay_closed_event(
+    ctx: &SandboxContext,
+    open: &RelayOpen,
+    ssh_socket_path: &std::path::Path,
+) -> OcsfEvent {
+    let mut builder = NetworkActivityBuilder::new(ctx)
         .activity(ActivityId::Close)
         .severity(SeverityId::Informational)
         .status(StatusId::Success)
-        .message(format!("relay closed (channel_id={channel_id})"))
-        .build()
+        .message(relay_target_message(open, "closed", ssh_socket_path));
+    if let Some(endpoint) = relay_target_endpoint(open) {
+        builder = builder
+            .dst_endpoint(endpoint)
+            .connection_info(ConnectionInfo::new("tcp"));
+    }
+    builder.build()
 }
 
-fn relay_failed_event(ctx: &SandboxContext, channel_id: &str, error: &str) -> OcsfEvent {
-    NetworkActivityBuilder::new(ctx)
+fn relay_failed_event(
+    ctx: &SandboxContext,
+    open: &RelayOpen,
+    ssh_socket_path: &std::path::Path,
+    error: &str,
+) -> OcsfEvent {
+    let mut builder = NetworkActivityBuilder::new(ctx)
         .activity(ActivityId::Fail)
         .severity(SeverityId::Low)
         .status(StatusId::Failure)
         .message(format!(
-            "relay bridge failed (channel_id={channel_id}): {error}"
-        ))
-        .build()
+            "{}: {error}",
+            relay_target_message(open, "bridge failed", ssh_socket_path)
+        ));
+    if let Some(endpoint) = relay_target_endpoint(open) {
+        builder = builder
+            .dst_endpoint(endpoint)
+            .connection_info(ConnectionInfo::new("tcp"));
+    }
+    builder.build()
 }
 
 fn relay_close_from_gateway_event(
@@ -139,6 +213,10 @@ fn relay_close_from_gateway_event(
 /// HTTP/2 frame size so each `RelayFrame::data` fits in one frame.
 const RELAY_CHUNK_SIZE: usize = 16 * 1024;
 
+trait TargetStream: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<T> TargetStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
+
 fn map_stream_message<T>(
     message: Result<Option<T>, tonic::Status>,
     eof_error: &'static str,
@@ -158,14 +236,21 @@ pub fn spawn(
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
+    netns_fd: Option<i32>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_session_loop(endpoint, sandbox_id, ssh_socket_path))
+    tokio::spawn(run_session_loop(
+        endpoint,
+        sandbox_id,
+        ssh_socket_path,
+        netns_fd,
+    ))
 }
 
 async fn run_session_loop(
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
+    netns_fd: Option<i32>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
@@ -173,7 +258,7 @@ async fn run_session_loop(
     loop {
         attempt += 1;
 
-        match run_single_session(&endpoint, &sandbox_id, &ssh_socket_path).await {
+        match run_single_session(&endpoint, &sandbox_id, &ssh_socket_path, netns_fd).await {
             Ok(()) => {
                 let event = session_closed_event(crate::ocsf_ctx(), &endpoint, &sandbox_id);
                 ocsf_emit!(event);
@@ -194,6 +279,7 @@ async fn run_single_session(
     endpoint: &str,
     sandbox_id: &str,
     ssh_socket_path: &std::path::Path,
+    netns_fd: Option<i32>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -262,7 +348,9 @@ async fn run_single_session(
                     &msg,
                     sandbox_id,
                     ssh_socket_path,
+                    netns_fd,
                     &channel,
+                    &tx,
                 );
             }
             _ = heartbeat_interval.tick() => {
@@ -283,7 +371,9 @@ fn handle_gateway_message(
     msg: &GatewayMessage,
     sandbox_id: &str,
     ssh_socket_path: &std::path::Path,
+    netns_fd: Option<i32>,
     channel: &Channel,
+    tx: &mpsc::Sender<SupervisorMessage>,
 ) {
     match &msg.payload {
         Some(gateway_message::Payload::Heartbeat(_)) => {
@@ -291,22 +381,30 @@ fn handle_gateway_message(
         }
         Some(gateway_message::Payload::RelayOpen(open)) => {
             let channel_id = open.channel_id.clone();
+            let relay_open = open.clone();
             let sandbox_id = sandbox_id.to_string();
             let channel = channel.clone();
             let ssh_socket_path = ssh_socket_path.to_path_buf();
+            let tx = tx.clone();
 
-            let event = relay_open_event(crate::ocsf_ctx(), &channel_id);
+            let event = relay_open_event(crate::ocsf_ctx(), &relay_open, &ssh_socket_path);
             ocsf_emit!(event);
 
             tokio::spawn(async move {
-                match handle_relay_open(&channel_id, &ssh_socket_path, channel).await {
+                let event_open = relay_open.clone();
+                match handle_relay_open(relay_open, &ssh_socket_path, netns_fd, channel, tx).await {
                     Ok(()) => {
-                        let event = relay_closed_event(crate::ocsf_ctx(), &channel_id);
+                        let event =
+                            relay_closed_event(crate::ocsf_ctx(), &event_open, &ssh_socket_path);
                         ocsf_emit!(event);
                     }
                     Err(e) => {
-                        let event =
-                            relay_failed_event(crate::ocsf_ctx(), &channel_id, &e.to_string());
+                        let event = relay_failed_event(
+                            crate::ocsf_ctx(),
+                            &event_open,
+                            &ssh_socket_path,
+                            &e.to_string(),
+                        );
                         ocsf_emit!(event);
                         warn!(
                             sandbox_id = %sandbox_id,
@@ -336,10 +434,23 @@ fn handle_gateway_message(
 /// TLS handshake. The first `RelayFrame` we send is a `RelayInit`; subsequent
 /// frames carry raw SSH bytes in `data`.
 async fn handle_relay_open(
-    channel_id: &str,
+    relay_open: RelayOpen,
     ssh_socket_path: &std::path::Path,
+    netns_fd: Option<i32>,
     channel: Channel,
+    tx: mpsc::Sender<SupervisorMessage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let channel_id = relay_open.channel_id.clone();
+    let target = match open_target(&relay_open, ssh_socket_path, netns_fd).await {
+        Ok(target) => target,
+        Err(err) => {
+            send_relay_open_result(&tx, &channel_id, false, err.to_string()).await;
+            return Err(err);
+        }
+    };
+
+    send_relay_open_result(&tx, &channel_id, true, String::new()).await;
+
     let mut client = OpenShellClient::new(channel);
 
     // Outbound chunks to the gateway.
@@ -351,7 +462,7 @@ async fn handle_relay_open(
         .send(RelayFrame {
             payload: Some(openshell_core::proto::relay_frame::Payload::Init(
                 RelayInit {
-                    channel_id: channel_id.to_string(),
+                    channel_id: channel_id.clone(),
                 },
             )),
         })
@@ -366,21 +477,19 @@ async fn handle_relay_open(
     let mut inbound = response.into_inner();
 
     // Connect to the local SSH daemon on its Unix socket.
-    let ssh = tokio::net::UnixStream::connect(ssh_socket_path).await?;
-    let (mut ssh_r, mut ssh_w) = ssh.into_split();
+    let (mut target_r, mut target_w) = tokio::io::split(target);
 
     debug!(
         channel_id = %channel_id,
-        socket = %ssh_socket_path.display(),
-        "relay bridge: connected to local SSH daemon"
+        "relay bridge: connected to local target"
     );
 
-    // SSH → gRPC (out_tx): read local SSH, forward as `RelayFrame::data`.
+    // Target → gRPC (out_tx): read local target, forward as `RelayFrame::data`.
     let out_tx_writer = out_tx.clone();
-    let ssh_to_grpc = tokio::spawn(async move {
+    let target_to_grpc = tokio::spawn(async move {
         let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
         loop {
-            match ssh_r.read(&mut buf).await {
+            match target_r.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let chunk = RelayFrame {
@@ -396,7 +505,7 @@ async fn handle_relay_open(
         }
     });
 
-    // gRPC (inbound) → SSH: drain inbound chunks into the local SSH socket.
+    // gRPC (inbound) → target: drain inbound chunks into the local target socket.
     let mut inbound_err: Option<String> = None;
     while let Some(next) = inbound.next().await {
         match next {
@@ -409,8 +518,8 @@ async fn handle_relay_open(
                 if data.is_empty() {
                     continue;
                 }
-                if let Err(e) = ssh_w.write_all(&data).await {
-                    inbound_err = Some(format!("write to ssh failed: {e}"));
+                if let Err(e) = target_w.write_all(&data).await {
+                    inbound_err = Some(format!("write to target failed: {e}"));
                     break;
                 }
             }
@@ -421,18 +530,177 @@ async fn handle_relay_open(
         }
     }
 
-    // Half-close the SSH socket's write side so the daemon sees EOF.
-    let _ = ssh_w.shutdown().await;
+    // Half-close the target socket's write side so the service sees EOF.
+    let _ = target_w.shutdown().await;
 
     // Dropping out_tx closes the outbound gRPC stream, letting the gateway
     // observe EOF on its side too.
     drop(out_tx);
-    let _ = ssh_to_grpc.await;
+    let _ = target_to_grpc.await;
 
     if let Some(e) = inbound_err {
         return Err(e.into());
     }
     Ok(())
+}
+
+async fn send_relay_open_result(
+    tx: &mpsc::Sender<SupervisorMessage>,
+    channel_id: &str,
+    success: bool,
+    error: String,
+) {
+    let _ = tx
+        .send(SupervisorMessage {
+            payload: Some(supervisor_message::Payload::RelayOpenResult(
+                RelayOpenResult {
+                    channel_id: channel_id.to_string(),
+                    success,
+                    error,
+                },
+            )),
+        })
+        .await;
+}
+
+async fn open_target(
+    relay_open: &RelayOpen,
+    ssh_socket_path: &std::path::Path,
+    netns_fd: Option<i32>,
+) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
+    match relay_open.target.as_ref() {
+        Some(relay_open::Target::Tcp(target)) => open_tcp_target(target, netns_fd).await,
+        Some(relay_open::Target::Ssh(_)) | None => {
+            let stream = tokio::net::UnixStream::connect(ssh_socket_path).await?;
+            Ok(Box::new(stream))
+        }
+    }
+}
+
+async fn open_tcp_target(
+    target: &TcpRelayTarget,
+    netns_fd: Option<i32>,
+) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
+    let host = normalize_tcp_target_host(target)?;
+    let port = u16::try_from(target.port).map_err(|_| "tcp target port must fit in u16")?;
+    let stream = connect_tcp_target(host, port, netns_fd).await?;
+    Ok(Box::new(stream))
+}
+
+#[cfg(target_os = "linux")]
+async fn connect_tcp_target(
+    host: String,
+    port: u16,
+    netns_fd: Option<RawFd>,
+) -> Result<tokio::net::TcpStream, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(fd) = netns_fd {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> std::io::Result<std::net::TcpStream> {
+                #[allow(unsafe_code)]
+                let rc = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                std::net::TcpStream::connect((host.as_str(), port))
+            })();
+            let _ = tx.send(result);
+        });
+
+        let stream = rx
+            .await
+            .map_err(|_| "netns tcp connect thread panicked")??;
+        stream.set_nonblocking(true)?;
+        return Ok(tokio::net::TcpStream::from_std(stream)?);
+    }
+
+    Ok(tokio::net::TcpStream::connect((host.as_str(), port)).await?)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn connect_tcp_target(
+    host: String,
+    port: u16,
+    _netns_fd: Option<i32>,
+) -> Result<tokio::net::TcpStream, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(tokio::net::TcpStream::connect((host.as_str(), port)).await?)
+}
+
+#[cfg(test)]
+fn validate_tcp_target(target: &TcpRelayTarget) -> Result<(), String> {
+    normalize_tcp_target_host(target).map(|_| ())
+}
+
+fn normalize_tcp_target_host(target: &TcpRelayTarget) -> Result<String, String> {
+    if target.port == 0 || target.port > u32::from(u16::MAX) {
+        return Err("tcp target port must be between 1 and 65535".to_string());
+    }
+
+    let host = target.host.trim();
+    if host.is_empty() {
+        return Err("tcp target host is required".to_string());
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok("127.0.0.1".to_string());
+    }
+
+    let ip: IpAddr = host
+        .parse()
+        .map_err(|_| "tcp target host must be loopback".to_string())?;
+    if ip.is_loopback() {
+        Ok(ip.to_string())
+    } else {
+        Err("tcp target host must be loopback".to_string())
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    fn tcp(host: &str, port: u32) -> TcpRelayTarget {
+        TcpRelayTarget {
+            host: host.to_string(),
+            port,
+        }
+    }
+
+    #[test]
+    fn tcp_target_allows_loopback_hosts() {
+        validate_tcp_target(&tcp("127.0.0.1", 8080)).expect("ipv4 loopback");
+        validate_tcp_target(&tcp("::1", 8080)).expect("ipv6 loopback");
+        validate_tcp_target(&tcp("localhost", 8080)).expect("localhost");
+    }
+
+    #[test]
+    fn tcp_target_normalizes_localhost_before_dialing() {
+        assert_eq!(
+            normalize_tcp_target_host(&tcp("localhost", 8080)).expect("localhost"),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            normalize_tcp_target_host(&tcp("LOCALHOST", 8080)).expect("localhost"),
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn tcp_target_rejects_non_loopback_hosts() {
+        let err = validate_tcp_target(&tcp("10.0.0.1", 8080)).expect_err("private ip rejected");
+        assert_eq!(err, "tcp target host must be loopback");
+
+        let err = validate_tcp_target(&tcp("example.com", 8080)).expect_err("hostname rejected");
+        assert_eq!(err, "tcp target host must be loopback");
+    }
+
+    #[test]
+    fn tcp_target_rejects_invalid_ports() {
+        let err = validate_tcp_target(&tcp("127.0.0.1", 0)).expect_err("zero rejected");
+        assert_eq!(err, "tcp target port must be between 1 and 65535");
+
+        let err = validate_tcp_target(&tcp("127.0.0.1", 70000)).expect_err("too large rejected");
+        assert_eq!(err, "tcp target port must be between 1 and 65535");
+    }
 }
 
 #[cfg(test)]
@@ -479,6 +747,29 @@ mod ocsf_event_tests {
         }
     }
 
+    fn ssh_relay_open(channel_id: &str) -> RelayOpen {
+        RelayOpen {
+            channel_id: channel_id.to_string(),
+            target: Some(relay_open::Target::Ssh(Default::default())),
+            service_id: String::new(),
+        }
+    }
+
+    fn tcp_relay_open(channel_id: &str, host: &str, port: u32) -> RelayOpen {
+        RelayOpen {
+            channel_id: channel_id.to_string(),
+            target: Some(relay_open::Target::Tcp(TcpRelayTarget {
+                host: host.to_string(),
+                port,
+            })),
+            service_id: String::new(),
+        }
+    }
+
+    fn ssh_socket_path() -> &'static std::path::Path {
+        std::path::Path::new("/run/openshell/ssh.sock")
+    }
+
     #[test]
     fn session_established_emits_network_open_success() {
         let event = session_established_event(&ctx(), "https://gw:443", "sess-1", 30);
@@ -518,22 +809,43 @@ mod ocsf_event_tests {
 
     #[test]
     fn relay_open_emits_network_open_success() {
-        let event = relay_open_event(&ctx(), "ch-42");
+        let event = relay_open_event(&ctx(), &ssh_relay_open("ch-42"), ssh_socket_path());
         let na = network_activity(&event);
         assert_eq!(na.base.activity_id, ActivityId::Open.as_u8());
         assert_eq!(na.base.severity, SeverityId::Informational);
+        let msg = na.base.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("ch-42"), "message: {msg}");
         assert!(
-            na.base
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("ch-42")
+            msg.contains("target=unix:/run/openshell/ssh.sock"),
+            "message: {msg}"
+        );
+    }
+
+    #[test]
+    fn tcp_relay_open_emits_target_endpoint() {
+        let event = relay_open_event(
+            &ctx(),
+            &tcp_relay_open("ch-42", "127.0.0.1", 8765),
+            ssh_socket_path(),
+        );
+        let na = network_activity(&event);
+        assert_eq!(na.base.activity_id, ActivityId::Open.as_u8());
+        assert_eq!(
+            na.dst_endpoint.as_ref().and_then(|e| e.ip.as_deref()),
+            Some("127.0.0.1")
+        );
+        assert_eq!(na.dst_endpoint.as_ref().and_then(|e| e.port), Some(8765));
+        assert_eq!(
+            na.connection_info
+                .as_ref()
+                .map(|c| c.protocol_name.as_str()),
+            Some("tcp")
         );
     }
 
     #[test]
     fn relay_closed_emits_network_close_success() {
-        let event = relay_closed_event(&ctx(), "ch-42");
+        let event = relay_closed_event(&ctx(), &ssh_relay_open("ch-42"), ssh_socket_path());
         let na = network_activity(&event);
         assert_eq!(na.base.activity_id, ActivityId::Close.as_u8());
         assert_eq!(na.base.status, Some(StatusId::Success));
@@ -541,7 +853,12 @@ mod ocsf_event_tests {
 
     #[test]
     fn relay_failed_emits_network_fail_low() {
-        let event = relay_failed_event(&ctx(), "ch-42", "write to ssh failed");
+        let event = relay_failed_event(
+            &ctx(),
+            &ssh_relay_open("ch-42"),
+            ssh_socket_path(),
+            "write to ssh failed",
+        );
         let na = network_activity(&event);
         assert_eq!(na.base.activity_id, ActivityId::Fail.as_u8());
         assert_eq!(na.base.severity, SeverityId::Low);

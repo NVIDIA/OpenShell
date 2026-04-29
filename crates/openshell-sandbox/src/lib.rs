@@ -685,7 +685,7 @@ pub async fn run_sandbox(
         sandbox_id.as_ref(),
         ssh_socket_path.as_ref(),
     ) {
-        supervisor_session::spawn(endpoint.clone(), id.clone(), socket.clone());
+        supervisor_session::spawn(endpoint.clone(), id.clone(), socket.clone(), ssh_netns_fd);
         info!("supervisor session task spawned");
     }
 

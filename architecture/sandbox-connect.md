@@ -8,27 +8,46 @@ Sandbox connect provides secure remote access into running sandbox environments.
 2. **Command execution** (`sandbox create -- <cmd>`) -- runs a command over SSH with stdout/stderr piped back
 3. **File sync** (`sandbox create --upload`) -- uploads local files into the sandbox before command execution
 
-Gateway connectivity is **supervisor-initiated**: the gateway never dials the sandbox pod. On startup, each sandbox's supervisor opens a long-lived bidirectional gRPC stream (`ConnectSupervisor`) to the gateway and holds it for the sandbox's lifetime. **`CreateSshSession` → HTTP CONNECT and `ExecSandbox` both depend on that registration**: `open_relay` blocks until a live `ConnectSupervisor` entry exists for the `sandbox_id`; if the supervisor never registers (wrong endpoint, bad env, crash loop), the client hits the supervisor-session wait timeout instead of getting a relay. When a client asks the gateway for SSH, the gateway sends a `RelayOpen` message over that stream; the supervisor responds by initiating a `RelayStream` gRPC call that rides the same TCP+TLS+HTTP/2 connection as a new multiplexed stream. The supervisor bridges the bytes of that stream into a root-owned Unix socket where the embedded SSH daemon listens. **The in-container sshd is reached only on that local Unix socket** — the supervisor `UnixStream::connect`s to it. Do not assume the relay path terminates at a container-exposed TCP listener for sshd; any optional TCP surface is separate from the gateway relay bridge.
+Gateway connectivity is **supervisor-initiated**: the gateway never dials the sandbox pod. On startup, each sandbox's supervisor opens a long-lived bidirectional gRPC stream (`ConnectSupervisor`) to the gateway and holds it for the sandbox's lifetime. **`CreateSshSession`, `ForwardTcp`, and `ExecSandbox` all depend on that registration**: `open_relay` blocks until a live `ConnectSupervisor` entry exists for the `sandbox_id`; if the supervisor never registers (wrong endpoint, bad env, crash loop), the client hits the supervisor-session wait timeout instead of getting a relay. When a client asks the gateway for SSH, the OpenSSH `ProxyCommand` runs `openshell ssh-proxy`, which opens a bidirectional gRPC `ForwardTcp` stream to the gateway. Its first frame is `TcpForwardInit { target.ssh, authorization_token }`, where the token comes from `CreateSshSession`. The gateway validates the token, then sends a `RelayOpen` message over `ConnectSupervisor` with an explicit `SshRelayTarget`; older targetless messages remain SSH-compatible. The supervisor validates and dials the requested target before reporting a successful `RelayOpenResult`, then initiates a `RelayStream` gRPC call that rides the same TCP+TLS+HTTP/2 connection as a new multiplexed stream. For SSH targets, the supervisor bridges the bytes of that stream into a root-owned Unix socket where the embedded SSH daemon listens. **The in-container sshd is reached only on that local Unix socket** — the supervisor `UnixStream::connect`s to it. Do not assume the relay path terminates at a container-exposed TCP listener for sshd; any optional TCP surface is separate from the gateway relay bridge.
 
 There is also a gateway-side `ExecSandbox` gRPC RPC that executes commands inside sandboxes without requiring an external SSH client. It uses the same relay mechanism.
 
+The OS-88 forwarding path also carries arbitrary TCP services: `openshell service forward <sandbox> --target-port <port>` binds a local TCP listener, opens one `ForwardTcp` bidirectional gRPC stream per accepted local connection, and sends `TcpForwardInit { target.tcp, authorization_token }` with a `TcpRelayTarget` for the requested loopback port inside the sandbox. This avoids the SSH `direct-tcpip` transport and keeps gateway auth, typed routing, session-token authorization, and relay target validation in the OpenShell protocol.
+
 ### Podman and relay environment
 
-The **Podman** compute driver (`crates/openshell-driver-podman/src/container.rs`, `build_env` / `build_container_spec`) must inject the same **relay-critical** environment variables into the container as the Kubernetes driver: `OPENSHELL_ENDPOINT` (gateway gRPC), `OPENSHELL_SANDBOX_ID`, and `OPENSHELL_SSH_SOCKET_PATH` (Unix path the embedded sshd binds and the supervisor dials). Without `OPENSHELL_SSH_SOCKET_PATH`, the in-container `openshell-sandbox` process does not know where to create the socket; without `OPENSHELL_ENDPOINT` / `OPENSHELL_SANDBOX_ID`, the supervisor cannot complete `ConnectSupervisor`, so the gateway never has a session to target with `RelayOpen`. Driver-owned keys overwrite user spec/template env so these cannot be overridden. **Podman container readiness** (libpod `HealthConfig` in `build_container_spec`) treats the sandbox as ready when a sentinel file exists, **or** `test -S` passes on the configured `sandbox_ssh_socket_path` (**supervisor / Unix-socket path**), **or** a legacy TCP listen check on the published SSH port — so the `Ready` phase used by `CreateSshSession` and the SSH tunnel can reflect Unix-socket–based startup, not only a TCP listener.
+The **Podman** compute driver (`crates/openshell-driver-podman/src/container.rs`, `build_env` / `build_container_spec`) must inject the same **relay-critical** environment variables into the container as the Kubernetes driver: `OPENSHELL_ENDPOINT` (gateway gRPC), `OPENSHELL_SANDBOX_ID`, and `OPENSHELL_SSH_SOCKET_PATH` (Unix path the embedded sshd binds and the supervisor dials). Without `OPENSHELL_SSH_SOCKET_PATH`, the in-container `openshell-sandbox` process does not know where to create the socket; without `OPENSHELL_ENDPOINT` / `OPENSHELL_SANDBOX_ID`, the supervisor cannot complete `ConnectSupervisor`, so the gateway never has a session to target with `RelayOpen`. Driver-owned keys overwrite user spec/template env so these cannot be overridden. **Podman container readiness** (libpod `HealthConfig` in `build_container_spec`) treats the sandbox as ready when a sentinel file exists, **or** `test -S` passes on the configured `sandbox_ssh_socket_path` (**supervisor / Unix-socket path**), **or** a legacy TCP listen check on the published SSH port — so the `Ready` phase used by `CreateSshSession` and `ForwardTcp` can reflect Unix-socket–based startup, not only a TCP listener.
 
 ## Two-Plane Architecture
 
 The supervisor and gateway maintain two logical planes over **one TCP+TLS connection**, multiplexed by HTTP/2 streams:
 
-- **Control plane** -- the `ConnectSupervisor` bidirectional gRPC stream. Carries `SupervisorHello`, heartbeats, `RelayOpen`/`RelayClose` requests from the gateway, and `RelayOpenResult`/`RelayClose` replies from the supervisor. Lives for the lifetime of the sandbox supervisor process.
-- **Data plane** -- one `RelayStream` bidirectional gRPC call per SSH connect or exec invocation. Each call is a new HTTP/2 stream on the same connection. Frames are opaque bytes except for the first frame from the supervisor, which is a typed `RelayInit { channel_id }` used to pair the stream with a pending relay slot on the gateway.
+- **Control plane** -- the `ConnectSupervisor` bidirectional gRPC stream. Carries `SupervisorHello`, heartbeats, targetable `RelayOpen`/`RelayClose` requests from the gateway, and `RelayOpenResult`/`RelayClose` replies from the supervisor. Lives for the lifetime of the sandbox supervisor process.
+- **Data plane** -- one `RelayStream` bidirectional gRPC call per accepted relay. Each call is a new HTTP/2 stream on the same connection. Frames are opaque bytes except for the first frame from the supervisor, which is a typed `RelayInit { channel_id }` used to pair the stream with a pending relay slot on the gateway.
 
-Running both planes over one HTTP/2 connection means each relay avoids a fresh TLS handshake and benefits from a single authenticated transport boundary. Hyper/h2 `adaptive_window(true)` is enabled on both sides so bulk transfers (large file uploads, long exec stdout) aren't pinned to the default 64 KiB stream window.
+Running both planes over one HTTP/2 connection means each relay avoids a fresh TLS handshake and benefits from a single authenticated transport boundary. Hyper/h2 adaptive windows are enabled on the gateway, the sandbox supervisor channel, and CLI gRPC channels so bulk transfers (large file uploads, long exec stdout) aren't pinned to the default 64 KiB stream window.
 
 The supervisor-initiated direction gives the model two properties:
 
 1. The sandbox pod exposes no ingress surface. Network reachability is whatever the supervisor itself can reach outward.
 2. Authentication reduces to one place: the existing gateway mTLS channel. There is no second application-layer handshake to design, rotate, or replay-protect.
+
+### Targetable relay base
+
+`RelayOpen` is targetable but remains SSH-compatible by default. In `proto/openshell.proto`, `RelayOpen.target` is an optional `oneof` with:
+
+- `SshRelayTarget` -- the built-in SSH target. This is the explicit target used by the server-side `open_relay()` wrapper, so existing SSH connect and `ExecSandbox` flows continue to request SSH without each caller constructing the target.
+- `TcpRelayTarget { host, port }` -- a supervisor-dialed TCP target inside the sandbox. The supervisor accepts only loopback hosts (`127.0.0.1`, `::1`, or `localhost`) and ports `1..=65535`.
+
+If `target` is absent, the supervisor treats the relay as `SshRelayTarget` for compatibility with older gateways or messages. The supervisor opens the target before sending `RelayOpenResult { success: true }`; if validation or dialing fails, it sends `success: false` with the error and does not start a `RelayStream`.
+
+### CLI service forward over gRPC
+
+**Files**: `proto/openshell.proto`, `crates/openshell-cli/src/run.rs`, `crates/openshell-server/src/grpc/sandbox.rs`
+
+`ForwardTcp` is a bidirectional gRPC stream between the CLI and gateway. The CLI sends `TcpForwardFrame::Init { sandbox_id, service_id, target.tcp, authorization_token }` as the first frame, followed by `TcpForwardFrame::Data` chunks from the accepted local TCP connection. The gateway validates that the sandbox exists and is `Ready`, validates the session token, validates that the target is loopback-only, calls `open_relay_with_target(TcpRelayTarget)`, waits for the supervisor's `RelayStream`, and bridges opaque bytes between the CLI stream and the relay stream.
+
+The spike command does not create persistent `SandboxService` records yet. It takes the target directly from CLI flags and uses the same loopback-only target restrictions that the supervisor enforces again at relay-open time.
 
 ## Components
 
@@ -52,7 +71,7 @@ These helpers are re-exported from `crates/openshell-cli/src/run.rs` for backwar
 
 **File**: `crates/openshell-cli/src/main.rs` (`Commands::SshProxy`)
 
-A top-level CLI subcommand (`ssh-proxy`) that the SSH `ProxyCommand` invokes. It receives `--gateway`, `--sandbox-id`, `--token`, and `--gateway-name` flags, then delegates to `sandbox_ssh_proxy()`. This process has no TTY of its own -- it pipes stdin/stdout directly to the gateway tunnel.
+A top-level CLI subcommand (`ssh-proxy`) that the SSH `ProxyCommand` invokes. It receives `--gateway`, `--sandbox-id`, `--token`, and `--gateway-name` flags, then delegates to `sandbox_ssh_proxy()`. This process has no TTY of its own -- it pipes stdin/stdout directly to the gateway `ForwardTcp` stream.
 
 ### gRPC session bootstrap
 
@@ -60,7 +79,7 @@ A top-level CLI subcommand (`ssh-proxy`) that the SSH `ProxyCommand` invokes. It
 
 Two RPCs manage SSH session tokens:
 
-- `CreateSshSession(sandbox_id)` -- validates the sandbox exists and is `Ready`, generates a UUID token, persists an `SshSession` record, and returns the token plus gateway connection details (host, port, scheme, connect path, optional TTL).
+- `CreateSshSession(sandbox_id)` -- validates the sandbox exists and is `Ready`, generates a UUID token, persists an `SshSession` record, and returns the token plus gateway connection details (host, port, scheme, optional TTL).
 - `RevokeSshSession(token)` -- marks the session's `revoked` flag to `true` in the persistence layer.
 
 ### Supervisor session registry
@@ -76,11 +95,13 @@ Key operations:
 
 - `register(sandbox_id, session_id, tx)` -- inserts a new session and returns the previous sender if it superseded one. Used by `handle_connect_supervisor` to accept a new stream.
 - `remove_if_current(sandbox_id, session_id)` -- removes only if the stored `session_id` matches. Guards against the supersede race where an old session's cleanup runs after a newer session has already registered.
-- `open_relay(sandbox_id, timeout)` -- called by the gateway tunnel and exec handlers. Waits up to `timeout` for a supervisor session to appear (with exponential backoff 100 ms → 2 s), registers a pending relay slot keyed by a fresh `channel_id`, sends `RelayOpen` to the supervisor, and returns a `oneshot::Receiver<DuplexStream>` that resolves when the supervisor claims the slot.
+- `open_relay(sandbox_id, timeout)` -- called by exec handlers. Wraps `open_relay_with_target()` with `SshRelayTarget`, waits up to `timeout` for a supervisor session to appear (with exponential backoff 100 ms → 2 s), registers a pending relay slot keyed by a fresh `channel_id`, sends `RelayOpen` to the supervisor, and returns a `oneshot::Receiver<Result<DuplexStream, Status>>` that resolves when the supervisor claims the slot or reports target-open failure.
+- `open_relay_with_target(sandbox_id, target, service_id, timeout)` -- lower-level relay opener for explicit `RelayOpen.target` values. It stores the full `RelayOpen` in the pending slot so replay after supervisor supersede preserves the requested target.
+- `fail_pending_relay(channel_id, error)` -- removes a pending relay and wakes the caller with `Status::unavailable` when the supervisor sends `RelayOpenResult { success: false }`.
 - `claim_relay(channel_id)` -- called by `handle_relay_stream` when the supervisor's first `RelayFrame::Init` arrives. Removes the pending entry, enforces a 10-second staleness bound (`RELAY_PENDING_TIMEOUT`), creates a 64 KiB `tokio::io::duplex` pair, hands the gateway-side half to the waiter, and returns the supervisor-side half to be bridged against the inbound/outbound `RelayFrame` streams.
 - `reap_expired_relays()` -- bounds leaks from pending slots the supervisor never claimed (e.g., supervisor crashed between `RelayOpen` and `RelayStream`). Scheduled every 30 s by `spawn_relay_reaper()` during server startup.
 
-The `ConnectSupervisor` handler (`handle_connect_supervisor`) validates `SupervisorHello`, assigns a fresh `session_id`, sends `SessionAccepted { heartbeat_interval_secs: 15 }`, spawns a loop that processes inbound messages (`Heartbeat`, `RelayOpenResult`, `RelayClose`), and emits a `GatewayHeartbeat` every 15 seconds.
+The `ConnectSupervisor` handler (`handle_connect_supervisor`) validates `SupervisorHello`, assigns a fresh `session_id`, sends `SessionAccepted { heartbeat_interval_secs: 15 }`, spawns a loop that processes inbound messages (`Heartbeat`, `RelayOpenResult`, `RelayClose`), and emits a `GatewayHeartbeat` every 15 seconds. Successful `RelayOpenResult` values are informational; failed results wake the pending relay waiter via `fail_pending_relay()` instead of only being logged.
 
 ### RelayStream handler
 
@@ -93,18 +114,19 @@ Accepts one inbound `RelayFrame` to extract `channel_id` from `RelayInit`, claim
 
 The first frame that isn't `RelayInit` is rejected (`invalid_argument`). Any non-data frame after init closes the relay.
 
-### Gateway tunnel handler
+### Gateway `ForwardTcp` handler
 
-**File**: `crates/openshell-server/src/ssh_tunnel.rs`
+**File**: `crates/openshell-server/src/grpc/sandbox.rs` (`handle_forward_tcp`)
 
-An Axum route at `/connect/ssh` on the shared gateway port. Handles HTTP CONNECT requests by:
+Handles one CLI-to-gateway bidirectional `ForwardTcp` stream by:
 
-1. Validating the session token (present, not revoked, bound to the sandbox id in `X-Sandbox-Id`, not expired).
+1. Reading the first `TcpForwardFrame` and requiring `TcpForwardInit`.
 2. Confirming the sandbox is in `Ready` phase.
-3. Enforcing per-token (max 3) and per-sandbox (max 20) concurrent connection limits.
-4. Calling `supervisor_sessions.open_relay(sandbox_id, 30s)` -- the 30-second wait covers the supervisor's initial mTLS + `ConnectSupervisor` handshake on a freshly-scheduled pod.
-5. Waiting up to 10 seconds for the supervisor to open its `RelayStream` and deliver the gateway-side `DuplexStream`.
-6. Performing the HTTP CONNECT upgrade on the client connection and calling `copy_bidirectional` between the upgraded client socket and the relay stream.
+3. Validating `authorization_token` against the `SshSession` row and enforcing per-token (max 3) and per-sandbox (max 20) concurrent connection limits.
+4. For `target.tcp`, validating that the target host is loopback-only and the port is `1..=65535`.
+5. Calling `supervisor_sessions.open_relay_with_target(...)` with the validated `SshRelayTarget` or `TcpRelayTarget`.
+6. Waiting up to 10 seconds for the supervisor to open its `RelayStream` and deliver the gateway-side `DuplexStream`, or to report target-open failure.
+7. Bridging opaque `TcpForwardFrame::Data` chunks between the CLI stream and the relay stream.
 
 There is no gateway-to-sandbox TCP dial, handshake preface, or pod-IP resolution in this path.
 
@@ -112,23 +134,23 @@ There is no gateway-to-sandbox TCP dial, handshake preface, or pod-IP resolution
 
 **File**: `crates/openshell-server/src/multiplex.rs`
 
-The gateway runs a single listener that multiplexes gRPC and HTTP on the same port. `MultiplexedService` routes based on the `content-type` header: requests with `application/grpc` go to the gRPC router; all others (including HTTP CONNECT) go to the HTTP router. The HTTP router (`crates/openshell-server/src/http.rs`) merges health endpoints with the SSH tunnel router. Hyper is configured with `http2().adaptive_window(true)` so the HTTP/2 stream windows grow under load rather than throttling `RelayStream` to the default 64 KiB window.
+The gateway runs a single listener that multiplexes gRPC and HTTP on the same port. `MultiplexedService` routes based on the `content-type` header: requests with `application/grpc` go to the gRPC router; all others go to the HTTP router for health endpoints. Hyper is configured with `http2().adaptive_window(true)` so the HTTP/2 stream windows grow under load rather than throttling `ForwardTcp` or `RelayStream` to the default 64 KiB window.
 
 ### Sandbox supervisor session
 
 **File**: `crates/openshell-sandbox/src/supervisor_session.rs`
 
-`spawn(endpoint, sandbox_id, ssh_socket_path)` starts a background task that:
+`spawn(endpoint, sandbox_id, ssh_socket_path, netns_fd)` starts a background task that:
 
 1. Opens a gRPC `Channel` to the gateway (`http2_adaptive_window(true)`). The same channel multiplexes the control stream and every relay.
 2. Sends `SupervisorHello { sandbox_id, instance_id }` as the first outbound message.
 3. Waits for `SessionAccepted` (or fails fast on `SessionRejected`).
 4. Runs a loop that reads inbound `GatewayMessage` values and emits `SupervisorHeartbeat` at the accepted interval (min 5 s, usually 15 s).
-5. On `RelayOpen`, spawns `handle_relay_open()` which opens a new `RelayStream` RPC on the existing channel, sends `RelayInit { channel_id }` as the first frame, dials the local SSH Unix socket, and bridges bytes in both directions in 16 KiB chunks.
+5. On `RelayOpen`, spawns `handle_relay_open()` which resolves the target (`SshRelayTarget`, `TcpRelayTarget`, or targetless-as-SSH), validates loopback-only TCP targets, dials SSH through the Unix socket or TCP from the sandbox network namespace, sends `RelayOpenResult`, opens a new `RelayStream` RPC on the existing channel, sends `RelayInit { channel_id }` as the first frame, and bridges bytes in both directions in 16 KiB chunks.
 
 Reconnect policy: the session loop wraps `run_single_session()` with exponential backoff (1 s → 30 s) on any error. A `session_established` / `session_failed` OCSF event is emitted on each attempt.
 
-The supervisor is a dumb byte bridge with no awareness of the SSH protocol flowing through it.
+After target selection, the supervisor is a dumb byte bridge with no awareness of the SSH protocol flowing through it.
 
 ### Sandbox SSH daemon
 
@@ -151,7 +173,7 @@ The `ExecSandbox` gRPC RPC provides programmatic command execution without requi
 1. Validates `sandbox_id`, `command`, env keys, and field sizes; confirms the sandbox is `Ready`.
 2. Calls `supervisor_sessions.open_relay(sandbox_id, 15s)` -- a shorter wait than connect because exec runs in steady state, not on cold start.
 3. Waits up to 10 seconds for the relay `DuplexStream` to arrive.
-4. Starts a single-use localhost TCP listener on `127.0.0.1:0` and spawns a task that bridges a single accept to the `DuplexStream` with `copy_bidirectional`. This adapts the `DuplexStream` to something `russh::client::connect_stream` can dial.
+4. Starts a single-use localhost TCP listener on `127.0.0.1:0` and spawns a task that bridges a single accept to the `DuplexStream` with `copy_bidirectional`. This adapts the SSH-targeted `DuplexStream` to something `russh::client::connect_stream` can dial.
 5. Connects `russh` to the local proxy, authenticates `none` as user `sandbox`, opens a channel, optionally requests a PTY, and executes the shell-escaped command.
 6. Streams `stdout`/`stderr`/`exit` events back to the gRPC caller.
 
@@ -180,27 +202,26 @@ sequenceDiagram
     User->>CLI: openshell sandbox connect foo
     CLI->>GW: GetSandbox(name) -> sandbox.id
     CLI->>GW: CreateSshSession(sandbox_id)
-    GW-->>CLI: token, gateway_host, gateway_port, scheme, connect_path
+    GW-->>CLI: token, gateway_host, gateway_port, scheme
 
     Note over CLI: Builds ProxyCommand string: exec()s ssh
 
     User->>CLI: ssh spawns ssh-proxy subprocess
-    CLI->>GW: CONNECT /connect/ssh<br/>X-Sandbox-Id, X-Sandbox-Token
-    GW->>GW: Validate token + sandbox Ready
-    GW->>Reg: open_relay(sandbox_id, 30s)
+    CLI->>GW: ForwardTcp stream<br/>TcpForwardInit{target.ssh, authorization_token}
+    GW->>GW: Validate authorization_token + sandbox Ready
+    GW->>Reg: open_relay_with_target(sandbox_id, target=ssh, 15s)
     Reg-->>GW: (channel_id, relay_rx)
-    GW->>Sup: RelayOpen{channel_id} (over ConnectSupervisor)
+    GW->>Sup: RelayOpen{channel_id, target=ssh} (over ConnectSupervisor)
 
+    Sup->>Sock: UnixStream::connect(/run/openshell/ssh.sock)
+    Sock-->>SSHD: connection accepted
+    Sup->>GW: RelayOpenResult{success=true}
     Sup->>GW: RelayStream RPC (new HTTP/2 stream)
     Sup->>GW: RelayFrame::Init{channel_id}
     GW->>Reg: claim_relay(channel_id) -> DuplexStream pair
     Reg-->>GW: gateway-side DuplexStream (via relay_rx)
-    Sup->>Sock: UnixStream::connect(/run/openshell/ssh.sock)
-    Sock-->>SSHD: connection accepted
 
-    GW-->>CLI: 200 OK (upgrade)
-
-    Note over CLI,SSHD: SSH protocol over:<br/>CLI↔GW (HTTP CONNECT) ↔ RelayStream frames ↔ Sup ↔ Unix socket ↔ SSHD
+    Note over CLI,SSHD: SSH protocol over:<br/>CLI↔GW (ForwardTcp gRPC) ↔ RelayStream frames ↔ Sup ↔ Unix socket ↔ SSHD
 
     CLI->>SSHD: SSH handshake + auth_none
     SSHD-->>CLI: Auth accepted
@@ -225,9 +246,9 @@ sequenceDiagram
    - `-o SetEnv=TERM=xterm-256color`
    - `sandbox` as the SSH user
 4. If stdin is a terminal (interactive), the CLI calls `exec()` (Unix) to replace itself with the `ssh` process. Otherwise it spawns and waits.
-5. `sandbox_ssh_proxy()` connects via TCP (plain) or TLS (mTLS) to the gateway, sends a raw HTTP CONNECT request with `X-Sandbox-Id` and `X-Sandbox-Token` headers, and on a 200 response spawns two tasks to copy bytes between stdin/stdout and the tunnel.
-6. Gateway-side: `ssh_connect()` in `ssh_tunnel.rs` authorizes the request, opens a relay, waits for the supervisor's `RelayStream`, and bridges the upgraded HTTP connection to the relay with `tokio::io::copy_bidirectional`.
-7. Supervisor-side: on `RelayOpen`, `handle_relay_open()` in `crates/openshell-sandbox/src/supervisor_session.rs` opens a `RelayStream` RPC, sends `RelayInit`, dials `/run/openshell/ssh.sock`, and bridges the frames to the Unix socket.
+5. `sandbox_ssh_proxy()` opens a gRPC `ForwardTcp` stream, sends `TcpForwardInit { sandbox_id, service_id: "ssh-proxy:<sandbox_id>", target.ssh, authorization_token: token }`, and spawns two tasks to copy bytes between stdin/stdout and `TcpForwardFrame::Data` messages.
+6. Gateway-side: `handle_forward_tcp()` authorizes the SSH target with `authorization_token`, opens an SSH-targeted relay through `SupervisorSessionRegistry::open_relay_with_target()`, waits for the supervisor's `RelayStream`, and bridges `TcpForwardFrame::Data` to the relay stream.
+7. Supervisor-side: on `RelayOpen`, `handle_relay_open()` in `crates/openshell-sandbox/src/supervisor_session.rs` dials `/run/openshell/ssh.sock`, reports `RelayOpenResult { success: true }`, opens a `RelayStream` RPC, sends `RelayInit`, and bridges the frames to the Unix socket.
 
 ### Command Execution (CLI)
 
@@ -303,13 +324,14 @@ sequenceDiagram
 
     Client->>GW: ExecSandbox(sandbox_id, command, stdin, timeout)
     GW->>GW: Validate sandbox exists + Ready
-    GW->>Reg: open_relay(sandbox_id, 15s)
+    GW->>Reg: open_relay(sandbox_id, 15s) -> target=ssh
     Reg-->>GW: (channel_id, relay_rx)
-    GW->>Sup: RelayOpen{channel_id}
+    GW->>Sup: RelayOpen{channel_id, target=ssh}
 
+    Sup->>SSHD: connect /run/openshell/ssh.sock
+    Sup->>GW: RelayOpenResult{success=true}
     Sup->>GW: RelayStream + RelayInit{channel_id}
     GW->>Reg: claim_relay -> DuplexStream
-    Sup->>SSHD: connect /run/openshell/ssh.sock
 
     Note over GW: start_single_use_ssh_proxy_over_relay<br/>(127.0.0.1:ephemeral -> DuplexStream)
 
@@ -414,7 +436,7 @@ Tests in `supervisor_session.rs` pin this behavior:
 
 All gRPC traffic (control plane + data plane + other RPCs) rides one mTLS-authenticated TCP+TLS+HTTP/2 connection from the supervisor to the gateway. Client certificates prove the supervisor's identity; the server certificate proves the gateway's. Nothing sits between the supervisor and the SSH daemon except the Unix socket's filesystem permissions.
 
-The CLI continues to authenticate to the gateway with its own mTLS credentials (or Cloudflare bearer token in reverse-proxy deployments) and a per-session token returned by `CreateSshSession`. The session token is enforced at the gateway: token scope (sandbox id), revocation state, and optional expiry are all checked in `ssh_connect()` before `open_relay()` is called.
+The CLI continues to authenticate to the gateway with its own mTLS credentials (or Cloudflare bearer token in reverse-proxy deployments) and a per-session token returned by `CreateSshSession`. The session token is enforced at the gateway: token scope (sandbox id), revocation state, and optional expiry are all checked in `handle_forward_tcp()` before `open_relay_with_target()` is called for `target.ssh`.
 
 ### Unix socket access control
 
@@ -447,7 +469,7 @@ The sandbox generates a fresh Ed25519 host key on every startup. The CLI disable
 
 ## Sandbox Target Resolution
 
-The gateway does not resolve a sandbox's network address or port. The only identifier that matters is `sandbox_id`, which keys into the supervisor session registry.
+The gateway does not resolve a sandbox pod network address or port. The `sandbox_id` keys into the supervisor session registry, and the optional `RelayOpen.target` tells the already-connected supervisor what local target to dial inside the sandbox. SSH callers use `SshRelayTarget`; targetless messages also resolve to SSH. TCP relay targets are valid only for loopback destinations and are rejected by the supervisor before any `RelayStream` starts.
 
 ## API and Persistence
 
@@ -466,7 +488,6 @@ Response:
 - `gateway_host` (string) -- resolved from `Config::ssh_gateway_host` (defaults to bind address if empty)
 - `gateway_port` (uint32) -- resolved from `Config::ssh_gateway_port` (defaults to bind port if 0)
 - `gateway_scheme` (string) -- `"https"` if TLS is configured, otherwise `"http"`
-- `connect_path` (string) -- from `Config::ssh_connect_path` (default: `/connect/ssh`)
 - `host_key_fingerprint` (string) -- currently unused (empty)
 - `expires_at_ms` (int64) -- session expiry; 0 disables expiry
 
@@ -479,6 +500,18 @@ Request:
 Response:
 
 - `revoked` (bool) -- true if a session was found and revoked
+
+### ForwardTcp
+
+**Proto**: `proto/openshell.proto` -- `TcpForwardFrame` / `TcpForwardInit`
+
+`ForwardTcp(stream TcpForwardFrame) returns (stream TcpForwardFrame)` carries opaque bytes between the CLI and gateway. The first frame must be `TcpForwardInit`:
+
+- `sandbox_id` (string) -- sandbox to connect to
+- `service_id` (string) -- optional audit/correlation identifier
+- `target.ssh` -- SSH target used by `ssh-proxy`
+- `target.tcp` -- loopback TCP target used by service forwarding
+- `authorization_token` (string) -- short-lived session token from `CreateSshSession`, required for all targets
 
 ### SshSession persistence
 
@@ -514,8 +547,10 @@ Key messages:
 | `SessionRejected` | gw → sup | `reason` |
 | `SupervisorHeartbeat` | sup → gw | (empty) |
 | `GatewayHeartbeat` | gw → sup | (empty) |
-| `RelayOpen` | gw → sup | `channel_id` (UUID) |
-| `RelayOpenResult` | sup → gw | `channel_id`, `success`, `error` |
+| `RelayOpen` | gw → sup | `channel_id` (UUID), optional `target` (`SshRelayTarget` or loopback-only `TcpRelayTarget`), `service_id` |
+| `SshRelayTarget` | gw → sup | Empty built-in SSH target; absence of `target` is treated the same way |
+| `TcpRelayTarget` | gw → sup | `host`, `port`; supervisor accepts only `127.0.0.1`, `::1`, or `localhost` and ports `1..=65535` |
+| `RelayOpenResult` | sup → gw | `channel_id`, `success`, `error`; failure wakes the pending gateway waiter |
 | `RelayClose` | either | `channel_id`, `reason` |
 | `RelayInit` | sup → gw (first `RelayFrame`) | `channel_id` |
 | `RelayFrame` | either | `oneof { RelayInit init, bytes data }` |
@@ -556,7 +591,7 @@ This function is shared between the CLI and TUI via the `openshell-core::forward
 
 | Stage | Duration | Where |
 |---|---|---|
-| Supervisor session wait (SSH connect) | 30 s | `ssh_tunnel::ssh_connect` -> `open_relay` |
+| Supervisor session wait (`ForwardTcp`) | 15 s | `handle_forward_tcp` -> `open_relay_with_target` |
 | Supervisor session wait (ExecSandbox) | 15 s | `handle_exec_sandbox` -> `open_relay` |
 | Wait for supervisor to claim relay | 10 s | `relay_rx` wrapped in `tokio::time::timeout` |
 | Pending-relay TTL (reaper) | 10 s | `RELAY_PENDING_TIMEOUT` in registry |
@@ -571,18 +606,18 @@ This function is shared between the CLI and TUI via the `openshell-core::forward
 
 | Scenario | Status / Behavior | Source |
 |---|---|---|
-| Missing `X-Sandbox-Id` or `X-Sandbox-Token` header | `401 Unauthorized` | `ssh_tunnel.rs` -- `header_value()` |
-| Empty header value | `400 Bad Request` | `ssh_tunnel.rs` -- `header_value()` |
-| Non-CONNECT method on `/connect/ssh` | `405 Method Not Allowed` | `ssh_tunnel.rs` -- `ssh_connect()` |
-| Token not found in persistence | `401 Unauthorized` | `ssh_tunnel.rs` -- `ssh_connect()` |
-| Token revoked or sandbox ID mismatch | `401 Unauthorized` | `ssh_tunnel.rs` -- `ssh_connect()` |
-| Token expired | `401 Unauthorized` | `ssh_tunnel.rs` -- `ssh_connect()` |
-| Sandbox not found | `404 Not Found` | `ssh_tunnel.rs` -- `ssh_connect()` |
-| Sandbox not in `Ready` phase | `412 Precondition Failed` | `ssh_tunnel.rs` -- `ssh_connect()` |
-| Per-token or per-sandbox concurrency limit hit | `429 Too Many Requests` | `ssh_tunnel.rs` -- `ssh_connect()` |
-| Supervisor session not connected after 30 s | `502 Bad Gateway` | `ssh_tunnel.rs` -- `ssh_connect()` |
-| Supervisor failed to claim relay within 10 s | Tunnel closed; `"relay open timed out"` logged | `ssh_tunnel.rs` -- spawned tunnel task |
-| Relay channel oneshot dropped | Tunnel closed; `"relay channel dropped"` logged | `ssh_tunnel.rs` -- spawned tunnel task |
+| Empty `ForwardTcp` stream or first frame is not `TcpForwardInit` | `invalid_argument` | `handle_forward_tcp` |
+| Missing `authorization_token` for `ForwardTcp` | `unauthenticated` | `acquire_forward_connection_guard` |
+| Token not found in persistence | `unauthenticated` | `validate_ssh_forward_token` |
+| Token revoked or sandbox ID mismatch | `unauthenticated` | `validate_ssh_forward_token` |
+| Token expired | `unauthenticated` | `validate_ssh_forward_token` |
+| Sandbox not found | `not_found` | `handle_forward_tcp` |
+| Sandbox not in `Ready` phase | `failed_precondition` | `handle_forward_tcp` |
+| Per-token or per-sandbox concurrency limit hit | `resource_exhausted` | `acquire_ssh_connection_slots` |
+| Supervisor session not connected after 15 s | `unavailable` | `handle_forward_tcp` |
+| Supervisor rejects relay target or cannot dial it | `ForwardTcp` stream returns the supervisor error, or `ExecSandbox` returns `unavailable`; pending relay waiter is woken with the supervisor error | `handle_relay_open`, `fail_pending_relay` |
+| Supervisor failed to claim relay within 10 s | `deadline_exceeded`; `"ForwardTcp: relay open timed out"` logged | `handle_forward_tcp` spawned task |
+| Relay channel oneshot dropped | `unavailable`; `"ForwardTcp: relay channel dropped"` logged | `handle_forward_tcp` spawned task |
 | First `RelayFrame` not `RelayInit` or empty `channel_id` | `invalid_argument` on `RelayStream` | `supervisor_session.rs` -- `handle_relay_stream` |
 | `RelayStream` arrives after pending entry expired (>10 s) | `deadline_exceeded` | `supervisor_session.rs` -- `claim_relay` |
 | Gateway restart during live relay | CLI SSH detects via keepalive within ~45 s; relays are torn down with the TCP connection | CLI `ServerAliveInterval=15`, `ServerAliveCountMax=3` |
@@ -593,9 +628,9 @@ This function is shared between the CLI and TUI via the `openshell-core::forward
 
 ## Graceful Shutdown
 
-### Gateway tunnel teardown
+### Gateway forward teardown
 
-After `copy_bidirectional` completes on either side, `ssh_connect()` calls `AsyncWriteExt::shutdown()` on the upgraded client connection so SSH sees a clean EOF and can read any remaining protocol data (e.g., exit-status) before exiting.
+When the CLI-to-gateway stream ends, `bridge_forward_tcp_stream()` shuts down the relay write half so SSH sees a clean EOF and can read any remaining protocol data (e.g., exit-status) before exiting.
 
 ### RelayStream teardown
 
@@ -619,7 +654,6 @@ The sandbox SSH daemon's exit thread waits for the reader thread to finish forwa
 |---|---|---|
 | `ssh_gateway_host` | `127.0.0.1` | Public hostname/IP advertised in `CreateSshSessionResponse` |
 | `ssh_gateway_port` | `8080` | Public port for gateway connections (0 = use bind port) |
-| `ssh_connect_path` | `/connect/ssh` | HTTP path for CONNECT requests |
 | `sandbox_ssh_socket_path` | `/run/openshell/ssh.sock` | Path the supervisor binds its Unix socket on; passed to the sandbox as `OPENSHELL_SSH_SOCKET_PATH` |
 | `ssh_session_ttl_secs` | (default in code) | Default TTL applied to new `SshSession` rows; 0 disables expiry |
 

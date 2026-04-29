@@ -94,7 +94,7 @@ graph TB
     CLI -- "gRPC over HTTPS (mTLS)<br/>:30051 NodePort" --> Gateway
     TUI -- "gRPC polling (mTLS)<br/>every 2s" --> Gateway
     SDK -- "gRPC over HTTPS (mTLS)" --> Gateway
-    CLI -- "HTTP CONNECT upgrade<br/>/connect/ssh (mTLS)" --> Gateway
+    CLI -- "gRPC ForwardTcp<br/>target.ssh (mTLS)" --> Gateway
     CLI -. "reads mTLS certs" .-> LocalConfig
 
     %% ============================================================
@@ -108,9 +108,9 @@ graph TB
     %% ============================================================
     %% CONNECTIONS: Supervisor session (inbound from sandbox)
     %% ============================================================
-    RelayBridge -- "ConnectSupervisor<br/>(persistent bidi stream)" --> SupRegistry
-    RelayBridge -- "RelayStream<br/>(per-invocation byte bridge,<br/>same HTTP/2 connection)" --> SupRegistry
-    RelayBridge -- "Unix socket<br/>SSH bytes" --> SSHServer
+    RelayBridge -- "ConnectSupervisor<br/>(persistent bidi stream,<br/>targetable RelayOpen)" --> SupRegistry
+    RelayBridge -- "RelayStream<br/>(per-accepted-relay byte bridge,<br/>same HTTP/2 connection)" --> SupRegistry
+    RelayBridge -- "Unix socket<br/>SSH target bytes" --> SSHServer
 
     %% ============================================================
     %% CONNECTIONS: CRD Controller
@@ -153,7 +153,7 @@ graph TB
     %% ============================================================
     %% CLIENT SSH / EXEC (bytes tunneled via supervisor relay)
     %% ============================================================
-    CLI -- "HTTP CONNECT /connect/ssh<br/>+ tar-over-SSH file sync<br/>(bytes bridged through<br/>SupervisorSessionRegistry)" --> Gateway
+    CLI -- "gRPC ForwardTcp(target.ssh)<br/>+ tar-over-SSH file sync<br/>(bytes bridged through<br/>SupervisorSessionRegistry)" --> Gateway
 
     %% ============================================================
     %% STYLES
@@ -195,9 +195,9 @@ graph TB
 
 1. **CLI/SDK to Gateway**: All control-plane traffic uses gRPC over HTTPS with mutual TLS (mTLS). Single multiplexed port (8080 inside cluster, 30051 NodePort).
 
-2. **Supervisor Session (inbound from sandbox)**: Each sandbox supervisor opens a persistent `ConnectSupervisor` bidi gRPC stream to the gateway over mTLS. The gateway tracks these in `SupervisorSessionRegistry`. When SSH or exec access is needed, the gateway sends `RelayOpen { channel_id }` on that stream; the supervisor responds by initiating a `RelayStream` RPC on the same HTTP/2 connection whose first frame is a `RelayInit { channel_id }`. Subsequent frames carry raw bytes in both directions. The gateway never dials the sandbox pod.
+2. **Supervisor Session (inbound from sandbox)**: Each sandbox supervisor opens a persistent `ConnectSupervisor` bidi gRPC stream to the gateway over mTLS. The gateway tracks these in `SupervisorSessionRegistry`. When SSH or exec access is needed, the gateway sends `RelayOpen { channel_id, target = SshRelayTarget }` on that stream; targetless relay requests remain SSH-compatible, and TCP targets are supervisor-validated as loopback-only. The supervisor dials the target before reporting a successful `RelayOpenResult`, then initiates a `RelayStream` RPC on the same HTTP/2 connection whose first frame is a `RelayInit { channel_id }`. Subsequent frames carry raw bytes in both directions. The gateway never dials the sandbox pod.
 
-3. **SSH / Exec Access**: CLI connects via HTTP CONNECT upgrade at `/connect/ssh` (or calls `ExecSandbox` gRPC). The gateway authenticates, calls `open_relay`, and bridges the client bytes through the supervisor's `RelayStream` to the supervisor's in-sandbox SSH daemon, which binds to a Unix socket (`/run/openshell/ssh.sock`) rather than a TCP port.
+3. **SSH / Exec Access**: CLI connects via the bidirectional gRPC `ForwardTcp` stream with `TcpForwardInit.target = SshRelayTarget` (or calls `ExecSandbox` gRPC). The gateway authenticates the SSH target with the short-lived session token, calls `open_relay_with_target(SshRelayTarget)`, and bridges the client bytes through the supervisor's `RelayStream` to the supervisor's in-sandbox SSH daemon, which binds to a Unix socket (`/run/openshell/ssh.sock`) rather than a TCP port.
 
 4. **File Sync**: tar archives streamed over the relay-tunneled SSH session (no rsync dependency).
 

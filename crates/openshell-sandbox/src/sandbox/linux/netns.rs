@@ -11,7 +11,7 @@ use miette::{IntoDiagnostic, Result};
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
 use std::process::Command;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Default subnet for sandbox networking.

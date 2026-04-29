@@ -253,6 +253,7 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         let endpoint = Endpoint::from_shared(server.to_string())
             .into_diagnostic()?
             .connect_timeout(Duration::from_secs(10))
+            .http2_adaptive_window(true)
             .http2_keep_alive_interval(Duration::from_secs(10))
             .keep_alive_while_idle(true);
         return endpoint.connect().await.into_diagnostic();
@@ -272,6 +273,7 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         let endpoint = Endpoint::from_shared(local_url)
             .into_diagnostic()?
             .connect_timeout(Duration::from_secs(10))
+            .http2_adaptive_window(true)
             .http2_keep_alive_interval(Duration::from_secs(10))
             .keep_alive_while_idle(true);
         return endpoint.connect().await.into_diagnostic();
@@ -280,6 +282,7 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
     let mut endpoint = Endpoint::from_shared(server.to_string())
         .into_diagnostic()?
         .connect_timeout(Duration::from_secs(10))
+        .http2_adaptive_window(true)
         .http2_keep_alive_interval(Duration::from_secs(10))
         .keep_alive_while_idle(true);
 
