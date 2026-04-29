@@ -74,7 +74,7 @@ fn append_rootfs_tree_to_archive(
         .map_err(|e| format!("read {}: {e}", source.display()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("read {}: {e}", source.display()))?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(fs::DirEntry::file_name);
 
     for entry in entries {
         let entry_name = entry.file_name();
