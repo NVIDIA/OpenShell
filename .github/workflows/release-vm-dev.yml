@@ -689,8 +689,8 @@ jobs:
           done
           vm_count=$(ls release-final/openshell-vm-*.tar.gz 2>/dev/null | wc -l)
           driver_count=$(ls release-final/openshell-driver-vm-*.tar.gz 2>/dev/null | wc -l)
-          if [ "$vm_count" -eq 0 ] || [ "$driver_count" -eq 0 ]; then
-            echo "ERROR: Missing binary tarballs (openshell-vm=${vm_count}, openshell-driver-vm=${driver_count})" >&2
+          if [ "$vm_count" -ne 3 ] || [ "$driver_count" -ne 3 ]; then
+            echo "ERROR: Expected 3 openshell-vm and 3 openshell-driver-vm binary tarballs (openshell-vm=${vm_count}, openshell-driver-vm=${driver_count})" >&2
             ls -la release/ || true
             exit 1
           fi
