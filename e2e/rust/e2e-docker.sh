@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Run the Rust e2e smoke test against a standalone gateway running the
+# Run a Rust e2e test against a standalone gateway running the
 # bundled Docker compute driver.
 #
 # Unlike the Kubernetes driver (which deploys a k3s cluster) or the VM
@@ -20,10 +20,12 @@
 #   4. Starts openshell-gateway with --drivers=docker, binding to a
 #      random free host port.
 #   5. Installs the client cert into the CLI gateway config dir and
-#      runs the Rust smoke test.
+#      runs the selected Rust e2e test.
 #   6. Tears the gateway process down on exit.
 #
-# Usage: mise run e2e:docker
+# Usage:
+#   mise run e2e:docker
+#   mise run e2e:docker:gpu
 
 set -euo pipefail
 
@@ -35,6 +37,8 @@ STATE_DIR=""
 GATEWAY_CONFIG_DIR=""
 GATEWAY_PID=""
 GATEWAY_LOG="${WORKDIR}/gateway.log"
+E2E_TEST="${OPENSHELL_E2E_DOCKER_TEST:-smoke}"
+GPU_MODE="${OPENSHELL_E2E_DOCKER_GPU:-0}"
 # Unique sandbox namespace for this test run. Set just before the gateway
 # is started so cleanup can filter Docker containers strictly to ones
 # this run created, even when other OpenShell sandboxes are present on
@@ -119,6 +123,17 @@ if ! command -v openssl >/dev/null 2>&1; then
   echo "ERROR: openssl is required to generate ephemeral PKI" >&2
   exit 2
 fi
+if [ "${GPU_MODE}" = "1" ]; then
+  DOCKER_CDI_SPEC_DIRS="$(docker info --format '{{json .CDISpecDirs}}' 2>/dev/null || true)"
+  if [ -z "${DOCKER_CDI_SPEC_DIRS}" ] \
+     || [ "${DOCKER_CDI_SPEC_DIRS}" = "null" ] \
+     || [ "${DOCKER_CDI_SPEC_DIRS}" = "[]" ] \
+     || [ "${DOCKER_CDI_SPEC_DIRS}" = "<no value>" ]; then
+    echo "ERROR: e2e:docker:gpu requires Docker CDI support." >&2
+    echo "       Generate CDI specs and restart Docker, then verify docker info reports CDISpecDirs." >&2
+    exit 2
+  fi
+fi
 
 normalize_arch() {
   case "$1" in
@@ -186,8 +201,10 @@ chmod +x "${SUPERVISOR_BIN}"
 # in the image. Use the community sandbox base image (also what real
 # deployments default to). Callers can override with
 # OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE if they have a smaller local image
-# with the required 'sandbox' user.
-SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
+# with the required 'sandbox' user. CDI injects the NVIDIA userspace
+# stack at runtime, so the GPU lane uses the same base image.
+DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}"
 if ! docker image inspect "${SANDBOX_IMAGE}" >/dev/null 2>&1; then
   echo "Pulling ${SANDBOX_IMAGE}..."
   docker pull "${SANDBOX_IMAGE}"
@@ -313,8 +330,8 @@ if [ "${elapsed}" -ge "${timeout}" ]; then
   exit 1
 fi
 
-# ── Run the smoke test ───────────────────────────────────────────────
-echo "Running e2e smoke test (gateway: ${OPENSHELL_GATEWAY}, endpoint: ${CLI_GATEWAY_ENDPOINT})..."
-cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test smoke -- --nocapture
+# ── Run the selected test ────────────────────────────────────────────
+echo "Running e2e ${E2E_TEST} test (gateway: ${OPENSHELL_GATEWAY}, endpoint: ${CLI_GATEWAY_ENDPOINT})..."
+cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test "${E2E_TEST}" -- --nocapture
 
-echo "Smoke test passed."
+echo "${E2E_TEST} test passed."
