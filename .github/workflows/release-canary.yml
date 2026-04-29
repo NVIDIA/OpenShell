@@ -67,6 +67,109 @@ jobs:
             echo "Version check passed: found $EXPECTED in output"
           fi
 
+  deb-install:
+    name: Debian package (${{ matrix.arch }})
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: build-amd64
+          - arch: arm64
+            runner: build-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Determine release tag
+        id: release
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            WORKFLOW_NAME="${{ github.event.workflow_run.name }}"
+            if [ "$WORKFLOW_NAME" = "Release Dev" ]; then
+              echo "tag=dev" >> "$GITHUB_OUTPUT"
+            elif [ "$WORKFLOW_NAME" = "Release Tag" ]; then
+              TAG="${{ github.event.workflow_run.head_branch }}"
+              if [ -z "$TAG" ]; then
+                echo "::error::Could not determine release tag from workflow_run"
+                exit 1
+              fi
+              echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::Unexpected triggering workflow: ${WORKFLOW_NAME}"
+              exit 1
+            fi
+          fi
+
+      - name: Install dev Debian package with install-dev.sh
+        if: steps.release.outputs.tag == 'dev'
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-dev.sh | sh
+
+      - name: Download Debian package
+        if: steps.release.outputs.tag != 'dev'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          ASSET_URL=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+            | jq -r --arg arch "$ARCH" '.assets[] | select(.name | test("^openshell_.*_" + $arch + "\\.deb$")) | .browser_download_url' \
+            | head -n1)
+          if [ -z "$ASSET_URL" ]; then
+            echo "::error::No Debian package asset found for ${TAG} ${ARCH}"
+            exit 1
+          fi
+          curl -fL -o openshell.deb "$ASSET_URL"
+
+      - name: Install Debian package
+        if: steps.release.outputs.tag != 'dev'
+        run: apt-get install -y ./openshell.deb
+
+      - name: Verify Debian package installation
+        run: |
+          set -euo pipefail
+          command -v openshell
+          command -v openshell-gateway
+          test -x /usr/libexec/openshell/openshell-driver-vm
+          openshell --version
+          openshell-gateway --version
+          /usr/libexec/openshell/openshell-driver-vm --version
+          dpkg -L openshell | grep -F /usr/lib/systemd/system/openshell-gateway.service
+          dpkg -L openshell | grep -F /etc/default/openshell-gateway
+          dpkg -L openshell | grep -F /etc/openshell/active_gateway
+          dpkg -L openshell | grep -F /etc/openshell/gateways/default/metadata.json
+          grep -q '^OPENSHELL_BIND_ADDRESS=127\.0\.0\.1$' /etc/default/openshell-gateway
+          grep -q '^OPENSHELL_DISABLE_TLS=true$' /etc/default/openshell-gateway
+          grep -q '^OPENSHELL_DRIVERS=docker$' /etc/default/openshell-gateway
+          grep -q '^default$' /etc/openshell/active_gateway
+          grep -q '"gateway_endpoint": "http://127\.0\.0\.1:8080"' /etc/openshell/gateways/default/metadata.json
+
+          TAG="${{ steps.release.outputs.tag }}"
+          openshell gateway info --name default
+
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            EXPECTED="${TAG#v}"
+            ACTUAL="$(openshell --version)"
+            if [[ "$ACTUAL" != *"$EXPECTED"* ]]; then
+              echo "::error::Version mismatch: expected '$EXPECTED' in '$ACTUAL'"
+              exit 1
+            fi
+          fi
+
   canary:
     name: Canary ${{ matrix.mode }} (${{ matrix.arch }})
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}

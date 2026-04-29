@@ -33,6 +33,39 @@ OpenShell also publishes a standalone `openshell-gateway` binary as a GitHub rel
 
 Both the standalone artifact and the deployed container image use the `openshell-gateway` binary.
 
+## Debian Packages
+
+OpenShell publishes Debian packages for `linux/amd64` and `linux/arm64`.
+
+- **Package name**: `openshell`
+- **Artifact name**: `openshell_<version>_<arch>.deb`
+- **Installed commands**: `/usr/bin/openshell`, `/usr/bin/openshell-gateway`
+- **Installed helper**: `/usr/libexec/openshell/openshell-driver-vm`
+- **Systemd unit**: `openshell-gateway.service`
+- **Release workflows**: `.github/workflows/release-dev.yml`, `.github/workflows/release-tag.yml`
+- **Dev installer**: `install-dev.sh`
+
+The dev and tagged release workflows build the Linux `openshell-driver-vm`
+artifacts through `.github/workflows/driver-vm-linux.yml`, then
+`.github/workflows/deb-package.yml` bundles the same-run CLI, gateway, and VM
+driver artifacts into the final Debian packages.
+
+`install-dev.sh` installs the rolling `dev` Debian package on supported Linux
+hosts. It resolves the current package filename from the dev release checksum
+file, verifies the package checksum, then installs it with `apt`/`dpkg`.
+
+The systemd unit is installed but not enabled or started automatically. Its
+defaults live in `/etc/default/openshell-gateway`: TLS is disabled for simple
+local startup, the gateway binds `127.0.0.1`, and the VM driver helper is found
+through `OPENSHELL_DRIVER_DIR=/usr/libexec/openshell`. The packaged service
+defaults to the Docker compute driver so it can start locally without an SSH
+handshake secret. Non-Docker drivers such as VM, Podman, and Kubernetes require
+`OPENSHELL_SSH_HANDSHAKE_SECRET` when enabled.
+
+The package installs a system-wide default gateway registration under
+`/etc/openshell`: `default` points to `http://127.0.0.1:8080` and is used by the
+CLI when a user has no per-user active gateway configured.
+
 ## Python Wheels
 
 OpenShell also publishes Python wheels for `linux/amd64`, `linux/arm64`, and macOS ARM64.
