@@ -44,6 +44,12 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
             kind: "messages".to_string(),
         },
         InferenceApiPattern {
+            method: "POST".to_string(),
+            path_glob: "/v1/messages/count_tokens".to_string(),
+            protocol: "anthropic_messages".to_string(),
+            kind: "messages_count_tokens".to_string(),
+        },
+        InferenceApiPattern {
             method: "GET".to_string(),
             path_glob: "/v1/models".to_string(),
             protocol: "model_discovery".to_string(),
@@ -405,6 +411,15 @@ mod tests {
         let result = detect_inference_pattern("POST", "/v1/messages", &patterns);
         assert!(result.is_some());
         assert_eq!(result.unwrap().protocol, "anthropic_messages");
+    }
+
+    #[test]
+    fn detect_anthropic_count_tokens() {
+        let patterns = default_patterns();
+        let result = detect_inference_pattern("POST", "/v1/messages/count_tokens", &patterns);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().protocol, "anthropic_messages");
+        assert_eq!(result.unwrap().kind, "messages_count_tokens");
     }
 
     #[test]
