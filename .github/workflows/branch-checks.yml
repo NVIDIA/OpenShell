@@ -13,6 +13,37 @@ permissions:
   packages: read
 
 jobs:
+  mise-lockfile:
+    name: mise Lockfile
+    runs-on: build-amd64
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Detect mise config changes
+        id: changed
+        uses: tj-actions/changed-files@aa08304bd477b800d468db44fe10f6c61f7f7b11 # v42.1.0
+        with:
+          files: |
+            mise.toml
+            mise.lock
+
+      - name: Verify mise.lock is in sync with mise.toml
+        if: steps.changed.outputs.any_changed == 'true'
+        run: |
+          mise lock
+          if ! git diff --exit-code mise.lock; then
+            echo "::error::mise.lock is out of sync with mise.toml. Run 'mise lock' locally and commit the result." >&2
+            exit 1
+          fi
+
   license-headers:
     name: License Headers
     runs-on: build-amd64
@@ -25,7 +56,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install tools
-        run: mise install
+        run: mise install --locked
 
       - name: Check license headers
         run: mise run license:check
@@ -46,7 +77,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install tools
-        run: mise install
+        run: mise install --locked
 
       - name: Configure sccache remote cache
         if: vars.SCCACHE_MEMCACHED_ENDPOINT != ''
@@ -90,7 +121,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install tools
-        run: mise install
+        run: mise install --locked
 
       - name: Install dependencies
         run: uv sync --frozen

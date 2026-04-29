@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-driver-docker"
+description = "Docker compute driver for OpenShell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+openshell-core = { path = "../openshell-core" }
+
+tokio = { workspace = true }
+tonic = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+bollard = { version = "0.20" }
+tar = "0.4"
+tempfile = "3"
+
+[lints]
+workspace = true

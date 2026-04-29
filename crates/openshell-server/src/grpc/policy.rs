@@ -12,6 +12,7 @@
 
 use crate::ServerState;
 use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, PolicyRecord, Store};
+use crate::policy_store::PolicyStoreExt;
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -62,8 +63,6 @@ use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit, curr
 
 /// Internal object type for durable gateway-global settings.
 const GLOBAL_SETTINGS_OBJECT_TYPE: &str = "gateway_settings";
-/// Internal object id for the singleton global settings record.
-const GLOBAL_SETTINGS_ID: &str = "gateway_settings:global";
 const GLOBAL_SETTINGS_NAME: &str = "global";
 /// Internal object type for durable sandbox-scoped settings.
 pub(crate) const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
@@ -166,6 +165,16 @@ fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
             binary_path,
         } => format!("remove-binary {rule_name} {binary_path}"),
     }
+}
+
+fn ensure_chunk_belongs_to_sandbox(
+    chunk: &DraftChunkRecord,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    if chunk.sandbox_id != sandbox_id {
+        return Err(Status::not_found("chunk not found"));
+    }
+    Ok(())
 }
 
 fn summarize_add_endpoint(rule_name: &str, rule: &NetworkPolicyRule) -> String {
@@ -338,9 +347,10 @@ pub(super) async fn handle_get_sandbox_config(
         // Lazy backfill: no policy history exists yet.
         let spec = sandbox
             .spec
+            .as_ref()
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
-        match spec.policy {
+        match spec.policy.clone() {
             None => {
                 debug!(
                     sandbox_id = %sandbox_id,
@@ -386,7 +396,8 @@ pub(super) async fn handle_get_sandbox_config(
     };
 
     let global_settings = load_global_settings(state.store.as_ref()).await?;
-    let sandbox_settings = load_sandbox_settings(state.store.as_ref(), &sandbox_id).await?;
+    let sandbox_settings =
+        load_sandbox_settings(state.store.as_ref(), sandbox.object_name()).await?;
 
     let mut global_policy_version: u32 = 0;
 
@@ -685,13 +696,12 @@ pub(super) async fn handle_update_config(
             }
 
             let mut sandbox_settings =
-                load_sandbox_settings(state.store.as_ref(), &sandbox_id).await?;
+                load_sandbox_settings(state.store.as_ref(), sandbox.object_name()).await?;
             let removed = sandbox_settings.settings.remove(key).is_some();
             if removed {
                 sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
                 save_sandbox_settings(
                     state.store.as_ref(),
-                    &sandbox_id,
                     sandbox.object_name(),
                     &sandbox_settings,
                 )
@@ -718,13 +728,13 @@ pub(super) async fn handle_update_config(
             .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
         let stored = proto_setting_to_stored(key, setting)?;
 
-        let mut sandbox_settings = load_sandbox_settings(state.store.as_ref(), &sandbox_id).await?;
+        let mut sandbox_settings =
+            load_sandbox_settings(state.store.as_ref(), sandbox.object_name()).await?;
         let changed = upsert_setting_value(&mut sandbox_settings.settings, key, stored);
         if changed {
             sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
             save_sandbox_settings(
                 state.store.as_ref(),
-                &sandbox_id,
                 sandbox.object_name(),
                 &sandbox_settings,
             )
@@ -1336,6 +1346,7 @@ pub(super) async fn handle_approve_draft_chunk(
         .await
         .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
         .ok_or_else(|| Status::not_found("chunk not found"))?;
+    ensure_chunk_belongs_to_sandbox(&chunk, &sandbox_id)?;
 
     if chunk.status != "pending" && chunk.status != "rejected" {
         return Err(Status::failed_precondition(format!(
@@ -1421,6 +1432,7 @@ pub(super) async fn handle_reject_draft_chunk(
         .await
         .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
         .ok_or_else(|| Status::not_found("chunk not found"))?;
+    ensure_chunk_belongs_to_sandbox(&chunk, &sandbox_id)?;
 
     if chunk.status != "pending" && chunk.status != "approved" {
         return Err(Status::failed_precondition(format!(
@@ -1603,12 +1615,13 @@ pub(super) async fn handle_edit_draft_chunk(
         .proposed_rule
         .ok_or_else(|| Status::invalid_argument("proposed_rule is required"))?;
 
-    let _sandbox = state
+    let sandbox = state
         .store
         .get_message_by_name::<Sandbox>(&req.name)
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox_id = sandbox.object_id().to_string();
 
     let chunk = state
         .store
@@ -1616,6 +1629,7 @@ pub(super) async fn handle_edit_draft_chunk(
         .await
         .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
         .ok_or_else(|| Status::not_found("chunk not found"))?;
+    ensure_chunk_belongs_to_sandbox(&chunk, &sandbox_id)?;
 
     if chunk.status != "pending" {
         return Err(Status::failed_precondition(format!(
@@ -1665,6 +1679,7 @@ pub(super) async fn handle_undo_draft_chunk(
         .await
         .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
         .ok_or_else(|| Status::not_found("chunk not found"))?;
+    ensure_chunk_belongs_to_sandbox(&chunk, &sandbox_id)?;
 
     if chunk.status != "approved" {
         return Err(Status::failed_precondition(format!(
@@ -2261,8 +2276,7 @@ async fn apply_merge_operations_with_retry(
                 return Ok((next_version, hash));
             }
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("UNIQUE") || msg.contains("unique") || msg.contains("duplicate") {
+                if e.is_unique_violation_on("objects_version_uq") {
                     warn!(
                         sandbox_id = %sandbox_id,
                         attempt,
@@ -2403,7 +2417,7 @@ fn upsert_setting_value(
 }
 
 pub(super) async fn load_global_settings(store: &Store) -> Result<StoredSettings, Status> {
-    load_settings_record(store, GLOBAL_SETTINGS_OBJECT_TYPE, GLOBAL_SETTINGS_ID).await
+    load_settings_record(store, GLOBAL_SETTINGS_OBJECT_TYPE, GLOBAL_SETTINGS_NAME).await
 }
 
 pub(super) async fn save_global_settings(
@@ -2413,53 +2427,34 @@ pub(super) async fn save_global_settings(
     save_settings_record(
         store,
         GLOBAL_SETTINGS_OBJECT_TYPE,
-        GLOBAL_SETTINGS_ID,
         GLOBAL_SETTINGS_NAME,
         settings,
     )
     .await
 }
 
-/// Derive a distinct settings record ID from a sandbox UUID.
-pub(crate) fn sandbox_settings_id(sandbox_id: &str) -> String {
-    format!("settings:{sandbox_id}")
-}
-
 pub(super) async fn load_sandbox_settings(
     store: &Store,
-    sandbox_id: &str,
+    sandbox_name: &str,
 ) -> Result<StoredSettings, Status> {
-    load_settings_record(
-        store,
-        SANDBOX_SETTINGS_OBJECT_TYPE,
-        &sandbox_settings_id(sandbox_id),
-    )
-    .await
+    load_settings_record(store, SANDBOX_SETTINGS_OBJECT_TYPE, sandbox_name).await
 }
 
 pub(super) async fn save_sandbox_settings(
     store: &Store,
-    sandbox_id: &str,
     sandbox_name: &str,
     settings: &StoredSettings,
 ) -> Result<(), Status> {
-    save_settings_record(
-        store,
-        SANDBOX_SETTINGS_OBJECT_TYPE,
-        &sandbox_settings_id(sandbox_id),
-        sandbox_name,
-        settings,
-    )
-    .await
+    save_settings_record(store, SANDBOX_SETTINGS_OBJECT_TYPE, sandbox_name, settings).await
 }
 
 async fn load_settings_record(
     store: &Store,
     object_type: &str,
-    id: &str,
+    name: &str,
 ) -> Result<StoredSettings, Status> {
     let record = store
-        .get(object_type, id)
+        .get_by_name(object_type, name)
         .await
         .map_err(|e| Status::internal(format!("fetch settings failed: {e}")))?;
     if let Some(record) = record {
@@ -2473,14 +2468,19 @@ async fn load_settings_record(
 async fn save_settings_record(
     store: &Store,
     object_type: &str,
-    id: &str,
     name: &str,
     settings: &StoredSettings,
 ) -> Result<(), Status> {
     let payload = serde_json::to_vec(settings)
         .map_err(|e| Status::internal(format!("encode settings payload failed: {e}")))?;
     store
-        .put(object_type, id, name, &payload, None)
+        .put(
+            object_type,
+            &uuid::Uuid::new_v4().to_string(),
+            name,
+            &payload,
+            None,
+        )
         .await
         .map_err(|e| Status::internal(format!("persist settings failed: {e}")))?;
     Ok(())
@@ -2579,7 +2579,14 @@ fn materialize_global_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ServerState;
+    use crate::compute::new_test_runtime;
     use crate::persistence::Store;
+    use crate::sandbox_index::SandboxIndex;
+    use crate::sandbox_watch::SandboxWatchBus;
+    use crate::supervisor_session::SupervisorSessionRegistry;
+    use crate::tracing_bus::TracingLogBus;
+    use openshell_core::Config;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tonic::Code;
@@ -2674,6 +2681,371 @@ mod tests {
         assert_eq!(policy.version, 1);
         assert!(policy.filesystem.is_some());
         assert_eq!(policy.process.unwrap().run_as_user, "sandbox");
+    }
+
+    async fn test_server_state() -> Arc<ServerState> {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        let compute = new_test_runtime(store.clone()).await;
+        Arc::new(ServerState::new(
+            Config::new(None)
+                .with_database_url("sqlite::memory:?cache=shared")
+                .with_ssh_handshake_secret("test-secret"),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn draft_chunk_handler_lifecycle_round_trip() {
+        use openshell_core::proto::{
+            GetDraftPolicyRequest, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-draft-flow".to_string(),
+                name: "draft-flow".to_string(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+        let sandbox_name = sandbox.object_name().to_string();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "allow_example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let submit = handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "allow_example".to_string(),
+                    proposed_rule: Some(proposed_rule.clone()),
+                    rationale: "observed denied request".to_string(),
+                    confidence: 0.85,
+                    hit_count: 3,
+                    first_seen_ms: 100,
+                    last_seen_ms: 200,
+                    binary: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(submit.accepted_chunks, 1);
+        assert_eq!(submit.rejected_chunks, 0);
+
+        let draft_policy = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.clone(),
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(draft_policy.draft_version, 1);
+        assert_eq!(draft_policy.chunks.len(), 1);
+        assert_eq!(draft_policy.chunks[0].status, "pending");
+        let chunk_id = draft_policy.chunks[0].id.clone();
+
+        let approve = handle_approve_draft_chunk(
+            &state,
+            Request::new(ApproveDraftChunkRequest {
+                name: sandbox_name.clone(),
+                chunk_id: chunk_id.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(approve.policy_version, 1);
+        assert!(!approve.policy_hash.is_empty());
+
+        let history_after_approve = handle_get_draft_history(
+            &state,
+            Request::new(GetDraftHistoryRequest {
+                name: sandbox_name.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(history_after_approve.entries.len(), 2);
+        assert_eq!(history_after_approve.entries[0].event_type, "proposed");
+        assert_eq!(history_after_approve.entries[1].event_type, "approved");
+        assert_eq!(history_after_approve.entries[1].chunk_id, chunk_id);
+
+        let policies_after_approve = handle_list_sandbox_policies(
+            &state,
+            Request::new(ListSandboxPoliciesRequest {
+                name: sandbox_name.clone(),
+                limit: 10,
+                offset: 0,
+                global: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(policies_after_approve.revisions.len(), 1);
+        assert_eq!(policies_after_approve.revisions[0].version, 1);
+
+        let undo = handle_undo_draft_chunk(
+            &state,
+            Request::new(UndoDraftChunkRequest {
+                name: sandbox_name.clone(),
+                chunk_id: chunk_id.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(undo.policy_version, 2);
+        assert!(!undo.policy_hash.is_empty());
+
+        let draft_policy_after_undo = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.clone(),
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(draft_policy_after_undo.chunks.len(), 1);
+        assert_eq!(draft_policy_after_undo.chunks[0].status, "pending");
+
+        let history_after_undo = handle_get_draft_history(
+            &state,
+            Request::new(GetDraftHistoryRequest {
+                name: sandbox_name.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(history_after_undo.entries.len(), 1);
+        assert_eq!(history_after_undo.entries[0].event_type, "proposed");
+
+        let policies_after_undo = handle_list_sandbox_policies(
+            &state,
+            Request::new(ListSandboxPoliciesRequest {
+                name: sandbox_name.clone(),
+                limit: 10,
+                offset: 0,
+                global: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(policies_after_undo.revisions.len(), 2);
+        assert_eq!(policies_after_undo.revisions[0].version, 2);
+        assert_eq!(policies_after_undo.revisions[1].version, 1);
+
+        let cleared = handle_clear_draft_chunks(
+            &state,
+            Request::new(ClearDraftChunksRequest {
+                name: sandbox_name.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(cleared.chunks_cleared, 1);
+
+        let draft_policy_after_clear = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.clone(),
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(draft_policy_after_clear.chunks.is_empty());
+
+        let history_after_clear = handle_get_draft_history(
+            &state,
+            Request::new(GetDraftHistoryRequest { name: sandbox_name }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(history_after_clear.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn draft_chunk_handlers_reject_cross_sandbox_chunk_ids() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let sandbox_a = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-draft-owner".to_string(),
+                name: "draft-owner".to_string(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        let sandbox_b = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-draft-other".to_string(),
+                name: "draft-other".to_string(),
+                created_at_ms: 1_000_001,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox_a).await.unwrap();
+        state.store.put_message(&sandbox_b).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "allow_example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_a.object_name().to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "allow_example".to_string(),
+                    proposed_rule: Some(proposed_rule.clone()),
+                    rationale: "observed denied request".to_string(),
+                    confidence: 0.85,
+                    hit_count: 3,
+                    first_seen_ms: 100,
+                    last_seen_ms: 200,
+                    binary: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft_policy = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_a.object_name().to_string(),
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = draft_policy.chunks[0].id.clone();
+        let other_name = sandbox_b.object_name().to_string();
+
+        let approve_err = handle_approve_draft_chunk(
+            &state,
+            Request::new(ApproveDraftChunkRequest {
+                name: other_name.clone(),
+                chunk_id: chunk_id.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(approve_err.code(), Code::NotFound);
+
+        let reject_err = handle_reject_draft_chunk(
+            &state,
+            Request::new(RejectDraftChunkRequest {
+                name: other_name.clone(),
+                chunk_id: chunk_id.clone(),
+                reason: "wrong sandbox".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reject_err.code(), Code::NotFound);
+
+        let edit_err = handle_edit_draft_chunk(
+            &state,
+            Request::new(EditDraftChunkRequest {
+                name: other_name.clone(),
+                chunk_id: chunk_id.clone(),
+                proposed_rule: Some(proposed_rule.clone()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(edit_err.code(), Code::NotFound);
+
+        handle_approve_draft_chunk(
+            &state,
+            Request::new(ApproveDraftChunkRequest {
+                name: sandbox_a.object_name().to_string(),
+                chunk_id: chunk_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let undo_err = handle_undo_draft_chunk(
+            &state,
+            Request::new(UndoDraftChunkRequest {
+                name: other_name,
+                chunk_id,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(undo_err.code(), Code::NotFound);
     }
 
     #[test]
@@ -3401,25 +3773,9 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_settings_id_has_prefix_preventing_collision() {
-        let sandbox_id = "abc-123";
-        let settings_id = sandbox_settings_id(sandbox_id);
-        assert!(settings_id.starts_with("settings:"));
-        assert_ne!(settings_id, sandbox_id);
-    }
-
-    #[test]
-    fn sandbox_settings_id_different_sandboxes_produce_different_ids() {
-        let id_a = sandbox_settings_id("sandbox-1");
-        let id_b = sandbox_settings_id("sandbox-2");
-        assert_ne!(id_a, id_b);
-    }
-
-    #[test]
-    fn sandbox_settings_id_embeds_sandbox_id() {
-        let sandbox_id = "some-uuid-value";
-        let settings_id = sandbox_settings_id(sandbox_id);
-        assert!(settings_id.contains(sandbox_id));
+    fn sandbox_settings_names_match_sandbox_names() {
+        let sandbox_name = "my-sandbox";
+        assert_eq!(sandbox_name, "my-sandbox");
     }
 
     // ---- compute_config_revision ----
@@ -3629,17 +3985,17 @@ mod tests {
             .await
             .unwrap();
 
-        let sandbox_id = "sb-uuid-123";
+        let sandbox_name = "my-sandbox";
         let mut settings = StoredSettings::default();
         settings
             .settings
             .insert("dummy_int".to_string(), StoredSettingValue::Int(99));
         settings.revision = 3;
-        save_sandbox_settings(&store, sandbox_id, "my-sandbox", &settings)
+        save_sandbox_settings(&store, sandbox_name, &settings)
             .await
             .unwrap();
 
-        let loaded = load_sandbox_settings(&store, sandbox_id).await.unwrap();
+        let loaded = load_sandbox_settings(&store, sandbox_name).await.unwrap();
         assert_eq!(loaded.revision, 3);
         assert_eq!(
             loaded.settings.get("dummy_int"),
@@ -3784,8 +4140,8 @@ mod tests {
         let loaded = load_global_settings(&store).await.unwrap();
         assert!(!loaded.settings.contains_key("log_level"));
 
-        let sandbox_id = "test-sandbox-uuid";
-        let mut sandbox_settings = load_sandbox_settings(&store, sandbox_id).await.unwrap();
+        let sandbox_name = "test-sandbox";
+        let mut sandbox_settings = load_sandbox_settings(&store, sandbox_name).await.unwrap();
         let changed = upsert_setting_value(
             &mut sandbox_settings.settings,
             "log_level",
@@ -3793,11 +4149,11 @@ mod tests {
         );
         assert!(changed);
         sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
-        save_sandbox_settings(&store, sandbox_id, "test-sandbox", &sandbox_settings)
+        save_sandbox_settings(&store, sandbox_name, &sandbox_settings)
             .await
             .unwrap();
 
-        let reloaded = load_sandbox_settings(&store, sandbox_id).await.unwrap();
+        let reloaded = load_sandbox_settings(&store, sandbox_name).await.unwrap();
         assert_eq!(
             reloaded.settings.get("log_level"),
             Some(&StoredSettingValue::String("debug".to_string())),

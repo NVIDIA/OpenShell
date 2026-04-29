@@ -64,7 +64,8 @@ impl FromStr for ImagePullPolicy {
 #[derive(Clone)]
 pub struct PodmanComputeConfig {
     /// Path to the Podman API Unix socket.
-    /// Default: `$XDG_RUNTIME_DIR/podman/podman.sock`
+    /// Default: `$XDG_RUNTIME_DIR/podman/podman.sock` (Linux),
+    /// `$HOME/.local/share/containers/podman/machine/podman.sock` (macOS).
     pub socket_path: PathBuf,
     /// Default OCI image for sandboxes.
     pub default_image: String,
@@ -106,18 +107,26 @@ pub struct PodmanComputeConfig {
 impl PodmanComputeConfig {
     /// Resolve the default socket path from the environment.
     ///
-    /// Uses `$XDG_RUNTIME_DIR` when available (set by `pam_systemd`/logind),
-    /// otherwise falls back to the real UID via `getuid()` — matching how the
-    /// Podman CLI itself resolves the rootless socket path.
+    /// - **macOS**: `$HOME/.local/share/containers/podman/machine/podman.sock`
+    ///   (the symlink created by `podman machine` pointing to the VM API socket).
+    /// - **Linux**: `$XDG_RUNTIME_DIR/podman/podman.sock` when set (by
+    ///   `pam_systemd`/logind), otherwise `/run/user/{uid}/podman/podman.sock`
+    ///   using the real UID via `getuid()`.
     #[must_use]
     pub fn default_socket_path() -> PathBuf {
-        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-            PathBuf::from(xdg).join("podman/podman.sock")
-        } else {
-            // Use the real UID from the kernel — reliable in containers,
-            // systemd services, CI, and after su/sudo.
-            let uid = nix::unistd::getuid();
-            PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
+        #[cfg(target_os = "macos")]
+        {
+            let home = std::env::var("HOME").expect("HOME must be set on macOS");
+            PathBuf::from(home).join(".local/share/containers/podman/machine/podman.sock")
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+                PathBuf::from(xdg).join("podman/podman.sock")
+            } else {
+                let uid = nix::unistd::getuid();
+                PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
+            }
         }
     }
 }
@@ -172,6 +181,7 @@ mod tests {
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn default_socket_path_respects_xdg_runtime_dir() {
         let _guard = ENV_LOCK
             .lock()
@@ -183,6 +193,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn default_socket_path_falls_back_to_uid() {
         let _guard = ENV_LOCK
             .lock()
@@ -193,6 +204,21 @@ mod tests {
             assert_eq!(
                 path,
                 PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
+            );
+        });
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn default_socket_path_uses_podman_machine_on_macos() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        temp_env::with_vars([("HOME", Some("/Users/testuser"))], || {
+            let path = PodmanComputeConfig::default_socket_path();
+            assert_eq!(
+                path,
+                PathBuf::from("/Users/testuser/.local/share/containers/podman/machine/podman.sock")
             );
         });
     }

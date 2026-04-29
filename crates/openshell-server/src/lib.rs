@@ -27,6 +27,7 @@ mod http;
 mod inference;
 mod multiplex;
 mod persistence;
+pub(crate) mod policy_store;
 mod sandbox_index;
 mod sandbox_watch;
 mod ssh_sessions;
@@ -42,9 +43,9 @@ use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-use compute::{ComputeRuntime, VmComputeConfig};
+use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
@@ -89,6 +90,10 @@ pub struct ServerState {
     pub settings_mutex: tokio::sync::Mutex<()>,
 
     /// Registry of active supervisor sessions and pending relay channels.
+    ///
+    /// Stored as `Arc` so compute drivers (e.g. the Docker driver)
+    /// can be constructed before `ServerState` and still
+    /// query session state to surface supervisor readiness.
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 }
 
@@ -136,13 +141,15 @@ impl ServerState {
 pub async fn run_server(
     config: Config,
     vm_config: VmComputeConfig,
+    docker_config: DockerComputeConfig,
     tracing_log_bus: TracingLogBus,
 ) -> Result<()> {
     let database_url = config.database_url.trim();
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
-    if config.ssh_handshake_secret.is_empty() {
+    let driver = configured_compute_driver(&config)?;
+    if config.ssh_handshake_secret.is_empty() && driver != ComputeDriverKind::Docker {
         return Err(Error::config(
             "ssh_handshake_secret is required. Set --ssh-handshake-secret or OPENSHELL_SSH_HANDSHAKE_SECRET",
         ));
@@ -156,6 +163,7 @@ pub async fn run_server(
     let compute = build_compute_runtime(
         &config,
         &vm_config,
+        &docker_config,
         store.clone(),
         sandbox_index.clone(),
         sandbox_watch_bus.clone(),
@@ -172,6 +180,14 @@ pub async fn run_server(
         tracing_log_bus,
         supervisor_sessions,
     ));
+
+    // Resume sandboxes that were stopped during the previous gateway
+    // shutdown so the running compute state matches the persisted store.
+    // Runs before watchers spawn so the watch loop sees the post-resume
+    // snapshot on its first poll.
+    if let Err(err) = state.compute.resume_persisted_sandboxes().await {
+        warn!(error = %err, "Failed to resume persisted sandboxes during startup");
+    }
 
     state.compute.spawn_watchers();
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
@@ -244,13 +260,24 @@ pub async fn run_server(
         None
     };
 
-    // Accept connections
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    // Accept connections until the gateway receives a graceful shutdown signal.
     loop {
-        let (stream, addr) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                error!(error = %e, "Failed to accept connection");
-                continue;
+        let (stream, addr) = tokio::select! {
+            _ = &mut shutdown => {
+                info!("Shutdown signal received; stopping gateway");
+                break;
+            }
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        error!(error = %e, "Failed to accept connection");
+                        continue;
+                    }
+                }
             }
         };
 
@@ -282,11 +309,53 @@ pub async fn run_server(
             });
         }
     }
+
+    state
+        .compute
+        .cleanup_on_shutdown()
+        .await
+        .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
+
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        tokio::select! {
+            _ = ctrl_c_signal() => {}
+            _ = terminate_signal() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c_signal().await;
+    }
+}
+
+async fn ctrl_c_signal() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        warn!(error = %err, "Failed to install Ctrl-C signal handler");
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_signal() {
+    let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    else {
+        warn!("Failed to install SIGTERM signal handler");
+        std::future::pending::<()>().await;
+        return;
+    };
+    let _ = signal.recv().await;
 }
 
 async fn build_compute_runtime(
     config: &Config,
     vm_config: &VmComputeConfig,
+    docker_config: &DockerComputeConfig,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -320,6 +389,17 @@ async fn build_compute_runtime(
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions.clone(),
+        )
+        .await
+        .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
+        ComputeDriverKind::Docker => ComputeRuntime::new_docker(
+            config.clone(),
+            docker_config.clone(),
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
         )
         .await
         .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
@@ -392,11 +472,10 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
         [] => Err(Error::config(
             "at least one compute driver must be configured",
         )),
-        [
-            driver @ (ComputeDriverKind::Kubernetes
-            | ComputeDriverKind::Vm
-            | ComputeDriverKind::Podman),
-        ] => Ok(*driver),
+        [driver @ ComputeDriverKind::Kubernetes]
+        | [driver @ ComputeDriverKind::Vm]
+        | [driver @ ComputeDriverKind::Docker]
+        | [driver @ ComputeDriverKind::Podman] => Ok(*driver),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
             drivers
@@ -468,6 +547,15 @@ mod tests {
         assert_eq!(
             configured_compute_driver(&config).unwrap(),
             ComputeDriverKind::Vm
+        );
+    }
+
+    #[test]
+    fn configured_compute_driver_accepts_docker() {
+        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Docker]);
+        assert_eq!(
+            configured_compute_driver(&config).unwrap(),
+            ComputeDriverKind::Docker
         );
     }
 }

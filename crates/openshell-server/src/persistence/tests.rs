@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ObjectId, ObjectLabels, ObjectName, ObjectType, Store, generate_name};
-use openshell_core::proto::ObjectForTest;
+use super::{ObjectType, Store, generate_name};
+use crate::policy_store::PolicyStoreExt;
+use openshell_core::proto::{ObjectForTest, SandboxPolicy};
+use prost::Message;
 
 #[tokio::test]
 async fn sqlite_put_get_round_trip() {
@@ -206,11 +208,19 @@ async fn sqlite_name_unique_per_object_type() {
         .await
         .unwrap();
 
-    // Same name, same object_type, different id -> should fail (unique constraint).
-    let result = store
+    // Same name, same object_type, different id -> upsert on name.
+    store
         .put("sandbox", "id-2", "shared-name", b"payload2", None)
-        .await;
-    assert!(result.is_err());
+        .await
+        .unwrap();
+
+    let record = store
+        .get_by_name("sandbox", "shared-name")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.id, "id-1");
+    assert_eq!(record.payload, b"payload2");
 
     // Same name, different object_type -> should succeed.
     store
@@ -230,13 +240,12 @@ async fn sqlite_id_globally_unique() {
         .await
         .unwrap();
 
-    // Same id, different object_type -> the upsert is a no-op (WHERE
-    // clause prevents updating a row with a different object_type).
-    // The original row is preserved unchanged.
-    store
+    // Same id, different object_type -> should fail because ids remain global
+    // primary keys even when writes upsert on name.
+    let result = store
         .put("secret", "same-id", "name-b", b"payload2", None)
-        .await
-        .unwrap();
+        .await;
+    assert!(result.is_err());
 
     // Original row is untouched.
     let record = store.get("sandbox", "same-id").await.unwrap().unwrap();
@@ -461,8 +470,9 @@ async fn policy_put_and_get_latest() {
         .await
         .unwrap();
 
+    let policy_v1 = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, b"policy-v1", "hash1")
+        .put_policy_revision("p1", "sandbox-1", 1, &policy_v1, "hash1")
         .await
         .unwrap();
 
@@ -470,11 +480,16 @@ async fn policy_put_and_get_latest() {
     assert_eq!(latest.version, 1);
     assert_eq!(latest.policy_hash, "hash1");
     assert_eq!(latest.status, "pending");
-    assert_eq!(latest.policy_payload, b"policy-v1");
+    assert_eq!(latest.policy_payload, policy_v1);
 
     // Add version 2
+    let policy_v2 = SandboxPolicy {
+        version: 2,
+        ..SandboxPolicy::default()
+    }
+    .encode_to_vec();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, b"policy-v2", "hash2")
+        .put_policy_revision("p2", "sandbox-1", 2, &policy_v2, "hash2")
         .await
         .unwrap();
 
@@ -489,12 +504,18 @@ async fn policy_get_by_version() {
         .await
         .unwrap();
 
+    let policy_v1 = SandboxPolicy::default().encode_to_vec();
+    let policy_v2 = SandboxPolicy {
+        version: 2,
+        ..SandboxPolicy::default()
+    }
+    .encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .put_policy_revision("p1", "sandbox-1", 1, &policy_v1, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, b"v2", "h2")
+        .put_policy_revision("p2", "sandbox-1", 2, &policy_v2, "h2")
         .await
         .unwrap();
 
@@ -524,8 +545,9 @@ async fn policy_update_status_and_get_loaded() {
         .await
         .unwrap();
 
+    let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
         .await
         .unwrap();
 
@@ -556,8 +578,9 @@ async fn policy_status_failed_with_error() {
         .await
         .unwrap();
 
+    let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
         .await
         .unwrap();
 
@@ -581,16 +604,17 @@ async fn policy_supersede_older() {
         .await
         .unwrap();
 
+    let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, b"v2", "h2")
+        .put_policy_revision("p2", "sandbox-1", 2, &payload, "h2")
         .await
         .unwrap();
     store
-        .put_policy_revision("p3", "sandbox-1", 3, b"v3", "h3")
+        .put_policy_revision("p3", "sandbox-1", 3, &payload, "h3")
         .await
         .unwrap();
 
@@ -635,16 +659,17 @@ async fn policy_list_ordered_by_version_desc() {
         .await
         .unwrap();
 
+    let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, b"v2", "h2")
+        .put_policy_revision("p2", "sandbox-1", 2, &payload, "h2")
         .await
         .unwrap();
     store
-        .put_policy_revision("p3", "sandbox-1", 3, b"v3", "h3")
+        .put_policy_revision("p3", "sandbox-1", 3, &payload, "h3")
         .await
         .unwrap();
 
@@ -667,20 +692,26 @@ async fn policy_isolation_between_sandboxes() {
         .await
         .unwrap();
 
+    let policy_s1 = SandboxPolicy::default().encode_to_vec();
+    let policy_s2 = SandboxPolicy {
+        version: 7,
+        ..SandboxPolicy::default()
+    }
+    .encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .put_policy_revision("p1", "sandbox-1", 1, &policy_s1, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-2", 1, b"v1-s2", "h2")
+        .put_policy_revision("p2", "sandbox-2", 1, &policy_s2, "h2")
         .await
         .unwrap();
 
     let s1 = store.get_latest_policy("sandbox-1").await.unwrap().unwrap();
     let s2 = store.get_latest_policy("sandbox-2").await.unwrap().unwrap();
 
-    assert_eq!(s1.policy_payload, b"v1");
-    assert_eq!(s2.policy_payload, b"v1-s2");
+    assert_eq!(s1.policy_payload, policy_s1);
+    assert_eq!(s2.policy_payload, policy_s2);
 }
 
 // ---- Label selector parsing tests ----

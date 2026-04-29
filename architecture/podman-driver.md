@@ -217,7 +217,7 @@ If the container is already gone during inspect or remove, the driver still perf
 
 | Environment Variable | CLI Flag | Default | Description |
 |---------------------|----------|---------|-------------|
-| `OPENSHELL_PODMAN_SOCKET` | `--podman-socket` | `$XDG_RUNTIME_DIR/podman/podman.sock` | Podman API Unix socket path |
+| `OPENSHELL_PODMAN_SOCKET` | `--podman-socket` | `$XDG_RUNTIME_DIR/podman/podman.sock` (Linux), `$HOME/.local/share/containers/podman/machine/podman.sock` (macOS) | Podman API Unix socket path |
 | `OPENSHELL_SANDBOX_IMAGE` | `--sandbox-image` | (from gateway config) | Default OCI image for sandboxes |
 | `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY` | `--sandbox-image-pull-policy` | `missing` | Pull policy: `always`, `missing`, `never`, `newer` |
 | `OPENSHELL_GRPC_ENDPOINT` | `--grpc-endpoint` | Auto-detected via `host.containers.internal` | Gateway gRPC endpoint for sandbox callbacks |

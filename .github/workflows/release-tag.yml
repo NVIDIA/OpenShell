@@ -269,7 +269,7 @@ jobs:
         run: git fetch --tags --force
 
       - name: Install tools
-        run: mise install
+        run: mise install --locked
 
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
@@ -443,7 +443,7 @@ jobs:
         run: git fetch --tags --force
 
       - name: Install tools
-        run: mise install
+        run: mise install --locked
 
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
@@ -528,7 +528,7 @@ jobs:
         run: git fetch --tags --force
 
       - name: Install tools
-        run: mise install
+        run: mise install --locked
 
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2

@@ -6,6 +6,7 @@ on:
     paths:
       - 'deploy/docker/Dockerfile.ci'
       - 'mise.toml'
+      - 'mise.lock'
       - 'tasks/**'
       - '.github/workflows/ci-image.yml'
   workflow_dispatch:

@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 openshell-core = { path = "../openshell-core" }
+openshell-driver-docker = { path = "../openshell-driver-docker" }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
 openshell-driver-podman = { path = "../openshell-driver-podman" }
 openshell-ocsf = { path = "../openshell-ocsf" }
@@ -71,7 +72,6 @@ tokio-stream = { workspace = true }
 sqlx = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
-url = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
@@ -79,6 +79,7 @@ russh = "0.57"
 rand = "0.9"
 petname = "2"
 ipnet = "2"
+tempfile = "3"
 
 [features]
 dev-settings = ["openshell-core/dev-settings"]
@@ -86,7 +87,6 @@ dev-settings = ["openshell-core/dev-settings"]
 [dev-dependencies]
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring", "webpki-tokio"] }
 rcgen = { version = "0.13", features = ["crypto", "pem"] }
-tempfile = "3"
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 wiremock = "0.6"

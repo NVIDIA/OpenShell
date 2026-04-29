@@ -6,13 +6,65 @@
 mod postgres;
 mod sqlite;
 
-use openshell_core::{Error, Result};
+pub use openshell_core::proto::{
+    StoredDraftChunk as DraftChunkRecord, StoredPolicyRevision as PolicyRecord,
+};
+
+use openshell_core::{Error as CoreError, Result as CoreResult};
 use prost::Message;
 use rand::Rng;
 use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
 
 pub use postgres::PostgresStore;
 pub use sqlite::SqliteStore;
+
+pub type PersistenceResult<T> = Result<T, PersistenceError>;
+
+/// Persistence-layer error type.
+#[derive(Debug, Error, Clone)]
+pub enum PersistenceError {
+    #[error("configuration error: {0}")]
+    Config(String),
+    #[error("database error: {0}")]
+    Database(String),
+    #[error("migration error: {0}")]
+    Migration(String),
+    #[error("decode error: {0}")]
+    Decode(String),
+    #[error("encode error: {0}")]
+    Encode(String),
+    #[error("unique violation{constraint_msg}")]
+    UniqueViolation {
+        constraint: Option<String>,
+        detail: Option<String>,
+        constraint_msg: String,
+    },
+}
+
+impl PersistenceError {
+    pub fn unique_violation(constraint: Option<String>, detail: Option<String>) -> Self {
+        let constraint_msg = constraint
+            .as_ref()
+            .map(|value| format!(" on {value}"))
+            .unwrap_or_default();
+        Self::UniqueViolation {
+            constraint,
+            detail,
+            constraint_msg,
+        }
+    }
+
+    pub fn is_unique_violation_on(&self, constraint: &str) -> bool {
+        matches!(
+            self,
+            Self::UniqueViolation {
+                constraint: Some(value),
+                ..
+            } if value == constraint
+        )
+    }
+}
 
 /// Stored object record.
 #[derive(Debug, Clone)]
@@ -25,20 +77,6 @@ pub struct ObjectRecord {
     pub updated_at_ms: i64,
     /// JSON-serialized labels (key-value pairs).
     pub labels: Option<String>,
-}
-
-/// Stored sandbox policy revision record.
-#[derive(Debug, Clone)]
-pub struct PolicyRecord {
-    pub id: String,
-    pub sandbox_id: String,
-    pub version: i64,
-    pub policy_payload: Vec<u8>,
-    pub policy_hash: String,
-    pub status: String,
-    pub load_error: Option<String>,
-    pub created_at_ms: i64,
-    pub loaded_at_ms: Option<i64>,
 }
 
 /// Persistence store implementations.
@@ -67,23 +105,33 @@ pub fn generate_name() -> String {
 
 impl Store {
     /// Connect to a persistence store based on the database URL.
-    pub async fn connect(url: &str) -> Result<Self> {
+    pub async fn connect(url: &str) -> CoreResult<Self> {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            let store = PostgresStore::connect(url).await?;
-            store.migrate().await?;
+            let store = PostgresStore::connect(url)
+                .await
+                .map_err(|e| CoreError::execution(e.to_string()))?;
+            store
+                .migrate()
+                .await
+                .map_err(|e| CoreError::execution(e.to_string()))?;
             Ok(Self::Postgres(store))
         } else if url.starts_with("sqlite:") {
-            let store = SqliteStore::connect(url).await?;
-            store.migrate().await?;
+            let store = SqliteStore::connect(url)
+                .await
+                .map_err(|e| CoreError::execution(e.to_string()))?;
+            store
+                .migrate()
+                .await
+                .map_err(|e| CoreError::execution(e.to_string()))?;
             Ok(Self::Sqlite(store))
         } else {
-            Err(Error::config(format!(
+            Err(CoreError::config(format!(
                 "unsupported database URL scheme: {url}"
             )))
         }
     }
 
-    /// Insert or update an object.
+    /// Insert or update a generic named object.
     pub async fn put(
         &self,
         object_type: &str,
@@ -91,7 +139,7 @@ impl Store {
         name: &str,
         payload: &[u8],
         labels: Option<&str>,
-    ) -> Result<()> {
+    ) -> PersistenceResult<()> {
         match self {
             Self::Postgres(store) => store.put(object_type, id, name, payload, labels).await,
             Self::Sqlite(store) => store.put(object_type, id, name, payload, labels).await,
@@ -99,7 +147,11 @@ impl Store {
     }
 
     /// Fetch an object by id.
-    pub async fn get(&self, object_type: &str, id: &str) -> Result<Option<ObjectRecord>> {
+    pub async fn get(
+        &self,
+        object_type: &str,
+        id: &str,
+    ) -> PersistenceResult<Option<ObjectRecord>> {
         match self {
             Self::Postgres(store) => store.get(object_type, id).await,
             Self::Sqlite(store) => store.get(object_type, id).await,
@@ -107,7 +159,11 @@ impl Store {
     }
 
     /// Fetch an object by name within an object type.
-    pub async fn get_by_name(&self, object_type: &str, name: &str) -> Result<Option<ObjectRecord>> {
+    pub async fn get_by_name(
+        &self,
+        object_type: &str,
+        name: &str,
+    ) -> PersistenceResult<Option<ObjectRecord>> {
         match self {
             Self::Postgres(store) => store.get_by_name(object_type, name).await,
             Self::Sqlite(store) => store.get_by_name(object_type, name).await,
@@ -115,7 +171,7 @@ impl Store {
     }
 
     /// Delete an object by id.
-    pub async fn delete(&self, object_type: &str, id: &str) -> Result<bool> {
+    pub async fn delete(&self, object_type: &str, id: &str) -> PersistenceResult<bool> {
         match self {
             Self::Postgres(store) => store.delete(object_type, id).await,
             Self::Sqlite(store) => store.delete(object_type, id).await,
@@ -123,7 +179,7 @@ impl Store {
     }
 
     /// Delete an object by name within an object type.
-    pub async fn delete_by_name(&self, object_type: &str, name: &str) -> Result<bool> {
+    pub async fn delete_by_name(&self, object_type: &str, name: &str) -> PersistenceResult<bool> {
         match self {
             Self::Postgres(store) => store.delete_by_name(object_type, name).await,
             Self::Sqlite(store) => store.delete_by_name(object_type, name).await,
@@ -136,7 +192,7 @@ impl Store {
         object_type: &str,
         limit: u32,
         offset: u32,
-    ) -> Result<Vec<ObjectRecord>> {
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
         match self {
             Self::Postgres(store) => store.list(object_type, limit, offset).await,
             Self::Sqlite(store) => store.list(object_type, limit, offset).await,
@@ -151,7 +207,7 @@ impl Store {
         label_selector: &str,
         limit: u32,
         offset: u32,
-    ) -> Result<Vec<ObjectRecord>> {
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
         match self {
             Self::Postgres(store) => {
                 store
@@ -161,117 +217,6 @@ impl Store {
             Self::Sqlite(store) => {
                 store
                     .list_with_selector(object_type, label_selector, limit, offset)
-                    .await
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Policy revision operations
-    // -----------------------------------------------------------------------
-
-    /// Insert a new policy revision.
-    pub async fn put_policy_revision(
-        &self,
-        id: &str,
-        sandbox_id: &str,
-        version: i64,
-        payload: &[u8],
-        hash: &str,
-    ) -> Result<()> {
-        match self {
-            Self::Postgres(store) => {
-                store
-                    .put_policy_revision(id, sandbox_id, version, payload, hash)
-                    .await
-            }
-            Self::Sqlite(store) => {
-                store
-                    .put_policy_revision(id, sandbox_id, version, payload, hash)
-                    .await
-            }
-        }
-    }
-
-    /// Get the latest policy revision for a sandbox (by highest version, any status).
-    pub async fn get_latest_policy(&self, sandbox_id: &str) -> Result<Option<PolicyRecord>> {
-        match self {
-            Self::Postgres(store) => store.get_latest_policy(sandbox_id).await,
-            Self::Sqlite(store) => store.get_latest_policy(sandbox_id).await,
-        }
-    }
-
-    /// Get the latest loaded policy revision for a sandbox.
-    pub async fn get_latest_loaded_policy(&self, sandbox_id: &str) -> Result<Option<PolicyRecord>> {
-        match self {
-            Self::Postgres(store) => store.get_latest_loaded_policy(sandbox_id).await,
-            Self::Sqlite(store) => store.get_latest_loaded_policy(sandbox_id).await,
-        }
-    }
-
-    /// Get a specific policy revision by sandbox id and version.
-    pub async fn get_policy_by_version(
-        &self,
-        sandbox_id: &str,
-        version: i64,
-    ) -> Result<Option<PolicyRecord>> {
-        match self {
-            Self::Postgres(store) => store.get_policy_by_version(sandbox_id, version).await,
-            Self::Sqlite(store) => store.get_policy_by_version(sandbox_id, version).await,
-        }
-    }
-
-    /// List policy revisions for a sandbox, ordered by version descending.
-    pub async fn list_policies(
-        &self,
-        sandbox_id: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<Vec<PolicyRecord>> {
-        match self {
-            Self::Postgres(store) => store.list_policies(sandbox_id, limit, offset).await,
-            Self::Sqlite(store) => store.list_policies(sandbox_id, limit, offset).await,
-        }
-    }
-
-    /// Update the status of a policy revision.
-    pub async fn update_policy_status(
-        &self,
-        sandbox_id: &str,
-        version: i64,
-        status: &str,
-        load_error: Option<&str>,
-        loaded_at_ms: Option<i64>,
-    ) -> Result<bool> {
-        match self {
-            Self::Postgres(store) => {
-                store
-                    .update_policy_status(sandbox_id, version, status, load_error, loaded_at_ms)
-                    .await
-            }
-            Self::Sqlite(store) => {
-                store
-                    .update_policy_status(sandbox_id, version, status, load_error, loaded_at_ms)
-                    .await
-            }
-        }
-    }
-
-    /// Mark all pending and loaded policy revisions older than `before_version` as superseded.
-    pub async fn supersede_older_policies(
-        &self,
-        sandbox_id: &str,
-        before_version: i64,
-    ) -> Result<u64> {
-        match self {
-            Self::Postgres(store) => {
-                store
-                    .supersede_older_policies(sandbox_id, before_version)
-                    .await
-            }
-            Self::Sqlite(store) => {
-                store
-                    .supersede_older_policies(sandbox_id, before_version)
                     .await
             }
         }
@@ -285,16 +230,15 @@ impl Store {
     pub async fn put_message<T: Message + ObjectType + ObjectId + ObjectName + ObjectLabels>(
         &self,
         message: &T,
-    ) -> Result<()> {
+    ) -> PersistenceResult<()> {
         // Serialize labels to JSON
         let labels_map = message.object_labels();
         let labels_json = if labels_map.as_ref().map_or(true, |m| m.is_empty()) {
             None
         } else {
-            Some(
-                serde_json::to_string(&labels_map)
-                    .map_err(|e| Error::execution(format!("failed to serialize labels: {e}")))?,
-            )
+            Some(serde_json::to_string(&labels_map).map_err(|e| {
+                PersistenceError::Encode(format!("failed to serialize labels: {e}"))
+            })?)
         };
 
         self.put(
@@ -308,161 +252,73 @@ impl Store {
     }
 
     /// Fetch and decode a protobuf message by id.
-    pub async fn get_message<T: Message + Default + ObjectType + ObjectLabels>(
+    pub async fn get_message<T: Message + Default + ObjectType>(
         &self,
         id: &str,
-    ) -> Result<Option<T>> {
+    ) -> PersistenceResult<Option<T>> {
         let record = self.get(T::object_type(), id).await?;
         let Some(record) = record else {
             return Ok(None);
         };
 
-        let message = T::decode(record.payload.as_slice())
-            .map_err(|e| Error::execution(format!("protobuf decode error: {e}")))?;
-
-        // Note: labels are already in the proto message from the payload
-        // The database `labels` column is for filtering only
-        Ok(Some(message))
+        T::decode(record.payload.as_slice())
+            .map(Some)
+            .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))
     }
 
     /// Fetch and decode a protobuf message by name.
-    pub async fn get_message_by_name<T: Message + Default + ObjectType + ObjectLabels>(
+    pub async fn get_message_by_name<T: Message + Default + ObjectType>(
         &self,
         name: &str,
-    ) -> Result<Option<T>> {
+    ) -> PersistenceResult<Option<T>> {
         let record = self.get_by_name(T::object_type(), name).await?;
         let Some(record) = record else {
             return Ok(None);
         };
 
-        let message = T::decode(record.payload.as_slice())
-            .map_err(|e| Error::execution(format!("protobuf decode error: {e}")))?;
-
-        // Note: labels are already in the proto message from the payload
-        // The database `labels` column is for filtering only
-        Ok(Some(message))
-    }
-
-    // -----------------------------------------------------------------------
-    // Draft policy chunk operations
-    // -----------------------------------------------------------------------
-
-    /// Insert a new draft policy chunk.
-    pub async fn put_draft_chunk(&self, chunk: &DraftChunkRecord) -> Result<()> {
-        match self {
-            Self::Postgres(store) => store.put_draft_chunk(chunk).await,
-            Self::Sqlite(store) => store.put_draft_chunk(chunk).await,
-        }
-    }
-
-    /// Fetch a single draft chunk by id.
-    pub async fn get_draft_chunk(&self, id: &str) -> Result<Option<DraftChunkRecord>> {
-        match self {
-            Self::Postgres(store) => store.get_draft_chunk(id).await,
-            Self::Sqlite(store) => store.get_draft_chunk(id).await,
-        }
-    }
-
-    /// List draft chunks for a sandbox, optionally filtered by status.
-    pub async fn list_draft_chunks(
-        &self,
-        sandbox_id: &str,
-        status_filter: Option<&str>,
-    ) -> Result<Vec<DraftChunkRecord>> {
-        match self {
-            Self::Postgres(store) => store.list_draft_chunks(sandbox_id, status_filter).await,
-            Self::Sqlite(store) => store.list_draft_chunks(sandbox_id, status_filter).await,
-        }
-    }
-
-    /// Update the status of a draft chunk.
-    pub async fn update_draft_chunk_status(
-        &self,
-        id: &str,
-        status: &str,
-        decided_at_ms: Option<i64>,
-    ) -> Result<bool> {
-        match self {
-            Self::Postgres(store) => {
-                store
-                    .update_draft_chunk_status(id, status, decided_at_ms)
-                    .await
-            }
-            Self::Sqlite(store) => {
-                store
-                    .update_draft_chunk_status(id, status, decided_at_ms)
-                    .await
-            }
-        }
-    }
-
-    /// Update the proposed rule on a pending draft chunk.
-    pub async fn update_draft_chunk_rule(&self, id: &str, proposed_rule: &[u8]) -> Result<bool> {
-        match self {
-            Self::Postgres(store) => store.update_draft_chunk_rule(id, proposed_rule).await,
-            Self::Sqlite(store) => store.update_draft_chunk_rule(id, proposed_rule).await,
-        }
-    }
-
-    /// Delete all draft chunks for a sandbox with a given status.
-    pub async fn delete_draft_chunks(&self, sandbox_id: &str, status: &str) -> Result<u64> {
-        match self {
-            Self::Postgres(store) => store.delete_draft_chunks(sandbox_id, status).await,
-            Self::Sqlite(store) => store.delete_draft_chunks(sandbox_id, status).await,
-        }
-    }
-
-    /// Get the current maximum draft version for a sandbox.
-    pub async fn get_draft_version(&self, sandbox_id: &str) -> Result<i64> {
-        match self {
-            Self::Postgres(store) => store.get_draft_version(sandbox_id).await,
-            Self::Sqlite(store) => store.get_draft_version(sandbox_id).await,
-        }
+        T::decode(record.payload.as_slice())
+            .map(Some)
+            .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))
     }
 }
 
-/// Stored draft policy chunk record.
-#[derive(Debug, Clone)]
-pub struct DraftChunkRecord {
-    pub id: String,
-    pub sandbox_id: String,
-    pub draft_version: i64,
-    pub status: String,
-    pub rule_name: String,
-    pub proposed_rule: Vec<u8>,
-    pub rationale: String,
-    pub security_notes: String,
-    pub confidence: f64,
-    pub created_at_ms: i64,
-    pub decided_at_ms: Option<i64>,
-    /// Denormalized endpoint host (lowercase) for DB-level dedup.
-    pub host: String,
-    /// Denormalized endpoint port for DB-level dedup.
-    pub port: i32,
-    /// Binary path that triggered the denial (for per-binary dedup).
-    pub binary: String,
-    /// How many times this endpoint has been seen across denial flush cycles.
-    pub hit_count: i32,
-    /// First time this endpoint was proposed (ms since epoch).
-    pub first_seen_ms: i64,
-    /// Most recent time this endpoint was re-proposed (ms since epoch).
-    pub last_seen_ms: i64,
-}
-
-pub fn current_time_ms() -> Result<i64> {
+pub fn current_time_ms() -> PersistenceResult<i64> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::execution(format!("time error: {e}")))?;
+        .map_err(|e| PersistenceError::Database(format!("time error: {e}")))?;
     i64::try_from(now.as_millis())
-        .map_err(|e| Error::execution(format!("time conversion error: {e}")))
+        .map_err(|e| PersistenceError::Database(format!("time conversion error: {e}")))
 }
 
-fn map_db_error(error: &sqlx::Error) -> Error {
-    Error::execution(format!("database error: {error}"))
+fn map_db_error(error: &sqlx::Error) -> PersistenceError {
+    if let sqlx::Error::Database(db) = error {
+        if db.is_unique_violation() {
+            let constraint = db
+                .constraint()
+                .map(ToString::to_string)
+                .or_else(|| infer_sqlite_unique_constraint(db.message()));
+            return PersistenceError::unique_violation(constraint, Some(db.message().to_string()));
+        }
+    }
+    PersistenceError::Database(error.to_string())
 }
 
-fn map_migrate_error(error: &sqlx::migrate::MigrateError) -> Error {
-    Error::execution(format!("migration error: {error}"))
+fn infer_sqlite_unique_constraint(message: &str) -> Option<String> {
+    if message.contains("objects.object_type, objects.scope, objects.version") {
+        Some("objects_version_uq".to_string())
+    } else if message.contains("objects.object_type, objects.scope, objects.dedup_key") {
+        Some("objects_dedup_uq".to_string())
+    } else if message.contains("objects.object_type, objects.name") {
+        Some("objects_name_uq".to_string())
+    } else if message.contains("objects.id") {
+        Some("objects_pkey".to_string())
+    } else {
+        None
+    }
+}
+
+fn map_migrate_error(error: &sqlx::migrate::MigrateError) -> PersistenceError {
+    PersistenceError::Migration(error.to_string())
 }
 
 /// Parse a simple label selector string into key-value pairs.
@@ -472,7 +328,9 @@ fn map_migrate_error(error: &sqlx::migrate::MigrateError) -> Error {
 /// Note: Input validation should be performed at the gRPC layer using
 /// `grpc::validation::validate_label_selector()` before calling this function.
 /// Errors returned here indicate unexpected internal errors, not user input errors.
-pub fn parse_label_selector(selector: &str) -> Result<std::collections::HashMap<String, String>> {
+pub fn parse_label_selector(
+    selector: &str,
+) -> PersistenceResult<std::collections::HashMap<String, String>> {
     if selector.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
@@ -486,7 +344,7 @@ pub fn parse_label_selector(selector: &str) -> Result<std::collections::HashMap<
 
         let parts: Vec<&str> = pair.splitn(2, '=').collect();
         if parts.len() != 2 {
-            return Err(Error::execution(format!(
+            return Err(PersistenceError::Decode(format!(
                 "invalid label selector: expected 'key=value', got '{pair}'"
             )));
         }
@@ -495,7 +353,7 @@ pub fn parse_label_selector(selector: &str) -> Result<std::collections::HashMap<
         let value = parts[1].trim();
 
         if key.is_empty() {
-            return Err(Error::execution(format!(
+            return Err(PersistenceError::Decode(format!(
                 "invalid label selector: key cannot be empty in '{pair}'"
             )));
         }

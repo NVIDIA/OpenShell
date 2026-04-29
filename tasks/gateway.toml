@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Standalone gateway tasks
+
+["gateway:docker"]
+description = "Run a standalone gateway with the bundled Docker compute driver"
+run = "bash tasks/scripts/gateway-docker.sh"

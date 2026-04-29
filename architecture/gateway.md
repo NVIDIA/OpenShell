@@ -73,6 +73,7 @@ graph TD
 | Persistence | `crates/openshell-server/src/persistence/mod.rs` | `Store` enum (SQLite/Postgres), generic object CRUD, protobuf codec |
 | Compute runtime | `crates/openshell-server/src/compute/mod.rs` | `ComputeRuntime`, gateway-owned sandbox lifecycle orchestration over a compute backend |
 | Compute driver: Kubernetes | `crates/openshell-driver-kubernetes/src/driver.rs` | Kubernetes CRD create/delete/watch, pod template translation |
+| Compute driver: Docker | `crates/openshell-driver-docker/src/lib.rs` | Local Docker container create/stop/delete/watch |
 | Compute driver: VM | `crates/openshell-driver-vm/src/driver.rs` | Per-sandbox microVM create/delete/watch, supervisor-only guest boot |
 | Sandbox index | `crates/openshell-server/src/sandbox_index.rs` | `SandboxIndex` -- in-memory name/pod-to-id correlation |
 | Watch bus | `crates/openshell-server/src/sandbox_watch.rs` | `SandboxWatchBus` -- in-memory broadcast for persisted sandbox updates |
@@ -100,6 +101,7 @@ The gateway boots in `cli::run_cli` (`crates/openshell-server/src/cli.rs`) and p
    1. Connect to the persistence store (`Store::connect`), which auto-detects SQLite vs Postgres from the URL prefix and runs migrations.
    2. Create `ComputeRuntime` with a `ComputeDriver` implementation selected by `OPENSHELL_DRIVERS`:
       - `kubernetes` wraps `KubernetesComputeDriver` in `ComputeDriverService`, so the gateway uses the `openshell.compute.v1.ComputeDriver` RPC surface even without transport.
+      - `docker` constructs `openshell-driver-docker` in-process and manages local containers labeled with the configured sandbox namespace.
       - `vm` spawns the standalone `openshell-driver-vm` binary as a local compute-driver process, resolves it from `--driver-dir`, conventional libexec install paths, or a sibling of the gateway binary, connects to it over a Unix domain socket, and keeps the libkrun/rootfs runtime out of the gateway binary.
    3. Build `ServerState` (shared via `Arc<ServerState>` across all handlers), including a fresh `SupervisorSessionRegistry`.
    4. **Spawn background tasks**:
@@ -113,7 +115,7 @@ The gateway boots in `cli::run_cli` (`crates/openshell-server/src/cli.rs`) and p
 
 ## Configuration
 
-All configuration is via CLI flags with environment variable fallbacks. The `--db-url` and `--ssh-handshake-secret` flags are required.
+All configuration is via CLI flags with environment variable fallbacks. The `--db-url` flag is required. The `--ssh-handshake-secret` flag is required for non-Docker drivers; Docker sandboxes do not receive a handshake secret.
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
@@ -129,7 +131,7 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 | `--sandbox-namespace` | `OPENSHELL_SANDBOX_NAMESPACE` | `default` | Kubernetes namespace for sandbox CRDs |
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | None | Default container image for sandbox pods |
 | `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | None | gRPC endpoint reachable from within the cluster (for supervisor callbacks) |
-| `--drivers` | `OPENSHELL_DRIVERS` | `kubernetes` | Compute backend to use. Current options are `kubernetes` and `vm`. |
+| `--drivers` | `OPENSHELL_DRIVERS` | `kubernetes` | Compute backend to use. Current options are `kubernetes`, `docker`, and `vm`. |
 | `--vm-driver-state-dir` | `OPENSHELL_VM_DRIVER_STATE_DIR` | `target/openshell-vm-driver` | Host directory for VM sandbox rootfs, console logs, and runtime state |
 | `--driver-dir` | `OPENSHELL_DRIVER_DIR` | unset | Override directory for `openshell-driver-vm`. When unset, the gateway searches `~/.local/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`, then a sibling binary. |
 | `--vm-krun-log-level` | `OPENSHELL_VM_KRUN_LOG_LEVEL` | `1` | libkrun log level for VM helper processes |
@@ -595,6 +597,18 @@ The Helm chart template is at `deploy/helm/openshell/templates/statefulset.yaml`
 - **Stop**: `proto/compute_driver.proto` reserves `StopSandbox` for a non-destructive lifecycle transition. Resume is intentionally not a dedicated compute-driver RPC; the gateway auto-resumes a stopped sandbox when a client connects or executes into it.
 
 The gateway reaches the sandbox exclusively through the supervisor-initiated `ConnectSupervisor` session, so the driver never returns sandbox network endpoints.
+
+### Docker Driver
+
+The Docker driver (`crates/openshell-driver-docker/src/lib.rs`) is an in-process compute backend for local standalone gateways. It creates one Docker container per sandbox, labels each container with `openshell.ai/managed-by=openshell`, `openshell.ai/sandbox-id`, `openshell.ai/sandbox-name`, and `openshell.ai/sandbox-namespace`, and bind-mounts a Linux `openshell-sandbox` supervisor binary into the container.
+
+- **Create**: Pulls or validates the sandbox image according to `sandbox_image_pull_policy`, creates a labeled container, mounts the supervisor binary and optional TLS material, and starts the container with the supervisor as entrypoint.
+- **List/Get/Watch**: Reads labeled containers in the configured sandbox namespace and derives driver-native sandbox status from Docker state plus supervisor relay readiness.
+- **Stop**: Stops the matching labeled container without deleting it.
+- **Delete**: Force-removes the matching labeled container.
+- **Gateway shutdown**: On SIGINT or SIGTERM, `run_server()` leaves the accept loop and calls the Docker shutdown cleanup hook. The hook stops all running, restarting, or paused OpenShell-managed containers in the configured sandbox namespace so local sandboxes do not keep running after the gateway exits.
+- **Gateway startup resume**: Before the watch and reconcile loops spawn, `ComputeRuntime::resume_persisted_sandboxes()` walks every sandbox record in the store. For each sandbox whose phase is `Provisioning`, `Ready`, or `Unknown`, it asks the Docker driver to start the labeled container if it is in the `exited` or `created` state (`StartupResume::resume_sandbox`). Containers in `running` or `restarting` are left alone; `paused`, `dead`, and `removing` are skipped. If the matching container has disappeared, the sandbox is moved to phase `Error` with reason `BackendResourceMissing`; if the start call fails, the sandbox moves to `Error` with reason `ResumeFailed`. This is what makes sandboxes survive a graceful gateway restart end-to-end: shutdown stops them, the next startup resumes them, and the store remains the source of truth across the cycle. Drivers that do not need this hook (Kubernetes, Podman, VM) leave `startup_resume = None`, which makes the resume sweep a no-op.
+- **Handshake secret**: The Docker driver does not inject `OPENSHELL_SSH_HANDSHAKE_SECRET` or `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS` into containers. Supervisor relay auth relies on the gateway connection rather than a Docker-visible container env secret.
 
 ### VM Driver
 

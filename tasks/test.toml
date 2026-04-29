@@ -56,3 +56,7 @@ run = "e2e/rust/e2e-podman.sh"
 ["e2e:vm"]
 description = "Start openshell-gateway with the VM compute driver and run the cluster-agnostic smoke e2e"
 run = "e2e/rust/e2e-vm.sh"
+
+["e2e:docker"]
+description = "Run smoke e2e against a standalone gateway with the Docker compute driver"
+run = "e2e/rust/e2e-docker.sh"

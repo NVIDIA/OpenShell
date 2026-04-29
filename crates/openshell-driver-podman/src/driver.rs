@@ -58,11 +58,19 @@ impl PodmanComputeDriver {
     /// Create a new driver, verifying the Podman socket is reachable.
     pub async fn new(mut config: PodmanComputeConfig) -> Result<Self, PodmanApiError> {
         if !config.socket_path.exists() {
-            warn!(
-                path = %config.socket_path.display(),
-                "Podman socket not found; is the Podman service running? \
-                 Set OPENSHELL_PODMAN_SOCKET or XDG_RUNTIME_DIR to override."
-            );
+            if cfg!(target_os = "macos") {
+                warn!(
+                    path = %config.socket_path.display(),
+                    "Podman socket not found; is podman machine running? \
+                     Try `podman machine start` or set OPENSHELL_PODMAN_SOCKET to override."
+                );
+            } else {
+                warn!(
+                    path = %config.socket_path.display(),
+                    "Podman socket not found; is the Podman service running? \
+                     Set OPENSHELL_PODMAN_SOCKET or XDG_RUNTIME_DIR to override."
+                );
+            }
         }
 
         let client = PodmanClient::new(config.socket_path.clone());

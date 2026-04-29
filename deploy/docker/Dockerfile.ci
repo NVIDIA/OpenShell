@@ -65,18 +65,19 @@ RUN case "$TARGETARCH" in \
     && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${gh_arch}.tar.gz" \
     | tar xz --strip-components=2 -C /usr/local/bin "gh_${GH_VERSION}_linux_${gh_arch}/bin/gh"
 
-# Install mise
-ARG MISE_VERSION=v2026.4.20
+# Install mise (NOTE: keep this version in sync with mise.toml)
+ARG MISE_VERSION=v2026.4.25
 RUN curl https://mise.run | MISE_VERSION=$MISE_VERSION sh
 
 # Copy mise.toml and task includes, then install all tools via mise
 COPY mise.toml /opt/mise/mise.toml
+COPY mise.lock /opt/mise/mise.lock
 COPY tasks/ /opt/mise/tasks/
 WORKDIR /opt/mise
 RUN --mount=type=secret,id=MISE_GITHUB_TOKEN \
     export MISE_GITHUB_TOKEN="$(cat /run/secrets/MISE_GITHUB_TOKEN 2>/dev/null || true)" && \
     mise trust /opt/mise/mise.toml && \
-    env -u RUSTC_WRAPPER mise install && \
+    env -u RUSTC_WRAPPER mise install --locked && \
     mise reshim && \
     npm install -g "npm@${NPM_VERSION}" && \
     mise reshim && \
