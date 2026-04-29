@@ -153,9 +153,10 @@ Requires=podman.service
 Type=exec
 # Self-contained defaults for rootless operation.
 #
-# WARNING: TLS is disabled. The gateway has NO authentication and
-# listens on all interfaces. For network-exposed setups, configure
-# mTLS certificates and remove OPENSHELL_DISABLE_TLS.
+# WARNING: TLS is disabled. The gateway has NO authentication.
+# It binds to localhost by default; if you change OPENSHELL_BIND_HOST
+# to a non-loopback address, configure mTLS certificates and remove
+# OPENSHELL_DISABLE_TLS.
 #
 # The SSH handshake secret is auto-generated on first start into
 # ~/.config/openshell/gateway.env (mode 0600). To override, edit
@@ -165,6 +166,7 @@ Type=exec
 # %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
 ExecStartPre=/bin/sh -c 'ENV=%%E/openshell/gateway.env; [ -f "$ENV" ] || { mkdir -p %%E/openshell && echo "OPENSHELL_SSH_HANDSHAKE_SECRET=$(od -An -tx1 -N32 /dev/urandom | tr -dc 0-9a-f)" > "$ENV" && chmod 600 "$ENV"; }'
 EnvironmentFile=-%%E/openshell/gateway.env
+Environment=OPENSHELL_BIND_HOST=127.0.0.1
 Environment=OPENSHELL_DRIVERS=podman
 Environment=OPENSHELL_DB_URL=sqlite://%%S/openshell/gateway.db
 Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor-sideload:latest
@@ -220,14 +222,21 @@ OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor-sideload:latest
 # Default sandbox base image.
 OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 
+# Bind the gateway to localhost only (single-host use case).
+# Change to 0.0.0.0 if the gateway must accept connections from
+# other hosts on the network.
+OPENSHELL_BIND_HOST=127.0.0.1
+
 # ---- SECURITY WARNING ----
 # TLS is disabled by default for ease of initial setup. With TLS
-# disabled, the gateway has NO authentication and listens on ALL
-# network interfaces (0.0.0.0:8080). Any host that can reach this
-# port has full unauthenticated access to the API, including sandbox
-# creation, command execution, and credential retrieval.
+# disabled, the gateway has NO authentication. The default bind
+# address is localhost (127.0.0.1), limiting access to the local
+# machine. If you change OPENSHELL_BIND_HOST to a non-loopback
+# address, any host that can reach the gateway port has full
+# unauthenticated access to the API, including sandbox creation,
+# command execution, and credential retrieval.
 #
-# For any deployment beyond single-user localhost testing:
+# For any network-exposed deployment:
 #   1. Generate mTLS certificates (see OpenShell docs)
 #   2. Set OPENSHELL_TLS_CERT, OPENSHELL_TLS_KEY, OPENSHELL_TLS_CLIENT_CA
 #   3. Comment out OPENSHELL_DISABLE_TLS below
