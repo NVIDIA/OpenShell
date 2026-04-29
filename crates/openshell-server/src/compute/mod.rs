@@ -1517,6 +1517,7 @@ impl ComputeDriver for NoopTestDriver {
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 supports_gpu: false,
+                gpu_count: 0,
             },
         ))
     }

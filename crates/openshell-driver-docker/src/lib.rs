@@ -231,6 +231,7 @@ impl DockerComputeDriver {
             driver_version: self.config.daemon_version.clone(),
             default_image: self.config.default_image.clone(),
             supports_gpu: false,
+            gpu_count: 0,
         }
     }
 

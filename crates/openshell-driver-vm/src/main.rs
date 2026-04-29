@@ -5,6 +5,8 @@ use clap::Parser;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+#[cfg(target_os = "macos")]
+use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, procguard, run_vm};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -120,6 +122,9 @@ struct Args {
 
     #[arg(long, hide = true)]
     vm_guest_mac: Option<String>,
+
+    #[arg(long, hide = true)]
+    vm_gateway_port: Option<u16>,
 }
 
 #[tokio::main]
@@ -246,6 +251,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         host_ip: args.vm_host_ip.clone(),
         vsock_cid: args.vm_vsock_cid,
         guest_mac: args.vm_guest_mac.clone(),
+        gateway_port: args.vm_gateway_port,
     })
 }
 

@@ -47,6 +47,7 @@ pub struct VmLaunchConfig {
     pub host_ip: Option<String>,
     pub vsock_cid: Option<u32>,
     pub guest_mac: Option<String>,
+    pub gateway_port: Option<u16>,
 }
 
 pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
@@ -108,10 +109,11 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
 
     std::fs::create_dir_all(&shm_path).map_err(|e| format!("create shm dir: {e}"))?;
 
-    let runtime_dir = configured_runtime_dir()?;
+    let runtime_dir = qemu_runtime_dir()?;
 
-    setup_tap_networking(tap_device, host_ip)?;
-    let mut tap_guard = TapGuard::new(tap_device.to_string(), host_ip.to_string());
+    let gw_port = config.gateway_port.unwrap_or(0);
+    setup_tap_networking(tap_device, host_ip, gw_port)?;
+    let mut tap_guard = TapGuard::new(tap_device.to_string(), host_ip.to_string(), gw_port);
 
     let virtiofsd_log = sandbox_dir.join("virtiofsd.log");
     let virtiofsd_log_file =
@@ -200,7 +202,11 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
             "tap,id=net0,ifname={tap_device},script=no,downscript=no"
         ))
         .arg("-device")
-        .arg(format!("virtio-net-pci,netdev=net0,mac={guest_mac}"))
+        .arg("pcie-root-port,id=net_root,slot=3")
+        .arg("-device")
+        .arg(format!(
+            "virtio-net-pci-non-transitional,netdev=net0,mac={guest_mac},bus=net_root"
+        ))
         .arg("-device")
         .arg("pcie-root-port,id=vsock_root,slot=1")
         .arg("-device")
@@ -247,7 +253,7 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     }
     virtiofsd_guard.disarm();
     GVPROXY_PID.store(0, Ordering::Relaxed);
-    teardown_tap_networking(tap_device, host_ip);
+    teardown_tap_networking(tap_device, host_ip, gw_port);
     tap_guard.disarm();
     let _ = std::fs::remove_dir_all(&shm_path);
     let _ = std::fs::remove_dir_all(&virtiofsd_sock_dir);
@@ -338,13 +344,71 @@ fn host_dns_server() -> Option<String> {
     None
 }
 
-fn setup_tap_networking(tap_device: &str, host_ip: &str) -> Result<(), String> {
+/// Remove leftover `vmtap-*` interfaces from previous driver runs that
+/// were not torn down (e.g. the launcher was SIGKILLed before teardown).
+/// Called once at driver startup so stale interfaces cannot cause subnet
+/// routing conflicts with newly allocated TAPs.
+pub fn cleanup_stale_tap_interfaces() {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("vmtap-") {
+            continue;
+        }
+        // Read the IP address so we can clean up iptables rules too.
+        // Port 0 tells teardown we don't know the original gateway port;
+        // the blanket legacy rule is still cleaned up best-effort.
+        let ip = read_tap_host_ip(name);
+        if let Some(ref host_ip) = ip {
+            teardown_tap_networking(name, host_ip, 0);
+        } else {
+            let _ = run_cmd("ip", &["link", "set", name, "down"]);
+            let _ = run_cmd("ip", &["tuntap", "del", "dev", name, "mode", "tap"]);
+        }
+        tracing::warn!(interface = %name, "removed stale TAP interface from previous run");
+    }
+}
+
+/// Read the first IPv4 address assigned to a network interface.
+fn read_tap_host_ip(device: &str) -> Option<String> {
+    let output = StdCommand::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", device])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Format: "28: vmtap-xxx    inet 10.0.128.1/30 ..."
+    for token in stdout.split_whitespace() {
+        if let Some((ip, _prefix)) = token.split_once('/') {
+            if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                return Some(ip.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn setup_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) -> Result<(), String> {
     run_cmd("ip", &["tuntap", "add", "dev", tap_device, "mode", "tap"])?;
     run_cmd(
         "ip",
         &["addr", "add", &format!("{host_ip}/30"), "dev", tap_device],
     )?;
     run_cmd("ip", &["link", "set", tap_device, "up"])?;
+
+    // Deprioritize routes through down interfaces so a stale vmtap-*
+    // that somehow survives cleanup cannot shadow the active one.
+    let _ = std::fs::write(
+        format!("/proc/sys/net/ipv4/conf/{tap_device}/ignore_routes_with_linkdown"),
+        "1",
+    );
 
     enable_ip_forwarding()?;
 
@@ -413,11 +477,28 @@ fn setup_tap_networking(tap_device: &str, host_ip: &str) -> Result<(), String> {
             "ACCEPT",
         ],
     )?;
+    // Allow guest → host traffic only to the gateway gRPC port.
+    // Previous versions accepted ALL inbound traffic from the TAP
+    // interface; scope to the specific port so the guest cannot reach
+    // other host services.
+    let port_str = gateway_port.to_string();
+    let _ = run_cmd(
+        "iptables",
+        &[
+            "-D", "INPUT", "-i", tap_device, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
+        ],
+    );
+    run_cmd(
+        "iptables",
+        &[
+            "-A", "INPUT", "-i", tap_device, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
+        ],
+    )?;
 
     Ok(())
 }
 
-fn teardown_tap_networking(tap_device: &str, host_ip: &str) {
+fn teardown_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) {
     let subnet = tap_subnet_from_host_ip(host_ip);
     let _ = run_cmd(
         "iptables",
@@ -437,6 +518,21 @@ fn teardown_tap_networking(tap_device: &str, host_ip: &str) {
     let _ = run_cmd(
         "iptables",
         &["-D", "FORWARD", "-i", tap_device, "-j", "ACCEPT"],
+    );
+    // Remove the port-scoped INPUT rule. Also try the legacy blanket
+    // rule so stale rules from older driver versions are cleaned up.
+    if gateway_port > 0 {
+        let port_str = gateway_port.to_string();
+        let _ = run_cmd(
+            "iptables",
+            &[
+                "-D", "INPUT", "-i", tap_device, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
+            ],
+        );
+    }
+    let _ = run_cmd(
+        "iptables",
+        &["-D", "INPUT", "-i", tap_device, "-j", "ACCEPT"],
     );
     let _ = run_cmd(
         "iptables",
@@ -490,14 +586,16 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), String> {
 struct TapGuard {
     tap_device: String,
     host_ip: String,
+    gateway_port: u16,
     disarmed: bool,
 }
 
 impl TapGuard {
-    fn new(tap_device: String, host_ip: String) -> Self {
+    fn new(tap_device: String, host_ip: String, gateway_port: u16) -> Self {
         Self {
             tap_device,
             host_ip,
+            gateway_port,
             disarmed: false,
         }
     }
@@ -510,7 +608,7 @@ impl TapGuard {
 impl Drop for TapGuard {
     fn drop(&mut self) {
         if !self.disarmed {
-            teardown_tap_networking(&self.tap_device, &self.host_ip);
+            teardown_tap_networking(&self.tap_device, &self.host_ip, self.gateway_port);
         }
     }
 }
@@ -786,6 +884,14 @@ pub fn configured_runtime_dir() -> Result<PathBuf, String> {
         return Ok(PathBuf::from(path));
     }
     embedded_runtime::ensure_runtime_extracted()
+}
+
+fn qemu_runtime_dir() -> Result<PathBuf, String> {
+    configured_runtime_dir().map_err(|_| {
+        "QEMU backend requires OPENSHELL_VM_RUNTIME_DIR to be set (pointing to a directory \
+         containing vmlinux). Set the env var or run `mise run vm:setup`."
+            .to_string()
+    })
 }
 
 #[cfg(target_os = "macos")]

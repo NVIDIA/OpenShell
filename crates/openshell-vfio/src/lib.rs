@@ -7,12 +7,25 @@
 //! the VFIO subsystem. All sysfs access goes through [`SysfsRoot`] so the
 //! entire stack is testable without root or real hardware.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
 
 const NVIDIA_VENDOR_ID: &str = "0x10de";
 const GPU_CLASS_DISPLAY_VGA: &str = "0x030000";
 const GPU_CLASS_DISPLAY_3D: u32 = 0x0302;
+
+const VFIO_BIND_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const VFIO_BIND_MAX_POLL_ATTEMPTS: u32 = 20;
+
+/// Reference counter for vendor:device ID registrations in the vfio-pci
+/// match table. Multiple GPUs may share the same vendor:device pair (e.g.,
+/// two A100s). We only write to the kernel's `new_id`/`remove_id` sysfs
+/// files when the first GPU registers or the last GPU deregisters an ID.
+static VFIO_ID_REFCOUNTS: std::sync::LazyLock<Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -88,6 +101,14 @@ impl SysfsRoot {
         self.base.join("bus/pci/drivers_probe")
     }
 
+    pub fn vfio_pci_new_id(&self) -> PathBuf {
+        self.base.join("bus/pci/drivers/vfio-pci/new_id")
+    }
+
+    pub fn vfio_pci_remove_id(&self) -> PathBuf {
+        self.base.join("bus/pci/drivers/vfio-pci/remove_id")
+    }
+
     pub fn iommu_group(&self, bdf: &str) -> Result<u32, VfioError> {
         let link = self.pci_device(bdf).join("iommu_group");
         let target = fs::read_link(&link).map_err(|_| VfioError::NoIommuGroup {
@@ -152,6 +173,10 @@ pub struct GpuBindGuard {
     companion_bdfs: Vec<String>,
     sysfs: SysfsRoot,
     disarmed: bool,
+    /// Cached "VVVV DDDD" string captured at bind time so that
+    /// deregistration from vfio-pci's match table succeeds even if the
+    /// device's sysfs entries have disappeared (e.g. physical removal).
+    vfio_id: Option<String>,
 }
 
 impl GpuBindGuard {
@@ -165,18 +190,47 @@ impl GpuBindGuard {
     }
 }
 
+impl GpuBindGuard {
+    /// Deregister the cached vfio-pci match-table entry, then restore the
+    /// device to its host driver.
+    ///
+    /// Using the cached ID avoids re-reading vendor/device from sysfs,
+    /// which would fail if the GPU has been physically removed.
+    fn restore_with_cached_id(&self) {
+        if let Some(ref id_str) = self.vfio_id {
+            deregister_vfio_id_by_value(&self.sysfs, id_str);
+        }
+
+        for peer in &self.companion_bdfs {
+            if let Err(err) = restore_gpu_to_host_driver(&self.sysfs, peer) {
+                tracing::error!(bdf = %peer, error = %err, "failed to restore companion device to host driver");
+            }
+        }
+
+        if let Err(err) =
+            restore_gpu_to_host_driver_ex(&self.sysfs, &self.bdf, self.vfio_id.is_some())
+        {
+            tracing::error!(bdf = %self.bdf, error = %err, "failed to restore GPU to host driver");
+        }
+    }
+}
+
 impl Drop for GpuBindGuard {
     fn drop(&mut self) {
         if self.disarmed {
             return;
         }
-        for peer in &self.companion_bdfs {
-            if let Err(err) = restore_gpu_to_host_driver(&self.sysfs, peer) {
-                tracing::error!(bdf = %peer, error = %err, "failed to restore companion device to host driver on drop");
+        if self.vfio_id.is_some() {
+            self.restore_with_cached_id();
+        } else {
+            for peer in &self.companion_bdfs {
+                if let Err(err) = restore_gpu_to_host_driver(&self.sysfs, peer) {
+                    tracing::error!(bdf = %peer, error = %err, "failed to restore companion device to host driver on drop");
+                }
             }
-        }
-        if let Err(err) = restore_gpu_to_host_driver(&self.sysfs, &self.bdf) {
-            tracing::error!(bdf = %self.bdf, error = %err, "failed to restore GPU to host driver on drop");
+            if let Err(err) = restore_gpu_to_host_driver(&self.sysfs, &self.bdf) {
+                tracing::error!(bdf = %self.bdf, error = %err, "failed to restore GPU to host driver on drop");
+            }
         }
     }
 }
@@ -364,6 +418,127 @@ pub fn probe_host_nvidia_vfio_readiness(sysfs: &SysfsRoot) -> Vec<GpuInfo> {
 // Bind / unbind
 // ---------------------------------------------------------------------------
 
+/// Read vendor and device IDs from sysfs and format as `"VVVV DDDD"` (no `0x` prefix).
+fn vfio_id_string(sysfs: &SysfsRoot, bdf: &str) -> Option<String> {
+    let dev_dir = sysfs.pci_device(bdf);
+    let vendor = read_sysfs_trimmed(&dev_dir.join("vendor")).ok()?;
+    let device = read_sysfs_trimmed(&dev_dir.join("device")).ok()?;
+    let vendor_hex = vendor.strip_prefix("0x").unwrap_or(&vendor);
+    let device_hex = device.strip_prefix("0x").unwrap_or(&device);
+    Some(format!("{vendor_hex} {device_hex}"))
+}
+
+/// Best-effort registration of a device's vendor:device ID with `vfio-pci`.
+///
+/// Some kernel configurations require the ID to be pre-registered in
+/// `/sys/bus/pci/drivers/vfio-pci/new_id` before `drivers_probe` will
+/// bind the device, even when `driver_override` is set. Writing an
+/// already-registered ID returns `EEXIST`, which we silently ignore.
+fn register_vfio_new_id(sysfs: &SysfsRoot, bdf: &str) {
+    let Some(id_str) = vfio_id_string(sysfs, bdf) else {
+        return;
+    };
+
+    let should_write = {
+        let mut map = VFIO_ID_REFCOUNTS.lock().unwrap();
+        let count = map.entry(id_str.clone()).or_insert(0);
+        *count += 1;
+        *count == 1
+    };
+
+    if !should_write {
+        tracing::debug!(
+            bdf, id = %id_str,
+            "vfio-pci new_id already registered by another GPU, refcount incremented"
+        );
+        return;
+    }
+
+    let new_id_path = sysfs.vfio_pci_new_id();
+    match write_sysfs(&new_id_path, &id_str) {
+        Ok(()) => {
+            tracing::debug!(bdf, id = %id_str, "registered vfio-pci new_id");
+        }
+        Err(_) => {
+            tracing::debug!(
+                bdf, id = %id_str,
+                "vfio-pci new_id write skipped (already registered or driver not loaded)"
+            );
+        }
+    }
+}
+
+/// Best-effort deregistration of a device's vendor:device ID from `vfio-pci`.
+///
+/// Reverses the effect of [`register_vfio_new_id`] by writing to
+/// `/sys/bus/pci/drivers/vfio-pci/remove_id`. This prevents vfio-pci
+/// from winning the probe race against the host driver when
+/// `drivers_probe` runs during restore.
+///
+/// `ENODEV` is silently ignored (the ID may never have been registered
+/// or was already removed).
+fn deregister_vfio_new_id(sysfs: &SysfsRoot, bdf: &str) {
+    let Some(id_str) = vfio_id_string(sysfs, bdf) else {
+        return;
+    };
+
+    let should_write = {
+        let mut map = VFIO_ID_REFCOUNTS.lock().unwrap();
+        match map.get_mut(&id_str) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => {
+                map.remove(&id_str);
+                true
+            }
+            None => true,
+        }
+    };
+
+    if !should_write {
+        tracing::debug!(
+            bdf, id = %id_str,
+            "vfio-pci remove_id skipped (other GPUs still using this ID)"
+        );
+        return;
+    }
+
+    let remove_id_path = sysfs.vfio_pci_remove_id();
+    match write_sysfs(&remove_id_path, &id_str) {
+        Ok(()) => {
+            tracing::debug!(bdf, id = %id_str, "deregistered vfio-pci new_id");
+        }
+        Err(_) => {
+            tracing::debug!(
+                bdf, id = %id_str,
+                "vfio-pci remove_id write skipped (not registered or already removed)"
+            );
+        }
+    }
+}
+
+/// Best-effort deregistration using a pre-captured ID string.
+///
+/// Unlike [`deregister_vfio_new_id`], this does not read vendor/device
+/// from sysfs at call time, making it reliable even when the device has
+/// been physically removed or sysfs is otherwise inaccessible.
+fn deregister_vfio_id_by_value(sysfs: &SysfsRoot, id_str: &str) {
+    let remove_id_path = sysfs.vfio_pci_remove_id();
+    match write_sysfs(&remove_id_path, id_str) {
+        Ok(()) => {
+            tracing::debug!(id = %id_str, "deregistered vfio-pci new_id (by cached value)");
+        }
+        Err(_) => {
+            tracing::debug!(
+                id = %id_str,
+                "vfio-pci remove_id write skipped (not registered or already removed)"
+            );
+        }
+    }
+}
+
 /// Bind a single PCI device to `vfio-pci`. Skips devices already bound.
 fn bind_device_to_vfio(sysfs: &SysfsRoot, bdf: &str) -> Result<bool, VfioError> {
     if let Some(drv) = current_driver_name(sysfs, bdf) {
@@ -378,31 +553,50 @@ fn bind_device_to_vfio(sysfs: &SysfsRoot, bdf: &str) -> Result<bool, VfioError> 
         tracing::info!(bdf, driver = %drv, "unbound device from current driver");
     }
 
+    register_vfio_new_id(sysfs, bdf);
+
     let override_path = sysfs.pci_device(bdf).join("driver_override");
-    write_sysfs(&override_path, "vfio-pci").map_err(|e| VfioError::BindFailed {
-        bdf: bdf.to_string(),
-        reason: format!("driver_override: {e}"),
-    })?;
+    if let Err(e) = write_sysfs(&override_path, "vfio-pci") {
+        deregister_vfio_new_id(sysfs, bdf);
+        return Err(VfioError::BindFailed {
+            bdf: bdf.to_string(),
+            reason: format!("driver_override: {e}"),
+        });
+    }
 
-    write_sysfs(&sysfs.drivers_probe(), bdf).map_err(|e| VfioError::BindFailed {
-        bdf: bdf.to_string(),
-        reason: format!("drivers_probe: {e}"),
-    })?;
+    if let Err(e) = write_sysfs(&sysfs.drivers_probe(), bdf) {
+        deregister_vfio_new_id(sysfs, bdf);
+        return Err(VfioError::BindFailed {
+            bdf: bdf.to_string(),
+            reason: format!("drivers_probe: {e}"),
+        });
+    }
 
-    match current_driver_name(sysfs, bdf) {
-        Some(ref drv) if drv == "vfio-pci" => {}
-        other => {
-            return Err(VfioError::BindFailed {
-                bdf: bdf.to_string(),
-                reason: format!(
-                    "after probe, driver is {:?} instead of vfio-pci",
-                    other.as_deref().unwrap_or("<none>")
-                ),
-            });
+    if matches!(current_driver_name(sysfs, bdf).as_deref(), Some("vfio-pci")) {
+        return Ok(true);
+    }
+
+    // The kernel processes drivers_probe asynchronously on some systems;
+    // poll briefly to let the driver attach before declaring failure.
+    for _ in 0..VFIO_BIND_MAX_POLL_ATTEMPTS {
+        std::thread::sleep(VFIO_BIND_POLL_INTERVAL);
+        if matches!(current_driver_name(sysfs, bdf).as_deref(), Some("vfio-pci")) {
+            tracing::debug!(bdf, "vfio-pci binding confirmed after polling");
+            return Ok(true);
         }
     }
 
-    Ok(true)
+    deregister_vfio_new_id(sysfs, bdf);
+    Err(VfioError::BindFailed {
+        bdf: bdf.to_string(),
+        reason: format!(
+            "after drivers_probe with {}ms polling, driver is {:?} instead of vfio-pci",
+            VFIO_BIND_MAX_POLL_ATTEMPTS as u64 * VFIO_BIND_POLL_INTERVAL.as_millis() as u64,
+            current_driver_name(sysfs, bdf)
+                .as_deref()
+                .unwrap_or("<none>")
+        ),
+    })
 }
 
 /// Bind a GPU to `vfio-pci`, returning an RAII guard that restores it on drop.
@@ -479,17 +673,40 @@ pub fn prepare_gpu_for_passthrough(
         }
     }
 
+    let vfio_id = vfio_id_string(sysfs, bdf);
+
     Ok(GpuBindGuard {
         bdf: bdf.to_string(),
         companion_bdfs: bound_companions,
         sysfs: sysfs.clone(),
         disarmed: false,
+        vfio_id,
     })
 }
 
 /// Restore a GPU from `vfio-pci` back to the host's default driver.
 fn restore_gpu_to_host_driver(sysfs: &SysfsRoot, bdf: &str) -> Result<(), VfioError> {
+    restore_gpu_to_host_driver_ex(sysfs, bdf, false)
+}
+
+/// Inner restore implementation.
+///
+/// When `skip_deregister` is `true` the caller has already removed the
+/// device's vendor:device ID from vfio-pci's match table (e.g. via a
+/// cached value), so we skip the sysfs-based deregistration.
+fn restore_gpu_to_host_driver_ex(
+    sysfs: &SysfsRoot,
+    bdf: &str,
+    skip_deregister: bool,
+) -> Result<(), VfioError> {
     let dev_dir = sysfs.pci_device(bdf);
+
+    if !skip_deregister {
+        // Deregister the device ID from vfio-pci's match table before
+        // unbind+reprobe. Without this, drivers_probe re-binds to vfio-pci
+        // via the still-registered new_id entry.
+        deregister_vfio_new_id(sysfs, bdf);
+    }
 
     let unbind_path = dev_dir.join("driver/unbind");
     if unbind_path.exists() {
@@ -527,7 +744,9 @@ fn restore_gpu_to_host_driver(sysfs: &SysfsRoot, bdf: &str) -> Result<(), VfioEr
 ///
 /// Loads persisted state, checks each GPU, and restores any that are still
 /// bound to `vfio-pci`. Returns the list of BDFs that were restored.
-/// Removes the state file after reconciliation.
+/// Removes the state file only when all bindings are resolved; rewrites it
+/// with the remaining entries when some restorations fail so they can be
+/// retried on the next process start.
 pub fn reconcile_stale_bindings(sysfs: &SysfsRoot, state_path: &Path) -> Vec<String> {
     let state = match GpuBindState::load(state_path) {
         Ok(s) => s,
@@ -537,7 +756,14 @@ pub fn reconcile_stale_bindings(sysfs: &SysfsRoot, state_path: &Path) -> Vec<Str
         }
     };
 
+    // Any in-memory refcounts are stale (from a previous process that
+    // crashed). Clear them so deregister writes through to sysfs.
+    if let Ok(mut map) = VFIO_ID_REFCOUNTS.lock() {
+        map.clear();
+    }
+
     let mut restored = Vec::new();
+    let mut failed_bindings = Vec::new();
 
     for binding in &state.bindings {
         match current_driver_name(sysfs, &binding.bdf) {
@@ -549,6 +775,7 @@ pub fn reconcile_stale_bindings(sysfs: &SysfsRoot, state_path: &Path) -> Vec<Str
                 );
                 if let Err(err) = restore_gpu_to_host_driver(sysfs, &binding.bdf) {
                     tracing::error!(bdf = %binding.bdf, %err, "failed to restore stale GPU binding");
+                    failed_bindings.push(binding.clone());
                     continue;
                 }
                 restored.push(binding.bdf.clone());
@@ -563,8 +790,10 @@ pub fn reconcile_stale_bindings(sysfs: &SysfsRoot, state_path: &Path) -> Vec<Str
                         sandbox_id = %binding.sandbox_id,
                         "stale driver_override detected, clearing and re-probing"
                     );
+                    deregister_vfio_new_id(sysfs, &binding.bdf);
                     if let Err(err) = write_sysfs(&override_path, "\n") {
                         tracing::error!(bdf = %binding.bdf, %err, "failed to clear stale driver_override");
+                        failed_bindings.push(binding.clone());
                         continue;
                     }
                     let probe = sysfs.drivers_probe();
@@ -579,8 +808,29 @@ pub fn reconcile_stale_bindings(sysfs: &SysfsRoot, state_path: &Path) -> Vec<Str
         }
     }
 
-    if let Err(err) = fs::remove_file(state_path) {
-        tracing::warn!(%err, path = %state_path.display(), "failed to remove stale bind state file");
+    if failed_bindings.is_empty() {
+        if let Err(err) = fs::remove_file(state_path) {
+            tracing::warn!(%err, path = %state_path.display(), "failed to remove stale bind state file");
+        }
+    } else {
+        let remaining = GpuBindState {
+            bindings: failed_bindings,
+        };
+        match serde_json::to_string_pretty(&remaining) {
+            Ok(json) => {
+                if let Err(err) = fs::write(state_path, json) {
+                    tracing::error!(%err, path = %state_path.display(), "failed to persist remaining stale bindings");
+                } else {
+                    tracing::warn!(
+                        count = remaining.bindings.len(),
+                        "some GPU bindings could not be restored; state preserved for retry"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::error!(%err, "failed to serialize remaining stale bindings");
+            }
+        }
     }
 
     restored
@@ -625,6 +875,13 @@ mod tests {
         let group_devices_dir = group_dir.join("devices");
         fs::create_dir_all(&group_devices_dir).unwrap();
         symlink(&dev, group_devices_dir.join(bdf)).unwrap();
+    }
+
+    /// Remove a specific vendor:device key from the global refcount map.
+    /// Used by tests to clean up their own entries without disturbing
+    /// parallel tests that hold refcounts for different device IDs.
+    fn clear_vfio_id_refcount(id: &str) {
+        VFIO_ID_REFCOUNTS.lock().unwrap().remove(id);
     }
 
     // -- validate_bdf -------------------------------------------------------
@@ -778,6 +1035,14 @@ mod tests {
             sysfs.drivers_probe(),
             PathBuf::from("/sys/bus/pci/drivers_probe")
         );
+        assert_eq!(
+            sysfs.vfio_pci_new_id(),
+            PathBuf::from("/sys/bus/pci/drivers/vfio-pci/new_id")
+        );
+        assert_eq!(
+            sysfs.vfio_pci_remove_id(),
+            PathBuf::from("/sys/bus/pci/drivers/vfio-pci/remove_id")
+        );
 
         let custom = SysfsRoot::new("/tmp/test-sys");
         assert_eq!(
@@ -861,6 +1126,162 @@ mod tests {
         let devices = sysfs.iommu_group_devices(99).unwrap();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0], "0000:2d:00.0");
+    }
+
+    // -- register_vfio_new_id -----------------------------------------------
+
+    #[test]
+    fn test_register_vfio_new_id_writes_vendor_device() {
+        clear_vfio_id_refcount("10de 26b3");
+        let (tmp, sysfs) = setup_mock_sysfs();
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:2d:00.0",
+            "0x10de",
+            "0x26b3",
+            "0x030000",
+            42,
+        );
+
+        let new_id_path = sysfs.vfio_pci_new_id();
+        fs::create_dir_all(new_id_path.parent().unwrap()).unwrap();
+        fs::write(&new_id_path, "").unwrap();
+
+        register_vfio_new_id(&sysfs, "0000:2d:00.0");
+
+        let written = fs::read_to_string(&new_id_path).unwrap();
+        assert_eq!(written, "10de 26b3");
+    }
+
+    #[test]
+    fn test_register_vfio_new_id_ignores_missing_new_id_file() {
+        clear_vfio_id_refcount("10de 26b4");
+        let (tmp, sysfs) = setup_mock_sysfs();
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:2d:00.0",
+            "0x10de",
+            "0x26b4",
+            "0x030000",
+            42,
+        );
+
+        // Don't create the new_id file — should not panic or error
+        register_vfio_new_id(&sysfs, "0000:2d:00.0");
+    }
+
+    // -- deregister_vfio_new_id ---------------------------------------------
+
+    #[test]
+    fn test_deregister_vfio_new_id_writes_vendor_device() {
+        clear_vfio_id_refcount("10de 26b5");
+        let (tmp, sysfs) = setup_mock_sysfs();
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:2d:00.0",
+            "0x10de",
+            "0x26b5",
+            "0x030000",
+            42,
+        );
+
+        let remove_id_path = sysfs.vfio_pci_remove_id();
+        fs::create_dir_all(remove_id_path.parent().unwrap()).unwrap();
+        fs::write(&remove_id_path, "").unwrap();
+
+        deregister_vfio_new_id(&sysfs, "0000:2d:00.0");
+
+        let written = fs::read_to_string(&remove_id_path).unwrap();
+        assert_eq!(written, "10de 26b5");
+    }
+
+    #[test]
+    fn test_deregister_vfio_new_id_ignores_missing_remove_id_file() {
+        clear_vfio_id_refcount("10de 26b6");
+        let (tmp, sysfs) = setup_mock_sysfs();
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:2d:00.0",
+            "0x10de",
+            "0x26b6",
+            "0x030000",
+            42,
+        );
+
+        deregister_vfio_new_id(&sysfs, "0000:2d:00.0");
+    }
+
+    // -- refcount safety ----------------------------------------------------
+
+    #[test]
+    fn test_register_deregister_refcount() {
+        clear_vfio_id_refcount("10de 26b8");
+        let (tmp, sysfs) = setup_mock_sysfs();
+
+        // Two GPUs with the same vendor:device ID (e.g., two A100s).
+        // Uses 0x26b8 — unique to this test to avoid parallel interference.
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:2d:00.0",
+            "0x10de",
+            "0x26b8",
+            "0x030000",
+            42,
+        );
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:3b:00.0",
+            "0x10de",
+            "0x26b8",
+            "0x030200",
+            43,
+        );
+
+        let new_id_path = sysfs.vfio_pci_new_id();
+        fs::create_dir_all(new_id_path.parent().unwrap()).unwrap();
+        fs::write(&new_id_path, "").unwrap();
+
+        let remove_id_path = sysfs.vfio_pci_remove_id();
+        fs::write(&remove_id_path, "").unwrap();
+
+        // Register the same vendor:device for two different BDFs
+        register_vfio_new_id(&sysfs, "0000:2d:00.0");
+        let written = fs::read_to_string(&new_id_path).unwrap();
+        assert_eq!(
+            written, "10de 26b8",
+            "first register should write to new_id"
+        );
+
+        // Clear the file to detect whether the second register writes
+        fs::write(&new_id_path, "").unwrap();
+        register_vfio_new_id(&sysfs, "0000:3b:00.0");
+        let written = fs::read_to_string(&new_id_path).unwrap();
+        assert_eq!(
+            written, "",
+            "second register should NOT write to new_id (refcount > 1)"
+        );
+
+        // Deregister once — should NOT write to remove_id (one GPU still using it)
+        deregister_vfio_new_id(&sysfs, "0000:2d:00.0");
+        let written = fs::read_to_string(&remove_id_path).unwrap();
+        assert_eq!(
+            written, "",
+            "first deregister should NOT write to remove_id"
+        );
+
+        // Deregister again — should write to remove_id (last user)
+        deregister_vfio_new_id(&sysfs, "0000:3b:00.0");
+        let written = fs::read_to_string(&remove_id_path).unwrap();
+        assert_eq!(
+            written, "10de 26b8",
+            "second deregister SHOULD write to remove_id"
+        );
     }
 
     // -- companion binding --------------------------------------------------
@@ -960,6 +1381,7 @@ mod tests {
 
     #[test]
     fn test_guard_drop_restores_companions() {
+        clear_vfio_id_refcount("10de 2684");
         let (tmp, sysfs) = setup_mock_sysfs();
         create_pci_device(
             &sysfs,
@@ -1004,6 +1426,7 @@ mod tests {
                 companion_bdfs: vec!["0000:2d:00.1".to_string()],
                 sysfs: sysfs.clone(),
                 disarmed: false,
+                vfio_id: None,
             };
             // guard drops here — should attempt restore on both devices
         }
@@ -1051,6 +1474,7 @@ mod tests {
             companion_bdfs: vec![],
             sysfs: sysfs.clone(),
             disarmed: false,
+            vfio_id: None,
         };
         guard.disarm();
 
@@ -1060,10 +1484,51 @@ mod tests {
         assert_eq!(override_val, "vfio-pci");
     }
 
+    // -- restore writes remove_id -------------------------------------------
+
+    #[test]
+    fn test_restore_gpu_deregisters_new_id_before_reprobe() {
+        clear_vfio_id_refcount("10de 26b7");
+        let (tmp, sysfs) = setup_mock_sysfs();
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:2d:00.0",
+            "0x10de",
+            "0x26b7",
+            "0x030000",
+            42,
+        );
+
+        let probe = sysfs.drivers_probe();
+        fs::create_dir_all(probe.parent().unwrap()).unwrap();
+        fs::write(&probe, "").unwrap();
+
+        let remove_id_path = sysfs.vfio_pci_remove_id();
+        fs::create_dir_all(remove_id_path.parent().unwrap()).unwrap();
+        fs::write(&remove_id_path, "").unwrap();
+
+        set_mock_driver(&sysfs, "0000:2d:00.0", "vfio-pci");
+        fs::write(
+            sysfs.pci_device("0000:2d:00.0").join("driver_override"),
+            "vfio-pci",
+        )
+        .unwrap();
+
+        restore_gpu_to_host_driver(&sysfs, "0000:2d:00.0").unwrap();
+
+        let written = fs::read_to_string(&remove_id_path).unwrap();
+        assert_eq!(
+            written, "10de 26b7",
+            "remove_id should be written during restore"
+        );
+    }
+
     // -- reconcile_stale_bindings -------------------------------------------
 
     #[test]
     fn test_reconcile_clears_stale_driver_override_when_not_on_vfio() {
+        clear_vfio_id_refcount("10de 2684");
         let (tmp, sysfs) = setup_mock_sysfs();
         create_pci_device(
             &sysfs,

@@ -148,6 +148,53 @@ rewrite_openshell_endpoint_if_needed() {
     ts "WARNING: could not reach OpenShell endpoint ${host}:${port}"
 }
 
+create_gpu_device_nodes_mknod() {
+    # Mode 666 is intentional: single-tenant microVM with the VM itself as the
+    # isolation boundary. The sandbox user is the only non-root user.
+    local nv_major
+    nv_major=$(awk '$2 == "nvidia" {print $1}' /proc/devices 2>/dev/null || true)
+    if [ -n "$nv_major" ]; then
+        mknod -m 666 /dev/nvidiactl c "$nv_major" 255 2>/dev/null || true
+
+        local gpu_count=0
+        if [ -d /proc/driver/nvidia/gpus ]; then
+            for gpu_dir in /proc/driver/nvidia/gpus/*/; do
+                [ -d "$gpu_dir" ] || continue
+                mknod -m 666 "/dev/nvidia${gpu_count}" c "$nv_major" "$gpu_count" 2>/dev/null || true
+                gpu_count=$((gpu_count + 1))
+            done
+        fi
+        if [ "$gpu_count" -eq 0 ]; then
+            mknod -m 666 /dev/nvidia0 c "$nv_major" 0 2>/dev/null || true
+        fi
+
+        local modeset_major
+        modeset_major=$(awk '$2 == "nvidia-modeset" {print $1}' /proc/devices 2>/dev/null || true)
+        if [ -n "$modeset_major" ]; then
+            mknod -m 666 /dev/nvidia-modeset c "$modeset_major" 254 2>/dev/null || true
+        fi
+
+        local uvm_major
+        uvm_major=$(awk '$2 == "nvidia-uvm" {print $1}' /proc/devices 2>/dev/null || true)
+        if [ -n "$uvm_major" ]; then
+            mknod -m 666 /dev/nvidia-uvm c "$uvm_major" 0 2>/dev/null || true
+            mknod -m 666 /dev/nvidia-uvm-tools c "$uvm_major" 1 2>/dev/null || true
+        fi
+
+        local caps_major
+        caps_major=$(awk '$2 == "nvidia-caps" {print $1}' /proc/devices 2>/dev/null || true)
+        if [ -n "$caps_major" ]; then
+            mkdir -p /dev/nvidia-caps 2>/dev/null || true
+            mknod -m 666 /dev/nvidia-caps/nvidia-cap1 c "$caps_major" 1 2>/dev/null || true
+            mknod -m 666 /dev/nvidia-caps/nvidia-cap2 c "$caps_major" 2 2>/dev/null || true
+        fi
+
+        ts "GPU device nodes created via mknod (${gpu_count} GPU(s), major=${nv_major})"
+    else
+        ts "WARNING: 'nvidia' not in /proc/devices; device nodes unavailable"
+    fi
+}
+
 setup_gpu() {
     ts "GPU_ENABLED=true — initializing GPU passthrough"
 
@@ -157,8 +204,6 @@ setup_gpu() {
     fi
 
     # Stage GSP firmware from virtiofs to tmpfs to avoid slow FUSE reads
-    # during module load. The kernel's firmware_class.path= cmdline param
-    # points here initially for early request_firmware calls.
     if [ -d /lib/firmware/nvidia ]; then
         ts "staging GPU firmware to tmpfs"
         mkdir -p /run/firmware/nvidia
@@ -173,19 +218,22 @@ setup_gpu() {
     modprobe nvidia_uvm 2>/dev/null || true
     modprobe nvidia_modeset 2>/dev/null || true
 
-    # Free the tmpfs firmware copy now that modules are loaded
     rm -rf /run/firmware 2>/dev/null || true
 
     if command -v nvidia-smi >/dev/null 2>&1; then
-        ts "validating nvidia-smi"
-        if nvidia-smi; then
+        ts "running nvidia-smi to create device nodes and validate GPU"
+        local smi_rc=0
+        nvidia-smi >/dev/null 2>&1 || smi_rc=$?
+        if [ "$smi_rc" -eq 0 ]; then
+            nvidia-smi -L 2>/dev/null | while read -r line; do ts "  $line"; done
             ts "GPU initialization successful"
         else
-            ts "FATAL: nvidia-smi failed"
-            return 1
+            ts "WARNING: nvidia-smi failed (exit ${smi_rc}); falling back to mknod"
+            create_gpu_device_nodes_mknod
         fi
     else
-        ts "WARNING: nvidia-smi not found in rootfs; skipping GPU validation"
+        ts "nvidia-smi not found; creating device nodes via mknod"
+        create_gpu_device_nodes_mknod
     fi
 }
 
@@ -220,14 +268,28 @@ if [ -n "${VM_NET_IP}" ] && [ -n "${VM_NET_GW}" ]; then
     ts "configuring TAP networking (static ${VM_NET_IP} gw ${VM_NET_GW})"
     GATEWAY_IP="${VM_NET_GW}"
 
-    if ip link show eth0 >/dev/null 2>&1; then
-        ip link set eth0 up 2>/dev/null || true
-        ip addr add "${VM_NET_IP}/30" dev eth0 2>/dev/null || true
+    TAP_NIC=""
+    NIC_WAIT=0
+    while [ -z "$TAP_NIC" ] && [ "$NIC_WAIT" -lt 10 ]; do
+        for candidate in eth0 ens3 enp0s2 $(ls /sys/class/net/ 2>/dev/null | grep -v '^lo$'); do
+            if ip link show "$candidate" >/dev/null 2>&1 && [ "$candidate" != "lo" ]; then
+                TAP_NIC="$candidate"
+                break
+            fi
+        done
+        if [ -z "$TAP_NIC" ]; then
+            sleep 1
+            NIC_WAIT=$((NIC_WAIT + 1))
+        fi
+    done
+
+    if [ -n "$TAP_NIC" ]; then
+        ts "using NIC ${TAP_NIC} for TAP networking"
+        ip link set "$TAP_NIC" up 2>/dev/null || true
+        ip addr add "${VM_NET_IP}/30" dev "$TAP_NIC" 2>/dev/null || true
         ip route add default via "${VM_NET_GW}" 2>/dev/null || true
-    elif ip link show ens3 >/dev/null 2>&1; then
-        ip link set ens3 up 2>/dev/null || true
-        ip addr add "${VM_NET_IP}/30" dev ens3 2>/dev/null || true
-        ip route add default via "${VM_NET_GW}" 2>/dev/null || true
+    else
+        ts "WARNING: no network interface found for TAP networking"
     fi
 
     if [ -n "${VM_NET_DNS}" ]; then
@@ -292,6 +354,24 @@ export HOME=/sandbox
 export USER=sandbox
 
 rewrite_openshell_endpoint_if_needed
+
+# Log supervisor connectivity state for debugging stuck-in-Provisioning issues
+if [ -n "${OPENSHELL_ENDPOINT:-}" ]; then
+    _ep_parsed="$(parse_endpoint "$OPENSHELL_ENDPOINT" 2>/dev/null || true)"
+    if [ -n "$_ep_parsed" ]; then
+        _ep_host="$(printf '%s\n' "$_ep_parsed" | sed -n '2p')"
+        _ep_port="$(printf '%s\n' "$_ep_parsed" | sed -n '3p')"
+        if tcp_probe "$_ep_host" "$_ep_port"; then
+            ts "gateway reachable at ${_ep_host}:${_ep_port}"
+        else
+            ts "WARNING: gateway NOT reachable at ${_ep_host}:${_ep_port} — supervisor may fail to connect"
+        fi
+    fi
+    ts "OPENSHELL_ENDPOINT=${OPENSHELL_ENDPOINT}"
+fi
+if [ -n "${OPENSHELL_SANDBOX_ID:-}" ]; then
+    ts "OPENSHELL_SANDBOX_ID=${OPENSHELL_SANDBOX_ID}"
+fi
 
 ts "starting openshell-sandbox supervisor"
 exec /opt/openshell/bin/openshell-sandbox --workdir /sandbox

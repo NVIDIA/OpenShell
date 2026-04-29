@@ -4,7 +4,9 @@
 use crate::gpu::{
     GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
 };
-use crate::rootfs::{extract_sandbox_rootfs_to, sandbox_guest_init_path};
+use crate::rootfs::{
+    extract_gpu_sandbox_rootfs_to, extract_sandbox_rootfs_to, sandbox_guest_init_path,
+};
 use futures::Stream;
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
@@ -188,7 +190,6 @@ pub struct VmDriver {
     registry: Arc<Mutex<HashMap<String, SandboxRecord>>>,
     events: broadcast::Sender<WatchSandboxesEvent>,
     gpu_inventory: Option<Arc<std::sync::Mutex<GpuInventory>>>,
-    gpu_count: u32,
     subnet_allocator: Arc<std::sync::Mutex<SubnetAllocator>>,
 }
 
@@ -203,6 +204,9 @@ impl VmDriver {
         #[cfg(target_os = "linux")]
         if config.gpu_enabled {
             check_gpu_privileges()?;
+            tokio::task::spawn_blocking(crate::cleanup_stale_tap_interfaces)
+                .await
+                .map_err(|e| format!("cleanup stale TAP interfaces panicked: {e}"))?;
         }
 
         let state_root = config.state_dir.join("sandboxes");
@@ -222,14 +226,16 @@ impl VmDriver {
                 .map_err(|err| format!("failed to resolve vm driver executable: {err}"))?
         };
 
-        let (gpu_inventory, gpu_count) = if config.gpu_enabled {
+        let gpu_inventory = if config.gpu_enabled {
             let sysfs = SysfsRoot::system();
             let inventory = GpuInventory::new(sysfs, &config.state_dir);
-            let count = inventory.gpu_count();
-            tracing::info!(gpu_count = count, "GPU inventory initialized");
-            (Some(Arc::new(std::sync::Mutex::new(inventory))), count)
+            tracing::info!(
+                gpu_count = inventory.gpu_count(),
+                "GPU inventory initialized"
+            );
+            Some(Arc::new(std::sync::Mutex::new(inventory)))
         } else {
-            (None, 0)
+            None
         };
 
         let subnet_allocator = Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
@@ -244,19 +250,23 @@ impl VmDriver {
             registry: Arc::new(Mutex::new(HashMap::new())),
             events,
             gpu_inventory,
-            gpu_count,
             subnet_allocator,
         })
     }
 
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
+        let gpu_count = self
+            .gpu_inventory
+            .as_ref()
+            .and_then(|inv| inv.lock().ok())
+            .map_or(0, |inv| inv.gpu_count());
         GetCapabilitiesResponse {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: String::new(),
             supports_gpu: self.gpu_inventory.is_some(),
-            gpu_count: self.gpu_count,
+            gpu_count,
         }
     }
 
@@ -287,7 +297,12 @@ impl VmDriver {
             .tls_paths()
             .map_err(Status::failed_precondition)?;
         let rootfs_for_extract = rootfs.clone();
-        tokio::task::spawn_blocking(move || extract_sandbox_rootfs_to(&rootfs_for_extract))
+        let extract_fn = if is_gpu {
+            extract_gpu_sandbox_rootfs_to
+        } else {
+            extract_sandbox_rootfs_to
+        };
+        tokio::task::spawn_blocking(move || extract_fn(&rootfs_for_extract))
             .await
             .map_err(|err| Status::internal(format!("sandbox rootfs extraction panicked: {err}")))?
             .map_err(|err| Status::internal(format!("extract sandbox rootfs failed: {err}")))?;
@@ -304,19 +319,28 @@ impl VmDriver {
                 .gpu_inventory
                 .as_ref()
                 .ok_or_else(|| Status::internal("GPU inventory not initialized"))?;
-            let assignment = inventory
+            match inventory
                 .lock()
-                .map_err(|e| Status::internal(format!("GPU inventory lock poisoned: {e}")))?
-                .assign(&sandbox.id, gpu_device)
-                .map_err(|e| Status::failed_precondition(e))?;
-            tracing::info!(
-                sandbox_id = %sandbox.id,
-                bdf = %assignment.bdf,
-                gpu_name = %assignment.name,
-                iommu_group = assignment.iommu_group,
-                "assigned GPU to sandbox"
-            );
-            Some(assignment.bdf)
+                .map_err(|e| Status::internal(format!("GPU inventory lock poisoned: {e}")))
+                .and_then(|mut inv| {
+                    inv.assign(&sandbox.id, gpu_device)
+                        .map_err(|e| Status::failed_precondition(e))
+                }) {
+                Ok(assignment) => {
+                    tracing::info!(
+                        sandbox_id = %sandbox.id,
+                        bdf = %assignment.bdf,
+                        gpu_name = %assignment.name,
+                        iommu_group = assignment.iommu_group,
+                        "assigned GPU to sandbox"
+                    );
+                    Some(assignment.bdf)
+                }
+                Err(err) => {
+                    let _ = tokio::fs::remove_dir_all(&state_dir).await;
+                    return Err(err);
+                }
+            }
         } else {
             None
         };
@@ -371,9 +395,6 @@ impl VmDriver {
             command
                 .arg("--vm-mem-mib")
                 .arg(self.config.gpu_mem_mib.to_string());
-            command
-                .arg("--vm-krun-log-level")
-                .arg(self.config.krun_log_level.to_string());
             command.arg("--vm-gpu-bdf").arg(gpu_bdf.as_ref().unwrap());
             command.arg("--vm-tap-device").arg(&tap);
             command
@@ -383,17 +404,22 @@ impl VmDriver {
             command.arg("--vm-vsock-cid").arg(vsock_cid.to_string());
             command.arg("--vm-guest-mac").arg(&mac_str);
 
+            if let Some(port) = gateway_port_from_endpoint(&self.config.openshell_endpoint) {
+                command.arg("--vm-gateway-port").arg(port.to_string());
+            }
+
             Some(tap_endpoint)
         } else {
             command.arg("--vm-vcpus").arg(self.config.vcpus.to_string());
             command
                 .arg("--vm-mem-mib")
                 .arg(self.config.mem_mib.to_string());
-            command
-                .arg("--vm-krun-log-level")
-                .arg(self.config.krun_log_level.to_string());
             None
         };
+
+        command
+            .arg("--vm-krun-log-level")
+            .arg(self.config.krun_log_level.to_string());
 
         for env in build_guest_environment(sandbox, &self.config, endpoint_override.as_deref()) {
             command.arg("--vm-env").arg(env);
@@ -911,6 +937,10 @@ fn guest_visible_openshell_endpoint(endpoint: &str) -> String {
     endpoint.to_string()
 }
 
+fn gateway_port_from_endpoint(endpoint: &str) -> Option<u16> {
+    Url::parse(endpoint).ok().and_then(|url| url.port())
+}
+
 fn guest_visible_openshell_endpoint_for_tap(endpoint: &str, host_ip: &str) -> String {
     let Ok(mut url) = Url::parse(endpoint) else {
         return endpoint.to_string();
@@ -1362,7 +1392,6 @@ mod tests {
             registry: Arc::new(Mutex::new(HashMap::new())),
             events,
             gpu_inventory: None,
-            gpu_count: 0,
             subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
                 Ipv4Addr::new(10, 0, 128, 0),
                 17,

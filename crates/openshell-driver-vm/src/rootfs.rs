@@ -6,6 +6,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 const ROOTFS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rootfs.tar.zst"));
+const ROOTFS_GPU: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rootfs-gpu.tar.zst"));
 const ROOTFS_VARIANT_MARKER: &str = ".openshell-rootfs-variant";
 const SANDBOX_GUEST_INIT_PATH: &str = "/srv/openshell-vm-sandbox-init.sh";
 
@@ -14,14 +15,29 @@ pub const fn sandbox_guest_init_path() -> &'static str {
 }
 
 pub fn extract_sandbox_rootfs_to(dest: &Path) -> Result<(), String> {
-    if ROOTFS.is_empty() {
-        return Err(
-            "sandbox rootfs not embedded. Build openshell-driver-vm with OPENSHELL_VM_RUNTIME_COMPRESSED_DIR set or run `mise run vm:setup` first"
-                .to_string(),
-        );
+    extract_variant(
+        ROOTFS,
+        "sandbox",
+        "sandbox rootfs not embedded. Build openshell-driver-vm with OPENSHELL_VM_RUNTIME_COMPRESSED_DIR set or run `mise run vm:setup` first",
+        dest,
+    )
+}
+
+pub fn extract_gpu_sandbox_rootfs_to(dest: &Path) -> Result<(), String> {
+    extract_variant(
+        ROOTFS_GPU,
+        "sandbox-gpu",
+        "GPU sandbox rootfs not embedded. Build with `mise run vm:rootfs -- --gpu` first",
+        dest,
+    )
+}
+
+fn extract_variant(blob: &[u8], variant: &str, empty_msg: &str, dest: &Path) -> Result<(), String> {
+    if blob.is_empty() {
+        return Err(empty_msg.to_string());
     }
 
-    let expected_marker = format!("{}:sandbox", env!("CARGO_PKG_VERSION"));
+    let expected_marker = format!("{}:{variant}", env!("CARGO_PKG_VERSION"));
     let marker_path = dest.join(ROOTFS_VARIANT_MARKER);
 
     if dest.is_dir()
@@ -37,22 +53,25 @@ pub fn extract_sandbox_rootfs_to(dest: &Path) -> Result<(), String> {
             .map_err(|e| format!("remove old rootfs {}: {e}", dest.display()))?;
     }
 
-    extract_rootfs_to(dest)?;
+    unpack_zstd_tar(blob, variant, dest)?;
     prepare_sandbox_rootfs(dest)?;
     fs::write(marker_path, format!("{expected_marker}\n"))
         .map_err(|e| format!("write rootfs variant marker: {e}"))?;
     Ok(())
 }
 
-fn extract_rootfs_to(dest: &Path) -> Result<(), String> {
+fn unpack_zstd_tar(blob: &[u8], label: &str, dest: &Path) -> Result<(), String> {
     fs::create_dir_all(dest).map_err(|e| format!("create rootfs dir {}: {e}", dest.display()))?;
 
-    let decoder =
-        zstd::Decoder::new(Cursor::new(ROOTFS)).map_err(|e| format!("decompress rootfs: {e}"))?;
+    let decoder = zstd::Decoder::new(Cursor::new(blob))
+        .map_err(|e| format!("decompress {label} rootfs: {e}"))?;
     let mut archive = tar::Archive::new(decoder);
-    archive
-        .unpack(dest)
-        .map_err(|e| format!("extract rootfs tarball into {}: {e}", dest.display()))
+    archive.unpack(dest).map_err(|e| {
+        format!(
+            "extract {label} rootfs tarball into {}: {e}",
+            dest.display()
+        )
+    })
 }
 
 fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {

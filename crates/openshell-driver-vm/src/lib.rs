@@ -10,4 +10,7 @@ mod rootfs;
 mod runtime;
 
 pub use driver::{VmDriver, VmDriverConfig};
-pub use runtime::{VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, configured_runtime_dir, run_vm};
+pub use runtime::{
+    VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, cleanup_stale_tap_interfaces,
+    configured_runtime_dir, run_vm,
+};
