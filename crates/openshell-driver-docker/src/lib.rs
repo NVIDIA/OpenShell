@@ -8,8 +8,8 @@
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, HostConfig, Mount,
-    MountTypeEnum, RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, DeviceRequest, HostConfig,
+    Mount, MountTypeEnum, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -17,12 +17,12 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
+use openshell_core::config::{CDI_GPU_DEVICE_ALL, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
+    GpuSpec, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
     ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
     WatchSandboxesEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
     compute_driver_server::ComputeDriver, watch_sandboxes_event,
@@ -159,6 +159,7 @@ struct DockerDriverRuntimeConfig {
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
+    cdi_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -195,6 +196,12 @@ impl DockerComputeDriver {
         let version = docker.version().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;
+        let cdi_enabled = docker
+            .info()
+            .await
+            .ok()
+            .and_then(|info| info.cdi_spec_dirs)
+            .is_some_and(|dirs| !dirs.is_empty());
         let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
         let supervisor_bin = resolve_supervisor_bin(&docker, docker_config, &daemon_arch).await?;
         let guest_tls = docker_guest_tls_paths(config, docker_config)?;
@@ -212,6 +219,7 @@ impl DockerComputeDriver {
                 supervisor_bin,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
+                cdi_enabled,
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             supervisor_readiness,
@@ -230,11 +238,14 @@ impl DockerComputeDriver {
             driver_name: "docker".to_string(),
             driver_version: self.config.daemon_version.clone(),
             default_image: self.config.default_image.clone(),
-            supports_gpu: false,
+            supports_gpu: self.config.cdi_enabled,
         }
     }
 
-    fn validate_sandbox(sandbox: &DriverSandbox) -> Result<(), Status> {
+    fn validate_sandbox(
+        sandbox: &DriverSandbox,
+        config: &DockerDriverRuntimeConfig,
+    ) -> Result<(), Status> {
         let spec = sandbox
             .spec
             .as_ref()
@@ -249,9 +260,9 @@ impl DockerComputeDriver {
                 "docker sandboxes require a template image",
             ));
         }
-        if spec.gpu.is_some() {
+        if spec.gpu.is_some() && !config.cdi_enabled {
             return Err(Status::failed_precondition(
-                "docker compute driver does not support gpu sandboxes",
+                "docker GPU sandboxes require Docker CDI support. Enable CDI on the Docker daemon, then restart the OpenShell gateway/server so GPU capability is detected.",
             ));
         }
         if !template.agent_socket_path.trim().is_empty() {
@@ -299,7 +310,7 @@ impl DockerComputeDriver {
     }
 
     async fn create_sandbox_inner(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
-        Self::validate_sandbox(sandbox)?;
+        Self::validate_sandbox(sandbox, &self.config)?;
 
         if self
             .find_managed_container_summary(&sandbox.id, &sandbox.name)
@@ -673,7 +684,7 @@ impl ComputeDriver for DockerComputeDriver {
             .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        Self::validate_sandbox(&sandbox)?;
+        Self::validate_sandbox(&sandbox, &self.config)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
@@ -875,6 +886,16 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         .collect()
 }
 
+fn docker_gpu_device_requests(gpu: Option<&GpuSpec>) -> Option<Vec<DeviceRequest>> {
+    gpu.map(|_| {
+        vec![DeviceRequest {
+            driver: Some("cdi".to_string()),
+            device_ids: Some(vec![CDI_GPU_DEVICE_ALL.to_string()]),
+            ..Default::default()
+        }]
+    })
+}
+
 fn build_container_create_body(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
@@ -916,6 +937,7 @@ fn build_container_create_body(
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
+            device_requests: docker_gpu_device_requests(spec.gpu.as_ref()),
             mounts: Some(build_mounts(config)),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),

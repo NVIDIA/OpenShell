@@ -460,6 +460,16 @@ Kernel-level error behavior (e.g., Landlock ABI unavailable) depends on `Landloc
 
 **Baseline path filtering**: System-injected baseline paths (e.g., `/app`) are pre-filtered by `enrich_proto_baseline_paths()` / `enrich_sandbox_baseline_paths()` using `Path::exists()` before they reach Landlock. If a baseline `read_write` path is already present in `read_only`, enrichment skips the promotion so explicit policy intent is preserved. User-specified paths are not pre-filtered -- they are evaluated at Landlock apply time so misconfigurations surface as warnings or errors.
 
+**GPU baseline paths**: The supervisor currently infers GPU baseline paths from
+device nodes and NVIDIA runtime paths visible inside the sandbox container. The
+Docker compute driver can request CDI GPU injection, but this implementation
+does not pass CDI metadata into the supervisor. Future device-specific CDI
+selection may need follow-up work so the supervisor can enrich Landlock using
+the requested CDI device's actual device nodes and mounted library paths. That
+design must work for remote Docker daemons, where Docker-reported CDI spec
+directories are paths on the daemon host and may not be readable by the gateway
+process or the sandbox supervisor.
+
 ### Seccomp syscall filtering
 
 **File:** `crates/openshell-sandbox/src/sandbox/linux/seccomp.rs`
