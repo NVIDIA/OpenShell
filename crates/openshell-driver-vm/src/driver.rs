@@ -53,9 +53,6 @@ const DRIVER_NAME: &str = "openshell-driver-vm";
 const WATCH_BUFFER: usize = 256;
 const DEFAULT_VCPUS: u8 = 2;
 const DEFAULT_MEM_MIB: u32 = 2048;
-/// gvproxy gateway IP — runs DNS, DHCP, and the gvproxy HTTP API. Does **not**
-/// proxy arbitrary host ports.
-const GVPROXY_GATEWAY_IP: &str = "192.168.127.1";
 /// gvproxy host-loopback IP — gvproxy's TCP/UDP/ICMP forwarder NAT-rewrites
 /// this destination to the host's `127.0.0.1` and dials out from the host
 /// process. This is the only address that transparently reaches host-bound
@@ -396,7 +393,10 @@ impl VmDriver {
             ),
         );
 
-        let image_identity = match self.prepare_runtime_rootfs(&sandbox.id, &image_ref, &rootfs).await {
+        let image_identity = match self
+            .prepare_runtime_rootfs(&sandbox.id, &image_ref, &rootfs)
+            .await
+        {
             Ok(image_identity) => {
                 info!(
                     sandbox_id = %sandbox.id,
@@ -415,13 +415,13 @@ impl VmDriver {
                 return Err(err);
             }
         };
-        if let Some(tls_paths) = tls_paths.as_ref() {
-            if let Err(err) = prepare_guest_tls_materials(&rootfs, tls_paths).await {
-                let _ = tokio::fs::remove_dir_all(&state_dir).await;
-                return Err(Status::internal(format!(
-                    "prepare guest TLS materials failed: {err}"
-                )));
-            }
+        if let Some(tls_paths) = tls_paths.as_ref()
+            && let Err(err) = prepare_guest_tls_materials(&rootfs, tls_paths).await
+        {
+            let _ = tokio::fs::remove_dir_all(&state_dir).await;
+            return Err(Status::internal(format!(
+                "prepare guest TLS materials failed: {err}"
+            )));
         }
 
         if let Err(err) =
@@ -578,12 +578,7 @@ impl VmDriver {
         // promotes the sandbox to `Ready` separately.
         self.publish_platform_event(
             sandbox.id.clone(),
-            platform_event(
-                "vm",
-                "Normal",
-                "Started",
-                "Started VM launcher".to_string(),
-            ),
+            platform_event("vm", "Normal", "Started", "Started VM launcher".to_string()),
         );
         let snapshot = sandbox_snapshot(sandbox, provisioning_condition(), false);
         let process = Arc::new(Mutex::new(VmProcess {
@@ -937,10 +932,7 @@ impl VmDriver {
                 &image_identity_owned,
             )
             .map_err(|err| {
-                format!(
-                    "vm sandbox image '{}' is not base-compatible: {err}",
-                    image_ref_owned
-                )
+                format!("vm sandbox image '{image_ref_owned}' is not base-compatible: {err}")
             })?;
             create_rootfs_archive_from_dir(&prepared_rootfs_for_build, &prepared_archive_for_build)
         })
@@ -1041,10 +1033,7 @@ impl VmDriver {
                 &image_identity_owned,
             )
             .map_err(|err| {
-                format!(
-                    "vm sandbox image '{}' is not base-compatible: {err}",
-                    image_ref_owned
-                )
+                format!("vm sandbox image '{image_ref_owned}' is not base-compatible: {err}")
             })?;
             create_rootfs_archive_from_dir(&prepared_rootfs_for_build, &prepared_archive_for_build)
         })
@@ -1405,6 +1394,7 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_registry_reference(image_ref: &str) -> Result<Reference, Status> {
     Reference::try_from(image_ref).map_err(|err| {
         Status::failed_precondition(format!(
@@ -1447,6 +1437,7 @@ fn linux_oci_arch() -> &'static str {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn registry_auth(image_ref: &str) -> Result<RegistryAuth, Status> {
     let username = env_non_empty("OPENSHELL_REGISTRY_USERNAME");
     let token = env_non_empty("OPENSHELL_REGISTRY_TOKEN");
@@ -1488,6 +1479,7 @@ fn image_reference_registry_host(image_ref: &str) -> &str {
 }
 
 impl VmDriver {
+    #[allow(clippy::too_many_arguments)]
     async fn pull_registry_image_rootfs(
         &self,
         sandbox_id: &str,
@@ -1523,11 +1515,7 @@ impl VmDriver {
             .map_err(|err| Status::internal(format!("create layer staging dir failed: {err}")))?;
 
         let total_layers = manifest.layers.len();
-        let total_bytes: i64 = manifest
-            .layers
-            .iter()
-            .map(|layer| layer.size.max(0))
-            .sum();
+        let total_bytes: i64 = manifest.layers.iter().map(|layer| layer.size.max(0)).sum();
         for (index, layer) in manifest.layers.iter().enumerate() {
             // Emit a per-layer progress event so the CLI can show
             // "Layer 3/8 (12.4 MB)" as detail under the spinner.
@@ -1572,16 +1560,11 @@ impl VmDriver {
     /// Emit a `Pulled` platform event with a message that mirrors the
     /// kubelet's `Successfully pulled image ... Image size: N bytes.`
     /// format so the CLI's `extract_image_size` parser works unchanged.
-    async fn publish_pulled_event(
-        &self,
-        sandbox_id: &str,
-        image_ref: &str,
-        archive_path: &Path,
-    ) {
-        let size_suffix = match tokio::fs::metadata(archive_path).await {
-            Ok(meta) => format!(" Image size: {} bytes.", meta.len()),
-            Err(_) => String::new(),
-        };
+    async fn publish_pulled_event(&self, sandbox_id: &str, image_ref: &str, archive_path: &Path) {
+        let size_suffix = tokio::fs::metadata(archive_path).await.map_or_else(
+            |_| String::new(),
+            |meta| format!(" Image size: {} bytes.", meta.len()),
+        );
         self.publish_platform_event(
             sandbox_id.to_string(),
             platform_event(
@@ -1681,7 +1664,7 @@ fn compute_file_sha256(path: &Path) -> Result<String, String> {
 fn compute_file_sha256_hex(path: &Path) -> Result<String, String> {
     let mut file = fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         let read = file
             .read(&mut buffer)
@@ -1724,6 +1707,9 @@ fn extract_tar_reader_to_dir(reader: impl Read, dest: &Path) -> Result<(), Strin
         .map_err(|err| format!("extract layer into {}: {err}", dest.display()))
 }
 
+// `media_type` is an OCI media type string (e.g. `application/vnd.oci.image.layer.v1.tar+gzip`),
+// not a filesystem path, so case-sensitive comparison is correct.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn layer_compression_from_media_type(media_type: &str) -> Result<LayerCompression, String> {
     if media_type.is_empty() {
         return Err("layer media type is missing".to_string());
@@ -1756,7 +1742,7 @@ fn merge_layer_directory(source_dir: &Path, target_dir: &Path) -> Result<(), Str
         .map_err(|err| format!("read {}: {err}", source_dir.display()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("read {}: {err}", source_dir.display()))?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(fs::DirEntry::file_name);
 
     if entries
         .iter()
@@ -2304,7 +2290,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        validate_vm_sandbox(&sandbox).expect("template.image should be accepted");
+        validate_vm_sandbox(&sandbox, false).expect("template.image should be accepted");
     }
 
     #[test]
@@ -2318,6 +2304,11 @@ mod tests {
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
             events: broadcast::channel(WATCH_BUFFER).0,
+            gpu_inventory: None,
+            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
+                Ipv4Addr::new(10, 0, 128, 0),
+                17,
+            ))),
         };
 
         assert_eq!(driver.capabilities().default_image, "openshell/sandbox:dev");
@@ -2334,6 +2325,11 @@ mod tests {
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
             events: broadcast::channel(WATCH_BUFFER).0,
+            gpu_inventory: None,
+            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
+                Ipv4Addr::new(10, 0, 128, 0),
+                17,
+            ))),
         };
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
@@ -2363,6 +2359,11 @@ mod tests {
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
             events: broadcast::channel(WATCH_BUFFER).0,
+            gpu_inventory: None,
+            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
+                Ipv4Addr::new(10, 0, 128, 0),
+                17,
+            ))),
         };
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
@@ -2386,6 +2387,11 @@ mod tests {
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
             events: broadcast::channel(WATCH_BUFFER).0,
+            gpu_inventory: None,
+            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
+                Ipv4Addr::new(10, 0, 128, 0),
+                17,
+            ))),
         };
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
@@ -2502,14 +2508,12 @@ mod tests {
             format!("http://{OPENSHELL_HOST_GATEWAY_ALIAS}:8080")
         );
         assert_eq!(
-            guest_visible_openshell_endpoint(&format!(
-                "http://{GVPROXY_HOST_LOOPBACK_ALIAS}:8080"
-            )),
+            guest_visible_openshell_endpoint(&format!("http://{GVPROXY_HOST_LOOPBACK_ALIAS}:8080")),
             format!("http://{GVPROXY_HOST_LOOPBACK_ALIAS}:8080")
         );
         assert_eq!(
-            guest_visible_openshell_endpoint(&format!("http://{GVPROXY_GATEWAY_IP}:8080")),
-            format!("http://{GVPROXY_GATEWAY_IP}:8080")
+            guest_visible_openshell_endpoint("http://192.168.127.1:8080"),
+            "http://192.168.127.1:8080"
         );
         assert_eq!(
             guest_visible_openshell_endpoint("https://gateway.internal:8443"),
@@ -2689,7 +2693,7 @@ mod tests {
     fn validate_openshell_endpoint_accepts_host_gateway() {
         validate_openshell_endpoint("http://host.containers.internal:8080")
             .expect("guest-reachable host alias should be accepted");
-        validate_openshell_endpoint(&format!("http://{GVPROXY_GATEWAY_IP}:8080"))
+        validate_openshell_endpoint("http://192.168.127.1:8080")
             .expect("gateway IP should be accepted");
         validate_openshell_endpoint(&format!("http://{OPENSHELL_HOST_GATEWAY_ALIAS}:8080"))
             .expect("openshell host alias should be accepted");
