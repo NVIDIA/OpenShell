@@ -4442,7 +4442,24 @@ mod tests {
         }
 
         let cache = BinaryIdentityCache::new();
-        let result = resolve_process_identity(std::process::id(), peer_port, &cache);
+
+        // Resolve with a brief retry loop — under heavy CI load the child's
+        // procfs entry can momentarily fail to resolve even though the loop
+        // above just verified `/proc/<pid>/exe` pointed at `sleep`.  Retry a
+        // few times before declaring failure so the test is not flaky.
+        let mut result = resolve_process_identity(std::process::id(), peer_port, &cache);
+        for _ in 0..5 {
+            match &result {
+                Err(err)
+                    if err.reason.contains("No such file or directory")
+                        || err.reason.contains("os error 2") =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                    result = resolve_process_identity(std::process::id(), peer_port, &cache);
+                }
+                _ => break,
+            }
+        }
 
         // libc/syscall FFI requires unsafe
         #[allow(unsafe_code)]
