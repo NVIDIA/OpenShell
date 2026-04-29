@@ -426,7 +426,10 @@ pub(super) async fn handle_get_sandbox_config(
         }
     }
 
-    if use_providers_v2 && let Some(source_policy) = policy.as_ref() {
+    if use_providers_v2
+        && !matches!(policy_source, PolicySource::Global)
+        && let Some(source_policy) = policy.as_ref()
+    {
         let provider_layers =
             profile_provider_policy_layers(state.store.as_ref(), &sandbox_provider_names).await?;
         if !provider_layers.is_empty() {
@@ -2756,6 +2759,119 @@ mod tests {
         );
 
         assert!(bool_setting_enabled(&settings, settings::USE_PROVIDERS_V2_KEY).unwrap());
+    }
+
+    #[tokio::test]
+    async fn global_policy_suppresses_provider_profile_layers_when_v2_enabled() {
+        use openshell_core::proto::{
+            GetSandboxConfigRequest, NetworkEndpoint, NetworkPolicyRule, SandboxPhase,
+            SandboxPolicy, SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+
+        let sandbox_policy = SandboxPolicy {
+            network_policies: [(
+                "sandbox_only".to_string(),
+                NetworkPolicyRule {
+                    name: "sandbox_only".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "sandbox.example.com".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-global-profile".to_string(),
+                name: "global-profile-sandbox".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(sandbox_policy),
+                providers: vec!["work-github".to_string()],
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let global_policy = SandboxPolicy {
+            network_policies: [(
+                "global_only".to_string(),
+                NetworkPolicyRule {
+                    name: "global_only".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "global.example.com".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: [
+                (
+                    settings::USE_PROVIDERS_V2_KEY.to_string(),
+                    StoredSettingValue::Bool(true),
+                ),
+                (
+                    POLICY_SETTING_KEY.to_string(),
+                    StoredSettingValue::Bytes(hex::encode(global_policy.encode_to_vec())),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_config(
+            &state,
+            Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-global-profile".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let effective_policy = response.policy.expect("global policy should be returned");
+        assert_eq!(response.policy_source, PolicySource::Global as i32);
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("global_only")
+        );
+        assert!(
+            !effective_policy
+                .network_policies
+                .contains_key("sandbox_only")
+        );
+        assert!(
+            !effective_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
     }
 
     #[tokio::test]
