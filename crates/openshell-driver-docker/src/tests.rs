@@ -52,6 +52,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             key: PathBuf::from("/tmp/tls.key"),
         }),
         daemon_version: "28.0.0".to_string(),
+        supports_gpu: false,
     }
 }
 
@@ -169,6 +170,48 @@ fn build_container_create_body_clears_inherited_cmd() {
             .as_ref()
             .and_then(|labels| labels.get(SANDBOX_NAMESPACE_LABEL_KEY)),
         Some(&"default".to_string())
+    );
+    assert!(
+        create_body
+            .host_config
+            .as_ref()
+            .and_then(|host_config| host_config.device_requests.as_ref())
+            .is_none(),
+        "non-GPU containers should not request Docker devices"
+    );
+}
+
+#[test]
+fn validate_sandbox_rejects_gpu_when_cdi_unavailable() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().gpu = true;
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("Docker CDI"));
+}
+
+#[test]
+fn build_container_create_body_maps_gpu_to_all_cdi_device() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().gpu = true;
+
+    let create_body = build_container_create_body(&sandbox, &config).unwrap();
+    let request = create_body
+        .host_config
+        .as_ref()
+        .and_then(|host_config| host_config.device_requests.as_ref())
+        .and_then(|requests| requests.first())
+        .expect("GPU request should add a Docker device request");
+
+    assert_eq!(request.driver.as_deref(), Some("cdi"));
+    assert_eq!(
+        request.device_ids.as_ref().unwrap(),
+        &vec![CDI_GPU_DEVICE_ALL.to_string()]
     );
 }
 
