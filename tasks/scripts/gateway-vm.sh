@@ -6,6 +6,10 @@
 # Start a standalone openshell-gateway backed by the VM compute driver
 # (openshell-driver-vm) for local manual testing.
 #
+# Invocation:
+#   mise run gateway:start vm          # canonical
+#   mise run gateway:vm                # alias
+#
 # Defaults:
 # - Plaintext HTTP on 127.0.0.1:18081
 # - Dedicated CLI gateway "vm-dev"
@@ -20,9 +24,11 @@
 #   OPENSHELL_SANDBOX_NAMESPACE=my-ns mise run gateway:vm
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:vm
 #
-# After the gateway is running, point the CLI at it with either:
-#   openshell --gateway vm-dev <command>
-#   openshell gateway select vm-dev   # then plain `openshell <command>`
+# This script also writes ~/.config/openshell/active_gateway so the
+# `openshell` CLI automatically targets this gateway in subsequent shells.
+# No need to run `openshell gateway select`. Inside this repo you can
+# override per-developer with OPENSHELL_GATEWAY in `.env` (mise loads it).
+# An explicit `--gateway` / `--gateway-endpoint` flag still wins.
 
 set -euo pipefail
 
@@ -93,6 +99,18 @@ register_gateway_metadata() {
   "auth_mode": "plaintext"
 }
 EOF
+}
+
+# Mirror what `openshell gateway select <name>` does: write the gateway name
+# to $XDG_CONFIG_HOME/openshell/active_gateway. The CLI picks it up as the
+# default target when neither --gateway nor OPENSHELL_GATEWAY is set.
+save_active_gateway() {
+  local name=$1
+  local config_home active_gateway_path
+  config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+  active_gateway_path="${config_home}/openshell/active_gateway"
+  mkdir -p "$(dirname "${active_gateway_path}")"
+  printf '%s' "${name}" >"${active_gateway_path}"
 }
 
 check_supervisor_cross_toolchain() {
@@ -190,6 +208,7 @@ mkdir -p "${VM_DRIVER_STATE_DIR}"
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
+save_active_gateway "${GATEWAY_NAME}"
 
 echo "Starting standalone VM gateway..."
 echo "  gateway:    ${GATEWAY_NAME}"
@@ -200,9 +219,9 @@ echo "  driver:     ${DRIVER_DIR}/openshell-driver-vm"
 echo "  driver dir: ${VM_DRIVER_STATE_DIR}"
 echo "  image:      ${SANDBOX_IMAGE}"
 echo
-echo "Point the CLI at this gateway with one of:"
-echo "  openshell --gateway ${GATEWAY_NAME} status"
-echo "  openshell gateway select ${GATEWAY_NAME}"
+echo "Active gateway set to '${GATEWAY_NAME}'. The CLI now targets this gateway"
+echo "by default — just run \`openshell <command>\`. Override with --gateway"
+echo "or by setting OPENSHELL_GATEWAY (e.g. in .env)."
 echo
 
 GATEWAY_ARGS=(
