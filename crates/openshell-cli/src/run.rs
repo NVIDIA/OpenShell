@@ -202,19 +202,6 @@ enum KubeEventReason {
 /// every log line (helpful when debugging stuck provisioning, e.g. on
 /// the experimental VM gateway).
 fn should_show_provisioning_log(line: &openshell_core::proto::SandboxLogLine) -> bool {
-    if std::env::var("OPENSHELL_PROVISION_VERBOSE")
-        .map(|v| !v.is_empty() && v != "0" && v.to_ascii_lowercase() != "false")
-        .unwrap_or(false)
-    {
-        return true;
-    }
-
-    // Always surface warnings and errors during provisioning.
-    let level = line.level.to_ascii_lowercase();
-    if matches!(level.as_str(), "warn" | "warning" | "error") {
-        return true;
-    }
-
     // Allowlisted substrings for info-level progress lines emitted by
     // the server compute layer and bundled drivers (VM / Docker). Keep
     // this short — anything not matching is suppressed by default.
@@ -230,6 +217,20 @@ fn should_show_provisioning_log(line: &openshell_core::proto::SandboxLogLine) ->
         "Sandbox ready",
         "Supervisor connected",
     ];
+
+    if std::env::var("OPENSHELL_PROVISION_VERBOSE")
+        .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    // Always surface warnings and errors during provisioning.
+    let level = line.level.to_ascii_lowercase();
+    if matches!(level.as_str(), "warn" | "warning" | "error") {
+        return true;
+    }
+
     ALLOWLIST.iter().any(|needle| line.message.contains(needle))
 }
 
@@ -2363,12 +2364,7 @@ pub async fn sandbox_create(
                         } else {
                             line.level.to_uppercase()
                         };
-                        eprintln!(
-                            "  {} {} {}",
-                            ts.dimmed(),
-                            level.dimmed(),
-                            line.message,
-                        );
+                        eprintln!("  {} {} {}", ts.dimmed(), level.dimmed(), line.message,);
                     }
                 }
             }
@@ -6251,6 +6247,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_health_check_supports_plain_http_endpoints() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");
         let server = thread::spawn(move || {

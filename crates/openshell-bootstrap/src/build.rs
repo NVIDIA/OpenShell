@@ -56,8 +56,9 @@ pub fn encode_rootfs_tar_image_ref(path: &Path) -> Result<String> {
         .canonicalize()
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to resolve rootfs tar path {}", path.display()))?;
-    let file_url = Url::from_file_path(&canonical)
-        .map_err(|_| miette::miette!("failed to encode rootfs tar path {}", canonical.display()))?;
+    let file_url = Url::from_file_path(&canonical).map_err(|()| {
+        miette::miette!("failed to encode rootfs tar path {}", canonical.display())
+    })?;
     Ok(format!(
         "{ROOTFS_TAR_IMAGE_REF_SCHEME}:{}",
         &file_url[Position::BeforePath..]
