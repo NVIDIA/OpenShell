@@ -1138,6 +1138,22 @@ enum SandboxCommands {
         #[arg(long)]
         gpu: bool,
 
+        /// Minimum CPU cores requested (Kubernetes quantity, e.g. "500m", "2").
+        #[arg(long, value_name = "QUANTITY", help_heading = "RESOURCE FLAGS")]
+        cpu_request: Option<String>,
+
+        /// Maximum CPU cores allowed (Kubernetes quantity, e.g. "500m", "4").
+        #[arg(long, value_name = "QUANTITY", help_heading = "RESOURCE FLAGS")]
+        cpu_limit: Option<String>,
+
+        /// Minimum memory requested (Kubernetes quantity, e.g. "256Mi", "4Gi").
+        #[arg(long, value_name = "QUANTITY", help_heading = "RESOURCE FLAGS")]
+        memory_request: Option<String>,
+
+        /// Maximum memory allowed (Kubernetes quantity, e.g. "512Mi", "8Gi").
+        #[arg(long, value_name = "QUANTITY", help_heading = "RESOURCE FLAGS")]
+        memory_limit: Option<String>,
+
         /// SSH destination for remote bootstrap (e.g., user@hostname).
         /// Only used when no cluster exists yet; ignored if a cluster is
         /// already active.
@@ -2307,6 +2323,10 @@ async fn main() -> Result<()> {
                     no_keep,
                     editor,
                     gpu,
+                    cpu_request,
+                    cpu_limit,
+                    memory_request,
+                    memory_limit,
                     remote,
                     ssh_key,
                     providers,
@@ -2368,6 +2388,13 @@ async fn main() -> Result<()> {
                         (local, remote, !no_git_ignore)
                     });
 
+                    let resource_args = run::ResourceArgs {
+                        cpu_request,
+                        cpu_limit,
+                        memory_request,
+                        memory_limit,
+                    };
+
                     let editor = editor.map(Into::into);
                     let forward = forward
                         .map(|s| openshell_core::forward::ForwardSpec::parse(&s))
@@ -2402,6 +2429,7 @@ async fn main() -> Result<()> {
                                 upload_spec.as_ref(),
                                 keep,
                                 gpu,
+                                &resource_args,
                                 editor,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
@@ -2425,6 +2453,7 @@ async fn main() -> Result<()> {
                                 upload_spec.as_ref(),
                                 keep,
                                 gpu,
+                                &resource_args,
                                 editor,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
