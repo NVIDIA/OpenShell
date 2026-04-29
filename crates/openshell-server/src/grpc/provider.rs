@@ -386,10 +386,21 @@ pub(super) async fn handle_delete_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ServerState;
+    use crate::compute::new_test_runtime;
     use crate::grpc::MAX_MAP_KEY_LEN;
+    use crate::sandbox_index::SandboxIndex;
+    use crate::sandbox_watch::SandboxWatchBus;
+    use crate::supervisor_session::SupervisorSessionRegistry;
+    use crate::tracing_bus::TracingLogBus;
+    use openshell_core::Config;
+    use openshell_core::proto::{
+        GetProviderProfileRequest, ListProviderProfilesRequest, ProviderProfileCategory,
+    };
     use openshell_core::{ObjectId, ObjectName};
     use std::collections::HashMap;
-    use tonic::Code;
+    use std::sync::Arc;
+    use tonic::{Code, Request};
 
     #[test]
     fn env_key_validation_accepts_valid_keys() {
@@ -430,6 +441,89 @@ mod tests {
             .into_iter()
             .collect(),
         }
+    }
+
+    async fn test_server_state() -> Arc<ServerState> {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        let compute = new_test_runtime(store.clone()).await;
+        Arc::new(ServerState::new(
+            Config::new(None)
+                .with_database_url("sqlite::memory:?cache=shared")
+                .with_ssh_handshake_secret("test-secret"),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn list_provider_profiles_returns_built_in_profile_categories() {
+        let state = test_server_state().await;
+        let response = handle_list_provider_profiles(
+            &state,
+            Request::new(ListProviderProfilesRequest {
+                limit: 100,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let github = response
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "github")
+            .expect("github profile should be listed");
+        assert_eq!(
+            github.category,
+            ProviderProfileCategory::SourceControl as i32
+        );
+        assert!(
+            response
+                .profiles
+                .iter()
+                .all(|profile| profile.id != "generic"),
+            "generic remains a legacy provider type without a v2 profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_provider_profile_returns_profile_or_not_found() {
+        let state = test_server_state().await;
+        let github = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: "github".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profile
+        .expect("github profile should be returned");
+        assert_eq!(github.id, "github");
+        assert_eq!(
+            github.category,
+            ProviderProfileCategory::SourceControl as i32
+        );
+
+        let generic_err = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: "generic".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(generic_err.code(), Code::NotFound);
     }
 
     #[tokio::test]

@@ -205,7 +205,14 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
+        Ok(Response::new(
+            openshell_core::proto::ListProviderProfilesResponse {
+                profiles: openshell_providers::default_profiles()
+                    .iter()
+                    .map(|profile| profile.to_proto())
+                    .collect(),
+            },
+        ))
     }
 
     async fn get_provider_profile(
@@ -541,6 +548,15 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     run::provider_delete(&ts.endpoint, &["my-claude".to_string()], &ts.tls)
         .await
         .expect("provider delete");
+}
+
+#[tokio::test]
+async fn provider_list_types_cli_uses_profile_browsing_rpc() {
+    let ts = run_server().await;
+
+    run::provider_list_types(&ts.endpoint, &ts.tls)
+        .await
+        .expect("provider list-types");
 }
 
 #[tokio::test]
