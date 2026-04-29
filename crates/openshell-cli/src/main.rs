@@ -2982,6 +2982,7 @@ mod tests {
             gateway_endpoint: endpoint.to_string(),
             is_remote: true,
             auth_mode: Some("cloudflare_jwt".to_string()),
+            client_lifecycle_managed: Some(false),
             ..Default::default()
         }
     }

@@ -1727,6 +1727,7 @@ fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Re
         name: gateway_name.to_string(),
         gateway_endpoint: format!("https://127.0.0.1:{gateway_port}"),
         gateway_port,
+        client_lifecycle_managed: Some(true),
         ..Default::default()
     };
 

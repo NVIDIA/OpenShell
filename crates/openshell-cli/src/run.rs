@@ -897,6 +897,7 @@ fn plaintext_gateway_metadata(
         remote_host,
         resolved_host,
         auth_mode: Some("plaintext".to_string()),
+        client_lifecycle_managed: Some(false),
         ..Default::default()
     }
 }
@@ -1188,6 +1189,7 @@ pub async fn gateway_add(
             remote_host,
             resolved_host,
             auth_mode: Some("mtls".to_string()),
+            client_lifecycle_managed: Some(false),
             ..Default::default()
         };
 
@@ -1213,6 +1215,7 @@ pub async fn gateway_add(
             gateway_endpoint: endpoint.clone(),
             is_remote: true,
             auth_mode: Some("cloudflare_jwt".to_string()),
+            client_lifecycle_managed: Some(false),
             ..Default::default()
         };
 
@@ -1738,10 +1741,20 @@ fn resolve_gateway_control_target_from(
     }
 
     match metadata {
-        Some(metadata) if metadata.is_remote => metadata.remote_host.map_or(
+        // Not client-managed (`gateway add`) — the gateway lifecycle is
+        // managed externally (e.g. systemd, Podman, bare-metal); only
+        // remove the local registration metadata on destroy/stop.
+        Some(ref m) if m.client_lifecycle_managed == Some(false) => {
+            GatewayControlTarget::ExternalRegistration
+        }
+        // Remote gateway with SSH destination — managed remote container.
+        Some(ref m) if m.is_remote => m.remote_host.clone().map_or(
             GatewayControlTarget::ExternalRegistration,
             GatewayControlTarget::Remote,
         ),
+        // Client-managed (`gateway start`) or legacy metadata (no
+        // `client_lifecycle_managed` field) — treat as a
+        // locally-managed container.
         _ => GatewayControlTarget::Local,
     }
 }
@@ -5935,6 +5948,7 @@ mod tests {
             gateway_endpoint: endpoint.to_string(),
             is_remote: true,
             auth_mode: Some("cloudflare_jwt".to_string()),
+            client_lifecycle_managed: Some(false),
             ..Default::default()
         }
     }
@@ -6336,6 +6350,65 @@ mod tests {
     }
 
     #[test]
+    fn resolve_gateway_control_target_non_managed_loopback_is_external() {
+        // A gateway registered via `gateway add http://localhost:8080` should
+        // be classified as an external registration, not a local container.
+        let metadata = GatewayMetadata {
+            name: "localhost".to_string(),
+            gateway_endpoint: "http://localhost:8080".to_string(),
+            is_remote: false,
+            gateway_port: 0,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: Some("plaintext".to_string()),
+            edge_team_domain: None,
+            edge_auth_url: None,
+            client_lifecycle_managed: Some(false),
+        };
+        let target = resolve_gateway_control_target_from(Some(metadata), None);
+        assert!(matches!(target, GatewayControlTarget::ExternalRegistration));
+    }
+
+    #[test]
+    fn resolve_gateway_control_target_managed_gateway_is_local() {
+        // A gateway deployed via `gateway start` should be classified as local.
+        let metadata = GatewayMetadata {
+            name: "openshell".to_string(),
+            gateway_endpoint: "https://127.0.0.1:8080".to_string(),
+            is_remote: false,
+            gateway_port: 8080,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: None,
+            edge_team_domain: None,
+            edge_auth_url: None,
+            client_lifecycle_managed: Some(true),
+        };
+        let target = resolve_gateway_control_target_from(Some(metadata), None);
+        assert!(matches!(target, GatewayControlTarget::Local));
+    }
+
+    #[test]
+    fn resolve_gateway_control_target_legacy_metadata_defaults_to_local() {
+        // Legacy metadata without the `client_lifecycle_managed` field
+        // should preserve the existing behavior: non-remote → Local.
+        let metadata = GatewayMetadata {
+            name: "openshell".to_string(),
+            gateway_endpoint: "https://127.0.0.1:8080".to_string(),
+            is_remote: false,
+            gateway_port: 8080,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: None,
+            edge_team_domain: None,
+            edge_auth_url: None,
+            client_lifecycle_managed: None,
+        };
+        let target = resolve_gateway_control_target_from(Some(metadata), None);
+        assert!(matches!(target, GatewayControlTarget::Local));
+    }
+
+    #[test]
     fn gateway_select_uses_explicit_name_without_prompting() {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
@@ -6508,6 +6581,7 @@ mod tests {
             let metadata = load_gateway_metadata("127.0.0.1").expect("load stored gateway");
             assert_eq!(metadata.auth_mode.as_deref(), Some("plaintext"));
             assert!(!metadata.is_remote);
+            assert_eq!(metadata.client_lifecycle_managed, Some(false));
             assert_eq!(metadata.gateway_endpoint, "http://127.0.0.1:8080");
             assert_eq!(load_active_gateway().as_deref(), Some("127.0.0.1"));
         });
@@ -6537,6 +6611,7 @@ mod tests {
             let metadata = load_gateway_metadata("dev-http").expect("load stored gateway");
             assert_eq!(metadata.auth_mode.as_deref(), Some("plaintext"));
             assert!(!metadata.is_remote);
+            assert_eq!(metadata.client_lifecycle_managed, Some(false));
             assert_eq!(metadata.gateway_endpoint, "http://gateway.example.com:8080");
             assert_eq!(load_active_gateway().as_deref(), Some("dev-http"));
         });

@@ -69,6 +69,18 @@ pub struct GatewayMetadata {
     /// Local VM driver state directory for standalone VM gateways.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm_driver_state_dir: Option<PathBuf>,
+
+    /// Whether the CLI manages this gateway's full lifecycle (deploy,
+    /// stop, destroy).
+    ///
+    /// - `Some(true)` — deployed via `gateway start`; destroy/stop operate on
+    ///   the underlying container or VM.
+    /// - `Some(false)` — registered via `gateway add`; destroy/stop only remove
+    ///   the local registration metadata.
+    /// - `None` — legacy metadata written before this field existed; the CLI
+    ///   falls back to the previous heuristic (`is_remote`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_lifecycle_managed: Option<bool>,
 }
 
 impl GatewayMetadata {
@@ -157,6 +169,7 @@ pub fn create_gateway_metadata_with_host(
         remote_host,
         resolved_host,
         auth_mode: disable_tls.then(|| "plaintext".to_string()),
+        client_lifecycle_managed: Some(true),
         ..Default::default()
     }
 }
@@ -504,6 +517,64 @@ mod tests {
         }"#;
         let parsed: GatewayMetadata = serde_json::from_str(json).unwrap();
         assert!(parsed.resolved_host.is_none());
+    }
+
+    #[test]
+    fn metadata_deserialize_without_client_lifecycle_managed_field() {
+        // Legacy metadata files won't have the client_lifecycle_managed field.
+        // Ensure backwards compatibility: defaults to None.
+        let json = r#"{
+            "name": "test",
+            "gateway_endpoint": "https://127.0.0.1:8080",
+            "is_remote": false,
+            "gateway_port": 8080
+        }"#;
+        let parsed: GatewayMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.client_lifecycle_managed, None);
+    }
+
+    #[test]
+    fn metadata_roundtrip_with_client_lifecycle_managed_field() {
+        let meta = GatewayMetadata {
+            name: "test".to_string(),
+            gateway_endpoint: "https://127.0.0.1:8080".to_string(),
+            is_remote: false,
+            gateway_port: 8080,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: None,
+            edge_team_domain: None,
+            edge_auth_url: None,
+            client_lifecycle_managed: Some(false),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains(r#""client_lifecycle_managed":false"#));
+        let parsed: GatewayMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.client_lifecycle_managed, Some(false));
+    }
+
+    #[test]
+    fn metadata_omits_client_lifecycle_managed_when_none() {
+        let meta = GatewayMetadata {
+            name: "test".to_string(),
+            gateway_endpoint: "https://127.0.0.1:8080".to_string(),
+            is_remote: false,
+            gateway_port: 8080,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: None,
+            edge_team_domain: None,
+            edge_auth_url: None,
+            client_lifecycle_managed: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(!json.contains("client_lifecycle_managed"));
+    }
+
+    #[test]
+    fn create_gateway_metadata_sets_client_lifecycle_managed_true() {
+        let meta = create_gateway_metadata("test", None, 8080);
+        assert_eq!(meta.client_lifecycle_managed, Some(true));
     }
 
     #[test]
