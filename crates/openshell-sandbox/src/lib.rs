@@ -9,6 +9,7 @@ pub mod bypass_monitor;
 mod child_env;
 pub mod denial_aggregator;
 mod grpc_client;
+pub mod helpers;
 mod identity;
 pub mod l7;
 pub mod log_push;
@@ -217,6 +218,7 @@ pub async fn run_sandbox(
     _health_check: bool,
     _health_port: u16,
     inference_routes: Option<String>,
+    helpers_config: Option<String>,
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<i32> {
     let (program, args) = command
@@ -248,6 +250,31 @@ pub async fn run_sandbox(
             debug!("OCSF context already initialized, keeping existing");
         }
     }
+
+    // Start supervisor helpers before anything else. Helpers run in the
+    // supervisor's full-capability, no-seccomp, no-NoNewPrivs context with
+    // operator-declared ambient caps — intended for small audited daemons
+    // (e.g. capability brokers) that the sandboxed workload will connect to
+    // via an approved Landlock path. We hold the handles for the lifetime
+    // of `run_sandbox` so that `kill_on_drop` reaps them on shutdown.
+    let _helper_handles = if let Some(path) = helpers_config.as_deref() {
+        let config = helpers::load_helpers_config(std::path::Path::new(path))?;
+        let handles = helpers::spawn_helpers(&config)?;
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "loaded")
+                .message(format!(
+                    "Supervisor helpers started [count:{}]",
+                    handles.len()
+                ))
+                .build()
+        );
+        handles
+    } else {
+        Vec::new()
+    };
 
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
