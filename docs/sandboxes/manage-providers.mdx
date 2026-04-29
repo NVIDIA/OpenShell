@@ -12,6 +12,13 @@ AI agents typically need credentials to access external services: an API key for
 
 Create and manage providers that supply credentials to sandboxes.
 
+Provider types include profile metadata for known endpoints and binaries. View
+the available provider types before creating a provider:
+
+```shell
+openshell provider list-types
+```
+
 ## Create a Provider
 
 Providers can be created from local environment variables or with explicit credential values.
@@ -46,6 +53,15 @@ openshell provider create --name my-api --type generic --credential API_KEY
 ```
 
 This looks up the current value of `$API_KEY` in your shell and stores it.
+
+Provider profile metadata is available for known provider types. Provider profile
+network policy is gateway opt-in:
+
+```shell
+openshell settings set --global --key use_providers_v2 --value true
+```
+
+Without `use_providers_v2=true`, provider behavior remains credential-only.
 
 ## Manage Providers
 
@@ -84,7 +100,10 @@ openshell sandbox create --provider my-claude --provider my-github -- claude
 ```
 
 Each `--provider` flag attaches one provider. The sandbox receives all
-credentials from every attached provider at runtime.
+credentials from every attached provider at runtime. Profile-managed providers
+also contribute provider-generated network policy entries when
+`use_providers_v2` is enabled at the gateway. When the setting is disabled,
+providers keep the previous behavior and only provide credentials.
 
 <Warning>
 Providers cannot be added to a running sandbox. If you need to attach an

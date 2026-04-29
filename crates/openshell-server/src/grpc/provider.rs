@@ -273,9 +273,12 @@ impl ObjectType for Provider {
 
 use crate::ServerState;
 use openshell_core::proto::{
-    CreateProviderRequest, DeleteProviderRequest, DeleteProviderResponse, GetProviderRequest,
-    ListProvidersRequest, ListProvidersResponse, ProviderResponse, UpdateProviderRequest,
+    CreateProviderRequest, DeleteProviderRequest, DeleteProviderResponse,
+    GetProviderProfileRequest, GetProviderRequest, ListProviderProfilesRequest,
+    ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
+    ProviderProfileResponse, ProviderResponse, UpdateProviderRequest,
 };
+use openshell_providers::{default_profiles, get_default_profile};
 use std::sync::Arc;
 use tonic::{Request, Response};
 
@@ -315,6 +318,40 @@ pub(super) async fn handle_list_providers(
     let providers = list_provider_records(state.store.as_ref(), limit, request.offset).await?;
 
     Ok(Response::new(ListProvidersResponse { providers }))
+}
+
+pub(super) async fn handle_list_provider_profiles(
+    _state: &Arc<ServerState>,
+    request: Request<ListProviderProfilesRequest>,
+) -> Result<Response<ListProviderProfilesResponse>, Status> {
+    let request = request.into_inner();
+    let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE) as usize;
+    let offset = request.offset as usize;
+    let profiles = default_profiles()
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|profile| profile.to_proto())
+        .collect();
+
+    Ok(Response::new(ListProviderProfilesResponse { profiles }))
+}
+
+pub(super) async fn handle_get_provider_profile(
+    _state: &Arc<ServerState>,
+    request: Request<GetProviderProfileRequest>,
+) -> Result<Response<ProviderProfileResponse>, Status> {
+    let id = request.into_inner().id;
+    if id.trim().is_empty() {
+        return Err(Status::invalid_argument("id is required"));
+    }
+    let profile = get_default_profile(id.trim())
+        .ok_or_else(|| Status::not_found("provider profile not found"))?
+        .to_proto();
+
+    Ok(Response::new(ProviderProfileResponse {
+        profile: Some(profile),
+    }))
 }
 
 pub(super) async fn handle_update_provider(
@@ -427,7 +464,7 @@ mod tests {
                     id: String::new(),
                     name: "gitlab-local".to_string(),
                     created_at_ms: 1000000,
-                    labels: std::collections::HashMap::new(),
+                    labels: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -936,7 +973,7 @@ mod tests {
                 id: "sandbox-001".to_string(),
                 name: "test-sandbox".to_string(),
                 created_at_ms: 1000000,
-                labels: std::collections::HashMap::new(),
+                labels: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 providers: vec!["my-claude".to_string()],
@@ -972,7 +1009,7 @@ mod tests {
                 id: "sandbox-002".to_string(),
                 name: "empty-sandbox".to_string(),
                 created_at_ms: 1000000,
-                labels: std::collections::HashMap::new(),
+                labels: HashMap::new(),
             }),
             spec: Some(SandboxSpec::default()),
             status: None,

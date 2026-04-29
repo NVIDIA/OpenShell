@@ -264,11 +264,10 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 const SETTINGS_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell settings get my-sandbox
   $ openshell settings get --global
-  $ openshell settings set my-sandbox --key log_level --value debug
-  $ openshell settings set --global --key log_level --value warn
-  $ openshell settings set --global --key dummy_bool --value yes
-  $ openshell settings set --global --key dummy_int --value 42
-  $ openshell settings delete --global --key log_level
+  $ openshell settings set --global --key use_providers_v2 --value true
+  $ openshell settings set my-sandbox --key ocsf_json_enabled --value true
+  $ openshell settings set --global --key ocsf_json_enabled --value true
+  $ openshell settings delete --global --key use_providers_v2
 ";
 
 const PROVIDER_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
@@ -699,6 +698,10 @@ enum ProviderCommands {
         #[arg(long)]
         names: bool,
     },
+
+    /// List available provider types.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    ListTypes,
 
     /// Update an existing provider's credentials or config.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -2619,6 +2622,9 @@ async fn main() -> Result<()> {
                     names,
                 } => {
                     run::provider_list(endpoint, limit, offset, names, &tls).await?;
+                }
+                ProviderCommands::ListTypes => {
+                    run::provider_list_types(endpoint, &tls).await?;
                 }
                 ProviderCommands::Update {
                     name,

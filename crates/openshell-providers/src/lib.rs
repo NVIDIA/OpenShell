@@ -5,6 +5,7 @@
 
 mod context;
 mod discovery;
+mod profiles;
 mod providers;
 #[cfg(test)]
 mod test_helpers;
@@ -16,6 +17,7 @@ pub use openshell_core::proto::Provider;
 
 pub use context::{DiscoveryContext, RealDiscoveryContext};
 pub use discovery::discover_with_spec;
+pub use profiles::{ProviderTypeProfile, default_profiles, get_default_profile};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -113,6 +115,16 @@ impl ProviderRegistry {
     pub fn credential_env_vars(&self, id: &str) -> &'static [&'static str] {
         self.get(id)
             .map_or(&[], ProviderPlugin::credential_env_vars)
+    }
+
+    #[must_use]
+    pub fn profile(&self, id: &str) -> Option<&'static ProviderTypeProfile> {
+        get_default_profile(id)
+    }
+
+    #[must_use]
+    pub fn profiles(&self) -> Vec<&'static ProviderTypeProfile> {
+        default_profiles().iter().collect()
     }
 
     #[must_use]
