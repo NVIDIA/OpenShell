@@ -2,4 +2,4 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [toolchain]
-channel = "stable"
+channel = "1.95.0"

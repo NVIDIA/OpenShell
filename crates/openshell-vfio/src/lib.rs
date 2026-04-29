@@ -605,7 +605,6 @@ fn bind_device_to_vfio(sysfs: &SysfsRoot, bdf: &str) -> Result<bool, VfioError> 
 /// Also binds all companion devices in the same IOMMU group (e.g. the
 /// HD Audio function on consumer GPUs). All bound companions are tracked
 /// and restored when the guard is dropped.
-#[allow(clippy::cognitive_complexity)]
 pub fn prepare_gpu_for_passthrough(
     sysfs: &SysfsRoot,
     bdf: &str,
@@ -749,7 +748,6 @@ fn restore_gpu_to_host_driver_ex(
 /// Removes the state file only when all bindings are resolved; rewrites it
 /// with the remaining entries when some restorations fail so they can be
 /// retried on the next process start.
-#[allow(clippy::cognitive_complexity)]
 pub fn reconcile_stale_bindings(sysfs: &SysfsRoot, state_path: &Path) -> Vec<String> {
     let state = match GpuBindState::load(state_path) {
         Ok(s) => s,
