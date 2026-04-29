@@ -218,6 +218,29 @@ jobs:
             --cache-from "type=gha,scope=${{ inputs.component }}-${{ matrix.arch }}" \
             --cache-to "type=gha,mode=max,scope=${{ inputs.component }}-${{ matrix.arch }}"
 
+      - name: Smoke check ${{ inputs.component }} image
+        if: ${{ !inputs.push }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE_REGISTRY}/${{ inputs.component }}:${IMAGE_TAG}"
+          case "${{ inputs.component }}" in
+            gateway)
+              output="$(docker run --rm --platform "${{ matrix.platform }}" "$image" --version)"
+              echo "$output"
+              grep -q '^openshell-gateway ' <<<"$output"
+              ;;
+            supervisor)
+              output="$(docker run --rm --platform "${{ matrix.platform }}" "$image" --version)"
+              echo "$output"
+              grep -q '^openshell-sandbox ' <<<"$output"
+              ;;
+            cluster)
+              output="$(docker run --rm --platform "${{ matrix.platform }}" --entrypoint /opt/openshell/bin/openshell-sandbox "$image" --version)"
+              echo "$output"
+              grep -q '^openshell-sandbox ' <<<"$output"
+              ;;
+          esac
+
   merge:
     name: Merge ${{ inputs.component }} manifest
     needs: [resolve, build]

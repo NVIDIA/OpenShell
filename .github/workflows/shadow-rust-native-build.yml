@@ -192,6 +192,10 @@ jobs:
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ steps.version.outputs.cargo_version }}"'"/}' Cargo.toml
 
       - name: Build ${{ steps.target.outputs.binary }} (${{ steps.target.outputs.target }})
+        env:
+          # Preserve the release-codegen setting used by the old Dockerfile
+          # Rust build path so image artifacts keep the same release profile.
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
         run: |
           set -euo pipefail
           args=(

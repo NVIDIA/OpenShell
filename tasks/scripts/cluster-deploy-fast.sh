@@ -148,10 +148,10 @@ fi
 
 matches_gateway() {
   local path=$1
-	case "${path}" in
-	    Cargo.toml|Cargo.lock|proto/*|tasks/scripts/stage-prebuilt-binaries.sh)
-	      return 0
-	      ;;
+  case "${path}" in
+    Cargo.toml|Cargo.lock|proto/*|tasks/scripts/stage-prebuilt-binaries.sh)
+      return 0
+      ;;
     deploy/docker/Dockerfile.images|tasks/scripts/docker-build-image.sh)
       return 0
       ;;
@@ -169,10 +169,10 @@ matches_gateway() {
 
 matches_supervisor() {
   local path=$1
-	case "${path}" in
-	    Cargo.toml|Cargo.lock|proto/*|tasks/scripts/stage-prebuilt-binaries.sh)
-	      return 0
-	      ;;
+  case "${path}" in
+    Cargo.toml|Cargo.lock|proto/*|tasks/scripts/stage-prebuilt-binaries.sh)
+      return 0
+      ;;
     deploy/docker/Dockerfile.images|tasks/scripts/docker-build-image.sh)
       return 0
       ;;

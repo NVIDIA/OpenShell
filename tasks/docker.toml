@@ -63,11 +63,6 @@ description = "Alias for build:docker:cluster"
 depends = ["build:docker:cluster"]
 hide = true
 
-["docker:stage-prebuilt"]
-description = "Build and stage Rust binaries consumed by Docker image builds"
-depends = ["build:docker:prebuilt"]
-hide = true
-
 ["build:docker:cluster:multiarch"]
 description = "Build multi-arch cluster image and push to a registry"
 run = "tasks/scripts/docker-publish-multiarch.sh"
