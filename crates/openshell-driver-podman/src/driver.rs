@@ -11,6 +11,7 @@ use crate::watcher::{
 };
 use openshell_core::ComputeDriverError;
 use openshell_core::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
+use std::path::Path;
 use tracing::{info, warn};
 
 impl From<PodmanApiError> for ComputeDriverError {
@@ -176,7 +177,7 @@ impl PodmanComputeDriver {
     /// versions. As a heuristic, check if the NVIDIA device node exists (this
     /// works for both rootful and rootless).
     fn has_gpu_capacity() -> bool {
-        std::path::Path::new("/dev/nvidia0").exists()
+        Path::new("/dev/nvidia0").exists()
     }
 
     /// Validate a sandbox before creation.
@@ -190,11 +191,16 @@ impl PodmanComputeDriver {
                 "GPU sandbox requested, but no NVIDIA GPU devices are available.".to_string(),
             ));
         }
+        if let Some(spec) = sandbox.spec.as_ref() {
+            validate_host_mounts(&spec.host_mounts)?;
+        }
         Ok(())
     }
 
     /// Create a sandbox container.
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), ComputeDriverError> {
+        self.validate_sandbox_create(sandbox)?;
+
         if sandbox.name.is_empty() {
             return Err(ComputeDriverError::Precondition(
                 "sandbox name is required".into(),
@@ -476,6 +482,31 @@ impl PodmanComputeDriver {
             .await
             .map_err(ComputeDriverError::from)
     }
+}
+
+fn validate_host_mounts(
+    mounts: &[openshell_core::proto::compute::v1::DriverHostMount],
+) -> Result<(), ComputeDriverError> {
+    for mount in mounts {
+        let source = Path::new(&mount.source_path);
+        if !source.is_absolute() {
+            return Err(ComputeDriverError::Precondition(
+                "host mount source_path must be absolute".to_string(),
+            ));
+        }
+        if !source.is_dir() {
+            return Err(ComputeDriverError::Precondition(format!(
+                "host mount source_path '{}' does not exist or is not a directory",
+                source.display()
+            )));
+        }
+        if !mount.sandbox_path.starts_with('/') {
+            return Err(ComputeDriverError::Precondition(
+                "host mount sandbox_path must be absolute".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -63,6 +63,8 @@ pub fn clamp_limit(raw: u32, default: u32, max: u32) -> u32 {
 const MAX_NAME_LEN: usize = 253;
 /// Maximum number of providers that can be attached to a sandbox.
 const MAX_PROVIDERS: usize = 32;
+/// Maximum number of host directories that can be mounted into a sandbox.
+const MAX_HOST_MOUNTS: usize = 16;
 /// Maximum length for the `log_level` field.
 const MAX_LOG_LEVEL_LEN: usize = 32;
 /// Maximum number of entries in `spec.environment`.

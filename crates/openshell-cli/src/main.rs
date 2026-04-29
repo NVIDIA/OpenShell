@@ -6,7 +6,7 @@
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
-use miette::Result;
+use miette::{IntoDiagnostic, Result, WrapErr};
 use owo_colors::OwoColorize;
 use std::io::Write;
 
@@ -1114,6 +1114,13 @@ enum SandboxCommands {
         /// Disable `.gitignore` filtering for `--upload`.
         #[arg(long, requires = "upload", help_heading = "UPLOAD FLAGS")]
         no_git_ignore: bool,
+
+        /// Bind mount a host directory into the sandbox.
+        ///
+        /// Format: `<HOST_DIR>:<SANDBOX_PATH>`. The host directory must exist
+        /// and `SANDBOX_PATH` must be an absolute path.
+        #[arg(long = "mount", value_hint = ValueHint::AnyPath)]
+        host_mounts: Vec<String>,
 
         /// Deprecated compatibility flag. Sandboxes are kept by default.
         #[arg(long, hide = true, conflicts_with = "no_keep")]
@@ -2308,6 +2315,7 @@ async fn main() -> Result<()> {
                     from,
                     upload,
                     no_git_ignore,
+                    host_mounts,
                     keep,
                     no_keep,
                     editor,
@@ -2373,6 +2381,10 @@ async fn main() -> Result<()> {
                         let (local, remote) = parse_upload_spec(s);
                         (local, remote, !no_git_ignore)
                     });
+                    let host_mounts = host_mounts
+                        .iter()
+                        .map(|spec| parse_host_mount_spec(spec))
+                        .collect::<Result<Vec<_>>>()?;
 
                     let editor = editor.map(Into::into);
                     let forward = forward
@@ -2406,6 +2418,7 @@ async fn main() -> Result<()> {
                                 from.as_deref(),
                                 &ctx.name,
                                 upload_spec.as_ref(),
+                                &host_mounts,
                                 keep,
                                 gpu,
                                 gpu_device.as_deref(),
@@ -2430,6 +2443,7 @@ async fn main() -> Result<()> {
                                 name.as_deref(),
                                 from.as_deref(),
                                 upload_spec.as_ref(),
+                                &host_mounts,
                                 keep,
                                 gpu,
                                 gpu_device.as_deref(),
@@ -2798,6 +2812,47 @@ fn parse_upload_spec(spec: &str) -> (String, Option<String>) {
     } else {
         (spec.to_string(), None)
     }
+}
+
+/// Parse a host mount spec like `<host-dir>:<sandbox-path>`.
+fn parse_host_mount_spec(spec: &str) -> Result<openshell_core::proto::HostMount> {
+    let (source, sandbox_path) = spec.rsplit_once(':').ok_or_else(|| {
+        miette::miette!("invalid mount spec '{spec}', expected <HOST_DIR>:<SANDBOX_PATH>")
+    })?;
+    if source.is_empty() || sandbox_path.is_empty() {
+        return Err(miette::miette!(
+            "invalid mount spec '{spec}', expected <HOST_DIR>:<SANDBOX_PATH>"
+        ));
+    }
+    if !sandbox_path.starts_with('/') {
+        return Err(miette::miette!(
+            "invalid mount spec '{spec}', sandbox path must be absolute"
+        ));
+    }
+
+    let source_path = std::path::Path::new(source);
+    if !source_path.exists() {
+        return Err(miette::miette!(
+            "mount source does not exist: {}",
+            source_path.display()
+        ));
+    }
+    if !source_path.is_dir() {
+        return Err(miette::miette!(
+            "mount source must be a directory: {}",
+            source_path.display()
+        ));
+    }
+    let source_path = source_path
+        .canonicalize()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to resolve mount source '{}'", source_path.display()))?;
+
+    Ok(openshell_core::proto::HostMount {
+        source_path: source_path.display().to_string(),
+        sandbox_path: sandbox_path.to_string(),
+        read_only: false,
+    })
 }
 
 #[cfg(test)]
@@ -3192,6 +3247,28 @@ mod tests {
         let (local, remote) = parse_upload_spec("./src:");
         assert_eq!(local, "./src");
         assert_eq!(remote, None);
+    }
+
+    #[test]
+    fn parse_host_mount_spec_accepts_directory_and_absolute_sandbox_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = format!("{}:/sandbox/shared", tmp.path().display());
+        let mount = parse_host_mount_spec(&spec).expect("mount spec should parse");
+
+        assert_eq!(
+            mount.source_path,
+            tmp.path().canonicalize().unwrap().display().to_string()
+        );
+        assert_eq!(mount.sandbox_path, "/sandbox/shared");
+        assert!(!mount.read_only);
+    }
+
+    #[test]
+    fn parse_host_mount_spec_rejects_relative_sandbox_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = format!("{}:sandbox/shared", tmp.path().display());
+        let err = parse_host_mount_spec(&spec).expect_err("relative sandbox path should fail");
+        assert!(err.to_string().contains("sandbox path must be absolute"));
     }
 
     #[test]

@@ -31,6 +31,7 @@ fn test_sandbox() -> DriverSandbox {
             }),
             gpu: false,
             gpu_device: String::new(),
+            host_mounts: Vec::new(),
         }),
         status: None,
     }
@@ -127,7 +128,9 @@ fn build_environment_sets_docker_tls_paths() {
 
 #[test]
 fn build_mounts_uses_docker_tls_directory() {
-    let mounts = build_mounts(&runtime_config());
+    let sandbox = test_sandbox();
+    let spec = sandbox.spec.as_ref().unwrap();
+    let mounts = build_mounts(&runtime_config(), spec);
     let targets = mounts
         .iter()
         .filter_map(|mount| mount.target.clone())
@@ -141,6 +144,32 @@ fn build_mounts_uses_docker_tls_directory() {
             .iter()
             .all(|target| target.starts_with(TLS_MOUNT_DIR) || target == SUPERVISOR_MOUNT_PATH)
     );
+}
+
+#[test]
+fn build_mounts_includes_host_mounts() {
+    let mut sandbox = test_sandbox();
+    let shared = tempfile::tempdir().unwrap();
+    sandbox.spec.as_mut().unwrap().host_mounts.push(
+        openshell_core::proto::compute::v1::DriverHostMount {
+            source_path: shared.path().display().to_string(),
+            sandbox_path: "/sandbox/shared".to_string(),
+            read_only: false,
+        },
+    );
+
+    let spec = sandbox.spec.as_ref().unwrap();
+    let mounts = build_mounts(&runtime_config(), spec);
+
+    let mount = mounts
+        .iter()
+        .find(|mount| mount.target.as_deref() == Some("/sandbox/shared"))
+        .expect("host mount should be present");
+    assert_eq!(
+        mount.source.as_deref(),
+        Some(shared.path().to_str().unwrap())
+    );
+    assert_eq!(mount.read_only, Some(false));
 }
 
 #[test]

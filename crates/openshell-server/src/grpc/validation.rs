@@ -15,10 +15,10 @@ use prost::Message;
 use tonic::Status;
 
 use super::{
-    MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_NAME_LEN,
-    MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES, MAX_PROVIDER_CREDENTIALS_ENTRIES,
-    MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS, MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN,
-    MAX_TEMPLATE_STRUCT_SIZE,
+    MAX_ENVIRONMENT_ENTRIES, MAX_HOST_MOUNTS, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN,
+    MAX_MAP_VALUE_LEN, MAX_NAME_LEN, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
+    MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS,
+    MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -126,6 +126,24 @@ pub(super) fn validate_sandbox_spec(
         "spec.environment",
     )?;
 
+    // --- spec.host_mounts ---
+    if spec.host_mounts.len() > MAX_HOST_MOUNTS {
+        return Err(Status::invalid_argument(format!(
+            "host_mounts exceeds maximum entries ({} > {MAX_HOST_MOUNTS})",
+            spec.host_mounts.len()
+        )));
+    }
+    for (idx, mount) in spec.host_mounts.iter().enumerate() {
+        validate_path_field(
+            &mount.source_path,
+            &format!("host_mounts[{idx}].source_path"),
+        )?;
+        validate_path_field(
+            &mount.sandbox_path,
+            &format!("host_mounts[{idx}].sandbox_path"),
+        )?;
+    }
+
     // --- spec.template ---
     if let Some(ref tmpl) = spec.template {
         validate_sandbox_template(tmpl)?;
@@ -142,6 +160,21 @@ pub(super) fn validate_sandbox_spec(
     }
 
     Ok(())
+}
+
+fn validate_path_field(value: &str, field_name: &str) -> Result<(), Status> {
+    if value.len() > MAX_TEMPLATE_STRING_LEN {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} exceeds maximum length ({} > {MAX_TEMPLATE_STRING_LEN})",
+            value.len()
+        )));
+    }
+    if value.trim().is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} must not be empty"
+        )));
+    }
+    reject_control_chars(value, field_name)
 }
 
 /// Validate template-level field sizes.
@@ -642,13 +675,13 @@ pub(super) fn level_matches(log_level: &str, min_level: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::SandboxSpec;
+    use openshell_core::proto::{HostMount, SandboxSpec};
     use std::collections::HashMap;
     use tonic::Code;
 
     use crate::grpc::{
-        MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN,
-        MAX_NAME_LEN, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
+        MAX_ENVIRONMENT_ENTRIES, MAX_HOST_MOUNTS, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN, MAX_NAME_LEN, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
         MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS,
         MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
     };
@@ -711,6 +744,23 @@ mod tests {
         let err = validate_sandbox_spec("ok", &spec).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("providers"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_over_limit_host_mounts() {
+        let spec = SandboxSpec {
+            host_mounts: (0..=MAX_HOST_MOUNTS)
+                .map(|i| HostMount {
+                    source_path: format!("/tmp/source-{i}"),
+                    sandbox_path: format!("/sandbox/mount-{i}"),
+                    read_only: false,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("host_mounts"));
     }
 
     #[test]

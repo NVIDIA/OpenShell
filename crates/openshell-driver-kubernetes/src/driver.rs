@@ -19,6 +19,7 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -203,6 +204,9 @@ impl KubernetesComputeDriver {
             return Err(tonic::Status::failed_precondition(
                 "GPU sandbox requested, but the active gateway has no allocatable GPUs. Please refer to documentation and use `openshell doctor` commands to inspect GPU support and gateway configuration.",
             ));
+        }
+        if let Some(spec) = sandbox.spec.as_ref() {
+            validate_host_mounts(&spec.host_mounts)?;
         }
         Ok(())
     }
@@ -690,6 +694,63 @@ fn supervisor_volume_mount() -> serde_json::Value {
     })
 }
 
+fn validate_host_mounts(
+    mounts: &[openshell_core::proto::compute::v1::DriverHostMount],
+) -> Result<(), tonic::Status> {
+    for mount in mounts {
+        let source = Path::new(&mount.source_path);
+        if !source.is_absolute() {
+            return Err(tonic::Status::invalid_argument(
+                "host mount source_path must be absolute",
+            ));
+        }
+        if !mount.sandbox_path.starts_with('/') {
+            return Err(tonic::Status::invalid_argument(
+                "host mount sandbox_path must be absolute",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_host_mounts(
+    container: &mut serde_json::Map<String, serde_json::Value>,
+    pod_spec: &mut serde_json::Map<String, serde_json::Value>,
+    mounts: &[openshell_core::proto::compute::v1::DriverHostMount],
+) {
+    if mounts.is_empty() {
+        return;
+    }
+
+    let volume_mounts = container
+        .entry("volumeMounts")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let volume_mounts = volume_mounts
+        .as_array_mut()
+        .expect("volumeMounts should be an array");
+
+    let volumes = pod_spec
+        .entry("volumes")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let volumes = volumes.as_array_mut().expect("volumes should be an array");
+
+    for (index, mount) in mounts.iter().enumerate() {
+        let name = format!("host-mount-{index}");
+        volume_mounts.push(serde_json::json!({
+            "name": &name,
+            "mountPath": &mount.sandbox_path,
+            "readOnly": mount.read_only
+        }));
+        volumes.push(serde_json::json!({
+            "name": &name,
+            "hostPath": {
+                "path": &mount.source_path,
+                "type": "Directory"
+            }
+        }));
+    }
+}
+
 /// Apply supervisor side-load transforms to an already-built pod template JSON.
 ///
 /// This injects the hostPath volume, volume mount, command override, and
@@ -931,6 +992,7 @@ fn sandbox_to_k8s_spec(
                     client_tls_secret_name,
                     host_gateway_ip,
                     inject_workspace,
+                    &spec.host_mounts,
                 ),
             );
             if !template.agent_socket_path.is_empty() {
@@ -960,6 +1022,8 @@ fn sandbox_to_k8s_spec(
     if !root.contains_key("podTemplate") {
         let empty_env = std::collections::HashMap::new();
         let spec_env = spec.as_ref().map_or(&empty_env, |s| &s.environment);
+        let host_mounts: &[openshell_core::proto::compute::v1::DriverHostMount] =
+            spec.map_or(&[], |s| s.host_mounts.as_slice());
         root.insert(
             "podTemplate".to_string(),
             sandbox_template_to_k8s(
@@ -977,6 +1041,7 @@ fn sandbox_to_k8s_spec(
                 client_tls_secret_name,
                 host_gateway_ip,
                 inject_workspace,
+                host_mounts,
             ),
         );
     }
@@ -1002,6 +1067,7 @@ fn sandbox_template_to_k8s(
     client_tls_secret_name: &str,
     host_gateway_ip: &str,
     inject_workspace: bool,
+    host_mounts: &[openshell_core::proto::compute::v1::DriverHostMount],
 ) -> serde_json::Value {
     // The supervisor binary is always side-loaded from the node filesystem
     // via a hostPath volume, regardless of which sandbox image is used.
@@ -1086,10 +1152,6 @@ fn sandbox_template_to_k8s(
     if let Some(resources) = container_resources(template, gpu) {
         container.insert("resources".to_string(), resources);
     }
-    spec.insert(
-        "containers".to_string(),
-        serde_json::Value::Array(vec![serde_json::Value::Object(container)]),
-    );
 
     // Add TLS secret volume.  Mode 0400 (owner-read) prevents the
     // unprivileged sandbox user from reading the mTLS private key.
@@ -1102,6 +1164,11 @@ fn sandbox_template_to_k8s(
             }]),
         );
     }
+    apply_host_mounts(&mut container, &mut spec, host_mounts);
+    spec.insert(
+        "containers".to_string(),
+        serde_json::Value::Array(vec![serde_json::Value::Object(container)]),
+    );
 
     // Add hostAliases so sandbox pods can reach the Docker host.
     if !host_gateway_ip.is_empty() {
@@ -1582,6 +1649,7 @@ mod tests {
             "",
             "",
             true,
+            &[],
         );
 
         assert_eq!(
@@ -1624,6 +1692,7 @@ mod tests {
             "",
             "",
             true,
+            &[],
         );
 
         assert_eq!(
@@ -1662,6 +1731,7 @@ mod tests {
             "",
             "",
             true,
+            &[],
         );
 
         assert_eq!(
@@ -1696,6 +1766,7 @@ mod tests {
             "",
             "",
             true,
+            &[],
         );
 
         let limits = &pod_template["spec"]["containers"][0]["resources"]["limits"];
@@ -1723,6 +1794,7 @@ mod tests {
             "",
             "172.17.0.1",
             true,
+            &[],
         );
 
         let host_aliases = pod_template["spec"]["hostAliases"]
@@ -1754,6 +1826,7 @@ mod tests {
             "",
             "",
             true,
+            &[],
         );
 
         assert!(
@@ -1780,6 +1853,7 @@ mod tests {
             "my-tls-secret",
             "",
             true,
+            &[],
         );
 
         let volumes = pod_template["spec"]["volumes"]
@@ -1794,6 +1868,48 @@ mod tests {
             256, // 0o400
             "TLS secret volume must use mode 0400 to prevent sandbox user from reading the private key"
         );
+    }
+
+    #[test]
+    fn host_mounts_inject_host_path_volume_and_mount() {
+        let mounts = [openshell_core::proto::compute::v1::DriverHostMount {
+            source_path: "/var/shared".to_string(),
+            sandbox_path: "/sandbox/shared".to_string(),
+            read_only: false,
+        }];
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+            "",
+            true,
+            &mounts,
+        );
+
+        let container_mounts = pod_template["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts should exist");
+        assert!(container_mounts.iter().any(|mount| {
+            mount["name"] == "host-mount-0" && mount["mountPath"] == "/sandbox/shared"
+        }));
+
+        let volumes = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should exist");
+        assert!(volumes.iter().any(|volume| {
+            volume["name"] == "host-mount-0"
+                && volume["hostPath"]["path"] == "/var/shared"
+                && volume["hostPath"]["type"] == "Directory"
+        }));
     }
 
     // -----------------------------------------------------------------------
@@ -1923,6 +2039,7 @@ mod tests {
             "",
             "",
             false, // user provided custom VCTs
+            &[],
         );
 
         // No init container should be present

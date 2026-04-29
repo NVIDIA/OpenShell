@@ -16,10 +16,10 @@ use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
-    DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
-    DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest, ListSandboxesRequest,
-    ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
+    CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverHostMount,
+    DriverPlatformEvent, DriverResourceRequirements, DriverSandbox, DriverSandboxSpec,
+    DriverSandboxStatus, DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest,
+    ListSandboxesRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
     compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
     watch_sandboxes_event,
 };
@@ -1108,6 +1108,15 @@ fn driver_sandbox_spec_from_public(spec: &SandboxSpec) -> DriverSandboxSpec {
             .map(driver_sandbox_template_from_public),
         gpu: spec.gpu,
         gpu_device: spec.gpu_device.clone(),
+        host_mounts: spec
+            .host_mounts
+            .iter()
+            .map(|mount| DriverHostMount {
+                source_path: mount.source_path.clone(),
+                sandbox_path: mount.sandbox_path.clone(),
+                read_only: mount.read_only,
+            })
+            .collect(),
     }
 }
 

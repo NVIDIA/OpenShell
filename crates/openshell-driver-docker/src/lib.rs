@@ -20,7 +20,7 @@ use futures::{Stream, StreamExt};
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DriverCondition, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
+    DriverCondition, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus, DriverSandboxTemplate,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
     ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
@@ -269,6 +269,7 @@ impl DockerComputeDriver {
                 "docker compute driver does not support template.platform_config",
             ));
         }
+        validate_host_mounts(&spec.host_mounts)?;
 
         let _ = docker_resource_limits(template)?;
         Ok(())
@@ -794,7 +795,7 @@ impl ComputeDriver for DockerComputeDriver {
     }
 }
 
-fn build_mounts(config: &DockerDriverRuntimeConfig) -> Vec<Mount> {
+fn build_mounts(config: &DockerDriverRuntimeConfig, spec: &DriverSandboxSpec) -> Vec<Mount> {
     let mut mounts = vec![bind_mount(
         &config.supervisor_bin,
         SUPERVISOR_MOUNT_PATH,
@@ -804,6 +805,13 @@ fn build_mounts(config: &DockerDriverRuntimeConfig) -> Vec<Mount> {
         mounts.push(bind_mount(&tls.ca, TLS_CA_MOUNT_PATH, true));
         mounts.push(bind_mount(&tls.cert, TLS_CERT_MOUNT_PATH, true));
         mounts.push(bind_mount(&tls.key, TLS_KEY_MOUNT_PATH, true));
+    }
+    for mount in &spec.host_mounts {
+        mounts.push(bind_mount(
+            Path::new(&mount.source_path),
+            &mount.sandbox_path,
+            mount.read_only,
+        ));
     }
     mounts
 }
@@ -917,7 +925,7 @@ fn build_container_create_body(
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
-            mounts: Some(build_mounts(config)),
+            mounts: Some(build_mounts(config, spec)),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,
@@ -948,6 +956,31 @@ fn require_sandbox_identifier(sandbox_id: &str, sandbox_name: &str) -> Result<()
         return Err(Status::invalid_argument(
             "sandbox_id or sandbox_name is required",
         ));
+    }
+    Ok(())
+}
+
+fn validate_host_mounts(
+    mounts: &[openshell_core::proto::compute::v1::DriverHostMount],
+) -> Result<(), Status> {
+    for mount in mounts {
+        let source = Path::new(&mount.source_path);
+        if !source.is_absolute() {
+            return Err(Status::invalid_argument(
+                "host mount source_path must be absolute",
+            ));
+        }
+        if !source.is_dir() {
+            return Err(Status::failed_precondition(format!(
+                "host mount source_path '{}' does not exist or is not a directory",
+                source.display()
+            )));
+        }
+        if !mount.sandbox_path.starts_with('/') {
+            return Err(Status::invalid_argument(
+                "host mount sandbox_path must be absolute",
+            ));
+        }
     }
     Ok(())
 }

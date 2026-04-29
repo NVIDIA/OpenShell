@@ -889,6 +889,11 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
     if !spec.gpu && !spec.gpu_device.is_empty() {
         return Err(Status::invalid_argument("gpu_device requires gpu=true"));
     }
+    if !spec.host_mounts.is_empty() {
+        return Err(Status::failed_precondition(
+            "vm sandboxes do not support host_mounts",
+        ));
+    }
 
     if let Some(template) = spec.template.as_ref() {
         if !template.image.is_empty() {

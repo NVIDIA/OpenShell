@@ -208,6 +208,18 @@ message SandboxSpec {
   // (e.g. "0", "1"). When empty with gpu=true, the driver assigns the
   // first available GPU.
   string gpu_device = 10;
+  // Host directories to bind mount into the sandbox at create time.
+  repeated HostMount host_mounts = 11;
+}
+
+// A host directory mounted into a sandbox.
+message HostMount {
+  // Absolute path on the gateway/driver host.
+  string source_path = 1;
+  // Absolute path inside the sandbox.
+  string sandbox_path = 2;
+  // Mount read-only when true. Defaults to read-write.
+  bool read_only = 3;
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.

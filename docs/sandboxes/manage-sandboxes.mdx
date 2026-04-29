@@ -221,6 +221,15 @@ You can also upload files at creation time with the `--upload` flag on
 
 </Note>
 
+Mount a host directory into a new sandbox when you need live file sharing:
+
+```shell
+openshell sandbox create --mount ./project:/sandbox/project -- claude
+```
+
+The mount source must be an existing host directory and the sandbox path must be absolute.
+OpenShell resolves relative host paths before sending the create request.
+
 ## Delete Sandboxes
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.

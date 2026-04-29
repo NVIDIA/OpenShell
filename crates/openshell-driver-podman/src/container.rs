@@ -333,6 +333,28 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox);
     let devices = build_devices(sandbox);
+    let host_mounts = sandbox
+        .spec
+        .as_ref()
+        .map_or_else(Vec::new, |spec| spec.host_mounts.clone());
+    let mut mounts = vec![Mount {
+        kind: "tmpfs".into(),
+        source: "tmpfs".into(),
+        destination: "/run/netns".into(),
+        options: vec!["rw".into(), "nosuid".into(), "nodev".into()],
+    }];
+    for mount in host_mounts {
+        mounts.push(Mount {
+            kind: "bind".into(),
+            source: mount.source_path,
+            destination: mount.sandbox_path,
+            options: if mount.read_only {
+                vec!["ro".into()]
+            } else {
+                vec!["rw".into()]
+            },
+        });
+    }
 
     // Network configuration -- always bridge mode.
     // Matches libpod's network spec format `{name: {opts}}`; the unit-struct
@@ -462,12 +484,7 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
         // directory does not exist on the host, so the mkdir inside the container
         // fails with EPERM. A private tmpfs gives the supervisor its own writable
         // /run/netns without needing host filesystem access.
-        mounts: vec![Mount {
-            kind: "tmpfs".into(),
-            source: "tmpfs".into(),
-            destination: "/run/netns".into(),
-            options: vec!["rw".into(), "nosuid".into(), "nodev".into()],
-        }],
+        mounts,
         // Publish the SSH port with host_port=0 to get an ephemeral host port.
         // In rootless Podman the bridge network (10.89.x.x) is not routable from
         // the host, so we must use the published host port on 127.0.0.1 instead.
@@ -766,6 +783,38 @@ mod tests {
             Some("real-name"),
             "openshell.sandbox-name must not be overridden by template labels"
         );
+    }
+
+    #[test]
+    fn container_spec_includes_host_mounts() {
+        use openshell_core::proto::compute::v1::{
+            DriverHostMount, DriverSandboxSpec, DriverSandboxTemplate,
+        };
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate::default()),
+            host_mounts: vec![DriverHostMount {
+                source_path: "/tmp/shared".to_string(),
+                sandbox_path: "/sandbox/shared".to_string(),
+                read_only: false,
+            }],
+            ..Default::default()
+        });
+
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        let mount = mounts
+            .iter()
+            .find(|mount| mount["destination"] == "/sandbox/shared")
+            .expect("host mount should be present");
+        assert_eq!(mount["type"], "bind");
+        assert_eq!(mount["source"], "/tmp/shared");
+        assert_eq!(mount["options"], serde_json::json!(["rw"]));
     }
 
     #[test]
