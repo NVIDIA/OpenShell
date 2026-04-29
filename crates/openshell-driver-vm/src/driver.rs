@@ -277,6 +277,9 @@ impl VmDriver {
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)
     }
 
+    // `tonic::Status` is large but is the standard error type across the
+    // gRPC API surface; boxing here would diverge from every other handler.
+    #[allow(clippy::result_large_err)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<CreateSandboxResponse, Status> {
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)?;
 
@@ -327,7 +330,7 @@ impl VmDriver {
                 .map_err(|e| Status::internal(format!("GPU inventory lock poisoned: {e}")))
                 .and_then(|mut inv| {
                     inv.assign(&sandbox.id, gpu_device)
-                        .map_err(|e| Status::failed_precondition(e))
+                        .map_err(Status::failed_precondition)
                 }) {
                 Ok(assignment) => {
                     tracing::info!(
@@ -361,7 +364,7 @@ impl VmDriver {
 
         // Compute the endpoint override before building the env so
         // there is a single OPENSHELL_ENDPOINT value in the env list.
-        let endpoint_override = if gpu_bdf.is_some() {
+        let endpoint_override = if let Some(bdf) = gpu_bdf.as_ref() {
             let subnet = match self
                 .subnet_allocator
                 .lock()
@@ -369,7 +372,7 @@ impl VmDriver {
                 .and_then(|mut alloc| {
                     alloc
                         .allocate(&sandbox.id)
-                        .map_err(|e| Status::failed_precondition(e))
+                        .map_err(Status::failed_precondition)
                 }) {
                 Ok(s) => s,
                 Err(err) => {
@@ -398,7 +401,7 @@ impl VmDriver {
             command
                 .arg("--vm-mem-mib")
                 .arg(self.config.gpu_mem_mib.to_string());
-            command.arg("--vm-gpu-bdf").arg(gpu_bdf.as_ref().unwrap());
+            command.arg("--vm-gpu-bdf").arg(bdf);
             command.arg("--vm-tap-device").arg(&tap);
             command
                 .arg("--vm-guest-ip")
@@ -574,10 +577,10 @@ impl VmDriver {
     }
 
     fn release_gpu_and_subnet(&self, sandbox_id: &str) {
-        if let Some(ref inventory) = self.gpu_inventory {
-            if let Ok(mut inv) = inventory.lock() {
-                inv.release(sandbox_id);
-            }
+        if let Some(inventory) = self.gpu_inventory.as_ref()
+            && let Ok(mut inv) = inventory.lock()
+        {
+            inv.release(sandbox_id);
         }
         if let Ok(mut alloc) = self.subnet_allocator.lock() {
             alloc.release(sandbox_id);
@@ -963,9 +966,10 @@ fn build_guest_environment(
     config: &VmDriverConfig,
     endpoint_override: Option<&str>,
 ) -> Vec<String> {
-    let openshell_endpoint = endpoint_override
-        .map(String::from)
-        .unwrap_or_else(|| guest_visible_openshell_endpoint(&config.openshell_endpoint));
+    let openshell_endpoint = endpoint_override.map_or_else(
+        || guest_visible_openshell_endpoint(&config.openshell_endpoint),
+        String::from,
+    );
     let mut environment = HashMap::from([
         ("HOME".to_string(), "/root".to_string()),
         (

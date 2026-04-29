@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Once;
 
 /// Opaque handle to a prepared-but-not-yet-enforced sandbox.
-/// Holds the Landlock ruleset with PathFds opened as root.
+/// Holds the Landlock ruleset with `PathFds` opened as root.
 pub struct PreparedSandbox {
     landlock: Option<landlock::PreparedRuleset>,
     policy: SandboxPolicy,
@@ -21,7 +21,7 @@ pub struct PreparedSandbox {
 
 /// Phase 1: Prepare sandbox restrictions **as root** (before `drop_privileges`).
 ///
-/// Opens Landlock PathFds while the process still has root privileges,
+/// Opens Landlock `PathFds` while the process still has root privileges,
 /// ensuring paths like mode-700 directories are accessible.
 pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<PreparedSandbox> {
     let landlock = landlock::prepare(policy, workdir)?;
@@ -50,6 +50,7 @@ pub fn apply_supervisor_prelude() -> Result<()> {
 
 /// Legacy single-phase apply. Kept for backward compatibility.
 /// New callers should use [`prepare`] + [`enforce`] for correct privilege ordering.
+#[allow(dead_code)] // Retained for backward compat; live callers use prepare+enforce.
 pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
     landlock::apply(policy, workdir)?;
     seccomp::apply(policy)?;
@@ -72,12 +73,12 @@ pub fn log_sandbox_readiness(policy: &SandboxPolicy, workdir: Option<&str>) {
     let mut read_write = policy.filesystem.read_write.clone();
     let read_only = &policy.filesystem.read_only;
 
-    if policy.filesystem.include_workdir {
-        if let Some(dir) = workdir {
-            let workdir_path = PathBuf::from(dir);
-            if !read_write.contains(&workdir_path) {
-                read_write.push(workdir_path);
-            }
+    if policy.filesystem.include_workdir
+        && let Some(dir) = workdir
+    {
+        let workdir_path = PathBuf::from(dir);
+        if !read_write.contains(&workdir_path) {
+            read_write.push(workdir_path);
         }
     }
 
@@ -96,74 +97,71 @@ pub fn log_sandbox_readiness(policy: &SandboxPolicy, workdir: Option<&str>) {
     }
 
     let availability = landlock::probe_availability();
-    match &availability {
-        landlock::LandlockAvailability::Available { abi } => {
-            openshell_ocsf::ocsf_emit!(
-                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
-                    .severity(openshell_ocsf::SeverityId::Informational)
-                    .status(openshell_ocsf::StatusId::Success)
-                    .state(openshell_ocsf::StateId::Enabled, "probed")
-                    .message(format!(
-                        "Landlock filesystem sandbox available \
-                         [abi:v{abi} compat:{:?} ro:{} rw:{}]",
-                        policy.landlock.compatibility,
-                        read_only.len(),
-                        read_write.len(),
-                    ))
-                    .build()
-            );
-        }
-        _ => {
-            // Landlock is NOT available — this is the critical log that was
-            // previously invisible because it only fired inside pre_exec.
-            let is_best_effort = matches!(
-                policy.landlock.compatibility,
-                crate::policy::LandlockCompatibility::BestEffort
-            );
-            let (desc, msg) = if is_best_effort {
-                (
-                    format!(
-                        "Sandbox will run WITHOUT filesystem restrictions: {availability}. \
-                         Policy requests {total_paths} path rule(s) \
-                         (ro:{} rw:{}) but Landlock cannot enforce them. \
-                         Set landlock.compatibility to 'hard_requirement' to make this fatal.",
-                        read_only.len(),
-                        read_write.len(),
-                    ),
-                    format!(
-                        "Landlock filesystem sandbox unavailable (best_effort, degraded): {availability}"
-                    ),
-                )
-            } else {
-                (
-                    format!(
-                        "Landlock is unavailable: {availability}. \
-                         Policy requires {total_paths} path rule(s) \
-                         (ro:{} rw:{}) with hard_requirement — sandbox startup will fail.",
-                        read_only.len(),
-                        read_write.len(),
-                    ),
-                    format!(
-                        "Landlock filesystem sandbox unavailable (hard_requirement, will fail): {availability}"
-                    ),
-                )
-            };
-            openshell_ocsf::ocsf_emit!(
-                openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
-                    .activity(openshell_ocsf::ActivityId::Open)
-                    .severity(openshell_ocsf::SeverityId::High)
-                    .confidence(openshell_ocsf::ConfidenceId::High)
-                    .is_alert(true)
-                    .finding_info(
-                        openshell_ocsf::FindingInfo::new(
-                            "landlock-unavailable",
-                            "Landlock Filesystem Sandbox Unavailable",
-                        )
-                        .with_desc(&desc),
+    if let landlock::LandlockAvailability::Available { abi } = &availability {
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "probed")
+                .message(format!(
+                    "Landlock filesystem sandbox available \
+                     [abi:v{abi} compat:{:?} ro:{} rw:{}]",
+                    policy.landlock.compatibility,
+                    read_only.len(),
+                    read_write.len(),
+                ))
+                .build()
+        );
+    } else {
+        // Landlock is NOT available — this is the critical log that was
+        // previously invisible because it only fired inside pre_exec.
+        let is_best_effort = matches!(
+            policy.landlock.compatibility,
+            crate::policy::LandlockCompatibility::BestEffort
+        );
+        let (desc, msg) = if is_best_effort {
+            (
+                format!(
+                    "Sandbox will run WITHOUT filesystem restrictions: {availability}. \
+                     Policy requests {total_paths} path rule(s) \
+                     (ro:{} rw:{}) but Landlock cannot enforce them. \
+                     Set landlock.compatibility to 'hard_requirement' to make this fatal.",
+                    read_only.len(),
+                    read_write.len(),
+                ),
+                format!(
+                    "Landlock filesystem sandbox unavailable (best_effort, degraded): {availability}"
+                ),
+            )
+        } else {
+            (
+                format!(
+                    "Landlock is unavailable: {availability}. \
+                     Policy requires {total_paths} path rule(s) \
+                     (ro:{} rw:{}) with hard_requirement — sandbox startup will fail.",
+                    read_only.len(),
+                    read_write.len(),
+                ),
+                format!(
+                    "Landlock filesystem sandbox unavailable (hard_requirement, will fail): {availability}"
+                ),
+            )
+        };
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
+                .activity(openshell_ocsf::ActivityId::Open)
+                .severity(openshell_ocsf::SeverityId::High)
+                .confidence(openshell_ocsf::ConfidenceId::High)
+                .is_alert(true)
+                .finding_info(
+                    openshell_ocsf::FindingInfo::new(
+                        "landlock-unavailable",
+                        "Landlock Filesystem Sandbox Unavailable",
                     )
-                    .message(msg)
-                    .build()
-            );
-        }
+                    .with_desc(&desc),
+                )
+                .message(msg)
+                .build()
+        );
     }
 }

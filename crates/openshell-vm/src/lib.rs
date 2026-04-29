@@ -998,9 +998,7 @@ fn is_process_named(pid: libc::pid_t, expected: &str) -> bool {
 #[cfg(target_os = "linux")]
 fn is_process_named(pid: libc::pid_t, expected: &str) -> bool {
     let comm_path = format!("/proc/{pid}/comm");
-    std::fs::read_to_string(comm_path)
-        .map(|name| name.trim().contains(expected))
-        .unwrap_or(false)
+    std::fs::read_to_string(comm_path).is_ok_and(|name| name.trim().contains(expected))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]

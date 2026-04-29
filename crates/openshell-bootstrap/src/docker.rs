@@ -749,10 +749,7 @@ pub async fn ensure_container(
     // When OPENSHELL_PUSH_IMAGES is set the entrypoint overrides the baked-in
     // HelmChart manifest so k3s uses the locally-pushed images with
     // IfNotPresent pull policy instead of pulling from the remote registry.
-    let push_mode = std::env::var("OPENSHELL_PUSH_IMAGES")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .is_some();
+    let push_mode = std::env::var("OPENSHELL_PUSH_IMAGES").is_ok_and(|v| !v.trim().is_empty());
     let effective_tag = std::env::var("IMAGE_TAG")
         .ok()
         .filter(|v| !v.trim().is_empty())

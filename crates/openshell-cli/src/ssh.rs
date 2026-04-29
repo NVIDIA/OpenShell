@@ -512,8 +512,7 @@ fn write_upload_archive<W: Write>(writer: W, source: UploadSource) -> Result<()>
                 let full_path = base_dir.join(file);
                 let archive_path = archive_prefix
                     .as_ref()
-                    .map(|prefix| prefix.join(file))
-                    .unwrap_or_else(|| PathBuf::from(file));
+                    .map_or_else(|| PathBuf::from(file), |prefix| prefix.join(file));
                 if full_path.is_file() {
                     archive
                         .append_path_with_name(&full_path, &archive_path)

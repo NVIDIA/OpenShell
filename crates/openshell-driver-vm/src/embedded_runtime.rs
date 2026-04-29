@@ -115,7 +115,7 @@ pub fn validate_runtime_dir(dir: &Path) -> Result<(), String> {
         if !path.is_file() {
             return Err(format!("missing runtime file: {}", path.display()));
         }
-        let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let size = fs::metadata(path).map_or(0, |m| m.len());
         if size == 0 {
             return Err(format!("runtime file is empty (stub): {}", path.display()));
         }

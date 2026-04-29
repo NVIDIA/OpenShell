@@ -292,14 +292,14 @@ pub fn current_time_ms() -> PersistenceResult<i64> {
 }
 
 fn map_db_error(error: &sqlx::Error) -> PersistenceError {
-    if let sqlx::Error::Database(db) = error {
-        if db.is_unique_violation() {
-            let constraint = db
-                .constraint()
-                .map(ToString::to_string)
-                .or_else(|| infer_sqlite_unique_constraint(db.message()));
-            return PersistenceError::unique_violation(constraint, Some(db.message().to_string()));
-        }
+    if let sqlx::Error::Database(db) = error
+        && db.is_unique_violation()
+    {
+        let constraint = db
+            .constraint()
+            .map(ToString::to_string)
+            .or_else(|| infer_sqlite_unique_constraint(db.message()));
+        return PersistenceError::unique_violation(constraint, Some(db.message().to_string()));
     }
     PersistenceError::Database(error.to_string())
 }

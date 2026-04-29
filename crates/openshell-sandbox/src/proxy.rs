@@ -4394,6 +4394,8 @@ mod tests {
         let (_accepted, _) = listener.accept().expect("accept");
 
         let fd = stream.as_raw_fd();
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFD);
             assert!(flags >= 0, "F_GETFD failed");
@@ -4407,9 +4409,13 @@ mod tests {
         let sleep_path = CString::new("/bin/sleep").unwrap();
         let arg0 = CString::new("sleep").unwrap();
         let arg1 = CString::new("30").unwrap();
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
         let child_pid = unsafe { libc::fork() };
         assert!(child_pid >= 0, "fork failed");
         if child_pid == 0 {
+            // libc/syscall FFI requires unsafe
+            #[allow(unsafe_code)]
             unsafe {
                 libc::execl(
                     sleep_path.as_ptr(),
@@ -4438,6 +4444,8 @@ mod tests {
         let cache = BinaryIdentityCache::new();
         let result = resolve_process_identity(std::process::id(), peer_port, &cache);
 
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
         unsafe {
             libc::kill(child_pid, libc::SIGKILL);
             libc::waitpid(child_pid, std::ptr::null_mut(), 0);

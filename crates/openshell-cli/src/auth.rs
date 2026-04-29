@@ -94,8 +94,7 @@ pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
     // listener, spawns a callback server, and waits the full AUTH_TIMEOUT
     // (120 s) for a POST that will never arrive.
     let no_browser = std::env::var("OPENSHELL_NO_BROWSER")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     if no_browser {
         return Err(miette::miette!(
             "authentication skipped (OPENSHELL_NO_BROWSER is set).\n\

@@ -151,7 +151,7 @@ fn resolve_sandbox_name(name: Option<String>, gateway: &str) -> Result<String> {
              Specify a sandbox name or connect to one first: nav sandbox connect <name>"
         )
     })?;
-    eprintln!("{} Using sandbox '{}' (last used)", "→".bold(), last.bold(),);
+    eprintln!("{} Using sandbox '{}' (last used)", "→".bold(), last.bold());
     Ok(last)
 }
 
@@ -1874,7 +1874,7 @@ async fn main() -> Result<()> {
             } else {
                 println!("{}", "Gateway Status".cyan().bold());
                 println!();
-                println!("  {} No gateway configured.", "Status:".dimmed(),);
+                println!("  {} No gateway configured.", "Status:".dimmed());
                 println!();
                 println!(
                     "Deploy a gateway with: {}",
@@ -1897,7 +1897,7 @@ async fn main() -> Result<()> {
                             eprintln!("→ Found forward on sandbox '{n}'");
                             n
                         } else {
-                            eprintln!("{} No active forward found for port {port}", "!".yellow(),);
+                            eprintln!("{} No active forward found for port {port}", "!".yellow());
                             return Ok(());
                         }
                     }

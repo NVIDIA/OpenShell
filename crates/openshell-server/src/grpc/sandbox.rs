@@ -681,7 +681,7 @@ const MAX_COMMAND_STRING_LEN: usize = 256 * 1024; // 256 KiB
 fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String> {
     let mut parts = Vec::new();
     let mut env_entries = req.environment.iter().collect::<Vec<_>>();
-    env_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    env_entries.sort_by_key(|(a, _)| *a);
     for (key, value) in env_entries {
         parts.push(format!("{key}={}", shell_escape(value)?));
     }

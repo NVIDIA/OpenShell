@@ -8,7 +8,7 @@ use openshell_core::proto::{
 };
 use prost::Message;
 
-pub(crate) trait PolicyStoreExt {
+pub trait PolicyStoreExt {
     async fn put_policy_revision(
         &self,
         id: &str,
@@ -257,7 +257,7 @@ impl PolicyStoreExt for Store {
     }
 }
 
-pub(crate) fn policy_payload_from_record(record: &PolicyRecord) -> PersistenceResult<Vec<u8>> {
+pub fn policy_payload_from_record(record: &PolicyRecord) -> PersistenceResult<Vec<u8>> {
     let policy = ProtoSandboxPolicy::decode(record.policy_payload.as_slice()).map_err(|e| {
         crate::persistence::PersistenceError::Decode(format!("decode policy payload failed: {e}"))
     })?;
@@ -270,7 +270,7 @@ pub(crate) fn policy_payload_from_record(record: &PolicyRecord) -> PersistenceRe
     .encode_to_vec())
 }
 
-pub(crate) fn policy_record_from_parts(
+pub fn policy_record_from_parts(
     id: String,
     sandbox_id: String,
     version: i64,
@@ -301,9 +301,7 @@ pub(crate) fn policy_record_from_parts(
     })
 }
 
-pub(crate) fn draft_chunk_payload_from_record(
-    chunk: &DraftChunkRecord,
-) -> PersistenceResult<Vec<u8>> {
+pub fn draft_chunk_payload_from_record(chunk: &DraftChunkRecord) -> PersistenceResult<Vec<u8>> {
     let proposed_rule = if chunk.proposed_rule.is_empty() {
         None
     } else {
@@ -320,6 +318,7 @@ pub(crate) fn draft_chunk_payload_from_record(
         proposed_rule,
         rationale: chunk.rationale.clone(),
         security_notes: chunk.security_notes.clone(),
+        #[allow(clippy::cast_possible_truncation)] // f64->f32 for confidence scores
         confidence: chunk.confidence as f32,
         decided_at_ms: chunk.decided_at_ms.unwrap_or(0),
         host: chunk.host.clone(),
@@ -330,7 +329,7 @@ pub(crate) fn draft_chunk_payload_from_record(
     .encode_to_vec())
 }
 
-pub(crate) fn draft_chunk_record_from_parts(
+pub fn draft_chunk_record_from_parts(
     id: String,
     sandbox_id: String,
     status: String,

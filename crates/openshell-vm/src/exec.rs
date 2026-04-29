@@ -111,10 +111,10 @@ impl RawModeGuard {
         let stdin = std::io::stdin();
         let fd = stdin.as_fd();
         let original =
-            termios::tcgetattr(&fd).map_err(|e| VmError::Exec(format!("tcgetattr: {e}")))?;
+            termios::tcgetattr(fd).map_err(|e| VmError::Exec(format!("tcgetattr: {e}")))?;
         let mut raw = original.clone();
         termios::cfmakeraw(&mut raw);
-        termios::tcsetattr(&fd, SetArg::TCSANOW, &raw)
+        termios::tcsetattr(fd, SetArg::TCSANOW, &raw)
             .map_err(|e| VmError::Exec(format!("tcsetattr: {e}")))?;
         Ok(Self {
             raw_fd: std::os::unix::io::AsRawFd::as_raw_fd(&stdin),
@@ -126,7 +126,7 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let fd = unsafe { BorrowedFd::borrow_raw(self.raw_fd) };
-        let _ = termios::tcsetattr(&fd, SetArg::TCSANOW, &self.original);
+        let _ = termios::tcsetattr(fd, SetArg::TCSANOW, &self.original);
     }
 }
 
@@ -792,19 +792,18 @@ fn pump_stdin(mut writer: UnixStream, tty: bool) -> Result<(), VmError> {
             break;
         }
 
-        if tty {
-            if let Some(size) = get_terminal_size() {
-                if last_size != Some(size) {
-                    last_size = Some(size);
-                    let _ = send_json_line(
-                        &mut writer,
-                        &ClientFrame::Resize {
-                            cols: size.0,
-                            rows: size.1,
-                        },
-                    );
-                }
-            }
+        if tty
+            && let Some(size) = get_terminal_size()
+            && last_size != Some(size)
+        {
+            last_size = Some(size);
+            let _ = send_json_line(
+                &mut writer,
+                &ClientFrame::Resize {
+                    cols: size.0,
+                    rows: size.1,
+                },
+            );
         }
 
         let frame = ClientFrame::Stdin {
@@ -1016,8 +1015,8 @@ mod tests {
             rows: u16::MAX,
         };
         let json: serde_json::Value = serde_json::to_value(&frame).unwrap();
-        assert_eq!(json["cols"], u16::MAX as u64);
-        assert_eq!(json["rows"], u16::MAX as u64);
+        assert_eq!(json["cols"], u64::from(u16::MAX));
+        assert_eq!(json["rows"], u64::from(u16::MAX));
     }
 
     #[test]
@@ -1070,9 +1069,7 @@ mod tests {
     fn stdin_payload_round_trip() {
         let original = b"echo hello\n";
         let encoded = base64::engine::general_purpose::STANDARD.encode(original);
-        let frame = ClientFrame::Stdin {
-            data: encoded.clone(),
-        };
+        let frame = ClientFrame::Stdin { data: encoded };
         let json = serde_json::to_string(&frame).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let decoded = decode_payload(parsed["data"].as_str().unwrap()).unwrap();
@@ -1103,7 +1100,7 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert!(v["tty"].is_boolean());
-        assert_eq!(v["tty"].as_bool().unwrap(), true);
+        assert!(v["tty"].as_bool().unwrap());
 
         let req_no_tty = ExecRequest {
             argv: vec!["echo".into()],
@@ -1112,7 +1109,7 @@ mod tests {
             tty: false,
         };
         let v: serde_json::Value = serde_json::to_value(&req_no_tty).unwrap();
-        assert_eq!(v["tty"].as_bool().unwrap(), false);
+        assert!(!v["tty"].as_bool().unwrap());
     }
 
     #[test]

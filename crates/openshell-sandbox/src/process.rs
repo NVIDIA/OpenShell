@@ -790,7 +790,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[allow(unsafe_code)]
     unsafe fn dumpable_flag_probe() -> i64 {
-        unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) as i64 }
+        unsafe { i64::from(libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0)) }
     }
 
     #[test]

@@ -429,9 +429,7 @@ const CLUSTER_DEPLOY_LOG_LINES: usize = 15;
 
 /// Return the current terminal width, falling back to 80 columns.
 fn term_width() -> usize {
-    crossterm::terminal::size()
-        .map(|(w, _)| w as usize)
-        .unwrap_or(80)
+    crossterm::terminal::size().map_or(80, |(w, _)| w as usize)
 }
 
 /// Build a horizontal rule of `─` characters with an optional centered label.
@@ -446,7 +444,7 @@ fn horizontal_rule(label: Option<&str>, width: usize) -> String {
             let remaining = width - text_len;
             let left = remaining / 2;
             let right = remaining - left;
-            format!("{}{}{}", "─".repeat(left), text_with_pad, "─".repeat(right),)
+            format!("{}{}{}", "─".repeat(left), text_with_pad, "─".repeat(right))
         }
         None => "─".repeat(width),
     }
@@ -1182,7 +1180,7 @@ pub async fn gateway_login(name: &str) -> Result<()> {
     let token = crate::auth::browser_auth_flow(&metadata.gateway_endpoint).await?;
     openshell_bootstrap::edge_token::store_edge_token(name, &token)?;
 
-    eprintln!("{} Authenticated to gateway '{name}'", "✓".green().bold(),);
+    eprintln!("{} Authenticated to gateway '{name}'", "✓".green().bold());
 
     Ok(())
 }
@@ -2451,7 +2449,7 @@ pub async fn sandbox_create(
                     )
                     .await?;
                 }
-                eprintln!("  {} Files uploaded", "\u{2713}".green().bold(),);
+                eprintln!("  {} Files uploaded", "\u{2713}".green().bold());
             }
 
             // If --forward was requested, start the background port forward
@@ -4599,7 +4597,7 @@ pub async fn gateway_setting_delete(
             response.settings_revision
         );
     } else {
-        println!("{} Global setting {} not found", "!".yellow(), key,);
+        println!("{} Global setting {} not found", "!".yellow(), key);
     }
     Ok(())
 }

@@ -50,14 +50,17 @@ impl GpuInventory {
     }
 
     pub fn gpu_count(&self) -> u32 {
-        self.slots.len() as u32
+        u32::try_from(self.slots.len()).unwrap_or(u32::MAX)
     }
 
     pub fn available_count(&self) -> u32 {
-        self.slots
-            .iter()
-            .filter(|s| s.assigned_to.is_none())
-            .count() as u32
+        u32::try_from(
+            self.slots
+                .iter()
+                .filter(|s| s.assigned_to.is_none())
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
     }
 
     /// Assign a GPU to a sandbox. Returns the assignment details including BDF.
@@ -136,7 +139,7 @@ impl GpuInventory {
                     sandbox_id: id.clone(),
                     bound_at_ms: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_millis() as i64),
+                        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
                 })
             })
             .collect();
@@ -188,7 +191,7 @@ impl SubnetAllocator {
         let pool_size = 1u32 << (32 - self.prefix_len);
         let max_subnets = pool_size / 4;
 
-        if self.allocated.len() as u32 >= max_subnets {
+        if u32::try_from(self.allocated.len()).unwrap_or(u32::MAX) >= max_subnets {
             return Err("subnet pool exhausted".to_string());
         }
 
@@ -235,10 +238,10 @@ pub fn allocate_vsock_cid() -> u32 {
 
 /// Generate a locally-administered MAC from sandbox ID using FNV-1a.
 pub fn mac_from_sandbox_id(sandbox_id: &str) -> [u8; 6] {
-    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in sandbox_id.as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     let bytes = hash.to_le_bytes();
     let mut mac = [bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]];
@@ -248,8 +251,12 @@ pub fn mac_from_sandbox_id(sandbox_id: &str) -> [u8; 6] {
 
 /// TAP device name from sandbox ID (fits `IFNAMSIZ=16`).
 pub fn tap_device_name(sandbox_id: &str) -> String {
-    let end = sandbox_id.len().min(8);
-    let end = sandbox_id.floor_char_boundary(end);
+    let mut end = sandbox_id.len().min(8);
+    // Walk back to a UTF-8 char boundary (str::floor_char_boundary requires
+    // Rust 1.91 — we still build on older toolchains).
+    while end > 0 && !sandbox_id.is_char_boundary(end) {
+        end -= 1;
+    }
     let prefix = &sandbox_id[..end];
     format!("vmtap-{prefix}")
 }

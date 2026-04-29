@@ -85,20 +85,14 @@ impl EventHandler {
 
                 if event::poll(poll_interval).unwrap_or(false) {
                     match event::read() {
-                        Ok(TermEvent::Key(key)) => {
-                            if tx.send(Event::Key(key)).is_err() {
-                                return;
-                            }
+                        Ok(TermEvent::Key(key)) if tx.send(Event::Key(key)).is_err() => {
+                            return;
                         }
-                        Ok(TermEvent::Mouse(mouse)) => {
-                            if tx.send(Event::Mouse(mouse)).is_err() {
-                                return;
-                            }
+                        Ok(TermEvent::Mouse(mouse)) if tx.send(Event::Mouse(mouse)).is_err() => {
+                            return;
                         }
-                        Ok(TermEvent::Resize(w, h)) => {
-                            if tx.send(Event::Resize(w, h)).is_err() {
-                                return;
-                            }
+                        Ok(TermEvent::Resize(w, h)) if tx.send(Event::Resize(w, h)).is_err() => {
+                            return;
                         }
                         _ => {}
                     }

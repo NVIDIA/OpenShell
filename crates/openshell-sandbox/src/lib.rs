@@ -26,12 +26,14 @@ mod supervisor_session;
 use miette::{IntoDiagnostic, Result};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::LazyLock;
+#[cfg(any(target_os = "linux", test))]
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
-#[cfg(target_os = "linux")]
-use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
@@ -67,16 +69,15 @@ static OCSF_CTX: OnceLock<SandboxContext> = OnceLock::new();
 
 /// Fallback context used when `OCSF_CTX` has not been initialized (e.g. in
 /// unit tests that exercise individual functions without calling `run_sandbox`).
-static OCSF_CTX_FALLBACK: std::sync::LazyLock<SandboxContext> =
-    std::sync::LazyLock::new(|| SandboxContext {
-        sandbox_id: String::new(),
-        sandbox_name: String::new(),
-        container_image: String::new(),
-        hostname: "test".to_string(),
-        product_version: openshell_core::VERSION.to_string(),
-        proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
-        proxy_port: 3128,
-    });
+static OCSF_CTX_FALLBACK: LazyLock<SandboxContext> = LazyLock::new(|| SandboxContext {
+    sandbox_id: String::new(),
+    sandbox_name: String::new(),
+    container_image: String::new(),
+    hostname: "test".to_string(),
+    product_version: openshell_core::VERSION.to_string(),
+    proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
+    proxy_port: 3128,
+});
 
 /// Return a reference to the process-wide [`SandboxContext`].
 ///
@@ -492,15 +493,13 @@ pub async fn run_sandbox(
     // Reads /dev/kmsg for iptables LOG entries and emits structured
     // tracing events for direct connection attempts that bypass the proxy.
     #[cfg(target_os = "linux")]
-    let _bypass_monitor = if netns.is_some() {
+    let _bypass_monitor = netns.as_ref().and_then(|ns| {
         bypass_monitor::spawn(
-            netns.as_ref().expect("netns is Some").name().to_string(),
+            ns.name().to_string(),
             entrypoint_pid.clone(),
             bypass_denial_tx,
         )
-    } else {
-        None
-    };
+    });
 
     // On non-Linux, bypass_denial_tx is unused (no /dev/kmsg).
     #[cfg(not(target_os = "linux"))]
@@ -597,11 +596,11 @@ pub async fn run_sandbox(
                 }
 
                 match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
-                    Ok(WaitStatus::StillAlive) | Err(nix::errno::Errno::ECHILD) => {}
+                    Ok(WaitStatus::StillAlive)
+                    | Err(nix::errno::Errno::ECHILD | nix::errno::Errno::EINTR) => {}
                     Ok(reaped) => {
                         tracing::debug!(?reaped, "Reaped orphaned child process");
                     }
-                    Err(nix::errno::Errno::EINTR) => {}
                     Err(e) => {
                         tracing::debug!(error = %e, "waitpid error during orphan reap");
                         break;
@@ -1608,10 +1607,10 @@ fn is_retryable_error(err: &miette::Report) -> bool {
 ///
 /// Non-transient gRPC errors (e.g. `NOT_FOUND`, `INVALID_ARGUMENT`,
 /// `PERMISSION_DENIED`) are returned immediately without retrying.
-async fn grpc_retry<T, F, Fut>(op_name: &str, f: F) -> miette::Result<T>
+async fn grpc_retry<T, F, Fut>(op_name: &str, f: F) -> Result<T>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = miette::Result<T>>,
+    Fut: Future<Output = Result<T>>,
 {
     let mut last_err = None;
     for attempt in 1..=5u32 {
@@ -2352,8 +2351,7 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, symlink};
     use temp_env::with_vars;
 
-    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn bundle_to_resolved_routes_converts_all_fields() {

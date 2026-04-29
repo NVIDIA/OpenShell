@@ -417,7 +417,7 @@ fn validate_runtime_dir(dir: &Path) -> Result<(), VmError> {
         }
 
         // Check file is not empty (would indicate a stub)
-        let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let size = fs::metadata(path).map_or(0, |m| m.len());
         if size == 0 {
             return Err(VmError::HostSetup(format!(
                 "runtime file is empty (stub): {}",

@@ -1497,7 +1497,7 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
 
 #[cfg(test)]
 #[derive(Debug, Default)]
-pub(crate) struct NoopTestDriver;
+pub struct NoopTestDriver;
 
 #[cfg(test)]
 #[tonic::async_trait]
@@ -1591,7 +1591,7 @@ impl ComputeDriver for NoopTestDriver {
 }
 
 #[cfg(test)]
-pub(crate) async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
+pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
     ComputeRuntime {
         driver: Arc::new(NoopTestDriver),
         shutdown_cleanup: None,
@@ -1802,8 +1802,8 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
                 name: format!("session-{id}"),
-                created_at_ms: 1000000,
-                labels: std::collections::HashMap::new(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
             }),
             sandbox_id: sandbox_id.to_string(),
             token: format!("token-{id}"),

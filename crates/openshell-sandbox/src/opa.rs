@@ -638,7 +638,7 @@ fn normalize_endpoint_ports(data: &mut serde_json::Value) {
 ///
 /// Normalize a path by resolving `.` and `..` components without touching
 /// the filesystem. Only works correctly for absolute paths.
-#[cfg(test)]
+#[cfg(any(target_os = "linux", test))]
 fn normalize_path(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {
@@ -664,7 +664,7 @@ fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option
     // /proc/<pid>/root itself (a kernel pseudo-symlink to /) which
     // strips the prefix we need. read_link only reads the target of
     // the specified symlink, keeping us in the container's namespace.
-    let mut resolved = std::path::PathBuf::from(policy_path);
+    let mut resolved = PathBuf::from(policy_path);
 
     // Linux SYMLOOP_MAX is 40; stop before infinite loops
     for _ in 0..40 {
@@ -3680,9 +3680,8 @@ network_policies:
     #[cfg(target_os = "linux")]
     fn procfs_root_accessible() -> bool {
         use std::os::unix::fs::symlink;
-        let dir = match tempfile::tempdir() {
-            Ok(d) => d,
-            Err(_) => return false,
+        let Ok(dir) = tempfile::tempdir() else {
+            return false;
         };
         let target = dir.path().join("probe_target");
         let link = dir.path().join("probe_link");
@@ -3701,6 +3700,8 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_binary_with_real_symlink() {
+        use std::os::unix::fs::symlink;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
@@ -3708,7 +3709,6 @@ network_policies:
 
         // Create a real symlink in a temp directory and verify resolution
         // works through /proc/self/root (which maps to / on the host)
-        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("python3.11");
         let link = dir.path().join("python3");
@@ -3737,13 +3737,14 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_binary_non_symlink_returns_none() {
+        use std::io::Write;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
         }
 
         // A regular file should return None (no expansion needed)
-        use std::io::Write;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"regular file").unwrap();
         tmp.flush().unwrap();
@@ -3761,13 +3762,14 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_binary_multi_level_symlink() {
+        use std::os::unix::fs::symlink;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
         }
 
         // Test multi-level symlink resolution: python3 -> python3.11 -> cpython3.11
-        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let final_target = dir.path().join("cpython3.11");
         let mid_link = dir.path().join("python3.11");
@@ -3792,6 +3794,8 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn from_proto_with_pid_expands_symlinks_in_container() {
+        use std::os::unix::fs::symlink;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
@@ -3799,7 +3803,6 @@ network_policies:
 
         // End-to-end test: create a symlink, build engine with our PID,
         // verify the resolved path is allowed
-        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("node22");
         let link = dir.path().join("node");
@@ -3868,6 +3871,8 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn reload_from_proto_with_pid_resolves_symlinks() {
+        use std::os::unix::fs::symlink;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
@@ -3875,7 +3880,6 @@ network_policies:
 
         // Test hot-reload path: initial engine at pid=0, then reload with
         // real PID to trigger symlink resolution
-        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("python3.11");
         let link = dir.path().join("python3");

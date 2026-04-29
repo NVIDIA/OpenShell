@@ -1045,6 +1045,9 @@ mod unsafe_pty {
     }
 
     #[allow(unsafe_code)]
+    // `libc::TIOCSCTTY` is `u32` on macOS/BSD and `u64` on Linux; allow the
+    // cross-platform conversion so the same expression compiles everywhere.
+    #[allow(clippy::useless_conversion)]
     fn set_controlling_tty(fd: RawFd) -> std::io::Result<()> {
         let rc = unsafe { libc::ioctl(fd, libc::TIOCSCTTY.into(), 0) };
         if rc != 0 {
@@ -1498,7 +1501,7 @@ mod tests {
             None,
             None, // no netns fd
             #[cfg(target_os = "linux")]
-            crate::sandbox::linux::prepare(
+            sandbox::linux::prepare(
                 &SandboxPolicy {
                     version: 0,
                     filesystem: FilesystemPolicy::default(),
