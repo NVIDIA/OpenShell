@@ -4,7 +4,7 @@
 id: github
 display_name: GitHub
 description: GitHub API and Git operations
-category: source-control
+category: source_control
 credentials:
   - name: api_token
     description: GitHub token

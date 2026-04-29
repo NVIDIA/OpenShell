@@ -4,7 +4,7 @@
 id: opencode
 display_name: OpenCode
 description: OpenCode-compatible inference provider
-category: inference
+category: agent
 inference_capable: true
 credentials:
   - name: api_key

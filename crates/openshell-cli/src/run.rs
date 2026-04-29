@@ -22,6 +22,7 @@ use openshell_bootstrap::{
     get_gateway_metadata, list_gateways, load_active_gateway, remove_gateway_metadata,
     resolve_ssh_hostname, save_active_gateway, save_last_sandbox, store_gateway_metadata,
 };
+use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
@@ -3725,12 +3726,12 @@ pub async fn provider_list_types(server: &str, tls: &TlsOptions) -> Result<()> {
     }
 
     println!("{}", "Available Provider Types:".cyan().bold());
-    let mut current_category = String::new();
+    let mut current_category = i32::MIN;
     for profile in profiles {
         if profile.category != current_category {
-            current_category = profile.category.clone();
+            current_category = profile.category;
             println!();
-            println!("  {}", display_provider_category(&current_category).bold());
+            println!("  {}", display_provider_category(current_category).bold());
         }
         print_provider_type_row(&profile);
     }
@@ -3738,8 +3739,16 @@ pub async fn provider_list_types(server: &str, tls: &TlsOptions) -> Result<()> {
     Ok(())
 }
 
-fn display_provider_category(category: &str) -> String {
-    category.replace('-', " ").to_ascii_uppercase()
+fn display_provider_category(category: i32) -> &'static str {
+    match ProviderProfileCategory::try_from(category).unwrap_or(ProviderProfileCategory::Other) {
+        ProviderProfileCategory::Inference => "INFERENCE",
+        ProviderProfileCategory::Agent => "AGENT",
+        ProviderProfileCategory::SourceControl => "SOURCE CONTROL",
+        ProviderProfileCategory::Messaging => "MESSAGING",
+        ProviderProfileCategory::Data => "DATA",
+        ProviderProfileCategory::Knowledge => "KNOWLEDGE",
+        ProviderProfileCategory::Other | ProviderProfileCategory::Unspecified => "OTHER",
+    }
 }
 
 fn print_provider_type_row(profile: &ProviderProfile) {

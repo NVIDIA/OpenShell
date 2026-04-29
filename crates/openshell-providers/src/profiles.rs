@@ -6,9 +6,10 @@
 #![allow(deprecated)] // NetworkBinary::harness remains in the public proto for compatibility.
 
 use openshell_core::proto::{
-    NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProviderProfile, ProviderProfileCredential,
+    NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProviderProfile, ProviderProfileCategory,
+    ProviderProfileCredential,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
@@ -17,7 +18,6 @@ const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../profiles/claude.yaml"),
     include_str!("../profiles/codex.yaml"),
     include_str!("../profiles/copilot.yaml"),
-    include_str!("../profiles/generic.yaml"),
     include_str!("../profiles/github.yaml"),
     include_str!("../profiles/gitlab.yaml"),
     include_str!("../profiles/nvidia.yaml"),
@@ -75,8 +75,11 @@ pub struct ProviderTypeProfile {
     pub display_name: String,
     #[serde(default)]
     pub description: String,
-    #[serde(default)]
-    pub category: String,
+    #[serde(
+        default = "default_category",
+        deserialize_with = "deserialize_category"
+    )]
+    pub category: ProviderProfileCategory,
     #[serde(default)]
     pub credentials: Vec<CredentialProfile>,
     #[serde(default)]
@@ -107,7 +110,7 @@ impl ProviderTypeProfile {
             id: self.id.clone(),
             display_name: self.display_name.clone(),
             description: self.description.clone(),
-            category: self.category.clone(),
+            category: self.category as i32,
             credentials: self
                 .credentials
                 .iter()
@@ -148,6 +151,33 @@ impl ProviderTypeProfile {
                 })
                 .collect(),
         }
+    }
+}
+
+fn default_category() -> ProviderProfileCategory {
+    ProviderProfileCategory::Other
+}
+
+fn deserialize_category<'de, D>(deserializer: D) -> Result<ProviderProfileCategory, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    provider_profile_category_from_yaml(&raw)
+        .ok_or_else(|| de::Error::custom(format!("unsupported provider profile category: {raw}")))
+}
+
+fn provider_profile_category_from_yaml(raw: &str) -> Option<ProviderProfileCategory> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "" => Some(ProviderProfileCategory::Other),
+        "other" => Some(ProviderProfileCategory::Other),
+        "inference" => Some(ProviderProfileCategory::Inference),
+        "agent" => Some(ProviderProfileCategory::Agent),
+        "source_control" => Some(ProviderProfileCategory::SourceControl),
+        "messaging" => Some(ProviderProfileCategory::Messaging),
+        "data" => Some(ProviderProfileCategory::Data),
+        "knowledge" => Some(ProviderProfileCategory::Knowledge),
+        _ => None,
     }
 }
 
@@ -239,6 +269,8 @@ pub fn get_default_profile(id: &str) -> Option<&'static ProviderTypeProfile> {
 
 #[cfg(test)]
 mod tests {
+    use openshell_core::proto::ProviderProfileCategory;
+
     use super::{
         ProfileError, default_profiles, get_default_profile, parse_profile_catalog_yamls,
         parse_profile_yaml,
@@ -261,7 +293,10 @@ mod tests {
         let proto = profile.to_proto();
 
         assert_eq!(proto.id, "github");
-        assert_eq!(proto.category, "source-control");
+        assert_eq!(
+            proto.category,
+            ProviderProfileCategory::SourceControl as i32
+        );
         assert_eq!(proto.endpoints.len(), 2);
         assert_eq!(proto.binaries.len(), 4);
     }
@@ -289,6 +324,7 @@ credentials:
         .expect("profile should parse");
 
         assert_eq!(profile.id, "example");
+        assert_eq!(profile.category, ProviderProfileCategory::Other);
         assert_eq!(profile.credential_env_vars(), vec!["EXAMPLE_API_KEY"]);
     }
 

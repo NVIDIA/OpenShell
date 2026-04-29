@@ -4,7 +4,7 @@
 id: copilot
 display_name: GitHub Copilot
 description: GitHub Copilot tooling
-category: inference
+category: agent
 credentials:
   - name: github_token
     description: GitHub token used by Copilot tooling

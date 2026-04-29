@@ -588,12 +588,24 @@ message ProviderProfileCredential {
   string query_param = 7;
 }
 
+// Stable provider profile categories used by clients for grouping and filtering.
+enum ProviderProfileCategory {
+  PROVIDER_PROFILE_CATEGORY_UNSPECIFIED = 0;
+  PROVIDER_PROFILE_CATEGORY_OTHER = 1;
+  PROVIDER_PROFILE_CATEGORY_INFERENCE = 2;
+  PROVIDER_PROFILE_CATEGORY_AGENT = 3;
+  PROVIDER_PROFILE_CATEGORY_SOURCE_CONTROL = 4;
+  PROVIDER_PROFILE_CATEGORY_MESSAGING = 5;
+  PROVIDER_PROFILE_CATEGORY_DATA = 6;
+  PROVIDER_PROFILE_CATEGORY_KNOWLEDGE = 7;
+}
+
 // Provider type profile metadata exposed to clients.
 message ProviderProfile {
   string id = 1;
   string display_name = 2;
   string description = 3;
-  string category = 4;
+  ProviderProfileCategory category = 4;
   repeated ProviderProfileCredential credentials = 5;
   repeated openshell.sandbox.v1.NetworkEndpoint endpoints = 6;
   repeated openshell.sandbox.v1.NetworkBinary binaries = 7;

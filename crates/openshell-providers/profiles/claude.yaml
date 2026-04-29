@@ -4,7 +4,7 @@
 id: claude
 display_name: Claude Code
 description: Claude Code CLI
-category: inference
+category: agent
 inference_capable: true
 credentials:
   - name: api_key
