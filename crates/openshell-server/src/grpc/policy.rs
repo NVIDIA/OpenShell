@@ -2703,6 +2703,80 @@ mod tests {
         }
     }
 
+    fn test_policy_with_rule(rule_name: &str, host: &str) -> ProtoSandboxPolicy {
+        ProtoSandboxPolicy {
+            network_policies: [(
+                rule_name.to_string(),
+                NetworkPolicyRule {
+                    name: rule_name.to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: host.to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn test_sandbox(
+        id: &str,
+        name: &str,
+        policy: ProtoSandboxPolicy,
+        providers: Vec<String>,
+    ) -> Sandbox {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: id.to_string(),
+                name: name.to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(policy),
+                providers,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        }
+    }
+
+    async fn enable_providers_v2(state: &Arc<ServerState>) {
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: [(
+                settings::USE_PROVIDERS_V2_KEY.to_string(),
+                StoredSettingValue::Bool(true),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+    }
+
+    async fn get_sandbox_policy(state: &Arc<ServerState>, sandbox_id: &str) -> ProtoSandboxPolicy {
+        handle_get_sandbox_config(
+            state,
+            Request::new(GetSandboxConfigRequest {
+                sandbox_id: sandbox_id.to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .policy
+        .expect("sandbox config should include policy")
+    }
+
     #[tokio::test]
     async fn provider_policy_layers_skip_unknown_provider_types() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
@@ -2759,6 +2833,255 @@ mod tests {
         );
 
         assert!(bool_setting_enabled(&settings, settings::USE_PROVIDERS_V2_KEY).unwrap());
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_omits_provider_layers_when_v2_disabled() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-v2-disabled",
+                "v2-disabled",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-v2-disabled").await;
+
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("sandbox_only")
+        );
+        assert!(
+            !effective_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_composes_provider_layers_when_v2_enabled() {
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-v2-enabled",
+                "v2-enabled",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-v2-enabled").await;
+
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("sandbox_only")
+        );
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+        assert!(
+            effective_policy
+                .network_policies
+                .get("_provider_work_github")
+                .unwrap()
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.github.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_skips_profileless_provider_types_when_v2_enabled() {
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&test_provider("legacy-generic", "generic"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider("custom-provider", "custom"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-profileless",
+                "profileless",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["legacy-generic".to_string(), "custom-provider".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-profileless").await;
+
+        assert_eq!(effective_policy.network_policies.len(), 1);
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("sandbox_only")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_composition_is_jit_and_does_not_persist_provider_layers() {
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-jit",
+                "jit",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-jit").await;
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+
+        let persisted = state
+            .store
+            .get_latest_policy("sb-jit")
+            .await
+            .unwrap()
+            .expect("sandbox policy should be lazily backfilled");
+        let persisted_policy = ProtoSandboxPolicy::decode(persisted.policy_payload.as_slice())
+            .expect("persisted sandbox policy should decode");
+        assert!(
+            persisted_policy
+                .network_policies
+                .contains_key("sandbox_only")
+        );
+        assert!(
+            !persisted_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_preserves_overlapping_user_and_provider_rules() {
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-overlap",
+                "overlap",
+                test_policy_with_rule("_provider_work_github", "api.github.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-overlap").await;
+
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("_provider_work_github_2")
+        );
+        assert_eq!(
+            effective_policy
+                .network_policies
+                .get("_provider_work_github")
+                .unwrap()
+                .endpoints[0]
+                .host,
+            "api.github.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_environment_resolution_is_unchanged_by_providers_v2_setting() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-provider-env",
+                "provider-env",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let legacy_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-provider-env".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .environment;
+
+        enable_providers_v2(&state).await;
+        let v2_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-provider-env".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .environment;
+
+        assert_eq!(legacy_env, v2_env);
+        assert_eq!(v2_env.get("GITHUB_TOKEN"), Some(&"ghp-test".to_string()));
     }
 
     #[tokio::test]
