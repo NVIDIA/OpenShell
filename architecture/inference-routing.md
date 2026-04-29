@@ -136,6 +136,7 @@ Supported built-in patterns:
 | `POST` | `/v1/completions` | `openai_completions` | `completion` |
 | `POST` | `/v1/responses` | `openai_responses` | `responses` |
 | `POST` | `/v1/messages` | `anthropic_messages` | `messages` |
+| `POST` | `/v1/messages/count_tokens` | `anthropic_messages` | `messages_count_tokens` |
 | `GET` | `/v1/models` | `model_discovery` | `models_list` |
 | `GET` | `/v1/models/*` | `model_discovery` | `models_get` |
 
