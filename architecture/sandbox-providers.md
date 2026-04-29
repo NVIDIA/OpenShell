@@ -55,7 +55,11 @@ live as one YAML document per provider under
 YAML catalog and materializes the same proto-backed shape that future API imports
 will accept. Profiles describe credential names and environment variables, known
 network endpoints, expected binaries, category, and whether the provider is
-inference-capable.
+inference-capable. Categories are a proto enum so clients can group and filter
+provider types without parsing display strings. Current values are `other`,
+`inference`, `agent`, `source_control`, `messaging`, `data`, and `knowledge`.
+Agent profiles such as `claude`, `codex`, and `opencode` can still be
+inference-capable when their tool talks to an inference API.
 
 Profiles are additive to provider records. A provider record with only `type`,
 `credentials`, and `config` can be matched to built-in profile metadata by

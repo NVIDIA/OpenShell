@@ -4,7 +4,7 @@
 id: gitlab
 display_name: GitLab
 description: GitLab API and Git operations
-category: source-control
+category: source_control
 credentials:
   - name: api_token
     description: GitLab token
