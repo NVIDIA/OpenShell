@@ -105,9 +105,7 @@ pub fn ensure_parent_dir_restricted(path: &Path) -> Result<()> {
 #[cfg(unix)]
 pub fn is_file_permissions_too_open(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o077 != 0)
-        .unwrap_or(false)
+    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
 }
 
 #[cfg(test)]

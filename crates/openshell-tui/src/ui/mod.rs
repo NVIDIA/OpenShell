@@ -1,17 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-pub(crate) mod create_provider;
-pub(crate) mod create_sandbox;
+pub mod create_provider;
+pub mod create_sandbox;
 mod dashboard;
-pub(crate) mod global_settings;
-pub(crate) mod providers;
-pub(crate) mod sandbox_detail;
+pub mod global_settings;
+pub mod providers;
+pub mod sandbox_detail;
 mod sandbox_draft;
-pub(crate) mod sandbox_logs;
+pub mod sandbox_logs;
 mod sandbox_policy;
-pub(crate) mod sandbox_settings;
-pub(crate) mod sandboxes;
+pub mod sandbox_settings;
+pub mod sandboxes;
 mod splash;
 
 use ratatui::Frame;
@@ -89,12 +89,12 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 
     // Log detail popup renders over the full frame (not constrained to pane).
-    if app.focus == Focus::SandboxLogs {
-        if let Some(detail_idx) = app.log_detail_index {
-            let filtered: Vec<&app::LogLine> = app.filtered_log_lines();
-            if let Some(log) = filtered.get(detail_idx) {
-                sandbox_logs::draw_detail_popup(frame, log, frame.size(), &app.theme);
-            }
+    if app.focus == Focus::SandboxLogs
+        && let Some(detail_idx) = app.log_detail_index
+    {
+        let filtered: Vec<&app::LogLine> = app.filtered_log_lines();
+        if let Some(log) = filtered.get(detail_idx) {
+            sandbox_logs::draw_detail_popup(frame, log, frame.size(), &app.theme);
         }
     }
 
@@ -328,8 +328,7 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 let selected_status = app
                     .draft_chunks
                     .get(app.draft_scroll + app.draft_selected)
-                    .map(|c| c.status.as_str())
-                    .unwrap_or("");
+                    .map_or("", |c| c.status.as_str());
                 let mut spans = vec![
                     Span::styled(" ", t.text),
                     Span::styled("[j/k]", t.key_hint),
@@ -456,7 +455,7 @@ fn draw_command_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 /// Center a popup rectangle within `area` using percentage-based width and
 /// an absolute height (in rows).
-pub(crate) fn centered_popup(percent_x: u16, height: u16, area: Rect) -> Rect {
+pub fn centered_popup(percent_x: u16, height: u16, area: Rect) -> Rect {
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

@@ -147,7 +147,7 @@ async fn gateway_login_help_is_recognized() {
 // -------------------------------------------------------------------
 
 /// `openshell gateway add <endpoint>` (cloud gateway) should:
-/// - Create cluster metadata with auth_mode = "cloudflare_jwt"
+/// - Create cluster metadata with `auth_mode` = `"cloudflare_jwt"`
 /// - Set the gateway as active
 /// - Attempt browser authentication (which will fail in CI — non-fatal)
 #[tokio::test]

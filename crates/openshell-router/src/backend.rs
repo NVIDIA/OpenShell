@@ -33,7 +33,7 @@ struct ValidationProbe {
     protocol: &'static str,
     body: bytes::Bytes,
     /// Alternate body to try when the primary probe fails with HTTP 400.
-    /// Used for OpenAI chat completions where newer models require
+    /// Used for `OpenAI` chat completions where newer models require
     /// `max_completion_tokens` while legacy/self-hosted backends only
     /// accept `max_tokens`.
     fallback_body: Option<bytes::Bytes>,
@@ -158,7 +158,7 @@ fn prepare_backend_request(
     body: bytes::Bytes,
 ) -> Result<(reqwest::RequestBuilder, String), RouterError> {
     let url = build_backend_url(&route.endpoint, path);
-    let headers = sanitize_request_headers(route, &headers);
+    let headers = sanitize_request_headers(route, headers);
 
     let reqwest_method: reqwest::Method = method
         .parse()
@@ -353,18 +353,18 @@ pub async fn verify_backend_endpoint(
     // there is a fallback body, retry with the alternate token parameter.
     // This handles the split between `max_completion_tokens` (GPT-5+) and
     // `max_tokens` (legacy/self-hosted backends).
-    if let (Err(err), Some(fallback_body)) = (&result, probe.fallback_body) {
-        if err.kind == ValidationFailureKind::RequestShape {
-            return try_validation_request(
-                client,
-                route,
-                probe.path,
-                probe.protocol,
-                headers,
-                fallback_body,
-            )
-            .await;
-        }
+    if let (Err(err), Some(fallback_body)) = (&result, probe.fallback_body)
+        && err.kind == ValidationFailureKind::RequestShape
+    {
+        return try_validation_request(
+            client,
+            route,
+            probe.path,
+            probe.protocol,
+            headers,
+            fallback_body,
+        )
+        .await;
     }
 
     result
@@ -768,7 +768,7 @@ mod tests {
         assert_eq!(validated.protocol, "openai_chat_completions");
     }
 
-    /// Non-chat-completions probes (e.g. anthropic_messages) should not
+    /// Non-chat-completions probes (e.g. `anthropic_messages`) should not
     /// have a fallback — a 400 remains a hard failure.
     #[tokio::test]
     async fn verify_non_chat_completions_no_fallback() {

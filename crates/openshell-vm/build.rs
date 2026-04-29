@@ -12,7 +12,7 @@
 //! Environment:
 //!   `OPENSHELL_VM_RUNTIME_COMPRESSED_DIR` - Path to compressed artifacts
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 fn main() {
@@ -97,7 +97,7 @@ fn main() {
                     e
                 )
             });
-            let size = fs::metadata(&dst_path).map(|m| m.len()).unwrap_or(0);
+            let size = fs::metadata(&dst_path).map_or(0, |m| m.len());
             println!("cargo:warning=Embedded {src_name}: {size} bytes");
         } else {
             println!(
@@ -116,7 +116,7 @@ fn main() {
 
 /// Generate stub (empty) resource files so the build can complete.
 /// The embedded module will fail at runtime if these stubs are used.
-fn generate_stub_resources(out_dir: &PathBuf) {
+fn generate_stub_resources(out_dir: &Path) {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
     let (libkrun_name, libkrunfw_name) = match target_os.as_str() {

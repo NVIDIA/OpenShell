@@ -14,6 +14,9 @@ pub mod linux;
 /// # Errors
 ///
 /// Returns an error if the sandbox cannot be applied.
+// On Linux the spawn path uses `prepare`+`enforce` directly; this single-phase
+// apply is only invoked from the non-Linux spawn_impl.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 #[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
 pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
     #[cfg(target_os = "linux")]

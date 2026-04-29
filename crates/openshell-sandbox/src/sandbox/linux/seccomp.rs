@@ -7,10 +7,10 @@
 //!
 //! 1. **Socket domain blocks** -- prevent raw/kernel sockets that bypass the proxy
 //! 2. **Unconditional syscall blocks** -- block syscalls that enable sandbox escape
-//!    (fileless exec, ptrace, BPF, cross-process memory access, io_uring, mount)
+//!    (fileless exec, ptrace, BPF, cross-process memory access, `io_uring`, mount)
 //! 3. **Conditional syscall blocks** -- block dangerous flag combinations on otherwise
-//!    needed syscalls (execveat+AT_EMPTY_PATH, unshare+CLONE_NEWUSER,
-//!    seccomp+SET_MODE_FILTER)
+//!    needed syscalls (`execveat+AT_EMPTY_PATH`, `unshare+CLONE_NEWUSER`,
+//!    `seccomp+SET_MODE_FILTER`)
 
 use crate::policy::{NetworkMode, SandboxPolicy};
 use miette::{IntoDiagnostic, Result};
@@ -90,6 +90,8 @@ fn build_supervisor_prelude_rules() -> BTreeMap<i64, Vec<SeccompRule>> {
 }
 
 fn set_no_new_privs() -> Result<()> {
+    // libc/syscall FFI requires unsafe
+    #[allow(unsafe_code)]
     let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if rc != 0 {
         return Err(miette::miette!(
@@ -119,7 +121,7 @@ fn compile_filter(
 ///
 /// This is a separate filter from the main one because seccomp BPF cannot
 /// dereference the `struct clone_args *` pointer that clone3 takes as arg 0,
-/// so we cannot selectively block CLONE_NEWUSER. We block clone3
+/// so we cannot selectively block `CLONE_NEWUSER`. We block clone3
 /// unconditionally with ENOSYS so glibc falls back to the older clone
 /// syscall (where flags are a direct register argument and CAN be filtered).
 ///
@@ -140,8 +142,8 @@ fn build_clone3_filter() -> Result<seccompiler::BpfProgram> {
 /// 2. Install the main filter second. It blocks further seccomp filter
 ///    installation with `EPERM`, preserving the original hardening intent.
 fn apply_runtime_filters(
-    main_filter: seccompiler::BpfProgramRef,
-    clone3_filter: seccompiler::BpfProgramRef,
+    main_filter: seccompiler::BpfProgramRef<'_>,
+    clone3_filter: seccompiler::BpfProgramRef<'_>,
 ) -> Result<()> {
     apply_filter(clone3_filter).into_diagnostic()?;
     apply_filter(main_filter).into_diagnostic()?;
@@ -283,6 +285,15 @@ fn add_masked_arg_rule(
 }
 
 #[cfg(test)]
+// libc/syscall FFI requires unsafe; these tests fork children and exercise
+// blocked syscalls, so unsafe blocks/calls are pervasive.
+#[allow(
+    unsafe_code,
+    unsafe_op_in_unsafe_fn,
+    unused_unsafe,
+    clippy::borrow_as_ptr,
+    trivial_numeric_casts
+)]
 mod tests {
     use super::*;
 

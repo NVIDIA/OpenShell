@@ -95,7 +95,7 @@ pub struct PreparedRuleset {
     compatibility: LandlockCompatibility,
 }
 
-/// Phase 1: Open PathFds and build the Landlock ruleset **as root**.
+/// Phase 1: Open `PathFds` and build the Landlock ruleset **as root**.
 ///
 /// This must run before `drop_privileges()` so that `PathFd::new()` can open
 /// paths that are only accessible to root (e.g. mode 700 directories).
@@ -272,6 +272,7 @@ pub fn enforce(prepared: PreparedRuleset) -> Result<()> {
 /// Legacy single-phase apply. Kept for non-Linux platforms and tests.
 /// On Linux, callers should use [`prepare`] + [`enforce`] for correct
 /// privilege ordering.
+#[allow(dead_code)] // Retained for backward compat; live callers use prepare+enforce.
 pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
     if let Some(prepared) = prepare(policy, workdir)? {
         enforce(prepared)?;

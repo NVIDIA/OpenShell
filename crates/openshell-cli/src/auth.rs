@@ -72,6 +72,9 @@ fn generate_confirmation_code() -> String {
         let hash_b = hasher_b.finish();
 
         prev_hash = hash_b;
+        // hash_b is `u64`; truncation to `usize` is acceptable here since we mod
+        // by charset.len() (small) and only use it as an index.
+        #[allow(clippy::cast_possible_truncation)]
         let idx = (hash_b as usize) % charset.len();
         code.push(charset[idx] as char);
     }
@@ -91,8 +94,7 @@ pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
     // listener, spawns a callback server, and waits the full AUTH_TIMEOUT
     // (120 s) for a POST that will never arrive.
     let no_browser = std::env::var("OPENSHELL_NO_BROWSER")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     if no_browser {
         return Err(miette::miette!(
             "authentication skipped (OPENSHELL_NO_BROWSER is set).\n\
@@ -129,8 +131,9 @@ pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
 
     eprint!("Press Enter to open the browser for authentication...");
     std::io::stderr().flush().ok();
-    let mut _input = String::new();
-    std::io::stdin().read_line(&mut _input).ok();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).ok();
+    drop(input);
 
     if let Err(e) = open_browser(&auth_url) {
         debug!(error = %e, "failed to open browser");

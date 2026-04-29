@@ -94,6 +94,20 @@ impl tracing::field::Visit for MessageVisitor<'_> {
     }
 }
 
+/// Test helper: wraps `Arc<Mutex<Vec<u8>>>` so it implements `Write + Send`.
+#[cfg(test)]
+struct SyncWriter(std::sync::Arc<Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl Write for SyncWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,19 +151,5 @@ mod tests {
             line.contains("test message"),
             "Expected message, got: {line}"
         );
-    }
-}
-
-/// Test helper: wraps `Arc<Mutex<Vec<u8>>>` so it implements `Write + Send`.
-#[cfg(test)]
-struct SyncWriter(std::sync::Arc<Mutex<Vec<u8>>>);
-
-#[cfg(test)]
-impl Write for SyncWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap().flush()
     }
 }

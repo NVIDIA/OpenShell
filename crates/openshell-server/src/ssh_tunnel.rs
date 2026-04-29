@@ -106,10 +106,13 @@ async fn ssh_connect(
 
     // Check token expiry (0 means no expiry for backward compatibility).
     if session.expires_at_ms > 0 {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
         if now_ms > session.expires_at_ms {
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -268,10 +271,13 @@ pub fn spawn_session_reaper(store: Arc<Store>, interval: Duration) {
 }
 
 async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
 
     let records = store
         .list(SshSession::object_type(), 1000, 0)
@@ -321,7 +327,7 @@ mod tests {
         SshSession {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
-                name: format!("session-{}", id),
+                name: format!("session-{id}"),
                 created_at_ms: 1000,
                 labels: HashMap::new(),
             }),
@@ -333,10 +339,13 @@ mod tests {
     }
 
     fn now_ms() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX)
     }
 
     // ---- Connection limit tests ----

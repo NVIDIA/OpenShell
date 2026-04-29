@@ -188,11 +188,11 @@ mod tests {
             .unwrap();
 
             let result = complete_gateway_names(OsStr::new("a"));
-            let names: Vec<String> = result
-                .iter()
-                .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
-                .collect();
-            assert!(names.contains(&"alpha".to_string()));
+            assert!(
+                result
+                    .iter()
+                    .any(|candidate| candidate.get_value().to_string_lossy() == "alpha")
+            );
         });
     }
 }

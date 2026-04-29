@@ -90,9 +90,9 @@ if [ -z "${VM_RUNTIME_TARBALL:-}" ] && _check_compressed_artifacts "$OUTPUT_DIR"
     mkdir -p "$WORK_DIR"
     for f in "${OUTPUT_DIR}"/*.zst; do
         [ -f "$f" ] || continue
+        [ -s "$f" ] || continue
         name="$(basename "${f%.zst}")"
-        # Skip rootfs tarball — bundle-vm-runtime.sh doesn't need it
-        [[ "$name" == rootfs.tar ]] && continue
+        [[ "$name" == rootfs*.tar ]] && continue
         zstd -d "$f" -o "${WORK_DIR}/${name}" -f -q
         chmod 0755 "${WORK_DIR}/${name}"
     done

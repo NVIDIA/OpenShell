@@ -35,7 +35,7 @@ For rootful bridge networking:
 6. Netavark configures iptables/nftables rules -- masquerade for outbound, DNAT for port mappings
 7. Netavark starts aardvark-dns if DNS is enabled, listening on the bridge gateway address
 
-```
+```text
 Host Kernel
   |
   +-- Bridge interface (e.g., "podman0")  <-- created by Netavark
@@ -60,7 +60,7 @@ Unprivileged users cannot create network interfaces on the host. They cannot cre
 
 Pasta (part of the `passt` project -- same binary, different command name) operates entirely in userspace, translating between the container's L2 TAP interface and the host's L4 sockets. It requires no capabilities or privileges.
 
-```
+```text
 Container Network Namespace
   |
   +-- TAP device (e.g., "eth0")
@@ -131,7 +131,7 @@ Unlike bridge networking, pasta containers are isolated from each other by defau
 
 The Podman compute driver creates three layers of network isolation:
 
-```
+```text
 Namespace 1: Host
   |
   pasta manages port forwarding (127.0.0.1:<ephemeral>)
@@ -164,7 +164,7 @@ client.ensure_network(&config.network_name).await?;
 
 This creates a bridge network named `"openshell"` (default from `DEFAULT_NETWORK_NAME` in `openshell-core/src/config.rs`) with `dns_enabled: true`. In rootless mode, this bridge exists inside a user namespace managed by pasta. The bridge IP range (e.g., `10.89.x.x`) is not routable from the host.
 
-```
+```text
 Host (your machine)
   |
   127.0.0.1:<ephemeral>  <--- pasta binds this on the host
@@ -212,7 +212,7 @@ The bridge gateway IP does NOT work for this purpose in rootless mode because it
 
 Inside the container, the supervisor creates another network namespace (`netns.rs:53-178`, setup at lines 53-63, `ip netns add` at line 77) for the user workload:
 
-```
+```text
 Container (10.89.1.2 on the Podman bridge)
   |
   [Supervisor process - runs in container's default netns]
@@ -247,7 +247,7 @@ A tmpfs is mounted at `/run/netns` in the container spec (`container.rs:458-463`
 
 ### SSH Session: Client to Sandbox Shell
 
-```
+```text
 Client (CLI on user's machine)
   |
   1. gRPC: CreateSshSession -> gateway (returns token, connect_path)
@@ -281,7 +281,7 @@ The SSH daemon listens on a Unix socket (not a TCP port) with 0600 permissions. 
 
 ### Outbound HTTP Request from Sandbox Process
 
-```
+```text
 User's code (inner netns, 10.200.0.2)
   |
   1. curl https://api.example.com
@@ -306,7 +306,7 @@ Supervisor proxy (10.200.0.1:3128 in container netns)
 
 ### Supervisor gRPC Callback to Gateway
 
-```
+```text
 Supervisor (container netns, 10.89.x.2)
   |
   1. gRPC connect to http://host.containers.internal:8080

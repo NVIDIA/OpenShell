@@ -160,10 +160,10 @@ impl OpenShell for TestOpenShell {
         if providers.contains_key(&provider_name) {
             return Err(Status::already_exists("provider already exists"));
         }
-        if provider.object_id().is_empty() {
-            if let Some(metadata) = &mut provider.metadata {
-                metadata.id = format!("id-{provider_name}");
-            }
+        if provider.object_id().is_empty()
+            && let Some(metadata) = &mut provider.metadata
+        {
+            metadata.id = format!("id-{provider_name}");
         }
         providers.insert(provider_name, provider.clone());
         Ok(Response::new(ProviderResponse {
@@ -216,9 +216,9 @@ impl OpenShell for TestOpenShell {
             .cloned()
             .ok_or_else(|| Status::not_found("provider not found"))?;
         // Merge semantics: empty map = no change, empty value = delete key.
-        let merge = |mut base: std::collections::HashMap<String, String>,
-                     incoming: std::collections::HashMap<String, String>|
-         -> std::collections::HashMap<String, String> {
+        let merge = |mut base: HashMap<String, String>,
+                     incoming: HashMap<String, String>|
+         -> HashMap<String, String> {
             if incoming.is_empty() {
                 return base;
             }
@@ -236,7 +236,7 @@ impl OpenShell for TestOpenShell {
         let updated = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: existing_metadata.id,
-                name: provider_metadata.name.clone(),
+                name: provider_metadata.name,
                 created_at_ms: existing_metadata.created_at_ms,
                 labels: existing_metadata.labels,
             }),
@@ -399,15 +399,14 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
-    type RelayStreamStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::RelayFrame, tonic::Status>,
-    >;
+    type RelayStreamStream =
+        tokio_stream::wrappers::ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
 
     async fn relay_stream(
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
-    ) -> Result<tonic::Response<Self::RelayStreamStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 }
 

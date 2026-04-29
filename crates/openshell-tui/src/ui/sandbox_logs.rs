@@ -335,7 +335,7 @@ const CONNECT_FIELD_ORDER: &[&str] = &[
     "reason",
 ];
 
-/// Priority field order for L7_REQUEST log lines.
+/// Priority field order for `L7_REQUEST` log lines.
 const L7_FIELD_ORDER: &[&str] = &[
     "l7_action",
     "l7_target",
@@ -348,7 +348,7 @@ const L7_FIELD_ORDER: &[&str] = &[
 ];
 
 /// Return fields in a smart order based on the log message type.
-pub(crate) fn ordered_fields<'a>(log: &'a LogLine) -> Vec<(&'a str, &'a str)> {
+pub fn ordered_fields(log: &LogLine) -> Vec<(&str, &str)> {
     // Matches both "CONNECT" (L4-only decision) and "CONNECT_L7" (tunnel lifecycle for L7 endpoints)
     let order: Option<&[&str]> = if log.message.starts_with("CONNECT") {
         Some(CONNECT_FIELD_ORDER)
@@ -358,8 +358,18 @@ pub(crate) fn ordered_fields<'a>(log: &'a LogLine) -> Vec<(&'a str, &'a str)> {
         None
     };
 
-    match order {
-        Some(priority) => {
+    order.map_or_else(
+        || {
+            // Default: alphabetical.
+            let mut pairs: Vec<(&str, &str)> = log
+                .fields
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            pairs.sort_by_key(|(k, _)| *k);
+            pairs
+        },
+        |priority| {
             let mut result: Vec<(&str, &str)> = Vec::with_capacity(log.fields.len());
             // Add priority fields first (in order).
             for &key in priority {
@@ -377,18 +387,8 @@ pub(crate) fn ordered_fields<'a>(log: &'a LogLine) -> Vec<(&'a str, &'a str)> {
             remaining.sort_by_key(|(k, _)| *k);
             result.extend(remaining);
             result
-        }
-        None => {
-            // Default: alphabetical.
-            let mut pairs: Vec<(&str, &str)> = log
-                .fields
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-            pairs.sort_by_key(|(k, _)| *k);
-            pairs
-        }
-    }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -404,7 +404,7 @@ fn level_style(level: &str, t: &crate::theme::Theme) -> ratatui::style::Style {
     }
 }
 
-pub(crate) fn format_short_time(epoch_ms: i64) -> String {
+pub fn format_short_time(epoch_ms: i64) -> String {
     if epoch_ms <= 0 {
         return String::from("--:--:--");
     }
@@ -420,7 +420,7 @@ pub(crate) fn format_short_time(epoch_ms: i64) -> String {
 ///
 /// Produces the same layout as `render_log_line()` but without styles or
 /// truncation: `HH:MM:SS {source:<7} {level:<5} {message} [key=value ...]`
-pub(crate) fn format_log_line_plain(log: &LogLine) -> String {
+pub fn format_log_line_plain(log: &LogLine) -> String {
     let ts = format_short_time(log.timestamp_ms);
     let mut s = format!("{ts} {:<7} {:<5} {}", log.source, log.level, log.message);
 

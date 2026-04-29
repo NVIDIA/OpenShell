@@ -426,8 +426,8 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "gitlab-local".to_string(),
-                    created_at_ms: 1000000,
-                    labels: std::collections::HashMap::new(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -499,7 +499,7 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "bad-provider".to_string(),
-                    created_at_ms: 1000000,
+                    created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                 }),
                 r#type: String::new(),
@@ -523,7 +523,7 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "missing".to_string(),
-                    created_at_ms: 1000000,
+                    created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                 }),
                 r#type: String::new(),
@@ -551,7 +551,7 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "noop-test".to_string(),
-                    created_at_ms: 1000000,
+                    created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                 }),
                 r#type: String::new(),
@@ -614,13 +614,13 @@ mod tests {
             updated.credentials.get("API_TOKEN"),
             Some(&"REDACTED".to_string())
         );
-        assert!(updated.credentials.get("SECONDARY").is_none());
+        assert!(!updated.credentials.contains_key("SECONDARY"));
         assert_eq!(updated.config.len(), 1);
         assert_eq!(
             updated.config.get("endpoint"),
             Some(&"https://example.com".to_string())
         );
-        assert!(updated.config.get("region").is_none());
+        assert!(!updated.config.contains_key("region"));
         let stored: Provider = store
             .get_message_by_name("delete-key-test")
             .await
@@ -631,7 +631,7 @@ mod tests {
             stored.credentials.get("API_TOKEN"),
             Some(&"token-123".to_string())
         );
-        assert!(stored.credentials.get("SECONDARY").is_none());
+        assert!(!stored.credentials.contains_key("SECONDARY"));
     }
 
     #[tokio::test]
@@ -916,7 +916,7 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "my-claude".to_string(),
-                    created_at_ms: 1000000,
+                    created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                 }),
                 r#type: "claude".to_string(),
@@ -935,8 +935,8 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sandbox-001".to_string(),
                 name: "test-sandbox".to_string(),
-                created_at_ms: 1000000,
-                labels: std::collections::HashMap::new(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 providers: vec!["my-claude".to_string()],
@@ -971,8 +971,8 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sandbox-002".to_string(),
                 name: "empty-sandbox".to_string(),
-                created_at_ms: 1000000,
-                labels: std::collections::HashMap::new(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
             }),
             spec: Some(SandboxSpec::default()),
             status: None,

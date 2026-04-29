@@ -79,7 +79,7 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE")]
     sandbox_image: Option<String>,
 
-    /// Kubernetes imagePullPolicy for sandbox pods (Always, IfNotPresent, Never).
+    /// Kubernetes `imagePullPolicy` for sandbox pods (Always, `IfNotPresent`, Never).
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY")]
     sandbox_image_pull_policy: Option<String>,
 

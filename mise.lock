@@ -35,7 +35,17 @@ checksum = "sha256:afe92510c467f952a009b994f2d998ff8f9dd266dc26eca55d14a0dd46fec
 url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_linux_arm64.tar.gz"
 url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658323"
 
+[tools."github:anchore/syft"."platforms.linux-arm64-musl"]
+checksum = "sha256:afe92510c467f952a009b994f2d998ff8f9dd266dc26eca55d14a0dd46fec7f2"
+url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658323"
+
 [tools."github:anchore/syft"."platforms.linux-x64"]
+checksum = "sha256:7b98251d2d08926bb5d4639b56b1f0996a58ef6667c5830e3fe3cd3ad5f4214a"
+url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658325"
+
+[tools."github:anchore/syft"."platforms.linux-x64-musl"]
 checksum = "sha256:7b98251d2d08926bb5d4639b56b1f0996a58ef6667c5830e3fe3cd3ad5f4214a"
 url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_linux_amd64.tar.gz"
 url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658325"
@@ -44,6 +54,16 @@ url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658325"
 checksum = "sha256:3640e2181c8be7a56377f3c96e520d5380c924dbafd115ee3c8d45fcbc89cac2"
 url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_darwin_arm64.tar.gz"
 url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658324"
+
+[tools."github:anchore/syft"."platforms.macos-x64"]
+checksum = "sha256:08fd18f55037f999f50b2c2256a9285f0146978a0b16cdc58662ecdc85d0e3c0"
+url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_darwin_amd64.tar.gz"
+url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658329"
+
+[tools."github:anchore/syft"."platforms.windows-x64"]
+checksum = "sha256:c51695d171c61460369dabdd5c71b8f350ef8618466818356a30808d7105c710"
+url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_windows_amd64.zip"
+url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658321"
 
 [[tools."github:mozilla/sccache"]]
 version = "0.14.0"
@@ -54,7 +74,17 @@ checksum = "sha256:62a6c942c47c93333bc0174704800cef7edfa0416d08e1356c1d3e39f0b46
 url = "https://github.com/mozilla/sccache/releases/download/v0.14.0/sccache-v0.14.0-aarch64-unknown-linux-musl.tar.gz"
 url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/353136010"
 
+[tools."github:mozilla/sccache"."platforms.linux-arm64-musl"]
+checksum = "sha256:62a6c942c47c93333bc0174704800cef7edfa0416d08e1356c1d3e39f0b462f2"
+url = "https://github.com/mozilla/sccache/releases/download/v0.14.0/sccache-v0.14.0-aarch64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/353136010"
+
 [tools."github:mozilla/sccache"."platforms.linux-x64"]
+checksum = "sha256:8424b38cda4ecce616a1557d81328f3d7c96503a171eab79942fad618b42af44"
+url = "https://github.com/mozilla/sccache/releases/download/v0.14.0/sccache-v0.14.0-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/353136108"
+
+[tools."github:mozilla/sccache"."platforms.linux-x64-musl"]
 checksum = "sha256:8424b38cda4ecce616a1557d81328f3d7c96503a171eab79942fad618b42af44"
 url = "https://github.com/mozilla/sccache/releases/download/v0.14.0/sccache-v0.14.0-x86_64-unknown-linux-musl.tar.gz"
 url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/353136108"
@@ -63,6 +93,16 @@ url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/35313610
 checksum = "sha256:a781e8018260ab128e7690d8497736fa231b6ca895d57131d5b5b966ca987594"
 url = "https://github.com/mozilla/sccache/releases/download/v0.14.0/sccache-v0.14.0-aarch64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/353135984"
+
+[tools."github:mozilla/sccache"."platforms.macos-x64"]
+checksum = "sha256:f86c5ecf9b9a1aee53022601725c5cea0e1d9318d80a8233017101063936ab62"
+url = "https://github.com/mozilla/sccache/releases/download/v0.14.0/sccache-v0.14.0-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/353136084"
+
+[tools."github:mozilla/sccache"."platforms.windows-x64"]
+checksum = "sha256:74a3ffd4207e8e0e62af7747bd03b42deab0f6dabc7ef0a8cdd950f83f1037c8"
+url = "https://github.com/mozilla/sccache/releases/download/v0.14.0/sccache-v0.14.0-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/353136140"
 
 [[tools.helm]]
 version = "4.1.4"
@@ -88,13 +128,29 @@ backend = "aqua:kubernetes/kubernetes/kubectl"
 checksum = "sha256:6a5a4cc4e396d7626a7a693a3044b51c75520f81db30fe6816c2554e53be336f"
 url = "https://dl.k8s.io/v1.35.4/bin/linux/arm64/kubectl"
 
+[tools.kubectl."platforms.linux-arm64-musl"]
+checksum = "sha256:6a5a4cc4e396d7626a7a693a3044b51c75520f81db30fe6816c2554e53be336f"
+url = "https://dl.k8s.io/v1.35.4/bin/linux/arm64/kubectl"
+
 [tools.kubectl."platforms.linux-x64"]
+checksum = "sha256:b529430df69a688fd61b64ad2299edb5fd71cb58be2a4779dba624c7d3510efd"
+url = "https://dl.k8s.io/v1.35.4/bin/linux/amd64/kubectl"
+
+[tools.kubectl."platforms.linux-x64-musl"]
 checksum = "sha256:b529430df69a688fd61b64ad2299edb5fd71cb58be2a4779dba624c7d3510efd"
 url = "https://dl.k8s.io/v1.35.4/bin/linux/amd64/kubectl"
 
 [tools.kubectl."platforms.macos-arm64"]
 checksum = "sha256:ec644a2473b64b486987f695dfb1867963ce6d42d267b86e944585a546f92b5d"
 url = "https://dl.k8s.io/v1.35.4/bin/darwin/arm64/kubectl"
+
+[tools.kubectl."platforms.macos-x64"]
+checksum = "sha256:dddb01bddb96f78e48e33105ccfa2feedff585a8b2e3b812f5d0f64c7403710a"
+url = "https://dl.k8s.io/v1.35.4/bin/darwin/amd64/kubectl"
+
+[tools.kubectl."platforms.windows-x64"]
+checksum = "sha256:d77d03309bd80de56dafe8ca59ff6f2076e2ed4ee61c6a94657a4b6e945210e6"
+url = "https://dl.k8s.io/v1.35.4/bin/windows/amd64/kubectl.exe"
 
 [[tools.node]]
 version = "24.15.0"
@@ -104,13 +160,29 @@ backend = "core:node"
 checksum = "sha256:73afc234d558c24919875f51c2d1ea002a2ada4ea6f83601a383869fefa64eed"
 url = "https://nodejs.org/dist/v24.15.0/node-v24.15.0-linux-arm64.tar.gz"
 
+[tools.node."platforms.linux-arm64-musl"]
+checksum = "sha256:73afc234d558c24919875f51c2d1ea002a2ada4ea6f83601a383869fefa64eed"
+url = "https://nodejs.org/dist/v24.15.0/node-v24.15.0-linux-arm64.tar.gz"
+
 [tools.node."platforms.linux-x64"]
+checksum = "sha256:44836872d9aec49f1e6b52a9a922872db9a2b02d235a616a5681b6a85fec8d89"
+url = "https://nodejs.org/dist/v24.15.0/node-v24.15.0-linux-x64.tar.gz"
+
+[tools.node."platforms.linux-x64-musl"]
 checksum = "sha256:44836872d9aec49f1e6b52a9a922872db9a2b02d235a616a5681b6a85fec8d89"
 url = "https://nodejs.org/dist/v24.15.0/node-v24.15.0-linux-x64.tar.gz"
 
 [tools.node."platforms.macos-arm64"]
 checksum = "sha256:372331b969779ab5d15b949884fc6eaf88d5afe87bde8ba881d6400b9100ffc4"
 url = "https://nodejs.org/dist/v24.15.0/node-v24.15.0-darwin-arm64.tar.gz"
+
+[tools.node."platforms.macos-x64"]
+checksum = "sha256:ffd5ee293467927f3ee731a553eb88fd1f48cf74eebc2d74a6babe4af228673b"
+url = "https://nodejs.org/dist/v24.15.0/node-v24.15.0-darwin-x64.tar.gz"
+
+[tools.node."platforms.windows-x64"]
+checksum = "sha256:cc5149eabd53779ce1e7bdc5401643622d0c7e6800ade18928a767e940bb0e62"
+url = "https://nodejs.org/dist/v24.15.0/node-v24.15.0-win-x64.zip"
 
 [[tools."npm:markdownlint-cli2"]]
 version = "0.22.0"
@@ -144,7 +216,17 @@ checksum = "sha256:0556f1260a9a1fc83210dcecf9d4cbacf17eb4a684541c84798ffc8b4d618
 url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
+[tools.python."platforms.linux-arm64-musl"]
+checksum = "sha256:0556f1260a9a1fc83210dcecf9d4cbacf17eb4a684541c84798ffc8b4d618c35"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
+provenance = "github-attestations"
+
 [tools.python."platforms.linux-x64"]
+checksum = "sha256:13d3b6d15f4c3c1dd1955a3c81e06bdc5aef4cb5cb65076878374948be3b0412"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+provenance = "github-attestations"
+
+[tools.python."platforms.linux-x64-musl"]
 checksum = "sha256:13d3b6d15f4c3c1dd1955a3c81e06bdc5aef4cb5cb65076878374948be3b0412"
 url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 provenance = "github-attestations"
@@ -152,6 +234,16 @@ provenance = "github-attestations"
 [tools.python."platforms.macos-arm64"]
 checksum = "sha256:874f9931ad40dcce38caf6f408aa7e10ec3d0dfce2184ba7af62a965a66b9cd9"
 url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-aarch64-apple-darwin-install_only_stripped.tar.gz"
+provenance = "github-attestations"
+
+[tools.python."platforms.macos-x64"]
+checksum = "sha256:d34198cd856fa80ebf3aa821fe329a25fab66eeda44f72ac9576591282e31bb7"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-x86_64-apple-darwin-install_only_stripped.tar.gz"
+provenance = "github-attestations"
+
+[tools.python."platforms.windows-x64"]
+checksum = "sha256:b84dce293464cfd366ee792a3d5b42abe5174fc9cce733ba895b3ef467cb3161"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [[tools.rust]]
@@ -167,7 +259,17 @@ checksum = "sha256:55bd1c1c10ec8b95a8c184f5e18b566703c6ab105f0fc118aaa4d748aabf2
 url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-aarch64-unknown-linux-musl.tar.gz"
 provenance = "github-attestations"
 
+[tools.uv."platforms.linux-arm64-musl"]
+checksum = "sha256:55bd1c1c10ec8b95a8c184f5e18b566703c6ab105f0fc118aaa4d748aabf28e4"
+url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-aarch64-unknown-linux-musl.tar.gz"
+provenance = "github-attestations"
+
 [tools.uv."platforms.linux-x64"]
+checksum = "sha256:adccf40b5d1939a5e0093081ec2307ea24235adf7c2d96b122c561fa37711c46"
+url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-x86_64-unknown-linux-musl.tar.gz"
+provenance = "github-attestations"
+
+[tools.uv."platforms.linux-x64-musl"]
 checksum = "sha256:adccf40b5d1939a5e0093081ec2307ea24235adf7c2d96b122c561fa37711c46"
 url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-x86_64-unknown-linux-musl.tar.gz"
 provenance = "github-attestations"
@@ -175,6 +277,16 @@ provenance = "github-attestations"
 [tools.uv."platforms.macos-arm64"]
 checksum = "sha256:ae738b5661a900579ec621d3918c0ef17bdec0da2a8a6d8b161137cd15f25414"
 url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-aarch64-apple-darwin.tar.gz"
+provenance = "github-attestations"
+
+[tools.uv."platforms.macos-x64"]
+checksum = "sha256:17443e293f2ae407bb2d8d34b875ebfe0ae01cf1296de5647e69e7b2e2b428f0"
+url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-x86_64-apple-darwin.tar.gz"
+provenance = "github-attestations"
+
+[tools.uv."platforms.windows-x64"]
+checksum = "sha256:4c1d55501869b3330d4aabf45ad6024ce2367e0f3af83344395702d272c22e88"
+url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-x86_64-pc-windows-msvc.zip"
 provenance = "github-attestations"
 
 [[tools.zig]]

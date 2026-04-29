@@ -163,7 +163,7 @@ fn draw_edit_overlay(
         Span::styled(" Cancel", t.muted),
     ]));
 
-    let popup_height = (lines.len() + 2) as u16;
+    let popup_height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let popup = centered_rect(50, popup_height, area);
     frame.render_widget(Clear, popup);
 
@@ -207,7 +207,7 @@ fn draw_confirm_set(frame: &mut Frame<'_>, app: &App, idx: usize, area: Rect) {
         ]),
     ];
 
-    let popup_height = (lines.len() + 2) as u16;
+    let popup_height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let popup = centered_rect(60, popup_height, area);
     frame.render_widget(Clear, popup);
 
@@ -245,7 +245,7 @@ fn draw_confirm_delete(frame: &mut Frame<'_>, app: &App, idx: usize, area: Rect)
         ]),
     ];
 
-    let popup_height = (lines.len() + 2) as u16;
+    let popup_height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let popup = centered_rect(55, popup_height, area);
     frame.render_widget(Clear, popup);
 

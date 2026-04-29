@@ -30,6 +30,7 @@ fn test_sandbox() -> DriverSandbox {
                 platform_config: None,
             }),
             gpu: false,
+            gpu_device: String::new(),
         }),
         status: None,
     }

@@ -62,7 +62,7 @@ fn assert_runtime_bundle_staged() {
 /// Boot the full `OpenShell` gateway and verify the gRPC service becomes
 /// reachable on port 30051.
 #[test]
-#[ignore] // requires libkrun + rootfs
+#[ignore = "requires libkrun + rootfs"]
 fn gateway_boots_and_service_becomes_reachable() {
     codesign_if_needed();
     assert_runtime_bundle_staged();
@@ -87,7 +87,7 @@ fn gateway_boots_and_service_becomes_reachable() {
     }
 
     // Tear down regardless of result.
-    let _ = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let _ = unsafe { libc::kill(child.id().cast_signed(), libc::SIGTERM) };
     let _ = child.wait();
 
     assert!(
@@ -99,7 +99,7 @@ fn gateway_boots_and_service_becomes_reachable() {
 /// Run a trivial command inside the VM via `--exec` and verify it exits
 /// successfully, proving the VM boots and can execute guest processes.
 #[test]
-#[ignore] // requires libkrun + rootfs
+#[ignore = "requires libkrun + rootfs"]
 fn gateway_exec_runs_guest_command() {
     codesign_if_needed();
     assert_runtime_bundle_staged();
@@ -119,7 +119,7 @@ fn gateway_exec_runs_guest_command() {
 
 /// Boot the VM, then use `openshell-vm exec` against the running instance.
 #[test]
-#[ignore] // requires libkrun + rootfs
+#[ignore = "requires libkrun + rootfs"]
 fn gateway_exec_attaches_to_running_vm() {
     codesign_if_needed();
     assert_runtime_bundle_staged();
@@ -143,7 +143,7 @@ fn gateway_exec_attaches_to_running_vm() {
         .output()
         .expect("failed to run openshell-vm exec");
 
-    let _ = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let _ = unsafe { libc::kill(child.id().cast_signed(), libc::SIGTERM) };
     let _ = child.wait();
 
     assert!(

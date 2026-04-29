@@ -304,7 +304,7 @@ pub fn render_chase(
     }
 
     let frame = (elapsed_ms / 140) as usize;
-    let mouth_open = frame % 2 == 0;
+    let mouth_open = frame.is_multiple_of(2);
 
     // Characters.
     let pac = if mouth_open { "ᗧ" } else { "●" };
@@ -360,16 +360,14 @@ pub fn render_chase(
     let mut current_style = buf[0].1;
 
     for &(ch, style) in &buf {
-        if style == current_style {
-            current_str.push(ch);
-        } else {
+        if style != current_style {
             if !current_str.is_empty() {
                 spans.push(Span::styled(current_str.clone(), current_style));
                 current_str.clear();
             }
             current_style = style;
-            current_str.push(ch);
         }
+        current_str.push(ch);
     }
     if !current_str.is_empty() {
         spans.push(Span::styled(current_str, current_style));

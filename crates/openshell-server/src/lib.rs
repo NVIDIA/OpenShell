@@ -27,6 +27,7 @@ mod http;
 mod inference;
 mod multiplex;
 mod persistence;
+pub(crate) mod policy_store;
 mod sandbox_index;
 mod sandbox_watch;
 mod ssh_tunnel;
@@ -206,8 +207,7 @@ pub async fn run_server(
     if let Some(health_bind_address) = config.health_bind_address {
         let health_listener = TcpListener::bind(health_bind_address).await.map_err(|e| {
             Error::transport(format!(
-                "failed to bind health port {}: {e}",
-                health_bind_address
+                "failed to bind health port {health_bind_address}: {e}"
             ))
         })?;
         info!(address = %health_bind_address, "Health server listening");
@@ -265,7 +265,7 @@ pub async fn run_server(
     // Accept connections until the gateway receives a graceful shutdown signal.
     loop {
         let (stream, addr) = tokio::select! {
-            _ = &mut shutdown => {
+            () = &mut shutdown => {
                 info!("Shutdown signal received; stopping gateway");
                 break;
             }
@@ -322,8 +322,8 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     {
         tokio::select! {
-            _ = ctrl_c_signal() => {}
-            _ = terminate_signal() => {}
+            () = ctrl_c_signal() => {}
+            () = terminate_signal() => {}
         }
     }
 
@@ -351,6 +351,9 @@ async fn terminate_signal() {
     let _ = signal.recv().await;
 }
 
+// Internal wiring helper: each argument is a distinct piece of runtime state
+// that must be passed through, so the count is justified.
+#[allow(clippy::too_many_arguments)]
 async fn build_compute_runtime(
     config: &Config,
     vm_config: &VmComputeConfig,
@@ -420,8 +423,10 @@ async fn build_compute_runtime(
             let socket_path = std::env::var("OPENSHELL_PODMAN_SOCKET")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(openshell_driver_podman::PodmanComputeConfig::default_socket_path);
+                .map_or_else(
+                    openshell_driver_podman::PodmanComputeConfig::default_socket_path,
+                    std::path::PathBuf::from,
+                );
 
             let network_name = std::env::var("OPENSHELL_NETWORK_NAME")
                 .ok()
@@ -471,10 +476,12 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
         [] => Err(Error::config(
             "at least one compute driver must be configured",
         )),
-        [driver @ ComputeDriverKind::Kubernetes]
-        | [driver @ ComputeDriverKind::Vm]
-        | [driver @ ComputeDriverKind::Docker]
-        | [driver @ ComputeDriverKind::Podman] => Ok(*driver),
+        [
+            driver @ (ComputeDriverKind::Kubernetes
+            | ComputeDriverKind::Vm
+            | ComputeDriverKind::Docker
+            | ComputeDriverKind::Podman),
+        ] => Ok(*driver),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
             drivers

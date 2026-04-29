@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use miette::{Result, miette};
 use openshell_core::proto::policy_merge_operation;
@@ -13,12 +13,12 @@ use openshell_core::proto::{
 use openshell_policy::{PolicyMergeOp, generated_rule_name};
 
 #[derive(Debug, Clone)]
-pub(crate) struct PolicyUpdatePlan {
+pub struct PolicyUpdatePlan {
     pub merge_operations: Vec<PolicyMergeOperation>,
     pub preview_operations: Vec<PolicyMergeOp>,
 }
 
-pub(crate) fn build_policy_update_plan(
+pub fn build_policy_update_plan(
     add_endpoints: &[String],
     remove_endpoints: &[String],
     add_deny: &[String],
@@ -51,8 +51,10 @@ pub(crate) fn build_policy_update_plan(
         let target_rule_name = rule_name
             .map(str::trim)
             .filter(|name| !name.is_empty())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| generated_rule_name(&endpoint.host, endpoint.port));
+            .map_or_else(
+                || generated_rule_name(&endpoint.host, endpoint.port),
+                ToString::to_string,
+            );
         let rule = NetworkPolicyRule {
             name: target_rule_name.clone(),
             endpoints: vec![endpoint.clone()],
@@ -165,7 +167,7 @@ fn group_allow_rules(specs: &[String]) -> Result<BTreeMap<(String, u32), Vec<L7R
                     method: parsed.method,
                     path: parsed.path,
                     command: String::new(),
-                    query: Default::default(),
+                    query: HashMap::default(),
                 }),
             });
     }
@@ -183,7 +185,7 @@ fn group_deny_rules(specs: &[String]) -> Result<BTreeMap<(String, u32), Vec<L7De
                 method: parsed.method,
                 path: parsed.path,
                 command: String::new(),
-                query: Default::default(),
+                query: HashMap::default(),
             });
     }
     Ok(grouped)

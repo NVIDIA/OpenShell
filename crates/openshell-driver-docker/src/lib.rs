@@ -231,6 +231,7 @@ impl DockerComputeDriver {
             driver_version: self.config.daemon_version.clone(),
             default_image: self.config.default_image.clone(),
             supports_gpu: false,
+            gpu_count: 0,
         }
     }
 
@@ -1606,7 +1607,7 @@ fn write_cache_binary_atomic(final_path: &Path, bytes: &[u8]) -> CoreResult<()> 
         ))
     })?;
     temp.as_file().sync_all().map_err(|err| {
-        Error::config(format!("failed to sync supervisor binary temp file: {err}",))
+        Error::config(format!("failed to sync supervisor binary temp file: {err}"))
     })?;
 
     #[cfg(unix)]

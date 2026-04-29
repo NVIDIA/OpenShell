@@ -8,7 +8,7 @@ pub mod vm;
 pub use openshell_driver_docker::DockerComputeConfig;
 pub use vm::VmComputeConfig;
 
-use crate::grpc::policy::{SANDBOX_SETTINGS_OBJECT_TYPE, sandbox_settings_id};
+use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::persistence::{ObjectId, ObjectName, ObjectRecord, ObjectType, Store};
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
@@ -81,12 +81,11 @@ trait StartupResume: Send + Sync {
 #[tonic::async_trait]
 impl StartupResume for DockerComputeDriver {
     async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
-        DockerComputeDriver::resume_sandbox(self, sandbox_id, sandbox_name)
+        Self::resume_sandbox(self, sandbox_id, sandbox_name)
             .await
             .map_err(|err| err.to_string())
     }
 }
-
 /// Interval between store-vs-backend reconciliation sweeps.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -98,7 +97,7 @@ const ORPHAN_GRACE_PERIOD: Duration = Duration::from_secs(300);
 pub use openshell_core::ComputeDriverError as ComputeError;
 
 #[derive(Debug)]
-pub(crate) struct ManagedDriverProcess {
+pub struct ManagedDriverProcess {
     child: std::sync::Mutex<Option<tokio::process::Child>>,
     socket_path: std::path::PathBuf,
 }
@@ -211,9 +210,7 @@ impl ComputeDriver for RemoteComputeDriver {
     ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
         let mut client = self.client();
         let response = client.watch_sandboxes(request).await?;
-        let stream = response
-            .into_inner()
-            .map(|item| item.map_err(|status| status));
+        let stream = response.into_inner();
         Ok(tonic::Response::new(Box::pin(stream)))
     }
 }
@@ -480,36 +477,7 @@ impl ComputeRuntime {
             .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
         self.sandbox_index.update_from_sandbox(&sandbox);
         self.sandbox_watch_bus.notify(&id);
-
-        if let Ok(records) = self.store.list(SshSession::object_type(), 1000, 0).await {
-            for record in records {
-                if let Ok(session) = SshSession::decode(record.payload.as_slice())
-                    && session.sandbox_id == id
-                    && let Err(e) = self
-                        .store
-                        .delete(SshSession::object_type(), session.object_id())
-                        .await
-                {
-                    warn!(
-                        session_id = %session.object_id(),
-                        error = %e,
-                        "Failed to delete SSH session during sandbox cleanup"
-                    );
-                }
-            }
-        }
-
-        if let Err(e) = self
-            .store
-            .delete(SANDBOX_SETTINGS_OBJECT_TYPE, &sandbox_settings_id(&id))
-            .await
-        {
-            warn!(
-                sandbox_id = %id,
-                error = %e,
-                "Failed to delete sandbox settings during cleanup"
-            );
-        }
+        self.cleanup_sandbox_owned_records(&sandbox).await;
 
         let driver_sandbox = driver_sandbox_from_public(&sandbox);
         let deleted = self
@@ -959,6 +927,15 @@ impl ComputeRuntime {
     }
 
     async fn apply_deleted_locked(&self, sandbox_id: &str) -> Result<(), String> {
+        let sandbox = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(sandbox) = sandbox.as_ref() {
+            self.cleanup_sandbox_owned_records(sandbox).await;
+        }
+
         let _ = self
             .store
             .delete(Sandbox::object_type(), sandbox_id)
@@ -968,6 +945,44 @@ impl ComputeRuntime {
         self.sandbox_watch_bus.notify(sandbox_id);
         self.cleanup_sandbox_state(sandbox_id);
         Ok(())
+    }
+
+    async fn cleanup_sandbox_owned_records(&self, sandbox: &Sandbox) {
+        self.cleanup_sandbox_ssh_sessions(sandbox.object_id()).await;
+
+        if let Err(e) = self
+            .store
+            .delete_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_name())
+            .await
+        {
+            warn!(
+                sandbox_id = %sandbox.object_id(),
+                sandbox_name = %sandbox.object_name(),
+                error = %e,
+                "Failed to delete sandbox settings during cleanup"
+            );
+        }
+    }
+
+    async fn cleanup_sandbox_ssh_sessions(&self, sandbox_id: &str) {
+        if let Ok(records) = self.store.list(SshSession::object_type(), 1000, 0).await {
+            for record in records {
+                if let Ok(session) = SshSession::decode(record.payload.as_slice())
+                    && session.sandbox_id == sandbox_id
+                    && let Err(e) = self
+                        .store
+                        .delete(SshSession::object_type(), session.object_id())
+                        .await
+                {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        session_id = %session.object_id(),
+                        error = %e,
+                        "Failed to delete SSH session during sandbox cleanup"
+                    );
+                }
+            }
+        }
     }
 
     fn cleanup_sandbox_state(&self, sandbox_id: &str) {
@@ -1092,6 +1107,7 @@ fn driver_sandbox_spec_from_public(spec: &SandboxSpec) -> DriverSandboxSpec {
             .as_ref()
             .map(driver_sandbox_template_from_public),
         gpu: spec.gpu,
+        gpu_device: spec.gpu_device.clone(),
     }
 }
 
@@ -1114,8 +1130,6 @@ fn driver_sandbox_template_from_public(template: &SandboxTemplate) -> DriverSand
 fn extract_typed_resources(
     resources: &Option<prost_types::Struct>,
 ) -> Option<DriverResourceRequirements> {
-    let s = resources.as_ref()?;
-
     fn get_quantity(s: &prost_types::Struct, section: &str, key: &str) -> String {
         s.fields
             .get(section)
@@ -1129,6 +1143,8 @@ fn extract_typed_resources(
             })
             .unwrap_or_default()
     }
+
+    let s = resources.as_ref()?;
 
     let req = DriverResourceRequirements {
         cpu_request: get_quantity(s, "requests", "cpu"),
@@ -1151,7 +1167,7 @@ fn extract_typed_resources(
 }
 
 /// Build the opaque `platform_config` Struct from platform-specific public
-/// template fields (runtime_class_name, annotations, volume_claim_templates)
+/// template fields (`runtime_class_name`, annotations, `volume_claim_templates`)
 /// plus any resource fields beyond CPU/memory.
 fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Struct> {
     use prost_types::{Struct, Value, value::Kind};
@@ -1480,6 +1496,118 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
 }
 
 #[cfg(test)]
+#[derive(Debug, Default)]
+pub struct NoopTestDriver;
+
+#[cfg(test)]
+#[tonic::async_trait]
+impl ComputeDriver for NoopTestDriver {
+    type WatchSandboxesStream = DriverWatchStream;
+
+    async fn get_capabilities(
+        &self,
+        _request: Request<GetCapabilitiesRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::GetCapabilitiesResponse>, Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::GetCapabilitiesResponse {
+                driver_name: "noop-test-driver".to_string(),
+                driver_version: "test".to_string(),
+                default_image: "openshell/sandbox:test".to_string(),
+                supports_gpu: false,
+                gpu_count: 0,
+            },
+        ))
+    }
+
+    async fn validate_sandbox_create(
+        &self,
+        _request: Request<ValidateSandboxCreateRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::ValidateSandboxCreateResponse>,
+        Status,
+    > {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::ValidateSandboxCreateResponse {},
+        ))
+    }
+
+    async fn get_sandbox(
+        &self,
+        _request: Request<GetSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::GetSandboxResponse>, Status>
+    {
+        Err(Status::not_found("sandbox not found"))
+    }
+
+    async fn list_sandboxes(
+        &self,
+        _request: Request<ListSandboxesRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::ListSandboxesResponse>, Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::ListSandboxesResponse {
+                sandboxes: Vec::new(),
+            },
+        ))
+    }
+
+    async fn create_sandbox(
+        &self,
+        _request: Request<CreateSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::CreateSandboxResponse>, Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::CreateSandboxResponse {},
+        ))
+    }
+
+    async fn stop_sandbox(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::StopSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::StopSandboxResponse>, Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::StopSandboxResponse {},
+        ))
+    }
+
+    async fn delete_sandbox(
+        &self,
+        _request: Request<DeleteSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::DeleteSandboxResponse>, Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::DeleteSandboxResponse { deleted: true },
+        ))
+    }
+
+    async fn watch_sandboxes(
+        &self,
+        _request: Request<WatchSandboxesRequest>,
+    ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
+        Ok(tonic::Response::new(Box::pin(futures::stream::empty())))
+    }
+}
+
+#[cfg(test)]
+pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
+    ComputeRuntime {
+        driver: Arc::new(NoopTestDriver),
+        shutdown_cleanup: None,
+        startup_resume: None,
+        _driver_process: None,
+        default_image: "openshell/sandbox:test".to_string(),
+        store,
+        sandbox_index: SandboxIndex::new(),
+        sandbox_watch_bus: SandboxWatchBus::new(),
+        tracing_log_bus: TracingLogBus::new(),
+        supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
+        sync_lock: Arc::new(Mutex::new(())),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use futures::stream;
@@ -1487,6 +1615,7 @@ mod tests {
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
         GetSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateResponse,
     };
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::{mpsc, oneshot};
 
@@ -1534,6 +1663,7 @@ mod tests {
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 supports_gpu: true,
+                gpu_count: 0,
             }))
         }
 
@@ -1659,11 +1789,26 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
                 name: name.to_string(),
-                created_at_ms: 1000000,
-                labels: std::collections::HashMap::new(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
             }),
             phase: phase as i32,
             ..Default::default()
+        }
+    }
+
+    fn ssh_session_record(id: &str, sandbox_id: &str) -> SshSession {
+        SshSession {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: id.to_string(),
+                name: format!("session-{id}"),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+            }),
+            sandbox_id: sandbox_id.to_string(),
+            token: format!("token-{id}"),
+            revoked: false,
+            expires_at_ms: 0,
         }
     }
 
@@ -2187,7 +2332,6 @@ mod tests {
                     deleting: false,
                 }),
             }],
-            ..Default::default()
         }))
         .await;
 
@@ -2245,7 +2389,6 @@ mod tests {
                     last_transition_time: String::new(),
                 })),
             }],
-            ..Default::default()
         }))
         .await;
 
@@ -2318,6 +2461,19 @@ mod tests {
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime.sandbox_index.update_from_sandbox(&sandbox);
+        runtime
+            .store
+            .put(
+                SANDBOX_SETTINGS_OBJECT_TYPE,
+                "settings-sb-1",
+                sandbox.object_name(),
+                br#"{"revision":1,"settings":{}}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = ssh_session_record("session-1", sandbox.object_id());
+        runtime.store.put_message(&session).await.unwrap();
 
         let mut watch_rx = runtime.sandbox_watch_bus.subscribe(sandbox.object_id());
 
@@ -2340,6 +2496,22 @@ mod tests {
                 .sandbox_id_for_sandbox_name(sandbox.object_name())
                 .is_none()
         );
+        assert!(
+            runtime
+                .store
+                .get_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_name())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
         let _ = watch_rx.try_recv();
         assert!(matches!(
             watch_rx.try_recv(),
@@ -2349,8 +2521,8 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingResume {
-        calls: tokio::sync::Mutex<Vec<(String, String)>>,
-        results: tokio::sync::Mutex<std::collections::HashMap<String, Result<bool, String>>>,
+        calls: Mutex<Vec<(String, String)>>,
+        results: Mutex<HashMap<String, Result<bool, String>>>,
     }
 
     impl RecordingResume {

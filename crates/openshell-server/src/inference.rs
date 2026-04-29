@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
+
 use openshell_core::proto::{
     ClusterInferenceConfig, GetClusterInferenceRequest, GetClusterInferenceResponse,
     GetInferenceBundleRequest, GetInferenceBundleResponse, InferenceRoute, Provider, ResolvedRoute,
@@ -390,10 +392,13 @@ async fn resolve_inference_bundle(store: &Store) -> Result<GetInferenceBundleRes
         routes.push(r);
     }
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
 
     // Compute a simple revision from route contents for cache freshness checks.
     let revision = {
@@ -483,7 +488,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("id-{name}"),
                 name: name.to_string(),
-                created_at_ms: 1000000,
+                created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
             }),
             config: Some(ClusterInferenceConfig {
@@ -500,7 +505,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("provider-{name}"),
                 name: name.to_string(),
-                created_at_ms: 1000000,
+                created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
             }),
             r#type: provider_type.to_string(),
@@ -659,7 +664,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "provider-1".to_string(),
                 name: "openai-dev".to_string(),
-                created_at_ms: 1000000,
+                created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
             }),
             r#type: "openai".to_string(),
@@ -680,7 +685,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "r-1".to_string(),
                 name: CLUSTER_INFERENCE_ROUTE_NAME.to_string(),
-                created_at_ms: 1000000,
+                created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
             }),
             config: Some(ClusterInferenceConfig {

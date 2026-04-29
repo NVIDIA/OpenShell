@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Network IP classification utilities shared across OpenShell crates.
+//! Network IP classification utilities shared across `OpenShell` crates.
 //!
 //! These helpers enforce the always-blocked IP invariant (loopback, link-local,
 //! unspecified) and the broader internal-IP classification (adds RFC 1918 and
@@ -97,11 +97,23 @@ pub fn is_always_blocked_net(net: ipnet::IpNet) -> bool {
                 return true;
             }
 
-            // Check IPv4-mapped IPv6 (::ffff:127.0.0.1, ::ffff:169.254.x.x, etc.)
-            if let Some(v4) = network.to_ipv4_mapped() {
-                if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
-                    return true;
-                }
+            // Check IPv4-mapped IPv6 addresses. The network-address check covers
+            // ranges whose first address is already in a blocked range
+            // (e.g. ::ffff:127.0.0.1/128, ::ffff:169.254.0.1/128). The
+            // containment checks below catch broader prefixes that only reach
+            // into a blocked range further in — e.g. ::ffff:168.0.0.0/103
+            // has a public network address but spans ::ffff:169.254.0.0.
+            if network
+                .to_ipv4_mapped()
+                .is_some_and(|v4| v4.is_loopback() || v4.is_link_local() || v4.is_unspecified())
+            {
+                return true;
+            }
+            if v6net.contains(&Ipv4Addr::LOCALHOST.to_ipv6_mapped())
+                || v6net.contains(&Ipv4Addr::new(169, 254, 0, 0).to_ipv6_mapped())
+                || v6net.contains(&Ipv4Addr::UNSPECIFIED.to_ipv6_mapped())
+            {
+                return true;
             }
 
             false
@@ -121,7 +133,7 @@ pub fn is_always_blocked_net(net: ipnet::IpNet) -> bool {
 /// when `allowed_ips` should be populated in proposals.
 pub fn is_internal_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => is_internal_v4(&v4),
+        IpAddr::V4(v4) => is_internal_v4(v4),
         IpAddr::V6(v6) => {
             if v6.is_loopback() || v6.is_unspecified() {
                 return true;
@@ -136,7 +148,7 @@ pub fn is_internal_ip(ip: IpAddr) -> bool {
             }
             // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_internal_v4(&v4);
+                return is_internal_v4(v4);
             }
             false
         }
@@ -145,7 +157,7 @@ pub fn is_internal_ip(ip: IpAddr) -> bool {
 
 /// IPv4 internal address check covering RFC 1918, CGNAT (RFC 6598), and other
 /// special-use ranges that should never be reachable from sandbox egress.
-fn is_internal_v4(v4: &Ipv4Addr) -> bool {
+fn is_internal_v4(v4: Ipv4Addr) -> bool {
     if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() {
         return true;
     }
@@ -330,6 +342,42 @@ mod tests {
     fn test_always_blocked_net_v6_broad_containing_loopback() {
         let net: ipnet::IpNet = "::/0".parse().unwrap();
         assert!(is_always_blocked_net(net));
+    }
+
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_loopback_single() {
+        let net: ipnet::IpNet = "::ffff:127.0.0.1/128".parse().unwrap();
+        assert!(is_always_blocked_net(net));
+    }
+
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_link_local_single() {
+        let net: ipnet::IpNet = "::ffff:169.254.0.1/128".parse().unwrap();
+        assert!(is_always_blocked_net(net));
+    }
+
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_broad_spans_link_local() {
+        // ::ffff:168.0.0.0/103 has a public network address (168.0.0.0) but
+        // the range covers 168.0.0.0–169.255.255.255, which includes the
+        // link-local block 169.254.0.0/16.
+        let net: ipnet::IpNet = "::ffff:168.0.0.0/103".parse().unwrap();
+        assert!(is_always_blocked_net(net));
+    }
+
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_broad_spans_loopback() {
+        // ::ffff:64.0.0.0/98 has a public network address (64.0.0.0) but the
+        // range covers 64.0.0.0–127.255.255.255, which includes loopback.
+        let net: ipnet::IpNet = "::ffff:64.0.0.0/98".parse().unwrap();
+        assert!(is_always_blocked_net(net));
+    }
+
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_allows_public() {
+        // ::ffff:8.8.8.8/128 is a public address — should not be blocked.
+        let net: ipnet::IpNet = "::ffff:8.8.8.8/128".parse().unwrap();
+        assert!(!is_always_blocked_net(net));
     }
 
     // -- is_internal_ip --

@@ -3,7 +3,7 @@
 
 //! Object metadata accessors for Kubernetes-style resources.
 //!
-//! These traits provide uniform access to ObjectMeta fields across all resource types.
+//! These traits provide uniform access to `ObjectMeta` fields across all resource types.
 
 use crate::proto::{InferenceRoute, ObjectForTest, Provider, Sandbox, SshSession};
 use std::collections::HashMap;
@@ -26,16 +26,13 @@ pub trait ObjectLabels {
 // Implementations for Sandbox
 impl ObjectId for Sandbox {
     fn object_id(&self) -> &str {
-        self.metadata.as_ref().map(|m| m.id.as_str()).unwrap_or("")
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
     }
 }
 
 impl ObjectName for Sandbox {
     fn object_name(&self) -> &str {
-        self.metadata
-            .as_ref()
-            .map(|m| m.name.as_str())
-            .unwrap_or("")
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
     }
 }
 
@@ -48,16 +45,13 @@ impl ObjectLabels for Sandbox {
 // Implementations for Provider
 impl ObjectId for Provider {
     fn object_id(&self) -> &str {
-        self.metadata.as_ref().map(|m| m.id.as_str()).unwrap_or("")
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
     }
 }
 
 impl ObjectName for Provider {
     fn object_name(&self) -> &str {
-        self.metadata
-            .as_ref()
-            .map(|m| m.name.as_str())
-            .unwrap_or("")
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
     }
 }
 
@@ -70,16 +64,13 @@ impl ObjectLabels for Provider {
 // Implementations for SshSession
 impl ObjectId for SshSession {
     fn object_id(&self) -> &str {
-        self.metadata.as_ref().map(|m| m.id.as_str()).unwrap_or("")
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
     }
 }
 
 impl ObjectName for SshSession {
     fn object_name(&self) -> &str {
-        self.metadata
-            .as_ref()
-            .map(|m| m.name.as_str())
-            .unwrap_or("")
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
     }
 }
 
@@ -92,16 +83,13 @@ impl ObjectLabels for SshSession {
 // Implementations for InferenceRoute
 impl ObjectId for InferenceRoute {
     fn object_id(&self) -> &str {
-        self.metadata.as_ref().map(|m| m.id.as_str()).unwrap_or("")
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
     }
 }
 
 impl ObjectName for InferenceRoute {
     fn object_name(&self) -> &str {
-        self.metadata
-            .as_ref()
-            .map(|m| m.name.as_str())
-            .unwrap_or("")
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
     }
 }
 

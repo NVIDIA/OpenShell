@@ -423,15 +423,14 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
-    type RelayStreamStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::RelayFrame, tonic::Status>,
-    >;
+    type RelayStreamStream =
+        tokio_stream::wrappers::ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
 
     async fn relay_stream(
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
-    ) -> Result<tonic::Response<Self::RelayStreamStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 }
 
@@ -574,6 +573,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -612,6 +612,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         None,
         false,
         false,
+        None,
         None,
         None,
         None,
@@ -659,6 +660,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -703,6 +705,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -741,6 +744,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         None,
         false,
         false,
+        None,
         None,
         None,
         None,

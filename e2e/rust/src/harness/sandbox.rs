@@ -153,10 +153,10 @@ impl SandboxGuard {
                 accumulated.push('\n');
 
                 // Try to extract the sandbox name from the header.
-                if name.is_none() {
-                    if let Some(n) = extract_sandbox_name(&accumulated) {
-                        name = Some(n);
-                    }
+                if name.is_none()
+                    && let Some(n) = extract_sandbox_name(&accumulated)
+                {
+                    name = Some(n);
                 }
 
                 // Check for the ready marker.

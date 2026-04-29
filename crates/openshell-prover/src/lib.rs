@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Formal policy verification for OpenShell sandboxes.
+//! Formal policy verification for `OpenShell` sandboxes.
 //!
 //! Encodes sandbox policies, binary capabilities, and credential scopes as Z3
 //! SMT constraints, then checks reachability queries to detect data exfiltration
@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn test_parse_policy() {
         let path = testdata_dir().join("policy.yaml");
-        let model = policy::parse_policy(&path).expect("failed to parse policy");
+        let model = parse_policy(&path).expect("failed to parse policy");
         assert_eq!(model.version, 1);
         assert!(model.network_policies.contains_key("github_api"));
         let rule = &model.network_policies["github_api"];
@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn test_filesystem_policy() {
         let path = testdata_dir().join("policy.yaml");
-        let model = policy::parse_policy(&path).expect("failed to parse policy");
+        let model = parse_policy(&path).expect("failed to parse policy");
         let readable = model.filesystem_policy.readable_paths();
         assert!(readable.contains(&"/usr".to_owned()));
         assert!(readable.contains(&"/sandbox".to_owned()));
@@ -114,12 +114,12 @@ mod tests {
     // 3. Workdir NOT included by default (matches runtime behavior).
     #[test]
     fn test_include_workdir_default() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 filesystem_policy:
   read_only:
     - /usr
-"#;
+";
         let model = policy::parse_policy_str(yaml).expect("parse");
         let readable = model.filesystem_policy.readable_paths();
         assert!(!readable.contains(&"/sandbox".to_owned()));
@@ -128,13 +128,13 @@ filesystem_policy:
     // 4. Workdir excluded when include_workdir: false.
     #[test]
     fn test_include_workdir_false() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 filesystem_policy:
   include_workdir: false
   read_only:
     - /usr
-"#;
+";
         let model = policy::parse_policy_str(yaml).expect("parse");
         let readable = model.filesystem_policy.readable_paths();
         assert!(!readable.contains(&"/sandbox".to_owned()));
@@ -143,14 +143,14 @@ filesystem_policy:
     // 5. No duplicate when workdir already in read_write.
     #[test]
     fn test_include_workdir_no_duplicate() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 filesystem_policy:
   include_workdir: true
   read_write:
     - /sandbox
     - /tmp
-"#;
+";
         let model = policy::parse_policy_str(yaml).expect("parse");
         let readable = model.filesystem_policy.readable_paths();
         let sandbox_count = readable.iter().filter(|p| *p == "/sandbox").count();
@@ -163,12 +163,12 @@ filesystem_policy:
         let policy_path = testdata_dir().join("policy.yaml");
         let creds_path = testdata_dir().join("credentials.yaml");
 
-        let pol = policy::parse_policy(&policy_path).expect("parse policy");
+        let pol = parse_policy(&policy_path).expect("parse policy");
         let cred_set = credentials::load_credential_set_embedded(&creds_path).expect("load creds");
         let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
 
-        let z3_model = model::build_model(pol, cred_set, bin_reg);
-        let findings = queries::run_all_queries(&z3_model);
+        let z3_model = build_model(pol, cred_set, bin_reg);
+        let findings = run_all_queries(&z3_model);
 
         let query_types: std::collections::HashSet<&str> =
             findings.iter().map(|f| f.query.as_str()).collect();
@@ -195,12 +195,12 @@ filesystem_policy:
         let policy_path = testdata_dir().join("empty-policy.yaml");
         let creds_path = testdata_dir().join("credentials.yaml");
 
-        let pol = policy::parse_policy(&policy_path).expect("parse policy");
+        let pol = parse_policy(&policy_path).expect("parse policy");
         let cred_set = credentials::load_credential_set_embedded(&creds_path).expect("load creds");
         let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
 
-        let z3_model = model::build_model(pol, cred_set, bin_reg);
-        let findings = queries::run_all_queries(&z3_model);
+        let z3_model = build_model(pol, cred_set, bin_reg);
+        let findings = run_all_queries(&z3_model);
 
         assert!(
             findings.is_empty(),

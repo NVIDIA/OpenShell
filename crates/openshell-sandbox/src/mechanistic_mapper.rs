@@ -178,13 +178,13 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
             .map(|(_, name)| format!(" ({name})"))
             .unwrap_or_default();
 
-        let private_ip_note = if !allowed_ips.is_empty() {
+        let private_ip_note = if allowed_ips.is_empty() {
+            String::new()
+        } else {
             format!(
                 " Host resolves to private IP ({}); allowed_ips included for SSRF override.",
                 allowed_ips.join(", ")
             )
-        } else {
-            String::new()
         };
 
         // Note: hit_count in the DB accumulates across flush cycles, so we
@@ -226,7 +226,7 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
             decided_at_ms: 0,
             stage,
             supersedes_chunk_id: String::new(),
-            hit_count: total_count as i32,
+            hit_count: total_count.cast_signed(),
             first_seen_ms,
             last_seen_ms,
             binary: binary.clone(),
@@ -336,16 +336,15 @@ fn generate_security_notes(host: &str, port: u16, is_ssrf: bool) -> String {
 /// Falls back to the exact observed path when no pattern applies.
 fn build_l7_rules(samples: &HashMap<(String, String), u32>) -> Vec<L7Rule> {
     // Deduplicate after generalisation.
-    let mut seen: HashMap<(String, String), ()> = HashMap::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut rules = Vec::new();
 
     for (method, path) in samples.keys() {
         let generalised = generalise_path(path);
         let key = (method.clone(), generalised.clone());
-        if seen.contains_key(&key) {
+        if !seen.insert(key) {
             continue;
         }
-        seen.insert(key, ());
 
         rules.push(L7Rule {
             allow: Some(L7Allow {
@@ -405,7 +404,7 @@ fn looks_like_id(segment: &str) -> bool {
         return true;
     }
     // UUID-ish (contains dashes, 32+ hex chars)
-    let hex_only: String = segment.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let hex_only: String = segment.chars().filter(char::is_ascii_hexdigit).collect();
     if hex_only.len() >= 24 && segment.contains('-') {
         return true;
     }
@@ -450,10 +449,11 @@ async fn resolve_allowed_ips_if_private(host: &str, port: u32) -> Vec<String> {
     let addrs = match tokio::net::lookup_host(&addr).await {
         Ok(addrs) => addrs.collect::<Vec<_>>(),
         Err(e) => {
+            let port_u16 = u16::try_from(port).unwrap_or(u16::MAX);
             let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
                 .activity(openshell_ocsf::ActivityId::Fail)
                 .severity(openshell_ocsf::SeverityId::Low)
-                .dst_endpoint(openshell_ocsf::Endpoint::from_domain(host, port as u16))
+                .dst_endpoint(openshell_ocsf::Endpoint::from_domain(host, port_u16))
                 .message(format!("DNS resolution failed for allowed_ips check: {e}"))
                 .build();
             openshell_ocsf::ocsf_emit!(event);
@@ -462,10 +462,11 @@ async fn resolve_allowed_ips_if_private(host: &str, port: u32) -> Vec<String> {
     };
 
     if addrs.is_empty() {
+        let port_u16 = u16::try_from(port).unwrap_or(u16::MAX);
         let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
             .activity(openshell_ocsf::ActivityId::Fail)
             .severity(openshell_ocsf::SeverityId::Low)
-            .dst_endpoint(openshell_ocsf::Endpoint::from_domain(host, port as u16))
+            .dst_endpoint(openshell_ocsf::Endpoint::from_domain(host, port_u16))
             .message(format!(
                 "DNS resolution returned no addresses for {host}:{port}"
             ))

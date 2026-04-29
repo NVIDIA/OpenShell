@@ -32,14 +32,16 @@ use tracing::warn;
 /// Perform SSH server initialization: generate a host key, build the config,
 /// and bind the Unix socket listener. Extracted so that startup errors can be
 /// forwarded through the readiness channel rather than being silently logged.
-async fn ssh_server_init(
-    listen_path: &Path,
-    ca_file_paths: &Option<(PathBuf, PathBuf)>,
-) -> Result<(
+type SshServerInit = (
     UnixListener,
     Arc<russh::server::Config>,
     Option<Arc<(PathBuf, PathBuf)>>,
-)> {
+);
+
+fn ssh_server_init(
+    listen_path: &Path,
+    ca_file_paths: &Option<(PathBuf, PathBuf)>,
+) -> Result<SshServerInit> {
     let mut rng = OsRng;
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
 
@@ -105,7 +107,7 @@ pub async fn run_ssh_server(
     ca_file_paths: Option<(PathBuf, PathBuf)>,
     provider_env: HashMap<String, String>,
 ) -> Result<()> {
-    let (listener, config, ca_paths) = match ssh_server_init(&listen_path, &ca_file_paths).await {
+    let (listener, config, ca_paths) = match ssh_server_init(&listen_path, &ca_file_paths) {
         Ok(v) => {
             // Signal that the SSH server has bound the socket and is ready to
             // accept connections. The parent task awaits this before spawning
@@ -265,8 +267,8 @@ impl russh::server::Handler for SshHandler {
     /// Clean up per-channel state when the channel is closed.
     ///
     /// This is the final cleanup and subsumes `channel_eof` — if `channel_close`
-    /// fires without a preceding `channel_eof`, all resources (pty_master File,
-    /// input_sender) are dropped here.
+    /// fires without a preceding `channel_eof`, all resources (`pty_master` File,
+    /// `input_sender`) are dropped here.
     async fn channel_close(
         &mut self,
         channel: ChannelId,
@@ -317,7 +319,9 @@ impl russh::server::Handler for SshHandler {
         }
 
         let host = host_to_connect.to_string();
-        let port = port_to_connect as u16;
+        // SSH protocol port is bounded by u32 but only u16 is meaningful;
+        // saturate as a guard for malformed clients.
+        let port = u16::try_from(port_to_connect).unwrap_or(u16::MAX);
         let netns_fd = self.netns_fd;
 
         tokio::spawn(async move {
@@ -652,8 +656,10 @@ fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
             let home = nix::unistd::User::from_name(user)
                 .ok()
                 .flatten()
-                .map(|u| u.dir.to_string_lossy().into_owned())
-                .unwrap_or_else(|| format!("/home/{user}"));
+                .map_or_else(
+                    || format!("/home/{user}"),
+                    |u| u.dir.to_string_lossy().into_owned(),
+                );
             (user.to_string(), home)
         }
         _ => ("sandbox".to_string(), "/sandbox".to_string()),
@@ -1039,6 +1045,9 @@ mod unsafe_pty {
     }
 
     #[allow(unsafe_code)]
+    // `libc::TIOCSCTTY` is `u32` on macOS/BSD and `u64` on Linux; allow the
+    // cross-platform conversion so the same expression compiles everywhere.
+    #[allow(clippy::useless_conversion)]
     fn set_controlling_tty(fd: RawFd) -> std::io::Result<()> {
         let rc = unsafe { libc::ioctl(fd, libc::TIOCSCTTY.into(), 0) };
         if rc != 0 {
@@ -1182,6 +1191,11 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::doc_markdown,
+    unsafe_code,
+    reason = "Test code: doc text references identifiers and uses libc::winsize zero-init."
+)]
 mod tests {
     use super::*;
     use std::process::Stdio;
@@ -1487,7 +1501,7 @@ mod tests {
             None,
             None, // no netns fd
             #[cfg(target_os = "linux")]
-            crate::sandbox::linux::prepare(
+            sandbox::linux::prepare(
                 &SandboxPolicy {
                     version: 0,
                     filesystem: FilesystemPolicy::default(),

@@ -311,15 +311,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
-    type RelayStreamStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::RelayFrame, tonic::Status>,
-    >;
+    type RelayStreamStream = ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
 
     async fn relay_stream(
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
-    ) -> Result<tonic::Response<Self::RelayStreamStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 }
 
@@ -440,9 +438,8 @@ where
                     break;
                 }
             }
-            Ok(Message::Close(_)) => break,
+            Ok(Message::Close(_)) | Err(_) => break,
             Ok(Message::Ping(_) | Message::Pong(_)) => {}
-            Err(_) => break,
         }
     }
     let _ = writer.shutdown().await;
