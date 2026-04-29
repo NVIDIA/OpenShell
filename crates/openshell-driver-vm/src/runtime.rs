@@ -24,11 +24,25 @@ static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 /// launcher (especially on macOS where `PR_SET_PDEATHSIG` is absent).
 static GVPROXY_PID: AtomicI32 = AtomicI32::new(0);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmBackend {
     Libkrun,
     Qemu,
 }
+
+// virtio-net feature bits (see Linux `include/uapi/linux/virtio_net.h`).
+const NET_FEATURE_CSUM: u32 = 1 << 0;
+const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
+const NET_FEATURE_GUEST_TSO4: u32 = 1 << 7;
+const NET_FEATURE_GUEST_UFO: u32 = 1 << 10;
+const NET_FEATURE_HOST_TSO4: u32 = 1 << 11;
+const NET_FEATURE_HOST_UFO: u32 = 1 << 14;
+const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
+    | NET_FEATURE_GUEST_CSUM
+    | NET_FEATURE_GUEST_TSO4
+    | NET_FEATURE_GUEST_UFO
+    | NET_FEATURE_HOST_TSO4
+    | NET_FEATURE_HOST_UFO;
 
 pub struct VmLaunchConfig {
     pub rootfs: PathBuf,
@@ -154,7 +168,7 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     let virtiofsd_child = virtiofsd_cmd
         .spawn()
         .map_err(|e| format!("failed to start virtiofsd: {e}"))?;
-    let virtiofsd_pid = virtiofsd_child.id() as i32;
+    let virtiofsd_pid = virtiofsd_child.id().cast_signed();
     GVPROXY_PID.store(virtiofsd_pid, Ordering::Relaxed);
     let mut virtiofsd_guard = GvproxyGuard::new(virtiofsd_child);
 
@@ -240,7 +254,7 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("failed to start QEMU: {e}"))?;
 
-    let qemu_pid = qemu_child.id() as i32;
+    let qemu_pid = qemu_child.id().cast_signed();
     install_signal_forwarding(qemu_pid);
 
     let status = qemu_child
@@ -274,7 +288,8 @@ fn write_guest_env_file(rootfs: &Path, env_vars: &[String]) -> Result<(), String
     let mut content = String::new();
     for var in env_vars {
         if let Some((key, value)) = var.split_once('=') {
-            content.push_str(&format!("export {key}=\"{}\"\n", shell_escape(value)));
+            use std::fmt::Write as _;
+            let _ = writeln!(content, "export {key}=\"{}\"", shell_escape(value));
         }
     }
     std::fs::write(&env_file, &content).map_err(|e| format!("write guest env file: {e}"))?;
@@ -301,12 +316,12 @@ fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
         format!("init={}", config.exec_path),
     ];
 
-    if let Some(ip) = &config.guest_ip {
-        if let Some(host_ip) = &config.host_ip {
-            parts.push(format!("ip={ip}::{host_ip}:255.255.255.252:sandbox::off"));
-            parts.push(format!("VM_NET_IP={ip}"));
-            parts.push(format!("VM_NET_GW={host_ip}"));
-        }
+    if let Some(ip) = &config.guest_ip
+        && let Some(host_ip) = &config.host_ip
+    {
+        parts.push(format!("ip={ip}::{host_ip}:255.255.255.252:sandbox::off"));
+        parts.push(format!("VM_NET_IP={ip}"));
+        parts.push(format!("VM_NET_GW={host_ip}"));
     }
 
     if let Some(dns) = host_dns_server() {
@@ -344,10 +359,11 @@ fn host_dns_server() -> Option<String> {
     None
 }
 
-/// Remove leftover `vmtap-*` interfaces from previous driver runs that
-/// were not torn down (e.g. the launcher was SIGKILLed before teardown).
-/// Called once at driver startup so stale interfaces cannot cause subnet
-/// routing conflicts with newly allocated TAPs.
+/// Remove leftover `vmtap-*` interfaces from previous driver runs.
+///
+/// Called once at driver startup for interfaces that were not torn down
+/// (e.g. the launcher was `SIGKILL`-ed before teardown), so stale
+/// interfaces cannot cause subnet routing conflicts with newly allocated TAPs.
 pub fn cleanup_stale_tap_interfaces() {
     let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
         return;
@@ -386,10 +402,10 @@ fn read_tap_host_ip(device: &str) -> Option<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Format: "28: vmtap-xxx    inet 10.0.128.1/30 ..."
     for token in stdout.split_whitespace() {
-        if let Some((ip, _prefix)) = token.split_once('/') {
-            if ip.parse::<std::net::Ipv4Addr>().is_ok() {
-                return Some(ip.to_string());
-            }
+        if let Some((ip, _prefix)) = token.split_once('/')
+            && ip.parse::<std::net::Ipv4Addr>().is_ok()
+        {
+            return Some(ip.to_string());
         }
     }
     None
@@ -552,13 +568,14 @@ fn teardown_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) {
 }
 
 fn tap_subnet_from_host_ip(host_ip: &str) -> String {
-    if let Ok(ip) = host_ip.parse::<std::net::Ipv4Addr>() {
-        let base = u32::from(ip) & !3;
-        let base_ip = std::net::Ipv4Addr::from(base);
-        format!("{base_ip}/30")
-    } else {
-        format!("{host_ip}/30")
-    }
+    host_ip.parse::<std::net::Ipv4Addr>().map_or_else(
+        |_| format!("{host_ip}/30"),
+        |ip| {
+            let base = u32::from(ip) & !3;
+            let base_ip = std::net::Ipv4Addr::from(base);
+            format!("{base_ip}/30")
+        },
+    )
 }
 
 fn enable_ip_forwarding() -> Result<(), String> {
@@ -778,7 +795,7 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
         // The procguard cleanup reads GVPROXY_PID atomically. Storing it
         // here makes the callback able to SIGTERM gvproxy if the driver
         // dies from this moment onward.
-        GVPROXY_PID.store(child.id() as i32, Ordering::Relaxed);
+        GVPROXY_PID.store(child.id().cast_signed(), Ordering::Relaxed);
 
         wait_for_path(&net_sock, Duration::from_secs(5), "gvproxy data socket")?;
 
@@ -786,18 +803,6 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
         vm.add_vsock(0)?;
 
         let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
-        const NET_FEATURE_CSUM: u32 = 1 << 0;
-        const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
-        const NET_FEATURE_GUEST_TSO4: u32 = 1 << 7;
-        const NET_FEATURE_GUEST_UFO: u32 = 1 << 10;
-        const NET_FEATURE_HOST_TSO4: u32 = 1 << 11;
-        const NET_FEATURE_HOST_UFO: u32 = 1 << 14;
-        const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
-            | NET_FEATURE_GUEST_CSUM
-            | NET_FEATURE_GUEST_TSO4
-            | NET_FEATURE_GUEST_UFO
-            | NET_FEATURE_HOST_TSO4
-            | NET_FEATURE_HOST_UFO;
 
         #[cfg(target_os = "linux")]
         vm.add_net_unixstream(&net_sock, &mac, COMPAT_NET_FEATURES)?;
@@ -980,7 +985,7 @@ impl VmContext {
 
         Ok(Self {
             krun,
-            ctx_id: ctx_id as u32,
+            ctx_id: ctx_id.cast_unsigned(),
         })
     }
 
@@ -1078,10 +1083,10 @@ impl VmContext {
 
     fn set_exec(&self, exec_path: &str, args: &[String], env: &[String]) -> Result<(), String> {
         let exec_c = CString::new(exec_path).map_err(|e| format!("invalid exec path: {e}"))?;
-        let argv_strs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let (_argv_owners, argv_ptrs) = c_string_array(&argv_strs)?;
-        let env_strs: Vec<&str> = env.iter().map(String::as_str).collect();
-        let (_env_owners, env_ptrs) = c_string_array(&env_strs)?;
+        let argv_slices: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (_argv_owners, argv_ptrs) = c_string_array(&argv_slices)?;
+        let env_slices: Vec<&str> = env.iter().map(String::as_str).collect();
+        let (_env_owners, env_ptrs) = c_string_array(&env_slices)?;
 
         check(
             unsafe {
@@ -1154,24 +1159,26 @@ fn wait_for_path(path: &Path, timeout: Duration, label: &str) -> Result<(), Stri
 }
 
 fn hash_path_id(path: &Path) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in path.to_string_lossy().as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     format!("{:012x}", hash & 0x0000_ffff_ffff_ffff)
 }
 
 fn secure_socket_base(subdir: &str) -> Result<PathBuf, String> {
-    let base = if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(xdg)
-    } else {
-        let mut base = PathBuf::from("/tmp");
-        if !base.is_dir() {
-            base = std::env::temp_dir();
-        }
-        base
-    };
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
+        || {
+            let fallback = PathBuf::from("/tmp");
+            if fallback.is_dir() {
+                fallback
+            } else {
+                std::env::temp_dir()
+            }
+        },
+        PathBuf::from,
+    );
     let dir = base.join(subdir);
 
     if dir.exists() {
@@ -1298,7 +1305,7 @@ fn path_to_cstring(path: &Path) -> Result<CString, String> {
     let path = path
         .to_str()
         .ok_or_else(|| format!("path is not valid UTF-8: {}", path.display()))?;
-    CString::new(path).map_err(|e| format!("invalid path string {}: {e}", path))
+    CString::new(path).map_err(|e| format!("invalid path string {path}: {e}"))
 }
 
 #[cfg(target_os = "linux")]

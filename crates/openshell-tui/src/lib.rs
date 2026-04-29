@@ -7,6 +7,7 @@ mod event;
 pub mod theme;
 mod ui;
 
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -33,9 +34,9 @@ const SPLASH_DURATION: Duration = Duration::from_secs(3);
 // Re-export for use by the CLI crate.
 pub use theme::ThemeMode;
 
-/// Launch the OpenShell TUI.
+/// Launch the `OpenShell` TUI.
 ///
-/// `channel` must be a connected gRPC channel to the OpenShell gateway.
+/// `channel` must be a connected gRPC channel to the `OpenShell` gateway.
 /// `theme_mode` selects the color theme: `Auto` detects the terminal
 /// background, `Dark`/`Light` forces a specific palette.
 pub async fn run(
@@ -188,11 +189,11 @@ pub async fn run(
                         .next()
                         .cloned()
                         .unwrap_or_default();
-                    let masked = if let Some(val) = provider.credentials.values().next() {
-                        mask_secret(val)
-                    } else {
-                        "-".to_string()
-                    };
+                    let masked = provider
+                        .credentials
+                        .values()
+                        .next()
+                        .map_or_else(|| "-".to_string(), |val| mask_secret(val));
                     app.provider_detail = Some(app::ProviderDetailView {
                         name: provider.object_name().to_string(),
                         provider_type: provider.r#type.clone(),
@@ -313,12 +314,11 @@ pub async fn run(
             },
             Some(Event::Tick) => {
                 // Auto-dismiss splash after SPLASH_DURATION.
-                if app.screen == Screen::Splash {
-                    if let Some(start) = app.splash_start {
-                        if start.elapsed() >= SPLASH_DURATION {
-                            app.dismiss_splash();
-                        }
-                    }
+                if app.screen == Screen::Splash
+                    && let Some(start) = app.splash_start
+                    && start.elapsed() >= SPLASH_DURATION
+                {
+                    app.dismiss_splash();
                 }
 
                 refresh_gateway_list(&mut app);
@@ -338,90 +338,90 @@ pub async fn run(
             }
             Some(Event::Redraw) => {
                 // Check if a buffered sandbox CreateResult is ready to finalize.
-                if let Some(form) = app.create_form.as_ref() {
-                    if form.create_result.is_some() {
-                        let elapsed = form
-                            .anim_start
-                            .map_or(app::MIN_CREATING_DISPLAY, |s| s.elapsed());
-                        if elapsed >= app::MIN_CREATING_DISPLAY {
-                            let result = app
-                                .create_form
-                                .as_mut()
-                                .and_then(|f| f.create_result.take());
-                            if let Some(h) = app.anim_handle.take() {
-                                h.abort();
-                            }
-                            match result {
-                                Some(Ok(name)) => {
-                                    app.create_form = None;
-                                    let ports = std::mem::take(&mut app.pending_forward_ports);
-                                    let command = std::mem::take(&mut app.pending_exec_command);
-                                    let port_info = if ports.is_empty() {
-                                        String::new()
-                                    } else {
-                                        let list = ports
-                                            .iter()
-                                            .map(|p| p.to_string())
-                                            .collect::<Vec<_>>()
-                                            .join(", ");
-                                        format!(" (forwarding port(s) {list})")
-                                    };
-                                    app.status_text = format!("Created sandbox: {name}{port_info}");
-                                    refresh_sandboxes(&mut app).await;
+                if let Some(form) = app.create_form.as_ref()
+                    && form.create_result.is_some()
+                {
+                    let elapsed = form
+                        .anim_start
+                        .map_or(app::MIN_CREATING_DISPLAY, |s| s.elapsed());
+                    if elapsed >= app::MIN_CREATING_DISPLAY {
+                        let result = app
+                            .create_form
+                            .as_mut()
+                            .and_then(|f| f.create_result.take());
+                        if let Some(h) = app.anim_handle.take() {
+                            h.abort();
+                        }
+                        match result {
+                            Some(Ok(name)) => {
+                                app.create_form = None;
+                                let ports = std::mem::take(&mut app.pending_forward_ports);
+                                let command = std::mem::take(&mut app.pending_exec_command);
+                                let port_info = if ports.is_empty() {
+                                    String::new()
+                                } else {
+                                    let list = ports
+                                        .iter()
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    format!(" (forwarding port(s) {list})")
+                                };
+                                app.status_text = format!("Created sandbox: {name}{port_info}");
+                                refresh_sandboxes(&mut app).await;
 
-                                    // If a command was specified, suspend TUI and exec it.
-                                    if !command.is_empty() {
-                                        handle_exec_command(
-                                            &mut app,
-                                            &mut terminal,
-                                            &events,
-                                            &name,
-                                            &command,
-                                        )
-                                        .await;
-                                    }
+                                // If a command was specified, suspend TUI and exec it.
+                                if !command.is_empty() {
+                                    handle_exec_command(
+                                        &mut app,
+                                        &mut terminal,
+                                        &events,
+                                        &name,
+                                        &command,
+                                    )
+                                    .await;
                                 }
-                                Some(Err(msg)) => {
-                                    if let Some(form) = app.create_form.as_mut() {
-                                        form.phase = app::CreatePhase::Form;
-                                        form.anim_start = None;
-                                        form.status = Some(format!("Create failed: {msg}"));
-                                    }
-                                }
-                                None => {}
                             }
+                            Some(Err(msg)) => {
+                                if let Some(form) = app.create_form.as_mut() {
+                                    form.phase = app::CreatePhase::Form;
+                                    form.anim_start = None;
+                                    form.status = Some(format!("Create failed: {msg}"));
+                                }
+                            }
+                            None => {}
                         }
                     }
                 }
                 // Check if a buffered provider CreateResult is ready to finalize.
-                if let Some(form) = app.create_provider_form.as_ref() {
-                    if form.create_result.is_some() {
-                        let elapsed = form
-                            .anim_start
-                            .map_or(app::MIN_CREATING_DISPLAY, |s| s.elapsed());
-                        if elapsed >= app::MIN_CREATING_DISPLAY {
-                            let result = app
-                                .create_provider_form
-                                .as_mut()
-                                .and_then(|f| f.create_result.take());
-                            if let Some(h) = app.anim_handle.take() {
-                                h.abort();
+                if let Some(form) = app.create_provider_form.as_ref()
+                    && form.create_result.is_some()
+                {
+                    let elapsed = form
+                        .anim_start
+                        .map_or(app::MIN_CREATING_DISPLAY, |s| s.elapsed());
+                    if elapsed >= app::MIN_CREATING_DISPLAY {
+                        let result = app
+                            .create_provider_form
+                            .as_mut()
+                            .and_then(|f| f.create_result.take());
+                        if let Some(h) = app.anim_handle.take() {
+                            h.abort();
+                        }
+                        match result {
+                            Some(Ok(name)) => {
+                                app.create_provider_form = None;
+                                app.status_text = format!("Created provider: {name}");
+                                refresh_providers(&mut app).await;
                             }
-                            match result {
-                                Some(Ok(name)) => {
-                                    app.create_provider_form = None;
-                                    app.status_text = format!("Created provider: {name}");
-                                    refresh_providers(&mut app).await;
+                            Some(Err(msg)) => {
+                                if let Some(form) = app.create_provider_form.as_mut() {
+                                    form.phase = app::CreateProviderPhase::EnterKey;
+                                    form.anim_start = None;
+                                    form.status = Some(format!("Create failed: {msg}"));
                                 }
-                                Some(Err(msg)) => {
-                                    if let Some(form) = app.create_provider_form.as_mut() {
-                                        form.phase = app::CreateProviderPhase::EnterKey;
-                                        form.anim_start = None;
-                                        form.status = Some(format!("Create failed: {msg}"));
-                                    }
-                                }
-                                None => {}
                             }
+                            None => {}
                         }
                     }
                 }
@@ -594,7 +594,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                     source: String::new(),
                     target: String::new(),
                     message: format!("Failed to fetch logs: {}", e.message()),
-                    fields: Default::default(),
+                    fields: HashMap::default(),
                 }]));
                 return;
             }
@@ -605,7 +605,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                     source: String::new(),
                     target: String::new(),
                     message: "Timed out fetching logs.".into(),
-                    fields: Default::default(),
+                    fields: HashMap::default(),
                 }]));
                 return;
             }
@@ -621,24 +621,20 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             ..Default::default()
         };
 
-        let resp =
-            match tokio::time::timeout(Duration::from_secs(5), client.watch_sandbox(req)).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(_)) | Err(_) => return, // Silently stop — user can re-enter logs.
-            };
+        // Silently stop — user can re-enter logs.
+        let Ok(Ok(resp)) =
+            tokio::time::timeout(Duration::from_secs(5), client.watch_sandbox(req)).await
+        else {
+            return;
+        };
 
         let mut stream = resp.into_inner();
-        loop {
-            match stream.message().await {
-                Ok(Some(event)) => {
-                    if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
-                        event.payload
-                    {
-                        let line = proto_to_log_line(log);
-                        let _ = tx.send(Event::LogLines(vec![line]));
-                    }
-                }
-                _ => break, // Stream ended or error.
+        while let Ok(Some(event)) = stream.message().await {
+            if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
+                event.payload
+            {
+                let line = proto_to_log_line(log);
+                let _ = tx.send(Event::LogLines(vec![line]));
             }
         }
     });
@@ -717,7 +713,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
             Ok(Ok(resp)) => {
                 if let Some(sandbox) = resp.into_inner().sandbox {
                     if let Some(spec) = &sandbox.spec {
-                        app.sandbox_providers_list = spec.providers.clone();
+                        app.sandbox_providers_list.clone_from(&spec.providers);
                     }
                     let id = sandbox.object_id().to_string();
                     if id.is_empty() { None } else { Some(id) }
@@ -796,13 +792,14 @@ async fn handle_shell_connect(
             name: sandbox_name.clone(),
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
-            Ok(Ok(resp)) => match resp.into_inner().sandbox {
-                Some(s) => s.object_id().to_string(),
-                None => {
+            Ok(Ok(resp)) => {
+                if let Some(s) = resp.into_inner().sandbox {
+                    s.object_id().to_string()
+                } else {
                     app.status_text = "sandbox not found".to_string();
                     return;
                 }
-            },
+            }
             Ok(Err(e)) => {
                 app.status_text = format!("failed to get sandbox: {}", e.message());
                 return;
@@ -945,13 +942,14 @@ async fn handle_exec_command(
             name: sandbox_name.to_string(),
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
-            Ok(Ok(resp)) => match resp.into_inner().sandbox {
-                Some(s) => s.object_id().to_string(),
-                None => {
+            Ok(Ok(resp)) => {
+                if let Some(s) = resp.into_inner().sandbox {
+                    s.object_id().to_string()
+                } else {
                     app.status_text = format!("exec: sandbox {sandbox_name} not found");
                     return;
                 }
-            },
+            }
             Ok(Err(e)) => {
                 app.status_text = format!("exec: failed to get sandbox: {}", e.message());
                 return;
@@ -1015,7 +1013,7 @@ async fn handle_exec_command(
     // remote shell parses it correctly.
     let command_str = command
         .split_whitespace()
-        .map(|word| shell_escape(word))
+        .map(shell_escape)
         .collect::<Vec<_>>()
         .join(" ");
     let mut ssh = std::process::Command::new("ssh");
@@ -1207,7 +1205,7 @@ fn render_policy_lines(
                         };
                         lines.push(Line::from(vec![
                             Span::styled("      Allow: ", t.muted),
-                            Span::styled(format!("{:<6} {}", method, target), t.text),
+                            Span::styled(format!("{method:<6} {target}"), t.text),
                         ]));
                     }
                 }
@@ -1275,7 +1273,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     // Stash command so we can exec after sandbox creation + Ready.
     app.pending_exec_command = command;
     // Stash ports so we can include them in the status text.
-    app.pending_forward_ports = ports.clone();
+    app.pending_forward_ports.clone_from(&ports);
 
     let endpoint = app.endpoint.clone();
     let gateway_name = app.gateway_name.clone();
@@ -1311,7 +1309,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                 policy,
                 ..Default::default()
             }),
-            labels: std::collections::HashMap::new(),
+            labels: HashMap::new(),
         };
 
         let sandbox_name =
@@ -1353,21 +1351,19 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                 let req = openshell_core::proto::GetSandboxRequest {
                     name: sandbox_name.clone(),
                 };
-                match client.get_sandbox(req).await {
-                    Ok(resp) => {
-                        if let Some(sandbox) = resp.into_inner().sandbox {
-                            if sandbox.phase == 2 {
-                                break sandbox.object_id().to_string();
-                            }
-                            if sandbox.phase == 3 {
-                                let _ = tx.send(Event::CreateResult(Err(
-                                    "sandbox entered error state".to_string(),
-                                )));
-                                return;
-                            }
-                        }
+                // Retry on transient errors.
+                if let Ok(resp) = client.get_sandbox(req).await
+                    && let Some(sandbox) = resp.into_inner().sandbox
+                {
+                    if sandbox.phase == 2 {
+                        break sandbox.object_id().to_string();
                     }
-                    Err(_) => {} // Retry on transient errors.
+                    if sandbox.phase == 3 {
+                        let _ = tx.send(Event::CreateResult(Err(
+                            "sandbox entered error state".to_string()
+                        )));
+                        return;
+                    }
                 }
             };
 
@@ -1568,11 +1564,11 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                         id: String::new(),
                         name: provider_name.clone(),
                         created_at_ms: 0,
-                        labels: std::collections::HashMap::new(),
+                        labels: HashMap::new(),
                     }),
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
-                    config: Default::default(),
+                    config: HashMap::default(),
                 }),
             };
 
@@ -1649,7 +1645,7 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let new_value = form.new_value.clone();
 
     tokio::spawn(async move {
-        let mut credentials = std::collections::HashMap::new();
+        let mut credentials = HashMap::new();
         credentials.insert(cred_key, new_value);
 
         let req = openshell_core::proto::UpdateProviderRequest {
@@ -1658,11 +1654,11 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     id: String::new(),
                     name: name.clone(),
                     created_at_ms: 0,
-                    labels: std::collections::HashMap::new(),
+                    labels: HashMap::new(),
                 }),
                 r#type: ptype,
                 credentials,
-                config: Default::default(),
+                config: HashMap::default(),
             }),
         };
 
@@ -1970,25 +1966,25 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let value = match kind {
             openshell_core::settings::SettingValueKind::Bool => {
-                match openshell_core::settings::parse_bool_like(&raw) {
-                    Some(v) => setting_value::Value::BoolValue(v),
-                    None => {
-                        let _ = tx.send(Event::GlobalSettingSetResult(Err(format!(
-                            "invalid bool value: {raw}"
-                        ))));
-                        return;
-                    }
+                if let Some(v) = openshell_core::settings::parse_bool_like(&raw) {
+                    setting_value::Value::BoolValue(v)
+                } else {
+                    let _ = tx.send(Event::GlobalSettingSetResult(Err(format!(
+                        "invalid bool value: {raw}"
+                    ))));
+                    return;
                 }
             }
-            openshell_core::settings::SettingValueKind::Int => match raw.parse::<i64>() {
-                Ok(v) => setting_value::Value::IntValue(v),
-                Err(_) => {
+            openshell_core::settings::SettingValueKind::Int => {
+                if let Ok(v) = raw.parse::<i64>() {
+                    setting_value::Value::IntValue(v)
+                } else {
                     let _ = tx.send(Event::GlobalSettingSetResult(Err(format!(
                         "invalid int value: {raw}"
                     ))));
                     return;
                 }
-            },
+            }
             openshell_core::settings::SettingValueKind::String => {
                 setting_value::Value::StringValue(raw)
             }
@@ -2074,25 +2070,25 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let value = match kind {
             openshell_core::settings::SettingValueKind::Bool => {
-                match openshell_core::settings::parse_bool_like(&raw) {
-                    Some(v) => setting_value::Value::BoolValue(v),
-                    None => {
-                        let _ = tx.send(Event::SandboxSettingSetResult(Err(format!(
-                            "invalid bool value: {raw}"
-                        ))));
-                        return;
-                    }
+                if let Some(v) = openshell_core::settings::parse_bool_like(&raw) {
+                    setting_value::Value::BoolValue(v)
+                } else {
+                    let _ = tx.send(Event::SandboxSettingSetResult(Err(format!(
+                        "invalid bool value: {raw}"
+                    ))));
+                    return;
                 }
             }
-            openshell_core::settings::SettingValueKind::Int => match raw.parse::<i64>() {
-                Ok(v) => setting_value::Value::IntValue(v),
-                Err(_) => {
+            openshell_core::settings::SettingValueKind::Int => {
+                if let Ok(v) = raw.parse::<i64>() {
+                    setting_value::Value::IntValue(v)
+                } else {
                     let _ = tx.send(Event::SandboxSettingSetResult(Err(format!(
                         "invalid int value: {raw}"
                     ))));
                     return;
                 }
-            },
+            }
             openshell_core::settings::SettingValueKind::String => {
                 setting_value::Value::StringValue(raw)
             }
@@ -2225,8 +2221,7 @@ async fn refresh_sandboxes(app: &mut App) {
                 .map(|s| {
                     s.metadata
                         .as_ref()
-                        .map(|m| format_age(m.created_at_ms))
-                        .unwrap_or_else(|| "?".to_string())
+                        .map_or_else(|| "?".to_string(), |m| format_age(m.created_at_ms))
                 })
                 .collect();
             app.sandbox_created = sandboxes
@@ -2234,8 +2229,7 @@ async fn refresh_sandboxes(app: &mut App) {
                 .map(|s| {
                     s.metadata
                         .as_ref()
-                        .map(|m| format_timestamp(m.created_at_ms))
-                        .unwrap_or_else(|| "?".to_string())
+                        .map_or_else(|| "?".to_string(), |m| format_timestamp(m.created_at_ms))
                 })
                 .collect();
 
@@ -2258,7 +2252,7 @@ async fn refresh_sandboxes(app: &mut App) {
                 .map(|s| {
                     s.object_labels()
                         .as_ref()
-                        .map(|labels| app::format_labels(labels))
+                        .map(app::format_labels)
                         .unwrap_or_default()
                 })
                 .collect();

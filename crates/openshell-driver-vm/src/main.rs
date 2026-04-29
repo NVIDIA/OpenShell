@@ -301,6 +301,8 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
+// Signature must match the macOS variant which can fail.
+#[allow(clippy::unnecessary_wraps)]
 fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
     Ok(())
 }

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! gRPC client for fetching sandbox policy, provider environment, and inference
-//! route bundles from OpenShell server.
+//! route bundles from `OpenShell` server.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -17,7 +17,7 @@ use openshell_core::proto::{
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
 
-/// Create a channel to the OpenShell server.
+/// Create a channel to the `OpenShell` server.
 ///
 /// When the endpoint uses `https://`, mTLS is configured using these env vars:
 /// - `OPENSHELL_TLS_CA` -- path to the CA certificate
@@ -78,18 +78,18 @@ async fn connect_channel(endpoint: &str) -> Result<Channel> {
         .wrap_err("failed to connect to OpenShell server")
 }
 
-/// Create a channel to the OpenShell server (public for use by supervisor_session).
+/// Create a channel to the `OpenShell` server (public for use by `supervisor_session`).
 pub async fn connect_channel_pub(endpoint: &str) -> Result<Channel> {
     connect_channel(endpoint).await
 }
 
-/// Connect to the OpenShell server (mTLS or plaintext based on endpoint scheme).
+/// Connect to the `OpenShell` server (mTLS or plaintext based on endpoint scheme).
 async fn connect(endpoint: &str) -> Result<OpenShellClient<Channel>> {
     let channel = connect_channel(endpoint).await?;
     Ok(OpenShellClient::new(channel))
 }
 
-/// Fetch sandbox policy from OpenShell server via gRPC.
+/// Fetch sandbox policy from `OpenShell` server via gRPC.
 ///
 /// Returns `Ok(Some(policy))` when the server has a policy configured,
 /// or `Ok(None)` when the sandbox was created without a policy (the sandbox
@@ -191,7 +191,7 @@ pub async fn sync_policy(endpoint: &str, sandbox: &str, policy: &ProtoSandboxPol
     sync_policy_with_client(&mut client, sandbox, policy).await
 }
 
-/// Fetch provider environment variables for a sandbox from OpenShell server via gRPC.
+/// Fetch provider environment variables for a sandbox from `OpenShell` server via gRPC.
 ///
 /// Returns a map of environment variable names to values derived from provider
 /// credentials configured on the sandbox. Returns an empty map if the sandbox
@@ -214,7 +214,7 @@ pub async fn fetch_provider_environment(
     Ok(response.into_inner().environment)
 }
 
-/// A reusable gRPC client for the OpenShell service.
+/// A reusable gRPC client for the `OpenShell` service.
 ///
 /// Wraps a tonic channel connected once and reused for policy polling
 /// and status reporting, avoiding per-request TLS handshake overhead.
@@ -231,7 +231,7 @@ pub struct SettingsPollResult {
     pub config_revision: u64,
     pub policy_source: PolicySource,
     /// Effective settings keyed by name.
-    pub settings: std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    pub settings: HashMap<String, openshell_core::proto::EffectiveSetting>,
     /// When `policy_source` is `Global`, the version of the global policy revision.
     pub global_policy_version: u32,
 }

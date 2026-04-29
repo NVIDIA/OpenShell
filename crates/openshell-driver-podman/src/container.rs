@@ -48,7 +48,7 @@ pub fn secret_name(sandbox_id: &str) -> String {
 
 /// Truncate a container ID to 12 characters (standard short form).
 #[must_use]
-pub(crate) fn short_id(id: &str) -> String {
+pub fn short_id(id: &str) -> String {
     id.chars().take(12).collect()
 }
 
@@ -80,7 +80,7 @@ struct ContainerSpec {
     healthconfig: HealthConfig,
     resource_limits: ResourceLimits,
     /// Env-type secrets: map of `ENV_VAR_NAME → secret_name`.
-    /// Podman's libpod SpecGenerator uses `secret_env` (a flat map) for
+    /// Podman's libpod `SpecGenerator` uses `secret_env` (a flat map) for
     /// environment-variable injection, distinct from `secrets` which only
     /// handles file-mounted secrets under `/run/secrets/`.
     secret_env: BTreeMap<String, String>,
@@ -90,17 +90,21 @@ struct ContainerSpec {
     /// the gateway server running on the host in rootless mode.
     hostadd: Vec<String>,
     netns: NetNS,
+    // Matches libpod's network spec format, which is `{name: {opts}}` where
+    // empty opts is a unit struct rather than `()`. Keep as a map so JSON
+    // serialization matches the API exactly.
+    #[allow(clippy::zero_sized_map_values)]
     networks: BTreeMap<String, NetworkAttachment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     devices: Option<Vec<LinuxDevice>>,
-    /// Extra mounts for the libpod SpecGenerator (e.g. tmpfs entries).
+    /// Extra mounts for the libpod `SpecGenerator` (e.g. tmpfs entries).
     mounts: Vec<Mount>,
-    /// Port mappings from host to container. Using host_port=0 requests an
+    /// Port mappings from host to container. Using `host_port=0` requests an
     /// ephemeral port, readable back from the inspect response.
     portmappings: Vec<PortMapping>,
 }
 
-/// A port mapping entry for the libpod SpecGenerator.
+/// A port mapping entry for the libpod `SpecGenerator`.
 #[derive(Serialize)]
 struct PortMapping {
     host_port: u16,
@@ -112,12 +116,12 @@ struct PortMapping {
 ///
 /// Unlike `volumes` (named Podman volumes) or `image_volumes` (OCI image
 /// mounts resolved at the libpod layer), these mounts are passed to the
-/// libpod SpecGenerator and support arbitrary mount types (e.g. tmpfs).
+/// libpod `SpecGenerator` and support arbitrary mount types (e.g. tmpfs).
 /// Field names must be lowercase to match the libpod JSON schema.
 #[derive(Serialize)]
 struct Mount {
     #[serde(rename = "type")]
-    mount_type: String,
+    kind: String,
     source: String,
     destination: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -331,6 +335,9 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
     let devices = build_devices(sandbox);
 
     // Network configuration -- always bridge mode.
+    // Matches libpod's network spec format `{name: {opts}}`; the unit-struct
+    // value mirrors empty opts in the JSON.
+    #[allow(clippy::zero_sized_map_values)]
     let mut networks = BTreeMap::new();
     networks.insert(config.network_name.clone(), NetworkAttachment {});
 
@@ -456,7 +463,7 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
         // fails with EPERM. A private tmpfs gives the supervisor its own writable
         // /run/netns without needing host filesystem access.
         mounts: vec![Mount {
-            mount_type: "tmpfs".into(),
+            kind: "tmpfs".into(),
             source: "tmpfs".into(),
             destination: "/run/netns".into(),
             options: vec!["rw".into(), "nosuid".into(), "nodev".into()],

@@ -115,6 +115,7 @@ async fn delete_sandbox(name: &str) {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // end-to-end test exercises full label lifecycle
 async fn sandbox_labels_are_stored_and_filterable() {
     // Create sandboxes with different labels
     let name1 = create_sandbox_with_labels(
@@ -195,7 +196,7 @@ async fn sandbox_labels_are_stored_and_filterable() {
     assert_eq!(
         dev_backend_sandboxes
             .iter()
-            .filter(|name| [&name1, &name2, &name3, &name4].contains(&name))
+            .filter(|name| [&name1, &name2, &name3, &name4].contains(name))
             .count(),
         1,
         "env=dev,team=backend filter should return exactly 1 sandbox, got: {dev_backend_sandboxes:?}"

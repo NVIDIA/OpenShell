@@ -17,7 +17,7 @@ use openshell_ocsf::{
 };
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Context for L7 request policy evaluation.
 pub struct L7EvalContext {
@@ -218,13 +218,8 @@ where
         // Uses redacted_target (path only, no query params) to avoid logging secrets.
         {
             let (action_id, disposition_id, severity) = match decision_str {
-                "allow" => (
-                    ActionId::Allowed,
-                    DispositionId::Allowed,
-                    SeverityId::Informational,
-                ),
                 "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
-                "audit" => (
+                "allow" | "audit" => (
                     ActionId::Allowed,
                     DispositionId::Allowed,
                     SeverityId::Informational,

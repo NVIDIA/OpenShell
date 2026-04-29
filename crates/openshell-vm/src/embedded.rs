@@ -229,7 +229,8 @@ pub fn cleanup_old_rootfs() -> Result<(), VmError> {
     }
 
     let current_version_dir = base.join(VERSION);
-    cleanup_old_versions_in_base(&base, &current_version_dir)
+    cleanup_old_versions_in_base(&base, &current_version_dir);
+    Ok(())
 }
 
 /// Check if the rootfs is embedded (non-empty).
@@ -257,12 +258,13 @@ fn runtime_cache_key() -> String {
         let sample = &chunk[..chunk.len().min(64)];
         let mut word: u64 = 0;
         for (j, &b) in sample.iter().enumerate() {
-            word ^= (b as u64) << ((j % 8) * 8);
+            word ^= u64::from(b) << ((j % 8) * 8);
         }
         // Mix in resource index so identical resources don't cancel out.
-        fp ^= word.rotate_left((i as u32) * 13 + 7);
+        let i_u32 = u32::try_from(i).unwrap_or(u32::MAX);
+        fp ^= word.rotate_left(i_u32 * 13 + 7);
         // Also mix in the total length so size changes are detected.
-        fp ^= (chunk.len() as u64).rotate_left((i as u32) * 17 + 3);
+        fp ^= (chunk.len() as u64).rotate_left(i_u32 * 17 + 3);
     }
     format!("{VERSION}-{fp:016x}")
 }
@@ -286,17 +288,17 @@ fn rootfs_cache_base() -> Result<PathBuf, VmError> {
 }
 
 fn cleanup_old_versions(current_dir: &Path) -> Result<(), VmError> {
-    cleanup_old_versions_in_base(&runtime_cache_base()?, current_dir)
+    cleanup_old_versions_in_base(&runtime_cache_base()?, current_dir);
+    Ok(())
 }
 
-fn cleanup_old_versions_in_base(base: &Path, current_dir: &Path) -> Result<(), VmError> {
+fn cleanup_old_versions_in_base(base: &Path, current_dir: &Path) {
     if !base.exists() {
-        return Ok(());
+        return;
     }
 
-    let entries = match fs::read_dir(base) {
-        Ok(e) => e,
-        Err(_) => return Ok(()), // Can't read, skip cleanup
+    let Ok(entries) = fs::read_dir(base) else {
+        return; // Can't read, skip cleanup
     };
 
     for entry in entries.filter_map(Result::ok) {
@@ -316,8 +318,6 @@ fn cleanup_old_versions_in_base(base: &Path, current_dir: &Path) -> Result<(), V
             }
         }
     }
-
-    Ok(())
 }
 
 fn extract_resource(compressed: &[u8], dest: &Path) -> Result<(), VmError> {
@@ -417,7 +417,7 @@ fn validate_runtime_dir(dir: &Path) -> Result<(), VmError> {
         }
 
         // Check file is not empty (would indicate a stub)
-        let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let size = fs::metadata(path).map_or(0, |m| m.len());
         if size == 0 {
             return Err(VmError::HostSetup(format!(
                 "runtime file is empty (stub): {}",

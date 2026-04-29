@@ -103,12 +103,12 @@ pub async fn start_watch(client: PodmanClient) -> Result<WatchStream, PodmanApiE
                 }
             }
         }
-        if let Some(event) = driver_sandbox_from_list_entry(entry).map(sandbox_event) {
-            if tx.send(Ok(event)).await.is_err() {
-                return Err(PodmanApiError::Connection(
-                    "watch receiver dropped during initial sync".into(),
-                ));
-            }
+        if let Some(event) = driver_sandbox_from_list_entry(entry).map(sandbox_event)
+            && tx.send(Ok(event)).await.is_err()
+        {
+            return Err(PodmanApiError::Connection(
+                "watch receiver dropped during initial sync".into(),
+            ));
         }
     }
 
@@ -118,10 +118,10 @@ pub async fn start_watch(client: PodmanClient) -> Result<WatchStream, PodmanApiE
         while let Some(result) = event_rx.recv().await {
             match result {
                 Ok(event) => {
-                    if let Some(we) = map_podman_event(&event, &client).await {
-                        if tx.send(Ok(we)).await.is_err() {
-                            return;
-                        }
+                    if let Some(we) = map_podman_event(&event, &client).await
+                        && tx.send(Ok(we)).await.is_err()
+                    {
+                        return;
                     }
                 }
                 Err(e) => {
@@ -292,7 +292,7 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
 }
 
 /// Build a `DriverSandbox` from a container list entry (no inspect needed).
-pub(crate) fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<DriverSandbox> {
+pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<DriverSandbox> {
     let sandbox_id = entry.labels.get(LABEL_SANDBOX_ID)?.clone();
     let sandbox_name = entry
         .labels
@@ -508,9 +508,8 @@ mod tests {
         };
 
         let payload = event.payload.unwrap();
-        let sandbox_event = match payload {
-            watch_sandboxes_event::Payload::Sandbox(s) => s,
-            _ => panic!("expected Sandbox payload"),
+        let watch_sandboxes_event::Payload::Sandbox(sandbox_event) = payload else {
+            panic!("expected Sandbox payload")
         };
         let status = sandbox_event.sandbox.unwrap().status.unwrap();
         assert_eq!(status.conditions.len(), 1);

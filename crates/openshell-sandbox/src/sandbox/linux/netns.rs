@@ -11,7 +11,7 @@ use miette::{IntoDiagnostic, Result};
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
 use std::process::Command;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Default subnet for sandbox networking.
@@ -211,6 +211,8 @@ impl NetworkNamespace {
         if let Some(fd) = self.ns_fd {
             debug!(namespace = %self.name, "Entering network namespace via setns");
             // SAFETY: setns is safe to call after fork, before exec
+            // libc/syscall FFI requires unsafe
+            #[allow(unsafe_code)]
             let result = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
             if result != 0 {
                 return Err(miette::miette!(
@@ -235,7 +237,7 @@ impl NetworkNamespace {
     /// Install iptables rules for bypass detection inside the namespace.
     ///
     /// Sets up OUTPUT chain rules that:
-    /// 1. ACCEPT traffic destined for the proxy (host_ip:proxy_port)
+    /// 1. ACCEPT traffic destined for the proxy (`host_ip:proxy_port`)
     /// 2. ACCEPT loopback traffic
     /// 3. ACCEPT established/related connections (response packets)
     /// 4. LOG + REJECT all other TCP/UDP traffic (bypass attempts)
@@ -251,22 +253,19 @@ impl NetworkNamespace {
     /// diagnostic logging.
     pub fn install_bypass_rules(&self, proxy_port: u16) -> Result<()> {
         // Check if iptables is available before attempting to install rules.
-        let iptables_path = match find_iptables() {
-            Some(path) => path,
-            None => {
-                openshell_ocsf::ocsf_emit!(openshell_ocsf::ConfigStateChangeBuilder::new(
-                    crate::ocsf_ctx()
-                )
-                .severity(openshell_ocsf::SeverityId::Medium)
-                .status(openshell_ocsf::StatusId::Failure)
-                .state(openshell_ocsf::StateId::Disabled, "degraded")
-                .message(format!(
-                    "iptables not found; bypass detection rules will not be installed [ns:{}]",
-                    self.name
-                ))
-                .build());
-                return Ok(());
-            }
+        let Some(iptables_path) = find_iptables() else {
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Medium)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Disabled, "degraded")
+                    .message(format!(
+                        "iptables not found; bypass detection rules will not be installed [ns:{}]",
+                        self.name
+                    ))
+                    .build()
+            );
+            return Ok(());
         };
 
         let host_ip_str = self.host_ip.to_string();
@@ -299,20 +298,20 @@ impl NetworkNamespace {
 
         // Install IPv6 rules — best-effort.
         // Skip the proxy ACCEPT rule for IPv6 since the proxy address is IPv4.
-        if let Some(ip6_path) = find_ip6tables(&iptables_path) {
-            if let Err(e) = self.install_bypass_rules_for_v6(&ip6_path, &log_prefix) {
-                openshell_ocsf::ocsf_emit!(openshell_ocsf::ConfigStateChangeBuilder::new(
-                    crate::ocsf_ctx()
-                )
-                .severity(openshell_ocsf::SeverityId::Low)
-                .status(openshell_ocsf::StatusId::Failure)
-                .state(openshell_ocsf::StateId::Other, "degraded")
-                .message(format!(
-                    "Failed to install IPv6 bypass detection rules (non-fatal) [ns:{}]: {e}",
-                    self.name
-                ))
-                .build());
-            }
+        if let Some(ip6_path) = find_ip6tables(&iptables_path)
+            && let Err(e) = self.install_bypass_rules_for_v6(&ip6_path, &log_prefix)
+        {
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Low)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Other, "degraded")
+                    .message(format!(
+                        "Failed to install IPv6 bypass detection rules (non-fatal) [ns:{}]: {e}",
+                        self.name
+                    ))
+                    .build()
+            );
         }
 
         openshell_ocsf::ocsf_emit!(
@@ -755,13 +754,13 @@ fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<
 const IPTABLES_SEARCH_PATHS: &[&str] =
     &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"];
 
-/// Returns true if xt extension modules (e.g. xt_comment) cannot be used
+/// Returns true if xt extension modules (e.g. `xt_comment`) cannot be used
 /// via the given iptables binary.
 ///
-/// Some kernels have nf_tables but lack the nft_compat bridge that allows
-/// xt extension modules to be used through the nf_tables path (e.g. Jetson
+/// Some kernels have `nf_tables` but lack the `nft_compat` bridge that allows
+/// xt extension modules to be used through the `nf_tables` path (e.g. Jetson
 /// Linux 5.15-tegra). This probe detects that condition by attempting to
-/// insert a rule using the xt_comment extension. If it fails, xt extensions
+/// insert a rule using the `xt_comment` extension. If it fails, xt extensions
 /// are unavailable and the caller should fall back to iptables-legacy.
 fn xt_extensions_unavailable(iptables_path: &str) -> bool {
     // Create a temporary probe chain. If this fails (e.g. no CAP_NET_ADMIN),
@@ -769,8 +768,7 @@ fn xt_extensions_unavailable(iptables_path: &str) -> bool {
     let created = Command::new(iptables_path)
         .args(["-t", "filter", "-N", "_xt_probe"])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
 
     if !created {
         return false;
@@ -792,8 +790,7 @@ fn xt_extensions_unavailable(iptables_path: &str) -> bool {
             "ACCEPT",
         ])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
 
     // Clean up — best-effort, ignore failures.
     let _ = Command::new(iptables_path)

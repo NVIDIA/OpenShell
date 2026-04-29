@@ -359,7 +359,7 @@ pub struct CreateProviderForm {
     pub is_generic: bool,
     /// Status message (errors, validation).
     pub status: Option<String>,
-    /// Warning shown at top of EnterKey modal (e.g. autodetect failure).
+    /// Warning shown at top of `EnterKey` modal (e.g. autodetect failure).
     pub warning: Option<String>,
     /// Animation start time.
     pub anim_start: Option<Instant>,
@@ -578,6 +578,7 @@ pub fn format_labels(labels: &HashMap<String, String>) -> String {
 }
 
 impl App {
+    #[allow(clippy::large_types_passed_by_value)] // Theme is Copy; one-shot ctor
     pub fn new(
         client: OpenShellClient<Channel>,
         gateway_name: String,
@@ -719,18 +720,18 @@ impl App {
         self.sandbox_settings = settings::REGISTERED_SETTINGS
             .iter()
             .map(|reg| {
-                let (value, scope) = settings
-                    .get(reg.key)
-                    .map(|es| {
-                        let v = es.value.as_ref().and_then(|sv| sv.value.clone());
-                        let s = match es.scope {
-                            1 => SettingScope::Sandbox,
-                            2 => SettingScope::Global,
-                            _ => SettingScope::Unset,
-                        };
-                        (v, s)
-                    })
-                    .unwrap_or((None, SettingScope::Unset));
+                let (value, scope) =
+                    settings
+                        .get(reg.key)
+                        .map_or((None, SettingScope::Unset), |es| {
+                            let v = es.value.as_ref().and_then(|sv| sv.value.clone());
+                            let s = match es.scope {
+                                1 => SettingScope::Sandbox,
+                                2 => SettingScope::Global,
+                                _ => SettingScope::Unset,
+                            };
+                            (v, s)
+                        });
                 SandboxSettingEntry {
                     key: reg.key.to_string(),
                     kind: reg.kind,
@@ -858,11 +859,8 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !self.gateways.is_empty() {
-                    self.gateway_selected =
-                        (self.gateway_selected + 1).min(self.gateways.len() - 1);
-                }
+            KeyCode::Char('j') | KeyCode::Down if !self.gateways.is_empty() => {
+                self.gateway_selected = (self.gateway_selected + 1).min(self.gateways.len() - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.gateway_selected = self.gateway_selected.saturating_sub(1);
@@ -902,11 +900,8 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.provider_count > 0 {
-                    self.provider_selected =
-                        (self.provider_selected + 1).min(self.provider_count - 1);
-                }
+            KeyCode::Char('j') | KeyCode::Down if self.provider_count > 0 => {
+                self.provider_selected = (self.provider_selected + 1).min(self.provider_count - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.provider_selected = self.provider_selected.saturating_sub(1);
@@ -914,22 +909,16 @@ impl App {
             KeyCode::Char('c') => {
                 self.open_create_provider_form();
             }
-            KeyCode::Enter => {
-                // Fetch and show provider detail.
-                if self.provider_count > 0 {
-                    self.pending_provider_get = true;
-                }
+            // Fetch and show provider detail.
+            KeyCode::Enter if self.provider_count > 0 => {
+                self.pending_provider_get = true;
             }
-            KeyCode::Char('u') => {
-                // Open update form for the selected provider.
-                if self.provider_count > 0 {
-                    self.open_update_provider_form();
-                }
+            // Open update form for the selected provider.
+            KeyCode::Char('u') if self.provider_count > 0 => {
+                self.open_update_provider_form();
             }
-            KeyCode::Char('d') => {
-                if self.provider_count > 0 {
-                    self.confirm_provider_delete = true;
-                }
+            KeyCode::Char('d') if self.provider_count > 0 => {
+                self.confirm_provider_delete = true;
             }
             KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right => {
                 self.middle_pane_tab = self.middle_pane_tab.next();
@@ -947,11 +936,9 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !self.global_settings.is_empty() {
-                    self.global_settings_selected =
-                        (self.global_settings_selected + 1).min(self.global_settings.len() - 1);
-                }
+            KeyCode::Char('j') | KeyCode::Down if !self.global_settings.is_empty() => {
+                self.global_settings_selected =
+                    (self.global_settings_selected + 1).min(self.global_settings.len() - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.global_settings_selected = self.global_settings_selected.saturating_sub(1);
@@ -1082,10 +1069,8 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.sandbox_count > 0 {
-                    self.sandbox_selected = (self.sandbox_selected + 1).min(self.sandbox_count - 1);
-                }
+            KeyCode::Char('j') | KeyCode::Down if self.sandbox_count > 0 => {
+                self.sandbox_selected = (self.sandbox_selected + 1).min(self.sandbox_count - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.sandbox_selected = self.sandbox_selected.saturating_sub(1);
@@ -1093,13 +1078,11 @@ impl App {
             KeyCode::Char('c') => {
                 self.open_create_form();
             }
-            KeyCode::Enter => {
-                if self.sandbox_count > 0 {
-                    self.screen = Screen::Sandbox;
-                    self.focus = Focus::SandboxPolicy;
-                    self.confirm_delete = false;
-                    self.pending_sandbox_detail = true;
-                }
+            KeyCode::Enter if self.sandbox_count > 0 => {
+                self.screen = Screen::Sandbox;
+                self.focus = Focus::SandboxPolicy;
+                self.confirm_delete = false;
+                self.pending_sandbox_detail = true;
             }
             KeyCode::Esc => {
                 self.focus = Focus::Providers;
@@ -1150,10 +1133,8 @@ impl App {
             KeyCode::Char('r') => {
                 self.focus = Focus::SandboxDraft;
             }
-            KeyCode::Char('s') => {
-                if self.sandbox_count > 0 {
-                    self.pending_shell_connect = true;
-                }
+            KeyCode::Char('s') if self.sandbox_count > 0 => {
+                self.pending_shell_connect = true;
             }
             KeyCode::Char('d') => {
                 self.confirm_delete = true;
@@ -1195,11 +1176,9 @@ impl App {
                 // In policy tab, 'l' opens logs. In settings tab, switch tab.
                 self.sandbox_policy_tab = self.sandbox_policy_tab.next();
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !self.sandbox_settings.is_empty() {
-                    self.sandbox_settings_selected =
-                        (self.sandbox_settings_selected + 1).min(self.sandbox_settings.len() - 1);
-                }
+            KeyCode::Char('j') | KeyCode::Down if !self.sandbox_settings.is_empty() => {
+                self.sandbox_settings_selected =
+                    (self.sandbox_settings_selected + 1).min(self.sandbox_settings.len() - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.sandbox_settings_selected = self.sandbox_settings_selected.saturating_sub(1);
@@ -1404,10 +1383,8 @@ impl App {
                 self.focus = Focus::SandboxLogs;
                 self.pending_log_fetch = true;
             }
-            KeyCode::Enter => {
-                if !self.draft_chunks.is_empty() {
-                    self.draft_detail_open = true;
-                }
+            KeyCode::Enter if !self.draft_chunks.is_empty() => {
+                self.draft_detail_open = true;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if total == 0 {
@@ -1435,13 +1412,11 @@ impl App {
                 self.draft_scroll = 0;
                 self.draft_selected = 0;
             }
-            KeyCode::Char('G') => {
-                if total > 0 {
-                    let max_scroll = total.saturating_sub(vh.min(total));
-                    self.draft_scroll = max_scroll;
-                    let visible = total.saturating_sub(self.draft_scroll).min(vh);
-                    self.draft_selected = visible.saturating_sub(1);
-                }
+            KeyCode::Char('G') if total > 0 => {
+                let max_scroll = total.saturating_sub(vh.min(total));
+                self.draft_scroll = max_scroll;
+                let visible = total.saturating_sub(self.draft_scroll).min(vh);
+                self.draft_selected = visible.saturating_sub(1);
             }
             // Approve selected chunk (pending → approved, rejected → approved).
             KeyCode::Char('a') => {
@@ -1586,12 +1561,10 @@ impl App {
                     self.log_autoscroll = false;
                 }
             }
-            KeyCode::Enter => {
-                if filtered_len > 0 && self.log_selection_anchor.is_none() {
-                    let abs = self.sandbox_log_scroll + self.log_cursor;
-                    if abs < filtered_len {
-                        self.log_detail_index = Some(abs);
-                    }
+            KeyCode::Enter if filtered_len > 0 && self.log_selection_anchor.is_none() => {
+                let abs = self.sandbox_log_scroll + self.log_cursor;
+                if abs < filtered_len {
+                    self.log_detail_index = Some(abs);
                 }
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -1655,7 +1628,8 @@ impl App {
             self.sandbox_log_scroll = self.sandbox_log_scroll.saturating_sub(delta.unsigned_abs());
             self.log_autoscroll = false;
         } else {
-            self.sandbox_log_scroll = (self.sandbox_log_scroll + delta as usize).min(max_scroll);
+            self.sandbox_log_scroll =
+                (self.sandbox_log_scroll + delta.cast_unsigned()).min(max_scroll);
         }
         let visible = filtered_len
             .saturating_sub(self.sandbox_log_scroll)
@@ -1723,11 +1697,9 @@ impl App {
                     CreateFormField::Image => Self::handle_text_input(&mut form.image, key),
                     CreateFormField::Command => Self::handle_text_input(&mut form.command, key),
                     CreateFormField::Providers => match key.code {
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            if !form.providers.is_empty() {
-                                form.provider_cursor =
-                                    (form.provider_cursor + 1).min(form.providers.len() - 1);
-                            }
+                        KeyCode::Char('j') | KeyCode::Down if !form.providers.is_empty() => {
+                            form.provider_cursor =
+                                (form.provider_cursor + 1).min(form.providers.len() - 1);
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             form.provider_cursor = form.provider_cursor.saturating_sub(1);
@@ -1826,10 +1798,8 @@ impl App {
                 KeyCode::Esc => {
                     self.create_provider_form = None;
                 }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if !form.types.is_empty() {
-                        form.type_cursor = (form.type_cursor + 1).min(form.types.len() - 1);
-                    }
+                KeyCode::Char('j') | KeyCode::Down if !form.types.is_empty() => {
+                    form.type_cursor = (form.type_cursor + 1).min(form.types.len() - 1);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     form.type_cursor = form.type_cursor.saturating_sub(1);
@@ -1870,7 +1840,7 @@ impl App {
                     form.status = None;
                     form.warning = None;
                 }
-                KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('k') | KeyCode::Up => {
+                KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up => {
                     form.method_cursor = 1 - form.method_cursor;
                 }
                 KeyCode::Enter => {
@@ -2076,7 +2046,7 @@ impl App {
             registry
                 .credential_env_vars(&ptype)
                 .first()
-                .map_or(String::new(), |s| s.to_string())
+                .map_or(String::new(), ToString::to_string)
         } else {
             cred_key
         };

@@ -14,8 +14,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
+/// CA certificate, client certificate, and client key bytes for mTLS.
+type MtlsMaterials = (Vec<u8>, Vec<u8>, Vec<u8>);
+
 /// Load mTLS materials from the gateway's cert directory.
-fn load_mtls_materials(gateway_name: &str) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+fn load_mtls_materials(gateway_name: &str) -> Result<MtlsMaterials, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
     let mtls_dir = PathBuf::from(home)
         .join(".config/openshell/gateways")

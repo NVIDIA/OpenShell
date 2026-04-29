@@ -54,7 +54,7 @@ const MAX_NAME_LEN: usize = 255;
 /// Valid names start with an alphanumeric character and contain only
 /// alphanumerics, dots, underscores, and hyphens — matching Podman's
 /// own naming rules. Names longer than [`MAX_NAME_LEN`] are rejected.
-pub(crate) fn validate_name(name: &str) -> Result<(), PodmanApiError> {
+pub fn validate_name(name: &str) -> Result<(), PodmanApiError> {
     // Regex-equivalent: ^[a-zA-Z0-9][a-zA-Z0-9._-]*$
     if name.is_empty() {
         return Err(PodmanApiError::InvalidInput(
@@ -92,6 +92,7 @@ pub struct ContainerInspect {
     pub name: String,
     pub state: ContainerState,
     #[serde(default)]
+    #[allow(dead_code)] // kept for podman API compat
     pub network_settings: NetworkSettings,
     #[serde(default)]
     pub config: ContainerConfig,
@@ -101,6 +102,7 @@ pub struct ContainerInspect {
 #[serde(rename_all = "PascalCase")]
 pub struct ContainerState {
     pub status: String,
+    #[allow(dead_code)] // kept for podman API compat
     pub running: bool,
     #[serde(default)]
     pub exit_code: i64,
@@ -125,8 +127,10 @@ pub struct HealthState {
 #[serde(rename_all = "PascalCase")]
 pub struct NetworkSettings {
     #[serde(default)]
+    #[allow(dead_code)] // kept for podman API compat
     pub networks: HashMap<String, NetworkInfo>,
     #[serde(default)]
+    #[allow(dead_code)] // kept for podman API compat
     pub ports: HashMap<String, Option<Vec<PortBinding>>>,
 }
 
@@ -135,6 +139,7 @@ pub struct NetworkSettings {
 pub struct NetworkInfo {
     #[serde(rename = "IPAddress")]
     #[serde(default)]
+    #[allow(dead_code)] // kept for podman API compat
     pub ip_address: String,
 }
 
@@ -142,9 +147,11 @@ pub struct NetworkInfo {
 #[serde(rename_all = "PascalCase")]
 pub struct PortBinding {
     #[serde(default)]
+    #[allow(dead_code)] // kept for podman API compat
     pub host_port: String,
     #[serde(rename = "HostIp")]
     #[serde(default)]
+    #[allow(dead_code)] // kept for podman API compat
     pub host_ip: String,
 }
 
@@ -166,19 +173,26 @@ pub struct ContainerListEntry {
     #[serde(default)]
     pub labels: HashMap<String, String>,
     #[serde(default)]
+    #[allow(dead_code)] // kept for podman API compat
     pub ports: Option<Vec<PortMappingEntry>>,
     #[serde(default)]
+    #[allow(dead_code)] // kept for podman API compat
     pub networks: Option<Vec<String>>,
     #[serde(default)]
+    #[allow(dead_code)] // kept for podman API compat
     pub exit_code: i64,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct PortMappingEntry {
+    #[allow(dead_code)] // kept for podman API compat
     pub host_port: u16,
+    #[allow(dead_code)] // kept for podman API compat
     pub container_port: u16,
+    #[allow(dead_code)] // kept for podman API compat
     pub protocol: String,
     #[serde(default)]
+    #[allow(dead_code)] // kept for podman API compat
     pub host_ip: String,
 }
 
@@ -187,11 +201,13 @@ pub struct PortMappingEntry {
 #[serde(rename_all = "PascalCase")]
 pub struct PodmanEvent {
     #[serde(rename = "Type")]
+    #[allow(dead_code)] // kept for podman API compat
     pub event_type: String,
     pub action: String,
     #[serde(default)]
     pub actor: EventActor,
     #[serde(rename = "timeNano", default)]
+    #[allow(dead_code)] // kept for podman API compat
     pub time_nano: i64,
 }
 
@@ -407,7 +423,7 @@ impl PodmanClient {
         timeout_secs: u32,
     ) -> Result<(), PodmanApiError> {
         validate_name(name)?;
-        let http_timeout = Duration::from_secs(timeout_secs as u64 + 5);
+        let http_timeout = Duration::from_secs(u64::from(timeout_secs) + 5);
         let (status, bytes) = self
             .request(
                 hyper::Method::POST,
@@ -614,17 +630,15 @@ impl PodmanClient {
         }
         // The response is NDJSON. Check the last line for an error field.
         let body = String::from_utf8_lossy(&bytes);
-        if let Some(last_line) = body.lines().filter(|l| !l.is_empty()).last() {
-            if let Ok(obj) = serde_json::from_str::<Value>(last_line) {
-                if let Some(err) = obj.get("error").and_then(|v| v.as_str()) {
-                    if !err.is_empty() {
-                        return Err(PodmanApiError::Api {
-                            status: 500,
-                            message: format!("image pull failed: {err}"),
-                        });
-                    }
-                }
-            }
+        if let Some(last_line) = body.lines().rfind(|l| !l.is_empty())
+            && let Ok(obj) = serde_json::from_str::<Value>(last_line)
+            && let Some(err) = obj.get("error").and_then(|v| v.as_str())
+            && !err.is_empty()
+        {
+            return Err(PodmanApiError::Api {
+                status: 500,
+                message: format!("image pull failed: {err}"),
+            });
         }
         Ok(())
     }
@@ -730,7 +744,7 @@ impl PodmanClient {
                 // Parse complete newline-delimited JSON lines.
                 while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
                     let line: Vec<u8> = buffer.drain(..=pos).collect();
-                    let trimmed = line.strip_suffix(&[b'\n']).unwrap_or(&line);
+                    let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
                     if trimmed.is_empty() {
                         continue;
                     }

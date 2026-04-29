@@ -743,14 +743,14 @@ fn parse_label_selector_accepts_empty_value() {
     // Kubernetes allows empty label values, so selectors should accept "key=" format
     let result = super::parse_label_selector("env=").unwrap();
     assert_eq!(result.len(), 1);
-    assert_eq!(result.get("env"), Some(&"".to_string()));
+    assert_eq!(result.get("env"), Some(&String::new()));
 }
 
 #[test]
 fn parse_label_selector_multiple_with_empty_value() {
     let result = super::parse_label_selector("env=,tier=frontend").unwrap();
     assert_eq!(result.len(), 2);
-    assert_eq!(result.get("env"), Some(&"".to_string()));
+    assert_eq!(result.get("env"), Some(&String::new()));
     assert_eq!(result.get("tier"), Some(&"frontend".to_string()));
 }
 

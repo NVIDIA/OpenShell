@@ -44,8 +44,7 @@ pub fn check_data_exfiltration(model: &ReachabilityModel) -> Vec<Finding> {
                     (
                         "l4_only".to_owned(),
                         format!(
-                            "L4-only endpoint — no HTTP inspection, {} can send arbitrary data",
-                            bpath
+                            "L4-only endpoint — no HTTP inspection, {bpath} can send arbitrary data"
                         ),
                     )
                 } else {

@@ -591,7 +591,8 @@ fn bind_device_to_vfio(sysfs: &SysfsRoot, bdf: &str) -> Result<bool, VfioError> 
         bdf: bdf.to_string(),
         reason: format!(
             "after drivers_probe with {}ms polling, driver is {:?} instead of vfio-pci",
-            VFIO_BIND_MAX_POLL_ATTEMPTS as u64 * VFIO_BIND_POLL_INTERVAL.as_millis() as u64,
+            u64::from(VFIO_BIND_MAX_POLL_ATTEMPTS)
+                * u64::try_from(VFIO_BIND_POLL_INTERVAL.as_millis()).unwrap_or(u64::MAX),
             current_driver_name(sysfs, bdf)
                 .as_deref()
                 .unwrap_or("<none>")

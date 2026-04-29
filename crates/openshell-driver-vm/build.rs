@@ -7,7 +7,7 @@
 //! artifacts it needs to boot base VMs without depending on the openshell-vm
 //! binary or crate.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 fn main() {
@@ -126,7 +126,7 @@ fn main() {
                 e
             )
         });
-        let size = fs::metadata(&dst_path).map(|m| m.len()).unwrap_or(0);
+        let size = fs::metadata(&dst_path).map_or(0, |m| m.len());
         println!("cargo:warning=Embedded {src_name}: {size} bytes");
     }
 
@@ -145,7 +145,7 @@ fn main() {
     }
 }
 
-fn generate_stub_resources(out_dir: &std::path::Path, names: &[&str]) {
+fn generate_stub_resources(out_dir: &Path, names: &[&str]) {
     for name in names {
         let path = out_dir.join(name);
         if !path.exists() {

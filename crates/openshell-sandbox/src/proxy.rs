@@ -79,6 +79,9 @@ pub struct InferenceContext {
 }
 
 impl InferenceContext {
+    // `router`/`routes` are intentionally distinct nouns (the router and the
+    // route list it consumes); both names are clearer than alternatives.
+    #[allow(clippy::similar_names)]
     pub fn new(
         patterns: Vec<crate::l7::inference::InferenceApiPattern>,
         router: openshell_router::Router,
@@ -295,6 +298,10 @@ fn emit_denial_simple(
     }
 }
 
+// Many distinct, non-related context parameters are required for a CONNECT
+// dispatch; bundling them into a struct would just shift the noise into call
+// sites.
+#[allow(clippy::too_many_arguments)]
 async fn handle_tcp_connection(
     mut client: TcpStream,
     opa_engine: Arc<OpaEngine>,
@@ -497,6 +504,9 @@ async fn handle_tcp_connection(
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
     let dns_connect_start = std::time::Instant::now();
+    // The "non-empty" branch is the explicit-allowlist path; reading it first
+    // matches the policy decision narrative.
+    #[allow(clippy::if_not_else)]
     let mut upstream = if !raw_allowed_ips.is_empty() {
         // allowed_ips mode: validate resolved IPs against CIDR allowlist.
         // Loopback and link-local are still always blocked.
@@ -1597,7 +1607,7 @@ fn query_l7_config(
     // Only query if action is Allow (not Deny)
     let has_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
-        _ => false,
+        NetworkAction::Deny { .. } => false,
     };
     if !has_policy {
         return None;
@@ -1640,7 +1650,7 @@ fn query_tls_mode(
 ) -> crate::l7::TlsMode {
     let has_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
-        _ => false,
+        NetworkAction::Deny { .. } => false,
     };
     if !has_policy {
         return crate::l7::TlsMode::Auto;
@@ -1763,7 +1773,10 @@ async fn resolve_from_sandbox_hosts(
     if addrs.is_empty() { None } else { Some(addrs) }
 }
 
+// Mirrors the Linux signature so call sites can `.await` uniformly across
+// platforms; the non-Linux path has nothing to await.
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::unused_async)]
 async fn resolve_from_sandbox_hosts(
     _host: &str,
     _port: u16,
@@ -1969,7 +1982,7 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
                 }
                 nets.push(n);
             }
-            Err(_) => errors.push(format!("invalid CIDR/IP in allowed_ips: {entry}")),
+            Err(()) => errors.push(format!("invalid CIDR/IP in allowed_ips: {entry}")),
         }
     }
 
@@ -1980,7 +1993,7 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
     }
 }
 
-/// Query allowed_ips from the matched endpoint config for a CONNECT decision.
+/// Query `allowed_ips` from the matched endpoint config for a CONNECT decision.
 fn query_allowed_ips(
     engine: &OpaEngine,
     decision: &ConnectDecision,
@@ -1990,7 +2003,7 @@ fn query_allowed_ips(
     // Only query if action is Allow with a matched policy
     let has_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
-        _ => false,
+        NetworkAction::Deny { .. } => false,
     };
     if !has_policy {
         return vec![];
@@ -2049,15 +2062,12 @@ fn normalize_inference_path(path: &str) -> String {
 fn extract_host_from_uri(uri: &str) -> String {
     // Absolute-form URIs look like "http://host[:port]/path"
     // Strip the scheme prefix, then extract the authority (host[:port]) before the first '/'.
-    let after_scheme = uri.find("://").map(|i| &uri[i + 3..]).unwrap_or(uri);
+    let after_scheme = uri.find("://").map_or(uri, |i| &uri[i + 3..]);
     let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
     // Strip port if present (handle IPv6 bracket notation)
     let host = if authority.starts_with('[') {
         // IPv6: [::1]:port
-        authority
-            .find(']')
-            .map(|i| &authority[..=i])
-            .unwrap_or(authority)
+        authority.find(']').map_or(authority, |i| &authority[..=i])
     } else {
         authority.split(':').next().unwrap_or(authority)
     };
@@ -2092,14 +2102,12 @@ fn parse_proxy_uri(uri: &str) -> Result<(String, String, u16, String)> {
             .find(']')
             .ok_or_else(|| miette::miette!("Unclosed IPv6 bracket in URI: {uri}"))?;
         let after_bracket = &rest[bracket_end + 1..];
-        if let Some(slash_pos) = after_bracket.find('/') {
+        after_bracket.find('/').map_or((rest, "/"), |slash_pos| {
             (
-                &rest[..bracket_end + 1 + slash_pos],
+                &rest[..=bracket_end + slash_pos],
                 &after_bracket[slash_pos..],
             )
-        } else {
-            (&rest[..], "/")
-        }
+        })
     } else if let Some(slash_pos) = rest.find('/') {
         (&rest[..slash_pos], &rest[slash_pos..])
     } else {
@@ -2210,10 +2218,10 @@ fn rewrite_forward_request(
             continue;
         }
 
-        let rewritten_line = match secret_resolver {
-            Some(resolver) => rewrite_header_line(line, resolver),
-            None => line.to_string(),
-        };
+        let rewritten_line = secret_resolver.map_or_else(
+            || line.to_string(),
+            |resolver| rewrite_header_line(line, resolver),
+        );
 
         output.extend_from_slice(rewritten_line.as_bytes());
         output.extend_from_slice(b"\r\n");
@@ -2256,6 +2264,9 @@ fn rewrite_forward_request(
 /// Private IPs require explicit `allowed_ips` on the endpoint config (SSRF
 /// override). Rewrites the absolute-form request to origin-form, connects
 /// upstream, and relays the response using `copy_bidirectional` for streaming.
+// Many distinct, non-related context parameters are required for forward proxy
+// dispatch; bundling them into a struct would just shift the noise into call sites.
+#[allow(clippy::too_many_arguments)]
 async fn handle_forward_proxy(
     method: &str,
     target_uri: &str,
@@ -2466,10 +2477,11 @@ async fn handle_forward_proxy(
         let query_params =
             match crate::l7::path::canonicalize_request_target(&path, &canonicalize_options) {
                 Ok((canon, query)) => {
-                    let params = match query.as_deref() {
-                        Some(q) => crate::l7::rest::parse_query_params(q).unwrap_or_default(),
-                        None => std::collections::HashMap::new(),
-                    };
+                    let params = query
+                        .as_deref()
+                        .map_or_else(std::collections::HashMap::new, |q| {
+                            crate::l7::rest::parse_query_params(q).unwrap_or_default()
+                        });
                     path = canon.path;
                     params
                 }
@@ -2525,13 +2537,8 @@ async fn handle_forward_proxy(
 
         {
             let (action_id, disposition_id, severity) = match decision_str {
-                "allow" => (
-                    ActionId::Allowed,
-                    DispositionId::Allowed,
-                    SeverityId::Informational,
-                ),
                 "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
-                "audit" => (
+                "allow" | "audit" => (
                     ActionId::Allowed,
                     DispositionId::Allowed,
                     SeverityId::Informational,
@@ -2603,6 +2610,9 @@ async fn handle_forward_proxy(
         raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
     }
 
+    // The "non-empty" branch is the explicit-allowlist path; reading it first
+    // matches the policy decision narrative.
+    #[allow(clippy::if_not_else)]
     let addrs =
         if !raw_allowed_ips.is_empty() {
             // allowed_ips mode: validate resolved IPs against CIDR allowlist.
@@ -2916,6 +2926,12 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::needless_raw_string_hashes,
+    clippy::iter_on_single_items,
+    clippy::needless_continue,
+    reason = "Test code: test fixtures and explicit control-flow markers are idiomatic in tests."
+)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -4378,6 +4394,8 @@ mod tests {
         let (_accepted, _) = listener.accept().expect("accept");
 
         let fd = stream.as_raw_fd();
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFD);
             assert!(flags >= 0, "F_GETFD failed");
@@ -4391,9 +4409,13 @@ mod tests {
         let sleep_path = CString::new("/bin/sleep").unwrap();
         let arg0 = CString::new("sleep").unwrap();
         let arg1 = CString::new("30").unwrap();
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
         let child_pid = unsafe { libc::fork() };
         assert!(child_pid >= 0, "fork failed");
         if child_pid == 0 {
+            // libc/syscall FFI requires unsafe
+            #[allow(unsafe_code)]
             unsafe {
                 libc::execl(
                     sleep_path.as_ptr(),
@@ -4420,8 +4442,27 @@ mod tests {
         }
 
         let cache = BinaryIdentityCache::new();
-        let result = resolve_process_identity(std::process::id(), peer_port, &cache);
 
+        // Resolve with a brief retry loop — under heavy CI load the child's
+        // procfs entry can momentarily fail to resolve even though the loop
+        // above just verified `/proc/<pid>/exe` pointed at `sleep`.  Retry a
+        // few times before declaring failure so the test is not flaky.
+        let mut result = resolve_process_identity(std::process::id(), peer_port, &cache);
+        for _ in 0..5 {
+            match &result {
+                Err(err)
+                    if err.reason.contains("No such file or directory")
+                        || err.reason.contains("os error 2") =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                    result = resolve_process_identity(std::process::id(), peer_port, &cache);
+                }
+                _ => break,
+            }
+        }
+
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
         unsafe {
             libc::kill(child_pid, libc::SIGKILL);
             libc::waitpid(child_pid, std::ptr::null_mut(), 0);

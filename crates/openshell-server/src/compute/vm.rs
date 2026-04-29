@@ -136,10 +136,10 @@ impl Default for VmComputeConfig {
 
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VmGuestTlsPaths {
-    pub(crate) ca: PathBuf,
-    pub(crate) cert: PathBuf,
-    pub(crate) key: PathBuf,
+pub struct VmGuestTlsPaths {
+    pub ca: PathBuf,
+    pub cert: PathBuf,
+    pub key: PathBuf,
 }
 
 /// Resolve the `openshell-driver-vm` binary path.
@@ -152,7 +152,7 @@ pub(crate) struct VmGuestTlsPaths {
 ///    `/usr/local/libexec`.
 /// 3. Sibling of the gateway's own executable (last-resort fallback so
 ///    local development builds still work out of the box).
-pub(crate) fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf> {
+pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf> {
     let mut searched: Vec<PathBuf> = Vec::new();
 
     // 1. Configured driver directory, or the conventional install locations
@@ -191,11 +191,10 @@ pub(crate) fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<
 }
 
 fn resolve_driver_search_dirs(vm_config: &VmComputeConfig) -> Vec<PathBuf> {
-    if let Some(dir) = vm_config.driver_dir.clone() {
-        vec![dir]
-    } else {
-        VmComputeConfig::default_driver_search_dirs(std::env::var_os("HOME").map(PathBuf::from))
-    }
+    vm_config.driver_dir.clone().map_or_else(
+        || VmComputeConfig::default_driver_search_dirs(std::env::var_os("HOME").map(PathBuf::from)),
+        |dir| vec![dir],
+    )
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -205,12 +204,12 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 /// Path of the Unix domain socket the driver will listen on.
-pub(crate) fn compute_driver_socket_path(vm_config: &VmComputeConfig) -> PathBuf {
+pub fn compute_driver_socket_path(vm_config: &VmComputeConfig) -> PathBuf {
     vm_config.state_dir.join("compute-driver.sock")
 }
 
 #[cfg(unix)]
-pub(crate) fn compute_driver_guest_tls_paths(
+pub fn compute_driver_guest_tls_paths(
     config: &Config,
     vm_config: &VmComputeConfig,
 ) -> Result<Option<VmGuestTlsPaths>> {
@@ -261,7 +260,7 @@ pub(crate) fn compute_driver_guest_tls_paths(
 /// and return a gRPC `Channel` connected to it plus a process handle that
 /// kills the subprocess and removes the socket on drop.
 #[cfg(unix)]
-pub(crate) async fn spawn(
+pub async fn spawn(
     config: &Config,
     vm_config: &VmComputeConfig,
 ) -> Result<(Channel, Arc<ManagedDriverProcess>)> {
@@ -333,7 +332,7 @@ pub(crate) async fn spawn(
 }
 
 #[cfg(not(unix))]
-pub(crate) async fn spawn(
+pub async fn spawn(
     _config: &Config,
     _vm_config: &VmComputeConfig,
 ) -> Result<(Channel, std::sync::Arc<super::ManagedDriverProcess>)> {
@@ -349,9 +348,10 @@ async fn wait_for_compute_driver(
 ) -> Result<Channel> {
     let mut last_error: Option<String> = None;
     for _ in 0..100 {
-        if let Some(status) = child.try_wait().map_err(|e| {
+        let try_wait_result = child.try_wait().map_err(|e| {
             Error::execution(format!("failed to poll vm compute driver process: {e}"))
-        })? {
+        })?;
+        if let Some(status) = try_wait_result {
             return Err(Error::execution(format!(
                 "vm compute driver exited before becoming ready with status {status}"
             )));

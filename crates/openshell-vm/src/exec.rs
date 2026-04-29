@@ -111,10 +111,10 @@ impl RawModeGuard {
         let stdin = std::io::stdin();
         let fd = stdin.as_fd();
         let original =
-            termios::tcgetattr(&fd).map_err(|e| VmError::Exec(format!("tcgetattr: {e}")))?;
+            termios::tcgetattr(fd).map_err(|e| VmError::Exec(format!("tcgetattr: {e}")))?;
         let mut raw = original.clone();
         termios::cfmakeraw(&mut raw);
-        termios::tcsetattr(&fd, SetArg::TCSANOW, &raw)
+        termios::tcsetattr(fd, SetArg::TCSANOW, &raw)
             .map_err(|e| VmError::Exec(format!("tcsetattr: {e}")))?;
         Ok(Self {
             raw_fd: std::os::unix::io::AsRawFd::as_raw_fd(&stdin),
@@ -126,7 +126,7 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let fd = unsafe { BorrowedFd::borrow_raw(self.raw_fd) };
-        let _ = termios::tcsetattr(&fd, SetArg::TCSANOW, &self.original);
+        let _ = termios::tcsetattr(fd, SetArg::TCSANOW, &self.original);
     }
 }
 
@@ -147,25 +147,26 @@ pub fn vm_exec_socket_path(rootfs: &Path) -> PathBuf {
     // secure_socket_base() when the gvproxy socket dir is created; here
     // we just compute the path. The parent directory is created (with
     // permission checks) at launch time via create_dir_all.
-    let base = if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(xdg)
-    } else {
-        let mut base = PathBuf::from("/tmp");
-        if !base.is_dir() {
-            base = std::env::temp_dir();
-        }
-        base
-    };
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
+        || {
+            let mut base = PathBuf::from("/tmp");
+            if !base.is_dir() {
+                base = std::env::temp_dir();
+            }
+            base
+        },
+        PathBuf::from,
+    );
     let dir = base.join("ovm-exec");
     let id = hash_path_id(rootfs);
     dir.join(format!("{id}.sock"))
 }
 
 fn hash_path_id(path: &Path) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in path.to_string_lossy().as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     format!("{:012x}", hash & 0x0000_ffff_ffff_ffff)
 }
@@ -345,14 +346,14 @@ pub fn reset_runtime_state(rootfs: &Path, gateway_name: &str) -> Result<(), VmEr
 /// This function is a no-op if `state.db` does not exist (e.g. first boot or
 /// after a full `--reset`).
 pub fn recover_corrupt_kine_db(rootfs: &Path) -> Result<(), VmError> {
+    // The SQLite file format begins with a 16-byte magic string.
+    // Reference: https://www.sqlite.org/fileformat.html#the_database_header
+    const SQLITE_MAGIC: &[u8] = b"SQLite format 3\x00";
+
     let db_path = rootfs.join("var/lib/rancher/k3s/server/db/state.db");
     if !db_path.exists() {
         return Ok(()); // Nothing to check — first boot or post-reset.
     }
-
-    // The SQLite file format begins with a 16-byte magic string.
-    // Reference: https://www.sqlite.org/fileformat.html#the_database_header
-    const SQLITE_MAGIC: &[u8] = b"SQLite format 3\x00";
 
     // Read only the first 100 bytes (the minimum valid SQLite header size)
     // instead of loading the entire database into memory.
@@ -791,19 +792,18 @@ fn pump_stdin(mut writer: UnixStream, tty: bool) -> Result<(), VmError> {
             break;
         }
 
-        if tty {
-            if let Some(size) = get_terminal_size() {
-                if last_size != Some(size) {
-                    last_size = Some(size);
-                    let _ = send_json_line(
-                        &mut writer,
-                        &ClientFrame::Resize {
-                            cols: size.0,
-                            rows: size.1,
-                        },
-                    );
-                }
-            }
+        if tty
+            && let Some(size) = get_terminal_size()
+            && last_size != Some(size)
+        {
+            last_size = Some(size);
+            let _ = send_json_line(
+                &mut writer,
+                &ClientFrame::Resize {
+                    cols: size.0,
+                    rows: size.1,
+                },
+            );
         }
 
         let frame = ClientFrame::Stdin {
@@ -1015,8 +1015,8 @@ mod tests {
             rows: u16::MAX,
         };
         let json: serde_json::Value = serde_json::to_value(&frame).unwrap();
-        assert_eq!(json["cols"], u16::MAX as u64);
-        assert_eq!(json["rows"], u16::MAX as u64);
+        assert_eq!(json["cols"], u64::from(u16::MAX));
+        assert_eq!(json["rows"], u64::from(u16::MAX));
     }
 
     #[test]
@@ -1069,9 +1069,7 @@ mod tests {
     fn stdin_payload_round_trip() {
         let original = b"echo hello\n";
         let encoded = base64::engine::general_purpose::STANDARD.encode(original);
-        let frame = ClientFrame::Stdin {
-            data: encoded.clone(),
-        };
+        let frame = ClientFrame::Stdin { data: encoded };
         let json = serde_json::to_string(&frame).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let decoded = decode_payload(parsed["data"].as_str().unwrap()).unwrap();
@@ -1102,7 +1100,7 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert!(v["tty"].is_boolean());
-        assert_eq!(v["tty"].as_bool().unwrap(), true);
+        assert!(v["tty"].as_bool().unwrap());
 
         let req_no_tty = ExecRequest {
             argv: vec!["echo".into()],
@@ -1111,7 +1109,7 @@ mod tests {
             tty: false,
         };
         let v: serde_json::Value = serde_json::to_value(&req_no_tty).unwrap();
-        assert_eq!(v["tty"].as_bool().unwrap(), false);
+        assert!(!v["tty"].as_bool().unwrap());
     }
 
     #[test]

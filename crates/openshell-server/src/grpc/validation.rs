@@ -241,11 +241,7 @@ pub(super) fn validate_string_map(
 
 /// Validate field sizes on a `Provider` before persisting.
 pub(super) fn validate_provider_fields(provider: &Provider) -> Result<(), Status> {
-    let name_len = provider
-        .metadata
-        .as_ref()
-        .map(|m| m.name.len())
-        .unwrap_or(0);
+    let name_len = provider.metadata.as_ref().map_or(0, |m| m.name.len());
     if name_len > MAX_NAME_LEN {
         return Err(Status::invalid_argument(format!(
             "provider.name exceeds maximum length ({name_len} > {MAX_NAME_LEN})"
@@ -291,7 +287,7 @@ pub(super) fn validate_provider_fields(provider: &Provider) -> Result<(), Status
 ///
 /// Examples: `app`, `kubernetes.io/app`, `example.com/my-label`
 ///
-/// See: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
+/// See: <https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/>
 pub(super) fn validate_label_key(key: &str) -> Result<(), Status> {
     if key.is_empty() {
         return Err(Status::invalid_argument("label key cannot be empty"));
@@ -401,7 +397,7 @@ pub(super) fn validate_label_key(key: &str) -> Result<(), Status> {
 /// - If non-empty, must contain only alphanumeric, hyphens, underscores, and dots
 /// - If non-empty, must start and end with alphanumeric character
 ///
-/// See: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
+/// See: <https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/>
 pub(super) fn validate_label_value(value: &str) -> Result<(), Status> {
     // Empty values are allowed in Kubernetes
     if value.is_empty() {
@@ -631,8 +627,7 @@ pub(super) fn level_matches(log_level: &str, min_level: &str) -> bool {
     let to_num = |s: &str| match s.to_uppercase().as_str() {
         "ERROR" => 0,
         "WARN" => 1,
-        "INFO" => 2,
-        "OCSF" => 2,
+        "INFO" | "OCSF" => 2,
         "DEBUG" => 3,
         "TRACE" => 4,
         _ => 5, // unknown levels always pass
@@ -877,7 +872,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
                 name: name.to_string(),
-                created_at_ms: 1000000,
+                created_at_ms: 1_000_000,
                 labels: HashMap::new(),
             }),
             r#type: provider_type.to_string(),

@@ -324,7 +324,7 @@ pub fn draw_approve_all_popup(
     let count = chunks.len();
     // Height: header(1) + blank(1) + chunks(count, capped at 12) + blank(1) + hints(1) + borders(2) + padding(1)
     let list_lines = count.min(12);
-    let popup_height = (7 + list_lines) as u16;
+    let popup_height = u16::try_from(7 + list_lines).unwrap_or(u16::MAX);
     let popup_height = popup_height.min(area.height.saturating_sub(4));
     let popup_width = (area.width * 4 / 5).min(area.width.saturating_sub(4));
     let popup_area = centered_rect(popup_width, popup_height, area);

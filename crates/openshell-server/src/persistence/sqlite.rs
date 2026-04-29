@@ -204,7 +204,7 @@ LIMIT ?2 OFFSET ?3
 
                 required_labels
                     .iter()
-                    .all(|(key, value)| labels.get(key).map(|v| v == value).unwrap_or(false))
+                    .all(|(key, value)| labels.get(key).is_some_and(|v| v == value))
             })
             .skip(offset as usize)
             .take(limit as usize)

@@ -41,9 +41,7 @@ fn extract_variant(blob: &[u8], variant: &str, empty_msg: &str, dest: &Path) -> 
     let marker_path = dest.join(ROOTFS_VARIANT_MARKER);
 
     if dest.is_dir()
-        && fs::read_to_string(&marker_path)
-            .map(|value| value.trim() == expected_marker)
-            .unwrap_or(false)
+        && fs::read_to_string(&marker_path).is_ok_and(|value| value.trim() == expected_marker)
     {
         return Ok(());
     }

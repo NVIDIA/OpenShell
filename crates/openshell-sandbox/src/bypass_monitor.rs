@@ -170,17 +170,14 @@ pub fn spawn(
             }
         };
 
-        let stdout = match child.stdout.take() {
-            Some(s) => s,
-            None => {
-                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                    .activity(ActivityId::Other)
-                    .severity(SeverityId::Low)
-                    .message("dmesg --follow produced no stdout; bypass monitor will not run")
-                    .build();
-                ocsf_emit!(event);
-                return;
-            }
+        let Some(stdout) = child.stdout.take() else {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Other)
+                .severity(SeverityId::Low)
+                .message("dmesg --follow produced no stdout; bypass monitor will not run")
+                .build();
+            ocsf_emit!(event);
+            return;
         };
 
         let reader = std::io::BufReader::new(stdout);
@@ -515,6 +512,8 @@ mod tests {
         let (_accepted, _) = listener.accept().expect("accept");
 
         let fd = stream.as_raw_fd();
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFD);
             assert!(flags >= 0, "F_GETFD failed");
@@ -528,9 +527,13 @@ mod tests {
         let sleep_path = CString::new("/bin/sleep").unwrap();
         let arg0 = CString::new("sleep").unwrap();
         let arg1 = CString::new("30").unwrap();
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
         let child_pid = unsafe { libc::fork() };
         assert!(child_pid >= 0, "fork failed");
         if child_pid == 0 {
+            // libc/syscall FFI requires unsafe
+            #[allow(unsafe_code)]
             unsafe {
                 libc::execl(
                     sleep_path.as_ptr(),
@@ -558,6 +561,8 @@ mod tests {
 
         let (binary, pid, ancestors) = resolve_process_identity(std::process::id(), peer_port);
 
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
         unsafe {
             libc::kill(child_pid, libc::SIGKILL);
             libc::waitpid(child_pid, std::ptr::null_mut(), 0);

@@ -60,10 +60,10 @@ where
         }
 
         // If an enabled flag is set and it reads `false`, skip writing.
-        if let Some(ref flag) = self.enabled {
-            if !flag.load(Ordering::Relaxed) {
-                return;
-            }
+        if let Some(ref flag) = self.enabled
+            && !flag.load(Ordering::Relaxed)
+        {
+            return;
         }
 
         if let Some(ocsf_event) = clone_current_event()

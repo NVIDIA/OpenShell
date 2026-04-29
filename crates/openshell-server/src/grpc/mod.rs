@@ -3,7 +3,7 @@
 
 //! gRPC service implementation.
 
-pub(crate) mod policy;
+pub mod policy;
 mod provider;
 mod sandbox;
 mod validation;
@@ -119,7 +119,9 @@ fn current_time_ms() -> Result<i64, std::time::SystemTimeError> {
 ///
 /// This is a crate-level helper that wraps the validation module's implementation.
 /// Use this from modules outside of `grpc` that need to validate metadata.
-pub(crate) fn validate_object_metadata(
+// `tonic::Status` is large but is the API surface of gRPC handlers.
+#[allow(clippy::result_large_err)]
+pub fn validate_object_metadata(
     metadata: Option<&openshell_core::proto::datamodel::v1::ObjectMeta>,
     resource_type: &str,
 ) -> Result<(), Status> {

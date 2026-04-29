@@ -129,7 +129,7 @@ impl BinaryCapability {
 
     /// Whether the binary can perform write actions.
     pub fn can_write(&self) -> bool {
-        self.protocols.iter().any(|p| p.can_write()) || self.can_construct_http
+        self.protocols.iter().any(BinaryProtocol::can_write) || self.can_construct_http
     }
 
     /// Short mechanisms by which this binary can write.
@@ -170,12 +170,11 @@ impl BinaryRegistry {
             return cap.clone();
         }
         for (reg_path, cap) in &self.binaries {
-            if reg_path.contains('*') {
-                if let Ok(pattern) = glob::Pattern::new(reg_path) {
-                    if pattern.matches(path) {
-                        return cap.clone();
-                    }
-                }
+            if reg_path.contains('*')
+                && let Ok(pattern) = glob::Pattern::new(reg_path)
+                && pattern.matches(path)
+            {
+                return cap.clone();
             }
         }
         BinaryCapability {
