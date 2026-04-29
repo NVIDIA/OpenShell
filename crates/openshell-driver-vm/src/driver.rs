@@ -46,6 +46,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+use tracing::{info, warn};
 use url::{Host, Url};
 
 const DRIVER_NAME: &str = "openshell-driver-vm";
@@ -345,6 +346,11 @@ impl VmDriver {
     // gRPC API surface; boxing here would diverge from every other handler.
     #[allow(clippy::result_large_err)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<CreateSandboxResponse, Status> {
+        info!(
+            sandbox_id = %sandbox.id,
+            sandbox_name = %sandbox.name,
+            "vm driver: create_sandbox received"
+        );
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)?;
 
         if self.registry.lock().await.contains_key(&sandbox.id) {
@@ -362,6 +368,12 @@ impl VmDriver {
                 "vm sandboxes require template.image or a configured default sandbox image",
             )
         })?;
+        info!(
+            sandbox_id = %sandbox.id,
+            image_ref = %image_ref,
+            state_dir = %state_dir.display(),
+            "vm driver: resolved image ref, preparing rootfs"
+        );
 
         tokio::fs::create_dir_all(&state_dir)
             .await
@@ -371,9 +383,34 @@ impl VmDriver {
             .config
             .tls_paths()
             .map_err(Status::failed_precondition)?;
-        let image_identity = match self.prepare_runtime_rootfs(&image_ref, &rootfs).await {
-            Ok(image_identity) => image_identity,
+        // Mirror the K8s `Scheduled` event so the CLI can complete the
+        // "Requesting sandbox" step and switch the spinner over to the
+        // image-pull phase before we block on the registry.
+        self.publish_platform_event(
+            sandbox.id.clone(),
+            platform_event(
+                "vm",
+                "Normal",
+                "Scheduled",
+                format!("Sandbox accepted by vm driver to image \"{image_ref}\""),
+            ),
+        );
+
+        let image_identity = match self.prepare_runtime_rootfs(&sandbox.id, &image_ref, &rootfs).await {
+            Ok(image_identity) => {
+                info!(
+                    sandbox_id = %sandbox.id,
+                    image_identity = %image_identity,
+                    "vm driver: rootfs prepared"
+                );
+                image_identity
+            }
             Err(err) => {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    error = %err.message(),
+                    "vm driver: rootfs preparation failed"
+                );
                 let _ = tokio::fs::remove_dir_all(&state_dir).await;
                 return Err(err);
             }
@@ -507,9 +544,20 @@ impl VmDriver {
             command.arg("--vm-env").arg(env);
         }
 
+        info!(
+            sandbox_id = %sandbox.id,
+            launcher = %self.launcher_bin.display(),
+            console_output = %console_output.display(),
+            "vm driver: spawning VM launcher"
+        );
         let child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    error = %err,
+                    "vm driver: launcher spawn failed"
+                );
                 if gpu_bdf.is_some() {
                     self.release_gpu_and_subnet(&sandbox.id);
                 }
@@ -520,6 +568,23 @@ impl VmDriver {
                 )));
             }
         };
+        info!(
+            sandbox_id = %sandbox.id,
+            launcher_pid = child.id().unwrap_or(0),
+            "vm driver: launcher spawned"
+        );
+        // Mirror the K8s `Started` event so the CLI can complete the
+        // "Starting sandbox" step. The supervisor-ready transition still
+        // promotes the sandbox to `Ready` separately.
+        self.publish_platform_event(
+            sandbox.id.clone(),
+            platform_event(
+                "vm",
+                "Normal",
+                "Started",
+                "Started VM launcher".to_string(),
+            ),
+        );
         let snapshot = sandbox_snapshot(sandbox, provisioning_condition(), false);
         let process = Arc::new(Mutex::new(VmProcess {
             child,
@@ -665,10 +730,13 @@ impl VmDriver {
 
     async fn prepare_runtime_rootfs(
         &self,
+        sandbox_id: &str,
         image_ref: &str,
         rootfs: &Path,
     ) -> Result<String, Status> {
-        let image_identity = self.ensure_cached_image_rootfs_archive(image_ref).await?;
+        let image_identity = self
+            .ensure_cached_image_rootfs_archive(sandbox_id, image_ref)
+            .await?;
         let archive_path = image_cache_rootfs_archive(&self.config.state_dir, &image_identity);
         let rootfs_dest = rootfs.to_path_buf();
         tokio::task::spawn_blocking(move || extract_rootfs_archive_to(&archive_path, &rootfs_dest))
@@ -688,16 +756,22 @@ impl VmDriver {
             })
     }
 
-    async fn ensure_cached_image_rootfs_archive(&self, image_ref: &str) -> Result<String, Status> {
+    async fn ensure_cached_image_rootfs_archive(
+        &self,
+        sandbox_id: &str,
+        image_ref: &str,
+    ) -> Result<String, Status> {
         if let Some(rootfs_tar_path) = decode_rootfs_tar_image_ref(image_ref) {
             return self
                 .ensure_cached_rootfs_tar_image_rootfs_archive(image_ref, &rootfs_tar_path)
                 .await;
         }
 
+        info!(image_ref = %image_ref, "vm driver: ensuring cached image rootfs archive (registry)");
         let reference = parse_registry_reference(image_ref)?;
         let client = registry_client();
         let auth = registry_auth(image_ref)?;
+        info!(image_ref = %image_ref, "vm driver: authenticating with registry");
         client
             .auth(&reference, &auth, RegistryOperation::Pull)
             .await
@@ -706,6 +780,7 @@ impl VmDriver {
                     "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
                 ))
             })?;
+        info!(image_ref = %image_ref, "vm driver: fetching manifest digest");
         let image_identity = client
             .fetch_manifest_digest(&reference, &auth)
             .await
@@ -714,18 +789,59 @@ impl VmDriver {
                     "failed to resolve vm sandbox image '{image_ref}': {err}"
                 ))
             })?;
+        info!(
+            image_ref = %image_ref,
+            image_identity = %image_identity,
+            "vm driver: manifest digest resolved"
+        );
         let archive_path = image_cache_rootfs_archive(&self.config.state_dir, &image_identity);
 
+        // Mirror the K8s `Pulling` event so the CLI flips to the
+        // image-pull spinner with the image name as detail. We emit it
+        // for cache hits too and immediately follow with `Pulled` so the
+        // spinner step still advances cleanly.
+        self.publish_platform_event(
+            sandbox_id.to_string(),
+            platform_event(
+                "vm",
+                "Normal",
+                "Pulling",
+                format!("Pulling image \"{image_ref}\""),
+            ),
+        );
+
         if tokio::fs::metadata(&archive_path).await.is_ok() {
+            info!(
+                image_identity = %image_identity,
+                archive_path = %archive_path.display(),
+                "vm driver: image rootfs archive cache hit (no build needed)"
+            );
+            self.publish_pulled_event(sandbox_id, image_ref, &archive_path)
+                .await;
             return Ok(image_identity);
         }
 
+        info!(
+            image_identity = %image_identity,
+            "vm driver: image rootfs archive cache miss, acquiring build lock"
+        );
         let _cache_guard = self.image_cache_lock.lock().await;
+        info!(
+            image_identity = %image_identity,
+            "vm driver: build lock acquired"
+        );
         if tokio::fs::metadata(&archive_path).await.is_ok() {
+            info!(
+                image_identity = %image_identity,
+                "vm driver: image rootfs archive cache hit after lock (built by another task)"
+            );
+            self.publish_pulled_event(sandbox_id, image_ref, &archive_path)
+                .await;
             return Ok(image_identity);
         }
 
         self.build_cached_registry_image_rootfs_archive(
+            sandbox_id,
             &client,
             &reference,
             &auth,
@@ -733,6 +849,8 @@ impl VmDriver {
             &image_identity,
         )
         .await?;
+        self.publish_pulled_event(sandbox_id, image_ref, &archive_path)
+            .await;
         Ok(image_identity)
     }
 
@@ -848,6 +966,7 @@ impl VmDriver {
 
     async fn build_cached_registry_image_rootfs_archive(
         &self,
+        sandbox_id: &str,
         client: &OciClient,
         reference: &Reference,
         auth: &RegistryAuth,
@@ -882,19 +1001,35 @@ impl VmDriver {
                 Status::internal(format!("create image cache staging dir failed: {err}"))
             })?;
 
-        if let Err(err) = pull_registry_image_rootfs(
-            client,
-            reference,
-            auth,
-            image_ref,
-            &staging_dir,
-            &prepared_rootfs,
-        )
-        .await
+        info!(
+            image_ref = %image_ref,
+            staging_dir = %staging_dir.display(),
+            "vm driver: pulling registry image layers"
+        );
+        if let Err(err) = self
+            .pull_registry_image_rootfs(
+                sandbox_id,
+                client,
+                reference,
+                auth,
+                image_ref,
+                &staging_dir,
+                &prepared_rootfs,
+            )
+            .await
         {
+            warn!(
+                image_ref = %image_ref,
+                error = %err.message(),
+                "vm driver: pull_registry_image_rootfs failed"
+            );
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             return Err(err);
         }
+        info!(
+            image_ref = %image_ref,
+            "vm driver: image layers pulled, preparing rootfs archive"
+        );
 
         let image_ref_owned = image_ref.to_string();
         let image_identity_owned = image_identity.to_string();
@@ -917,11 +1052,20 @@ impl VmDriver {
         .map_err(|err| Status::internal(format!("image rootfs preparation panicked: {err}")))?;
 
         if let Err(err) = build_result {
+            warn!(
+                image_ref = %image_ref,
+                error = %err,
+                "vm driver: rootfs archive build failed"
+            );
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             return Err(Status::failed_precondition(err));
         }
 
         if tokio::fs::metadata(&archive_path).await.is_ok() {
+            info!(
+                image_identity = %image_identity,
+                "vm driver: another task wrote archive while we were building, discarding ours"
+            );
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             return Ok(());
         }
@@ -929,6 +1073,11 @@ impl VmDriver {
         tokio::fs::rename(&prepared_archive, &archive_path)
             .await
             .map_err(|err| Status::internal(format!("store cached image rootfs failed: {err}")))?;
+        info!(
+            image_identity = %image_identity,
+            archive_path = %archive_path.display(),
+            "vm driver: image rootfs archive committed to cache"
+        );
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         Ok(())
     }
@@ -1338,52 +1487,111 @@ fn image_reference_registry_host(image_ref: &str) -> &str {
     }
 }
 
-async fn pull_registry_image_rootfs(
-    client: &OciClient,
-    reference: &Reference,
-    auth: &RegistryAuth,
-    image_ref: &str,
-    staging_dir: &Path,
-    rootfs: &Path,
-) -> Result<(), Status> {
-    client
-        .auth(reference, auth, RegistryOperation::Pull)
-        .await
-        .map_err(|err| {
-            Status::failed_precondition(format!(
-                "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
-            ))
-        })?;
-    let (manifest, _) = client
-        .pull_image_manifest(reference, auth)
-        .await
-        .map_err(|err| {
-            Status::failed_precondition(format!(
-                "failed to pull vm sandbox image manifest '{image_ref}': {err}"
-            ))
-        })?;
+impl VmDriver {
+    async fn pull_registry_image_rootfs(
+        &self,
+        sandbox_id: &str,
+        client: &OciClient,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        image_ref: &str,
+        staging_dir: &Path,
+        rootfs: &Path,
+    ) -> Result<(), Status> {
+        client
+            .auth(reference, auth, RegistryOperation::Pull)
+            .await
+            .map_err(|err| {
+                Status::failed_precondition(format!(
+                    "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
+                ))
+            })?;
+        let (manifest, _) = client
+            .pull_image_manifest(reference, auth)
+            .await
+            .map_err(|err| {
+                Status::failed_precondition(format!(
+                    "failed to pull vm sandbox image manifest '{image_ref}': {err}"
+                ))
+            })?;
 
-    tokio::fs::create_dir_all(rootfs)
-        .await
-        .map_err(|err| Status::internal(format!("create rootfs dir failed: {err}")))?;
-    tokio::fs::create_dir_all(staging_dir.join("layers"))
-        .await
-        .map_err(|err| Status::internal(format!("create layer staging dir failed: {err}")))?;
+        tokio::fs::create_dir_all(rootfs)
+            .await
+            .map_err(|err| Status::internal(format!("create rootfs dir failed: {err}")))?;
+        tokio::fs::create_dir_all(staging_dir.join("layers"))
+            .await
+            .map_err(|err| Status::internal(format!("create layer staging dir failed: {err}")))?;
 
-    for (index, layer) in manifest.layers.iter().enumerate() {
-        pull_registry_layer(
-            client,
-            reference,
-            image_ref,
-            staging_dir,
-            rootfs,
-            layer,
-            index,
-        )
-        .await?;
+        let total_layers = manifest.layers.len();
+        let total_bytes: i64 = manifest
+            .layers
+            .iter()
+            .map(|layer| layer.size.max(0))
+            .sum();
+        for (index, layer) in manifest.layers.iter().enumerate() {
+            // Emit a per-layer progress event so the CLI can show
+            // "Layer 3/8 (12.4 MB)" as detail under the spinner.
+            let mut metadata = HashMap::new();
+            metadata.insert("layer_index".to_string(), (index + 1).to_string());
+            metadata.insert("layer_total".to_string(), total_layers.to_string());
+            metadata.insert("layer_digest".to_string(), layer.digest.clone());
+            metadata.insert("layer_size_bytes".to_string(), layer.size.to_string());
+            metadata.insert("image_ref".to_string(), image_ref.to_string());
+            if total_bytes > 0 {
+                metadata.insert("image_size_bytes".to_string(), total_bytes.to_string());
+            }
+            let mut event = platform_event(
+                "vm",
+                "Normal",
+                "PullingLayer",
+                format!(
+                    "Pulling layer {}/{} ({} bytes) for image \"{image_ref}\"",
+                    index + 1,
+                    total_layers,
+                    layer.size
+                ),
+            );
+            event.metadata = metadata;
+            self.publish_platform_event(sandbox_id.to_string(), event);
+
+            pull_registry_layer(
+                client,
+                reference,
+                image_ref,
+                staging_dir,
+                rootfs,
+                layer,
+                index,
+            )
+            .await?;
+        }
+
+        Ok(())
     }
 
-    Ok(())
+    /// Emit a `Pulled` platform event with a message that mirrors the
+    /// kubelet's `Successfully pulled image ... Image size: N bytes.`
+    /// format so the CLI's `extract_image_size` parser works unchanged.
+    async fn publish_pulled_event(
+        &self,
+        sandbox_id: &str,
+        image_ref: &str,
+        archive_path: &Path,
+    ) {
+        let size_suffix = match tokio::fs::metadata(archive_path).await {
+            Ok(meta) => format!(" Image size: {} bytes.", meta.len()),
+            Err(_) => String::new(),
+        };
+        self.publish_platform_event(
+            sandbox_id.to_string(),
+            platform_event(
+                "vm",
+                "Normal",
+                "Pulled",
+                format!("Successfully pulled image \"{image_ref}\".{size_suffix}"),
+            ),
+        );
+    }
 }
 
 async fn pull_registry_layer(

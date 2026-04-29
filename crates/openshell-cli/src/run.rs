@@ -194,6 +194,45 @@ enum KubeEventReason {
     Started,
 }
 
+/// Decide whether a server/driver log line should be surfaced during
+/// `sandbox create` provisioning.
+///
+/// Defaults to a curated allowlist so the spinner stays focused on
+/// meaningful progress. Set `OPENSHELL_PROVISION_VERBOSE=1` to surface
+/// every log line (helpful when debugging stuck provisioning, e.g. on
+/// the experimental VM gateway).
+fn should_show_provisioning_log(line: &openshell_core::proto::SandboxLogLine) -> bool {
+    if std::env::var("OPENSHELL_PROVISION_VERBOSE")
+        .map(|v| !v.is_empty() && v != "0" && v.to_ascii_lowercase() != "false")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    // Always surface warnings and errors during provisioning.
+    let level = line.level.to_ascii_lowercase();
+    if matches!(level.as_str(), "warn" | "warning" | "error") {
+        return true;
+    }
+
+    // Allowlisted substrings for info-level progress lines emitted by
+    // the server compute layer and bundled drivers (VM / Docker). Keep
+    // this short — anything not matching is suppressed by default.
+    const ALLOWLIST: &[&str] = &[
+        "Sandbox phase changed",
+        "Pulling image",
+        "Pulled image",
+        "Extracting",
+        "Preparing rootfs",
+        "Booting VM",
+        "Starting VM",
+        "Starting sandbox",
+        "Sandbox ready",
+        "Supervisor connected",
+    ];
+    ALLOWLIST.iter().any(|needle| line.message.contains(needle))
+}
+
 /// Map a Kubernetes event reason string to an enum.
 fn parse_kube_event_reason(reason: &str) -> Option<KubeEventReason> {
     match reason {
@@ -2301,6 +2340,36 @@ pub async fn sandbox_create(
                 // Detect gateway readiness from log messages.
                 if !saw_gateway_ready && line.message.contains("listening") {
                     saw_gateway_ready = true;
+                }
+
+                // Surface log lines as progress so users aren't staring at a
+                // silent spinner while non-Kubernetes drivers (VM, Docker) do
+                // their work. Drivers/server tracing with a `sandbox_id`
+                // field flows through here as Log payloads.
+                //
+                // The default filter keeps output focused on user-relevant
+                // progress: warn/error always, plus a curated allowlist of
+                // info messages. Set OPENSHELL_PROVISION_VERBOSE=1 to see
+                // every log line during provisioning.
+                if !line.message.is_empty() && should_show_provisioning_log(&line) {
+                    if let Some(d) = display.as_mut() {
+                        // Interactive: tuck the message under the spinner
+                        // as detail so the checklist stays clean.
+                        d.set_active_detail(&line.message);
+                    } else {
+                        let ts = format_timestamp(provision_start.elapsed());
+                        let level = if line.level.is_empty() {
+                            "INFO".to_string()
+                        } else {
+                            line.level.to_uppercase()
+                        };
+                        eprintln!(
+                            "  {} {} {}",
+                            ts.dimmed(),
+                            level.dimmed(),
+                            line.message,
+                        );
+                    }
                 }
             }
             Some(openshell_core::proto::sandbox_stream_event::Payload::Event(ev)) => {
