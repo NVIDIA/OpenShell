@@ -1923,6 +1923,7 @@ pub async fn sandbox_create_with_bootstrap(
     upload: Option<&(String, Option<String>, bool)>,
     keep: bool,
     gpu: bool,
+    gpu_ids: &[String],
     editor: Option<Editor>,
     remote: Option<&str>,
     ssh_key: Option<&str>,
@@ -1954,6 +1955,7 @@ pub async fn sandbox_create_with_bootstrap(
         upload,
         keep,
         gpu,
+        gpu_ids,
         editor,
         remote,
         ssh_key,
@@ -2010,6 +2012,7 @@ pub async fn sandbox_create(
     upload: Option<&(String, Option<String>, bool)>,
     keep: bool,
     gpu: bool,
+    gpu_ids: &[String],
     editor: Option<Editor>,
     remote: Option<&str>,
     ssh_key: Option<&str>,
@@ -2116,7 +2119,9 @@ pub async fn sandbox_create(
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
-            gpu: requested_gpu.then(GpuSpec::default),
+            gpu: requested_gpu.then(|| GpuSpec {
+                device_ids: gpu_ids.to_vec(),
+            }),
             policy,
             providers: configured_providers,
             template,

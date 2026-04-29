@@ -309,12 +309,29 @@ fn build_resource_limits(sandbox: &DriverSandbox) -> ResourceLimits {
 
 /// Build CDI GPU device list if GPU is requested.
 fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
-    if sandbox.spec.as_ref().is_some_and(|s| s.gpu.is_some()) {
-        Some(vec![LinuxDevice {
-            path: CDI_GPU_DEVICE_ALL.into(),
-        }])
+    let gpu = sandbox.spec.as_ref().and_then(|s| s.gpu.as_ref())?;
+    let device_ids = if gpu.device_ids.is_empty() {
+        vec![CDI_GPU_DEVICE_ALL.to_string()]
     } else {
-        None
+        gpu.device_ids
+            .iter()
+            .map(|id| normalize_cdi_gpu_device_id(id))
+            .collect()
+    };
+    Some(
+        device_ids
+            .into_iter()
+            .map(|path| LinuxDevice { path })
+            .collect(),
+    )
+}
+
+fn normalize_cdi_gpu_device_id(id: &str) -> String {
+    let id = id.trim();
+    if id.contains('/') && id.contains('=') {
+        id.to_string()
+    } else {
+        format!("nvidia.com/gpu={id}")
     }
 }
 

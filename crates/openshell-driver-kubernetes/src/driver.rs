@@ -193,7 +193,13 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
-        let gpu_requested = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu.is_some());
+        let gpu = sandbox.spec.as_ref().and_then(|spec| spec.gpu.as_ref());
+        if gpu.is_some_and(|gpu| !gpu.device_ids.is_empty()) {
+            return Err(tonic::Status::invalid_argument(
+                "kubernetes compute driver does not support gpu.device_ids",
+            ));
+        }
+        let gpu_requested = gpu.is_some();
         if gpu_requested
             && !self.has_gpu_capacity().await.map_err(|err| {
                 tonic::Status::internal(format!("check GPU node capacity failed: {err}"))

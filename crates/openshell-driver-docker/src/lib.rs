@@ -260,6 +260,13 @@ impl DockerComputeDriver {
                 "docker sandboxes require a template image",
             ));
         }
+        if let Some(gpu) = spec.gpu.as_ref()
+            && gpu.device_ids.iter().any(|id| id.trim().is_empty())
+        {
+            return Err(Status::invalid_argument(
+                "gpu.device_ids cannot contain empty IDs",
+            ));
+        }
         if spec.gpu.is_some() && !config.cdi_enabled {
             return Err(Status::failed_precondition(
                 "docker GPU sandboxes require Docker CDI support. Enable CDI on the Docker daemon, then restart the OpenShell gateway/server so GPU capability is detected.",
@@ -886,14 +893,44 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         .collect()
 }
 
-fn docker_gpu_device_requests(gpu: Option<&GpuSpec>) -> Option<Vec<DeviceRequest>> {
-    gpu.map(|_| {
-        vec![DeviceRequest {
-            driver: Some("cdi".to_string()),
-            device_ids: Some(vec![CDI_GPU_DEVICE_ALL.to_string()]),
-            ..Default::default()
-        }]
-    })
+fn normalize_cdi_gpu_device_id(id: &str) -> Result<String, Status> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(Status::invalid_argument(
+            "gpu.device_ids cannot contain empty IDs",
+        ));
+    }
+    if id.contains('/') && id.contains('=') {
+        Ok(id.to_string())
+    } else {
+        Ok(format!("nvidia.com/gpu={id}"))
+    }
+}
+
+fn docker_gpu_device_ids(gpu: Option<&GpuSpec>) -> Result<Option<Vec<String>>, Status> {
+    let Some(gpu) = gpu else {
+        return Ok(None);
+    };
+    if gpu.device_ids.is_empty() {
+        return Ok(Some(vec![CDI_GPU_DEVICE_ALL.to_string()]));
+    }
+
+    gpu.device_ids
+        .iter()
+        .map(|id| normalize_cdi_gpu_device_id(id))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn docker_gpu_device_requests(gpu: Option<&GpuSpec>) -> Result<Option<Vec<DeviceRequest>>, Status> {
+    let Some(device_ids) = docker_gpu_device_ids(gpu)? else {
+        return Ok(None);
+    };
+    Ok(Some(vec![DeviceRequest {
+        driver: Some("cdi".to_string()),
+        device_ids: Some(device_ids),
+        ..Default::default()
+    }]))
 }
 
 fn build_container_create_body(
@@ -937,7 +974,7 @@ fn build_container_create_body(
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
-            device_requests: docker_gpu_device_requests(spec.gpu.as_ref()),
+            device_requests: docker_gpu_device_requests(spec.gpu.as_ref())?,
             mounts: Some(build_mounts(config)),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),

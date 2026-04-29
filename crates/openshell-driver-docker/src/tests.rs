@@ -215,6 +215,53 @@ fn build_container_create_body_maps_gpu_to_all_cdi_device() {
 }
 
 #[test]
+fn build_container_create_body_normalizes_gpu_ids_to_cdi_devices() {
+    let mut config = runtime_config();
+    config.cdi_enabled = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().gpu = Some(GpuSpec {
+        device_ids: vec![
+            "0".to_string(),
+            "GPU-deadbeef".to_string(),
+            "nvidia.com/gpu=2".to_string(),
+        ],
+    });
+
+    let create_body = build_container_create_body(&sandbox, &config).unwrap();
+    let request = create_body
+        .host_config
+        .as_ref()
+        .and_then(|host_config| host_config.device_requests.as_ref())
+        .and_then(|requests| requests.first())
+        .expect("GPU request should add a Docker device request");
+
+    assert_eq!(request.driver.as_deref(), Some("cdi"));
+    assert_eq!(
+        request.device_ids.as_ref().unwrap(),
+        &vec![
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=GPU-deadbeef".to_string(),
+            "nvidia.com/gpu=2".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn build_container_create_body_rejects_empty_gpu_ids() {
+    let mut config = runtime_config();
+    config.cdi_enabled = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().gpu = Some(GpuSpec {
+        device_ids: vec![" ".to_string()],
+    });
+
+    let err = build_container_create_body(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("empty IDs"));
+}
+
+#[test]
 fn require_sandbox_identifier_rejects_when_id_and_name_are_empty() {
     // Regression test: `delete_sandbox` (and the other identifier-keyed
     // RPCs) must refuse requests where both the id and the name are

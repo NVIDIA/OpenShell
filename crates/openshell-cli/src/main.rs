@@ -1138,6 +1138,11 @@ enum SandboxCommands {
         #[arg(long)]
         gpu: bool,
 
+        /// Request a specific GPU CDI device ID for the sandbox.
+        /// May be passed more than once. Only valid with --gpu.
+        #[arg(long = "gpu-id", requires = "gpu")]
+        gpu_ids: Vec<String>,
+
         /// SSH destination for remote bootstrap (e.g., user@hostname).
         /// Only used when no cluster exists yet; ignored if a cluster is
         /// already active.
@@ -2307,6 +2312,7 @@ async fn main() -> Result<()> {
                     no_keep,
                     editor,
                     gpu,
+                    gpu_ids,
                     remote,
                     ssh_key,
                     providers,
@@ -2402,6 +2408,7 @@ async fn main() -> Result<()> {
                                 upload_spec.as_ref(),
                                 keep,
                                 gpu,
+                                &gpu_ids,
                                 editor,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
@@ -2425,6 +2432,7 @@ async fn main() -> Result<()> {
                                 upload_spec.as_ref(),
                                 keep,
                                 gpu,
+                                &gpu_ids,
                                 editor,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
@@ -3458,6 +3466,42 @@ mod tests {
             } else {
                 panic!("expected SandboxCommands::Create");
             }
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_id_requires_gpu_flag() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu-id", "0"]);
+
+        assert!(
+            result.is_err(),
+            "sandbox create --gpu-id should require --gpu"
+        );
+    }
+
+    #[test]
+    fn sandbox_create_gpu_id_is_repeatable() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--gpu",
+            "--gpu-id",
+            "0",
+            "--gpu-id",
+            "nvidia.com/gpu=1",
+        ])
+        .expect("sandbox create --gpu --gpu-id should parse");
+
+        if let Some(Commands::Sandbox {
+            command: Some(SandboxCommands::Create { gpu, gpu_ids, .. }),
+            ..
+        }) = cli.command
+        {
+            assert!(gpu);
+            assert_eq!(gpu_ids, vec!["0", "nvidia.com/gpu=1"]);
+        } else {
+            panic!("expected SandboxCommands::Create");
         }
     }
 

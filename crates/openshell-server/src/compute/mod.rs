@@ -1112,8 +1112,10 @@ fn driver_sandbox_spec_from_public(spec: &SandboxSpec) -> DriverSandboxSpec {
     }
 }
 
-fn driver_gpu_spec_from_public(_gpu: &PublicGpuSpec) -> DriverGpuSpec {
-    DriverGpuSpec::default()
+fn driver_gpu_spec_from_public(gpu: &PublicGpuSpec) -> DriverGpuSpec {
+    DriverGpuSpec {
+        device_ids: gpu.device_ids.clone(),
+    }
 }
 
 fn driver_sandbox_template_from_public(template: &SandboxTemplate) -> DriverSandboxTemplate {

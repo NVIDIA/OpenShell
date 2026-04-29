@@ -462,13 +462,13 @@ Kernel-level error behavior (e.g., Landlock ABI unavailable) depends on `Landloc
 
 **GPU baseline paths**: The supervisor currently infers GPU baseline paths from
 device nodes and NVIDIA runtime paths visible inside the sandbox container. The
-Docker compute driver can request CDI GPU injection, but this implementation
-does not pass CDI metadata into the supervisor. Future device-specific CDI
-selection may need follow-up work so the supervisor can enrich Landlock using
-the requested CDI device's actual device nodes and mounted library paths. That
-design must work for remote Docker daemons, where Docker-reported CDI spec
-directories are paths on the daemon host and may not be readable by the gateway
-process or the sandbox supervisor.
+Docker compute driver can request specific CDI devices, but this implementation
+does not pass CDI metadata into the supervisor. Non-standard CDI platforms may
+need follow-up work so the supervisor can enrich Landlock using the requested
+CDI device's actual device nodes and mounted library paths. That design must
+work for remote Docker daemons, where Docker-reported CDI spec directories are
+paths on the daemon host and may not be readable by the gateway process or the
+sandbox supervisor.
 
 ### Seccomp syscall filtering
 

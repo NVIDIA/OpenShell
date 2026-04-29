@@ -75,7 +75,11 @@ message DriverSandbox {
 }
 
 // GPU resource requirements for a sandbox.
-message GpuSpec {}
+message GpuSpec {
+  // Optional specific device IDs to pin.
+  // Drivers define the accepted ID formats.
+  repeated string device_ids = 1;
+}
 
 // Driver-owned provisioning inputs required to create a sandbox.
 message DriverSandboxSpec {
