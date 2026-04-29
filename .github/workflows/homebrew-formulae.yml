@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Update Homebrew Formulae
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - Release Tag
+      - Release Dev
+      - Release VM Dev
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+concurrency:
+  group: homebrew-formulae
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  update:
+    name: Update Formulae
+    if: github.repository == 'NVIDIA/OpenShell' && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.10.12"
+
+      - name: Render formulae
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UV_NO_SYNC: "1"
+        run: uv run python tasks/scripts/homebrew/update_formulae.py
+
+      - name: Commit formula updates
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Formula/openshell.rb Formula/openshell-dev.rb; then
+            echo "Formulae are already up to date."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/openshell.rb Formula/openshell-dev.rb
+          git commit -m "chore(homebrew): update formulae [skip ci]"
+          git push origin HEAD:main
