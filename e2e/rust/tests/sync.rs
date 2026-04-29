@@ -261,26 +261,31 @@ async fn upload_respects_gitignore_by_default() {
         .await
         .expect("download filtered upload");
 
+    // Filtered uploads of a directory preserve the source basename, so
+    // contents land under `<download>/repo/...` (matches `openshell sandbox
+    // upload <dir> <dest>` semantics from the unfiltered path).
+    let uploaded_root = download_dir.join("repo");
+
     // tracked.txt should be present.
-    let tracked = fs::read_to_string(download_dir.join("tracked.txt"))
+    let tracked = fs::read_to_string(uploaded_root.join("tracked.txt"))
         .expect("tracked.txt should exist after filtered upload");
     assert_eq!(tracked, "i-am-tracked", "tracked.txt content mismatch");
 
     // .gitignore itself should be present (it's tracked).
     assert!(
-        download_dir.join(".gitignore").exists(),
+        uploaded_root.join(".gitignore").exists(),
         ".gitignore should be uploaded (it's a tracked file)"
     );
 
     // ignored.log should NOT be present.
     assert!(
-        !download_dir.join("ignored.log").exists(),
+        !uploaded_root.join("ignored.log").exists(),
         "ignored.log should be filtered out by .gitignore"
     );
 
     // build/ directory should NOT be present.
     assert!(
-        !download_dir.join("build").exists(),
+        !uploaded_root.join("build").exists(),
         "build/ directory should be filtered out by .gitignore"
     );
 
