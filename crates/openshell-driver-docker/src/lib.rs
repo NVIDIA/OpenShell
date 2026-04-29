@@ -249,7 +249,7 @@ impl DockerComputeDriver {
                 "docker sandboxes require a template image",
             ));
         }
-        if spec.gpu {
+        if spec.gpu.is_some() {
             return Err(Status::failed_precondition(
                 "docker compute driver does not support gpu sandboxes",
             ));

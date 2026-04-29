@@ -309,7 +309,7 @@ fn build_resource_limits(sandbox: &DriverSandbox) -> ResourceLimits {
 
 /// Build CDI GPU device list if GPU is requested.
 fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
-    if sandbox.spec.as_ref().is_some_and(|s| s.gpu) {
+    if sandbox.spec.as_ref().is_some_and(|s| s.gpu.is_some()) {
         Some(vec![LinuxDevice {
             path: CDI_GPU_DEVICE_ALL.into(),
         }])

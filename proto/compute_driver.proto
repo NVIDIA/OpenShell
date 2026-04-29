@@ -74,6 +74,9 @@ message DriverSandbox {
   DriverSandboxStatus status = 5;
 }
 
+// GPU resource requirements for a sandbox.
+message GpuSpec {}
+
 // Driver-owned provisioning inputs required to create a sandbox.
 message DriverSandboxSpec {
   // Log level exposed to processes running inside the sandbox.
@@ -82,8 +85,8 @@ message DriverSandboxSpec {
   map<string, string> environment = 5;
   // Runtime template consumed by the driver during provisioning.
   DriverSandboxTemplate template = 6;
-  // Request NVIDIA GPU resources for this sandbox.
-  bool gpu = 9;
+  // Request GPU resources for this sandbox.
+  GpuSpec gpu = 9;
 }
 
 // Driver-owned runtime template consumed by the compute platform.

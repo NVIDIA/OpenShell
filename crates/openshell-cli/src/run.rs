@@ -27,7 +27,7 @@ use openshell_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
     ExecSandboxRequest, GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GpuSpec, HealthRequest, ListProvidersRequest,
     ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource, PolicyStatus, Provider,
     RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
     SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
@@ -2116,7 +2116,7 @@ pub async fn sandbox_create(
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
-            gpu: requested_gpu,
+            gpu: requested_gpu.then(GpuSpec::default),
             policy,
             providers: configured_providers,
             template,

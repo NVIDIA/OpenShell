@@ -183,7 +183,7 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
-        let gpu_requested = sandbox.spec.as_ref().is_some_and(|s| s.gpu);
+        let gpu_requested = sandbox.spec.as_ref().is_some_and(|s| s.gpu.is_some());
         if gpu_requested && !self.has_gpu_capacity() {
             return Err(ComputeDriverError::Precondition(
                 "GPU sandbox requested, but no NVIDIA GPU devices are available.".to_string(),

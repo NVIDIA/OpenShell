@@ -683,7 +683,7 @@ fn validate_vm_sandbox(sandbox: &Sandbox) -> Result<(), Status> {
         .spec
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox spec is required"))?;
-    if spec.gpu {
+    if spec.gpu.is_some() {
         return Err(Status::failed_precondition(
             "vm sandboxes do not support gpu=true",
         ));
@@ -937,7 +937,7 @@ fn current_time_ms() -> i64 {
 mod tests {
     use super::*;
     use openshell_core::proto::compute::v1::{
-        DriverSandboxSpec as SandboxSpec, DriverSandboxTemplate as SandboxTemplate,
+        DriverSandboxSpec as SandboxSpec, DriverSandboxTemplate as SandboxTemplate, GpuSpec,
     };
     use prost_types::{Struct, Value, value::Kind};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -948,7 +948,7 @@ mod tests {
     fn validate_vm_sandbox_rejects_gpu() {
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
-                gpu: true,
+                gpu: Some(GpuSpec::default()),
                 ..Default::default()
             }),
             ..Default::default()

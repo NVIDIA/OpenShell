@@ -193,7 +193,7 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
-        let gpu_requested = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu);
+        let gpu_requested = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu.is_some());
         if gpu_requested
             && !self.has_gpu_capacity().await.map_err(|err| {
                 tonic::Status::internal(format!("check GPU node capacity failed: {err}"))
@@ -916,7 +916,7 @@ fn sandbox_to_k8s_spec(
                 "podTemplate".to_string(),
                 sandbox_template_to_k8s(
                     template,
-                    spec.gpu,
+                    spec.gpu.is_some(),
                     default_image,
                     image_pull_policy,
                     sandbox_id,
@@ -962,7 +962,7 @@ fn sandbox_to_k8s_spec(
             "podTemplate".to_string(),
             sandbox_template_to_k8s(
                 &SandboxTemplate::default(),
-                spec.as_ref().is_some_and(|s| s.gpu),
+                spec.as_ref().is_some_and(|s| s.gpu.is_some()),
                 default_image,
                 image_pull_policy,
                 sandbox_id,

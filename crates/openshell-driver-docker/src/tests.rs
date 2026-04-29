@@ -29,7 +29,7 @@ fn test_sandbox() -> DriverSandbox {
                 resources: None,
                 platform_config: None,
             }),
-            gpu: false,
+            gpu: None,
         }),
         status: None,
     }

@@ -18,14 +18,14 @@ use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
-    DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest, ListSandboxesRequest,
-    ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
+    DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest, GpuSpec as DriverGpuSpec,
+    ListSandboxesRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
     compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
     watch_sandboxes_event,
 };
 use openshell_core::proto::{
-    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxTemplate, SshSession,
+    GpuSpec as PublicGpuSpec, PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec,
+    SandboxStatus, SandboxTemplate, SshSession,
 };
 use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
@@ -1108,8 +1108,12 @@ fn driver_sandbox_spec_from_public(spec: &SandboxSpec) -> DriverSandboxSpec {
             .template
             .as_ref()
             .map(driver_sandbox_template_from_public),
-        gpu: spec.gpu,
+        gpu: spec.gpu.as_ref().map(driver_gpu_spec_from_public),
     }
+}
+
+fn driver_gpu_spec_from_public(_gpu: &PublicGpuSpec) -> DriverGpuSpec {
+    DriverGpuSpec::default()
 }
 
 fn driver_sandbox_template_from_public(template: &SandboxTemplate) -> DriverSandboxTemplate {
@@ -1455,7 +1459,7 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
 }
 
 fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Option<&SandboxSpec>) {
-    let gpu_requested = spec.is_some_and(|sandbox_spec| sandbox_spec.gpu);
+    let gpu_requested = spec.is_some_and(|sandbox_spec| sandbox_spec.gpu.is_some());
     if !gpu_requested {
         return;
     }
@@ -2076,7 +2080,7 @@ mod tests {
         rewrite_user_facing_conditions(
             &mut status,
             Some(&SandboxSpec {
-                gpu: true,
+                gpu: Some(PublicGpuSpec::default()),
                 ..Default::default()
             }),
         );
@@ -2108,7 +2112,7 @@ mod tests {
         rewrite_user_facing_conditions(
             &mut status,
             Some(&SandboxSpec {
-                gpu: false,
+                gpu: None,
                 ..Default::default()
             }),
         );
@@ -2336,7 +2340,7 @@ mod tests {
 
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
-                gpu: true,
+                gpu: Some(PublicGpuSpec::default()),
                 ..Default::default()
             }),
             ..sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning)
@@ -2359,7 +2363,7 @@ mod tests {
             SandboxPhase::try_from(stored.phase).unwrap(),
             SandboxPhase::Ready
         );
-        assert!(stored.spec.as_ref().is_some_and(|spec| spec.gpu));
+        assert!(stored.spec.as_ref().is_some_and(|spec| spec.gpu.is_some()));
     }
 
     #[tokio::test]
