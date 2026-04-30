@@ -80,6 +80,59 @@ port_is_in_use() {
   (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
 }
 
+invoking_user() {
+  if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+    printf '%s\n' "${SUDO_USER}"
+  else
+    id -un
+  fi
+}
+
+invoking_user_home() {
+  local user=$1
+  local home
+  if [ "${user}" = "$(id -un)" ]; then
+    printf '%s\n' "${HOME}"
+    return
+  fi
+  if command -v getent >/dev/null 2>&1; then
+    home="$(getent passwd "${user}" | cut -d: -f6)"
+    if [ -n "${home}" ]; then
+      printf '%s\n' "${home}"
+      return
+    fi
+  fi
+  if command -v dscl >/dev/null 2>&1; then
+    home="$(dscl . -read "/Users/${user}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+    if [ -n "${home}" ]; then
+      printf '%s\n' "${home}"
+      return
+    fi
+  fi
+  if [ "$(uname -s)" = "Darwin" ]; then
+    printf '/Users/%s\n' "${user}"
+  else
+    printf '/home/%s\n' "${user}"
+  fi
+}
+
+gateway_config_home() {
+  local user home
+  user="$(invoking_user)"
+  if [ -n "${SUDO_USER:-}" ] && [ "${user}" != "$(id -un)" ]; then
+    home="$(invoking_user_home "${user}")"
+    printf '%s\n' "${home}/.config"
+  else
+    printf '%s\n' "${XDG_CONFIG_HOME:-${HOME}/.config}"
+  fi
+}
+
+chown_invoking_user() {
+  if [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
+    chown -R "${SUDO_UID}:${SUDO_GID}" "$@" 2>/dev/null || true
+  fi
+}
+
 register_gateway_metadata() {
   local name=$1
   local endpoint=$2
@@ -87,7 +140,7 @@ register_gateway_metadata() {
   local vm_driver_state_dir=$4
   local config_home gateway_dir
 
-  config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+  config_home="$(gateway_config_home)"
   gateway_dir="${config_home}/openshell/gateways/${name}"
 
   mkdir -p "${gateway_dir}"
@@ -103,6 +156,7 @@ register_gateway_metadata() {
 }
 EOF
   chmod 600 "${gateway_dir}/metadata.json" 2>/dev/null || true
+  chown_invoking_user "${config_home}/openshell"
 }
 
 # Mirror what `openshell gateway select <name>` does: write the gateway name
@@ -111,10 +165,11 @@ EOF
 save_active_gateway() {
   local name=$1
   local config_home active_gateway_path
-  config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+  config_home="$(gateway_config_home)"
   active_gateway_path="${config_home}/openshell/active_gateway"
   mkdir -p "$(dirname "${active_gateway_path}")"
   printf '%s' "${name}" >"${active_gateway_path}"
+  chown_invoking_user "${config_home}/openshell"
 }
 
 check_supervisor_cross_toolchain() {
