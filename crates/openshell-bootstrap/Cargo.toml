@@ -16,10 +16,12 @@ base64 = "0.22"
 bollard = { version = "0.20", features = ["ssh"] }
 bytes = { workspace = true }
 futures = { workspace = true }
+hmac = "0.12"
 miette = { workspace = true }
 rcgen = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 url = { workspace = true }
 tar = "0.4"
 tempfile = "3"

@@ -148,10 +148,14 @@ pub async fn run_server(
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
-    // The ssh_handshake_secret check is driver-scoped: the Kubernetes and
-    // Podman drivers inject the secret into sandbox env, while the VM and
-    // Docker drivers do not consume it. The check is enforced per-driver
-    // in `build_compute_runtime`.
+    let driver = configured_compute_driver(&config)?;
+    if config.ssh_handshake_secret.is_empty()
+        && !matches!(driver, ComputeDriverKind::Docker | ComputeDriverKind::Vm)
+    {
+        return Err(Error::config(
+            "ssh_handshake_secret is required. Set --ssh-handshake-secret or OPENSHELL_SSH_HANDSHAKE_SECRET",
+        ));
+    }
 
     let store = Arc::new(Store::connect(database_url).await?);
 
@@ -366,35 +370,32 @@ async fn build_compute_runtime(
     info!(driver = %driver, "Using compute driver");
 
     match driver {
-        ComputeDriverKind::Kubernetes => {
-            require_ssh_handshake_secret(config)?;
-            ComputeRuntime::new_kubernetes(
-                KubernetesComputeConfig {
-                    namespace: config.sandbox_namespace.clone(),
-                    default_image: config.sandbox_image.clone(),
-                    image_pull_policy: config.sandbox_image_pull_policy.clone(),
-                    grpc_endpoint: config.grpc_endpoint.clone(),
-                    // Filesystem path to the supervisor's Unix-socket SSH daemon.
-                    // The path lives in a root-only directory so only the
-                    // supervisor can connect; the gateway reaches it through
-                    // the RelayStream bridge, not directly. Override via
-                    // `sandbox_ssh_socket_path` in the config for deployments
-                    // where multiple supervisors share a filesystem.
-                    ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
-                    ssh_handshake_secret: config.ssh_handshake_secret.clone(),
-                    ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
-                    client_tls_secret_name: config.client_tls_secret_name.clone(),
-                    host_gateway_ip: config.host_gateway_ip.clone(),
-                },
-                store,
-                sandbox_index,
-                sandbox_watch_bus,
-                tracing_log_bus,
-                supervisor_sessions.clone(),
-            )
-            .await
-            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
-        }
+        ComputeDriverKind::Kubernetes => ComputeRuntime::new_kubernetes(
+            KubernetesComputeConfig {
+                namespace: config.sandbox_namespace.clone(),
+                default_image: config.sandbox_image.clone(),
+                image_pull_policy: config.sandbox_image_pull_policy.clone(),
+                grpc_endpoint: config.grpc_endpoint.clone(),
+                // Filesystem path to the supervisor's Unix-socket SSH daemon.
+                // The path lives in a root-only directory so only the
+                // supervisor can connect; the gateway reaches it through the
+                // RelayStream bridge, not directly. Override via
+                // `sandbox_ssh_socket_path` in the config for deployments
+                // where multiple supervisors share a filesystem.
+                ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
+                ssh_handshake_secret: config.ssh_handshake_secret.clone(),
+                ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
+                client_tls_secret_name: config.client_tls_secret_name.clone(),
+                host_gateway_ip: config.host_gateway_ip.clone(),
+            },
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions.clone(),
+        )
+        .await
+        .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
         ComputeDriverKind::Docker => ComputeRuntime::new_docker(
             config.clone(),
             docker_config.clone(),
@@ -421,7 +422,6 @@ async fn build_compute_runtime(
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
         ComputeDriverKind::Podman => {
-            require_ssh_handshake_secret(config)?;
             let socket_path = std::env::var("OPENSHELL_PODMAN_SOCKET")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -471,15 +471,6 @@ async fn build_compute_runtime(
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
     }
-}
-
-fn require_ssh_handshake_secret(config: &Config) -> Result<()> {
-    if config.ssh_handshake_secret.is_empty() {
-        return Err(Error::config(
-            "ssh_handshake_secret is required for this driver. Set --ssh-handshake-secret or OPENSHELL_SSH_HANDSHAKE_SECRET",
-        ));
-    }
-    Ok(())
 }
 
 fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
