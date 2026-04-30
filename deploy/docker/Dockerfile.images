@@ -21,7 +21,7 @@ ARG K3S_VERSION=v1.35.3-k3s1
 ARG K3S_DIGEST=sha256:4607083d3cac07e1ccde7317297271d13ed5f60f35a78f33fcef84858a9f1d69
 ARG K9S_VERSION=v0.50.18
 ARG HELM_VERSION=v3.17.3
-ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
+ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.19.0-1
 
 # ---------------------------------------------------------------------------
 # Per-arch binary stages

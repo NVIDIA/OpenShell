@@ -495,7 +495,22 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
             target_os = "redox"
         )))]
         {
+            let cdi_gids = snapshot_cdi_gids();
             nix::unistd::initgroups(user_cstr.as_c_str(), group.gid).into_diagnostic()?;
+            if !cdi_gids.is_empty() {
+                let mut merged: Vec<nix::unistd::Gid> =
+                    nix::unistd::getgroups().unwrap_or_default();
+                for gid in &cdi_gids {
+                    if !merged.contains(gid) {
+                        merged.push(*gid);
+                    }
+                }
+                tracing::info!(
+                    gids = ?cdi_gids.iter().map(|g| g.as_raw()).collect::<Vec<_>>(),
+                    "Preserving CDI-injected supplementary GIDs across initgroups"
+                );
+                nix::unistd::setgroups(&merged).into_diagnostic()?;
+            }
         }
     }
 
@@ -537,6 +552,30 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Snapshot supplementary GIDs injected by the container runtime (e.g. via CDI
+/// `additionalGids`) before `initgroups` replaces them.
+///
+/// Only captures GIDs when GPU devices are present — on non-GPU sandboxes the
+/// runtime won't inject device-access GIDs so there is nothing to preserve.
+/// GID 0 (root) is always excluded to avoid inadvertent privilege retention.
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "haiku",
+    target_os = "redox"
+)))]
+fn snapshot_cdi_gids() -> Vec<nix::unistd::Gid> {
+    if !std::path::Path::new("/dev/nvidiactl").exists() {
+        return Vec::new();
+    }
+    let root_gid = nix::unistd::Gid::from_raw(0);
+    nix::unistd::getgroups()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|&g| g != root_gid)
+        .collect()
 }
 
 /// Process exit status.
