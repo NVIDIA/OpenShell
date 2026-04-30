@@ -199,7 +199,6 @@ const HELP_TEMPLATE: &str = "\
 \x1b[1mSANDBOX COMMANDS\x1b[0m
   sandbox:     Manage sandboxes
   forward:     Manage port forwarding to a sandbox
-  service:     Forward sandbox services over gRPC
   logs:        View sandbox logs
   policy:      Manage sandbox policy
   settings:    Manage sandbox and global settings
@@ -268,14 +267,9 @@ const FORWARD_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell forward start 8080
   $ openshell forward start 3000 my-sandbox
+  $ openshell forward service my-sandbox --target-port 8000 --local 8000
   $ openshell forward stop 8080
   $ openshell forward list
-";
-
-const SERVICE_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
-  $ openshell service forward my-sandbox --target-port 8080
-  $ openshell service forward my-sandbox --target-port 5432 --local 15432
-  $ openshell service forward my-sandbox --target-port 3000 --local 127.0.0.1:0
 ";
 
 const LOGS_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
@@ -413,13 +407,6 @@ enum Commands {
     Forward {
         #[command(subcommand)]
         command: Option<ForwardCommands>,
-    },
-
-    /// Forward sandbox services over gRPC.
-    #[command(after_help = SERVICE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
-    Service {
-        #[command(subcommand)]
-        command: Option<ServiceCommands>,
     },
 
     /// View sandbox logs.
@@ -1627,13 +1614,10 @@ enum ForwardCommands {
     /// List active port forwards.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List,
-}
 
-#[derive(Subcommand, Debug)]
-enum ServiceCommands {
     /// Forward a local TCP port to a loopback service inside a sandbox over gRPC.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Forward {
+    Service {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
@@ -1646,7 +1630,7 @@ enum ServiceCommands {
         #[arg(long, default_value = "127.0.0.1")]
         target_host: String,
 
-        /// Local bind address and port: [bind_address:]port. Use port 0 for dynamic assignment.
+        /// Local bind address and port: [bind_address:]port. Defaults to the target port. Use port 0 for dynamic assignment.
         #[arg(long)]
         local: Option<String>,
     },
@@ -1816,38 +1800,6 @@ async fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::Service {
-            command:
-                Some(ServiceCommands::Forward {
-                    name,
-                    target_port,
-                    target_host,
-                    local,
-                }),
-        }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
-            let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_edge_auth(&mut tls, &ctx.name);
-            let name = resolve_sandbox_name(name, &ctx.name)?;
-            run::service_forward_tcp(
-                &ctx.endpoint,
-                &name,
-                local.as_deref(),
-                &target_host,
-                target_port,
-                &tls,
-            )
-            .await?;
-        }
-
-        Some(Commands::Service { command: None }) => {
-            Cli::command()
-                .find_subcommand_mut("service")
-                .expect("service subcommand exists")
-                .print_help()
-                .expect("Failed to print help");
-        }
-
         // -----------------------------------------------------------
         // Top-level forward (was `sandbox forward`)
         // -----------------------------------------------------------
@@ -1923,6 +1875,27 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+            }
+            ForwardCommands::Service {
+                name,
+                target_port,
+                target_host,
+                local,
+            } => {
+                let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                let mut tls = tls.with_gateway_name(&ctx.name);
+                apply_auth(&mut tls, &ctx.name);
+                let name = resolve_sandbox_name(name, &ctx.name)?;
+                let local = local.unwrap_or_else(|| target_port.to_string());
+                run::service_forward_tcp(
+                    &ctx.endpoint,
+                    &name,
+                    Some(&local),
+                    &target_host,
+                    target_port,
+                    &tls,
+                )
+                .await?;
             }
             ForwardCommands::Start {
                 port,

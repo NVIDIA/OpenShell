@@ -20,8 +20,8 @@ use openshell_core::proto::{
     ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
     ListSandboxesResponse, Provider, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    SandboxStreamEvent, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest,
-    relay_open, tcp_forward_init,
+    SandboxResponse, SandboxStreamEvent, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    WatchSandboxRequest, relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use prost::Message;

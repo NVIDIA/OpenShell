@@ -128,9 +128,9 @@ helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage
 
 The gateway image and `server.supervisorImage` should use the same build tag in branch and E2E deploys. A stale supervisor image can make sandbox behavior lag behind gateway policy or proto changes.
 
-For local/external pull mode (the default local path via `mise run cluster`), local images are tagged to the configured local registry base, pushed to that registry, and pulled by k3s via the `registries.yaml` mirror endpoint. The `cluster` task rebuilds the local gateway image before tagging and pushing it, so a fresh bootstrap should not reuse stale `openshell/gateway:dev` bits from a previous source revision.
+For local/external pull mode (the default local path via `mise run cluster`), local images are tagged to the configured local registry base, pushed to that registry, and pulled by k3s via the `registries.yaml` mirror endpoint. The `cluster` task pushes prebuilt local tags (`openshell/*:dev`, falling back to `localhost:5000/openshell/*:dev` or `127.0.0.1:5000/openshell/*:dev`).
 
-Gateway image builds stage a partial Rust workspace from `deploy/docker/Dockerfile.images`. If cargo fails with a missing manifest under `/build/crates/...`, or an imported symbol exists locally but is missing in the image build, verify that every current gateway dependency crate is copied into the staged workspace there.
+Gateway image builds stage a partial Rust workspace from `deploy/docker/Dockerfile.images`. If cargo fails with a missing manifest under `/build/crates/...`, or an imported symbol exists locally but is missing in the image build, verify that every current gateway dependency crate, including `openshell-driver-docker`, `openshell-driver-kubernetes`, and `openshell-ocsf`, is copied into the staged workspace there.
 
 For plaintext local evaluation, confirm the chart has:
 
