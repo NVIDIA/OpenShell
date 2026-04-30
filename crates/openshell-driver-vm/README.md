@@ -37,7 +37,7 @@ mise run gateway:vm
 
 First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/gvproxy and `mise run vm:rootfs -- --base` builds the embedded rootfs. Subsequent runs are cached. To keep the Unix socket path under macOS `SUN_LEN`, `mise run gateway:vm` and `start.sh` default the state dir to `/tmp/openshell-vm-driver-dev-$USER-port-$PORT/` (SQLite DB + per-sandbox rootfs + `compute-driver.sock`) unless `OPENSHELL_VM_DRIVER_STATE_DIR` is set.
 The wrapper auto-registers the gateway with the CLI (`gateway destroy` + `gateway add`) so no manual registration step is needed. When running under `sudo`, it uses `sudo -u $SUDO_USER` for the registration so the config is written under the invoking user's home directory. Re-runs are idempotent.
-It also exports `OPENSHELL_DRIVER_DIR=$PWD/target/debug` before starting the gateway so local dev runs use the freshly built `openshell-driver-vm` instead of an older installed copy from `~/.local/libexec/openshell` or `/usr/local/libexec`.
+It also exports `OPENSHELL_DRIVER_DIR=$PWD/target/debug` before starting the gateway so local dev runs use the freshly built `openshell-driver-vm` instead of an older installed copy from `~/.local/libexec/openshell`, `/usr/libexec/openshell`, or `/usr/local/libexec`.
 
 For GPU passthrough (VFIO), pass `-- --gpu` and run with root privileges:
 
@@ -116,7 +116,7 @@ target/debug/openshell-gateway \
   --vm-driver-state-dir /tmp/openshell-vm-driver-dev-$USER-port-8080
 ```
 
-The gateway resolves `openshell-driver-vm` in this order: `--driver-dir`, conventional install locations (`~/.local/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`), then a sibling of the gateway binary.
+The gateway resolves `openshell-driver-vm` in this order: `--driver-dir`, conventional install locations (`~/.local/libexec/openshell`, `/usr/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`), then a sibling of the gateway binary.
 
 ## Flags
 

@@ -299,6 +299,8 @@ This opens an interactive SSH session into the sandbox, with all provider creden
 | [Docs Site Architecture](docs-site.md) | Documentation source layout, navigation structure, local validation and preview workflow, and publish pipeline. |
 | [Policy Language](security-policy.md) | The YAML/Rego policy system that governs sandbox behavior. |
 | [Inference Routing](inference-routing.md) | Transparent interception and sandbox-local routing of AI inference API calls to configured backends. |
+| [Docker Driver](docker-driver.md) | Docker compute driver implementation, dedicated network, multi-bind connectivity. |
+| [Podman Driver](podman-driver.md) | Podman compute driver implementation, rootless networking, secret injection. |
 | [System Architecture](system-architecture.md) | Top-level system architecture diagram with all deployable components and communication flows. |
 | [Gateway Settings Channel](gateway-settings.md) | Runtime settings channel: two-tier key-value configuration, global policy override, settings registry, CLI/TUI commands. |
 | [TUI](tui.md) | Terminal user interface for sandbox interaction. |

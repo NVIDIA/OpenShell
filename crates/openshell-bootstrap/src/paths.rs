@@ -5,6 +5,9 @@ use miette::Result;
 use openshell_core::paths::{xdg_config_dir, xdg_data_dir};
 use std::path::PathBuf;
 
+/// Environment override for tests and alternate system config roots.
+const OPENSHELL_SYSTEM_CONFIG_DIR: &str = "OPENSHELL_SYSTEM_CONFIG_DIR";
+
 /// Path to the file that stores the active gateway name.
 ///
 /// Location: `$XDG_CONFIG_HOME/openshell/active_gateway`
@@ -19,6 +22,20 @@ pub fn gateways_dir() -> Result<PathBuf> {
     Ok(xdg_config_dir()?.join("openshell").join("gateways"))
 }
 
+/// Path to the system-wide active gateway fallback.
+///
+/// Location: `/etc/openshell/active_gateway`
+pub fn system_active_gateway_path() -> PathBuf {
+    system_config_dir().join("active_gateway")
+}
+
+/// Base directory for system-wide gateway metadata fallbacks.
+///
+/// Location: `/etc/openshell/gateways/`
+pub fn system_gateways_dir() -> PathBuf {
+    system_config_dir().join("gateways")
+}
+
 /// Path to the file that stores the last-used sandbox name for a gateway.
 ///
 /// Location: `$XDG_CONFIG_HOME/openshell/gateways/<gateway>/last_sandbox`
@@ -31,6 +48,11 @@ pub fn last_sandbox_path(gateway: &str) -> Result<PathBuf> {
 /// Location: `$XDG_DATA_HOME/openshell/openshell-vm/`
 pub fn openshell_vm_base_dir() -> Result<PathBuf> {
     Ok(xdg_data_dir()?.join("openshell").join("openshell-vm"))
+}
+
+fn system_config_dir() -> PathBuf {
+    std::env::var_os(OPENSHELL_SYSTEM_CONFIG_DIR)
+        .map_or_else(|| PathBuf::from("/etc").join("openshell"), PathBuf::from)
 }
 
 #[cfg(test)]

@@ -52,6 +52,8 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             key: PathBuf::from("/tmp/tls.key"),
         }),
         daemon_version: "28.0.0".to_string(),
+        network_name: openshell_core::config::DEFAULT_NETWORK_NAME.to_string(),
+        network_gateway_ip: "172.18.0.1".parse().unwrap(),
     }
 }
 
@@ -186,6 +188,37 @@ fn require_sandbox_identifier_rejects_when_id_and_name_are_empty() {
     require_sandbox_identifier("sbx-1", "").expect("id-only is accepted");
     require_sandbox_identifier("", "demo").expect("name-only is accepted");
     require_sandbox_identifier("sbx-1", "demo").expect("id and name is accepted");
+}
+
+#[test]
+fn build_container_create_body_attaches_to_dedicated_network() {
+    // Sandboxes must opt out of Docker's default `bridge` and join the
+    // user-defined network that the driver provisions at startup. This
+    // keeps them L2-isolated from unrelated containers running on the
+    // host's docker0 bridge and matches the Podman driver's posture.
+    let mut config = runtime_config();
+    config.network_name = "openshell-test".to_string();
+    config.network_gateway_ip = "10.99.0.1".parse().unwrap();
+    let create_body = build_container_create_body(&test_sandbox(), &config).unwrap();
+    let host_config = create_body.host_config.expect("host_config is populated");
+
+    assert_eq!(
+        host_config.network_mode,
+        Some("openshell-test".to_string()),
+        "sandbox must attach to the configured openshell network"
+    );
+
+    let extra_hosts = host_config.extra_hosts.expect("extra_hosts is populated");
+    assert!(
+        extra_hosts.contains(&"host.openshell.internal:10.99.0.1".to_string()),
+        "host.openshell.internal must resolve to the sandbox network's gateway IP, not Docker's host-gateway alias (got {extra_hosts:?})"
+    );
+    assert!(
+        !extra_hosts
+            .iter()
+            .any(|h| h.starts_with("host.docker.internal:")),
+        "the docker-specific alias should not be injected (got {extra_hosts:?})"
+    );
 }
 
 #[test]

@@ -40,9 +40,11 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
 use std::collections::HashMap;
 use std::io::ErrorKind;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
@@ -196,12 +198,24 @@ pub async fn run_server(
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
 
-    // Bind the TCP listener
-    let listener = TcpListener::bind(config.bind_address)
+    // Bind the primary TCP listener plus any extras requested by drivers.
+    // The same multiplex service is served on each address so the CLI on
+    // loopback and sandboxes on a driver-supplied interface can both reach
+    // the gateway with identical semantics.
+    let mut listeners: Vec<(SocketAddr, TcpListener)> = Vec::new();
+    let primary_listener = TcpListener::bind(config.bind_address)
         .await
         .map_err(|e| Error::transport(format!("failed to bind to {}: {e}", config.bind_address)))?;
-
     info!(address = %config.bind_address, "Server listening");
+    listeners.push((config.bind_address, primary_listener));
+
+    for extra in &config.extra_bind_addresses {
+        let extra_listener = TcpListener::bind(*extra)
+            .await
+            .map_err(|e| Error::transport(format!("failed to bind extra address {extra}: {e}")))?;
+        info!(address = %extra, "Server listening on extra address");
+        listeners.push((*extra, extra_listener));
+    }
 
     // Bind the unauthenticated health endpoint on a separate port when configured.
     if let Some(health_bind_address) = config.health_bind_address {
@@ -259,21 +273,59 @@ pub async fn run_server(
         None
     };
 
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
+    // Coordinate graceful shutdown across every listener: a single broadcast
+    // channel notifies all accept loops, and a `JoinSet` lets us wait for
+    // them to drain before returning.
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let mut accept_tasks = tokio::task::JoinSet::new();
+    for (addr, listener) in listeners {
+        let service = service.clone();
+        let tls_acceptor = tls_acceptor.clone();
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        accept_tasks.spawn(async move {
+            run_accept_loop(addr, listener, service, tls_acceptor, &mut shutdown_rx).await;
+        });
+    }
 
-    // Accept connections until the gateway receives a graceful shutdown signal.
+    shutdown_signal().await;
+    info!("Shutdown signal received; stopping gateway");
+    let _ = shutdown_tx.send(());
+    while accept_tasks.join_next().await.is_some() {}
+
+    state
+        .compute
+        .cleanup_on_shutdown()
+        .await
+        .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
+
+    Ok(())
+}
+
+/// Drive a single listener until either the listener errors fatally or the
+/// gateway receives a shutdown signal.
+///
+/// All listeners share the same `MultiplexService` and (optional) TLS
+/// acceptor, so callers can run multiple instances of this loop in parallel
+/// to expose the gateway on more than one bind address without forking the
+/// service definition.
+async fn run_accept_loop(
+    bind_addr: SocketAddr,
+    listener: TcpListener,
+    service: MultiplexService,
+    tls_acceptor: Option<TlsAcceptor>,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+) {
     loop {
         let (stream, addr) = tokio::select! {
-            () = &mut shutdown => {
-                info!("Shutdown signal received; stopping gateway");
-                break;
+            _ = shutdown_rx.recv() => {
+                debug!(bind = %bind_addr, "Listener received shutdown");
+                return;
             }
             accepted = listener.accept() => {
                 match accepted {
                     Ok(conn) => conn,
                     Err(e) => {
-                        error!(error = %e, "Failed to accept connection");
+                        error!(error = %e, bind = %bind_addr, "Failed to accept connection");
                         continue;
                     }
                 }
@@ -308,14 +360,6 @@ pub async fn run_server(
             });
         }
     }
-
-    state
-        .compute
-        .cleanup_on_shutdown()
-        .await
-        .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
-
-    Ok(())
 }
 
 async fn shutdown_signal() {

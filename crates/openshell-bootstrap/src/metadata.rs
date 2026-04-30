@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::RemoteOptions;
-use crate::paths::{active_gateway_path, gateways_dir, last_sandbox_path};
+use crate::paths::{
+    active_gateway_path, gateways_dir, last_sandbox_path, system_active_gateway_path,
+    system_gateways_dir,
+};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::paths::ensure_parent_dir_restricted;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// Gateway metadata stored alongside deployment info.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +175,10 @@ fn stored_metadata_path(name: &str) -> Result<PathBuf> {
     Ok(gateways_dir()?.join(name).join("metadata.json"))
 }
 
+fn system_stored_metadata_path(name: &str) -> PathBuf {
+    system_gateways_dir().join(name).join("metadata.json")
+}
+
 /// Extract the hostname from an SSH destination string.
 ///
 /// Handles formats like:
@@ -247,7 +255,17 @@ pub fn store_gateway_metadata(name: &str, metadata: &GatewayMetadata) -> Result<
 
 pub fn load_gateway_metadata(name: &str) -> Result<GatewayMetadata> {
     let path = stored_metadata_path(name)?;
-    let contents = std::fs::read_to_string(&path)
+    if !path.exists() {
+        let system_path = system_stored_metadata_path(name);
+        if system_path.exists() {
+            return load_gateway_metadata_from_path(&system_path);
+        }
+    }
+    load_gateway_metadata_from_path(&path)
+}
+
+fn load_gateway_metadata_from_path(path: &Path) -> Result<GatewayMetadata> {
+    let contents = std::fs::read_to_string(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read metadata from {}", path.display()))?;
     serde_json::from_str(&contents)
@@ -274,8 +292,11 @@ pub fn save_active_gateway(name: &str) -> Result<()> {
 ///
 /// Returns `None` if no active gateway has been set.
 pub fn load_active_gateway() -> Option<String> {
-    let path = active_gateway_path().ok()?;
-    let contents = std::fs::read_to_string(&path).ok()?;
+    let user_contents = active_gateway_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok());
+    let contents =
+        user_contents.or_else(|| std::fs::read_to_string(system_active_gateway_path()).ok())?;
     let name = contents.trim().to_string();
     if name.is_empty() { None } else { Some(name) }
 }
@@ -315,15 +336,26 @@ pub fn clear_last_sandbox_if_matches(gateway: &str, sandbox: &str) {
 
 /// List all gateways that have stored metadata.
 ///
-/// Scans `$XDG_CONFIG_HOME/openshell/gateways/` for subdirectories containing
-/// `metadata.json` and returns the parsed metadata for each.
+/// Scans `/etc/openshell/gateways/` and `$XDG_CONFIG_HOME/openshell/gateways/`
+/// for subdirectories containing `metadata.json` and returns the parsed
+/// metadata for each. Per-user gateway metadata takes precedence over
+/// system-wide defaults with the same gateway name.
 pub fn list_gateways() -> Result<Vec<GatewayMetadata>> {
-    let dir = gateways_dir()?;
+    let mut gateways = BTreeMap::new();
+    collect_gateways_from_dir(system_gateways_dir(), &mut gateways)?;
+    collect_gateways_from_dir(gateways_dir()?, &mut gateways)?;
+
+    Ok(gateways.into_values().collect())
+}
+
+fn collect_gateways_from_dir(
+    dir: PathBuf,
+    gateways: &mut BTreeMap<String, GatewayMetadata>,
+) -> Result<()> {
     if !dir.exists() {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
-    let mut gateways = Vec::new();
     let entries = std::fs::read_dir(&dir)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read directory {}", dir.display()))?;
@@ -334,15 +366,14 @@ pub fn list_gateways() -> Result<Vec<GatewayMetadata>> {
         // Only consider directories that contain a metadata.json file
         if path.is_dir() {
             let gateway_name = entry.file_name().to_string_lossy().to_string();
-            if let Ok(metadata) = load_gateway_metadata(&gateway_name) {
-                gateways.push(metadata);
+            let metadata_path = path.join("metadata.json");
+            if let Ok(metadata) = load_gateway_metadata_from_path(&metadata_path) {
+                gateways.insert(gateway_name, metadata);
             }
         }
     }
 
-    // Sort by name for stable output
-    gateways.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(gateways)
+    Ok(())
 }
 
 /// Remove the active gateway file (used when destroying the active gateway).
@@ -600,7 +631,7 @@ mod tests {
     /// Helper: hold the shared XDG test lock, set `XDG_CONFIG_HOME` to a
     /// tempdir, run `f`, then restore the original value.
     #[allow(unsafe_code)]
-    fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
+    fn with_tmp_xdg<F: FnOnce()>(tmp: &Path, f: F) {
         let _guard = crate::XDG_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -615,6 +646,126 @@ mod tests {
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
+    }
+
+    #[allow(unsafe_code)]
+    fn with_tmp_config<F: FnOnce()>(user_config: &Path, system_config: &Path, f: F) {
+        let _guard = crate::XDG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let orig_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let orig_system = std::env::var("OPENSHELL_SYSTEM_CONFIG_DIR").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", user_config);
+            std::env::set_var("OPENSHELL_SYSTEM_CONFIG_DIR", system_config);
+        }
+        f();
+        unsafe {
+            match orig_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match orig_system {
+                Some(v) => std::env::set_var("OPENSHELL_SYSTEM_CONFIG_DIR", v),
+                None => std::env::remove_var("OPENSHELL_SYSTEM_CONFIG_DIR"),
+            }
+        }
+    }
+
+    fn write_system_gateway(system_config: &Path, name: &str, endpoint: &str) {
+        let metadata = GatewayMetadata {
+            name: name.to_string(),
+            gateway_endpoint: endpoint.to_string(),
+            is_remote: false,
+            gateway_port: 8080,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: Some("plaintext".to_string()),
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+        let gateway_dir = system_config.join("gateways").join(name);
+        std::fs::create_dir_all(&gateway_dir).unwrap();
+        std::fs::write(
+            gateway_dir.join("metadata.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn system_gateway_metadata_is_fallback_when_user_missing() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        write_system_gateway(system.path(), "default", "http://127.0.0.1:8080");
+        std::fs::write(system.path().join("active_gateway"), "default\n").unwrap();
+
+        with_tmp_config(user.path(), system.path(), || {
+            let metadata = load_gateway_metadata("default").unwrap();
+            assert_eq!(metadata.gateway_endpoint, "http://127.0.0.1:8080");
+            assert_eq!(metadata.auth_mode.as_deref(), Some("plaintext"));
+            assert_eq!(load_active_gateway().as_deref(), Some("default"));
+        });
+    }
+
+    #[test]
+    fn user_gateway_metadata_overrides_system_default() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        write_system_gateway(system.path(), "default", "http://127.0.0.1:8080");
+
+        with_tmp_config(user.path(), system.path(), || {
+            store_gateway_metadata(
+                "default",
+                &GatewayMetadata {
+                    name: "default".to_string(),
+                    gateway_endpoint: "http://127.0.0.1:18080".to_string(),
+                    is_remote: false,
+                    gateway_port: 18080,
+                    remote_host: None,
+                    resolved_host: None,
+                    auth_mode: Some("plaintext".to_string()),
+                    edge_team_domain: None,
+                    edge_auth_url: None,
+                },
+            )
+            .unwrap();
+
+            let metadata = load_gateway_metadata("default").unwrap();
+            assert_eq!(metadata.gateway_endpoint, "http://127.0.0.1:18080");
+        });
+    }
+
+    #[test]
+    fn list_gateways_merges_system_and_user_gateways() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        write_system_gateway(system.path(), "default", "http://127.0.0.1:8080");
+
+        with_tmp_config(user.path(), system.path(), || {
+            store_gateway_metadata(
+                "custom",
+                &GatewayMetadata {
+                    name: "custom".to_string(),
+                    gateway_endpoint: "https://gateway.example.com".to_string(),
+                    is_remote: true,
+                    gateway_port: 0,
+                    remote_host: None,
+                    resolved_host: None,
+                    auth_mode: Some("cloudflare_jwt".to_string()),
+                    edge_team_domain: None,
+                    edge_auth_url: None,
+                },
+            )
+            .unwrap();
+
+            let gateways = list_gateways().unwrap();
+            let names: Vec<_> = gateways
+                .iter()
+                .map(|gateway| gateway.name.as_str())
+                .collect();
+            assert_eq!(names, vec!["custom", "default"]);
+        });
     }
 
     #[test]

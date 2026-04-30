@@ -19,6 +19,7 @@ class Versions:
     python: str
     cargo: str
     docker: str
+    deb: str
     git_tag: str
     git_sha: str
 
@@ -55,6 +56,12 @@ def _compute_versions() -> Versions:
     # Docker tags can't contain '+'.
     docker_version = cargo_version.replace("+", "-")
 
+    # Debian versions use '~' so prereleases sort before the eventual release.
+    deb_version = cargo_version
+    deb_version = deb_version[1:] if deb_version.startswith("v") else deb_version
+    deb_version = deb_version.replace("-dev.", "~dev.", 1)
+    deb_version = f"{deb_version}-1"
+
     git_tag = _git(["describe", "--tags", "--abbrev=0"])
     git_sha = _git(["rev-parse", "--short", "HEAD"])
 
@@ -62,6 +69,7 @@ def _compute_versions() -> Versions:
         python=python_version,
         cargo=cargo_version,
         docker=docker_version,
+        deb=deb_version,
         git_tag=git_tag,
         git_sha=git_sha,
     )
@@ -75,10 +83,13 @@ def get_version(format: str) -> None:
         print(versions.cargo)
     elif format == "docker":
         print(versions.docker)
+    elif format == "deb":
+        print(versions.deb)
     else:
         print(f"VERSION_PY={versions.python}")
         print(f"VERSION_CARGO={versions.cargo}")
         print(f"VERSION_DOCKER={versions.docker}")
+        print(f"VERSION_DEB={versions.deb}")
         print(f"GIT_TAG={versions.git_tag}")
         print(f"GIT_SHA={versions.git_sha}")
 
@@ -97,6 +108,9 @@ def build_parser() -> argparse.ArgumentParser:
     get_version_parser.add_argument(
         "--docker", action="store_true", help="Print Docker version only."
     )
+    get_version_parser.add_argument(
+        "--deb", action="store_true", help="Print Debian package version only."
+    )
 
     return parser
 
@@ -112,6 +126,8 @@ def main() -> None:
             get_version("cargo")
         elif args.docker:
             get_version("docker")
+        elif args.deb:
+            get_version("deb")
         else:
             get_version("all")
 

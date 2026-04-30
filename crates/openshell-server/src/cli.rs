@@ -7,9 +7,9 @@ use clap::{Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::ComputeDriverKind;
 use openshell_core::config::{
-    DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS, DEFAULT_SSH_PORT,
+    DEFAULT_NETWORK_NAME, DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS, DEFAULT_SSH_PORT,
 };
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -22,9 +22,17 @@ use crate::{run_server, tracing_bus::TracingLogBus};
 #[command(version = openshell_core::VERSION)]
 #[command(about = "OpenShell gRPC/HTTP server", long_about = None)]
 struct Args {
-    /// Port to bind the server to (all interfaces).
+    /// Port to bind the server to.
     #[arg(long, default_value_t = DEFAULT_SERVER_PORT, env = "OPENSHELL_SERVER_PORT")]
     port: u16,
+
+    /// Address to bind the server to.
+    #[arg(
+        long,
+        default_value_t = IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        env = "OPENSHELL_BIND_ADDRESS"
+    )]
+    bind_address: IpAddr,
 
     /// Port for unauthenticated health endpoints (healthz, readyz).
     /// Set to 0 to disable the dedicated health listener.
@@ -136,8 +144,9 @@ struct Args {
     /// Directory searched for compute-driver binaries (e.g.
     /// `openshell-driver-vm`) when an explicit binary override isn't
     /// configured. When unset, the gateway searches
-    /// `$HOME/.local/libexec/openshell`, `/usr/local/libexec/openshell`,
-    /// `/usr/local/libexec`, then a sibling of the gateway binary.
+    /// `$HOME/.local/libexec/openshell`, `/usr/libexec/openshell`,
+    /// `/usr/local/libexec/openshell`, `/usr/local/libexec`, then a sibling
+    /// of the gateway binary.
     #[arg(long, env = "OPENSHELL_DRIVER_DIR")]
     driver_dir: Option<PathBuf>,
 
@@ -204,6 +213,12 @@ struct Args {
     #[arg(long, env = "OPENSHELL_DOCKER_TLS_KEY")]
     docker_tls_key: Option<PathBuf>,
 
+    /// Name of the Docker bridge network the driver creates and attaches
+    /// sandboxes to. Defaults to `openshell` so sandboxes are isolated at
+    /// L2 from unrelated workloads on the host's `docker0` bridge.
+    #[arg(long, env = "OPENSHELL_NETWORK_NAME", default_value = DEFAULT_NETWORK_NAME)]
+    network_name: String,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -239,7 +254,7 @@ async fn run_from_args(args: Args) -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
     );
 
-    let bind = SocketAddr::from(([0, 0, 0, 0], args.port));
+    let bind = SocketAddr::from((args.bind_address, args.port));
 
     let tls = if args.disable_tls {
         None
@@ -297,6 +312,34 @@ async fn run_from_args(args: Args) -> Result<()> {
         config = config.with_metrics_bind_address(metrics_bind);
     }
 
+    // When the docker driver is configured and the primary bind address only
+    // exposes the gateway on loopback (where the CLI talks to it), expose an
+    // additional listener on the Docker bridge gateway IP for the sandbox
+    // network. Sandbox containers reach the host through
+    // `host.openshell.internal`, which Docker maps to the bridge gateway,
+    // so without this they cannot complete the gRPC handshake. We
+    // intentionally ensure the network exists here (idempotent) so the
+    // gateway IP is well-defined before the docker driver is constructed,
+    // and we fail fast on detection issues because the sandbox-create flow
+    // would otherwise be silently broken.
+    if args.drivers.contains(&ComputeDriverKind::Docker)
+        && bind_only_reaches_loopback(args.bind_address)
+    {
+        let bridge_ip =
+            openshell_driver_docker::ensure_network_and_get_gateway(&args.network_name)
+                .await
+                .map_err(|err| miette::miette!(
+                    "docker driver requires the gateway to listen on the Docker bridge gateway IP, but it could not be set up: {err}"
+                ))?;
+        let bridge_addr = SocketAddr::from((bridge_ip, args.port));
+        info!(
+            address = %bridge_addr,
+            network = %args.network_name,
+            "Adding Docker bridge listener so sandboxes can reach the gateway"
+        );
+        config = config.with_extra_bind_address(bridge_addr);
+    }
+
     config = config
         .with_database_url(args.db_url)
         .with_compute_drivers(args.drivers)
@@ -348,6 +391,7 @@ async fn run_from_args(args: Args) -> Result<()> {
         guest_tls_ca: args.docker_tls_ca,
         guest_tls_cert: args.docker_tls_cert,
         guest_tls_key: args.docker_tls_key,
+        network_name: args.network_name,
     };
 
     if args.disable_tls {
@@ -367,9 +411,25 @@ fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, S
     value.parse()
 }
 
+/// Whether the requested bind address only allows clients reaching the host
+/// via loopback to talk to the gateway.
+///
+/// Loopback (`127.0.0.0/8`, `::1`) is treated as loopback-only. Anything else
+/// — including `0.0.0.0` / `::` and specific public IPs — is assumed to
+/// already cover the Docker bridge interface, so the docker driver does not
+/// need a separate listener.
+const fn bind_only_reaches_loopback(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::command;
+    use super::{Args, command};
+    use clap::Parser;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn command_uses_gateway_binary_name() {
@@ -384,5 +444,25 @@ mod tests {
         let cmd = command();
         let version = cmd.get_version().unwrap();
         assert_eq!(version.to_string(), openshell_core::VERSION);
+    }
+
+    #[test]
+    fn command_defaults_bind_address_to_all_interfaces() {
+        let args =
+            Args::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn command_parses_bind_address() {
+        let args = Args::try_parse_from([
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--bind-address",
+            "127.0.0.1",
+        ])
+        .unwrap();
+        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 }
