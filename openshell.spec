@@ -9,7 +9,7 @@
 
 Name:           openshell
 Version:        0.0.37
-Release:        1.20260430135232393374.rpm.45.g17657c0b%{?dist}
+Release:        1.20260430141223488997.rpm.46.g7ff80c76%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0

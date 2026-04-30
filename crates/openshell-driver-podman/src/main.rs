@@ -127,9 +127,9 @@ async fn main() -> Result<()> {
         ssh_handshake_skew_secs: args.ssh_handshake_skew_secs,
         stop_timeout_secs: args.stop_timeout,
         supervisor_image: args.supervisor_image,
-        tls_ca: args.podman_tls_ca,
-        tls_cert: args.podman_tls_cert,
-        tls_key: args.podman_tls_key,
+        guest_tls_ca: args.podman_tls_ca,
+        guest_tls_cert: args.podman_tls_cert,
+        guest_tls_key: args.podman_tls_key,
     })
     .await
     .into_diagnostic()?;

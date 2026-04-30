@@ -513,9 +513,11 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
             // OPENSHELL_TLS_CERT, and OPENSHELL_TLS_KEY env vars (set in
             // build_env above) to establish an mTLS connection back to the
             // gateway.
-            if let (Some(ca), Some(cert), Some(key)) =
-                (&config.tls_ca, &config.tls_cert, &config.tls_key)
-            {
+            if let (Some(ca), Some(cert), Some(key)) = (
+                &config.guest_tls_ca,
+                &config.guest_tls_cert,
+                &config.guest_tls_key,
+            ) {
                 let ro = vec!["ro".into(), "rbind".into()];
                 m.push(Mount {
                     kind: "bind".into(),
@@ -938,9 +940,9 @@ mod tests {
     fn container_spec_includes_tls_mounts_when_configured() {
         let sandbox = test_sandbox("tls-id", "tls-name");
         let mut config = test_config();
-        config.tls_ca = Some(std::path::PathBuf::from("/host/ca.crt"));
-        config.tls_cert = Some(std::path::PathBuf::from("/host/tls.crt"));
-        config.tls_key = Some(std::path::PathBuf::from("/host/tls.key"));
+        config.guest_tls_ca = Some(std::path::PathBuf::from("/host/ca.crt"));
+        config.guest_tls_cert = Some(std::path::PathBuf::from("/host/tls.crt"));
+        config.guest_tls_key = Some(std::path::PathBuf::from("/host/tls.key"));
 
         let spec = build_container_spec(&sandbox, &config);
 
