@@ -51,7 +51,7 @@ pub fn compose_effective_policy(
         let key = unique_provider_rule_key(&effective, &layer.rule_name);
         let mut rule = layer.rule.clone();
         if rule.name.is_empty() {
-            rule.name = key.clone();
+            rule.name.clone_from(&key);
         }
         effective.network_policies.insert(key, rule);
     }

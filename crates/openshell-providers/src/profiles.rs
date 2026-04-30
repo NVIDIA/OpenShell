@@ -169,8 +169,7 @@ where
 
 fn provider_profile_category_from_yaml(raw: &str) -> Option<ProviderProfileCategory> {
     match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-        "" => Some(ProviderProfileCategory::Other),
-        "other" => Some(ProviderProfileCategory::Other),
+        "" | "other" => Some(ProviderProfileCategory::Other),
         "inference" => Some(ProviderProfileCategory::Inference),
         "agent" => Some(ProviderProfileCategory::Agent),
         "source_control" => Some(ProviderProfileCategory::SourceControl),
@@ -313,13 +312,13 @@ mod tests {
     #[test]
     fn parse_profile_yaml_reads_single_provider_document() {
         let profile = parse_profile_yaml(
-            r#"
+            r"
 id: example
 display_name: Example
 credentials:
   - name: api_key
     env_vars: [EXAMPLE_API_KEY]
-"#,
+",
         )
         .expect("profile should parse");
 
@@ -331,14 +330,14 @@ credentials:
     #[test]
     fn parse_profile_catalog_yamls_rejects_duplicate_ids() {
         let err = parse_profile_catalog_yamls(&[
-            r#"
+            r"
 id: duplicate
 display_name: First
-"#,
-            r#"
+",
+            r"
 id: duplicate
 display_name: Second
-"#,
+",
         ])
         .unwrap_err();
 
@@ -347,13 +346,13 @@ display_name: Second
 
     #[test]
     fn parse_profile_catalog_yamls_rejects_invalid_endpoint_ports() {
-        let err = parse_profile_catalog_yamls(&[r#"
+        let err = parse_profile_catalog_yamls(&[r"
 id: bad-endpoint
 display_name: Bad Endpoint
 endpoints:
   - host: api.example.com
     port: 0
-"#])
+"])
         .unwrap_err();
 
         assert!(matches!(err, ProfileError::InvalidEndpoint { id, .. } if id == "bad-endpoint"));

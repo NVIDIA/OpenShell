@@ -209,7 +209,7 @@ impl OpenShell for TestOpenShell {
             openshell_core::proto::ListProviderProfilesResponse {
                 profiles: openshell_providers::default_profiles()
                     .iter()
-                    .map(|profile| profile.to_proto())
+                    .map(openshell_providers::ProviderTypeProfile::to_proto)
                     .collect(),
             },
         ))

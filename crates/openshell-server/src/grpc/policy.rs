@@ -2770,7 +2770,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("provider-{name}"),
                 name: name.to_string(),
-                created_at_ms: 1000000,
+                created_at_ms: 1_000_000,
                 labels: HashMap::new(),
             }),
             r#type: provider_type.to_string(),
@@ -2782,7 +2782,7 @@ mod tests {
 
     fn test_policy_with_rule(rule_name: &str, host: &str) -> ProtoSandboxPolicy {
         ProtoSandboxPolicy {
-            network_policies: [(
+            network_policies: std::iter::once((
                 rule_name.to_string(),
                 NetworkPolicyRule {
                     name: rule_name.to_string(),
@@ -2793,8 +2793,7 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
             ..Default::default()
         }
@@ -2828,11 +2827,10 @@ mod tests {
     async fn enable_providers_v2(state: &Arc<ServerState>) {
         let global_settings = StoredSettings {
             revision: 1,
-            settings: [(
+            settings: std::iter::once((
                 settings::USE_PROVIDERS_V2_KEY.to_string(),
                 StoredSettingValue::Bool(true),
-            )]
-            .into_iter()
+            ))
             .collect(),
         };
         save_global_settings(state.store.as_ref(), &global_settings)
@@ -3176,7 +3174,7 @@ mod tests {
             .unwrap();
 
         let sandbox_policy = SandboxPolicy {
-            network_policies: [(
+            network_policies: std::iter::once((
                 "sandbox_only".to_string(),
                 NetworkPolicyRule {
                     name: "sandbox_only".to_string(),
@@ -3187,8 +3185,7 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
             ..Default::default()
         };
@@ -3210,7 +3207,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let global_policy = SandboxPolicy {
-            network_policies: [(
+            network_policies: std::iter::once((
                 "global_only".to_string(),
                 NetworkPolicyRule {
                     name: "global_only".to_string(),
@@ -3221,8 +3218,7 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
             ..Default::default()
         };

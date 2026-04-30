@@ -258,14 +258,17 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ListProviderProfilesRequest>,
     ) -> Result<Response<ListProviderProfilesResponse>, Status> {
-        provider::handle_list_provider_profiles(&self.state, request).await
+        Ok(provider::handle_list_provider_profiles(
+            &self.state,
+            request,
+        ))
     }
 
     async fn get_provider_profile(
         &self,
         request: Request<GetProviderProfileRequest>,
     ) -> Result<Response<ProviderProfileResponse>, Status> {
-        provider::handle_get_provider_profile(&self.state, request).await
+        provider::handle_get_provider_profile(&self.state, request)
     }
 
     async fn update_provider(

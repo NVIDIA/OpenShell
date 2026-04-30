@@ -320,10 +320,10 @@ pub(super) async fn handle_list_providers(
     Ok(Response::new(ListProvidersResponse { providers }))
 }
 
-pub(super) async fn handle_list_provider_profiles(
+pub(super) fn handle_list_provider_profiles(
     _state: &Arc<ServerState>,
     request: Request<ListProviderProfilesRequest>,
-) -> Result<Response<ListProviderProfilesResponse>, Status> {
+) -> Response<ListProviderProfilesResponse> {
     let request = request.into_inner();
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE) as usize;
     let offset = request.offset as usize;
@@ -331,13 +331,13 @@ pub(super) async fn handle_list_provider_profiles(
         .iter()
         .skip(offset)
         .take(limit)
-        .map(|profile| profile.to_proto())
+        .map(openshell_providers::ProviderTypeProfile::to_proto)
         .collect();
 
-    Ok(Response::new(ListProviderProfilesResponse { profiles }))
+    Response::new(ListProviderProfilesResponse { profiles })
 }
 
-pub(super) async fn handle_get_provider_profile(
+pub(super) fn handle_get_provider_profile(
     _state: &Arc<ServerState>,
     request: Request<GetProviderProfileRequest>,
 ) -> Result<Response<ProviderProfileResponse>, Status> {
@@ -473,8 +473,6 @@ mod tests {
                 offset: 0,
             }),
         )
-        .await
-        .unwrap()
         .into_inner();
 
         let github = response
@@ -504,7 +502,6 @@ mod tests {
                 id: "github".to_string(),
             }),
         )
-        .await
         .unwrap()
         .into_inner()
         .profile
@@ -521,7 +518,6 @@ mod tests {
                 id: "generic".to_string(),
             }),
         )
-        .await
         .unwrap_err();
         assert_eq!(generic_err.code(), Code::NotFound);
     }
