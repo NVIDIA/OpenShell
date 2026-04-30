@@ -177,12 +177,8 @@ mod tests {
                     name: "alpha".to_string(),
                     gateway_endpoint: "https://alpha.example.com".to_string(),
                     is_remote: true,
-                    gateway_port: 0,
-                    remote_host: None,
-                    resolved_host: None,
                     auth_mode: Some("cloudflare_jwt".to_string()),
-                    edge_team_domain: None,
-                    edge_auth_url: None,
+                    ..Default::default()
                 },
             )
             .unwrap();

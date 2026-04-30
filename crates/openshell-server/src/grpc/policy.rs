@@ -10,9 +10,9 @@
 #![allow(clippy::cast_precision_loss)] // f64->f32 for confidence scores
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
-use crate::ServerState;
 use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, PolicyRecord, Store};
 use crate::policy_store::PolicyStoreExt;
+use crate::{ServerState, auth::oidc};
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -305,6 +305,36 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
     }
 }
 
+fn is_sandbox_secret_authenticated<T>(request: &Request<T>) -> bool {
+    oidc::is_sandbox_secret_authenticated(request.metadata())
+}
+
+/// Sandbox-secret-authenticated callers may only perform sandbox-scoped policy
+/// sync. They must not be able to mutate global config or sandbox settings.
+fn validate_sandbox_secret_update(req: &UpdateConfigRequest) -> Result<(), Status> {
+    if req.global {
+        return Err(Status::permission_denied(
+            "sandbox secret cannot mutate global config",
+        ));
+    }
+    if req.delete_setting {
+        return Err(Status::permission_denied(
+            "sandbox secret cannot delete settings",
+        ));
+    }
+    if req.name.trim().is_empty() {
+        return Err(Status::permission_denied(
+            "sandbox secret may only perform sandbox policy sync",
+        ));
+    }
+    if req.policy.is_none() || !req.setting_key.trim().is_empty() {
+        return Err(Status::permission_denied(
+            "sandbox secret may only perform sandbox policy sync",
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Config handlers
 // ---------------------------------------------------------------------------
@@ -484,7 +514,11 @@ pub(super) async fn handle_update_config(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
+    let sandbox_secret_auth = is_sandbox_secret_authenticated(&request);
     let req = request.into_inner();
+    if sandbox_secret_auth {
+        validate_sandbox_secret_update(&req)?;
+    }
     let key = req.setting_key.trim();
     let has_policy = req.policy.is_some();
     let has_setting = !key.is_empty();
@@ -2591,6 +2625,49 @@ mod tests {
     use std::sync::Arc;
     use tonic::Code;
 
+    #[test]
+    fn sandbox_secret_update_validation_allows_sandbox_policy_sync() {
+        let req = UpdateConfigRequest {
+            name: "sandbox-1".to_string(),
+            policy: Some(ProtoSandboxPolicy::default()),
+            ..Default::default()
+        };
+        assert!(validate_sandbox_secret_update(&req).is_ok());
+    }
+
+    #[test]
+    fn sandbox_secret_update_validation_rejects_global_mutation() {
+        let req = UpdateConfigRequest {
+            global: true,
+            policy: Some(ProtoSandboxPolicy::default()),
+            ..Default::default()
+        };
+        let err = validate_sandbox_secret_update(&req).unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[test]
+    fn sandbox_secret_update_validation_rejects_setting_mutation() {
+        let req = UpdateConfigRequest {
+            name: "sandbox-1".to_string(),
+            setting_key: "inference.model".to_string(),
+            setting_value: Some(SettingValue { value: None }),
+            ..Default::default()
+        };
+        let err = validate_sandbox_secret_update(&req).unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[test]
+    fn sandbox_secret_marker_detected_from_metadata() {
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            oidc::INTERNAL_AUTH_SOURCE_HEADER,
+            oidc::AUTH_SOURCE_SANDBOX_SECRET.parse().unwrap(),
+        );
+        assert!(is_sandbox_secret_authenticated(&req));
+    }
+
     // ---- Sandbox without policy ----
 
     #[tokio::test]
@@ -2700,6 +2777,7 @@ mod tests {
             SandboxWatchBus::new(),
             TracingLogBus::new(),
             Arc::new(SupervisorSessionRegistry::new()),
+            None,
         ))
     }
 

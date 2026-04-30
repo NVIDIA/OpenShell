@@ -112,6 +112,10 @@ pub struct Config {
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
     pub tls: Option<TlsConfig>,
 
+    /// OIDC configuration. When `Some`, the server validates Bearer JWTs.
+    #[serde(default)]
+    pub oidc: Option<OidcConfig>,
+
     /// Database URL for persistence.
     pub database_url: String,
 
@@ -223,6 +227,64 @@ pub struct TlsConfig {
     pub allow_unauthenticated: bool,
 }
 
+/// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
+///
+/// When configured, the server validates `authorization: Bearer <JWT>`
+/// headers on gRPC requests against the specified issuer's JWKS endpoint.
+///
+/// The roles claim path is configurable to support different providers:
+/// - Keycloak: `realm_access.roles` (default)
+/// - Entra ID / Okta: `roles`
+/// - Custom: any dot-separated path into the JWT claims
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcConfig {
+    /// OIDC issuer URL (e.g., `http://localhost:8180/realms/openshell`).
+    pub issuer: String,
+
+    /// Expected audience (`aud`) claim. Typically the OIDC client ID.
+    pub audience: String,
+
+    /// JWKS cache TTL in seconds. Defaults to 3600 (1 hour).
+    #[serde(default = "default_jwks_ttl_secs")]
+    pub jwks_ttl_secs: u64,
+
+    /// Dot-separated path to the roles array in the JWT claims.
+    /// Defaults to `realm_access.roles` (Keycloak).
+    /// Examples: `roles` (Entra ID), `groups` (Okta), `custom.path.roles`.
+    #[serde(default = "default_roles_claim")]
+    pub roles_claim: String,
+
+    /// Role name that grants admin access. Defaults to `openshell-admin`.
+    #[serde(default = "default_admin_role")]
+    pub admin_role: String,
+
+    /// Role name that grants standard user access. Defaults to `openshell-user`.
+    #[serde(default = "default_user_role")]
+    pub user_role: String,
+
+    /// Dot-separated path to the scopes value in the JWT claims.
+    /// When non-empty, the server enforces scope-based permissions on top of roles.
+    /// Keycloak: `scope` (space-delimited string). Okta: `scp` (JSON array).
+    #[serde(default)]
+    pub scopes_claim: String,
+}
+
+const fn default_jwks_ttl_secs() -> u64 {
+    3600
+}
+
+fn default_roles_claim() -> String {
+    "realm_access.roles".to_string()
+}
+
+fn default_admin_role() -> String {
+    "openshell-admin".to_string()
+}
+
+fn default_user_role() -> String {
+    "openshell-user".to_string()
+}
+
 impl Config {
     /// Create a new config with optional TLS.
     pub fn new(tls: Option<TlsConfig>) -> Self {
@@ -232,6 +294,7 @@ impl Config {
             metrics_bind_address: None,
             log_level: default_log_level(),
             tls,
+            oidc: None,
             database_url: String::new(),
             compute_drivers: default_compute_drivers(),
             sandbox_namespace: default_sandbox_namespace(),
@@ -382,6 +445,13 @@ impl Config {
     #[must_use]
     pub fn with_host_gateway_ip(mut self, ip: impl Into<String>) -> Self {
         self.host_gateway_ip = ip.into();
+        self
+    }
+
+    /// Set the OIDC configuration for JWT-based authentication.
+    #[must_use]
+    pub fn with_oidc(mut self, oidc: OidcConfig) -> Self {
+        self.oidc = Some(oidc);
         self
     }
 }

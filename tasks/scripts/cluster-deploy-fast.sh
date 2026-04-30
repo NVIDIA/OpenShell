@@ -427,6 +427,24 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     HOST_GATEWAY_ARGS="--set server.hostGatewayIP=${HOST_GATEWAY_IP}"
   fi
 
+  OIDC_HELM_ARGS=""
+  if [[ -n "${OPENSHELL_OIDC_ISSUER:-}" ]]; then
+    OIDC_HELM_ARGS="--set server.oidc.issuer=${OPENSHELL_OIDC_ISSUER}"
+    OIDC_HELM_ARGS="${OIDC_HELM_ARGS} --set server.oidc.audience=${OPENSHELL_OIDC_AUDIENCE:-openshell-cli}"
+    if [[ -n "${OPENSHELL_OIDC_ROLES_CLAIM:-}" ]]; then
+      OIDC_HELM_ARGS="${OIDC_HELM_ARGS} --set server.oidc.rolesClaim=${OPENSHELL_OIDC_ROLES_CLAIM}"
+    fi
+    if [[ -n "${OPENSHELL_OIDC_ADMIN_ROLE:-}" ]]; then
+      OIDC_HELM_ARGS="${OIDC_HELM_ARGS} --set server.oidc.adminRole=${OPENSHELL_OIDC_ADMIN_ROLE}"
+    fi
+    if [[ -n "${OPENSHELL_OIDC_USER_ROLE:-}" ]]; then
+      OIDC_HELM_ARGS="${OIDC_HELM_ARGS} --set server.oidc.userRole=${OPENSHELL_OIDC_USER_ROLE}"
+    fi
+    if [[ -n "${OPENSHELL_OIDC_SCOPES_CLAIM:-}" ]]; then
+      OIDC_HELM_ARGS="${OIDC_HELM_ARGS} --set server.oidc.scopesClaim=${OPENSHELL_OIDC_SCOPES_CLAIM}"
+    fi
+  fi
+
   cluster_exec "helm upgrade openshell ${CONTAINER_CHART_DIR} \
     --namespace openshell \
     --set image.repository=${IMAGE_REPO_BASE}/gateway \
@@ -437,6 +455,7 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     --set server.tls.clientCaSecretName=openshell-server-client-ca \
     --set server.tls.clientTlsSecretName=openshell-client-tls \
     ${HOST_GATEWAY_ARGS} \
+    ${OIDC_HELM_ARGS} \
     ${helm_wait_args}"
   helm_end=$(date +%s)
   log_duration "Helm upgrade" "${helm_start}" "${helm_end}"

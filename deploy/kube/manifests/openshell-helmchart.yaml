@@ -38,6 +38,14 @@ spec:
       hostGatewayIP: __HOST_GATEWAY_IP__
       disableGatewayAuth: __DISABLE_GATEWAY_AUTH__
       disableTls: __DISABLE_TLS__
+      oidc:
+        issuer: "__OIDC_ISSUER__"
+        audience: "__OIDC_AUDIENCE__"
+        jwksTtl: 3600
+        rolesClaim: "__OIDC_ROLES_CLAIM__"
+        adminRole: "__OIDC_ADMIN_ROLE__"
+        userRole: "__OIDC_USER_ROLE__"
+        scopesClaim: "__OIDC_SCOPES_CLAIM__"
       tls:
         certSecretName: openshell-server-tls
         clientCaSecretName: openshell-server-client-ca

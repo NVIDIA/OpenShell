@@ -1726,13 +1726,8 @@ fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Re
     let metadata = openshell_bootstrap::GatewayMetadata {
         name: gateway_name.to_string(),
         gateway_endpoint: format!("https://127.0.0.1:{gateway_port}"),
-        is_remote: false,
         gateway_port,
-        remote_host: None,
-        resolved_host: None,
-        auth_mode: None,
-        edge_team_domain: None,
-        edge_auth_url: None,
+        ..Default::default()
     };
 
     let exec_socket = vm_exec_socket_path(rootfs);

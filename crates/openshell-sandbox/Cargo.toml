@@ -35,7 +35,7 @@ miette = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = { workspace = true }
 hex = "0.4"
 russh = "0.57"
 rand_core = "0.6"

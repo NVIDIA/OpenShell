@@ -273,6 +273,16 @@ if [ -n "${GATEWAY_HOST:-}" ]; then
   fi
 fi
 
+if [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
+  DEPLOY_CMD+=(--oidc-issuer "${OPENSHELL_OIDC_ISSUER}")
+  [ -n "${OPENSHELL_OIDC_AUDIENCE:-}" ] && DEPLOY_CMD+=(--oidc-audience "${OPENSHELL_OIDC_AUDIENCE}")
+  [ -n "${OPENSHELL_OIDC_ROLES_CLAIM:-}" ] && DEPLOY_CMD+=(--oidc-roles-claim "${OPENSHELL_OIDC_ROLES_CLAIM}")
+  [ -n "${OPENSHELL_OIDC_ADMIN_ROLE:-}" ] && DEPLOY_CMD+=(--oidc-admin-role "${OPENSHELL_OIDC_ADMIN_ROLE}")
+  [ -n "${OPENSHELL_OIDC_USER_ROLE:-}" ] && DEPLOY_CMD+=(--oidc-user-role "${OPENSHELL_OIDC_USER_ROLE}")
+  [ -n "${OPENSHELL_OIDC_SCOPES_CLAIM:-}" ] && DEPLOY_CMD+=(--oidc-scopes-claim "${OPENSHELL_OIDC_SCOPES_CLAIM}")
+  [ -n "${OPENSHELL_OIDC_SCOPES:-}" ] && DEPLOY_CMD+=(--oidc-scopes "${OPENSHELL_OIDC_SCOPES}")
+fi
+
 "${DEPLOY_CMD[@]}"
 
 # Clear the fast-deploy state file so the next incremental deploy

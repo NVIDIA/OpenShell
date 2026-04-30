@@ -5,6 +5,7 @@ pub mod build;
 pub mod edge_token;
 pub mod errors;
 pub mod image;
+pub mod oidc_token;
 
 pub mod constants;
 mod docker;
@@ -123,6 +124,20 @@ pub struct DeployOptions {
     /// When false, an existing gateway is left as-is and deployment is
     /// skipped (the caller is responsible for prompting the user first).
     pub recreate: bool,
+    /// OIDC issuer URL. When set, the server validates Bearer JWTs.
+    pub oidc_issuer: Option<String>,
+    /// OIDC audience for the API resource server. Defaults to "openshell-cli".
+    pub oidc_audience: String,
+    /// OIDC client ID for CLI login. Defaults to "openshell-cli".
+    pub oidc_client_id: String,
+    /// OIDC roles claim path (e.g. `realm_access.roles`).
+    pub oidc_roles_claim: Option<String>,
+    /// OIDC admin role name.
+    pub oidc_admin_role: Option<String>,
+    /// OIDC user role name.
+    pub oidc_user_role: Option<String>,
+    /// OIDC scopes claim path. When set, the server enforces scope-based permissions.
+    pub oidc_scopes_claim: Option<String>,
 }
 
 impl DeployOptions {
@@ -139,6 +154,13 @@ impl DeployOptions {
             registry_token: None,
             gpu: vec![],
             recreate: false,
+            oidc_issuer: None,
+            oidc_audience: "openshell-cli".to_string(),
+            oidc_client_id: "openshell-cli".to_string(),
+            oidc_roles_claim: None,
+            oidc_admin_role: None,
+            oidc_user_role: None,
+            oidc_scopes_claim: None,
         }
     }
 
@@ -208,6 +230,48 @@ impl DeployOptions {
         self.recreate = recreate;
         self
     }
+
+    /// Set the OIDC issuer URL for JWT-based authentication.
+    #[must_use]
+    pub fn with_oidc_issuer(mut self, issuer: impl Into<String>) -> Self {
+        self.oidc_issuer = Some(issuer.into());
+        self
+    }
+
+    /// Set the OIDC audience (client ID).
+    #[must_use]
+    pub fn with_oidc_audience(mut self, audience: impl Into<String>) -> Self {
+        self.oidc_audience = audience.into();
+        self
+    }
+}
+
+fn apply_oidc_gateway_metadata(
+    metadata: &mut GatewayMetadata,
+    resume: bool,
+    existing: Option<&GatewayMetadata>,
+    oidc_issuer: Option<&str>,
+    oidc_client_id: &str,
+    oidc_audience: &str,
+) {
+    if let Some(issuer) = oidc_issuer {
+        metadata.auth_mode = Some("oidc".to_string());
+        metadata.oidc_issuer = Some(issuer.to_string());
+        metadata.oidc_client_id = Some(oidc_client_id.to_string());
+        metadata.oidc_audience = Some(oidc_audience.to_string());
+        return;
+    }
+
+    if resume
+        && let Some(existing) = existing
+        && existing.auth_mode.as_deref() == Some("oidc")
+    {
+        metadata.auth_mode.clone_from(&existing.auth_mode);
+        metadata.oidc_issuer.clone_from(&existing.oidc_issuer);
+        metadata.oidc_client_id.clone_from(&existing.oidc_client_id);
+        metadata.oidc_audience.clone_from(&existing.oidc_audience);
+        metadata.oidc_scopes.clone_from(&existing.oidc_scopes);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +336,13 @@ where
     let registry_token = options.registry_token;
     let gpu = options.gpu;
     let recreate = options.recreate;
+    let oidc_issuer = options.oidc_issuer;
+    let oidc_audience = options.oidc_audience;
+    let oidc_client_id = options.oidc_client_id;
+    let oidc_roles_claim = options.oidc_roles_claim;
+    let oidc_admin_role = options.oidc_admin_role;
+    let oidc_user_role = options.oidc_user_role;
+    let oidc_scopes_claim = options.oidc_scopes_claim;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
     // which needs a 'static callback for the bollard streaming pull.
@@ -457,6 +528,12 @@ where
             registry_token.as_deref(),
             &device_ids,
             resume,
+            oidc_issuer.as_deref(),
+            &oidc_audience,
+            oidc_roles_claim.as_deref(),
+            oidc_admin_role.as_deref(),
+            oidc_user_role.as_deref(),
+            oidc_scopes_claim.as_deref(),
         )
         .await?;
         let port = actual_port;
@@ -557,13 +634,28 @@ where
             wait_for_gateway_ready(&target_docker, &name, &mut gateway_log).await?;
         }
 
-        // Create and store gateway metadata.
-        let metadata = create_gateway_metadata_with_host(
+        // Create and store gateway metadata. On resume, preserve existing
+        // OIDC fields so a bare `gateway start` without `--oidc-*` flags
+        // doesn't erase a previously configured OIDC registration.
+        let mut metadata = create_gateway_metadata_with_host(
             &name,
             remote_opts.as_ref(),
             port,
             ssh_gateway_host.as_deref(),
             disable_tls,
+        );
+        let existing_metadata = if resume {
+            load_gateway_metadata(&name).ok()
+        } else {
+            None
+        };
+        apply_oidc_gateway_metadata(
+            &mut metadata,
+            resume,
+            existing_metadata.as_ref(),
+            oidc_issuer.as_deref(),
+            &oidc_client_id,
+            &oidc_audience,
         );
         store_gateway_metadata(&name, &metadata)?;
 
@@ -1215,5 +1307,83 @@ mod tests {
                 "{label} should contain PEM marker"
             );
         }
+    }
+
+    #[test]
+    fn apply_oidc_gateway_metadata_sets_explicit_values() {
+        let mut metadata = GatewayMetadata::default();
+        apply_oidc_gateway_metadata(
+            &mut metadata,
+            false,
+            None,
+            Some("http://issuer.test/realm"),
+            "openshell-cli",
+            "openshell-api",
+        );
+
+        assert_eq!(metadata.auth_mode.as_deref(), Some("oidc"));
+        assert_eq!(
+            metadata.oidc_issuer.as_deref(),
+            Some("http://issuer.test/realm")
+        );
+        assert_eq!(metadata.oidc_client_id.as_deref(), Some("openshell-cli"));
+        assert_eq!(metadata.oidc_audience.as_deref(), Some("openshell-api"));
+    }
+
+    #[test]
+    fn apply_oidc_gateway_metadata_preserves_existing_oidc_on_resume() {
+        let mut metadata = GatewayMetadata::default();
+        let existing = GatewayMetadata {
+            auth_mode: Some("oidc".to_string()),
+            oidc_issuer: Some("http://issuer.test/realm".to_string()),
+            oidc_client_id: Some("openshell-cli".to_string()),
+            oidc_audience: Some("openshell-api".to_string()),
+            oidc_scopes: Some("sandbox:read".to_string()),
+            ..GatewayMetadata::default()
+        };
+
+        apply_oidc_gateway_metadata(
+            &mut metadata,
+            true,
+            Some(&existing),
+            None,
+            "ignored-client",
+            "ignored-audience",
+        );
+
+        assert_eq!(metadata.auth_mode.as_deref(), Some("oidc"));
+        assert_eq!(
+            metadata.oidc_issuer.as_deref(),
+            Some("http://issuer.test/realm")
+        );
+        assert_eq!(metadata.oidc_client_id.as_deref(), Some("openshell-cli"));
+        assert_eq!(metadata.oidc_audience.as_deref(), Some("openshell-api"));
+        assert_eq!(metadata.oidc_scopes.as_deref(), Some("sandbox:read"));
+    }
+
+    #[test]
+    fn apply_oidc_gateway_metadata_does_not_preserve_without_resume() {
+        let mut metadata = GatewayMetadata::default();
+        let existing = GatewayMetadata {
+            auth_mode: Some("oidc".to_string()),
+            oidc_issuer: Some("http://issuer.test/realm".to_string()),
+            oidc_client_id: Some("openshell-cli".to_string()),
+            oidc_audience: Some("openshell-api".to_string()),
+            ..GatewayMetadata::default()
+        };
+
+        apply_oidc_gateway_metadata(
+            &mut metadata,
+            false,
+            Some(&existing),
+            None,
+            "ignored-client",
+            "ignored-audience",
+        );
+
+        assert!(metadata.auth_mode.is_none());
+        assert!(metadata.oidc_issuer.is_none());
+        assert!(metadata.oidc_client_id.is_none());
+        assert!(metadata.oidc_audience.is_none());
     }
 }

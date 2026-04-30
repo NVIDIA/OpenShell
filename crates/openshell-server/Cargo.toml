@@ -73,10 +73,11 @@ sqlx = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = { workspace = true }
+jsonwebtoken = { workspace = true }
 hex = "0.4"
 russh = "0.57"
-rand = "0.9"
+rand = { workspace = true }
 petname = "2"
 ipnet = "2"
 tempfile = "3"

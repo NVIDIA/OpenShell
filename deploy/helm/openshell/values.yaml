@@ -110,6 +110,26 @@ server:
     clientCaSecretName: openshell-server-client-ca
     # K8s secret mounted into sandbox pods for mTLS to the server
     clientTlsSecretName: openshell-client-tls
+  # OIDC (OpenID Connect) configuration for JWT-based authentication.
+  # When issuer is set, the server validates Bearer tokens on gRPC requests.
+  oidc:
+    # OIDC issuer URL (e.g. https://keycloak.example.com/realms/openshell).
+    issuer: ""
+    # Expected audience claim for the API resource server.
+    # This should match the server's --oidc-audience, NOT the CLI client ID.
+    audience: "openshell-cli"
+    # JWKS key cache TTL in seconds.
+    jwksTtl: 3600
+    # Dot-separated path to the roles array in the JWT claims.
+    # Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups".
+    rolesClaim: ""
+    # Role name for admin access. Leave empty (with userRole also empty) for
+    # authentication-only mode. Both must be set or both empty.
+    adminRole: ""
+    # Role name for standard user access.
+    userRole: ""
+    # Dot-separated path to the scopes array in the JWT claims.
+    scopesClaim: ""
 
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Gateway metadata stored alongside deployment info.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GatewayMetadata {
     /// The gateway name.
     pub name: String,
@@ -46,6 +46,25 @@ pub struct GatewayMetadata {
         alias = "cf_auth_url"
     )]
     pub edge_auth_url: Option<String>,
+
+    /// OIDC issuer URL (set when `auth_mode == "oidc"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_issuer: Option<String>,
+
+    /// OIDC client ID for the CLI login flow (set when `auth_mode == "oidc"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_client_id: Option<String>,
+
+    /// OIDC audience for the resource server (API). When different from
+    /// `client_id`, the CLI requests this audience in the token exchange.
+    /// When `None`, defaults to the `client_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_audience: Option<String>,
+
+    /// Space-separated `OAuth2` scopes to request during OIDC login.
+    /// When set, tokens will include these scopes for fine-grained access control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_scopes: Option<String>,
 }
 
 impl GatewayMetadata {
@@ -134,8 +153,7 @@ pub fn create_gateway_metadata_with_host(
         remote_host,
         resolved_host,
         auth_mode: disable_tls.then(|| "plaintext".to_string()),
-        edge_team_domain: None,
-        edge_auth_url: None,
+        ..Default::default()
     }
 }
 
@@ -460,9 +478,7 @@ mod tests {
             gateway_port: 8080,
             remote_host: Some("user@openshell-dev".to_string()),
             resolved_host: Some("10.0.0.5".to_string()),
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: GatewayMetadata = serde_json::from_str(&json).unwrap();
@@ -551,13 +567,8 @@ mod tests {
         let meta = GatewayMetadata {
             name: "t".into(),
             gateway_endpoint: "https://localhost:8080".into(),
-            is_remote: false,
             gateway_port: 8080,
-            remote_host: None,
-            resolved_host: None,
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
+            ..Default::default()
         };
         assert_eq!(meta.gateway_host(), None);
     }
@@ -571,9 +582,7 @@ mod tests {
             gateway_port: 8080,
             remote_host: Some("user@10.0.0.5".into()),
             resolved_host: Some("10.0.0.5".into()),
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
+            ..Default::default()
         };
         assert_eq!(meta.gateway_host(), Some("10.0.0.5"));
     }

@@ -506,6 +506,12 @@ pub async fn ensure_container(
     registry_token: Option<&str>,
     device_ids: &[String],
     resume: bool,
+    oidc_issuer: Option<&str>,
+    oidc_audience: &str,
+    oidc_roles_claim: Option<&str>,
+    oidc_admin_role: Option<&str>,
+    oidc_user_role: Option<&str>,
+    oidc_scopes_claim: Option<&str>,
 ) -> Result<u16> {
     let container_name = container_name(name);
 
@@ -782,6 +788,25 @@ pub async fn ensure_container(
     // HelmChart CR so k8s workloads can request nvidia.com/gpu resources.
     if !device_ids.is_empty() {
         env_vars.push("GPU_ENABLED=true".to_string());
+    }
+
+    // OIDC JWT authentication: pass issuer and audience to the entrypoint
+    // so the HelmChart manifest configures the server pod for JWT validation.
+    if let Some(issuer) = oidc_issuer {
+        env_vars.push(format!("OIDC_ISSUER={issuer}"));
+        env_vars.push(format!("OIDC_AUDIENCE={oidc_audience}"));
+        if let Some(claim) = oidc_roles_claim {
+            env_vars.push(format!("OIDC_ROLES_CLAIM={claim}"));
+        }
+        if let Some(role) = oidc_admin_role {
+            env_vars.push(format!("OIDC_ADMIN_ROLE={role}"));
+        }
+        if let Some(role) = oidc_user_role {
+            env_vars.push(format!("OIDC_USER_ROLE={role}"));
+        }
+        if let Some(claim) = oidc_scopes_claim {
+            env_vars.push(format!("OIDC_SCOPES_CLAIM={claim}"));
+        }
     }
 
     let env = Some(env_vars);
