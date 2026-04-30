@@ -588,7 +588,7 @@ impl SshHandler {
 /// the calling thread's network namespace permanently — a tokio blocking-pool
 /// thread could be reused for unrelated tasks and must not be contaminated.
 /// On non-Linux platforms (no network namespace support), we connect directly.
-async fn connect_in_netns(
+pub async fn connect_in_netns(
     addr: &str,
     netns_fd: Option<RawFd>,
 ) -> std::io::Result<tokio::net::TcpStream> {

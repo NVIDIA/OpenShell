@@ -103,6 +103,10 @@ server:
   # Disable TLS entirely — the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
   disableTls: false
+  localDomain:
+    enabled: false
+    cluster: ""
+    suffix: "openshell.localhost"
   tls:
     # K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server
     certSecretName: openshell-server-tls

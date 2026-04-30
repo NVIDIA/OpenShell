@@ -36,6 +36,9 @@ service OpenShell {
   // Create a short-lived SSH session for a sandbox.
   rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse);
 
+  // Create or update a sandbox HTTP service endpoint for local-domain routing.
+  rpc ExposeService(ExposeServiceRequest) returns (ServiceEndpointResponse);
+
   // Revoke a previously issued SSH session.
   rpc RevokeSshSession(RevokeSshSessionRequest) returns (RevokeSshSessionResponse);
 
@@ -377,6 +380,40 @@ message CreateSshSessionResponse {
 
   // Expiry timestamp in milliseconds since epoch. 0 means no expiry.
   int64 expires_at_ms = 8;
+}
+
+// Request to expose an HTTP service running inside a sandbox.
+message ExposeServiceRequest {
+  // Sandbox name.
+  string sandbox = 1;
+  // Service name within the sandbox.
+  string service = 2;
+  // Loopback TCP port inside the sandbox.
+  uint32 target_port = 3;
+  // Whether to print/use the local-domain URL.
+  bool domain = 4;
+}
+
+// Persisted sandbox service endpoint.
+message ServiceEndpoint {
+  // Kubernetes-style metadata.
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  // Sandbox object ID.
+  string sandbox_id = 2;
+  // Sandbox name.
+  string sandbox_name = 3;
+  // Service name within the sandbox.
+  string service_name = 4;
+  // Loopback TCP port inside the sandbox.
+  uint32 target_port = 5;
+  // Whether local-domain routing is enabled for this endpoint.
+  bool domain = 6;
+}
+
+// Response containing a service endpoint and, when available, its local URL.
+message ServiceEndpointResponse {
+  ServiceEndpoint endpoint = 1;
+  string url = 2;
 }
 
 // Revoke SSH session request.
@@ -843,6 +880,9 @@ message GatewayHeartbeat {}
 message RelayOpen {
   // Gateway-allocated channel identifier (UUID).
   string channel_id = 1;
+  // Optional loopback TCP target port inside the sandbox. Zero preserves the
+  // existing SSH relay behavior and targets the supervisor's SSH Unix socket.
+  uint32 target_port = 2;
 }
 
 // Initial RelayStream frame sent by the supervisor to claim a pending relay.

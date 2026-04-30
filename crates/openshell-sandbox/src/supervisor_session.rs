@@ -10,6 +10,7 @@
 //! daemon. The supervisor is a dumb byte bridge — it has no protocol awareness
 //! of the SSH or NSSH1 bytes flowing through.
 
+use std::os::fd::RawFd;
 use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
@@ -21,7 +22,7 @@ use openshell_ocsf::{
     ActivityId, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext, SeverityId, StatusId,
     ocsf_emit,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
@@ -158,14 +159,21 @@ pub fn spawn(
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
+    netns_fd: Option<RawFd>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_session_loop(endpoint, sandbox_id, ssh_socket_path))
+    tokio::spawn(run_session_loop(
+        endpoint,
+        sandbox_id,
+        ssh_socket_path,
+        netns_fd,
+    ))
 }
 
 async fn run_session_loop(
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
+    netns_fd: Option<RawFd>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
@@ -173,7 +181,7 @@ async fn run_session_loop(
     loop {
         attempt += 1;
 
-        match run_single_session(&endpoint, &sandbox_id, &ssh_socket_path).await {
+        match run_single_session(&endpoint, &sandbox_id, &ssh_socket_path, netns_fd).await {
             Ok(()) => {
                 let event = session_closed_event(crate::ocsf_ctx(), &endpoint, &sandbox_id);
                 ocsf_emit!(event);
@@ -194,6 +202,7 @@ async fn run_single_session(
     endpoint: &str,
     sandbox_id: &str,
     ssh_socket_path: &std::path::Path,
+    netns_fd: Option<RawFd>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -263,6 +272,7 @@ async fn run_single_session(
                     sandbox_id,
                     ssh_socket_path,
                     &channel,
+                    netns_fd,
                 );
             }
             _ = heartbeat_interval.tick() => {
@@ -284,6 +294,7 @@ fn handle_gateway_message(
     sandbox_id: &str,
     ssh_socket_path: &std::path::Path,
     channel: &Channel,
+    netns_fd: Option<RawFd>,
 ) {
     match &msg.payload {
         Some(gateway_message::Payload::Heartbeat(_)) => {
@@ -291,6 +302,9 @@ fn handle_gateway_message(
         }
         Some(gateway_message::Payload::RelayOpen(open)) => {
             let channel_id = open.channel_id.clone();
+            let target_port = u16::try_from(open.target_port)
+                .ok()
+                .filter(|port| *port > 0);
             let sandbox_id = sandbox_id.to_string();
             let channel = channel.clone();
             let ssh_socket_path = ssh_socket_path.to_path_buf();
@@ -299,7 +313,15 @@ fn handle_gateway_message(
             ocsf_emit!(event);
 
             tokio::spawn(async move {
-                match handle_relay_open(&channel_id, &ssh_socket_path, channel).await {
+                match handle_relay_open(
+                    &channel_id,
+                    target_port,
+                    &ssh_socket_path,
+                    channel,
+                    netns_fd,
+                )
+                .await
+                {
                     Ok(()) => {
                         let event = relay_closed_event(crate::ocsf_ctx(), &channel_id);
                         ocsf_emit!(event);
@@ -337,8 +359,10 @@ fn handle_gateway_message(
 /// frames carry raw SSH bytes in `data`.
 async fn handle_relay_open(
     channel_id: &str,
+    target_port: Option<u16>,
     ssh_socket_path: &std::path::Path,
     channel: Channel,
+    netns_fd: Option<RawFd>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = OpenShellClient::new(channel);
 
@@ -363,24 +387,48 @@ async fn handle_relay_open(
         .relay_stream(outbound)
         .await
         .map_err(|e| format!("relay_stream RPC failed: {e}"))?;
-    let mut inbound = response.into_inner();
+    let inbound = response.into_inner();
 
-    // Connect to the local SSH daemon on its Unix socket.
-    let ssh = tokio::net::UnixStream::connect(ssh_socket_path).await?;
-    let (mut ssh_r, mut ssh_w) = ssh.into_split();
+    if let Some(port) = target_port {
+        let service = connect_target_port(port, netns_fd).await?;
+        debug!(channel_id = %channel_id, port = port, "relay bridge: connected to local TCP service");
+        bridge_relay_stream(channel_id, inbound, out_tx, service).await
+    } else {
+        let ssh = tokio::net::UnixStream::connect(ssh_socket_path).await?;
+        debug!(
+            channel_id = %channel_id,
+            socket = %ssh_socket_path.display(),
+            "relay bridge: connected to local SSH daemon"
+        );
+        bridge_relay_stream(channel_id, inbound, out_tx, ssh).await
+    }
+}
 
-    debug!(
-        channel_id = %channel_id,
-        socket = %ssh_socket_path.display(),
-        "relay bridge: connected to local SSH daemon"
-    );
+async fn connect_target_port(
+    port: u16,
+    netns_fd: Option<RawFd>,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let addr = format!("127.0.0.1:{port}");
+    crate::ssh::connect_in_netns(&addr, netns_fd).await
+}
 
-    // SSH → gRPC (out_tx): read local SSH, forward as `RelayFrame::data`.
+async fn bridge_relay_stream<S>(
+    _channel_id: &str,
+    mut inbound: tonic::Streaming<RelayFrame>,
+    out_tx: mpsc::Sender<RelayFrame>,
+    service: S,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut service_r, mut service_w) = tokio::io::split(service);
+
+    // Service → gRPC (out_tx): read local service, forward as `RelayFrame::data`.
     let out_tx_writer = out_tx.clone();
-    let ssh_to_grpc = tokio::spawn(async move {
+    let service_to_grpc = tokio::spawn(async move {
         let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
         loop {
-            match ssh_r.read(&mut buf).await {
+            match service_r.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let chunk = RelayFrame {
@@ -396,7 +444,7 @@ async fn handle_relay_open(
         }
     });
 
-    // gRPC (inbound) → SSH: drain inbound chunks into the local SSH socket.
+    // gRPC (inbound) → service: drain inbound chunks into the local service socket.
     let mut inbound_err: Option<String> = None;
     while let Some(next) = inbound.next().await {
         match next {
@@ -409,8 +457,8 @@ async fn handle_relay_open(
                 if data.is_empty() {
                     continue;
                 }
-                if let Err(e) = ssh_w.write_all(&data).await {
-                    inbound_err = Some(format!("write to ssh failed: {e}"));
+                if let Err(e) = service_w.write_all(&data).await {
+                    inbound_err = Some(format!("write to service failed: {e}"));
                     break;
                 }
             }
@@ -421,13 +469,13 @@ async fn handle_relay_open(
         }
     }
 
-    // Half-close the SSH socket's write side so the daemon sees EOF.
-    let _ = ssh_w.shutdown().await;
+    // Half-close the service socket's write side so the service sees EOF.
+    let _ = service_w.shutdown().await;
 
     // Dropping out_tx closes the outbound gRPC stream, letting the gateway
     // observe EOF on its side too.
     drop(out_tx);
-    let _ = ssh_to_grpc.await;
+    let _ = service_to_grpc.await;
 
     if let Some(e) = inbound_err {
         return Err(e.into());
@@ -566,5 +614,23 @@ mod ocsf_event_tests {
         let err = map_stream_message::<SupervisorMessage>(Ok(None), "gateway closed stream")
             .expect_err("eof should force reconnect");
         assert_eq!(err.to_string(), "gateway closed stream");
+    }
+
+    #[tokio::test]
+    async fn connect_target_port_connects_to_loopback_without_netns() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("listener should bind");
+        let port = listener.local_addr().unwrap().port();
+
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await.expect("listener should accept");
+        });
+
+        let stream = connect_target_port(port, None)
+            .await
+            .expect("target port should connect");
+        drop(stream);
+        accept.await.expect("accept task should finish");
     }
 }

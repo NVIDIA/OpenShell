@@ -158,7 +158,7 @@ async fn ssh_connect(
     // direct-connect path tolerated ~34s here for similar reasons.
     let (channel_id, relay_rx) = match state
         .supervisor_sessions
-        .open_relay(&sandbox_id, Duration::from_secs(30))
+        .open_relay(&sandbox_id, None, Duration::from_secs(30))
         .await
     {
         Ok(pair) => pair,

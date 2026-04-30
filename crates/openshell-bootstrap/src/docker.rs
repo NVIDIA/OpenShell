@@ -493,6 +493,7 @@ pub async fn ensure_image(
 /// because the container was originally created with a different port.
 // Refactoring this signature would touch many call sites across the workspace.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::fn_params_excessive_bools)]
 pub async fn ensure_container(
     docker: &Docker,
     name: &str,
@@ -502,6 +503,9 @@ pub async fn ensure_container(
     gateway_port: u16,
     disable_tls: bool,
     disable_gateway_auth: bool,
+    local_domain: bool,
+    local_domain_cluster: &str,
+    local_domain_suffix: &str,
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     device_ids: &[String],
@@ -742,6 +746,11 @@ pub async fn ensure_container(
         // gateway port for remote clusters must match.
         env_vars.push(format!("SSH_GATEWAY_PORT={gateway_port}"));
     }
+    if local_domain {
+        env_vars.push("LOCAL_DOMAIN_ENABLED=true".to_string());
+        env_vars.push(format!("LOCAL_DOMAIN_CLUSTER={local_domain_cluster}"));
+        env_vars.push(format!("LOCAL_DOMAIN_SUFFIX={local_domain_suffix}"));
+    }
 
     // Pass image configuration to the cluster entrypoint.
     // The effective tag is resolved from the runtime IMAGE_TAG env var (if set)
@@ -754,6 +763,8 @@ pub async fn ensure_container(
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| image::DEFAULT_IMAGE_TAG.to_string());
+    let sandbox_image_pull_policy = env_non_empty("OPENSHELL_SANDBOX_IMAGE_PULL_POLICY")
+        .unwrap_or_else(|| "IfNotPresent".to_string());
     if push_mode {
         if let Ok(images) = std::env::var("OPENSHELL_PUSH_IMAGES")
             && !images.trim().is_empty()
@@ -765,6 +776,9 @@ pub async fn ensure_container(
     } else {
         env_vars.push(format!("IMAGE_TAG={effective_tag}"));
     }
+    env_vars.push(format!(
+        "SANDBOX_IMAGE_PULL_POLICY={sandbox_image_pull_policy}"
+    ));
 
     // Disable TLS: pass through to the entrypoint so the HelmChart manifest
     // configures the server pod for plaintext HTTP.

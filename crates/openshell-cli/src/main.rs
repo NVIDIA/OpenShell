@@ -165,6 +165,7 @@ const HELP_TEMPLATE: &str = "\
 
 \x1b[1mSANDBOX COMMANDS\x1b[0m
   sandbox:     Manage sandboxes
+  service:     Expose sandbox services
   forward:     Manage port forwarding to a sandbox
   logs:        View sandbox logs
   policy:      Manage sandbox policy
@@ -378,6 +379,13 @@ enum Commands {
     Forward {
         #[command(subcommand)]
         command: Option<ForwardCommands>,
+    },
+
+    /// Expose sandbox services.
+    #[command(help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Service {
+        #[command(subcommand)]
+        command: Option<ServiceCommands>,
     },
 
     /// View sandbox logs.
@@ -791,6 +799,16 @@ enum GatewayCommands {
         #[arg(long)]
         disable_gateway_auth: bool,
 
+        /// Enable browser-facing local-domain routing for this local gateway.
+        ///
+        /// This is enabled by default during the local-domain routing spike.
+        #[arg(long, default_value_t = true)]
+        local_domain: bool,
+
+        /// Suffix for local-domain routes.
+        #[arg(long, default_value = openshell_core::config::DEFAULT_LOCAL_DOMAIN_SUFFIX)]
+        local_domain_suffix: String,
+
         /// Username for authenticating with the container image registry.
         ///
         /// Defaults to `__token__` when `--registry-token` is set (the
@@ -920,6 +938,10 @@ enum GatewayCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_gateway_names))]
         name: Option<String>,
     },
+
+    /// Start a local proxy for browser access to remote gateway services.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Proxy,
 
     /// Show gateway deployment details.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -1674,6 +1696,28 @@ enum ForwardCommands {
     List,
 }
 
+#[derive(Subcommand, Debug)]
+enum ServiceCommands {
+    /// Expose an HTTP service running inside a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Expose {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: String,
+
+        /// Service name.
+        service: String,
+
+        /// Loopback TCP port inside the sandbox.
+        #[arg(long)]
+        target_port: u16,
+
+        /// Print and enable the local-domain URL for this service.
+        #[arg(long)]
+        domain: bool,
+    },
+}
+
 #[tokio::main]
 #[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; OK at top level.
 async fn main() -> Result<()> {
@@ -1736,6 +1780,8 @@ async fn main() -> Result<()> {
                 recreate,
                 plaintext,
                 disable_gateway_auth,
+                local_domain,
+                local_domain_suffix,
                 registry_username,
                 registry_token,
                 gpu,
@@ -1754,6 +1800,8 @@ async fn main() -> Result<()> {
                     recreate,
                     plaintext,
                     disable_gateway_auth,
+                    local_domain,
+                    &local_domain_suffix,
                     registry_username.as_deref(),
                     registry_token.as_deref(),
                     gpu,
@@ -1810,6 +1858,23 @@ async fn main() -> Result<()> {
             }
             GatewayCommands::Select { name } => {
                 run::gateway_select(name.as_deref(), &cli.gateway)?;
+            }
+            GatewayCommands::Proxy => {
+                let name = resolve_gateway_name(&cli.gateway).ok_or_else(|| {
+                    miette::miette!(
+                        "No active gateway.\n\
+                         Set one with: openshell gateway select <name>"
+                    )
+                })?;
+                let metadata = get_gateway_metadata(&name).ok_or_else(|| {
+                    miette::miette!(
+                        "Unknown gateway '{name}'.\n\
+                         List available gateways: openshell gateway select"
+                    )
+                })?;
+                let mut tls = tls.with_gateway_name(&metadata.name);
+                apply_edge_auth(&mut tls, &metadata.name);
+                openshell_cli::gateway_proxy::run(metadata, tls).await?;
             }
             GatewayCommands::Info { name } => {
                 let name = name
@@ -1982,6 +2047,24 @@ async fn main() -> Result<()> {
             }
         },
 
+        // -----------------------------------------------------------
+        // Service exposure
+        // -----------------------------------------------------------
+        Some(Commands::Service {
+            command:
+                Some(ServiceCommands::Expose {
+                    sandbox,
+                    service,
+                    target_port,
+                    domain,
+                }),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_edge_auth(&mut tls, &ctx.name);
+            run::service_expose(&ctx.endpoint, &sandbox, &service, target_port, domain, &tls)
+                .await?;
+        }
         // -----------------------------------------------------------
         // Top-level logs (was `sandbox logs`)
         // -----------------------------------------------------------
@@ -2730,6 +2813,13 @@ async fn main() -> Result<()> {
             Cli::command()
                 .find_subcommand_mut("forward")
                 .expect("forward subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Service { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("service")
+                .expect("service subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
         }

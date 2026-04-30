@@ -477,6 +477,16 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
         ))
     }
 
+    async fn expose_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::ExposeServiceRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::ServiceEndpointResponse>, tonic::Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::ServiceEndpointResponse::default(),
+        ))
+    }
+
     async fn revoke_ssh_session(
         &self,
         _: tonic::Request<openshell_core::proto::RevokeSshSessionRequest>,

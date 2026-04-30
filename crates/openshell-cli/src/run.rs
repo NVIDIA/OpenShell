@@ -25,13 +25,14 @@ use openshell_bootstrap::{
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
-    ExecSandboxRequest, GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource, PolicyStatus, Provider,
-    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
-    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
+    ExecSandboxRequest, ExposeServiceRequest, GetClusterInferenceRequest, GetDraftHistoryRequest,
+    GetDraftPolicyRequest, GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource,
+    PolicyStatus, Provider, RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy,
+    SandboxSpec, SandboxTemplate, SetClusterInferenceRequest, SettingScope, SettingValue,
+    UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
+    setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -1421,6 +1422,7 @@ fn print_failure_diagnosis(diagnosis: &openshell_bootstrap::errors::GatewayFailu
 
 /// Provision or start a gateway (local or remote).
 #[allow(clippy::too_many_arguments)] // user-facing CLI command
+#[allow(clippy::fn_params_excessive_bools)]
 pub async fn gateway_admin_deploy(
     name: &str,
     remote: Option<&str>,
@@ -1430,6 +1432,8 @@ pub async fn gateway_admin_deploy(
     recreate: bool,
     disable_tls: bool,
     disable_gateway_auth: bool,
+    local_domain: bool,
+    local_domain_suffix: &str,
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     gpu: Vec<String>,
@@ -1483,6 +1487,7 @@ pub async fn gateway_admin_deploy(
         .with_port(effective_port)
         .with_disable_tls(disable_tls)
         .with_disable_gateway_auth(disable_gateway_auth)
+        .with_local_domain(local_domain, local_domain_suffix)
         .with_gpu(gpu)
         .with_recreate(recreate);
     if let Some(opts) = remote_opts {
@@ -3518,6 +3523,39 @@ fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     }
 
     Ok(map)
+}
+
+pub async fn service_expose(
+    server: &str,
+    sandbox: &str,
+    service: &str,
+    target_port: u16,
+    domain: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .expose_service(ExposeServiceRequest {
+            sandbox: sandbox.to_string(),
+            service: service.to_string(),
+            target_port: u32::from(target_port),
+            domain,
+        })
+        .await
+        .map_err(|status| miette::miette!("expose service failed: {status}"))?
+        .into_inner();
+
+    println!(
+        "{} Exposed service {} on sandbox {} -> 127.0.0.1:{}",
+        "✓".green().bold(),
+        service.bold(),
+        sandbox.bold(),
+        target_port,
+    );
+    if !response.url.is_empty() {
+        println!("  URL: {}", response.url.cyan());
+    }
+    Ok(())
 }
 
 pub async fn provider_create(

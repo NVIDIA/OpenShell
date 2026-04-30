@@ -38,6 +38,10 @@ spec:
       hostGatewayIP: __HOST_GATEWAY_IP__
       disableGatewayAuth: __DISABLE_GATEWAY_AUTH__
       disableTls: __DISABLE_TLS__
+      localDomain:
+        enabled: __LOCAL_DOMAIN_ENABLED__
+        cluster: __LOCAL_DOMAIN_CLUSTER__
+        suffix: __LOCAL_DOMAIN_SUFFIX__
       tls:
         certSecretName: openshell-server-tls
         clientCaSecretName: openshell-server-client-ca

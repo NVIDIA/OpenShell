@@ -25,6 +25,7 @@ mod compute;
 mod grpc;
 mod http;
 mod inference;
+mod local_domain;
 mod multiplex;
 mod persistence;
 pub(crate) mod policy_store;

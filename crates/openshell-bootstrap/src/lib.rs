@@ -85,6 +85,7 @@ impl RemoteOptions {
 pub const DEFAULT_GATEWAY_PORT: u16 = 8080;
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct DeployOptions {
     pub name: String,
     pub image_ref: Option<String>,
@@ -103,6 +104,10 @@ pub struct DeployOptions {
     /// Disable gateway authentication (mTLS client certificate requirement).
     /// Ignored when `disable_tls` is true.
     pub disable_gateway_auth: bool,
+    /// Enable local-domain routing for browser-facing sandbox HTTP services.
+    pub local_domain: bool,
+    /// Hostname suffix used for local-domain routing.
+    pub local_domain_suffix: String,
     /// Registry authentication username. Defaults to `__token__` when a
     /// `registry_token` is provided but no username is set. Only needed
     /// for private registries — public GHCR repos pull without auth.
@@ -135,6 +140,8 @@ impl DeployOptions {
             gateway_host: None,
             disable_tls: false,
             disable_gateway_auth: false,
+            local_domain: true,
+            local_domain_suffix: openshell_core::config::DEFAULT_LOCAL_DOMAIN_SUFFIX.to_string(),
             registry_username: None,
             registry_token: None,
             gpu: vec![],
@@ -174,6 +181,13 @@ impl DeployOptions {
     #[must_use]
     pub fn with_disable_gateway_auth(mut self, disable: bool) -> Self {
         self.disable_gateway_auth = disable;
+        self
+    }
+
+    #[must_use]
+    pub fn with_local_domain(mut self, enabled: bool, suffix: impl Into<String>) -> Self {
+        self.local_domain = enabled;
+        self.local_domain_suffix = suffix.into();
         self
     }
 
@@ -268,6 +282,8 @@ where
     let gateway_host = options.gateway_host;
     let disable_tls = options.disable_tls;
     let disable_gateway_auth = options.disable_gateway_auth;
+    let local_domain = options.local_domain;
+    let local_domain_suffix = options.local_domain_suffix;
     let registry_username = options.registry_username;
     let registry_token = options.registry_token;
     let gpu = options.gpu;
@@ -404,6 +420,10 @@ where
             {
                 sans.push(host.clone());
             }
+            if local_domain {
+                sans.push(format!("{name}.{local_domain_suffix}"));
+                sans.push(format!("*.{name}.{local_domain_suffix}"));
+            }
             (sans, gateway_host)
         };
 
@@ -453,6 +473,9 @@ where
             port,
             disable_tls,
             disable_gateway_auth,
+            local_domain,
+            &name,
+            &local_domain_suffix,
             registry_username.as_deref(),
             registry_token.as_deref(),
             &device_ids,

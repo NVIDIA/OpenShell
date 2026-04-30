@@ -30,6 +30,9 @@ pub const DEFAULT_SSH_HANDSHAKE_SKEW_SECS: u64 = 300;
 /// Default Podman bridge network name.
 pub const DEFAULT_NETWORK_NAME: &str = "openshell";
 
+/// Default suffix for browser-facing local-domain routes.
+pub const DEFAULT_LOCAL_DOMAIN_SUFFIX: &str = "openshell.localhost";
+
 /// Default OCI image for the openshell-sandbox supervisor binary.
 pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
 
@@ -195,6 +198,26 @@ pub struct Config {
     /// allowing them to reach services running on the Docker host.
     #[serde(default)]
     pub host_gateway_ip: String,
+
+    /// Local-domain routing configuration for browser-facing sandbox HTTP services.
+    #[serde(default)]
+    pub local_domain: LocalDomainConfig,
+}
+
+/// Browser-facing local-domain routing configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalDomainConfig {
+    /// Enable local-domain routing.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Cluster label used in `<cluster>.<suffix>` hostnames.
+    #[serde(default)]
+    pub cluster: String,
+
+    /// Hostname suffix, defaults to `openshell.localhost`.
+    #[serde(default = "default_local_domain_suffix")]
+    pub suffix: String,
 }
 
 /// TLS configuration.
@@ -248,6 +271,7 @@ impl Config {
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
+            local_domain: LocalDomainConfig::default(),
         }
     }
 
@@ -384,10 +408,40 @@ impl Config {
         self.host_gateway_ip = ip.into();
         self
     }
+
+    /// Configure local-domain routing for browser-facing sandbox HTTP services.
+    #[must_use]
+    pub fn with_local_domain(
+        mut self,
+        enabled: bool,
+        cluster: impl Into<String>,
+        suffix: impl Into<String>,
+    ) -> Self {
+        self.local_domain = LocalDomainConfig {
+            enabled,
+            cluster: cluster.into(),
+            suffix: suffix.into(),
+        };
+        self
+    }
+}
+
+impl Default for LocalDomainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cluster: String::new(),
+            suffix: default_local_domain_suffix(),
+        }
+    }
 }
 
 fn default_bind_address() -> SocketAddr {
     "0.0.0.0:8080".parse().expect("valid default address")
+}
+
+fn default_local_domain_suffix() -> String {
+    DEFAULT_LOCAL_DOMAIN_SUFFIX.to_string()
 }
 
 fn default_log_level() -> String {

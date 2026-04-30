@@ -79,6 +79,7 @@ pub struct SupervisorSessionRegistry {
 struct PendingRelay {
     sender: RelayStreamSender,
     sandbox_id: String,
+    target_port: Option<u16>,
     created_at: Instant,
 }
 
@@ -233,6 +234,7 @@ impl SupervisorSessionRegistry {
     pub async fn open_relay(
         &self,
         sandbox_id: &str,
+        target_port: Option<u16>,
         session_wait_timeout: Duration,
     ) -> Result<(String, oneshot::Receiver<tokio::io::DuplexStream>), Status> {
         let tx = self
@@ -267,6 +269,7 @@ impl SupervisorSessionRegistry {
                 PendingRelay {
                     sender: relay_tx,
                     sandbox_id: sandbox_id.to_string(),
+                    target_port,
                     created_at: Instant::now(),
                 },
             );
@@ -275,6 +278,7 @@ impl SupervisorSessionRegistry {
         let msg = GatewayMessage {
             payload: Some(gateway_message::Payload::RelayOpen(RelayOpen {
                 channel_id: channel_id.clone(),
+                target_port: u32::from(target_port.unwrap_or(0)),
             })),
         };
 
@@ -329,9 +333,17 @@ impl SupervisorSessionRegistry {
 
     pub async fn replay_pending_relays(&self, sandbox_id: &str, tx: &mpsc::Sender<GatewayMessage>) {
         for channel_id in self.pending_channel_ids(sandbox_id) {
+            let target_port = self
+                .pending_relays
+                .lock()
+                .unwrap()
+                .get(&channel_id)
+                .and_then(|pending| pending.target_port)
+                .unwrap_or(0);
             let msg = GatewayMessage {
                 payload: Some(gateway_message::Payload::RelayOpen(RelayOpen {
                     channel_id: channel_id.clone(),
+                    target_port: u32::from(target_port),
                 })),
             };
             if tx.send(msg).await.is_err() {
@@ -855,7 +867,7 @@ mod tests {
         registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
 
         let (channel_id, _relay_rx) = registry
-            .open_relay("sbx", Duration::from_secs(1))
+            .open_relay("sbx", None, Duration::from_secs(1))
             .await
             .expect("open_relay should succeed when session is live");
 
@@ -863,6 +875,7 @@ mod tests {
         match msg.payload {
             Some(gateway_message::Payload::RelayOpen(open)) => {
                 assert_eq!(open.channel_id, channel_id);
+                assert_eq!(open.target_port, 0);
             }
             other => panic!("expected RelayOpen, got {other:?}"),
         }
@@ -872,7 +885,7 @@ mod tests {
     async fn open_relay_times_out_without_session() {
         let registry = SupervisorSessionRegistry::new();
         let err = registry
-            .open_relay("missing", Duration::from_millis(50))
+            .open_relay("missing", None, Duration::from_millis(50))
             .await
             .expect_err("open_relay should time out");
         assert_eq!(err.code(), tonic::Code::Unavailable);
@@ -897,7 +910,9 @@ mod tests {
             );
         });
 
-        let result = registry.open_relay("sbx", Duration::from_secs(2)).await;
+        let result = registry
+            .open_relay("sbx", None, Duration::from_secs(2))
+            .await;
         assert!(
             result.is_ok(),
             "open_relay should succeed when session arrives mid-wait: {result:?}"
@@ -915,7 +930,7 @@ mod tests {
         drop(rx);
 
         let err = registry
-            .open_relay("sbx", Duration::from_secs(1))
+            .open_relay("sbx", None, Duration::from_secs(1))
             .await
             .expect_err("open_relay should fail when mpsc is closed");
         assert_eq!(err.code(), tonic::Code::Unavailable);
@@ -947,6 +962,7 @@ mod tests {
                     PendingRelay {
                         sender: oneshot_tx,
                         sandbox_id: sandbox_id.to_string(),
+                        target_port: None,
                         created_at: Instant::now(),
                     },
                 );
@@ -954,7 +970,7 @@ mod tests {
         }
 
         let err = registry
-            .open_relay("sbx-a", Duration::from_millis(50))
+            .open_relay("sbx-a", None, Duration::from_millis(50))
             .await
             .expect_err("open_relay should reject once global cap is reached");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
@@ -976,6 +992,7 @@ mod tests {
                     PendingRelay {
                         sender: oneshot_tx,
                         sandbox_id: "sbx".to_string(),
+                        target_port: None,
                         created_at: Instant::now(),
                     },
                 );
@@ -983,7 +1000,7 @@ mod tests {
         }
 
         let err = registry
-            .open_relay("sbx", Duration::from_millis(50))
+            .open_relay("sbx", None, Duration::from_millis(50))
             .await
             .expect_err("open_relay should reject when per-sandbox cap is reached");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
@@ -998,7 +1015,7 @@ mod tests {
             make_shutdown(),
         );
         registry
-            .open_relay("sbx-other", Duration::from_millis(50))
+            .open_relay("sbx-other", None, Duration::from_millis(50))
             .await
             .expect("different sandbox should still accept new relays");
     }
@@ -1030,7 +1047,7 @@ mod tests {
         );
 
         let (_channel_id, _relay_rx) = registry
-            .open_relay("sbx", Duration::from_secs(1))
+            .open_relay("sbx", None, Duration::from_secs(1))
             .await
             .expect("open_relay should succeed");
 
@@ -1090,7 +1107,7 @@ mod tests {
         );
 
         let (channel_id, _relay_rx) = registry
-            .open_relay("sbx", Duration::from_secs(1))
+            .open_relay("sbx", Some(8080), Duration::from_secs(1))
             .await
             .expect("open_relay should succeed");
 
@@ -1122,6 +1139,7 @@ mod tests {
         match replayed.payload {
             Some(gateway_message::Payload::RelayOpen(open)) => {
                 assert_eq!(open.channel_id, channel_id);
+                assert_eq!(open.target_port, 8080);
             }
             other => panic!("expected RelayOpen on replay, got {other:?}"),
         }
@@ -1177,6 +1195,7 @@ mod tests {
             PendingRelay {
                 sender: relay_tx,
                 sandbox_id: "sbx-test".to_string(),
+                target_port: None,
                 created_at: Instant::now(),
             },
         );
@@ -1195,6 +1214,7 @@ mod tests {
             PendingRelay {
                 sender: relay_tx,
                 sandbox_id: "sbx-test".to_string(),
+                target_port: None,
                 created_at: Instant::now()
                     .checked_sub(Duration::from_secs(60))
                     .expect("test instant subtraction underflow"),
@@ -1225,6 +1245,7 @@ mod tests {
             PendingRelay {
                 sender: relay_tx,
                 sandbox_id: "sbx-test".to_string(),
+                target_port: None,
                 created_at: Instant::now(),
             },
         );
@@ -1244,6 +1265,7 @@ mod tests {
             PendingRelay {
                 sender: relay_tx,
                 sandbox_id: "sbx-test".to_string(),
+                target_port: None,
                 created_at: Instant::now(),
             },
         );
@@ -1275,6 +1297,7 @@ mod tests {
             PendingRelay {
                 sender: relay_tx,
                 sandbox_id: "sbx-test".to_string(),
+                target_port: None,
                 created_at: Instant::now()
                     .checked_sub(Duration::from_secs(60))
                     .expect("test instant subtraction underflow"),
@@ -1300,6 +1323,7 @@ mod tests {
             PendingRelay {
                 sender: relay_tx,
                 sandbox_id: "sbx-test".to_string(),
+                target_port: None,
                 created_at: Instant::now(),
             },
         );
