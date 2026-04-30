@@ -103,9 +103,12 @@ cat > "$pkgroot/etc/default/openshell-gateway" <<'EOF'
 # The packaged service is disabled by default. Review these settings before
 # running: sudo systemctl enable --now openshell-gateway
 
-# Bind to loopback for packaged plaintext service startup. Change this only
-# when the host has an explicit access-control boundary such as firewall rules
-# or a reverse proxy.
+# Primary bind address. The CLI talks to this listener. When the docker
+# driver is configured and this address is loopback, the gateway also binds
+# the gateway IP of the openshell sandbox network automatically so sandbox
+# containers can complete the gRPC handshake without exposing the gateway
+# on every host interface. Override this when fronting the gateway with a
+# firewall / reverse proxy or when binding to a different interface.
 OPENSHELL_BIND_ADDRESS=127.0.0.1
 OPENSHELL_SERVER_PORT=8080
 
@@ -125,9 +128,12 @@ OPENSHELL_DRIVERS=docker
 # Non-docker drivers require a shared SSH handshake secret.
 # OPENSHELL_SSH_HANDSHAKE_SECRET=
 
-# Set when sandbox workers must call back to this gateway through a specific
-# address, for example http://127.0.0.1:8080 in local plaintext deployments.
-# OPENSHELL_GRPC_ENDPOINT=http://127.0.0.1:8080
+# Sandbox callback URL. Loopback addresses are rewritten by the docker
+# driver to host.openshell.internal (which the driver maps to the openshell
+# network's gateway IP inside each sandbox) so this default works for the
+# bundled docker driver without manual tuning. Override only when the
+# gateway is reachable from sandboxes at a different address.
+OPENSHELL_GRPC_ENDPOINT=http://127.0.0.1:8080
 
 # TLS settings used when OPENSHELL_DISABLE_TLS=false.
 # OPENSHELL_TLS_CERT=/etc/openshell/gateway/tls.crt

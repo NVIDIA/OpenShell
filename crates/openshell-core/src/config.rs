@@ -105,6 +105,20 @@ pub struct Config {
     #[serde(default)]
     pub metrics_bind_address: Option<SocketAddr>,
 
+    /// Additional bind addresses that serve the same multiplexed gRPC/HTTP
+    /// surface as `bind_address`.
+    ///
+    /// Compute drivers may register extra listeners during startup so that
+    /// sandbox workloads can call back into the gateway over an interface
+    /// that the operator-supplied `bind_address` does not expose. The
+    /// canonical case is the Docker driver: when the gateway only binds to
+    /// loopback for the CLI, the driver appends the Docker bridge gateway
+    /// IP here so containers reaching the host via `host.openshell.internal`
+    /// (which Docker maps to `host-gateway`) can complete the gRPC
+    /// handshake.
+    #[serde(default)]
+    pub extra_bind_addresses: Vec<SocketAddr>,
+
     /// Log level (trace, debug, info, warn, error).
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -230,6 +244,7 @@ impl Config {
             bind_address: default_bind_address(),
             health_bind_address: None,
             metrics_bind_address: None,
+            extra_bind_addresses: Vec::new(),
             log_level: default_log_level(),
             tls,
             database_url: String::new(),
@@ -267,6 +282,19 @@ impl Config {
     #[must_use]
     pub const fn with_metrics_bind_address(mut self, addr: SocketAddr) -> Self {
         self.metrics_bind_address = Some(addr);
+        self
+    }
+
+    /// Append an extra listener address to the multiplex service.
+    ///
+    /// Duplicate entries (matching `bind_address` or any existing entry) are
+    /// silently dropped so callers can naively push driver-derived addresses
+    /// without checking for collisions.
+    #[must_use]
+    pub fn with_extra_bind_address(mut self, addr: SocketAddr) -> Self {
+        if addr != self.bind_address && !self.extra_bind_addresses.contains(&addr) {
+            self.extra_bind_addresses.push(addr);
+        }
         self
     }
 

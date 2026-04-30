@@ -7,7 +7,7 @@ use clap::{Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::ComputeDriverKind;
 use openshell_core::config::{
-    DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS, DEFAULT_SSH_PORT,
+    DEFAULT_NETWORK_NAME, DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS, DEFAULT_SSH_PORT,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -213,6 +213,12 @@ struct Args {
     #[arg(long, env = "OPENSHELL_DOCKER_TLS_KEY")]
     docker_tls_key: Option<PathBuf>,
 
+    /// Name of the Docker bridge network the driver creates and attaches
+    /// sandboxes to. Defaults to `openshell` so sandboxes are isolated at
+    /// L2 from unrelated workloads on the host's `docker0` bridge.
+    #[arg(long, env = "OPENSHELL_NETWORK_NAME", default_value = DEFAULT_NETWORK_NAME)]
+    network_name: String,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -306,6 +312,34 @@ async fn run_from_args(args: Args) -> Result<()> {
         config = config.with_metrics_bind_address(metrics_bind);
     }
 
+    // When the docker driver is configured and the primary bind address only
+    // exposes the gateway on loopback (where the CLI talks to it), expose an
+    // additional listener on the Docker bridge gateway IP for the sandbox
+    // network. Sandbox containers reach the host through
+    // `host.openshell.internal`, which Docker maps to the bridge gateway,
+    // so without this they cannot complete the gRPC handshake. We
+    // intentionally ensure the network exists here (idempotent) so the
+    // gateway IP is well-defined before the docker driver is constructed,
+    // and we fail fast on detection issues because the sandbox-create flow
+    // would otherwise be silently broken.
+    if args.drivers.contains(&ComputeDriverKind::Docker)
+        && bind_only_reaches_loopback(args.bind_address)
+    {
+        let bridge_ip =
+            openshell_driver_docker::ensure_network_and_get_gateway(&args.network_name)
+                .await
+                .map_err(|err| miette::miette!(
+                    "docker driver requires the gateway to listen on the Docker bridge gateway IP, but it could not be set up: {err}"
+                ))?;
+        let bridge_addr = SocketAddr::from((bridge_ip, args.port));
+        info!(
+            address = %bridge_addr,
+            network = %args.network_name,
+            "Adding Docker bridge listener so sandboxes can reach the gateway"
+        );
+        config = config.with_extra_bind_address(bridge_addr);
+    }
+
     config = config
         .with_database_url(args.db_url)
         .with_compute_drivers(args.drivers)
@@ -357,6 +391,7 @@ async fn run_from_args(args: Args) -> Result<()> {
         guest_tls_ca: args.docker_tls_ca,
         guest_tls_cert: args.docker_tls_cert,
         guest_tls_key: args.docker_tls_key,
+        network_name: args.network_name,
     };
 
     if args.disable_tls {
@@ -374,6 +409,20 @@ async fn run_from_args(args: Args) -> Result<()> {
 
 fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, String> {
     value.parse()
+}
+
+/// Whether the requested bind address only allows clients reaching the host
+/// via loopback to talk to the gateway.
+///
+/// Loopback (`127.0.0.0/8`, `::1`) is treated as loopback-only. Anything else
+/// — including `0.0.0.0` / `::` and specific public IPs — is assumed to
+/// already cover the Docker bridge interface, so the docker driver does not
+/// need a separate listener.
+const fn bind_only_reaches_loopback(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
 }
 
 #[cfg(test)]

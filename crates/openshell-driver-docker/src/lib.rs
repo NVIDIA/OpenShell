@@ -9,7 +9,7 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, HostConfig, Mount,
-    MountTypeEnum, RestartPolicy, RestartPolicyNameEnum,
+    MountTypeEnum, NetworkCreateRequest, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -56,7 +56,6 @@ const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 const SANDBOX_COMMAND: &str = "sleep infinity";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
-const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 
 /// Default image holding the Linux `openshell-sandbox` binary. The gateway
 /// pulls this image and extracts the binary to a host-side cache when no
@@ -118,8 +117,124 @@ pub trait SupervisorReadiness: Send + Sync + 'static {
     fn is_supervisor_connected(&self, sandbox_id: &str) -> bool;
 }
 
+/// Ensure a user-defined Docker bridge network with `name` exists, creating
+/// it if necessary.
+///
+/// If the network already exists with a different driver (e.g. `overlay`)
+/// the existing definition is reused with a warning — the daemon-managed
+/// network may have been pre-provisioned by an operator who knows what
+/// they're doing, and refusing to start would break that workflow. Other
+/// inspect failures are surfaced as configuration errors so misconfigured
+/// daemons fail fast.
+pub async fn ensure_network(docker: &Docker, name: &str) -> CoreResult<()> {
+    match docker
+        .inspect_network(
+            name,
+            None::<bollard::query_parameters::InspectNetworkOptions>,
+        )
+        .await
+    {
+        Ok(existing) => {
+            let driver = existing.driver.as_deref().unwrap_or("<unknown>");
+            if driver == "bridge" {
+                info!(network = %name, "Reusing existing Docker network");
+            } else {
+                warn!(
+                    network = %name,
+                    driver = %driver,
+                    "Reusing existing Docker network with non-bridge driver; sandboxes may behave unexpectedly"
+                );
+            }
+            return Ok(());
+        }
+        Err(BollardError::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {}
+        Err(err) => {
+            return Err(Error::execution(format!(
+                "failed to inspect Docker network '{name}': {err}"
+            )));
+        }
+    }
+
+    docker
+        .create_network(NetworkCreateRequest {
+            name: name.to_string(),
+            driver: Some("bridge".to_string()),
+            attachable: Some(true),
+            ..Default::default()
+        })
+        .await
+        .map_err(|err| {
+            Error::execution(format!("failed to create Docker network '{name}': {err}"))
+        })?;
+    info!(network = %name, "Created Docker network");
+    Ok(())
+}
+
+/// Query the Docker daemon for the IPv4 gateway address of `network_name`.
+///
+/// This is the address that `host-gateway` resolves to inside sandbox
+/// containers attached to that network — i.e. the only host-side address
+/// that `host.openshell.internal` is guaranteed to reach for them.
+///
+/// The gateway uses this to bind only the network-facing interface so that
+/// sandboxes can call back without exposing the gateway on every host
+/// interface.
+///
+/// Returns `Err` if the daemon is unreachable, the network has no IPAM
+/// configuration, or the gateway field is missing/unparseable.
+pub async fn host_bridge_gateway_address(
+    docker: &Docker,
+    network_name: &str,
+) -> CoreResult<std::net::IpAddr> {
+    let network = docker
+        .inspect_network(
+            network_name,
+            None::<bollard::query_parameters::InspectNetworkOptions>,
+        )
+        .await
+        .map_err(|err| {
+            Error::execution(format!(
+                "failed to inspect Docker network '{network_name}': {err}"
+            ))
+        })?;
+    let ipam = network.ipam.ok_or_else(|| {
+        Error::execution(format!(
+            "Docker network '{network_name}' has no IPAM configuration"
+        ))
+    })?;
+    let configs = ipam.config.unwrap_or_default();
+    let gateway = configs
+        .into_iter()
+        .find_map(|c| c.gateway.filter(|g| !g.is_empty()))
+        .ok_or_else(|| {
+            Error::execution(format!(
+                "Docker network '{network_name}' has no IPv4 gateway configured"
+            ))
+        })?;
+    gateway.parse().map_err(|err| {
+        Error::execution(format!(
+            "Docker network '{network_name}' gateway '{gateway}' is not a valid IP address: {err}"
+        ))
+    })
+}
+
+/// Convenience wrapper that connects to the local Docker daemon, ensures
+/// the sandbox network exists, and returns its IPv4 gateway address.
+///
+/// Used by `openshell-server` to set up the multi-bind listener without
+/// taking a direct dependency on `bollard`. Equivalent to calling
+/// [`ensure_network`] followed by [`host_bridge_gateway_address`].
+pub async fn ensure_network_and_get_gateway(network_name: &str) -> CoreResult<std::net::IpAddr> {
+    let docker = Docker::connect_with_local_defaults()
+        .map_err(|err| Error::execution(format!("failed to create Docker client: {err}")))?;
+    ensure_network(&docker, network_name).await?;
+    host_bridge_gateway_address(&docker, network_name).await
+}
+
 /// Gateway-local configuration for the Docker compute driver.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DockerComputeConfig {
     /// Optional override for the Linux `openshell-sandbox` binary mounted into containers.
     pub supervisor_bin: Option<PathBuf>,
@@ -138,6 +253,28 @@ pub struct DockerComputeConfig {
 
     /// Host-side private key for Docker sandbox mTLS.
     pub guest_tls_key: Option<PathBuf>,
+
+    /// Name of the user-defined Docker bridge network the driver creates and
+    /// attaches sandbox containers to. Isolates sandboxes at L2 from
+    /// unrelated workloads on the host's default `docker0` bridge.
+    ///
+    /// Defaults to [`openshell_core::config::DEFAULT_NETWORK_NAME`]. Override
+    /// via `OPENSHELL_NETWORK_NAME` (the same env var the Podman driver
+    /// honours).
+    pub network_name: String,
+}
+
+impl Default for DockerComputeConfig {
+    fn default() -> Self {
+        Self {
+            supervisor_bin: None,
+            supervisor_image: None,
+            guest_tls_ca: None,
+            guest_tls_cert: None,
+            guest_tls_key: None,
+            network_name: openshell_core::config::DEFAULT_NETWORK_NAME.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +296,17 @@ struct DockerDriverRuntimeConfig {
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
+    network_name: String,
+    /// IPv4 gateway address of the sandbox network. Injected into each
+    /// container's `/etc/hosts` as `host.openshell.internal -> <ip>`.
+    ///
+    /// Docker's `host-gateway` alias resolves to whatever the daemon was
+    /// configured with (typically the default `docker0` IP), which is
+    /// **not** the gateway of our user-defined `openshell` network. We
+    /// therefore inject the address explicitly so sandboxes attached to
+    /// the openshell network can reach the gateway listener bound on its
+    /// bridge.
+    network_gateway_ip: std::net::IpAddr,
 }
 
 #[derive(Clone)]
@@ -189,6 +337,11 @@ impl DockerComputeDriver {
                 "grpc_endpoint is required when using the docker compute driver",
             ));
         }
+        if docker_config.network_name.trim().is_empty() {
+            return Err(Error::config(
+                "network_name is required when using the docker compute driver",
+            ));
+        }
 
         let docker = Docker::connect_with_local_defaults()
             .map_err(|err| Error::execution(format!("failed to create Docker client: {err}")))?;
@@ -198,6 +351,17 @@ impl DockerComputeDriver {
         let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
         let supervisor_bin = resolve_supervisor_bin(&docker, docker_config, &daemon_arch).await?;
         let guest_tls = docker_guest_tls_paths(config, docker_config)?;
+
+        // Ensure the dedicated sandbox network exists before any sandbox is
+        // created so containers can be attached to it deterministically.
+        ensure_network(&docker, &docker_config.network_name).await?;
+        let network_gateway_ip =
+            host_bridge_gateway_address(&docker, &docker_config.network_name).await?;
+        info!(
+            network = %docker_config.network_name,
+            gateway = %network_gateway_ip,
+            "Resolved sandbox network gateway"
+        );
 
         let driver = Self {
             docker: Arc::new(docker),
@@ -212,6 +376,8 @@ impl DockerComputeDriver {
                 supervisor_bin,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
+                network_name: docker_config.network_name.clone(),
+                network_gateway_ip,
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             supervisor_readiness,
@@ -928,10 +1094,38 @@ fn build_container_create_body(
                 "SYS_PTRACE".to_string(),
                 "SYSLOG".to_string(),
             ]),
-            extra_hosts: Some(vec![
-                format!("{HOST_DOCKER_INTERNAL}:host-gateway"),
-                format!("{HOST_OPENSHELL_INTERNAL}:host-gateway"),
-            ]),
+            // The sandbox supervisor needs to bind-mount `/run/netns`,
+            // mark it shared, and create per-process network namespaces.
+            // Docker's default AppArmor profile (`docker-default`) denies
+            // these mount operations even with CAP_SYS_ADMIN, so we opt
+            // out of AppArmor confinement for sandbox containers. The
+            // sandbox enforces its own security boundary via Landlock,
+            // seccomp, OPA policy evaluation, and the dedicated network
+            // namespace it sets up for the agent — AppArmor at the
+            // container layer is redundant relative to those controls
+            // and conflicts with them in this case.
+            security_opt: Some(vec!["apparmor=unconfined".to_string()]),
+            // Attach to the dedicated openshell sandbox network so
+            // containers are isolated at L2 from unrelated workloads on
+            // the default `docker0` bridge.
+            network_mode: Some(config.network_name.clone()),
+            // Map the canonical OpenShell hostname to the IPv4 gateway of
+            // the sandbox network. We deliberately do *not* use Docker's
+            // `host-gateway` alias here: that magic value resolves to the
+            // daemon-configured host-gateway IP (typically the default
+            // `docker0` address), which is the wrong host-side address
+            // when the sandbox sits on a user-defined network. The
+            // gateway listener for sandboxes is bound to this network's
+            // bridge IP, so we inject it explicitly.
+            //
+            // We deliberately do not inject `host.docker.internal` —
+            // that alias is a Docker Desktop convention, not part of the
+            // OpenShell sandbox contract, and operators who need it can
+            // add it themselves at the daemon level.
+            extra_hosts: Some(vec![format!(
+                "{HOST_OPENSHELL_INTERNAL}:{}",
+                config.network_gateway_ip
+            )]),
             ..Default::default()
         }),
         ..Default::default()
