@@ -927,6 +927,13 @@ fn build_container_create_body(
                 "SYS_PTRACE".to_string(),
                 "SYSLOG".to_string(),
             ]),
+            // AppArmor's default Docker profile blocks mount(2) with MS_SHARED
+            // even when SYS_ADMIN is granted, which prevents ip-netns from
+            // creating network namespaces for proxy-mode isolation. The sandbox
+            // enforces its own isolation via seccomp, Landlock, and network
+            // namespaces, so the host AppArmor profile adds no meaningful
+            // defence here.
+            security_opt: Some(vec!["apparmor=unconfined".to_string()]),
             extra_hosts: Some(vec![
                 format!("{HOST_DOCKER_INTERNAL}:host-gateway"),
                 format!("{HOST_OPENSHELL_INTERNAL}:host-gateway"),
