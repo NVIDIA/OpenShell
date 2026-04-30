@@ -9,7 +9,7 @@ The `--from` flag accepts four kinds of input:
 | Input | Example | Behavior |
 |-------|---------|----------|
 | **Community sandbox name** | `--from openclaw` | Resolves to `ghcr.io/nvidia/openshell-community/sandboxes/openclaw:latest` |
-| **Dockerfile path** | `--from ./Dockerfile` | Builds the image, pushes it into the cluster, then creates the sandbox |
+| **Dockerfile path** | `--from ./Dockerfile` | Builds the image locally, makes it available to the local gateway, then creates the sandbox |
 | **Directory with Dockerfile** | `--from ./my-sandbox/` | Uses the directory as the build context |
 | **Full image reference** | `--from myregistry.com/img:tag` | Uses the image directly |
 
@@ -34,8 +34,13 @@ When `--from` points to a Dockerfile or directory, the CLI:
 
 1. Builds the image locally via the Docker daemon (respecting `.dockerignore`).
 2. For a local Kubernetes gateway, pushes it into the cluster's containerd runtime using `docker save` / `ctr import`.
-3. For a local VM gateway, exports the built image as a rootfs tar artifact and passes the VM driver a gateway-signed internal artifact reference. The driver rejects unsigned `openshell-rootfs-tar:` references so API clients cannot point it at arbitrary gateway host files.
-4. Creates the sandbox with the resulting image tag or VM artifact reference.
+3. For a local VM gateway, passes the VM driver an internal `openshell-vm-local-image:<tag>` reference. The driver resolves that tag against the local Docker daemon, exports the image filesystem, and prepares the VM rootfs in its own cache.
+4. Creates the sandbox with the resulting image tag or VM-local image reference.
+
+Local Dockerfile sources for VM gateways are trusted local-development inputs.
+Remote gateways continue to reject local Dockerfile sources because the gateway
+API does not yet validate or transfer local build artifacts across that
+boundary.
 
 ## How It Works
 

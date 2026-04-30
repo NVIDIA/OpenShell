@@ -21,8 +21,8 @@ path = "src/main.rs"
 [dependencies]
 openshell-core = { path = "../openshell-core" }
 openshell-vfio = { path = "../openshell-vfio" }
-openshell-bootstrap = { path = "../openshell-bootstrap" }
 
+bollard = { version = "0.20", features = ["ssh"] }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
 prost-types = { workspace = true }
