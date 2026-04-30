@@ -7,8 +7,7 @@
 # (openshell-driver-vm) for local manual testing.
 #
 # Invocation:
-#   mise run gateway:start vm          # canonical
-#   mise run gateway:vm                # alias
+#   mise run gateway:vm
 #
 # Defaults:
 # - Plaintext HTTP on 127.0.0.1:18081
@@ -23,6 +22,7 @@
 #   OPENSHELL_VM_GATEWAY_NAME=my-vm-gateway mise run gateway:vm
 #   OPENSHELL_SANDBOX_NAMESPACE=my-ns mise run gateway:vm
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:vm
+#   mise run gateway:vm -- --gpu
 #
 # This script also writes ~/.config/openshell/active_gateway so the
 # `openshell` CLI automatically targets this gateway in subsequent shells.
@@ -84,21 +84,27 @@ register_gateway_metadata() {
   local name=$1
   local endpoint=$2
   local port=$3
+  local vm_driver_state_dir=$4
+  local rootfs_artifact_secret=$5
   local config_home gateway_dir
 
   config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
   gateway_dir="${config_home}/openshell/gateways/${name}"
 
   mkdir -p "${gateway_dir}"
+  chmod 700 "${gateway_dir}" 2>/dev/null || true
   cat >"${gateway_dir}/metadata.json" <<EOF
 {
   "name": "${name}",
   "gateway_endpoint": "${endpoint}",
   "is_remote": false,
   "gateway_port": ${port},
-  "auth_mode": "plaintext"
+  "auth_mode": "plaintext",
+  "vm_driver_state_dir": "${vm_driver_state_dir}",
+  "vm_rootfs_artifact_secret": "${rootfs_artifact_secret}"
 }
 EOF
+  chmod 600 "${gateway_dir}/metadata.json" 2>/dev/null || true
 }
 
 # Mirror what `openshell gateway select <name>` does: write the gateway name
@@ -146,6 +152,51 @@ check_supervisor_cross_toolchain() {
   fi
 }
 
+generate_rootfs_artifact_secret() {
+  od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+VM_GPU="$(normalize_bool "${OPENSHELL_VM_GPU:-false}")"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --gpu)
+      VM_GPU="true"
+      shift
+      ;;
+    --gpu-mem-mib)
+      if [ "$#" -lt 2 ]; then
+        echo "ERROR: --gpu-mem-mib requires a value" >&2
+        exit 2
+      fi
+      export OPENSHELL_VM_GPU_MEM_MIB="$2"
+      shift 2
+      ;;
+    --gpu-vcpus)
+      if [ "$#" -lt 2 ]; then
+        echo "ERROR: --gpu-vcpus requires a value" >&2
+        exit 2
+      fi
+      export OPENSHELL_VM_GPU_VCPUS="$2"
+      shift 2
+      ;;
+    -h|--help)
+      echo "Usage: mise run gateway:vm -- [--gpu] [--gpu-mem-mib MIB] [--gpu-vcpus N]"
+      exit 0
+      ;;
+    *)
+      echo "ERROR: unknown gateway-vm option '$1'" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ "${VM_GPU}" = "true" ]; then
+  export OPENSHELL_VM_GPU="true"
+else
+  unset OPENSHELL_VM_GPU
+fi
+
 if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "ERROR: OPENSHELL_VM_GATEWAY_NAME must contain only letters, numbers, dots, underscores, or dashes" >&2
   exit 2
@@ -168,6 +219,12 @@ VM_DRIVER_STATE_DIR_DEFAULT="${OPENSHELL_VM_DRIVER_STATE_ROOT:-/tmp}/openshell-v
 VM_DRIVER_STATE_DIR="${OPENSHELL_VM_DRIVER_STATE_DIR:-${VM_DRIVER_STATE_DIR_DEFAULT}}"
 
 DISABLE_TLS="$(normalize_bool "${OPENSHELL_DISABLE_TLS:-true}")"
+ROOTFS_ARTIFACT_SECRET="${OPENSHELL_VM_ROOTFS_ARTIFACT_SECRET:-$(generate_rootfs_artifact_secret)}"
+if [[ ! "${ROOTFS_ARTIFACT_SECRET}" =~ ^[A-Za-z0-9._~=-]+$ ]]; then
+  echo "ERROR: OPENSHELL_VM_ROOTFS_ARTIFACT_SECRET must contain only URL-safe characters" >&2
+  exit 2
+fi
+export OPENSHELL_VM_ROOTFS_ARTIFACT_SECRET="${ROOTFS_ARTIFACT_SECRET}"
 
 # Build prerequisites: VM runtime artifacts + bundled supervisor.
 if [ ! -d "${COMPRESSED_DIR}" ] \
@@ -207,7 +264,7 @@ mkdir -p "${STATE_DIR}"
 mkdir -p "${VM_DRIVER_STATE_DIR}"
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
-register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
+register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}" "${VM_DRIVER_STATE_DIR}" "${ROOTFS_ARTIFACT_SECRET}"
 save_active_gateway "${GATEWAY_NAME}"
 
 echo "Starting standalone VM gateway..."
@@ -217,6 +274,7 @@ echo "  namespace:  ${SANDBOX_NAMESPACE}"
 echo "  state dir:  ${STATE_DIR}"
 echo "  driver:     ${DRIVER_DIR}/openshell-driver-vm"
 echo "  driver dir: ${VM_DRIVER_STATE_DIR}"
+echo "  gpu:        ${VM_GPU}"
 echo "  image:      ${SANDBOX_IMAGE}"
 echo
 echo "Active gateway set to '${GATEWAY_NAME}'. The CLI now targets this gateway"

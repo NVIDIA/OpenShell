@@ -33,8 +33,9 @@ The community registry prefix defaults to `ghcr.io/nvidia/openshell-community/sa
 When `--from` points to a Dockerfile or directory, the CLI:
 
 1. Builds the image locally via the Docker daemon (respecting `.dockerignore`).
-2. Pushes it into the cluster's containerd runtime using `docker save` / `ctr import`.
-3. Creates the sandbox with the resulting image tag.
+2. For a local Kubernetes gateway, pushes it into the cluster's containerd runtime using `docker save` / `ctr import`.
+3. For a local VM gateway, exports the built image as a rootfs tar artifact and passes the VM driver a gateway-signed internal artifact reference. The driver rejects unsigned `openshell-rootfs-tar:` references so API clients cannot point it at arbitrary gateway host files.
+4. Creates the sandbox with the resulting image tag or VM artifact reference.
 
 ## How It Works
 
