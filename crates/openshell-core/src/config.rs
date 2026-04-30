@@ -195,6 +195,14 @@ pub struct Config {
     /// allowing them to reach services running on the Docker host.
     #[serde(default)]
     pub host_gateway_ip: String,
+
+    /// Enable Kubernetes user namespace isolation (`hostUsers: false`) for
+    /// sandbox pods.  When enabled, container UID 0 maps to an unprivileged
+    /// host UID and capabilities become namespaced. Requires Kubernetes 1.33+
+    /// with user namespace support available (beta through 1.35, GA in 1.36+),
+    /// plus a supporting container runtime and Linux 5.12+.
+    #[serde(default)]
+    pub enable_user_namespaces: bool,
 }
 
 /// TLS configuration.
@@ -248,6 +256,7 @@ impl Config {
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
+            enable_user_namespaces: false,
         }
     }
 

@@ -385,6 +385,7 @@ async fn build_compute_runtime(
                 ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
                 client_tls_secret_name: config.client_tls_secret_name.clone(),
                 host_gateway_ip: config.host_gateway_ip.clone(),
+                enable_user_namespaces: config.enable_user_namespaces,
             },
             store,
             sandbox_index,
