@@ -222,8 +222,8 @@ Each segment has a fixed meaning:
 |---|---|---|
 | `host` | Yes | Destination hostname. |
 | `port` | Yes | Destination port, `1` through `65535`. |
-| `access` | No | Access preset for L7 endpoints: `read-only`, `read-write`, or `full`. REST and GraphQL endpoints expand presets differently. |
-| `protocol` | No | L7 inspection mode: `rest`, `graphql`, or `sql`. `sql` is audit-only and not a recommended workflow today. |
+| `access` | No | Access preset for L7 endpoints: `read-only`, `read-write`, or `full`. Incremental updates currently expand presets for REST-shaped access. |
+| `protocol` | No | L7 inspection mode: `rest` or `sql`. `sql` is audit-only and not a recommended workflow today. |
 | `enforcement` | No | Enforcement mode for inspected traffic: `enforce` or `audit`. |
 
 Examples:
@@ -232,14 +232,12 @@ Examples:
 |---|---|
 | `pypi.org:443` | Add a plain L4 endpoint. The proxy allows the TCP stream and does not inspect HTTP requests. |
 | `api.github.com:443:read-only:rest:enforce` | Add a REST endpoint with the `read-only` preset expanded by the policy engine into GET, HEAD, and OPTIONS access. |
-| `api.github.com:443:read-only:graphql:enforce` | Add a GraphQL endpoint with the `read-only` preset expanded into query-only access. |
 
-If you set `protocol: rest` or `protocol: graphql`, you also need an allow shape. With incremental updates, that means you should provide an `access` preset on `--add-endpoint`, then use `--add-allow` or `--add-deny` to refine REST endpoints later.
+If you set `protocol: rest`, you also need an allow shape. With incremental updates, that means you should provide an `access` preset on `--add-endpoint`, then use `--add-allow` or `--add-deny` to refine REST endpoints later.
 
 For example:
 
 - `api.github.com:443:read-only:rest` is valid.
-- `api.github.com:443:read-only:graphql` is valid.
 - `api.github.com:443::rest` is invalid. It does not mean "allow all traffic." An L7 endpoint with `protocol` but no `access` or `rules` is rejected when the policy loads.
 
 When you pass multiple `--add-endpoint` flags in one command, every `--binary` value applies to every added endpoint in that command. If different endpoints need different binaries, use separate `policy update` commands.
@@ -429,7 +427,7 @@ openshell policy update <name> --add-allow 'api.github.com:443:GET:/repos/**' --
 
 ## Examples
 
-Add these blocks to the `network_policies` section of your sandbox policy. Apply with `openshell policy update` for incremental additions or `openshell policy set <name> --policy <file> --wait` for full replacement.
+Add these blocks to the `network_policies` section of your sandbox policy. Apply simple endpoints and REST rule additions with `openshell policy update`, or apply any complete YAML block with `openshell policy set <name> --policy <file> --wait`.
 Use **Simple endpoint** for host-level allowlists and **Granular rules** for method/path control.
 
 <Tabs>
@@ -529,6 +527,8 @@ REST rules can also constrain query parameter values:
 ### GraphQL matching
 
 GraphQL endpoints use `protocol: graphql`. The proxy parses GraphQL-over-HTTP `GET` and `POST` requests, classifies each operation, and evaluates rules against the operation type, optional operation name, and selected root fields.
+
+GraphQL endpoint policies currently require full policy YAML applied with `openshell policy set`; the incremental `openshell policy update --add-endpoint` parser does not accept `graphql` as a protocol.
 
 ```yaml showLineNumbers={false}
   github_graphql:
