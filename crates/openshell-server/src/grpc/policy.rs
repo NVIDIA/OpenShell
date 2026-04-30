@@ -3154,6 +3154,9 @@ mod tests {
                     path: "/repos/*/issues".to_string(),
                     command: String::new(),
                     query: HashMap::new(),
+                    operation_type: String::new(),
+                    operation_name: String::new(),
+                    fields: Vec::new(),
                 }),
             }],
         };
@@ -3484,6 +3487,9 @@ mod tests {
                     path: "/repos/*/issues".to_string(),
                     command: String::new(),
                     query: HashMap::new(),
+                    operation_type: String::new(),
+                    operation_name: String::new(),
+                    fields: Vec::new(),
                 }),
             }],
         }];

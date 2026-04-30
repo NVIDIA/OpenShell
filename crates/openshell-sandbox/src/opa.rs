@@ -961,7 +961,14 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                                     "method": a.map_or("", |a| &a.method),
                                     "path": a.map_or("", |a| &a.path),
                                     "command": a.map_or("", |a| &a.command),
+                                    "operation_type": a.map_or("", |a| &a.operation_type),
+                                    "operation_name": a.map_or("", |a| &a.operation_name),
                                 });
+                                if let Some(a) = a
+                                    && !a.fields.is_empty()
+                                {
+                                    allow["fields"] = a.fields.clone().into();
+                                }
                                 let query: serde_json::Map<String, serde_json::Value> = a
                                     .map(|allow| {
                                         allow
@@ -1008,6 +1015,15 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                                 if !d.command.is_empty() {
                                     deny["command"] = d.command.clone().into();
                                 }
+                                if !d.operation_type.is_empty() {
+                                    deny["operation_type"] = d.operation_type.clone().into();
+                                }
+                                if !d.operation_name.is_empty() {
+                                    deny["operation_name"] = d.operation_name.clone().into();
+                                }
+                                if !d.fields.is_empty() {
+                                    deny["fields"] = d.fields.clone().into();
+                                }
                                 let query: serde_json::Map<String, serde_json::Value> = d
                                     .query
                                     .iter()
@@ -1032,6 +1048,29 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     }
                     if e.allow_encoded_slash {
                         ep["allow_encoded_slash"] = true.into();
+                    }
+                    if !e.persisted_queries.is_empty() {
+                        ep["persisted_queries"] = e.persisted_queries.clone().into();
+                    }
+                    if !e.graphql_persisted_queries.is_empty() {
+                        let persisted: serde_json::Map<String, serde_json::Value> = e
+                            .graphql_persisted_queries
+                            .iter()
+                            .map(|(key, op)| {
+                                (
+                                    key.clone(),
+                                    serde_json::json!({
+                                        "operation_type": op.operation_type,
+                                        "operation_name": op.operation_name,
+                                        "fields": op.fields,
+                                    }),
+                                )
+                            })
+                            .collect();
+                        ep["graphql_persisted_queries"] = persisted.into();
+                    }
+                    if e.graphql_max_body_bytes > 0 {
+                        ep["graphql_max_body_bytes"] = e.graphql_max_body_bytes.into();
                     }
                     ep
                 })
@@ -1724,6 +1763,42 @@ network_policies:
                   any: ["foo-*", "bar-*"]
     binaries:
       - { path: /usr/bin/curl }
+  graphql_api:
+    name: graphql_api
+    endpoints:
+      - host: api.graphql.com
+        port: 443
+        protocol: graphql
+        enforcement: enforce
+        persisted_queries: allow_registered
+        graphql_persisted_queries:
+          abc123:
+            operation_type: query
+            operation_name: Viewer
+            fields: [viewer]
+        rules:
+          - allow:
+              operation_type: query
+              fields: [viewer, repository]
+          - allow:
+              operation_type: mutation
+              operation_name: Issue*
+              fields: [createIssue, deleteRepository]
+        deny_rules:
+          - operation_type: mutation
+            fields: [deleteRepository]
+    binaries:
+      - { path: /usr/bin/curl }
+  graphql_readonly:
+    name: graphql_readonly
+    endpoints:
+      - host: gql.readonly.com
+        port: 443
+        protocol: graphql
+        enforcement: enforce
+        access: read-only
+    binaries:
+      - { path: /usr/bin/curl }
   l4_only:
     name: l4_only
     endpoints:
@@ -1767,6 +1842,45 @@ process:
                 "method": method,
                 "path": path,
                 "query_params": query_params
+            }
+        })
+    }
+
+    fn l7_graphql_input(host: &str, operations: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "network": { "host": host, "port": 443 },
+            "exec": {
+                "path": "/usr/bin/curl",
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": "POST",
+                "path": "/graphql",
+                "query_params": {},
+                "graphql": {
+                    "operations": operations
+                }
+            }
+        })
+    }
+
+    fn l7_graphql_error_input(host: &str, error: &str) -> serde_json::Value {
+        serde_json::json!({
+            "network": { "host": host, "port": 443 },
+            "exec": {
+                "path": "/usr/bin/curl",
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": "POST",
+                "path": "/graphql",
+                "query_params": {},
+                "graphql": {
+                    "operations": [],
+                    "error": error
+                }
             }
         })
     }
@@ -1853,6 +1967,135 @@ process:
                 "{method} should be allowed with full preset"
             );
         }
+    }
+
+    #[test]
+    fn l7_graphql_query_allowed_by_field_rule() {
+        let engine = l7_engine();
+        let input = l7_graphql_input(
+            "api.graphql.com",
+            serde_json::json!([{
+                "operation_type": "query",
+                "operation_name": "RepoLookup",
+                "fields": ["repository"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_unlisted_field_denied() {
+        let engine = l7_engine();
+        let input = l7_graphql_input(
+            "api.graphql.com",
+            serde_json::json!([{
+                "operation_type": "query",
+                "fields": ["viewer", "adminAuditLog"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_batch_denied_if_any_operation_unallowed() {
+        let engine = l7_engine();
+        let input = l7_graphql_input(
+            "api.graphql.com",
+            serde_json::json!([
+                {
+                    "operation_type": "query",
+                    "fields": ["viewer"],
+                    "persisted_query": false
+                },
+                {
+                    "operation_type": "mutation",
+                    "operation_name": "DeleteRepo",
+                    "fields": ["deleteRepository"],
+                    "persisted_query": false
+                }
+            ]),
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_deny_rule_takes_precedence() {
+        let engine = l7_engine();
+        let input = l7_graphql_input(
+            "api.graphql.com",
+            serde_json::json!([{
+                "operation_type": "mutation",
+                "operation_name": "IssueDelete",
+                "fields": ["deleteRepository"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_registered_hash_only_query_allowed() {
+        let engine = l7_engine();
+        let input = l7_graphql_input(
+            "api.graphql.com",
+            serde_json::json!([{
+                "operation_type": "",
+                "operation_name": "Viewer",
+                "fields": [],
+                "persisted_query": true,
+                "persisted_query_hash": "abc123"
+            }]),
+        );
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_unregistered_hash_only_query_denied() {
+        let engine = l7_engine();
+        let input = l7_graphql_input(
+            "api.graphql.com",
+            serde_json::json!([{
+                "operation_type": "",
+                "operation_name": "Viewer",
+                "fields": [],
+                "persisted_query": true,
+                "persisted_query_hash": "missing"
+            }]),
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_parse_error_denied() {
+        let engine = l7_engine();
+        let input = l7_graphql_error_input("api.graphql.com", "GraphQL document parse error");
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_readonly_access_allows_query_and_denies_mutation() {
+        let engine = l7_engine();
+        let query = l7_graphql_input(
+            "gql.readonly.com",
+            serde_json::json!([{
+                "operation_type": "query",
+                "fields": ["viewer"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(eval_l7(&engine, &query));
+
+        let mutation = l7_graphql_input(
+            "gql.readonly.com",
+            serde_json::json!([{
+                "operation_type": "mutation",
+                "fields": ["createIssue"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(!eval_l7(&engine, &mutation));
     }
 
     #[test]
@@ -1956,6 +2199,9 @@ process:
                             path: "/download".to_string(),
                             command: String::new(),
                             query,
+                            operation_type: String::new(),
+                            operation_name: String::new(),
+                            fields: Vec::new(),
                         }),
                     }],
                     ..Default::default()

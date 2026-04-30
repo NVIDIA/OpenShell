@@ -29,6 +29,7 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `bypass_monitor.rs` | Background `/dev/kmsg` reader for iptables bypass detection events |
 | `sandbox/linux/netns.rs` | Network namespace creation, veth pair setup, bypass detection iptables rules, cleanup on drop |
 | `l7/mod.rs` | L7 types (`L7Protocol`, `TlsMode`, `EnforcementMode`, `L7EndpointConfig`), config parsing, validation, access preset expansion, deprecated `tls` value handling |
+| `l7/graphql.rs` | GraphQL-over-HTTP request classifier, body buffering, operation/root-field extraction, and persisted-query metadata handling |
 | `l7/inference.rs` | Inference API pattern detection (`detect_inference_pattern()`), HTTP request/response parsing and formatting for intercepted inference connections |
 | `l7/tls.rs` | Ephemeral CA generation (`SandboxCa`), per-hostname leaf cert cache (`CertCache`), TLS termination/connection helpers, `looks_like_tls()` auto-detection |
 | `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation, credential-injection-only passthrough relay |
@@ -1028,12 +1029,12 @@ flowchart LR
 
 | Type | Definition | Purpose |
 |------|-----------|---------|
-| `L7Protocol` | `Rest`, `Sql` | Supported application protocols |
+| `L7Protocol` | `Rest`, `Graphql`, `Sql` | Supported application protocols |
 | `TlsMode` | `Auto` (default), `Skip` | TLS handling strategy — `Auto` peeks first bytes and terminates if TLS is detected; `Skip` bypasses detection entirely |
 | `EnforcementMode` | `Audit`, `Enforce` | What to do on L7 deny (log-only vs block) |
-| `L7EndpointConfig` | `{ protocol, tls, enforcement, allow_encoded_slash }` | Per-endpoint L7 configuration |
+| `L7EndpointConfig` | `{ protocol, tls, enforcement, allow_encoded_slash, graphql_max_body_bytes }` | Per-endpoint L7 configuration |
 | `L7Decision` | `{ allowed, reason, matched_rule }` | Result of L7 evaluation |
-| `L7RequestInfo` | `{ action, target, query_params }` | HTTP method, path, and decoded query multimap for policy evaluation |
+| `L7RequestInfo` | `{ action, target, query_params, graphql }` | HTTP method, path, decoded query multimap, and optional GraphQL classification for policy evaluation |
 
 ### Access presets
 
@@ -1041,9 +1042,9 @@ Policy data supports shorthand `access` presets that expand into explicit `rules
 
 | Preset | Expands to |
 |--------|-----------|
-| `read-only` | `GET **`, `HEAD **`, `OPTIONS **` |
-| `read-write` | `GET **`, `HEAD **`, `OPTIONS **`, `POST **`, `PUT **`, `PATCH **` |
-| `full` | `* **` (all methods, all paths) |
+| `read-only` | REST: `GET **`, `HEAD **`, `OPTIONS **`; GraphQL: `query` |
+| `read-write` | REST: `GET **`, `HEAD **`, `OPTIONS **`, `POST **`, `PUT **`, `PATCH **`; GraphQL: `query`, `mutation` |
+| `full` | REST: `* **`; GraphQL: `operation_type: "*"` |
 
 Expansion happens in `expand_access_presets()` before the Rego engine loads the data. The `rules` and `access` fields are mutually exclusive (validated at startup).
 
@@ -1055,14 +1056,17 @@ Expansion happens in `expand_access_presets()` before the Rego engine loads the 
 
 - `rules` and `access` both specified on same endpoint
 - `protocol` specified without `rules` or `access`
+- unknown `protocol`
 - `protocol: sql` with `enforcement: enforce` (SQL parsing not available in v1)
 - Empty `rules` array (would deny all traffic)
+- invalid GraphQL operation types, persisted-query mode, body limit, or rule shape
 
 **Warnings** (logged):
 
 - `tls: terminate` or `tls: passthrough` on any endpoint (deprecated — TLS termination is now automatic; use `tls: skip` to disable)
 - `tls: skip` with L7 rules on port 443 (L7 inspection cannot work on encrypted traffic)
 - Unknown HTTP method in rules
+- GraphQL-specific fields on non-GraphQL endpoints
 
 ### TLS termination (auto-detect)
 
@@ -1237,13 +1241,21 @@ Implements `L7Provider` for HTTP/1.1:
 
 - **`looks_like_http()`**: Protocol detection via first-byte peek -- checks for standard HTTP method prefixes (GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, CONNECT, TRACE).
 
+### GraphQL protocol classifier
+
+**File:** `crates/openshell-sandbox/src/l7/graphql.rs`
+
+GraphQL inspection reuses the HTTP parser, then buffers the request body up to `graphql_max_body_bytes` for classification. It supports `GET` and `POST` GraphQL-over-HTTP envelopes, JSON batches, named operations, root fragment expansion, Apollo persisted-query hashes, and saved-query IDs (`id`, `documentId`, `queryId`). The classifier emits `GraphqlRequestInfo` with operation type, optional operation name, root fields, and persisted-query identifiers.
+
+Hash-only or saved-query-only requests cannot be parsed into operation fields. They are denied unless the endpoint sets `persisted_queries: allow_registered` and provides a trusted `graphql_persisted_queries` entry for the hash or ID. Batch requests are fail-closed: any malformed, denied, or unregistered operation denies the whole HTTP request.
+
 ### Per-request L7 evaluation
 
 `relay_with_inspection()` in `crates/openshell-sandbox/src/l7/relay.rs` is the main relay loop:
 
 1. Parse one HTTP request from client via the provider. Parser and path-canonicalization failures close the connection and emit a denied OCSF network event with the rejection reason in `status_detail`.
 2. Resolve credential placeholders in the request target via `rewrite_target_for_eval()`. OPA receives the redacted path (`[CREDENTIAL]` markers); the resolved path goes only to upstream. If resolution fails, return HTTP 500 and close the connection.
-3. Build L7 input JSON with `request.method`, the **redacted** `request.path`, `request.query_params`, plus the CONNECT-level context (host, port, binary, ancestors, cmdline)
+3. Build L7 input JSON with `request.method`, the **redacted** `request.path`, `request.query_params`, optional `request.graphql`, plus the CONNECT-level context (host, port, binary, ancestors, cmdline)
 4. Evaluate `data.openshell.sandbox.allow_request` and `data.openshell.sandbox.request_deny_reason`
 5. Log the L7 decision (tagged `L7_REQUEST`) using the redacted target — real credential values never appear in logs
 6. If allowed (or audit mode): relay request to upstream via `relay_http_request_with_resolver()` (which rewrites all remaining credential placeholders in headers, query parameters, path segments, and Basic auth tokens) and relay the response back to client, then loop

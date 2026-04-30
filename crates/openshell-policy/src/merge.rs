@@ -627,6 +627,9 @@ fn expand_access_preset(access: &str) -> Option<Vec<L7Rule>> {
                     path: "**".to_string(),
                     command: String::new(),
                     query: HashMap::default(),
+                    operation_type: String::new(),
+                    operation_name: String::new(),
+                    fields: Vec::new(),
                 }),
             })
             .collect(),
@@ -797,6 +800,9 @@ mod tests {
                 path: path.to_string(),
                 command: String::new(),
                 query: HashMap::new(),
+                operation_type: String::new(),
+                operation_name: String::new(),
+                fields: Vec::new(),
             }),
         }
     }

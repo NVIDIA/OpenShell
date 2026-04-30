@@ -168,6 +168,9 @@ fn group_allow_rules(specs: &[String]) -> Result<BTreeMap<(String, u32), Vec<L7R
                     path: parsed.path,
                     command: String::new(),
                     query: HashMap::default(),
+                    operation_type: String::new(),
+                    operation_name: String::new(),
+                    fields: Vec::new(),
                 }),
             });
     }
@@ -186,6 +189,9 @@ fn group_deny_rules(specs: &[String]) -> Result<BTreeMap<(String, u32), Vec<L7De
                 path: parsed.path,
                 command: String::new(),
                 query: HashMap::default(),
+                operation_type: String::new(),
+                operation_name: String::new(),
+                fields: Vec::new(),
             });
     }
     Ok(grouped)

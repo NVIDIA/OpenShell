@@ -17,8 +17,9 @@ use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    FilesystemPolicy, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, LandlockPolicy, NetworkBinary,
-    NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
+    FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
+    LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
+    SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -115,12 +116,35 @@ struct NetworkEndpointDef {
     /// Defaults to false (strict).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     allow_encoded_slash: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    persisted_queries: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    graphql_persisted_queries: BTreeMap<String, GraphqlOperationDef>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    graphql_max_body_bytes: u32,
 }
 
 // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(v: &u16) -> bool {
     *v == 0
+}
+
+// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphqlOperationDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -140,6 +164,12 @@ struct L7AllowDef {
     command: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     query: BTreeMap<String, QueryMatcherDef>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -167,6 +197,12 @@ struct L7DenyRuleDef {
     command: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     query: BTreeMap<String, QueryMatcherDef>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -223,6 +259,9 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                         method: r.allow.method,
                                         path: r.allow.path,
                                         command: r.allow.command,
+                                        operation_type: r.allow.operation_type,
+                                        operation_name: r.allow.operation_name,
+                                        fields: r.allow.fields,
                                         query: r
                                             .allow
                                             .query
@@ -251,6 +290,9 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                     method: d.method,
                                     path: d.path,
                                     command: d.command,
+                                    operation_type: d.operation_type,
+                                    operation_name: d.operation_name,
+                                    fields: d.fields,
                                     query: d
                                         .query
                                         .into_iter()
@@ -270,6 +312,22 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 })
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
+                            persisted_queries: e.persisted_queries,
+                            graphql_persisted_queries: e
+                                .graphql_persisted_queries
+                                .into_iter()
+                                .map(|(key, op)| {
+                                    (
+                                        key,
+                                        GraphqlOperation {
+                                            operation_type: op.operation_type,
+                                            operation_name: op.operation_name,
+                                            fields: op.fields,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                            graphql_max_body_bytes: e.graphql_max_body_bytes,
                         }
                     })
                     .collect(),
@@ -367,6 +425,9 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                             method: a.method,
                                             path: a.path,
                                             command: a.command,
+                                            operation_type: a.operation_type,
+                                            operation_name: a.operation_name,
+                                            fields: a.fields,
                                             query: a
                                                 .query
                                                 .into_iter()
@@ -393,6 +454,9 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                     method: d.method.clone(),
                                     path: d.path.clone(),
                                     command: d.command.clone(),
+                                    operation_type: d.operation_type.clone(),
+                                    operation_name: d.operation_name.clone(),
+                                    fields: d.fields.clone(),
                                     query: d
                                         .query
                                         .iter()
@@ -410,6 +474,22 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 })
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
+                            persisted_queries: e.persisted_queries.clone(),
+                            graphql_persisted_queries: e
+                                .graphql_persisted_queries
+                                .iter()
+                                .map(|(key, op)| {
+                                    (
+                                        key.clone(),
+                                        GraphqlOperationDef {
+                                            operation_type: op.operation_type.clone(),
+                                            operation_name: op.operation_name.clone(),
+                                            fields: op.fields.clone(),
+                                        },
+                                    )
+                                })
+                                .collect(),
+                            graphql_max_body_bytes: e.graphql_max_body_bytes,
                         }
                     })
                     .collect(),
@@ -1489,6 +1569,57 @@ network_policies:
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         let deny = &proto.network_policies["test"].endpoints[0].deny_rules[0];
         assert_eq!(deny.query["type"].any, vec!["admin-*", "root-*"]);
+    }
+
+    #[test]
+    fn round_trip_preserves_graphql_policy_fields() {
+        let yaml = r"
+version: 1
+network_policies:
+  github_graphql:
+    name: github_graphql
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: graphql
+        enforcement: enforce
+        persisted_queries: allow_registered
+        graphql_max_body_bytes: 131072
+        graphql_persisted_queries:
+          abc123:
+            operation_type: query
+            operation_name: Viewer
+            fields: [viewer]
+        rules:
+          - allow:
+              operation_type: query
+              fields: [viewer, repository]
+          - allow:
+              operation_type: mutation
+              operation_name: Issue*
+              fields: [createIssue]
+        deny_rules:
+          - operation_type: mutation
+            fields: [deleteRepository]
+    binaries:
+      - path: /usr/bin/curl
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep = &proto2.network_policies["github_graphql"].endpoints[0];
+        assert_eq!(ep.protocol, "graphql");
+        assert_eq!(ep.persisted_queries, "allow_registered");
+        assert_eq!(ep.graphql_max_body_bytes, 131_072);
+        assert_eq!(
+            ep.graphql_persisted_queries["abc123"].operation_type,
+            "query"
+        );
+        assert_eq!(ep.rules[0].allow.as_ref().unwrap().operation_type, "query");
+        assert_eq!(ep.rules[1].allow.as_ref().unwrap().operation_name, "Issue*");
+        assert_eq!(ep.deny_rules[0].operation_type, "mutation");
+        assert_eq!(ep.deny_rules[0].fields, vec!["deleteRepository"]);
     }
 
     #[test]

@@ -2652,6 +2652,7 @@ async fn handle_forward_proxy(
             action: method.to_string(),
             target: path.clone(),
             query_params,
+            graphql: None,
         };
 
         let (allowed, reason) =

@@ -239,6 +239,17 @@ request_denied_for_endpoint(request, endpoint) if {
 	command_matches(request.command, deny_rule.command)
 }
 
+# --- L7 deny rule matching: GraphQL operation ---
+
+request_denied_for_endpoint(request, endpoint) if {
+	graphql_request_has_operations(request)
+	some deny_rule
+	deny_rule := endpoint.deny_rules[_]
+	deny_rule.operation_type
+	op := request.graphql.operations[_]
+	graphql_deny_rule_matches_operation(op, deny_rule, endpoint)
+}
+
 # Deny query matching: fail-closed semantics.
 # If no query rules on the deny rule, match unconditionally (any query params).
 # If query rules present, trigger the deny if ANY value for a configured key
@@ -288,7 +299,37 @@ deny_any_value_matches(values, matcher) if {
 
 request_deny_reason := reason if {
 	input.request
+	graphql_request_error(input.request)
+	reason := sprintf("GraphQL request rejected: %s", [input.request.graphql.error])
+}
+
+request_deny_reason := reason if {
+	input.request
+	not graphql_request_error(input.request)
+	graphql_request_has_unregistered_persisted_query(input.request, matched_endpoint_config)
+	reason := "GraphQL persisted query is not registered"
+}
+
+request_deny_reason := reason if {
+	input.request
 	deny_request
+	graphql_request_has_operations(input.request)
+	reason := "GraphQL operation blocked by deny rule"
+}
+
+request_deny_reason := reason if {
+	input.request
+	not deny_request
+	not allow_request
+	graphql_request_has_operations(input.request)
+	not graphql_request_has_unregistered_persisted_query(input.request, matched_endpoint_config)
+	reason := "GraphQL operation not permitted by policy"
+}
+
+request_deny_reason := reason if {
+	input.request
+	deny_request
+	not graphql_request_has_operations(input.request)
 	reason := sprintf("%s %s blocked by deny rule", [input.request.method, input.request.path])
 }
 
@@ -296,6 +337,7 @@ request_deny_reason := reason if {
 	input.request
 	not deny_request
 	not allow_request
+	not graphql_request_has_operations(input.request)
 	reason := sprintf("%s %s not permitted by policy", [input.request.method, input.request.path])
 }
 
@@ -317,6 +359,149 @@ request_allowed_for_endpoint(request, endpoint) if {
 	rule := endpoint.rules[_]
 	rule.allow.command
 	command_matches(request.command, rule.allow.command)
+}
+
+# --- L7 rule matching: GraphQL operation ---
+
+request_allowed_for_endpoint(request, endpoint) if {
+	graphql_request_allowed(request, endpoint)
+}
+
+graphql_request_allowed(request, endpoint) if {
+	graphql_request_has_operations(request)
+	not graphql_request_error(request)
+	not graphql_request_has_unregistered_persisted_query(request, endpoint)
+	not graphql_request_has_unallowed_operation(request, endpoint)
+}
+
+graphql_request_has_operations(request) if {
+	is_object(request.graphql)
+	operations := object.get(request.graphql, "operations", [])
+	count(operations) > 0
+}
+
+graphql_request_error(request) if {
+	is_object(request.graphql)
+	error := object.get(request.graphql, "error", "")
+	error != ""
+}
+
+graphql_request_has_unallowed_operation(request, endpoint) if {
+	op := request.graphql.operations[_]
+	not graphql_operation_allowed(op, endpoint)
+}
+
+graphql_operation_allowed(op, endpoint) if {
+	rule := endpoint.rules[_]
+	rule.allow.operation_type
+	graphql_allow_rule_matches_operation(op, rule.allow, endpoint)
+}
+
+graphql_request_has_unregistered_persisted_query(request, endpoint) if {
+	op := request.graphql.operations[_]
+	graphql_operation_needs_registry(op)
+	not graphql_registered_operation(op, endpoint)
+}
+
+graphql_operation_needs_registry(op) if {
+	object.get(op, "persisted_query", false) == true
+	object.get(op, "operation_type", "") == ""
+}
+
+graphql_registered_operation(op, endpoint) if {
+	object.get(endpoint, "persisted_queries", "deny") == "allow_registered"
+	id := graphql_operation_registry_key(op)
+	endpoint.graphql_persisted_queries[id]
+}
+
+graphql_operation_registry_key(op) := key if {
+	key := object.get(op, "persisted_query_hash", "")
+	key != ""
+}
+
+graphql_operation_registry_key(op) := key if {
+	object.get(op, "persisted_query_hash", "") == ""
+	key := object.get(op, "persisted_query_id", "")
+	key != ""
+}
+
+graphql_effective_operation(op, endpoint) := registered if {
+	graphql_operation_needs_registry(op)
+	key := graphql_operation_registry_key(op)
+	registered := endpoint.graphql_persisted_queries[key]
+}
+
+graphql_effective_operation(op, _) := op if {
+	not graphql_operation_needs_registry(op)
+}
+
+graphql_allow_rule_matches_operation(op, rule, endpoint) if {
+	effective := graphql_effective_operation(op, endpoint)
+	graphql_operation_type_matches(effective, rule)
+	graphql_operation_name_matches(effective, rule)
+	graphql_allow_fields_match(effective, rule)
+}
+
+graphql_deny_rule_matches_operation(op, rule, endpoint) if {
+	effective := graphql_effective_operation(op, endpoint)
+	graphql_operation_type_matches(effective, rule)
+	graphql_operation_name_matches(effective, rule)
+	graphql_deny_fields_match(effective, rule)
+}
+
+graphql_operation_type_matches(_, rule) if {
+	object.get(rule, "operation_type", "") == "*"
+}
+
+graphql_operation_type_matches(op, rule) if {
+	expected := object.get(rule, "operation_type", "")
+	expected != ""
+	expected != "*"
+	lower(object.get(op, "operation_type", "")) == lower(expected)
+}
+
+graphql_operation_name_matches(_, rule) if {
+	object.get(rule, "operation_name", "") == ""
+}
+
+graphql_operation_name_matches(op, rule) if {
+	pattern := object.get(rule, "operation_name", "")
+	pattern != ""
+	name := object.get(op, "operation_name", "")
+	glob.match(pattern, [], name)
+}
+
+# Allow-side field constraints are intentionally all-selected-fields semantics:
+# if a rule declares fields, every root field selected by the operation must
+# match one of the rule patterns. This prevents mixed-operation requests from
+# allowing an unlisted field because one safe field also appeared.
+graphql_allow_fields_match(_, rule) if {
+	count(object.get(rule, "fields", [])) == 0
+}
+
+graphql_allow_fields_match(op, rule) if {
+	count(object.get(rule, "fields", [])) > 0
+	count(object.get(op, "fields", [])) > 0
+	not graphql_operation_has_unmatched_field(op, rule)
+}
+
+graphql_operation_has_unmatched_field(op, rule) if {
+	field := object.get(op, "fields", [])[_]
+	not graphql_field_matches_any(field, object.get(rule, "fields", []))
+}
+
+graphql_deny_fields_match(_, rule) if {
+	count(object.get(rule, "fields", [])) == 0
+}
+
+graphql_deny_fields_match(op, rule) if {
+	field := object.get(op, "fields", [])[_]
+	graphql_field_matches_any(field, object.get(rule, "fields", []))
+}
+
+graphql_field_matches_any(field, patterns) if {
+	pattern := patterns[_]
+	glob.match(pattern, [], field)
 }
 
 # Wildcard "*" matches any method; otherwise case-insensitive exact match.

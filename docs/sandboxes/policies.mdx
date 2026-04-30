@@ -222,8 +222,8 @@ Each segment has a fixed meaning:
 |---|---|---|
 | `host` | Yes | Destination hostname. |
 | `port` | Yes | Destination port, `1` through `65535`. |
-| `access` | No | Access preset for REST endpoints: `read-only`, `read-write`, or `full`. |
-| `protocol` | No | L7 inspection mode: `rest` or `sql`. In practice, incremental updates are designed around `rest`. `sql` is audit-only and not a recommended workflow today. |
+| `access` | No | Access preset for L7 endpoints: `read-only`, `read-write`, or `full`. REST and GraphQL endpoints expand presets differently. |
+| `protocol` | No | L7 inspection mode: `rest`, `graphql`, or `sql`. `sql` is audit-only and not a recommended workflow today. |
 | `enforcement` | No | Enforcement mode for inspected traffic: `enforce` or `audit`. |
 
 Examples:
@@ -232,13 +232,15 @@ Examples:
 |---|---|
 | `pypi.org:443` | Add a plain L4 endpoint. The proxy allows the TCP stream and does not inspect HTTP requests. |
 | `api.github.com:443:read-only:rest:enforce` | Add a REST endpoint with the `read-only` preset expanded by the policy engine into GET, HEAD, and OPTIONS access. |
+| `api.github.com:443:read-only:graphql:enforce` | Add a GraphQL endpoint with the `read-only` preset expanded into query-only access. |
 
-If you set `protocol: rest`, you also need an allow shape. With incremental updates, that means you should provide an `access` preset on `--add-endpoint`, then use `--add-allow` or `--add-deny` to refine it later.
+If you set `protocol: rest` or `protocol: graphql`, you also need an allow shape. With incremental updates, that means you should provide an `access` preset on `--add-endpoint`, then use `--add-allow` or `--add-deny` to refine REST endpoints later.
 
 For example:
 
 - `api.github.com:443:read-only:rest` is valid.
-- `api.github.com:443::rest` is invalid. It does not mean "allow all traffic." A REST endpoint with `protocol` but no `access` or `rules` is rejected when the policy loads.
+- `api.github.com:443:read-only:graphql` is valid.
+- `api.github.com:443::rest` is invalid. It does not mean "allow all traffic." An L7 endpoint with `protocol` but no `access` or `rules` is rejected when the policy loads.
 
 When you pass multiple `--add-endpoint` flags in one command, every `--binary` value applies to every added endpoint in that command. If different endpoints need different binaries, use separate `policy update` commands.
 
@@ -523,6 +525,52 @@ REST rules can also constrain query parameter values:
 ```
 
 `query` matchers are case-sensitive and run on decoded values. If a request has duplicate keys (for example, `tag=a&tag=b`), every value for that key must match the configured glob(s).
+
+### GraphQL matching
+
+GraphQL endpoints use `protocol: graphql`. The proxy parses GraphQL-over-HTTP `GET` and `POST` requests, classifies each operation, and evaluates rules against the operation type, optional operation name, and selected root fields.
+
+```yaml showLineNumbers={false}
+  github_graphql:
+    name: github_graphql
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: graphql
+        enforcement: enforce
+        rules:
+          - allow:
+              operation_type: query
+              fields: [viewer, repository]
+          - allow:
+              operation_type: mutation
+              operation_name: Issue*
+              fields: [createIssue]
+        deny_rules:
+          - operation_type: mutation
+            fields: [deleteRepository]
+    binaries:
+      - { path: /usr/bin/gh }
+```
+
+For allow rules, every selected root field in an operation must match one of the configured `fields` globs. For deny rules, one matching root field blocks the request. Batched GraphQL requests are fail-closed: if any operation is malformed, denied, or unregistered, the whole HTTP request is denied.
+
+Hash-only persisted queries cannot be classified from the request alone. OpenShell denies them unless the endpoint uses `persisted_queries: allow_registered` and provides a trusted `graphql_persisted_queries` entry keyed by hash or saved-query ID.
+
+### GraphQL service policy shapes
+
+GraphQL field names are application-specific, so treat these as starting shapes to review against the actual app schema:
+
+| Service | Endpoint shape | Starting policy |
+|---|---|---|
+| Railway | `backboard.railway.app/graphql/v2` | Allow `query`; allow only reviewed deployment mutations; deny `volumeDelete`, `projectDelete`, `*Delete`, `*Destroy`. |
+| GitHub | `api.github.com/graphql` | Allow `query`; optionally allow low-risk mutations such as reactions; deny broad destructive/admin roots like `deleteRef`, `deleteRepository`, `updateBranchProtectionRule`, and `delete*`. |
+| GitLab | `/api/graphql` | Prefer read-only token scopes where possible; allow `query`; deny mutations by default or allow only reviewed workflow roots. |
+| Shopify Admin | `*.myshopify.com/admin/api/**/graphql.json` | Allow `query`; allow app-specific mutations only; deny `*Delete`, `bulkOperationRunMutation`, and high-impact inventory/order/customer roots unless approved. |
+| monday.com | `api.monday.com/v2` | Allow board/item reads; allow tightly scoped create/update mutations only where needed; deny delete/archive roots. |
+| Salesforce GraphQL | Salesforce GraphQL endpoint | Allow `query`; deny record create/update/delete mutations unless the sandbox is intended to modify CRM data. |
+| Hygraph | Project content API endpoint | Allow content reads; deny generated destructive content roots such as `delete*`, `deleteMany*`, `unpublish*`, and batch mutations unless a publishing workflow requires them. |
+| Atlassian GraphQL Gateway | `api.atlassian.com/graphql` | Allow reads by default; require explicit mutation allowlists because the gateway spans Jira, Confluence, Bitbucket, and admin surfaces. |
 
 ## Next Steps
 

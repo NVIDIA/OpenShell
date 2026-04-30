@@ -83,13 +83,13 @@ The `protocol` field on an endpoint controls whether the proxy inspects individu
 | Aspect | Detail |
 |---|---|
 | Default | Endpoints without a `protocol` field use L4-only enforcement: the proxy checks host, port, and binary, then relays the TCP stream without inspecting payloads. |
-| What you can change | Add `protocol: rest` to enable per-request HTTP inspection. Pair it with `rules` (fine-grained method and path control) or `access` presets (`full`, `read-only`, `read-write`). |
-| Risk if relaxed | L4-only endpoints allow the agent to send any data through the tunnel after the initial connection is permitted. The proxy cannot see HTTP methods, paths, or bodies. Adding `access: full` with `protocol: rest` enables inspection but permits all methods and paths, providing observability without restriction. |
-| Recommendation | Use `protocol: rest` with specific `rules` for APIs where you want method and path control. Use `access: read-only` for read-only endpoints. Omit `protocol` for non-HTTP protocols (WebSocket, gRPC streaming). |
+| What you can change | Add `protocol: rest` to enable per-request HTTP method/path inspection, or `protocol: graphql` to inspect GraphQL operation type, operation name, and root fields. Pair either protocol with `rules` or access presets (`full`, `read-only`, `read-write`). |
+| Risk if relaxed | L4-only endpoints allow the agent to send any data through the tunnel after the initial connection is permitted. The proxy cannot see HTTP methods, paths, or GraphQL operations. Adding `access: full` with L7 inspection enables observability but permits all inspected actions. |
+| Recommendation | Use `protocol: rest` with specific `rules` for APIs where intent is encoded in method and path. Use `protocol: graphql` for GraphQL APIs where destructive operations are body-encoded. Prefer `access: read-only` or explicit allowlists, and deny hash-only persisted queries unless you maintain a trusted registry. Omit `protocol` for non-HTTP protocols (WebSocket, gRPC streaming). |
 
 ### Enforcement Mode (`audit` vs `enforce`)
 
-When `protocol: rest` is active, the `enforcement` field controls whether the proxy blocks or logs rule violations.
+When L7 inspection is active, the `enforcement` field controls whether the proxy blocks or logs rule violations.
 
 | Aspect | Detail |
 |---|---|

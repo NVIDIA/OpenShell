@@ -102,6 +102,7 @@ where
 {
     match config.protocol {
         L7Protocol::Rest => relay_rest(config, &engine, client, upstream, ctx).await,
+        L7Protocol::Graphql => relay_graphql(config, &engine, client, upstream, ctx).await,
         L7Protocol::Sql => {
             if close_if_stale(engine.generation_guard(), ctx) {
                 return Ok(());
@@ -241,6 +242,7 @@ where
             action: req.action.clone(),
             target: redacted_target.clone(),
             query_params: req.query_params.clone(),
+            graphql: None,
         };
 
         // Evaluate L7 policy via Rego (using redacted target)
@@ -374,6 +376,199 @@ fn close_if_stale(guard: &PolicyGenerationGuard, ctx: &L7EvalContext) -> bool {
     true
 }
 
+async fn relay_graphql<C, U>(
+    config: &L7EndpointConfig,
+    engine: &TunnelPolicyEngine,
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    loop {
+        if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
+
+        let parsed = match crate::l7::graphql::parse_graphql_http_request(
+            client,
+            config.graphql_max_body_bytes,
+            crate::l7::path::CanonicalizeOptions {
+                allow_encoded_slash: config.allow_encoded_slash,
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                if is_benign_connection_error(&e) {
+                    debug!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %e,
+                        "GraphQL L7 connection closed"
+                    );
+                } else {
+                    let detail =
+                        parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
+                    emit_parse_rejection(ctx, &detail, "l7-graphql");
+                }
+                return Ok(());
+            }
+        };
+
+        let req = parsed.request;
+        let graphql_info = parsed.info;
+
+        if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
+
+        let (eval_target, redacted_target) = if let Some(ref resolver) = ctx.secret_resolver {
+            match secrets::rewrite_target_for_eval(&req.target, resolver) {
+                Ok(result) => (result.resolved, result.redacted),
+                Err(e) => {
+                    warn!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %e,
+                        "credential resolution failed in GraphQL request target, rejecting"
+                    );
+                    let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    client.write_all(response).await.into_diagnostic()?;
+                    client.flush().await.into_diagnostic()?;
+                    return Ok(());
+                }
+            }
+        } else {
+            (req.target.clone(), req.target.clone())
+        };
+
+        let request_info = L7RequestInfo {
+            action: req.action.clone(),
+            target: redacted_target.clone(),
+            query_params: req.query_params.clone(),
+            graphql: Some(graphql_info.clone()),
+        };
+
+        let (allowed, reason) = evaluate_l7_request(engine, ctx, &request_info)?;
+
+        if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
+
+        let decision_str = match (allowed, config.enforcement) {
+            (true, _) => "allow",
+            (false, EnforcementMode::Audit) => "audit",
+            (false, EnforcementMode::Enforce) => "deny",
+        };
+
+        {
+            let (action_id, disposition_id, severity) = match decision_str {
+                "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
+                "allow" | "audit" => (
+                    ActionId::Allowed,
+                    DispositionId::Allowed,
+                    SeverityId::Informational,
+                ),
+                _ => (
+                    ActionId::Other,
+                    DispositionId::Other,
+                    SeverityId::Informational,
+                ),
+            };
+            let gql_summary = graphql_log_summary(&graphql_info);
+            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Other)
+                .action(action_id)
+                .disposition(disposition_id)
+                .severity(severity)
+                .http_request(HttpRequest::new(
+                    &request_info.action,
+                    OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
+                ))
+                .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                .firewall_rule(&ctx.policy_name, "l7-graphql")
+                .message(format!(
+                    "GRAPHQL_L7_REQUEST {decision_str} {} {}:{}{} {gql_summary} reason={}",
+                    request_info.action, ctx.host, ctx.port, redacted_target, reason,
+                ))
+                .build();
+            ocsf_emit!(event);
+        }
+
+        let _ = &eval_target;
+
+        if allowed || config.enforcement == EnforcementMode::Audit {
+            let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+                &req,
+                client,
+                upstream,
+                ctx.secret_resolver.as_deref(),
+                Some(engine.generation_guard()),
+            )
+            .await?;
+            match outcome {
+                RelayOutcome::Reusable => {}
+                RelayOutcome::Consumed => {
+                    debug!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        "Upstream connection not reusable, closing GraphQL L7 relay"
+                    );
+                    return Ok(());
+                }
+                RelayOutcome::Upgraded { overflow } => {
+                    return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+                }
+            }
+        } else {
+            crate::l7::rest::RestProvider::default()
+                .deny_with_redacted_target(
+                    &req,
+                    &ctx.policy_name,
+                    &reason,
+                    client,
+                    Some(&redacted_target),
+                )
+                .await?;
+            return Ok(());
+        }
+    }
+}
+
+fn graphql_log_summary(info: &crate::l7::graphql::GraphqlRequestInfo) -> String {
+    if let Some(error) = &info.error {
+        return format!("graphql_error={error:?}");
+    }
+    let ops: Vec<String> = info
+        .operations
+        .iter()
+        .map(|op| {
+            let name = op.operation_name.as_deref().unwrap_or("-");
+            let fields = if op.fields.is_empty() {
+                "-".to_string()
+            } else {
+                op.fields.join(",")
+            };
+            let persisted = op
+                .persisted_query_hash
+                .as_deref()
+                .or(op.persisted_query_id.as_deref())
+                .unwrap_or("-");
+            format!(
+                "type={} name={} fields={} persisted={}",
+                op.operation_type, name, fields, persisted
+            )
+        })
+        .collect();
+    format!("graphql_ops={}", ops.join(";"))
+}
+
 /// Check if a miette error represents a benign connection close.
 ///
 /// TLS handshake EOF, missing `close_notify`, connection resets, and broken
@@ -422,6 +617,7 @@ pub fn evaluate_l7_request(
             "method": request.action,
             "path": request.target,
             "query_params": request.query_params.clone(),
+            "graphql": request.graphql.clone(),
         }
     });
 
