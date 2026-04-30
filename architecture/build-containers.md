@@ -35,9 +35,22 @@ OpenShell also publishes a standalone `openshell-gateway` binary as a GitHub rel
 - **Artifact name**: `openshell-gateway-<target>.tar.gz`
 - **Targets**: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`
 - **Release workflows**: `.github/workflows/release-dev.yml`, `.github/workflows/release-tag.yml`
-- **Installer**: None yet. The binary is a manual-download asset.
+- **Installers**: `install-vm.sh` for the rolling development gateway, and the Homebrew dev cask under `Casks/`.
 
 Both the standalone artifact and the deployed container image use the `openshell-gateway` binary.
+
+## Homebrew Dev Cask
+
+This repository also acts as the Homebrew tap for the rolling macOS Apple Silicon dev build. Users must tap it with the full Git URL because the repository is not named `homebrew-*`:
+
+```bash
+brew tap nvidia/openshell https://github.com/NVIDIA/OpenShell.git
+brew install --cask nvidia/openshell/openshell-dev
+```
+
+`Casks/openshell-dev.rb` uses `version :latest` and `sha256 :no_check` because it installs a rolling development archive from the `dev` GitHub release. `.github/workflows/homebrew-dev-cask.yml` runs after the dev CLI/gateway release or VM dev driver release completes. It downloads the macOS ARM64 CLI, gateway, and VM driver assets, repacks them into `openshell-homebrew-dev-aarch64-apple-darwin.tar.gz`, and uploads that archive back to the `dev` release.
+
+The archive exposes `openshell`, `openshell-gateway`, and `openshell-driver-vm` through cask `binary` stanzas. The gateway entrypoint is a wrapper that sets `OPENSHELL_DRIVER_DIR` to the bundled driver directory before executing the real gateway binary. The cask signs the VM driver with the Hypervisor entitlement during `postflight`.
 
 ## Python Wheels
 

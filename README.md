@@ -26,6 +26,13 @@ OpenShell is built agent-first. The project ships with agent skills for everythi
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
+**Homebrew dev cask (macOS Apple Silicon):**
+
+```bash
+brew tap nvidia/openshell https://github.com/NVIDIA/OpenShell.git
+brew install --cask nvidia/openshell/openshell-dev
+```
+
 **From PyPI (requires [uv](https://docs.astral.sh/uv/)):**
 
 ```bash

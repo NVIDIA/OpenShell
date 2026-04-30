@@ -1,0 +1,127 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Publish Homebrew Dev Cask Bundle
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - Release Dev
+      - Release VM Dev
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+concurrency:
+  group: homebrew-dev-cask
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    name: Publish Dev Cask Bundle
+    if: github.repository == 'NVIDIA/OpenShell' && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUNDLE_ASSET: openshell-homebrew-dev-aarch64-apple-darwin.tar.gz
+    steps:
+      - name: Download release assets
+        run: |
+          set -euo pipefail
+          mkdir -p downloads
+
+          gh release download dev \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern openshell-aarch64-apple-darwin.tar.gz \
+            --pattern openshell-gateway-aarch64-apple-darwin.tar.gz \
+            --dir downloads \
+            --clobber
+
+          gh release download vm-dev \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern openshell-driver-vm-aarch64-apple-darwin.tar.gz \
+            --dir downloads \
+            --clobber
+
+          test -f downloads/openshell-aarch64-apple-darwin.tar.gz
+          test -f downloads/openshell-gateway-aarch64-apple-darwin.tar.gz
+          test -f downloads/openshell-driver-vm-aarch64-apple-darwin.tar.gz
+
+      - name: Build cask bundle
+        run: |
+          set -euo pipefail
+          mkdir -p bundle/libexec/openshell artifacts
+
+          tar -xzf downloads/openshell-aarch64-apple-darwin.tar.gz \
+            -C bundle openshell
+          tar -xzf downloads/openshell-gateway-aarch64-apple-darwin.tar.gz \
+            -C bundle/libexec openshell-gateway
+          tar -xzf downloads/openshell-driver-vm-aarch64-apple-darwin.tar.gz \
+            -C bundle/libexec/openshell openshell-driver-vm
+
+          cat > bundle/openshell-gateway <<'SH'
+          #!/bin/sh
+          set -e
+
+          path=$0
+          while [ -L "$path" ]; do
+            link=$(readlink "$path")
+            case "$link" in
+              /*) path=$link ;;
+              *) path=$(dirname "$path")/$link ;;
+            esac
+          done
+
+          dir=$(CDPATH= cd -- "$(dirname -- "$path")" && pwd)
+          export OPENSHELL_DRIVER_DIR="${dir}/libexec/openshell"
+          exec "${dir}/libexec/openshell-gateway" "$@"
+          SH
+
+          cat > bundle/openshell-driver-vm <<'SH'
+          #!/bin/sh
+          set -e
+
+          path=$0
+          while [ -L "$path" ]; do
+            link=$(readlink "$path")
+            case "$link" in
+              /*) path=$link ;;
+              *) path=$(dirname "$path")/$link ;;
+            esac
+          done
+
+          dir=$(CDPATH= cd -- "$(dirname -- "$path")" && pwd)
+          exec "${dir}/libexec/openshell/openshell-driver-vm" "$@"
+          SH
+
+          cat > bundle/libexec/openshell/openshell-driver-vm-entitlements.plist <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.security.hypervisor</key>
+              <true/>
+          </dict>
+          </plist>
+          XML
+
+          chmod 0555 bundle/openshell bundle/openshell-gateway bundle/openshell-driver-vm
+          chmod 0555 bundle/libexec/openshell-gateway bundle/libexec/openshell/openshell-driver-vm
+
+          tar -czf "artifacts/${BUNDLE_ASSET}" -C bundle .
+          tar -tzf "artifacts/${BUNDLE_ASSET}"
+
+      - name: Upload cask bundle to dev release
+        run: |
+          set -euo pipefail
+          gh release upload dev "artifacts/${BUNDLE_ASSET}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
