@@ -45,7 +45,7 @@ The first implementation is tracked in [#1062](https://github.com/NVIDIA/OpenShe
 
 - structured L7 REST deny responses for agent-readable failures
 - a sandbox-local `policy.local` HTTP API backed by existing files, logs, and per-sandbox mTLS gateway calls
-- static sandbox-local agent guidance in `/etc/openshell/SKILL.md`
+- static sandbox-local agent guidance in `/etc/openshell/skills/policy_advisor.md`
 - agent-authored proposal provenance, validation status, and rejection guidance in the existing draft policy flow
 - TUI/CLI review for a single sandbox, with polling as the MVP refresh path
 
@@ -91,7 +91,7 @@ This RFC is therefore network-first by design, not because other policy domains 
 Every OpenShell sandbox should be able to host an agent-capable policy workflow with four core affordances:
 
 1. A local capability description that teaches an agent how to inspect current policy state, understand the available policy language, and submit a proposal for review.
-2. A sandbox-local or supervisor-adjacent API for reading effective policy, recent denials, and proposal state.
+2. A sandbox-local or supervisor-adjacent API for reading effective policy, recent denials, sandbox-local activity logs, and proposal state.
 3. A gateway-managed developer inbox for reviewing, editing, approving, rejecting, and auditing proposals in real time.
 4. A validation pipeline that checks proposed policy changes before they are applied.
 
@@ -250,17 +250,17 @@ The workspace should provide:
 - Effective sandbox policy, already resolved to the currently active version.
 - Policy schema and examples relevant to the sandbox's supported policy features.
 - A description of approval workflow semantics.
-- Recent denials and related proposal history.
+- Recent denials, sandbox-local activity logs, and related proposal history.
 - Guidance for generating the narrowest change possible.
 
-The first implementation can be a static `SKILL.md` plus a sandbox-local `policy.local` HTTP API. The long-term contract is the API; the skill is the ergonomic on-ramp. MCP can wrap this API later for agents that benefit from tool discovery, but it should not be the first load-bearing protocol or a separate implementation path.
+The first implementation can be a static `/etc/openshell/skills/policy_advisor.md` plus a sandbox-local `policy.local` HTTP API. The long-term contract is the API; the skill is the ergonomic on-ramp. MCP can wrap this API later for agents that benefit from tool discovery, but it should not be the first load-bearing protocol or a separate implementation path.
 
 The sandbox-facing surface must also have an explicit information boundary:
 
 Visible to the in-sandbox agent:
 
 - the current effective sandbox policy
-- deny reasons and local proposal history for that sandbox
+- deny reasons, sandbox-local logs, and local proposal history for that sandbox
 - supported policy primitives and examples
 - coarse proposal outcomes such as `needs_human_review`, `eligible_for_external_review`, or `rejected_for_safety`
 
@@ -531,7 +531,7 @@ Add a local policy interaction surface:
 
 Representative operations:
 
-- read effective policy and recent denials
+- read effective policy, recent denials, and sandbox-local activity logs
 - inspect proposal guidance and current proposal state
 - submit a policy proposal
 
@@ -542,7 +542,7 @@ Phase 2 implementation decisions:
 - primary transport: sandbox-local HTTP JSON at `policy.local`
 - ergonomic wrapper: defer MCP/CLI wrappers until the local API proves useful
 - first trust model: the sandbox is treated as single-tenant, so local callers are part of the sandbox tenant; this does not grant approval rights
-- first proposal format: reuse the `PolicyMergeOperation` shape behind `openshell policy update`; sandbox-origin operations are stored as draft chunks for approval instead of being applied immediately
+- first proposal format: reuse the `PolicyMergeOperation` shape behind `openshell policy update` inside a JSON request body; the supervisor/local service bundles those operations with intent, summary, and optional evidence references, sends them to the gateway over gRPC, and the gateway stores them as draft chunks for approval instead of applying them immediately
 
 #### Gateway / server
 
@@ -598,8 +598,8 @@ Goal: let any agent in a sandbox intentionally inspect and draft policy changes.
 
 Deliverables:
 
-- Generated sandbox-local `SKILL.md` or equivalent instruction bundle.
-- Supervisor read APIs for policy state, denials, and capabilities.
+- Generated sandbox-local `policy_advisor.md` or equivalent instruction bundle.
+- Supervisor read APIs for policy state, denials, local activity logs, and capabilities.
 - Initial proposal submission API.
 - Structured deny messages that point agents to the local policy workflow.
 - Feedback path so agents can read operator rejection guidance and iterate on a proposal.
