@@ -224,10 +224,6 @@ jobs:
           ldd --version
           ldd "$BIN" || true
 
-      - name: sccache stats
-        if: always()
-        run: mise x -- sccache --show-stats
-
       - name: Stage binary for prebuilt layout
         run: |
           set -euo pipefail
@@ -245,3 +241,15 @@ jobs:
           path: prebuilt-binaries/${{ inputs.arch }}/${{ steps.target.outputs.binary }}
           retention-days: ${{ inputs['retention-days'] }}
           if-no-files-found: error
+
+      - name: sccache stats
+        if: always()
+        run: |
+          set +e
+          stats_bin="${SCCACHE_PATH:-sccache}"
+          "$stats_bin" --show-stats
+          status=$?
+          if [[ $status -ne 0 ]]; then
+            echo "::warning::sccache stats unavailable (exit $status)"
+          fi
+          exit 0
