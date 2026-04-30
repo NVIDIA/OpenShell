@@ -78,9 +78,9 @@ Old runtime cache versions are cleaned up when a new version is extracted.
 Each VM sandbox starts from either a registry image fetched directly over OCI or
 a local Docker image reference produced by Dockerfile-based `--from` sources.
 For local Dockerfile sources, the CLI builds the image on the local Docker
-daemon and passes the VM driver an internal `openshell-vm-local-image:<tag>`
-reference. The driver resolves that tag on the gateway host, exports the image
-filesystem, and **rewrites that filesystem into a supervisor-only sandbox
+daemon and passes the ordinary image tag through `template.image`. The VM driver
+first checks the local Docker daemon for that tag; when present, it exports the
+image filesystem and **rewrites that filesystem into a supervisor-only sandbox
 guest** before caching it:
 
 - `/srv/openshell-vm-sandbox-init.sh` is installed as the guest entrypoint
@@ -111,7 +111,7 @@ sandbox image. The driver:
 - resolves the image on the gateway host without Docker for registry and
   community image refs
 - for local Dockerfile sources, the CLI builds through the host Docker socket
-  and hands the VM driver an internal local-image ref instead of a registry ref
+  and passes the resulting ordinary Docker tag through `template.image`
 - unpacks the image filesystem, injects the VM sandbox init/supervisor files,
   and validates required guest tools such as `bash`, `mount`, `ip`, and `sed`
 - caches the prepared guest rootfs under
@@ -120,7 +120,7 @@ sandbox image. The driver:
   `<vm-driver-state-dir>/sandboxes/<sandbox-id>/rootfs`
 
 The cache key uses an immutable image identity: repo digest for registry images
-and the local Docker image ID for local-image refs.
+and the local Docker image ID for images resolved from the local daemon.
 Different VM sandboxes can use different base images concurrently because the
 shared cache is per image, not global for the driver. Cached prepared rootfs
 entries remain on disk until the operator removes them from the VM driver state
