@@ -498,9 +498,12 @@ async fn build_compute_runtime(
 
 fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
     match config.compute_drivers.as_slice() {
-        [] => Err(Error::config(
-            "at least one compute driver must be configured",
-        )),
+        [] => openshell_core::config::detect_driver().ok_or_else(|| {
+            Error::config(
+                "no compute driver configured and auto-detection found no suitable driver; \
+                set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
+            )
+        }),
         [
             driver @ (ComputeDriverKind::Kubernetes
             | ComputeDriverKind::Vm
@@ -545,10 +548,33 @@ mod tests {
     }
 
     #[test]
-    fn configured_compute_driver_rejects_empty_drivers() {
+    fn configured_compute_driver_triggers_auto_detection_when_empty() {
         let config = Config::new(None).with_compute_drivers([]);
-        let err = configured_compute_driver(&config).unwrap_err();
-        assert!(err.to_string().contains("at least one compute driver"));
+        // Empty drivers triggers auto-detection, which may return Some or None
+        // depending on the environment. This test verifies the auto-detection path
+        // is taken rather than immediately returning an error.
+        let result = configured_compute_driver(&config);
+        // Either we get a detected driver or an error about none being detected
+        match result {
+            Ok(driver) => {
+                assert!(
+                    matches!(
+                        driver,
+                        ComputeDriverKind::Kubernetes
+                            | ComputeDriverKind::Docker
+                            | ComputeDriverKind::Podman
+                    ),
+                    "auto-detected unexpected driver: {driver:?}"
+                );
+            }
+            Err(e) => {
+                assert!(
+                    e.to_string()
+                        .contains("no compute driver configured and none detected"),
+                    "unexpected error: {e}"
+                );
+            }
+        }
     }
 
     #[test]

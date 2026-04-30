@@ -61,12 +61,14 @@ struct Args {
     /// Accepts a comma-delimited list such as `kubernetes` or
     /// `kubernetes,podman`. The configuration format is future-proofed for
     /// multiple drivers, but the gateway currently requires exactly one.
+    /// When unset, the gateway auto-detects the driver based on the runtime
+    /// environment (Kubernetes → Podman → Docker). VM is never auto-detected
+    /// and requires explicit configuration.
     #[arg(
         long,
         alias = "driver",
         env = "OPENSHELL_DRIVERS",
         value_delimiter = ',',
-        default_value = "kubernetes",
         value_parser = parse_compute_driver
     )]
     drivers: Vec<ComputeDriverKind>,
