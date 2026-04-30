@@ -57,19 +57,16 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
 }
 
 #[test]
-fn container_visible_endpoint_rewrites_loopback_hosts() {
-    assert_eq!(
-        container_visible_openshell_endpoint("https://localhost:8443"),
-        "https://host.openshell.internal:8443/"
-    );
-    assert_eq!(
-        container_visible_openshell_endpoint("http://127.0.0.1:8080"),
-        "http://host.openshell.internal:8080/"
-    );
-    assert_eq!(
-        container_visible_openshell_endpoint("https://gateway.internal:8443"),
-        "https://gateway.internal:8443"
-    );
+fn build_environment_preserves_loopback_endpoint_for_host_network() {
+    let mut config = runtime_config();
+    config.grpc_endpoint = "http://127.0.0.1:8080".to_string();
+
+    let env = build_environment(&test_sandbox(), &config);
+    assert!(env.contains(&"OPENSHELL_ENDPOINT=http://127.0.0.1:8080".to_string()));
+
+    config.grpc_endpoint = "https://localhost:8443".to_string();
+    let env = build_environment(&test_sandbox(), &config);
+    assert!(env.contains(&"OPENSHELL_ENDPOINT=https://localhost:8443".to_string()));
 }
 
 #[test]
@@ -229,6 +226,19 @@ fn require_sandbox_identifier_rejects_when_id_and_name_are_empty() {
     require_sandbox_identifier("sbx-1", "").expect("id-only is accepted");
     require_sandbox_identifier("", "demo").expect("name-only is accepted");
     require_sandbox_identifier("sbx-1", "demo").expect("id and name is accepted");
+}
+
+#[test]
+fn build_container_create_body_uses_host_network() {
+    let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
+    let host_config = create_body.host_config.expect("host_config is populated");
+
+    assert_eq!(
+        host_config.network_mode,
+        Some("host".to_string()),
+        "sandbox must use host networking so 127.0.0.1 reaches the host gateway"
+    );
+    assert!(host_config.extra_hosts.is_none());
 }
 
 #[test]

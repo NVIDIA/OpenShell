@@ -38,7 +38,6 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
-use url::{Host, Url};
 
 const WATCH_BUFFER: usize = 128;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -55,8 +54,6 @@ const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 const SANDBOX_COMMAND: &str = "sleep infinity";
-const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
-const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 
 /// Default image holding the Linux `openshell-sandbox` binary. The gateway
 /// pulls this image and extracts the binary to a host-side cache when no
@@ -852,7 +849,7 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
 
     environment.insert(
         "OPENSHELL_ENDPOINT".to_string(),
-        container_visible_openshell_endpoint(&config.grpc_endpoint),
+        config.grpc_endpoint.clone(),
     );
     environment.insert("OPENSHELL_SANDBOX_ID".to_string(), sandbox.id.clone());
     environment.insert("OPENSHELL_SANDBOX".to_string(), sandbox.name.clone());
@@ -950,17 +947,23 @@ fn build_container_create_body(
                 "SYS_PTRACE".to_string(),
                 "SYSLOG".to_string(),
             ]),
-            // AppArmor's default Docker profile blocks mount(2) with MS_SHARED
-            // even when SYS_ADMIN is granted, which prevents ip-netns from
-            // creating network namespaces for proxy-mode isolation. The sandbox
-            // enforces its own isolation via seccomp, Landlock, and network
-            // namespaces, so the host AppArmor profile adds no meaningful
-            // defence here.
+            // The sandbox supervisor needs to bind-mount `/run/netns`,
+            // mark it shared, and create per-process network namespaces.
+            // Docker's default AppArmor profile (`docker-default`) denies
+            // these mount operations even with CAP_SYS_ADMIN, so we opt
+            // out of AppArmor confinement for sandbox containers. The
+            // sandbox enforces its own security boundary via Landlock,
+            // seccomp, OPA policy evaluation, and the dedicated network
+            // namespace it sets up for the agent — AppArmor at the
+            // container layer is redundant relative to those controls
+            // and conflicts with them in this case.
             security_opt: Some(vec!["apparmor=unconfined".to_string()]),
-            extra_hosts: Some(vec![
-                format!("{HOST_DOCKER_INTERNAL}:host-gateway"),
-                format!("{HOST_OPENSHELL_INTERNAL}:host-gateway"),
-            ]),
+            // Run in the host network namespace so a gateway bound to
+            // 127.0.0.1 is reachable from the supervisor as 127.0.0.1.
+            // The supervisor still creates a nested network namespace for
+            // the sandboxed workload and forces workload traffic through
+            // its policy proxy.
+            network_mode: Some("host".to_string()),
             ..Default::default()
         }),
         ..Default::default()
@@ -989,25 +992,6 @@ fn sandbox_log_level(sandbox: &DriverSandbox, default_level: &str) -> String {
         .filter(|level| !level.is_empty())
         .unwrap_or(default_level)
         .to_string()
-}
-
-fn container_visible_openshell_endpoint(endpoint: &str) -> String {
-    let Ok(mut url) = Url::parse(endpoint) else {
-        return endpoint.to_string();
-    };
-
-    let should_rewrite = match url.host() {
-        Some(Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
-        Some(Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
-        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        None => false,
-    };
-
-    if should_rewrite && url.set_host(Some(HOST_OPENSHELL_INTERNAL)).is_ok() {
-        return url.to_string();
-    }
-
-    endpoint.to_string()
 }
 
 fn docker_resource_limits(

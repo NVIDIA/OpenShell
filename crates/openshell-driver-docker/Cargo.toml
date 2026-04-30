@@ -19,7 +19,6 @@ futures = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
-url = { workspace = true }
 bollard = { version = "0.20" }
 tar = "0.4"
 tempfile = "3"
