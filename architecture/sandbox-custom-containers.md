@@ -19,8 +19,9 @@ The CLI classifies the value in this order:
 
 1. **Existing file** whose name contains "Dockerfile" (case-insensitive) — treated as a Dockerfile to build.
 2. **Existing directory** containing a `Dockerfile` — treated as a build context directory.
-3. **Contains `/`, `:`, or `.`** — treated as a full container image reference.
-4. **Otherwise** — treated as a community sandbox name, expanded to `{OPENSHELL_COMMUNITY_REGISTRY}/{name}:latest`.
+3. **Missing explicit local path** (for example `./Dockerfile`, `../ctx`, or an absolute path) — rejected locally instead of sent to the gateway as an image pull.
+4. **Contains `/`, `:`, or `.`** — treated as a full container image reference.
+5. **Otherwise** — treated as a community sandbox name, expanded to `{OPENSHELL_COMMUNITY_REGISTRY}/{name}:latest`.
 
 The community registry prefix defaults to `ghcr.io/nvidia/openshell-community/sandboxes` and can be overridden with the `OPENSHELL_COMMUNITY_REGISTRY` environment variable.
 
