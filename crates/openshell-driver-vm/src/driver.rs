@@ -17,7 +17,9 @@ use oci_client::client::{Client as OciClient, ClientConfig};
 use oci_client::manifest::{ImageIndexEntry, OciDescriptor};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
-use openshell_bootstrap::build::decode_rootfs_tar_image_ref;
+use openshell_bootstrap::build::{
+    ROOTFS_TAR_IMAGE_REF_SCHEME, decode_authenticated_rootfs_tar_image_ref,
+};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
@@ -116,6 +118,7 @@ pub struct VmDriverConfig {
     pub gpu_enabled: bool,
     pub gpu_mem_mib: u32,
     pub gpu_vcpus: u8,
+    pub rootfs_artifact_secret: Option<String>,
 }
 
 impl Default for VmDriverConfig {
@@ -137,6 +140,7 @@ impl Default for VmDriverConfig {
             gpu_enabled: false,
             gpu_mem_mib: 8192,
             gpu_vcpus: 4,
+            rootfs_artifact_secret: None,
         }
     }
 }
@@ -756,9 +760,32 @@ impl VmDriver {
         sandbox_id: &str,
         image_ref: &str,
     ) -> Result<String, Status> {
-        if let Some(rootfs_tar_path) = decode_rootfs_tar_image_ref(image_ref) {
+        if is_rootfs_tar_image_ref(image_ref) {
+            let secret = self
+                .config
+                .rootfs_artifact_secret
+                .as_deref()
+                .filter(|secret| !secret.trim().is_empty())
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "vm rootfs tar image references require a gateway-issued artifact secret",
+                    )
+                })?;
+            let artifact = decode_authenticated_rootfs_tar_image_ref(image_ref, secret)
+                .map_err(|err| {
+                    Status::failed_precondition(format!(
+                        "invalid vm rootfs artifact reference: {err}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    Status::failed_precondition("invalid vm rootfs artifact reference")
+                })?;
             return self
-                .ensure_cached_rootfs_tar_image_rootfs_archive(image_ref, &rootfs_tar_path)
+                .ensure_cached_rootfs_tar_image_rootfs_archive(
+                    image_ref,
+                    &artifact.path,
+                    &artifact.digest,
+                )
                 .await;
         }
 
@@ -853,6 +880,7 @@ impl VmDriver {
         &self,
         image_ref: &str,
         rootfs_tar_path: &Path,
+        expected_digest: &str,
     ) -> Result<String, Status> {
         let rootfs_tar = rootfs_tar_path.to_path_buf();
         let image_identity = tokio::task::spawn_blocking(move || compute_file_sha256(&rootfs_tar))
@@ -866,6 +894,11 @@ impl VmDriver {
                     rootfs_tar_path.display()
                 ))
             })?;
+        if image_identity != expected_digest {
+            return Err(Status::failed_precondition(
+                "vm rootfs artifact digest does not match the authenticated reference",
+            ));
+        }
         let archive_path = image_cache_rootfs_archive(&self.config.state_dir, &image_identity);
 
         if tokio::fs::metadata(&archive_path).await.is_ok() {
@@ -1403,6 +1436,12 @@ fn parse_registry_reference(image_ref: &str) -> Result<Reference, Status> {
     })
 }
 
+fn is_rootfs_tar_image_ref(image_ref: &str) -> bool {
+    image_ref
+        .strip_prefix(ROOTFS_TAR_IMAGE_REF_SCHEME)
+        .is_some_and(|rest| rest.starts_with(':'))
+}
+
 fn registry_client() -> OciClient {
     OciClient::new(ClientConfig {
         platform_resolver: Some(Box::new(linux_platform_resolver)),
@@ -1470,8 +1509,12 @@ fn env_non_empty(key: &str) -> Option<String> {
 }
 
 fn image_reference_registry_host(image_ref: &str) -> &str {
-    let first = image_ref.split('/').next().unwrap_or(image_ref);
-    if first.contains('.') || first.contains(':') || first.eq_ignore_ascii_case("localhost") {
+    let mut parts = image_ref.splitn(2, '/');
+    let first = parts.next().unwrap_or(image_ref);
+    let has_path = parts.next().is_some();
+    if has_path
+        && (first.contains('.') || first.contains(':') || first.eq_ignore_ascii_case("localhost"))
+    {
         first
     } else {
         "docker.io"
@@ -2525,12 +2568,45 @@ mod tests {
     fn image_reference_registry_host_defaults_to_docker_hub() {
         assert_eq!(image_reference_registry_host("ubuntu:24.04"), "docker.io");
         assert_eq!(
+            image_reference_registry_host("library/ubuntu:24.04"),
+            "docker.io"
+        );
+        assert_eq!(
             image_reference_registry_host("ghcr.io/nvidia/openshell/base:latest"),
             "ghcr.io"
         );
         assert_eq!(
+            image_reference_registry_host("localhost/example:dev"),
+            "localhost"
+        );
+        assert_eq!(
             image_reference_registry_host("localhost:5000/example/sandbox:dev"),
             "localhost:5000"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_cached_image_rootfs_archive_rejects_unsigned_rootfs_tar_refs() {
+        let base = unique_temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        let artifact = base.join("rootfs.tar");
+        fs::write(&artifact, "not a real rootfs").unwrap();
+        let image_ref = openshell_bootstrap::build::encode_rootfs_tar_image_ref(&artifact).unwrap();
+        let driver = test_driver(VmDriverConfig {
+            state_dir: base.join("driver-state"),
+            ..Default::default()
+        });
+
+        let err = driver
+            .ensure_cached_image_rootfs_archive("sandbox-123", &image_ref)
+            .await
+            .expect_err("unsigned rootfs tar refs must be rejected");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("gateway-issued artifact secret"),
+            "unexpected error: {}",
+            err.message()
         );
     }
 
@@ -2821,6 +2897,21 @@ mod tests {
             "openshell-vm-driver-test-{}-{nanos}-{suffix}",
             std::process::id()
         ))
+    }
+
+    fn test_driver(config: VmDriverConfig) -> VmDriver {
+        VmDriver {
+            config,
+            launcher_bin: PathBuf::from("openshell-driver-vm"),
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            image_cache_lock: Arc::new(Mutex::new(())),
+            events: broadcast::channel(WATCH_BUFFER).0,
+            gpu_inventory: None,
+            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
+                Ipv4Addr::new(10, 0, 128, 0),
+                17,
+            ))),
+        }
     }
 
     fn spawn_exited_child() -> Child {

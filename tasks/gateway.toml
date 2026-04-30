@@ -2,26 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standalone gateway tasks
-#
-# Canonical entry point:
-#   mise run gateway:start <driver>     # driver = docker | vm
-#
-# Backward-compatible aliases:
-#   mise run gateway:docker
-#   mise run gateway:vm
-#
-# All three commands also write ~/.config/openshell/active_gateway so the
-# `openshell` CLI automatically targets the gateway you just started — no
-# need to follow up with `openshell gateway select`. Inside this repo you
-# can override the active gateway per-developer by setting OPENSHELL_GATEWAY
-# in `.env` (mise loads it automatically).
-
-["gateway:start"]
-description = "Run a standalone gateway with the given compute driver (docker | vm)"
-usage = """
-arg "[driver]" help="Compute driver to start (docker | vm). Defaults to $OPENSHELL_GATEWAY_DRIVER or 'docker'."
-"""
-run = "bash tasks/scripts/gateway-start.sh"
 
 ["gateway:docker"]
 description = "Run a standalone gateway with the bundled Docker compute driver"
