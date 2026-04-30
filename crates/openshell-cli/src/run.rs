@@ -2458,6 +2458,19 @@ pub async fn sandbox_create(
                 );
             }
 
+            // Spawn credential authority in the background for deferred providers.
+            {
+                match grpc_client(&effective_server, &effective_tls).await {
+                    Ok(cred_client) => {
+                        tracing::debug!("Credential authority: connecting to gateway");
+                        crate::credential_authority::spawn_credential_authority(cred_client);
+                    }
+                    Err(e) => {
+                        tracing::debug!("Credential authority: failed to connect: {e}");
+                    }
+                }
+            }
+
             if let Some(editor) = editor {
                 let ssh_gateway_name = effective_tls.gateway_name().unwrap_or(gateway_name);
                 sandbox_connect_editor(
@@ -3354,6 +3367,52 @@ async fn auto_create_provider(
         .discover_existing(provider_type)
         .map_err(|err| miette::miette!("failed to discover provider '{provider_type}': {err}"))?;
     let Some(discovered) = discovered else {
+        // No local credentials found — offer deferred mode
+        let env_keys = registry.credential_env_vars(provider_type);
+        if !env_keys.is_empty() && std::io::stdin().is_terminal() {
+            let use_deferred = Confirm::new()
+                .with_prompt("No local credentials found. Share on demand (deferred)?")
+                .default(true)
+                .interact()
+                .into_diagnostic()?;
+            if use_deferred {
+                let deferred_creds: HashMap<String, String> = env_keys
+                    .iter()
+                    .map(|k| (k.to_string(), "openshell:deferred".to_string()))
+                    .collect();
+                let name = preferred_name
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| provider_type.to_string());
+                let request = CreateProviderRequest {
+                    provider: Some(Provider {
+                        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                            id: String::new(),
+                            name: name.clone(),
+                            created_at_ms: 0,
+                            labels: std::collections::HashMap::new(),
+                        }),
+                        r#type: provider_type.to_string(),
+                        credentials: deferred_creds,
+                        config: std::collections::HashMap::new(),
+                    }),
+                };
+                client
+                    .create_provider(request)
+                    .await
+                    .map_err(|status| miette::miette!("failed to create deferred provider: {status}"))?;
+                eprintln!(
+                    "{} Created provider {} ({}) [deferred — credentials will be requested on demand]",
+                    "✓".green().bold(),
+                    name,
+                    provider_type,
+                );
+                if seen_names.insert(name.clone()) {
+                    configured_names.push(name);
+                }
+                eprintln!();
+                return Ok(());
+            }
+        }
         eprintln!(
             "{} No existing local credentials/config found for '{}'. You can configure it from inside the sandbox.",
             "!".yellow(),

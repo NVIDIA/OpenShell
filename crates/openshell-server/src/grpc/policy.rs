@@ -449,7 +449,7 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .spec
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
-    let environment =
+    let (environment, config_environment) =
         super::provider::resolve_provider_environment(state.store.as_ref(), &spec.providers)
             .await?;
 
@@ -457,11 +457,13 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         sandbox_id = %sandbox_id,
         provider_count = spec.providers.len(),
         env_count = environment.len(),
+        config_count = config_environment.len(),
         "GetSandboxProviderEnvironment request completed successfully"
     );
 
     Ok(Response::new(GetSandboxProviderEnvironmentResponse {
         environment,
+        config_environment,
     }))
 }
 

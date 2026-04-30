@@ -2532,11 +2532,28 @@ async fn main() -> Result<()> {
                         }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
+                            // Spawn credential authority for deferred providers.
+                            let has_cred_authority = {
+                                match openshell_cli::tls::grpc_client(endpoint, &tls).await {
+                                    Ok(cred_client) => {
+                                        tracing::debug!("Credential authority: connecting to gateway");
+                                        openshell_cli::credential_authority::spawn_credential_authority(cred_client);
+                                        true
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!("Credential authority: failed to connect: {e}");
+                                        false
+                                    }
+                                }
+                            };
                             if let Some(editor) = editor.map(Into::into) {
                                 run::sandbox_connect_editor(
                                     endpoint, &ctx.name, &name, editor, &tls,
                                 )
                                 .await?;
+                            } else if has_cred_authority {
+                                // Avoid exec() so the credential authority task stays alive.
+                                openshell_cli::ssh::sandbox_connect_without_exec(endpoint, &name, &tls).await?;
                             } else {
                                 run::sandbox_connect(endpoint, &name, &tls).await?;
                             }

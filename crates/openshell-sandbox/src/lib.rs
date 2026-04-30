@@ -7,6 +7,7 @@
 
 pub mod bypass_monitor;
 mod child_env;
+pub mod deferred_credentials;
 pub mod denial_aggregator;
 mod grpc_client;
 mod identity;
@@ -267,42 +268,81 @@ pub async fn run_sandbox(
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
-    let provider_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-        match grpc_client::fetch_provider_environment(endpoint, id).await {
-            Ok(env) => {
-                ocsf_emit!(
-                    ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Informational)
-                        .status(StatusId::Success)
-                        .state(StateId::Enabled, "loaded")
-                        .message(format!(
-                            "Fetched provider environment [env_count:{}]",
-                            env.len()
-                        ))
-                        .build()
-                );
-                env
+    let (credential_env, config_env) =
+        if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+            match grpc_client::fetch_provider_environment(endpoint, id).await {
+                Ok((creds, config)) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .message(format!(
+                                "Fetched provider environment [cred_count:{}, config_count:{}]",
+                                creds.len(),
+                                config.len()
+                            ))
+                            .build()
+                    );
+                    (creds, config)
+                }
+                Err(e) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .state(StateId::Other, "degraded")
+                            .message(format!(
+                                "Failed to fetch provider environment, continuing without: {e}"
+                            ))
+                            .build()
+                    );
+                    (std::collections::HashMap::new(), std::collections::HashMap::new())
+                }
             }
-            Err(e) => {
-                ocsf_emit!(
-                    ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .state(StateId::Other, "degraded")
-                        .message(format!(
-                            "Failed to fetch provider environment, continuing without: {e}"
-                        ))
-                        .build()
-                );
-                std::collections::HashMap::new()
+        } else {
+            (std::collections::HashMap::new(), std::collections::HashMap::new())
+        };
+
+    let (mut provider_env, secret_resolver) = SecretResolver::from_provider_env(credential_env);
+    // Config env vars are injected literally (not through SecretResolver).
+    for (key, value) in config_env {
+        provider_env.entry(key).or_insert(value);
+    }
+    let secret_resolver = secret_resolver.map(Arc::new);
+
+    // Create deferred credential resolver if any provider uses deferred secrets.
+    let has_deferred = secret_resolver.as_ref().map_or(false, |r| r.has_deferred());
+    tracing::debug!(
+        has_deferred = has_deferred,
+        has_sandbox_id = sandbox_id.is_some(),
+        has_endpoint = openshell_endpoint.is_some(),
+        "Deferred credential resolver check"
+    );
+    let deferred_resolver = if has_deferred {
+        if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+            match grpc_client::CachedOpenShellClient::connect(endpoint).await {
+                Ok(client) => {
+                    tracing::debug!("Deferred credential resolver created successfully");
+                    Some(Arc::new(
+                        deferred_credentials::DeferredCredentialResolver::new(
+                            client.raw_client(),
+                            id.clone(),
+                        ),
+                    ))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to create deferred credential resolver: {e}");
+                    None
+                }
             }
+        } else {
+            tracing::warn!("Missing sandbox_id or endpoint for deferred resolver");
+            None
         }
     } else {
-        std::collections::HashMap::new()
+        None
     };
-
-    let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
-    let secret_resolver = secret_resolver.map(Arc::new);
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
@@ -480,6 +520,7 @@ pub async fn run_sandbox(
             inference_ctx,
             secret_resolver.clone(),
             denial_tx,
+            deferred_resolver.clone(),
         )
         .await?;
         (Some(proxy_handle), denial_rx, bypass_denial_tx)

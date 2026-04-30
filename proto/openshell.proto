@@ -155,6 +155,17 @@ service OpenShell {
 
   // Get decision history for a sandbox's draft policy.
   rpc GetDraftHistory(GetDraftHistoryRequest) returns (GetDraftHistoryResponse);
+
+  // ---------------------------------------------------------------------------
+  // Deferred credential RPCs
+  // ---------------------------------------------------------------------------
+
+  // Resolve a deferred credential at runtime (called by sandbox supervisor).
+  rpc ResolveCredential(ResolveCredentialRequest) returns (ResolveCredentialResponse);
+
+  // Register as credential authority for deferred providers (called by CLI).
+  // The CLI sends CredentialResponse messages; the gateway pushes CredentialRequest messages.
+  rpc RegisterCredentialAuthority(stream CredentialResponse) returns (stream CredentialRequest);
 }
 
 // Health check request.
@@ -571,8 +582,10 @@ message GetSandboxProviderEnvironmentRequest {
 
 // Get sandbox provider environment response.
 message GetSandboxProviderEnvironmentResponse {
-  // Provider credential environment variables.
+  // Provider credential environment variables (subject to placeholder resolution).
   map<string, string> environment = 1;
+  // Provider config environment variables (injected literally, not placeholder'd).
+  map<string, string> config_environment = 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,4 +1148,40 @@ message DraftHistoryEntry {
 message GetDraftHistoryResponse {
   // Chronological decision history.
   repeated DraftHistoryEntry entries = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Deferred credential messages
+// ---------------------------------------------------------------------------
+
+// Sandbox→Gateway: resolve a deferred credential at runtime.
+message ResolveCredentialRequest {
+  string sandbox_id = 1;
+  // Environment variable key, e.g. "ANTHROPIC_API_KEY".
+  string env_key = 2;
+  // Destination host the request is heading to, e.g. "api.anthropic.com".
+  string destination_host = 3;
+}
+
+message ResolveCredentialResponse {
+  bool approved = 1;
+  // The secret value (only set when approved=true).
+  string value = 2;
+}
+
+// Gateway→CLI: request a credential from the registered authority.
+message CredentialRequest {
+  string request_id = 1;
+  string sandbox_id = 2;
+  string sandbox_name = 3;
+  string env_key = 4;
+  string destination_host = 5;
+}
+
+// CLI→Gateway: respond to a credential request.
+message CredentialResponse {
+  string request_id = 1;
+  bool approved = 2;
+  // The secret value (only set when approved=true).
+  string value = 3;
 }

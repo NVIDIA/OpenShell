@@ -3,9 +3,13 @@
 
 use base64::Engine as _;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
+
+/// Sentinel value stored in provider credentials for deferred (on-demand) secrets.
+pub(crate) const DEFERRED_SENTINEL: &str = "openshell:deferred";
 
 /// Public access to the placeholder prefix for fail-closed scanning in other modules.
 pub(crate) const PLACEHOLDER_PREFIX_PUBLIC: &str = PLACEHOLDER_PREFIX;
@@ -14,6 +18,19 @@ pub(crate) const PLACEHOLDER_PREFIX_PUBLIC: &str = PLACEHOLDER_PREFIX;
 /// placeholder boundaries within concatenated strings like path segments).
 fn is_env_key_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn extract_placeholder_from_str(s: &str) -> Option<String> {
+    if let Some(start) = s.find(PLACEHOLDER_PREFIX) {
+        let rest = &s[start..];
+        let end = rest
+            .bytes()
+            .position(|b| !is_env_key_char(b) && b != b':')
+            .unwrap_or(rest.len());
+        Some(rest[..end].to_string())
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -25,6 +42,7 @@ fn is_env_key_char(b: u8) -> bool {
 #[derive(Debug)]
 pub(crate) struct UnresolvedPlaceholderError {
     pub location: &'static str, // "header", "query_param", "path"
+    pub placeholder: Option<String>,
 }
 
 impl fmt::Display for UnresolvedPlaceholderError {
@@ -64,6 +82,7 @@ pub(crate) struct RewriteTargetResult {
 #[derive(Debug, Clone, Default)]
 pub struct SecretResolver {
     by_placeholder: HashMap<String, String>,
+    deferred_keys: HashSet<String>,
 }
 
 impl SecretResolver {
@@ -76,14 +95,36 @@ impl SecretResolver {
 
         let mut child_env = HashMap::with_capacity(provider_env.len());
         let mut by_placeholder = HashMap::with_capacity(provider_env.len());
+        let mut deferred_keys = HashSet::new();
 
         for (key, value) in provider_env {
             let placeholder = placeholder_for_env_key(&key);
             child_env.insert(key, placeholder.clone());
-            by_placeholder.insert(placeholder, value);
+            if value == DEFERRED_SENTINEL {
+                deferred_keys.insert(placeholder);
+            } else {
+                by_placeholder.insert(placeholder, value);
+            }
         }
 
-        (child_env, Some(Self { by_placeholder }))
+        (child_env, Some(Self { by_placeholder, deferred_keys }))
+    }
+
+    pub(crate) fn has_deferred(&self) -> bool {
+        !self.deferred_keys.is_empty()
+    }
+
+    pub(crate) fn is_deferred(&self, placeholder: &str) -> bool {
+        self.deferred_keys.contains(placeholder)
+    }
+
+    pub(crate) fn insert_resolved(&mut self, placeholder: String, value: String) {
+        self.deferred_keys.remove(&placeholder);
+        self.by_placeholder.insert(placeholder, value);
+    }
+
+    pub(crate) fn env_key_for_placeholder(placeholder: &str) -> Option<&str> {
+        placeholder.strip_prefix(PLACEHOLDER_PREFIX)
     }
 
     /// Resolve a placeholder string to the real secret value.
@@ -485,12 +526,12 @@ fn rewrite_path_segment(
                         %reason,
                         "credential resolution rejected: resolved value unsafe for path"
                     );
-                    UnresolvedPlaceholderError { location: "path" }
+                    UnresolvedPlaceholderError { location: "path", placeholder: Some(full_placeholder.to_string()) }
                 })?;
                 resolved.push_str(secret);
                 redacted.push_str("[CREDENTIAL]");
             } else {
-                return Err(UnresolvedPlaceholderError { location: "path" });
+                return Err(UnresolvedPlaceholderError { location: "path", placeholder: Some(full_placeholder.to_string()) });
             }
             pos = key_end;
         } else {
@@ -527,9 +568,9 @@ fn rewrite_uri_query_params(
                 redacted_params.push(format!("{key}=[CREDENTIAL]"));
                 any_rewritten = true;
             } else if decoded_value.contains(PLACEHOLDER_PREFIX) {
-                // Placeholder detected but not resolved
                 return Err(UnresolvedPlaceholderError {
                     location: "query_param",
+                    placeholder: Some(decoded_value.to_string()),
                 });
             } else {
                 resolved_params.push(param.to_string());
@@ -611,14 +652,16 @@ pub(crate) fn rewrite_http_header_block(
     // in both raw form and percent-decoded form of the output header block.
     let output_header = String::from_utf8_lossy(&output[..output.len().min(header_end + 256)]);
     if output_header.contains(PLACEHOLDER_PREFIX) {
-        return Err(UnresolvedPlaceholderError { location: "header" });
+        let ph = extract_placeholder_from_str(&output_header);
+        return Err(UnresolvedPlaceholderError { location: "header", placeholder: ph });
     }
 
     // Also check percent-decoded form of the request line (F5 — encoded placeholder bypass)
     let rewritten_rl = output_header.split("\r\n").next().unwrap_or("");
     let decoded_rl = percent_decode(rewritten_rl);
     if decoded_rl.contains(PLACEHOLDER_PREFIX) {
-        return Err(UnresolvedPlaceholderError { location: "path" });
+        let ph = extract_placeholder_from_str(&decoded_rl);
+        return Err(UnresolvedPlaceholderError { location: "path", placeholder: ph });
     }
 
     Ok(RewriteResult {
@@ -650,7 +693,8 @@ pub(crate) fn rewrite_target_for_eval(
         // Also check percent-decoded form
         let decoded = percent_decode(target);
         if decoded.contains(PLACEHOLDER_PREFIX) {
-            return Err(UnresolvedPlaceholderError { location: "path" });
+            let ph = extract_placeholder_from_str(&decoded);
+            return Err(UnresolvedPlaceholderError { location: "path", placeholder: ph });
         }
         return Ok(RewriteTargetResult {
             resolved: target.to_string(),

@@ -277,7 +277,7 @@ pub async fn sandbox_connect(server: &str, name: &str, tls: &TlsOptions) -> Resu
     sandbox_connect_with_mode(server, name, tls, true).await
 }
 
-pub(crate) async fn sandbox_connect_without_exec(
+pub async fn sandbox_connect_without_exec(
     server: &str,
     name: &str,
     tls: &TlsOptions,

@@ -150,6 +150,7 @@ impl ProxyHandle {
         inference_ctx: Option<Arc<InferenceContext>>,
         secret_resolver: Option<Arc<SecretResolver>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+        deferred_resolver: Option<Arc<crate::deferred_credentials::DeferredCredentialResolver>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -189,9 +190,10 @@ impl ProxyHandle {
                         let inf = inference_ctx.clone();
                         let resolver = secret_resolver.clone();
                         let dtx = denial_tx.clone();
+                        let deferred = deferred_resolver.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_connection(
-                                stream, opa, cache, spid, tls, inf, resolver, dtx,
+                                stream, opa, cache, spid, tls, inf, resolver, dtx, deferred,
                             )
                             .await
                             {
@@ -304,6 +306,7 @@ async fn handle_tcp_connection(
     inference_ctx: Option<Arc<InferenceContext>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+    deferred_resolver: Option<Arc<crate::deferred_credentials::DeferredCredentialResolver>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -348,6 +351,7 @@ async fn handle_tcp_connection(
             entrypoint_pid,
             secret_resolver,
             denial_tx.as_ref(),
+            deferred_resolver,
         )
         .await;
     }
@@ -661,6 +665,16 @@ async fn handle_tcp_connection(
     // Check if endpoint has L7 config for protocol-aware inspection
     let l7_config = query_l7_config(&opa_engine, &decision, &host_lc, port);
 
+    tracing::debug!(
+        "CONNECT {host}:{port} l7={l7} tls={tls} resolver={resolver} deferred={deferred}",
+        host = host_lc,
+        port = port,
+        l7 = l7_config.is_some(),
+        tls = tls_state.is_some(),
+        resolver = secret_resolver.is_some(),
+        deferred = deferred_resolver.is_some(),
+    );
+
     // Log the allowed CONNECT — use CONNECT_L7 when L7 inspection follows,
     // so log consumers can distinguish L4-only decisions from tunnel lifecycle events.
     let connect_msg = if l7_config.is_some() {
@@ -713,6 +727,7 @@ async fn handle_tcp_connection(
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
         secret_resolver: secret_resolver.clone(),
+        credential_resolver: deferred_resolver.clone(),
     };
 
     if effective_tls_skip {
@@ -2243,7 +2258,7 @@ fn rewrite_forward_request(
     if secret_resolver.is_some() {
         let output_str = String::from_utf8_lossy(&output);
         if output_str.contains(crate::secrets::PLACEHOLDER_PREFIX_PUBLIC) {
-            return Err(crate::secrets::UnresolvedPlaceholderError { location: "header" });
+            return Err(crate::secrets::UnresolvedPlaceholderError { location: "header", placeholder: None });
         }
     }
 
@@ -2267,6 +2282,7 @@ async fn handle_forward_proxy(
     entrypoint_pid: Arc<AtomicU32>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
+    deferred_resolver: Option<Arc<crate::deferred_credentials::DeferredCredentialResolver>>,
 ) -> Result<()> {
     // 1. Parse the absolute-form URI. `path` is marked `mut` so that, when an
     //    L7 config applies, the canonicalized form produced below replaces it
@@ -2450,6 +2466,7 @@ async fn handle_forward_proxy(
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
             secret_resolver: secret_resolver.clone(),
+            credential_resolver: deferred_resolver.clone(),
         };
 
         // Canonicalize the request-target. The canonical form is fed to OPA

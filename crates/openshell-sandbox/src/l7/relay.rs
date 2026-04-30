@@ -35,6 +35,8 @@ pub struct L7EvalContext {
     pub cmdline_paths: Vec<String>,
     /// Supervisor-only placeholder resolver for outbound headers.
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
+    /// Handle for resolving deferred credentials via gateway→CLI callback.
+    pub(crate) credential_resolver: Option<Arc<crate::deferred_credentials::DeferredCredentialResolver>>,
 }
 
 /// Run protocol-aware L7 inspection on a tunnel.
@@ -136,6 +138,10 @@ where
             allow_encoded_slash: config.allow_encoded_slash,
             ..Default::default()
         });
+    // Local resolver that can be updated when deferred credentials are resolved.
+    // Cloned from the shared context so mutations don't affect other connections.
+    let mut local_resolver: Option<Arc<SecretResolver>> = ctx.secret_resolver.clone();
+
     loop {
         // Parse one HTTP request from client
         let req = match provider.parse_request(client).await {
@@ -165,20 +171,55 @@ where
         // Rewrite credential placeholders in the request target BEFORE OPA
         // evaluation. OPA sees the redacted path; the resolved path goes only
         // to the upstream write.
-        let (eval_target, redacted_target) = if let Some(ref resolver) = ctx.secret_resolver {
-            match secrets::rewrite_target_for_eval(&req.target, resolver) {
+        let (eval_target, redacted_target) = if local_resolver.is_some() {
+            let resolver_ref = local_resolver.as_ref().unwrap();
+            match secrets::rewrite_target_for_eval(&req.target, resolver_ref) {
                 Ok(result) => (result.resolved, result.redacted),
                 Err(e) => {
-                    warn!(
-                        host = %ctx.host,
-                        port = ctx.port,
-                        error = %e,
-                        "credential resolution failed in request target, rejecting"
-                    );
-                    let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                    client.write_all(response).await.into_diagnostic()?;
-                    client.flush().await.into_diagnostic()?;
-                    return Ok(());
+                    // Check if this is a deferred credential that can be resolved at runtime
+                    if let (Some(placeholder), Some(cred_resolver)) = (e.placeholder.as_ref(), &ctx.credential_resolver) {
+                        debug!(
+                            host = %ctx.host,
+                            placeholder = %placeholder,
+                            "Deferred credential in request target, resolving via CLI callback"
+                        );
+                        match cred_resolver.resolve(placeholder, &ctx.host).await {
+                            Ok(value) => {
+                                let mut updated = (*resolver_ref).as_ref().clone();
+                                updated.insert_resolved(placeholder.clone(), value);
+                                local_resolver = Some(Arc::new(updated));
+                                // Retry with the updated resolver
+                                match secrets::rewrite_target_for_eval(&req.target, local_resolver.as_ref().unwrap()) {
+                                    Ok(result) => (result.resolved, result.redacted),
+                                    Err(retry_err) => {
+                                        warn!(host = %ctx.host, error = %retry_err, "credential resolution still failed after deferred resolve");
+                                        let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                        client.write_all(response).await.into_diagnostic()?;
+                                        client.flush().await.into_diagnostic()?;
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            Err(deny_err) => {
+                                info!(host = %ctx.host, error = %deny_err, "Deferred credential denied by user");
+                                let response = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                client.write_all(response).await.into_diagnostic()?;
+                                client.flush().await.into_diagnostic()?;
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        warn!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            error = %e,
+                            "credential resolution failed in request target, rejecting"
+                        );
+                        let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        client.write_all(response).await.into_diagnostic()?;
+                        client.flush().await.into_diagnostic()?;
+                        return Ok(());
+                    }
                 }
             }
         } else {
@@ -258,12 +299,22 @@ where
         let _ = &eval_target;
 
         if allowed || config.enforcement == EnforcementMode::Audit {
-            // Forward request to upstream and relay response
+            // Forward request to upstream and relay response.
+            // Use deferred-aware relay that can resolve credentials mid-request.
+            tracing::debug!(
+                host = %ctx.host,
+                has_resolver = local_resolver.is_some(),
+                has_cred_resolver = ctx.credential_resolver.is_some(),
+                "L7 relay: forwarding request"
+            );
             let outcome = crate::l7::rest::relay_http_request_with_resolver(
                 &req,
                 client,
                 upstream,
-                ctx.secret_resolver.as_deref(),
+                None,
+                Some(&mut local_resolver),
+                ctx.credential_resolver.as_ref(),
+                Some(&ctx.host),
             )
             .await?;
             match outcome {
@@ -452,7 +503,7 @@ where
         // relay_http_request_with_resolver handles both directions: it sends
         // the request upstream and reads the response back to the client.
         let outcome =
-            crate::l7::rest::relay_http_request_with_resolver(&req, client, upstream, resolver)
+            crate::l7::rest::relay_http_request_with_resolver(&req, client, upstream, resolver, None, None, None)
                 .await?;
 
         match outcome {

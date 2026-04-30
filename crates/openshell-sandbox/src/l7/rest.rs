@@ -11,6 +11,7 @@ use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::secrets::rewrite_http_header_block;
 use miette::{IntoDiagnostic, Result, miette};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
@@ -325,7 +326,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    relay_http_request_with_resolver(req, client, upstream, None).await
+    relay_http_request_with_resolver(req, client, upstream, None, None, None, None).await
 }
 
 pub(crate) async fn relay_http_request_with_resolver<C, U>(
@@ -333,6 +334,9 @@ pub(crate) async fn relay_http_request_with_resolver<C, U>(
     client: &mut C,
     upstream: &mut U,
     resolver: Option<&crate::secrets::SecretResolver>,
+    local_resolver: Option<&mut Option<Arc<crate::secrets::SecretResolver>>>,
+    credential_resolver: Option<&Arc<crate::deferred_credentials::DeferredCredentialResolver>>,
+    host: Option<&str>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -344,8 +348,48 @@ where
         .position(|w| w == b"\r\n\r\n")
         .map_or(req.raw_header.len(), |p| p + 4);
 
-    let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
-        .map_err(|e| miette!("credential injection failed: {e}"))?;
+    let rewrite_result = if let (Some(local_resolver), Some(host)) = (local_resolver, host) {
+        // Deferred path: try rewrite, on unresolved placeholder resolve via CLI callback.
+        match rewrite_http_header_block(&req.raw_header[..header_end], local_resolver.as_deref()) {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::debug!(
+                    host = %host,
+                    placeholder = ?e.placeholder,
+                    has_credential_resolver = credential_resolver.is_some(),
+                    "Unresolved placeholder detected in headers"
+                );
+                if let (Some(placeholder), Some(cred_resolver)) = (e.placeholder.as_ref(), credential_resolver) {
+                    tracing::debug!(
+                        host = %host,
+                        placeholder = %placeholder,
+                        "Deferred credential in headers, resolving via CLI callback"
+                    );
+                    match cred_resolver.resolve(placeholder, host).await {
+                        Ok(value) => {
+                            tracing::debug!(host = %host, "Deferred credential resolved successfully");
+                            let mut updated = (**local_resolver.as_ref().unwrap()).clone();
+                            updated.insert_resolved(placeholder.clone(), value);
+                            *local_resolver = Some(Arc::new(updated));
+                            rewrite_http_header_block(&req.raw_header[..header_end], local_resolver.as_deref())
+                                .map_err(|e| miette!("credential injection failed after deferred resolve: {e}"))?
+                        }
+                        Err(resolve_err) => {
+                            tracing::warn!(host = %host, error = %resolve_err, "Deferred credential resolution failed");
+                            return Err(miette!("deferred credential denied by user for {host}"));
+                        }
+                    }
+                } else {
+                    tracing::warn!(host = %host, "No credential resolver available, failing");
+                    return Err(miette!("credential injection failed: {e}"));
+                }
+            }
+        }
+    } else {
+        // Simple path: direct rewrite with optional static resolver.
+        rewrite_http_header_block(&req.raw_header[..header_end], resolver)
+            .map_err(|e| miette!("credential injection failed: {e}"))?
+    };
 
     upstream
         .write_all(&rewrite_result.rewritten)
@@ -374,11 +418,6 @@ where
 
     let outcome = relay_response(&req.action, upstream, client).await?;
 
-    // Validate that the client actually requested an upgrade before accepting
-    // a 101 from upstream. Per RFC 9110 Section 7.8, the server MUST NOT send
-    // 101 unless the client sent Upgrade + Connection: Upgrade headers. A
-    // non-compliant or malicious upstream could send an unsolicited 101 to
-    // bypass L7 inspection.
     if matches!(outcome, RelayOutcome::Upgraded { .. }) {
         let header_str = String::from_utf8_lossy(&req.raw_header[..header_end]);
         if !client_requested_upgrade(&header_str) {
@@ -1886,6 +1925,9 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 None,
+                None,
+                None,
+                None,
             ),
         )
         .await
@@ -1942,6 +1984,9 @@ mod tests {
                 &req,
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
+                None,
+                None,
+                None,
                 None,
             ),
         )
@@ -2068,6 +2113,9 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 resolver.as_ref(),
+                None,
+                None,
+                None,
             ),
         )
         .await
@@ -2151,7 +2199,10 @@ mod tests {
                 &req,
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
-                None, // <-- No resolver, as in the L4 raw tunnel path
+                None,
+                None,
+                None,
+                None,
             ),
         )
         .await
@@ -2240,6 +2291,9 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 resolver,
+                None,
+                None,
+                None,
             ),
         )
         .await

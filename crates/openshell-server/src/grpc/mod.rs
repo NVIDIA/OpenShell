@@ -3,6 +3,7 @@
 
 //! gRPC service implementation.
 
+pub(crate) mod credentials;
 pub(crate) mod policy;
 mod provider;
 mod sandbox;
@@ -12,6 +13,7 @@ use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
     ApproveDraftChunkResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
+    CredentialRequest, CredentialResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxRequest,
     GatewayMessage, GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest,
@@ -23,7 +25,8 @@ use openshell_core::proto::{
     ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxesRequest,
     ListSandboxesResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame, ReportPolicyStatusRequest,
-    ReportPolicyStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
+    ReportPolicyStatusResponse, ResolveCredentialRequest, ResolveCredentialResponse,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
     SandboxStreamEvent, ServiceStatus, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
     SupervisorMessage, UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest,
     UpdateConfigResponse, UpdateProviderRequest, WatchSandboxRequest, open_shell_server::OpenShell,
@@ -417,6 +420,25 @@ impl OpenShell for OpenShellService {
     ) -> Result<Response<Self::RelayStreamStream>, Status> {
         crate::supervisor_session::handle_relay_stream(&self.state.supervisor_sessions, request)
             .await
+    }
+
+    // --- Deferred credentials ---
+
+    async fn resolve_credential(
+        &self,
+        request: Request<ResolveCredentialRequest>,
+    ) -> Result<Response<ResolveCredentialResponse>, Status> {
+        credentials::handle_resolve_credential(&self.state, request).await
+    }
+
+    type RegisterCredentialAuthorityStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<CredentialRequest, Status>> + Send + 'static>>;
+
+    async fn register_credential_authority(
+        &self,
+        request: Request<tonic::Streaming<CredentialResponse>>,
+    ) -> Result<Response<Self::RegisterCredentialAuthorityStream>, Status> {
+        credentials::handle_register_credential_authority(&self.state, request).await
     }
 }
 

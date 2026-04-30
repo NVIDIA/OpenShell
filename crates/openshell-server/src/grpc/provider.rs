@@ -213,15 +213,28 @@ fn merge_map(
 /// collects credential key-value pairs. Returns a map of environment variables
 /// to inject into the sandbox. When duplicate keys appear across providers, the
 /// first provider's value wins.
+///
+/// Returns `(credentials, config)` — credentials are subject to placeholder
+/// resolution by the sandbox L7 proxy; config values are injected literally.
 pub(super) async fn resolve_provider_environment(
     store: &Store,
     provider_names: &[String],
-) -> Result<std::collections::HashMap<String, String>, Status> {
+) -> Result<
+    (
+        std::collections::HashMap<String, String>,
+        std::collections::HashMap<String, String>,
+    ),
+    Status,
+> {
     if provider_names.is_empty() {
-        return Ok(std::collections::HashMap::new());
+        return Ok((
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        ));
     }
 
     let mut env = std::collections::HashMap::new();
+    let mut config_env = std::collections::HashMap::new();
 
     for name in provider_names {
         let provider = store
@@ -241,9 +254,15 @@ pub(super) async fn resolve_provider_environment(
                 );
             }
         }
+
+        for (key, value) in &provider.config {
+            if is_valid_env_key(key) {
+                config_env.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
     }
 
-    Ok(env)
+    Ok((env, config_env))
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {
@@ -726,8 +745,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_provider_env_empty_list_returns_empty() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
-        let result = resolve_provider_environment(&store, &[]).await.unwrap();
+        let (result, config) = resolve_provider_environment(&store, &[]).await.unwrap();
         assert!(result.is_empty());
+        assert!(config.is_empty());
     }
 
     #[tokio::test]
@@ -755,12 +775,16 @@ mod tests {
         };
         create_provider_record(&store, provider).await.unwrap();
 
-        let result = resolve_provider_environment(&store, &["claude-local".to_string()])
+        let (result, config) = resolve_provider_environment(&store, &["claude-local".to_string()])
             .await
             .unwrap();
         assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
         assert_eq!(result.get("CLAUDE_API_KEY"), Some(&"sk-abc".to_string()));
         assert!(!result.contains_key("endpoint"));
+        assert_eq!(
+            config.get("endpoint"),
+            Some(&"https://api.anthropic.com".to_string())
+        );
     }
 
     #[tokio::test]
@@ -795,7 +819,7 @@ mod tests {
         };
         create_provider_record(&store, provider).await.unwrap();
 
-        let result = resolve_provider_environment(&store, &["test-provider".to_string()])
+        let (result, _config) = resolve_provider_environment(&store, &["test-provider".to_string()])
             .await
             .unwrap();
         assert_eq!(result.get("VALID_KEY"), Some(&"value".to_string()));
@@ -844,7 +868,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(
+        let (result, _config) = resolve_provider_environment(
             &store,
             &["claude-local".to_string(), "gitlab-local".to_string()],
         )
@@ -895,7 +919,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(
+        let (result, _config) = resolve_provider_environment(
             &store,
             &["provider-a".to_string(), "provider-b".to_string()],
         )
@@ -954,7 +978,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let spec = loaded.spec.unwrap();
-        let env = resolve_provider_environment(&store, &spec.providers)
+        let (env, _config) = resolve_provider_environment(&store, &spec.providers)
             .await
             .unwrap();
 
@@ -987,11 +1011,12 @@ mod tests {
             .unwrap()
             .unwrap();
         let spec = loaded.spec.unwrap();
-        let env = resolve_provider_environment(&store, &spec.providers)
+        let (env, config) = resolve_provider_environment(&store, &spec.providers)
             .await
             .unwrap();
 
         assert!(env.is_empty());
+        assert!(config.is_empty());
     }
 
     #[tokio::test]

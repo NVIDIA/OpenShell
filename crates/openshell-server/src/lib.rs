@@ -94,6 +94,9 @@ pub struct ServerState {
     /// can be constructed before `ServerState` and still
     /// query session state to surface supervisor readiness.
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
+
+    /// Registry of connected CLI credential authorities for deferred credential resolution.
+    pub credential_authority_registry: grpc::credentials::CredentialAuthorityRegistry,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -126,6 +129,7 @@ impl ServerState {
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
+            credential_authority_registry: grpc::credentials::CredentialAuthorityRegistry::new(),
         }
     }
 }

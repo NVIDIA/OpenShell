@@ -61,4 +61,14 @@ impl SandboxIndex {
         let inner = self.inner.read().expect("sandbox index lock poisoned");
         inner.agent_pod_to_id.get(pod).cloned()
     }
+
+    #[must_use]
+    pub fn sandbox_name_for_id(&self, id: &str) -> Option<String> {
+        let inner = self.inner.read().expect("sandbox index lock poisoned");
+        inner
+            .sandbox_name_to_id
+            .iter()
+            .find(|(_, v)| v.as_str() == id)
+            .map(|(k, _)| k.clone())
+    }
 }
