@@ -7,9 +7,8 @@
 #
 # Targets:
 #   gateway             Final gateway image
-#   supervisor          Final supervisor image
+#   supervisor          Final supervisor image (FROM scratch, binary only)
 #   cluster             Final cluster image
-#   supervisor-output   Minimal stage exporting only the supervisor binary
 #
 # Rust binaries are built natively before the image build and staged at:
 #   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-{gateway,sandbox}
@@ -87,11 +86,6 @@ FROM rust-builder AS supervisor-binary-1
 
 FROM supervisor-binary-${BUILD_FROM_SOURCE} AS supervisor-binary
 
-# Minimal extraction stage for fast-deploy: exports only the supervisor
-# binary (~20-40 MB) instead of the entire build environment (~968 MB).
-FROM scratch AS supervisor-output
-COPY --from=supervisor-binary /build/out/openshell-sandbox /openshell-sandbox
-
 # ---------------------------------------------------------------------------
 # Final gateway image
 # ---------------------------------------------------------------------------
@@ -120,22 +114,11 @@ CMD ["--bind-address", "0.0.0.0", "--port", "8080"]
 # ---------------------------------------------------------------------------
 # Final supervisor image
 # ---------------------------------------------------------------------------
-FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS supervisor
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates && \
-    apt-get install -y --only-upgrade gpgv && \
-    rm -rf /var/lib/apt/lists/*
-
-RUN useradd --create-home --user-group openshell
-
-WORKDIR /app
-
-COPY --from=supervisor-binary /build/out/openshell-sandbox /usr/local/bin/
-
-USER openshell
-
-ENTRYPOINT ["openshell-sandbox"]
+# Minimal FROM scratch image containing only the supervisor binary.
+# Used by both the Docker driver (binary extraction) and the Podman driver
+# (OCI image volume mount at /opt/openshell/bin).
+FROM scratch AS supervisor
+COPY --from=supervisor-binary /build/out/openshell-sandbox /openshell-sandbox
 
 # ---------------------------------------------------------------------------
 # Cluster asset stages

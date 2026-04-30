@@ -9,7 +9,6 @@ depends = [
   "build:docker:gateway",
   "build:docker:cluster",
   "build:docker:supervisor",
-  "build:docker:supervisor-sideload",
 ]
 hide = true
 
@@ -29,13 +28,8 @@ run = "tasks/scripts/docker-build-image.sh gateway"
 hide = true
 
 ["build:docker:supervisor"]
-description = "Build the standalone supervisor Docker image (Ubuntu-based, for K8s pods)"
+description = "Build the supervisor image (FROM scratch, binary only)"
 run = "tasks/scripts/docker-build-image.sh supervisor"
-hide = true
-
-["build:docker:supervisor-sideload"]
-description = "Build the supervisor sideload image (FROM scratch, for Podman image-volume mount)"
-run = "tasks/scripts/docker-build-image.sh supervisor-sideload"
 hide = true
 
 ["build:docker:cluster"]
@@ -51,11 +45,6 @@ hide = true
 ["docker:build:supervisor"]
 description = "Alias for build:docker:supervisor"
 depends = ["build:docker:supervisor"]
-hide = true
-
-["docker:build:supervisor-sideload"]
-description = "Alias for build:docker:supervisor-sideload"
-depends = ["build:docker:supervisor-sideload"]
 hide = true
 
 ["docker:build:cluster"]

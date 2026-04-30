@@ -48,7 +48,7 @@ run = "uv run pytest -o python_files='test_*.py' -m gpu -n ${E2E_PARALLEL:-1} e2
 
 ["e2e:podman"]
 description = "Start a Podman-backed gateway and run smoke e2e (requires rootless Podman; pass -- --port=N to override)"
-depends = ["build:docker:supervisor-sideload"]
+depends = ["build:docker:supervisor"]
 run = "e2e/rust/e2e-podman.sh"
 
 ["e2e:vm"]

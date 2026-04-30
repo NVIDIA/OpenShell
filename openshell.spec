@@ -169,7 +169,7 @@ EnvironmentFile=-%%E/openshell/gateway.env
 Environment=OPENSHELL_BIND_HOST=127.0.0.1
 Environment=OPENSHELL_DRIVERS=podman
 Environment=OPENSHELL_DB_URL=sqlite://%%S/openshell/gateway.db
-Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor-sideload:latest
+Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
 Environment=OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 Environment=OPENSHELL_DISABLE_TLS=true
 ExecStart=/usr/bin/openshell-gateway
@@ -217,7 +217,7 @@ OPENSHELL_DB_URL=sqlite:///var/lib/openshell/gateway.db
 OPENSHELL_DRIVERS=podman
 
 # Supervisor image mounted into sandbox containers.
-OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor-sideload:latest
+OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
 
 # Default sandbox base image.
 OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest

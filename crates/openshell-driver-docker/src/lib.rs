@@ -69,8 +69,9 @@ const DOCKER_NETWORK_DRIVER: &str = "bridge";
 /// explicit `--docker-supervisor-bin` override or local build is available.
 const DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
 
-/// Path to the supervisor binary inside the `openshell/supervisor` image.
-const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/usr/local/bin/openshell-sandbox";
+/// Path to the supervisor binary inside the `openshell/supervisor` image
+/// (a `FROM scratch` image containing only the binary).
+const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
 
 /// Return the default `ghcr.io/nvidia/openshell/supervisor:<tag>` reference
 /// used when no supervisor binary override is provided.
@@ -1661,8 +1662,8 @@ fn linux_supervisor_candidates(daemon_arch: &str) -> Vec<PathBuf> {
 }
 
 /// Pull the supervisor image (if not already local), extract
-/// `/usr/local/bin/openshell-sandbox` to a host cache keyed by the image's
-/// content digest, and return the cache path.
+/// `/openshell-sandbox` to a host cache keyed by the image's content
+/// digest, and return the cache path.
 ///
 /// The extraction is atomic: the binary is written to a sibling temp file
 /// inside the digest-keyed directory and renamed into place, so concurrent
@@ -1758,7 +1759,7 @@ async fn extract_supervisor_binary_bytes(docker: &Docker, image: &str) -> CoreRe
             ),
             ContainerCreateBody {
                 image: Some(image.to_string()),
-                entrypoint: Some(vec!["/bin/true".to_string()]),
+                entrypoint: Some(vec!["/openshell-sandbox".to_string()]),
                 cmd: Some(Vec::new()),
                 ..Default::default()
             },

@@ -20,7 +20,7 @@
 #
 # Prerequisites:
 #   - Rootless Podman service running (systemctl --user start podman.socket)
-#   - Supervisor sideload image built (mise run build:docker:supervisor-sideload)
+#   - Supervisor image built (mise run build:docker:supervisor)
 #   - Sandbox base image available locally
 
 set -euo pipefail
@@ -71,7 +71,7 @@ SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-}"
 # Verify the supervisor image exists locally.
 if ! podman image exists "${SUPERVISOR_IMAGE}" 2>/dev/null; then
   echo "ERROR: supervisor image '${SUPERVISOR_IMAGE}' not found locally."
-  echo "Build it with: mise run build:docker:supervisor-sideload"
+  echo "Build it with: mise run build:docker:supervisor"
   exit 1
 fi
 
