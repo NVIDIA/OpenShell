@@ -102,9 +102,25 @@ pub struct PodmanComputeConfig {
     /// Mounted read-only into sandbox containers at /opt/openshell/bin
     /// using Podman's `type=image` mount.
     pub supervisor_image: String,
+    /// Host path to the CA certificate for sandbox mTLS.
+    ///
+    /// When all three TLS paths (`tls_ca`, `tls_cert`, `tls_key`) are set,
+    /// the driver bind-mounts them into sandbox containers and switches the
+    /// auto-detected endpoint from `http://` to `https://`.
+    pub tls_ca: Option<PathBuf>,
+    /// Host path to the client certificate for sandbox mTLS.
+    pub tls_cert: Option<PathBuf>,
+    /// Host path to the client private key for sandbox mTLS.
+    pub tls_key: Option<PathBuf>,
 }
 
 impl PodmanComputeConfig {
+    /// Returns `true` when all three TLS paths are configured.
+    #[must_use]
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_ca.is_some() && self.tls_cert.is_some() && self.tls_key.is_some()
+    }
+
     /// Resolve the default socket path from the environment.
     ///
     /// - **macOS**: `$HOME/.local/share/containers/podman/machine/podman.sock`
@@ -148,6 +164,9 @@ impl Default for PodmanComputeConfig {
             ssh_handshake_skew_secs: DEFAULT_SSH_HANDSHAKE_SKEW_SECS,
             stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
             supervisor_image: DEFAULT_SUPERVISOR_IMAGE.to_string(),
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -168,6 +187,9 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("ssh_handshake_skew_secs", &self.ssh_handshake_skew_secs)
             .field("stop_timeout_secs", &self.stop_timeout_secs)
             .field("supervisor_image", &self.supervisor_image)
+            .field("tls_ca", &self.tls_ca)
+            .field("tls_cert", &self.tls_cert)
+            .field("tls_key", &self.tls_key)
             .finish()
     }
 }

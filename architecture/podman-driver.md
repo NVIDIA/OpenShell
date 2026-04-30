@@ -102,6 +102,18 @@ sequenceDiagram
 
 The supervisor image is a `FROM scratch` image containing only the prebuilt `openshell-sandbox` binary. It is built by the `supervisor` target in `deploy/docker/Dockerfile.images`. The `image_volumes` field in the container spec mounts this image's filesystem at `/opt/openshell/bin` with `rw: false`, making it a read-only overlay that the sandbox cannot tamper with.
 
+## TLS
+
+When the Podman driver's TLS configuration is set (`tls_ca`, `tls_cert`, `tls_key` in `PodmanComputeConfig`), the driver:
+
+1. Switches the auto-detected endpoint scheme from `http://` to `https://`
+2. Bind-mounts the client cert files (read-only) into the container at `/etc/openshell/tls/client/`
+3. Sets `OPENSHELL_TLS_CA`, `OPENSHELL_TLS_CERT`, `OPENSHELL_TLS_KEY` env vars pointing to the container-side paths
+
+The supervisor reads these env vars and uses them to establish an mTLS connection back to the gateway.
+
+The RPM packaging auto-generates a self-signed PKI on first start via `init-pki.sh`. Client certs are placed in the CLI auto-discovery directory (`~/.config/openshell/gateways/openshell/mtls/`) so the CLI connects with mTLS without manual configuration. See `deploy/rpm/GATEWAY-CONFIG.md` for the full RPM configuration reference.
+
 ## Network Model
 
 Sandbox network isolation uses a two-layer approach: a Podman bridge network for container-to-host communication, and a nested network namespace (created by the supervisor) for sandbox process isolation.

@@ -78,7 +78,7 @@ impl PodmanComputeDriver {
         // Verify connectivity.
         client.ping().await?;
 
-        // Verify cgroups v2 and log system info.
+        // Verify cgroups v2, detect rootless mode, and log system info.
         match client.system_info().await {
             Ok(info) => {
                 if info.host.cgroup_version != "v2" {
@@ -92,6 +92,7 @@ impl PodmanComputeDriver {
                 info!(
                     cgroup_version = %info.host.cgroup_version,
                     network_backend = %info.host.network_backend,
+                    rootless = info.host.security.rootless,
                     "Connected to Podman"
                 );
             }
@@ -124,16 +125,24 @@ impl PodmanComputeDriver {
         // Auto-detect the gRPC callback endpoint when not explicitly
         // configured. Sandbox containers use host.containers.internal
         // (injected via hostadd with host-gateway in the container spec)
-        // to reach the gateway server on the host. This works in both
-        // rootful and rootless Podman — the bridge gateway IP does NOT
-        // work in rootless mode because it lives inside the user
-        // namespace, not on the host.
+        // to reach the gateway server on the host. The scheme is
+        // determined by whether TLS client certs are configured: when
+        // all three TLS paths are set, the endpoint uses https so the
+        // supervisor connects with mTLS.
         if config.grpc_endpoint.is_empty() {
-            config.grpc_endpoint =
-                format!("http://host.containers.internal:{}", config.gateway_port);
+            let scheme = if config.tls_enabled() {
+                "https"
+            } else {
+                "http"
+            };
+            config.grpc_endpoint = format!(
+                "{scheme}://host.containers.internal:{}",
+                config.gateway_port
+            );
             info!(
                 grpc_endpoint = %config.grpc_endpoint,
-                "Auto-detected gRPC endpoint via host.containers.internal"
+                tls = config.tls_enabled(),
+                "Auto-detected gRPC endpoint"
             );
         }
 
@@ -557,51 +566,67 @@ mod tests {
         assert!(matches!(err, ComputeDriverError::Message(_)));
     }
 
-    // ── gateway_port / grpc_endpoint auto-detection ───────────────────────
+    // ── grpc_endpoint auto-detection ───────────────────────────────────
     //
     // PodmanComputeDriver::new() fills grpc_endpoint when it is empty.
-    // These tests use for_tests() (which skips the Podman socket handshake)
-    // to verify the endpoint that ends up in the config — and therefore in
-    // OPENSHELL_ENDPOINT inside every sandbox container.
+    // The scheme (http vs https) depends on whether TLS client certs are
+    // configured. These tests simulate the auto-detection logic.
 
     #[test]
-    fn grpc_endpoint_auto_detected_from_gateway_port() {
-        let config = PodmanComputeConfig {
+    fn grpc_endpoint_http_without_tls() {
+        let mut cfg = PodmanComputeConfig {
             gateway_port: 8081,
             ..PodmanComputeConfig::default()
         };
-        // Simulate what new() does once the socket/network checks pass.
-        let mut cfg = config;
         if cfg.grpc_endpoint.is_empty() {
-            cfg.grpc_endpoint = format!("http://host.containers.internal:{}", cfg.gateway_port);
+            let scheme = if cfg.tls_enabled() { "https" } else { "http" };
+            cfg.grpc_endpoint = format!("{scheme}://host.containers.internal:{}", cfg.gateway_port);
         }
         assert_eq!(cfg.grpc_endpoint, "http://host.containers.internal:8081");
     }
 
     #[test]
-    fn grpc_endpoint_auto_detected_uses_default_port_when_gateway_port_is_default() {
-        let config = PodmanComputeConfig::default();
-        assert_eq!(
-            config.gateway_port,
-            openshell_core::config::DEFAULT_SERVER_PORT
-        );
-        let mut cfg = config;
+    fn grpc_endpoint_https_with_tls() {
+        let mut cfg = PodmanComputeConfig {
+            gateway_port: 8080,
+            tls_ca: Some(std::path::PathBuf::from("/tls/ca.crt")),
+            tls_cert: Some(std::path::PathBuf::from("/tls/tls.crt")),
+            tls_key: Some(std::path::PathBuf::from("/tls/tls.key")),
+            ..PodmanComputeConfig::default()
+        };
         if cfg.grpc_endpoint.is_empty() {
-            cfg.grpc_endpoint = format!("http://host.containers.internal:{}", cfg.gateway_port);
+            let scheme = if cfg.tls_enabled() { "https" } else { "http" };
+            cfg.grpc_endpoint = format!("{scheme}://host.containers.internal:{}", cfg.gateway_port);
+        }
+        assert_eq!(cfg.grpc_endpoint, "https://host.containers.internal:8080");
+    }
+
+    #[test]
+    fn grpc_endpoint_partial_tls_falls_back_to_http() {
+        let mut cfg = PodmanComputeConfig {
+            gateway_port: 8080,
+            tls_ca: Some(std::path::PathBuf::from("/tls/ca.crt")),
+            // tls_cert and tls_key not set — incomplete TLS config.
+            ..PodmanComputeConfig::default()
+        };
+        assert!(!cfg.tls_enabled());
+        if cfg.grpc_endpoint.is_empty() {
+            let scheme = if cfg.tls_enabled() { "https" } else { "http" };
+            cfg.grpc_endpoint = format!("{scheme}://host.containers.internal:{}", cfg.gateway_port);
         }
         assert_eq!(cfg.grpc_endpoint, "http://host.containers.internal:8080");
     }
 
     #[test]
-    fn explicit_grpc_endpoint_takes_precedence_over_gateway_port() {
-        let config = PodmanComputeConfig {
+    fn explicit_grpc_endpoint_takes_precedence() {
+        let mut cfg = PodmanComputeConfig {
             grpc_endpoint: "https://gateway.internal:9000".to_string(),
             gateway_port: 8081,
             ..PodmanComputeConfig::default()
         };
-        let mut cfg = config;
         if cfg.grpc_endpoint.is_empty() {
-            cfg.grpc_endpoint = format!("http://host.containers.internal:{}", cfg.gateway_port);
+            let scheme = if cfg.tls_enabled() { "https" } else { "http" };
+            cfg.grpc_endpoint = format!("{scheme}://host.containers.internal:{}", cfg.gateway_port);
         }
         assert_eq!(cfg.grpc_endpoint, "https://gateway.internal:9000");
     }

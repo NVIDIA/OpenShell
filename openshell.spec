@@ -9,7 +9,7 @@
 
 Name:           openshell
 Version:        0.0.37
-Release:        1.20260428141722522502.rpm.27.g09c857c1%{?dist}
+Release:        1.20260430135232393374.rpm.45.g17657c0b%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
@@ -52,6 +52,7 @@ LLM inference routing.
 %package gateway
 Summary:        OpenShell gateway server with Podman sandbox driver
 Requires:       podman
+Requires:       openssl
 Requires:       %{name} = %{version}-%{release}
 
 %description gateway
@@ -151,27 +152,37 @@ Requires=podman.service
 
 [Service]
 Type=exec
-# Self-contained defaults for rootless operation.
+# Self-contained defaults for rootless operation with mTLS.
 #
-# WARNING: TLS is disabled. The gateway has NO authentication.
-# It binds to localhost by default; if you change OPENSHELL_BIND_HOST
-# to a non-loopback address, configure mTLS certificates and remove
-# OPENSHELL_DISABLE_TLS.
+# PKI is auto-generated on first start. Client certs are placed in
+# ~/.config/openshell/gateways/openshell/mtls/ so the CLI discovers
+# them automatically. See /usr/share/doc/openshell-gateway/ for details.
 #
 # The SSH handshake secret is auto-generated on first start into
 # ~/.config/openshell/gateway.env (mode 0600). To override, edit
 # that file or use: systemctl --user edit openshell-gateway.service
 
+# Auto-generate PKI on first start if not present.
+# %%S expands to $XDG_STATE_HOME (~/.local/state) in user units.
+ExecStartPre=%{_libexecdir}/openshell/init-pki.sh %%S/openshell/tls
+
 # Auto-generate SSH handshake secret on first start if not present.
 # %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
 ExecStartPre=/bin/sh -c 'ENV=%%E/openshell/gateway.env; [ -f "$ENV" ] || { mkdir -p %%E/openshell && echo "OPENSHELL_SSH_HANDSHAKE_SECRET=$(od -An -tx1 -N32 /dev/urandom | tr -dc 0-9a-f)" > "$ENV" && chmod 600 "$ENV"; }'
 EnvironmentFile=-%%E/openshell/gateway.env
-Environment=OPENSHELL_BIND_HOST=127.0.0.1
+Environment=OPENSHELL_BIND_HOST=0.0.0.0
 Environment=OPENSHELL_DRIVERS=podman
 Environment=OPENSHELL_DB_URL=sqlite://%%S/openshell/gateway.db
 Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
 Environment=OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
-Environment=OPENSHELL_DISABLE_TLS=true
+# mTLS: auto-generated certs in the state directory.
+Environment=OPENSHELL_TLS_CERT=%%S/openshell/tls/server/tls.crt
+Environment=OPENSHELL_TLS_KEY=%%S/openshell/tls/server/tls.key
+Environment=OPENSHELL_TLS_CLIENT_CA=%%S/openshell/tls/ca.crt
+# Podman driver: client certs bind-mounted into sandbox containers.
+Environment=OPENSHELL_PODMAN_TLS_CA=%%S/openshell/tls/ca.crt
+Environment=OPENSHELL_PODMAN_TLS_CERT=%%S/openshell/tls/client/tls.crt
+Environment=OPENSHELL_PODMAN_TLS_KEY=%%S/openshell/tls/client/tls.key
 ExecStart=/usr/bin/openshell-gateway
 StateDirectory=openshell
 Restart=on-failure
@@ -222,29 +233,43 @@ OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
 # Default sandbox base image.
 OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 
-# Bind the gateway to localhost only (single-host use case).
-# Change to 0.0.0.0 if the gateway must accept connections from
-# other hosts on the network.
-OPENSHELL_BIND_HOST=127.0.0.1
+# Bind address. Default 0.0.0.0 listens on all interfaces; mTLS
+# prevents unauthenticated access.
+OPENSHELL_BIND_HOST=0.0.0.0
 
-# ---- SECURITY WARNING ----
-# TLS is disabled by default for ease of initial setup. With TLS
-# disabled, the gateway has NO authentication. The default bind
-# address is localhost (127.0.0.1), limiting access to the local
-# machine. If you change OPENSHELL_BIND_HOST to a non-loopback
-# address, any host that can reach the gateway port has full
-# unauthenticated access to the API, including sandbox creation,
-# command execution, and credential retrieval.
+# ---- TLS (mTLS enabled by default) ----
+# A self-signed PKI is auto-generated on first start by init-pki.sh.
+# Client certs are placed in ~/.config/openshell/gateways/openshell/mtls/
+# so the CLI discovers them automatically.
 #
-# For any network-exposed deployment:
-#   1. Generate mTLS certificates (see OpenShell docs)
-#   2. Set OPENSHELL_TLS_CERT, OPENSHELL_TLS_KEY, OPENSHELL_TLS_CLIENT_CA
-#   3. Comment out OPENSHELL_DISABLE_TLS below
-OPENSHELL_DISABLE_TLS=true
+# To use externally-managed certs, replace the paths below.
+# To rotate certs, delete the TLS state directory and restart.
+# To disable TLS (NOT RECOMMENDED), uncomment the line below and
+# remove or comment out the OPENSHELL_TLS_* and OPENSHELL_PODMAN_TLS_*
+# variables.
+# OPENSHELL_DISABLE_TLS=true
+
+# Server TLS (gateway listens with these certs).
+OPENSHELL_TLS_CERT=/var/lib/openshell/tls/server/tls.crt
+OPENSHELL_TLS_KEY=/var/lib/openshell/tls/server/tls.key
+OPENSHELL_TLS_CLIENT_CA=/var/lib/openshell/tls/ca.crt
+
+# Podman driver: client certs bind-mounted into sandbox containers.
+OPENSHELL_PODMAN_TLS_CA=/var/lib/openshell/tls/ca.crt
+OPENSHELL_PODMAN_TLS_CERT=/var/lib/openshell/tls/client/tls.crt
+OPENSHELL_PODMAN_TLS_KEY=/var/lib/openshell/tls/client/tls.key
 EOF
 
 # --- Gateway state directory ---
 install -d %{buildroot}%{_sharedstatedir}/%{name}
+
+# --- PKI bootstrap script ---
+install -d %{buildroot}%{_libexecdir}/%{name}
+install -pm 0755 deploy/rpm/init-pki.sh %{buildroot}%{_libexecdir}/%{name}/init-pki.sh
+
+# --- Gateway documentation ---
+install -d %{buildroot}%{_docdir}/%{name}-gateway
+install -pm 0644 deploy/rpm/GATEWAY-CONFIG.md %{buildroot}%{_docdir}/%{name}-gateway/GATEWAY-CONFIG.md
 
 # --- Python SDK ---
 # Install Python SDK modules (test files are intentionally excluded)
@@ -315,9 +340,11 @@ fi
 
 %files gateway
 %license LICENSE
+%doc %{_docdir}/%{name}-gateway/GATEWAY-CONFIG.md
 %{_bindir}/%{name}-gateway
 %{_unitdir}/%{name}-gateway.service
 %{_userunitdir}/%{name}-gateway.service
+%{_libexecdir}/%{name}/init-pki.sh
 %attr(0640,root,root) %config(noreplace) %{_sysconfdir}/sysconfig/%{name}-gateway
 %dir %{_sharedstatedir}/%{name}
 

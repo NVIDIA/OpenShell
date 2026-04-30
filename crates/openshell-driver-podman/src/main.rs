@@ -86,6 +86,18 @@ struct Args {
     /// OCI image containing the openshell-sandbox supervisor binary.
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
     supervisor_image: String,
+
+    /// Host path to the CA certificate for sandbox mTLS.
+    #[arg(long, env = "OPENSHELL_PODMAN_TLS_CA")]
+    podman_tls_ca: Option<PathBuf>,
+
+    /// Host path to the client certificate for sandbox mTLS.
+    #[arg(long, env = "OPENSHELL_PODMAN_TLS_CERT")]
+    podman_tls_cert: Option<PathBuf>,
+
+    /// Host path to the client private key for sandbox mTLS.
+    #[arg(long, env = "OPENSHELL_PODMAN_TLS_KEY")]
+    podman_tls_key: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -115,6 +127,9 @@ async fn main() -> Result<()> {
         ssh_handshake_skew_secs: args.ssh_handshake_skew_secs,
         stop_timeout_secs: args.stop_timeout,
         supervisor_image: args.supervisor_image,
+        tls_ca: args.podman_tls_ca,
+        tls_cert: args.podman_tls_cert,
+        tls_key: args.podman_tls_key,
     })
     .await
     .into_diagnostic()?;

@@ -25,6 +25,11 @@ const CONTAINER_PREFIX: &str = "openshell-sandbox-";
 /// Volume name prefix.
 const VOLUME_PREFIX: &str = "openshell-sandbox-";
 
+/// Container-side mount paths for client TLS materials.
+const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
+const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
+const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
+
 /// Build a Podman container name from the sandbox name.
 #[must_use]
 pub fn container_name(sandbox_name: &str) -> String {
@@ -260,6 +265,15 @@ fn build_env(
     env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
     env.insert("OPENSHELL_SANDBOX_COMMAND".into(), "sleep infinity".into());
 
+    // 3. TLS client cert paths (when mTLS is enabled). These point to
+    //    the container-side mount paths where the cert files are
+    //    bind-mounted from the host.
+    if config.tls_enabled() {
+        env.insert("OPENSHELL_TLS_CA".into(), TLS_CA_MOUNT_PATH.into());
+        env.insert("OPENSHELL_TLS_CERT".into(), TLS_CERT_MOUNT_PATH.into());
+        env.insert("OPENSHELL_TLS_KEY".into(), TLS_KEY_MOUNT_PATH.into());
+    }
+
     env
 }
 
@@ -487,12 +501,43 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
         // directory does not exist on the host, so the mkdir inside the container
         // fails with EPERM. A private tmpfs gives the supervisor its own writable
         // /run/netns without needing host filesystem access.
-        mounts: vec![Mount {
-            kind: "tmpfs".into(),
-            source: "tmpfs".into(),
-            destination: "/run/netns".into(),
-            options: vec!["rw".into(), "nosuid".into(), "nodev".into()],
-        }],
+        mounts: {
+            let mut m = vec![Mount {
+                kind: "tmpfs".into(),
+                source: "tmpfs".into(),
+                destination: "/run/netns".into(),
+                options: vec!["rw".into(), "nosuid".into(), "nodev".into()],
+            }];
+            // Bind-mount client TLS materials into the container when mTLS
+            // is enabled. The supervisor reads these via OPENSHELL_TLS_CA,
+            // OPENSHELL_TLS_CERT, and OPENSHELL_TLS_KEY env vars (set in
+            // build_env above) to establish an mTLS connection back to the
+            // gateway.
+            if let (Some(ca), Some(cert), Some(key)) =
+                (&config.tls_ca, &config.tls_cert, &config.tls_key)
+            {
+                let ro = vec!["ro".into(), "rbind".into()];
+                m.push(Mount {
+                    kind: "bind".into(),
+                    source: ca.display().to_string(),
+                    destination: TLS_CA_MOUNT_PATH.into(),
+                    options: ro.clone(),
+                });
+                m.push(Mount {
+                    kind: "bind".into(),
+                    source: cert.display().to_string(),
+                    destination: TLS_CERT_MOUNT_PATH.into(),
+                    options: ro.clone(),
+                });
+                m.push(Mount {
+                    kind: "bind".into(),
+                    source: key.display().to_string(),
+                    destination: TLS_KEY_MOUNT_PATH.into(),
+                    options: ro,
+                });
+            }
+            m
+        },
         // Publish the SSH port with host_port=0 to get an ephemeral host port.
         // In rootless Podman the bridge network (10.89.x.x) is not routable from
         // the host, so we must use the published host port on 127.0.0.1 instead.
@@ -887,5 +932,76 @@ mod tests {
             Some(false),
             "image volume should be read-only"
         );
+    }
+
+    #[test]
+    fn container_spec_includes_tls_mounts_when_configured() {
+        let sandbox = test_sandbox("tls-id", "tls-name");
+        let mut config = test_config();
+        config.tls_ca = Some(std::path::PathBuf::from("/host/ca.crt"));
+        config.tls_cert = Some(std::path::PathBuf::from("/host/tls.crt"));
+        config.tls_key = Some(std::path::PathBuf::from("/host/tls.key"));
+
+        let spec = build_container_spec(&sandbox, &config);
+
+        // Verify TLS env vars are set.
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        assert_eq!(
+            env_map.get("OPENSHELL_TLS_CA").and_then(|v| v.as_str()),
+            Some("/etc/openshell/tls/client/ca.crt"),
+        );
+        assert_eq!(
+            env_map.get("OPENSHELL_TLS_CERT").and_then(|v| v.as_str()),
+            Some("/etc/openshell/tls/client/tls.crt"),
+        );
+        assert_eq!(
+            env_map.get("OPENSHELL_TLS_KEY").and_then(|v| v.as_str()),
+            Some("/etc/openshell/tls/client/tls.key"),
+        );
+
+        // Verify bind mounts exist for all three cert files.
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        let bind_dests: Vec<&str> = mounts
+            .iter()
+            .filter(|m| m["type"].as_str() == Some("bind"))
+            .filter_map(|m| m["destination"].as_str())
+            .collect();
+        assert!(
+            bind_dests.contains(&"/etc/openshell/tls/client/ca.crt"),
+            "should bind-mount CA cert"
+        );
+        assert!(
+            bind_dests.contains(&"/etc/openshell/tls/client/tls.crt"),
+            "should bind-mount client cert"
+        );
+        assert!(
+            bind_dests.contains(&"/etc/openshell/tls/client/tls.key"),
+            "should bind-mount client key"
+        );
+    }
+
+    #[test]
+    fn container_spec_omits_tls_without_config() {
+        let sandbox = test_sandbox("notls-id", "notls-name");
+        let config = test_config();
+
+        let spec = build_container_spec(&sandbox, &config);
+
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        assert!(
+            env_map.get("OPENSHELL_TLS_CA").is_none(),
+            "TLS env vars should not be set without TLS config"
+        );
+
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        let bind_count = mounts
+            .iter()
+            .filter(|m| m["type"].as_str() == Some("bind"))
+            .count();
+        assert_eq!(bind_count, 0, "no bind mounts without TLS config");
     }
 }
