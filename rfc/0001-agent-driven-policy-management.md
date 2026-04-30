@@ -44,7 +44,7 @@ This RFC proposes the next layer: make policy adaptation an intentional, agent-n
 The first implementation is tracked in [#1062](https://github.com/NVIDIA/OpenShell/issues/1062). It intentionally starts with the smallest agent-driven loop that can validate the product experience:
 
 - structured L7 REST deny responses for agent-readable failures
-- a sandbox-local `openshell-policy` CLI backed by existing files, logs, and per-sandbox mTLS gateway calls
+- a sandbox-local `policy.local` HTTP API backed by existing files, logs, and per-sandbox mTLS gateway calls
 - static sandbox-local agent guidance in `/etc/openshell/SKILL.md`
 - agent-authored proposal provenance, validation status, and rejection guidance in the existing draft policy flow
 - TUI/CLI review for a single sandbox, with polling as the MVP refresh path
@@ -212,8 +212,8 @@ The end-to-end interaction should look like this:
 ```mermaid
 sequenceDiagram
     participant A as Agent in Sandbox
-    participant S as Local Skill / CLI
-    participant U as Supervisor Local API (Unix socket)
+    participant S as Local Skill
+    participant U as policy.local API
     participant P as Local Prover Aid
     participant G as Gateway Proposal Service
     participant X as External Validator / Trusted Approver
@@ -253,7 +253,7 @@ The workspace should provide:
 - Recent denials and related proposal history.
 - Guidance for generating the narrowest change possible.
 
-The first implementation can be a generated `SKILL.md` plus a local CLI or Unix-socket API exposed by the sandbox supervisor. The long-term contract is the API; the skill is the ergonomic on-ramp.
+The first implementation can be a static `SKILL.md` plus a sandbox-local `policy.local` HTTP API. The long-term contract is the API; the skill is the ergonomic on-ramp. MCP can wrap this API later for agents that benefit from tool discovery, but it should not be the first load-bearing protocol or a separate implementation path.
 
 The sandbox-facing surface must also have an explicit information boundary:
 
@@ -526,8 +526,8 @@ One motivating workflow is a recurring research task: search X and LinkedIn for 
 
 Add a local policy interaction surface:
 
-- Unix domain socket API
-- sandbox-local CLI backed by that API
+- sandbox-local `policy.local` HTTP API
+- optional future MCP wrapper backed by that API
 
 Representative operations:
 
@@ -539,10 +539,10 @@ This surface must be readable by the agent but not self-approving.
 
 Phase 2 implementation decisions:
 
-- primary transport: Unix domain socket API
-- ergonomic wrapper: sandbox-local CLI
+- primary transport: sandbox-local HTTP JSON at `policy.local`
+- ergonomic wrapper: defer MCP/CLI wrappers until the local API proves useful
 - first trust model: the sandbox is treated as single-tenant, so local callers are part of the sandbox tenant; this does not grant approval rights
-- first proposal format: a minimal structured request tailored to L4 and L7 REST changes
+- first proposal format: reuse the `PolicyMergeOperation` shape behind `openshell policy update`; sandbox-origin operations are stored as draft chunks for approval instead of being applied immediately
 
 #### Gateway / server
 
