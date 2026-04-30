@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BINARY="$PROJECT_ROOT/target/debug/openshell"
 STATE_FILE="$PROJECT_ROOT/.cache/openshell-build.state"
+CALLER_PWD="$PWD"
 
 # ---------------------------------------------------------------------------
 # Fingerprint-based rebuild check
@@ -26,7 +27,10 @@ else
   current_head=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 
   # Collect dirty (modified, staged, untracked) files
-  mapfile -t changed_files < <(
+  changed_files=()
+  while IFS= read -r path; do
+    changed_files+=("$path")
+  done < <(
     {
       git diff --name-only 2>/dev/null
       git diff --name-only --cached 2>/dev/null
@@ -118,7 +122,10 @@ if [[ "$needs_build" == "1" ]]; then
   cd "$PROJECT_ROOT"
   new_head=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
   # Recompute fingerprint of remaining dirty files (build may not change them)
-  mapfile -t post_files < <(
+  post_files=()
+  while IFS= read -r path; do
+    post_files+=("$path")
+  done < <(
     {
       git diff --name-only 2>/dev/null
       git diff --name-only --cached 2>/dev/null
@@ -165,4 +172,5 @@ fingerprint=${new_fingerprint}
 EOF
 fi
 
+cd "$CALLER_PWD"
 exec "$BINARY" "$@"

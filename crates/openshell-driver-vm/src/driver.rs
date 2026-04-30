@@ -9,6 +9,7 @@ use crate::rootfs::{
     prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
 };
 use bollard::Docker;
+use bollard::errors::Error as BollardError;
 use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder};
 use flate2::read::GzDecoder;
@@ -92,7 +93,6 @@ const IMAGE_CACHE_ROOTFS_ARCHIVE: &str = "rootfs.tar";
 const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
-const VM_LOCAL_IMAGE_REF_PREFIX: &str = "openshell-vm-local-image:";
 static IMAGE_CACHE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -760,9 +760,14 @@ impl VmDriver {
         sandbox_id: &str,
         image_ref: &str,
     ) -> Result<String, Status> {
-        if let Some(local_image_ref) = parse_vm_local_image_ref(image_ref)? {
+        if let Some((docker, image_identity)) = self.resolve_local_docker_image(image_ref).await? {
             return self
-                .ensure_cached_local_image_rootfs_archive(sandbox_id, image_ref, local_image_ref)
+                .ensure_cached_local_image_rootfs_archive(
+                    sandbox_id,
+                    image_ref,
+                    &docker,
+                    &image_identity,
+                )
                 .await;
         }
 
@@ -853,19 +858,74 @@ impl VmDriver {
         Ok(image_identity)
     }
 
+    async fn resolve_local_docker_image(
+        &self,
+        image_ref: &str,
+    ) -> Result<Option<(Docker, String)>, Status> {
+        let required_local_image = is_openshell_local_build_image_ref(image_ref);
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(err) if required_local_image => {
+                return Err(Status::failed_precondition(format!(
+                    "failed to connect to local Docker daemon for locally built sandbox image '{image_ref}': {err}"
+                )));
+            }
+            Err(err) => {
+                warn!(
+                    image_ref = %image_ref,
+                    error = %err,
+                    "vm driver: local Docker daemon unavailable, falling back to registry"
+                );
+                return Ok(None);
+            }
+        };
+
+        match docker.inspect_image(image_ref).await {
+            Ok(inspect) => {
+                let image_identity =
+                    inspect
+                        .id
+                        .filter(|id| !id.trim().is_empty())
+                        .ok_or_else(|| {
+                            Status::failed_precondition(format!(
+                                "local Docker image '{image_ref}' inspect response has no image ID"
+                            ))
+                        })?;
+                info!(
+                    image_ref = %image_ref,
+                    image_identity = %image_identity,
+                    "vm driver: resolved image from local Docker daemon"
+                );
+                Ok(Some((docker, image_identity)))
+            }
+            Err(err) if is_docker_not_found_error(&err) && required_local_image => {
+                Err(Status::failed_precondition(format!(
+                    "locally built sandbox image '{image_ref}' is not present in the local Docker daemon"
+                )))
+            }
+            Err(err) if is_docker_not_found_error(&err) => Ok(None),
+            Err(err) if required_local_image => Err(Status::failed_precondition(format!(
+                "failed to inspect locally built sandbox image '{image_ref}': {err}"
+            ))),
+            Err(err) => {
+                warn!(
+                    image_ref = %image_ref,
+                    error = %err,
+                    "vm driver: local Docker image inspection failed, falling back to registry"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     async fn ensure_cached_local_image_rootfs_archive(
         &self,
         sandbox_id: &str,
         image_ref: &str,
-        local_image_ref: &str,
+        docker: &Docker,
+        image_identity: &str,
     ) -> Result<String, Status> {
-        let docker = Docker::connect_with_local_defaults().map_err(|err| {
-            Status::failed_precondition(format!(
-                "failed to connect to local Docker daemon for vm local image '{image_ref}': {err}"
-            ))
-        })?;
-        let image_identity = local_docker_image_identity(&docker, local_image_ref).await?;
-        let archive_path = image_cache_rootfs_archive(&self.config.state_dir, &image_identity);
+        let archive_path = image_cache_rootfs_archive(&self.config.state_dir, image_identity);
 
         self.publish_platform_event(
             sandbox_id.to_string(),
@@ -873,28 +933,28 @@ impl VmDriver {
                 "vm",
                 "Normal",
                 "Pulling",
-                format!("Pulling image \"{local_image_ref}\""),
+                format!("Pulling image \"{image_ref}\""),
             ),
         );
 
         if tokio::fs::metadata(&archive_path).await.is_ok() {
-            self.publish_pulled_event(sandbox_id, local_image_ref, &archive_path)
+            self.publish_pulled_event(sandbox_id, image_ref, &archive_path)
                 .await;
-            return Ok(image_identity);
+            return Ok(image_identity.to_string());
         }
 
         let _cache_guard = self.image_cache_lock.lock().await;
         if tokio::fs::metadata(&archive_path).await.is_ok() {
-            self.publish_pulled_event(sandbox_id, local_image_ref, &archive_path)
+            self.publish_pulled_event(sandbox_id, image_ref, &archive_path)
                 .await;
-            return Ok(image_identity);
+            return Ok(image_identity.to_string());
         }
 
-        self.build_cached_local_image_rootfs_archive(&docker, local_image_ref, &image_identity)
+        self.build_cached_local_image_rootfs_archive(docker, image_ref, image_identity)
             .await?;
-        self.publish_pulled_event(sandbox_id, local_image_ref, &archive_path)
+        self.publish_pulled_event(sandbox_id, image_ref, &archive_path)
             .await;
-        Ok(image_identity)
+        Ok(image_identity.to_string())
     }
 
     async fn build_cached_local_image_rootfs_archive(
@@ -1420,33 +1480,18 @@ fn parse_registry_reference(image_ref: &str) -> Result<Reference, Status> {
     })
 }
 
-#[allow(clippy::result_large_err)]
-fn parse_vm_local_image_ref(image_ref: &str) -> Result<Option<&str>, Status> {
-    let Some(local_image_ref) = image_ref.strip_prefix(VM_LOCAL_IMAGE_REF_PREFIX) else {
-        return Ok(None);
-    };
-    if local_image_ref.trim().is_empty() {
-        return Err(Status::failed_precondition(
-            "invalid vm local image reference: missing Docker image reference",
-        ));
-    }
-    Ok(Some(local_image_ref))
+fn is_openshell_local_build_image_ref(image_ref: &str) -> bool {
+    image_ref.starts_with("openshell/sandbox-from:")
 }
 
-async fn local_docker_image_identity(docker: &Docker, image_ref: &str) -> Result<String, Status> {
-    let inspect = docker.inspect_image(image_ref).await.map_err(|err| {
-        Status::failed_precondition(format!(
-            "failed to inspect local Docker image '{image_ref}': {err}"
-        ))
-    })?;
-    inspect
-        .id
-        .filter(|id| !id.trim().is_empty())
-        .ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "local Docker image '{image_ref}' inspect response has no image ID"
-            ))
-        })
+fn is_docker_not_found_error(err: &BollardError) -> bool {
+    matches!(
+        err,
+        BollardError::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
 }
 
 async fn export_local_image_rootfs_to_path(
@@ -2678,27 +2723,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_vm_local_image_ref_classifies_prefixed_refs() {
-        assert_eq!(
-            parse_vm_local_image_ref("openshell-vm-local-image:openshell/sandbox-from:123")
-                .unwrap(),
-            Some("openshell/sandbox-from:123")
-        );
-        assert_eq!(parse_vm_local_image_ref("ubuntu:24.04").unwrap(), None);
-    }
-
-    #[test]
-    fn parse_vm_local_image_ref_rejects_empty_refs() {
-        for image_ref in ["openshell-vm-local-image:", "openshell-vm-local-image:   "] {
-            let err =
-                parse_vm_local_image_ref(image_ref).expect_err("empty local image refs must fail");
-            assert_eq!(err.code(), Code::FailedPrecondition);
-            assert!(
-                err.message().contains("missing Docker image reference"),
-                "unexpected error: {}",
-                err.message()
-            );
-        }
+    fn openshell_local_build_image_ref_matches_cli_tags() {
+        assert!(is_openshell_local_build_image_ref(
+            "openshell/sandbox-from:123"
+        ));
+        assert!(!is_openshell_local_build_image_ref("ubuntu:24.04"));
+        assert!(!is_openshell_local_build_image_ref(
+            "ghcr.io/nvidia/openshell/base:latest"
+        ));
     }
 
     #[test]

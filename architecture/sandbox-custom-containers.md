@@ -34,8 +34,8 @@ When `--from` points to a Dockerfile or directory, the CLI:
 
 1. Builds the image locally via the Docker daemon (respecting `.dockerignore`).
 2. For a local Kubernetes gateway, pushes it into the cluster's containerd runtime using `docker save` / `ctr import`.
-3. For a local VM gateway, passes the VM driver an internal `openshell-vm-local-image:<tag>` reference. The driver resolves that tag against the local Docker daemon, exports the image filesystem, and prepares the VM rootfs in its own cache.
-4. Creates the sandbox with the resulting image tag or VM-local image reference.
+3. For standalone local Docker and VM gateways, passes the ordinary image tag through. The Docker driver runs that tag directly; the VM driver resolves it from the local Docker daemon, exports the image filesystem, and prepares the VM rootfs in its own cache.
+4. Creates the sandbox with the resulting image tag.
 
 Local Dockerfile sources for VM gateways are trusted local-development inputs.
 Remote gateways continue to reject local Dockerfile sources because the gateway
