@@ -39,6 +39,7 @@ use openshell_core::proto::{
     SandboxSpec, SandboxTemplate, SetClusterInferenceRequest, SettingScope, SettingValue,
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, UpdateProviderRequest,
     WatchSandboxRequest, exec_sandbox_event, setting_value, tcp_forward_init,
+    ExposeServiceRequest,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -3399,6 +3400,39 @@ fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     }
 
     Ok(map)
+}
+
+pub async fn service_expose(
+    server: &str,
+    sandbox: &str,
+    service: &str,
+    target_port: u16,
+    domain: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .expose_service(ExposeServiceRequest {
+            sandbox: sandbox.to_string(),
+            service: service.to_string(),
+            target_port: u32::from(target_port),
+            domain,
+        })
+        .await
+        .map_err(|status| miette::miette!("expose service failed: {status}"))?
+        .into_inner();
+
+    println!(
+        "{} Exposed service {} on sandbox {} -> 127.0.0.1:{}",
+        "✓".green().bold(),
+        service.bold(),
+        sandbox.bold(),
+        target_port,
+    );
+    if !response.url.is_empty() {
+        println!("  URL: {}", response.url.cyan());
+    }
+    Ok(())
 }
 
 pub async fn provider_create(

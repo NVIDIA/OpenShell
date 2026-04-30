@@ -656,7 +656,11 @@ pub(super) async fn handle_exec_sandbox(
     // while still failing quickly during normal operation.
     let (channel_id, relay_rx) = state
         .supervisor_sessions
-        .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
+        .open_relay(
+            sandbox.object_id(),
+            None,
+            std::time::Duration::from_secs(15),
+        )
         .await
         .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 

@@ -297,6 +297,22 @@ struct RunArgs {
     /// Keycloak: "scope". Okta: "scp". Leave empty to disable scope enforcement.
     #[arg(long, env = "OPENSHELL_OIDC_SCOPES_CLAIM", default_value = "")]
     oidc_scopes_claim: String,
+
+    /// Enable local-domain HTTP routing for browser-facing sandbox services.
+    #[arg(long, env = "OPENSHELL_LOCAL_DOMAIN_ENABLED")]
+    local_domain_enabled: bool,
+
+    /// Cluster label used in local-domain hostnames.
+    #[arg(long, env = "OPENSHELL_LOCAL_DOMAIN_CLUSTER", default_value = "")]
+    local_domain_cluster: String,
+
+    /// Suffix used in local-domain hostnames.
+    #[arg(
+        long,
+        env = "OPENSHELL_LOCAL_DOMAIN_SUFFIX",
+        default_value = openshell_core::config::DEFAULT_LOCAL_DOMAIN_SUFFIX
+    )]
+    local_domain_suffix: String,
 }
 
 pub fn command() -> Command {
@@ -393,7 +409,12 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
         .with_ssh_gateway_host(args.ssh_gateway_host)
         .with_ssh_gateway_port(args.ssh_gateway_port)
         .with_sandbox_ssh_port(args.sandbox_ssh_port)
-        .with_ssh_handshake_skew_secs(args.ssh_handshake_skew_secs);
+        .with_ssh_handshake_skew_secs(args.ssh_handshake_skew_secs)
+        .with_local_domain(
+            args.local_domain_enabled,
+            args.local_domain_cluster,
+            args.local_domain_suffix,
+        );
 
     if let Some(image) = args.sandbox_image {
         config = config.with_sandbox_image(image);

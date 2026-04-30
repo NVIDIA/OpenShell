@@ -6,7 +6,8 @@
 //! These traits provide uniform access to `ObjectMeta` fields across all resource types.
 
 use crate::proto::{
-    InferenceRoute, ObjectForTest, Provider, Sandbox, SshSession, StoredProviderProfile,
+    InferenceRoute, ObjectForTest, Provider, Sandbox, ServiceEndpoint, SshSession,
+    StoredProviderProfile,
 };
 use std::collections::HashMap;
 
@@ -96,6 +97,25 @@ impl ObjectName for SshSession {
 }
 
 impl ObjectLabels for SshSession {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+// Implementations for ServiceEndpoint
+impl ObjectId for ServiceEndpoint {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for ServiceEndpoint {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for ServiceEndpoint {
     fn object_labels(&self) -> Option<HashMap<String, String>> {
         self.metadata.as_ref().map(|m| m.labels.clone())
     }

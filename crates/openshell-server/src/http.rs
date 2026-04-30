@@ -3,7 +3,14 @@
 
 //! HTTP health endpoints using Axum.
 
-use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{
+    Json, Router,
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::IntoResponse,
+    routing::get,
+};
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Serialize;
 use std::sync::Arc;
@@ -59,5 +66,20 @@ async fn render_metrics(State(handle): State<PrometheusHandle>) -> impl IntoResp
 
 /// Create the HTTP router.
 pub fn http_router(state: Arc<crate::ServerState>) -> Router {
-    crate::ws_tunnel::router(state.clone()).merge(crate::auth::router(state))
+    crate::ws_tunnel::router(state.clone())
+        .merge(crate::auth::router(state.clone()))
+        .layer(middleware::from_fn_with_state(state, local_domain_first))
+}
+
+async fn local_domain_first(
+    State(state): State<Arc<crate::ServerState>>,
+    req: Request,
+    next: Next,
+) -> impl IntoResponse {
+    if crate::local_domain::is_local_domain_request(&req, &state.config.local_domain) {
+        return crate::local_domain::proxy_local_domain_request(state, req)
+            .await
+            .into_response();
+    }
+    next.run(req).await.into_response()
 }

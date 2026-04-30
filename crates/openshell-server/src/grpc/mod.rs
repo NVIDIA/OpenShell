@@ -6,6 +6,7 @@
 pub mod policy;
 mod provider;
 mod sandbox;
+mod service;
 mod validation;
 
 use openshell_core::proto::{
@@ -16,11 +17,12 @@ use openshell_core::proto::{
     DeleteProviderProfileResponse, DeleteProviderRequest, DeleteProviderResponse,
     DeleteSandboxRequest, DeleteSandboxResponse, DetachSandboxProviderRequest,
     DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent,
-    ExecSandboxRequest, GatewayMessage, GetDraftHistoryRequest, GetDraftHistoryResponse,
-    GetDraftPolicyRequest, GetDraftPolicyResponse, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderProfileRequest, GetProviderRequest,
-    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
-    GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    ExecSandboxRequest, ExposeServiceRequest, GatewayMessage, GetDraftHistoryRequest,
+    GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
+    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderProfileRequest,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
+    GetSandboxLogsRequest, GetSandboxLogsResponse, GetSandboxPolicyStatusRequest,
+    GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     HealthRequest, HealthResponse, ImportProviderProfilesRequest, ImportProviderProfilesResponse,
     LintProviderProfilesRequest, LintProviderProfilesResponse, ListProviderProfilesRequest,
@@ -30,8 +32,9 @@ use openshell_core::proto::{
     ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame, ReportPolicyStatusRequest,
     ReportPolicyStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
+    SandboxStreamEvent, ServiceEndpointResponse, ServiceStatus, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
+    UndoDraftChunkResponse,
     UpdateConfigRequest, UpdateConfigResponse, UpdateProviderRequest, WatchSandboxRequest,
     open_shell_server::OpenShell,
 };
@@ -258,6 +261,13 @@ impl OpenShell for OpenShellService {
         request: Request<CreateSshSessionRequest>,
     ) -> Result<Response<CreateSshSessionResponse>, Status> {
         sandbox::handle_create_ssh_session(&self.state, request).await
+    }
+
+    async fn expose_service(
+        &self,
+        request: Request<ExposeServiceRequest>,
+    ) -> Result<Response<ServiceEndpointResponse>, Status> {
+        service::handle_expose_service(&self.state, request).await
     }
 
     async fn revoke_ssh_session(
