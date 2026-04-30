@@ -2694,10 +2694,11 @@ mod tests {
     fn build_platform_config_inverts_user_namespaces_to_host_users() {
         use prost_types::value::Kind;
 
-        let mut template = SandboxTemplate::default();
-
         // user_namespaces: true  → host_users: false
-        template.user_namespaces = Some(true);
+        let mut template = SandboxTemplate {
+            user_namespaces: Some(true),
+            ..SandboxTemplate::default()
+        };
         let config = build_platform_config(&template).expect("config should be Some");
         let host_users = config
             .fields
