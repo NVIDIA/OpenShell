@@ -5,8 +5,8 @@ use crate::gpu::{
     GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
 };
 use crate::rootfs::{
-    create_rootfs_archive_from_dir, extract_rootfs_archive_to,
-    prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
+    create_rootfs_archive_from_dir, extract_rootfs_archive_to, inject_gpu_modules,
+    prepare_sandbox_rootfs_from_image_root, refresh_runtime_artifacts, sandbox_guest_init_path,
 };
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
@@ -419,6 +419,28 @@ impl VmDriver {
                 return Err(err);
             }
         };
+        if is_gpu {
+            let rootfs_for_gpu = rootfs.clone();
+            let driver_state_dir = self.config.state_dir.clone();
+            if let Err(err) = tokio::task::spawn_blocking(move || {
+                inject_gpu_modules(&rootfs_for_gpu, &driver_state_dir)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("GPU module injection panicked: {e}")))?
+            {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    error = %err,
+                    "vm driver: GPU module injection failed"
+                );
+                let _ = tokio::fs::remove_dir_all(&state_dir).await;
+                return Err(Status::failed_precondition(format!(
+                    "GPU module injection failed: {err}"
+                )));
+            }
+            info!(sandbox_id = %sandbox.id, "vm driver: GPU modules injected into rootfs");
+        }
+
         if let Some(tls_paths) = tls_paths.as_ref()
             && let Err(err) = prepare_guest_tls_materials(&rootfs, tls_paths).await
         {
@@ -738,10 +760,13 @@ impl VmDriver {
             .await?;
         let archive_path = image_cache_rootfs_archive(&self.config.state_dir, &image_identity);
         let rootfs_dest = rootfs.to_path_buf();
-        tokio::task::spawn_blocking(move || extract_rootfs_archive_to(&archive_path, &rootfs_dest))
-            .await
-            .map_err(|err| Status::internal(format!("sandbox rootfs extraction panicked: {err}")))?
-            .map_err(|err| Status::internal(format!("extract sandbox rootfs failed: {err}")))?;
+        tokio::task::spawn_blocking(move || {
+            extract_rootfs_archive_to(&archive_path, &rootfs_dest)?;
+            refresh_runtime_artifacts(&rootfs_dest)
+        })
+        .await
+        .map_err(|err| Status::internal(format!("sandbox rootfs extraction panicked: {err}")))?
+        .map_err(|err| Status::internal(format!("extract sandbox rootfs failed: {err}")))?;
 
         Ok(image_identity)
     }
