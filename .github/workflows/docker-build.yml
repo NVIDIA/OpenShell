@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       timeout-minutes:
-        description: "Job timeout in minutes"
+        description: "Per-arch Docker image job timeout in minutes"
         required: false
         type: number
         default: 20
@@ -23,7 +23,7 @@ on:
         type: string
         default: "linux/amd64,linux/arm64"
       runner:
-        description: "GitHub Actions runner label"
+        description: "Deprecated; per-arch native runners are selected automatically"
         required: false
         type: string
         default: "build-amd64"
@@ -35,17 +35,121 @@ on:
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
 
 permissions:
   contents: read
   packages: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  resolve:
+    name: Resolve build plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      platform_count: ${{ steps.resolve.outputs.platform_count }}
+      arches: ${{ steps.resolve.outputs.arches }}
+      binary_component: ${{ steps.resolve.outputs.binary_component }}
+      binary_name: ${{ steps.resolve.outputs.binary_name }}
+      artifact_prefix: ${{ steps.resolve.outputs.artifact_prefix }}
+    steps:
+      - name: Resolve component and platform matrix
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          component="${{ inputs.component }}"
+          case "$component" in
+            gateway)
+              binary_component=gateway
+              binary_name=openshell-gateway
+              ;;
+            supervisor|cluster)
+              binary_component=sandbox
+              binary_name=openshell-sandbox
+              ;;
+            *)
+              echo "unsupported component: $component" >&2
+              exit 1
+              ;;
+          esac
+
+          platform_input="${{ inputs.platform }}"
+          platform_input="${platform_input//[[:space:]]/}"
+          if [[ -z "$platform_input" ]]; then
+            echo "platform input must not be empty" >&2
+            exit 1
+          fi
+
+          IFS=',' read -r -a platforms <<< "$platform_input"
+          matrix='{"include":['
+          arches=()
+          count=0
+
+          for platform in "${platforms[@]}"; do
+            case "$platform" in
+              linux/amd64)
+                arch=amd64
+                runner=linux-amd64-cpu8
+                ;;
+              linux/arm64)
+                arch=arm64
+                runner=linux-arm64-cpu8
+                ;;
+              *)
+                echo "unsupported platform: $platform" >&2
+                echo "supported platforms: linux/amd64, linux/arm64" >&2
+                exit 1
+                ;;
+            esac
+
+            if [[ $count -gt 0 ]]; then
+              matrix+=','
+            fi
+            matrix+='{"platform":"'"$platform"'","arch":"'"$arch"'","runner":"'"$runner"'"}'
+            arches+=("$arch")
+            count=$((count + 1))
+          done
+
+          matrix+=']}'
+          {
+            echo "matrix=$matrix"
+            echo "platform_count=$count"
+            echo "arches=${arches[*]}"
+            echo "binary_component=$binary_component"
+            echo "binary_name=$binary_name"
+            echo "artifact_prefix=rust-binary-${component}-${binary_component}"
+          } >> "$GITHUB_OUTPUT"
+
+  rust-binary:
+    name: Rust ${{ needs.resolve.outputs.binary_component }} (${{ matrix.arch }})
+    needs: resolve
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    uses: ./.github/workflows/shadow-rust-native-build.yml
+    with:
+      component: ${{ needs.resolve.outputs.binary_component }}
+      arch: ${{ matrix.arch }}
+      cargo-version: ${{ inputs['cargo-version'] }}
+      features: openshell-core/dev-settings
+      artifact-name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
+    secrets: inherit
+
   build:
-    name: Build ${{ inputs.component }}
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: ${{ inputs.timeout-minutes }}
+    name: Build ${{ inputs.component }} (${{ matrix.arch }})
+    needs: [resolve, rust-binary]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ inputs['timeout-minutes'] }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -54,11 +158,14 @@ jobs:
       options: --privileged
       volumes:
         - /var/run/docker.sock:/var/run/docker.sock
+        # Expose the nv-gha-runners buildkitd.toml registry mirror config
+        # inside the container so setup-buildx can read it.
+        - /etc/buildkit:/etc/buildkit:ro
     env:
-      IMAGE_TAG: ${{ github.sha }}
+      IMAGE_TAG: ${{ needs.resolve.outputs.platform_count == '1' && github.sha || format('{0}-{1}', github.sha, matrix.arch) }}
       IMAGE_REGISTRY: ghcr.io/nvidia/openshell
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
-      DOCKER_PLATFORM: ${{ inputs.platform }}
+      DOCKER_PLATFORM: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,30 +174,99 @@ jobs:
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Fetch tags
-        run: git fetch --tags --force
-
-      - name: Compute cargo version
-        id: version
-        run: |
-          set -eu
-          if [[ -n "${{ inputs.cargo-version }}" ]]; then
-            echo "cargo_version=${{ inputs.cargo-version }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "cargo_version=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Install tools
+        run: mise install --locked
 
       - name: Log in to GHCR
+        if: ${{ inputs.push }}
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Set up Docker Buildx
+      - name: Set up buildx (local driver)
         uses: ./.github/actions/setup-buildx
+        with:
+          driver: local
+          buildkitd-config: /etc/buildkit/buildkitd.toml
+
+      - name: Download Rust binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
+          path: prebuilt-rust-binary
+
+      - name: Stage Rust binary in Docker build context
+        run: |
+          set -euo pipefail
+          binary="${{ needs.resolve.outputs.binary_name }}"
+          download_dir="prebuilt-rust-binary"
+          stage="deploy/docker/.build/prebuilt-binaries/${{ matrix.arch }}"
+          found="$(find "$download_dir" -type f -name "$binary" -print -quit)"
+          if [[ -z "$found" ]]; then
+            echo "missing downloaded artifact file: $binary" >&2
+            find "$download_dir" -maxdepth 4 -type f -print >&2 || true
+            exit 1
+          fi
+          mkdir -p "$stage"
+          install -m 0755 "$found" "$stage/$binary"
+          ls -lh "$stage/"
 
       - name: Build ${{ inputs.component }} image
         env:
           DOCKER_BUILDER: openshell
-          OPENSHELL_CARGO_VERSION: ${{ steps.version.outputs.cargo_version }}
-          # Enable dev-settings feature for test settings (dummy_bool, dummy_int)
-          # used by e2e tests.
-          EXTRA_CARGO_FEATURES: openshell-core/dev-settings
-        run: mise run --no-deps build:docker:${{ inputs.component }}
+        run: |
+          set -euo pipefail
+          mise exec -- tasks/scripts/docker-build-image.sh "${{ inputs.component }}" \
+            --cache-from "type=gha,scope=${{ inputs.component }}-${{ matrix.arch }}" \
+            --cache-to "type=gha,mode=max,scope=${{ inputs.component }}-${{ matrix.arch }}"
+
+      - name: Smoke check ${{ inputs.component }} image
+        if: ${{ !inputs.push }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE_REGISTRY}/${{ inputs.component }}:${IMAGE_TAG}"
+          case "${{ inputs.component }}" in
+            gateway)
+              output="$(docker run --rm --platform "${{ matrix.platform }}" "$image" --version)"
+              echo "$output"
+              grep -q '^openshell-gateway ' <<<"$output"
+              ;;
+            supervisor)
+              output="$(docker run --rm --platform "${{ matrix.platform }}" "$image" --version)"
+              echo "$output"
+              grep -q '^openshell-sandbox ' <<<"$output"
+              ;;
+            cluster)
+              output="$(docker run --rm --platform "${{ matrix.platform }}" --entrypoint /opt/openshell/bin/openshell-sandbox "$image" --version)"
+              echo "$output"
+              grep -q '^openshell-sandbox ' <<<"$output"
+              ;;
+          esac
+
+  merge:
+    name: Merge ${{ inputs.component }} manifest
+    needs: [resolve, build]
+    if: ${{ inputs.push && needs.resolve.outputs.platform_count != '1' }}
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Create multi-arch manifest
+        run: |
+          set -euo pipefail
+          image="ghcr.io/nvidia/openshell/${{ inputs.component }}"
+          refs=()
+          for arch in ${{ needs.resolve.outputs.arches }}; do
+            refs+=("${image}:${GITHUB_SHA}-${arch}")
+          done
+          docker buildx imagetools create \
+            --prefer-index=false \
+            -t "${image}:${GITHUB_SHA}" \
+            "${refs[@]}"

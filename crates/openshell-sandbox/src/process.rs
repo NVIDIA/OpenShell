@@ -35,13 +35,13 @@ fn scrub_sensitive_env(cmd: &mut Command) {
 }
 
 #[cfg(unix)]
-#[allow(unsafe_code)]
-pub(crate) fn harden_child_process() -> Result<()> {
+#[allow(unsafe_code, clippy::borrow_as_ptr)]
+pub fn harden_child_process() -> Result<()> {
     let core_limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    let rc = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &core_limit) };
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const core_limit) };
     if rc != 0 {
         return Err(miette::miette!(
             "Failed to disable core dumps: {}",
@@ -57,7 +57,7 @@ pub(crate) fn harden_child_process() -> Result<()> {
         rlim_cur: 512,
         rlim_max: 512,
     };
-    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &nproc_limit) };
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &raw const nproc_limit) };
     if rc != 0 {
         return Err(miette::miette!(
             "Failed to set RLIMIT_NPROC: {}",
@@ -427,7 +427,10 @@ impl Drop for ProcessHandle {
     }
 }
 
+// `effective_gid`/`effective_uid` are intentionally parallel names (same role
+// for different identifiers) and the noise from renaming would obscure intent.
 #[cfg(unix)]
+#[allow(clippy::similar_names)]
 pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
     let user_name = match policy.process.run_as_user.as_deref() {
         Some(name) if !name.is_empty() => Some(name),
@@ -740,11 +743,7 @@ mod tests {
                 let written = unsafe { libc::write(fds[1], bytes.as_ptr().cast(), bytes.len()) };
                 unsafe {
                     libc::close(fds[1]);
-                    libc::_exit(if written == bytes.len() as isize {
-                        0
-                    } else {
-                        1
-                    });
+                    libc::_exit(i32::from(written != bytes.len().cast_signed()));
                 }
             }
             ForkResult::Parent { child } => {
@@ -753,7 +752,7 @@ mod tests {
                 let read = unsafe { libc::read(fds[0], bytes.as_mut_ptr().cast(), bytes.len()) };
                 unsafe { libc::close(fds[0]) };
                 assert_eq!(
-                    read as usize,
+                    read.cast_unsigned(),
                     bytes.len(),
                     "expected {} probe bytes, got {}",
                     bytes.len(),
@@ -791,7 +790,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[allow(unsafe_code)]
     unsafe fn dumpable_flag_probe() -> i64 {
-        unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) as i64 }
+        unsafe { i64::from(libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0)) }
     }
 
     #[test]

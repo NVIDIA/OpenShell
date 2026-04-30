@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared sandbox policy parsing and defaults for OpenShell.
+//! Shared sandbox policy parsing and defaults for `OpenShell`.
 //!
 //! Provides bidirectional YAML↔proto conversion for sandbox policies.
 //!
@@ -117,6 +117,8 @@ struct NetworkEndpointDef {
     allow_encoded_slash: bool,
 }
 
+// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(v: &u16) -> bool {
     *v == 0
 }
@@ -369,12 +371,12 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                                 .query
                                                 .into_iter()
                                                 .map(|(key, matcher)| {
-                                                    let yaml_matcher = if !matcher.any.is_empty() {
+                                                    let yaml_matcher = if matcher.any.is_empty() {
+                                                        QueryMatcherDef::Glob(matcher.glob)
+                                                    } else {
                                                         QueryMatcherDef::Any(QueryAnyDef {
                                                             any: matcher.any,
                                                         })
-                                                    } else {
-                                                        QueryMatcherDef::Glob(matcher.glob)
                                                     };
                                                     (key, yaml_matcher)
                                                 })
@@ -395,12 +397,12 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                         .query
                                         .iter()
                                         .map(|(key, matcher)| {
-                                            let yaml_matcher = if !matcher.any.is_empty() {
+                                            let yaml_matcher = if matcher.any.is_empty() {
+                                                QueryMatcherDef::Glob(matcher.glob.clone())
+                                            } else {
                                                 QueryMatcherDef::Any(QueryAnyDef {
                                                     any: matcher.any.clone(),
                                                 })
-                                            } else {
-                                                QueryMatcherDef::Glob(matcher.glob.clone())
                                             };
                                             (key.clone(), yaml_matcher)
                                         })
@@ -535,9 +537,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
 /// the required `"sandbox"` value. Call this before validation so that
 /// policies without an explicit process section get the correct default.
 pub fn ensure_sandbox_process_identity(policy: &mut SandboxPolicy) {
-    let process = policy
-        .process
-        .get_or_insert_with(|| ProcessPolicy::default());
+    let process = policy.process.get_or_insert_with(ProcessPolicy::default);
     if process.run_as_user.is_empty() {
         process.run_as_user = "sandbox".into();
     }
@@ -812,7 +812,7 @@ network_policies:
     /// Verify that the network policy `name` field survives the round-trip.
     #[test]
     fn round_trip_preserves_policy_name() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   my_api:
@@ -822,7 +822,7 @@ network_policies:
         port: 443
     binaries:
       - path: /usr/bin/curl
-"#;
+";
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         assert_eq!(proto1.network_policies["my_api"].name, "my-custom-api-name");
 
@@ -891,7 +891,7 @@ network_policies:
 
     #[test]
     fn parse_policy_with_network_rules() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -900,7 +900,7 @@ network_policies:
       - { host: example.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         assert_eq!(policy.network_policies.len(), 1);
         let rule = &policy.network_policies["test"];
@@ -1277,7 +1277,7 @@ network_policies:
 
     #[test]
     fn parse_ports_array() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1286,7 +1286,7 @@ network_policies:
       - { host: api.example.com, ports: [80, 443] }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         let ep = &policy.network_policies["test"].endpoints[0];
         assert_eq!(ep.ports, vec![80, 443]);
@@ -1296,7 +1296,7 @@ network_policies:
 
     #[test]
     fn parse_single_port_normalized_to_ports() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1305,7 +1305,7 @@ network_policies:
       - { host: api.example.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         let ep = &policy.network_policies["test"].endpoints[0];
         assert_eq!(ep.ports, vec![443]);
@@ -1314,7 +1314,7 @@ network_policies:
 
     #[test]
     fn round_trip_preserves_multi_port() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1326,7 +1326,7 @@ network_policies:
           - 443
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
         let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
@@ -1339,7 +1339,7 @@ network_policies:
 
     #[test]
     fn serialize_single_port_uses_compact_form() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1348,7 +1348,7 @@ network_policies:
       - { host: api.example.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
         // Should use compact `port: 443` form, not `ports: [443]`
@@ -1493,7 +1493,7 @@ network_policies:
 
     #[test]
     fn parse_rejects_unknown_fields_in_deny_rule() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1504,20 +1504,20 @@ network_policies:
           - method: POST
             path: /foo
             bogus: true
-"#;
+";
         assert!(parse_sandbox_policy(yaml).is_err());
     }
 
     #[test]
     fn rejects_port_above_65535() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
     endpoints:
       - host: example.com
         port: 70000
-"#;
+";
         assert!(
             parse_sandbox_policy(yaml).is_err(),
             "port >65535 should fail to parse"

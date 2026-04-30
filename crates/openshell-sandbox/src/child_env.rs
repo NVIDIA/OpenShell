@@ -5,7 +5,7 @@ use std::path::Path;
 
 const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1";
 
-pub(crate) fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
+pub fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
     [
         ("ALL_PROXY", proxy_url.to_owned()),
         ("HTTP_PROXY", proxy_url.to_owned()),
@@ -21,14 +21,14 @@ pub(crate) fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
     ]
 }
 
-pub(crate) fn tls_env_vars(
+pub fn tls_env_vars(
     ca_cert_path: &Path,
     combined_bundle_path: &Path,
 ) -> [(&'static str, String); 5] {
     let ca_cert_path = ca_cert_path.display().to_string();
     let combined_bundle_path = combined_bundle_path.display().to_string();
     [
-        ("NODE_EXTRA_CA_CERTS", ca_cert_path.clone()),
+        ("NODE_EXTRA_CA_CERTS", ca_cert_path),
         ("SSL_CERT_FILE", combined_bundle_path.clone()),
         ("REQUESTS_CA_BUNDLE", combined_bundle_path.clone()),
         ("CURL_CA_BUNDLE", combined_bundle_path.clone()),

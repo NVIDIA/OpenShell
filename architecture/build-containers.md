@@ -19,7 +19,13 @@ The cluster image is a single-container Kubernetes distribution that bundles the
 - **Registry**: `ghcr.io/nvidia/openshell/cluster:latest`
 - **Pulled when**: `openshell gateway start`
 
-The supervisor binary (`openshell-sandbox`) is built by the shared `supervisor-builder` stage in `deploy/docker/Dockerfile.images` and placed at `/opt/openshell/bin/openshell-sandbox`. It is exposed to sandbox pods at runtime via a read-only `hostPath` volume mount — it is not baked into sandbox images.
+The supervisor binary (`openshell-sandbox`) is built before the image build, staged under `deploy/docker/.build/prebuilt-binaries/<arch>/`, and copied into the cluster image at `/opt/openshell/bin/openshell-sandbox`. It is exposed to sandbox pods at runtime via a read-only `hostPath` volume mount — it is not baked into sandbox images.
+
+## Image Build Pipeline
+
+`deploy/docker/Dockerfile.images` no longer compiles Rust. CI calls `.github/workflows/shadow-rust-native-build.yml` through `workflow_call` to build `openshell-gateway` or `openshell-sandbox` natively on the target architecture. `.github/workflows/docker-build.yml` downloads the resulting artifact, stages it at `deploy/docker/.build/prebuilt-binaries/<arch>/`, builds the per-arch image with the local Buildx driver, and merges multi-arch pushes with `docker buildx imagetools create`.
+
+Local Docker builds use `tasks/scripts/stage-prebuilt-binaries.sh` through `tasks/scripts/docker-build-image.sh` before invoking Docker, so clean checkouts do not need to create the staging directory manually.
 
 ## Standalone Gateway Binary
 
@@ -62,7 +68,7 @@ The incremental deploy (`cluster-deploy-fast.sh`) fingerprints local Git changes
 
 | Changed files | Rebuild triggered |
 |---|---|
-| Cargo manifests, proto definitions, cross-build script | Gateway + supervisor |
+| Cargo manifests, proto definitions, prebuilt staging script | Gateway + supervisor |
 | `crates/openshell-server/*`, `crates/openshell-ocsf/*`, `deploy/docker/Dockerfile.images` | Gateway |
 | `crates/openshell-sandbox/*`, `crates/openshell-policy/*` | Supervisor |
 | `deploy/helm/openshell/*` | Helm upgrade |

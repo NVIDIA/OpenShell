@@ -283,8 +283,8 @@ ensure_cargo_for_libkrun() {
 
   echo "ERROR: Cargo >= ${min_ver} is required to build libkrun (Rust edition 2024)." >&2
   echo "       Current: $(command -v cargo 2>/dev/null || echo '(no cargo in PATH)') $(cargo --version 2>/dev/null || true)" >&2
-  echo "       Typical fix: run vm:setup via mise from the repo so Rust stable is on PATH," >&2
-  echo "       or:  rustup update stable && export PATH=\"\$HOME/.cargo/bin:\$PATH\"" >&2
+  echo "       Typical fix: run vm:setup via mise from the repo so Rust 1.95.0 is on PATH," >&2
+  echo "       or:  rustup toolchain install 1.95.0 && rustup default 1.95.0 && export PATH=\"\$HOME/.cargo/bin:\$PATH\"" >&2
   echo "       Override minimum: LIBKRUN_MIN_CARGO_VERSION=…" >&2
   exit 1
 }

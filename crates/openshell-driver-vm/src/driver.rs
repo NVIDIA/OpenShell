@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::rootfs::{extract_sandbox_rootfs_to, sandbox_guest_init_path};
+use crate::gpu::{
+    GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
+};
+use crate::rootfs::{
+    extract_gpu_sandbox_rootfs_to, extract_sandbox_rootfs_to, sandbox_guest_init_path,
+};
 use futures::Stream;
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
@@ -16,7 +21,9 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
     compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
+use openshell_vfio::SysfsRoot;
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -62,6 +69,9 @@ pub struct VmDriverConfig {
     pub guest_tls_ca: Option<PathBuf>,
     pub guest_tls_cert: Option<PathBuf>,
     pub guest_tls_key: Option<PathBuf>,
+    pub gpu_enabled: bool,
+    pub gpu_mem_mib: u32,
+    pub gpu_vcpus: u8,
 }
 
 impl Default for VmDriverConfig {
@@ -79,6 +89,9 @@ impl Default for VmDriverConfig {
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
+            gpu_enabled: false,
+            gpu_mem_mib: 8192,
+            gpu_vcpus: 4,
         }
     }
 }
@@ -167,14 +180,17 @@ struct SandboxRecord {
     snapshot: Sandbox,
     state_dir: PathBuf,
     process: Arc<Mutex<VmProcess>>,
+    gpu_bdf: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VmDriver {
     config: VmDriverConfig,
     launcher_bin: PathBuf,
     registry: Arc<Mutex<HashMap<String, SandboxRecord>>>,
     events: broadcast::Sender<WatchSandboxesEvent>,
+    gpu_inventory: Option<Arc<std::sync::Mutex<GpuInventory>>>,
+    subnet_allocator: Arc<std::sync::Mutex<SubnetAllocator>>,
 }
 
 impl VmDriver {
@@ -184,6 +200,14 @@ impl VmDriver {
         }
         validate_openshell_endpoint(&config.openshell_endpoint)?;
         let _ = config.tls_paths()?;
+
+        #[cfg(target_os = "linux")]
+        if config.gpu_enabled {
+            check_gpu_privileges()?;
+            tokio::task::spawn_blocking(crate::cleanup_stale_tap_interfaces)
+                .await
+                .map_err(|e| format!("cleanup stale TAP interfaces panicked: {e}"))?;
+        }
 
         let state_root = config.state_dir.join("sandboxes");
         tokio::fs::create_dir_all(&state_root)
@@ -202,35 +226,70 @@ impl VmDriver {
                 .map_err(|err| format!("failed to resolve vm driver executable: {err}"))?
         };
 
+        let gpu_inventory = if config.gpu_enabled {
+            let sysfs = SysfsRoot::system();
+            let inventory = GpuInventory::new(sysfs, &config.state_dir);
+            tracing::info!(
+                gpu_count = inventory.gpu_count(),
+                "GPU inventory initialized"
+            );
+            Some(Arc::new(std::sync::Mutex::new(inventory)))
+        } else {
+            None
+        };
+
+        let subnet_allocator = Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
+            Ipv4Addr::new(10, 0, 128, 0),
+            17,
+        )));
+
         let (events, _) = broadcast::channel(WATCH_BUFFER);
         Ok(Self {
             config,
             launcher_bin,
             registry: Arc::new(Mutex::new(HashMap::new())),
             events,
+            gpu_inventory,
+            subnet_allocator,
         })
     }
 
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
+        let gpu_count = self
+            .gpu_inventory
+            .as_ref()
+            .and_then(|inv| inv.lock().ok())
+            .map_or(0, |inv| inv.gpu_count());
         GetCapabilitiesResponse {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: String::new(),
-            supports_gpu: false,
+            supports_gpu: self.gpu_inventory.is_some(),
+            gpu_count,
         }
     }
 
-    pub async fn validate_sandbox(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        validate_vm_sandbox(sandbox)
+    // `tonic::Status` is large but is the standard error type across the
+    // gRPC API surface; boxing here would diverge from every other handler.
+    #[allow(clippy::result_large_err)]
+    pub fn validate_sandbox(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        validate_vm_sandbox(sandbox, self.config.gpu_enabled)
     }
 
+    // `tonic::Status` is large but is the standard error type across the
+    // gRPC API surface; boxing here would diverge from every other handler.
+    #[allow(clippy::result_large_err)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<CreateSandboxResponse, Status> {
-        validate_vm_sandbox(sandbox)?;
+        validate_vm_sandbox(sandbox, self.config.gpu_enabled)?;
 
         if self.registry.lock().await.contains_key(&sandbox.id) {
             return Err(Status::already_exists("sandbox already exists"));
         }
+
+        let spec = sandbox.spec.as_ref();
+        let is_gpu = spec.is_some_and(|s| s.gpu);
+        let gpu_device = spec.map_or("", |s| s.gpu_device.as_str());
 
         let state_dir = sandbox_state_dir(&self.config.state_dir, &sandbox.id);
         let rootfs = state_dir.join("rootfs");
@@ -244,7 +303,12 @@ impl VmDriver {
             .tls_paths()
             .map_err(Status::failed_precondition)?;
         let rootfs_for_extract = rootfs.clone();
-        tokio::task::spawn_blocking(move || extract_sandbox_rootfs_to(&rootfs_for_extract))
+        let extract_fn = if is_gpu {
+            extract_gpu_sandbox_rootfs_to
+        } else {
+            extract_sandbox_rootfs_to
+        };
+        tokio::task::spawn_blocking(move || extract_fn(&rootfs_for_extract))
             .await
             .map_err(|err| Status::internal(format!("sandbox rootfs extraction panicked: {err}")))?
             .map_err(|err| Status::internal(format!("extract sandbox rootfs failed: {err}")))?;
@@ -256,21 +320,39 @@ impl VmDriver {
                 })?;
         }
 
+        let gpu_bdf = if is_gpu {
+            let inventory = self
+                .gpu_inventory
+                .as_ref()
+                .ok_or_else(|| Status::internal("GPU inventory not initialized"))?;
+            match inventory
+                .lock()
+                .map_err(|e| Status::internal(format!("GPU inventory lock poisoned: {e}")))
+                .and_then(|mut inv| {
+                    inv.assign(&sandbox.id, gpu_device)
+                        .map_err(Status::failed_precondition)
+                }) {
+                Ok(assignment) => {
+                    tracing::info!(
+                        sandbox_id = %sandbox.id,
+                        bdf = %assignment.bdf,
+                        gpu_name = %assignment.name,
+                        iommu_group = assignment.iommu_group,
+                        "assigned GPU to sandbox"
+                    );
+                    Some(assignment.bdf)
+                }
+                Err(err) => {
+                    let _ = tokio::fs::remove_dir_all(&state_dir).await;
+                    return Err(err);
+                }
+            }
+        } else {
+            None
+        };
+
         let console_output = state_dir.join("rootfs-console.log");
         let mut command = Command::new(&self.launcher_bin);
-        // Intentionally DO NOT set kill_on_drop(true). On a signal-driven
-        // driver exit (SIGKILL, SIGTERM without a handler, panic),
-        // tokio's Drop is racy with the launcher's procguard-initiated
-        // cleanup: if kill_on_drop SIGKILLs the launcher first, its
-        // cleanup callback never gets to SIGTERM gvproxy, and gvproxy is
-        // reparented to init as an orphan. Instead the whole cleanup
-        // cascade runs via procguard:
-        //   driver exits → launcher's kqueue (macOS) or PR_SET_PDEATHSIG
-        //   (Linux) fires → launcher kills gvproxy + libkrun fork →
-        //   launcher exits → its own children die under pdeathsig.
-        // The explicit Drop path in VmProcess::terminate_vm_process still
-        // handles voluntary `delete_sandbox` teardown cleanly, where we
-        // do want SIGTERM + wait + SIGKILL semantics.
         command.stdin(Stdio::null());
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
@@ -278,21 +360,83 @@ impl VmDriver {
         command.arg("--vm-rootfs").arg(&rootfs);
         command.arg("--vm-exec").arg(sandbox_guest_init_path());
         command.arg("--vm-workdir").arg("/");
-        command.arg("--vm-vcpus").arg(self.config.vcpus.to_string());
-        command
-            .arg("--vm-mem-mib")
-            .arg(self.config.mem_mib.to_string());
+        command.arg("--vm-console-output").arg(&console_output);
+
+        // Compute the endpoint override before building the env so
+        // there is a single OPENSHELL_ENDPOINT value in the env list.
+        let endpoint_override = if let Some(bdf) = gpu_bdf.as_ref() {
+            let subnet = match self
+                .subnet_allocator
+                .lock()
+                .map_err(|e| Status::internal(format!("subnet allocator lock poisoned: {e}")))
+                .and_then(|mut alloc| {
+                    alloc
+                        .allocate(&sandbox.id)
+                        .map_err(Status::failed_precondition)
+                }) {
+                Ok(s) => s,
+                Err(err) => {
+                    self.release_gpu_and_subnet(&sandbox.id);
+                    let _ = tokio::fs::remove_dir_all(&state_dir).await;
+                    return Err(err);
+                }
+            };
+            let vsock_cid = allocate_vsock_cid();
+            let mac = mac_from_sandbox_id(&sandbox.id);
+            let mac_str = format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            );
+            let tap = tap_device_name(&sandbox.id);
+
+            let tap_endpoint = guest_visible_openshell_endpoint_for_tap(
+                &self.config.openshell_endpoint,
+                &subnet.host_ip.to_string(),
+            );
+
+            command.arg("--vm-backend").arg("qemu");
+            command
+                .arg("--vm-vcpus")
+                .arg(self.config.gpu_vcpus.to_string());
+            command
+                .arg("--vm-mem-mib")
+                .arg(self.config.gpu_mem_mib.to_string());
+            command.arg("--vm-gpu-bdf").arg(bdf);
+            command.arg("--vm-tap-device").arg(&tap);
+            command
+                .arg("--vm-guest-ip")
+                .arg(subnet.guest_ip.to_string());
+            command.arg("--vm-host-ip").arg(subnet.host_ip.to_string());
+            command.arg("--vm-vsock-cid").arg(vsock_cid.to_string());
+            command.arg("--vm-guest-mac").arg(&mac_str);
+
+            if let Some(port) = gateway_port_from_endpoint(&self.config.openshell_endpoint) {
+                command.arg("--vm-gateway-port").arg(port.to_string());
+            }
+
+            Some(tap_endpoint)
+        } else {
+            command.arg("--vm-vcpus").arg(self.config.vcpus.to_string());
+            command
+                .arg("--vm-mem-mib")
+                .arg(self.config.mem_mib.to_string());
+            None
+        };
+
         command
             .arg("--vm-krun-log-level")
             .arg(self.config.krun_log_level.to_string());
-        command.arg("--vm-console-output").arg(&console_output);
-        for env in build_guest_environment(sandbox, &self.config) {
+
+        for env in build_guest_environment(sandbox, &self.config, endpoint_override.as_deref()) {
             command.arg("--vm-env").arg(env);
         }
 
         let child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
+                if gpu_bdf.is_some() {
+                    self.release_gpu_and_subnet(&sandbox.id);
+                }
                 let _ = tokio::fs::remove_dir_all(&state_dir).await;
                 return Err(Status::internal(format!(
                     "failed to launch vm helper '{}': {err}",
@@ -314,6 +458,7 @@ impl VmDriver {
                     snapshot: snapshot.clone(),
                     state_dir: state_dir.clone(),
                     process: process.clone(),
+                    gpu_bdf: gpu_bdf.clone(),
                 },
             );
         }
@@ -338,21 +483,31 @@ impl VmDriver {
         let record = {
             let registry = self.registry.lock().await;
             if let Some((id, record)) = registry.get_key_value(sandbox_id) {
-                Some((id.clone(), record.state_dir.clone(), record.process.clone()))
+                Some((
+                    id.clone(),
+                    record.state_dir.clone(),
+                    record.process.clone(),
+                    record.gpu_bdf.clone(),
+                ))
             } else {
                 let matched_id = registry
                     .iter()
                     .find(|(_, record)| record.snapshot.name == sandbox_name)
                     .map(|(id, _)| id.clone());
                 matched_id.and_then(|id| {
-                    registry
-                        .get(&id)
-                        .map(|record| (id, record.state_dir.clone(), record.process.clone()))
+                    registry.get(&id).map(|record| {
+                        (
+                            id,
+                            record.state_dir.clone(),
+                            record.process.clone(),
+                            record.gpu_bdf.clone(),
+                        )
+                    })
                 })
             }
         };
 
-        let Some((record_id, state_dir, process)) = record else {
+        let Some((record_id, state_dir, process, gpu_bdf)) = record else {
             return Ok(DeleteSandboxResponse { deleted: false });
         };
 
@@ -369,6 +524,10 @@ impl VmDriver {
             terminate_vm_process(&mut process.child)
                 .await
                 .map_err(|err| Status::internal(format!("failed to stop vm: {err}")))?;
+        }
+
+        if gpu_bdf.is_some() {
+            self.release_gpu_and_subnet(&record_id);
         }
 
         if let Err(err) = tokio::fs::remove_dir_all(&state_dir).await
@@ -394,14 +553,14 @@ impl VmDriver {
         sandbox_name: &str,
     ) -> Result<Option<Sandbox>, Status> {
         let registry = self.registry.lock().await;
-        let sandbox = if !sandbox_id.is_empty() {
-            registry
-                .get(sandbox_id)
-                .map(|record| record.snapshot.clone())
-        } else {
+        let sandbox = if sandbox_id.is_empty() {
             registry
                 .values()
                 .find(|record| record.snapshot.name == sandbox_name)
+                .map(|record| record.snapshot.clone())
+        } else {
+            registry
+                .get(sandbox_id)
                 .map(|record| record.snapshot.clone())
         };
         Ok(sandbox)
@@ -415,6 +574,17 @@ impl VmDriver {
             .collect::<Vec<_>>();
         snapshots.sort_by(|left, right| left.name.cmp(&right.name));
         snapshots
+    }
+
+    fn release_gpu_and_subnet(&self, sandbox_id: &str) {
+        if let Some(inventory) = self.gpu_inventory.as_ref()
+            && let Ok(mut inv) = inventory.lock()
+        {
+            inv.release(sandbox_id);
+        }
+        if let Ok(mut alloc) = self.subnet_allocator.lock() {
+            alloc.release(sandbox_id);
+        }
     }
 
     /// Watch the launcher child process and surface errors as driver
@@ -469,10 +639,10 @@ impl VmDriver {
             };
 
             if let Some(status) = exit_status {
-                let message = match status.code() {
-                    Some(code) => format!("VM process exited with status {code}"),
-                    None => "VM process exited".to_string(),
-                };
+                let message = status.code().map_or_else(
+                    || "VM process exited".to_string(),
+                    |code| format!("VM process exited with status {code}"),
+                );
                 if let Some(snapshot) = self
                     .set_snapshot_condition(
                         &sandbox_id,
@@ -487,6 +657,16 @@ impl VmDriver {
                     sandbox_id.clone(),
                     platform_event("vm", "Warning", "ProcessExited", message),
                 );
+                let has_gpu = {
+                    let registry = self.registry.lock().await;
+                    registry
+                        .get(&sandbox_id)
+                        .and_then(|r| r.gpu_bdf.as_ref())
+                        .is_some()
+                };
+                if has_gpu {
+                    self.release_gpu_and_subnet(&sandbox_id);
+                }
                 return;
             }
 
@@ -553,7 +733,7 @@ impl ComputeDriver for VmDriver {
             .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        self.validate_sandbox(&sandbox).await?;
+        self.validate_sandbox(&sandbox)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
@@ -668,7 +848,7 @@ impl ComputeDriver for VmDriver {
                             return;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -678,16 +858,38 @@ impl ComputeDriver for VmDriver {
     }
 }
 
-fn validate_vm_sandbox(sandbox: &Sandbox) -> Result<(), Status> {
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // libc::geteuid is a thin syscall wrapper
+fn check_gpu_privileges() -> Result<(), String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(
+            "GPU support requires root privileges for VFIO bind/unbind and TAP networking. \
+             Run with sudo or ensure CAP_SYS_ADMIN + CAP_NET_ADMIN capabilities are set."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+// `tonic::Status` is ~176 bytes; it's the standard error type across the
+// gRPC API surface, so boxing here would diverge from every other handler.
+#[allow(clippy::result_large_err)]
+fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Status> {
     let spec = sandbox
         .spec
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox spec is required"))?;
-    if spec.gpu {
+
+    if spec.gpu && !gpu_enabled {
         return Err(Status::failed_precondition(
-            "vm sandboxes do not support gpu=true",
+            "GPU support is not enabled on this driver; start with --gpu",
         ));
     }
+
+    if !spec.gpu && !spec.gpu_device.is_empty() {
+        return Err(Status::invalid_argument("gpu_device requires gpu=true"));
+    }
+
     if let Some(template) = spec.template.as_ref() {
         if !template.image.is_empty() {
             return Err(Status::failed_precondition(
@@ -744,7 +946,30 @@ fn guest_visible_openshell_endpoint(endpoint: &str) -> String {
     endpoint.to_string()
 }
 
-fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<String> {
+fn gateway_port_from_endpoint(endpoint: &str) -> Option<u16> {
+    Url::parse(endpoint).ok().and_then(|url| url.port())
+}
+
+fn guest_visible_openshell_endpoint_for_tap(endpoint: &str, host_ip: &str) -> String {
+    let Ok(mut url) = Url::parse(endpoint) else {
+        return endpoint.to_string();
+    };
+    if url.set_host(Some(host_ip)).is_ok() {
+        url.to_string()
+    } else {
+        endpoint.to_string()
+    }
+}
+
+fn build_guest_environment(
+    sandbox: &Sandbox,
+    config: &VmDriverConfig,
+    endpoint_override: Option<&str>,
+) -> Vec<String> {
+    let openshell_endpoint = endpoint_override.map_or_else(
+        || guest_visible_openshell_endpoint(&config.openshell_endpoint),
+        String::from,
+    );
     let mut environment = HashMap::from([
         ("HOME".to_string(), "/root".to_string()),
         (
@@ -752,10 +977,7 @@ fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<St
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
         ),
         ("TERM".to_string(), "xterm".to_string()),
-        (
-            "OPENSHELL_ENDPOINT".to_string(),
-            guest_visible_openshell_endpoint(&config.openshell_endpoint),
-        ),
+        ("OPENSHELL_ENDPOINT".to_string(), openshell_endpoint),
         ("OPENSHELL_SANDBOX_ID".to_string(), sandbox.id.clone()),
         ("OPENSHELL_SANDBOX".to_string(), sandbox.name.clone()),
         (
@@ -769,6 +991,10 @@ fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<St
         (
             "OPENSHELL_LOG_LEVEL".to_string(),
             sandbox_log_level(sandbox, &config.log_level),
+        ),
+        (
+            "OPENSHELL_SSH_HANDSHAKE_SECRET".to_string(),
+            config.ssh_handshake_secret.clone(),
         ),
     ]);
     if config.requires_tls_materials() {
@@ -836,7 +1062,7 @@ async fn copy_guest_tls_material(
 
 async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
     if let Some(pid) = child.id()
-        && let Err(err) = kill(Pid::from_raw(pid as i32), Signal::SIGTERM)
+        && let Err(err) = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM)
         && err != Errno::ESRCH
     {
         return Err(std::io::Error::other(format!(
@@ -930,12 +1156,15 @@ fn platform_event(source: &str, event_type: &str, reason: &str, message: String)
 fn current_time_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as i64)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::{SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name};
     use openshell_core::proto::compute::v1::{
         DriverSandboxSpec as SandboxSpec, DriverSandboxTemplate as SandboxTemplate,
     };
@@ -945,7 +1174,7 @@ mod tests {
     use tonic::Code;
 
     #[test]
-    fn validate_vm_sandbox_rejects_gpu() {
+    fn validate_vm_sandbox_rejects_gpu_when_not_enabled() {
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
                 gpu: true,
@@ -953,9 +1182,38 @@ mod tests {
             }),
             ..Default::default()
         };
-        let err = validate_vm_sandbox(&sandbox).expect_err("gpu should be rejected");
+        let err = validate_vm_sandbox(&sandbox, false)
+            .expect_err("gpu should be rejected when not enabled");
         assert_eq!(err.code(), Code::FailedPrecondition);
-        assert!(err.message().contains("gpu"));
+        assert!(err.message().contains("GPU support is not enabled"));
+    }
+
+    #[test]
+    fn validate_vm_sandbox_accepts_gpu_when_enabled() {
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                gpu: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_vm_sandbox(&sandbox, true).expect("gpu should be accepted when enabled");
+    }
+
+    #[test]
+    fn validate_vm_sandbox_rejects_gpu_device_without_gpu() {
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                gpu: false,
+                gpu_device: "0000:2d:00.0".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_vm_sandbox(&sandbox, true)
+            .expect_err("gpu_device without gpu should be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("gpu_device requires gpu=true"));
     }
 
     #[test]
@@ -964,13 +1222,12 @@ mod tests {
             spec: Some(SandboxSpec {
                 template: Some(SandboxTemplate {
                     platform_config: Some(Struct {
-                        fields: [(
+                        fields: std::iter::once((
                             "runtime_class_name".to_string(),
                             Value {
                                 kind: Some(Kind::StringValue("kata".to_string())),
                             },
-                        )]
-                        .into_iter()
+                        ))
                         .collect(),
                     }),
                     ..Default::default()
@@ -979,7 +1236,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let err = validate_vm_sandbox(&sandbox).expect_err("platform config should be rejected");
+        let err =
+            validate_vm_sandbox(&sandbox, false).expect_err("platform config should be rejected");
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(err.message().contains("platform_config"));
     }
@@ -1019,7 +1277,7 @@ mod tests {
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config);
+        let env = build_guest_environment(&sandbox, &config, None);
         assert!(env.contains(&"HOME=/root".to_string()));
         assert!(env.contains(&format!(
             "OPENSHELL_ENDPOINT=http://{GVPROXY_GATEWAY_IP}:8080/"
@@ -1028,6 +1286,39 @@ mod tests {
         assert!(env.contains(&format!(
             "OPENSHELL_SSH_SOCKET_PATH={GUEST_SSH_SOCKET_PATH}"
         )));
+        assert!(
+            env.contains(&"OPENSHELL_SSH_HANDSHAKE_SECRET=secret".to_string()),
+            "SSH handshake secret must be passed to the guest"
+        );
+    }
+
+    #[test]
+    fn build_guest_environment_uses_endpoint_override_for_tap() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ssh_handshake_secret: "secret".to_string(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, Some("http://10.0.128.1:8080"));
+        assert!(
+            env.contains(&"OPENSHELL_ENDPOINT=http://10.0.128.1:8080".to_string()),
+            "TAP endpoint override must replace the default"
+        );
+        let endpoint_count = env
+            .iter()
+            .filter(|e| e.starts_with("OPENSHELL_ENDPOINT="))
+            .count();
+        assert_eq!(
+            endpoint_count, 1,
+            "must have exactly one OPENSHELL_ENDPOINT"
+        );
     }
 
     #[test]
@@ -1085,7 +1376,7 @@ mod tests {
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config);
+        let env = build_guest_environment(&sandbox, &config, None);
         assert!(env.contains(&format!("OPENSHELL_TLS_CA={GUEST_TLS_CA_PATH}")));
         assert!(env.contains(&format!("OPENSHELL_TLS_CERT={GUEST_TLS_CERT_PATH}")));
         assert!(env.contains(&format!("OPENSHELL_TLS_KEY={GUEST_TLS_KEY_PATH}")));
@@ -1111,6 +1402,11 @@ mod tests {
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             events,
+            gpu_inventory: None,
+            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
+                Ipv4Addr::new(10, 0, 128, 0),
+                17,
+            ))),
         };
 
         let base = unique_temp_dir();
@@ -1233,6 +1529,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[test]
+    fn subnet_allocator_assigns_and_releases() {
+        let mut alloc = SubnetAllocator::new(Ipv4Addr::new(10, 0, 128, 0), 17);
+        let s1 = alloc.allocate("sandbox-1").unwrap();
+        assert_eq!(s1.host_ip, Ipv4Addr::new(10, 0, 128, 1));
+        assert_eq!(s1.guest_ip, Ipv4Addr::new(10, 0, 128, 2));
+        assert_eq!(s1.prefix_len, 30);
+
+        let s2 = alloc.allocate("sandbox-2").unwrap();
+        assert_ne!(s1.host_ip, s2.host_ip);
+
+        alloc.release("sandbox-1");
+        let s3 = alloc.allocate("sandbox-3").unwrap();
+        assert!(s3.host_ip != s2.host_ip);
+    }
+
+    #[test]
+    fn tap_device_name_fits_ifnamsiz() {
+        let name = tap_device_name("sandbox-abc-def-ghi");
+        assert!(name.len() <= 15);
+        assert!(name.starts_with("vmtap-"));
+    }
+
+    #[test]
+    fn mac_address_is_locally_administered() {
+        let mac = mac_from_sandbox_id("test-sandbox");
+        assert_eq!(mac[0] & 0x02, 0x02);
+        assert_eq!(mac[0] & 0x01, 0x00);
+    }
+
+    #[test]
+    fn vsock_cid_monotonically_increases() {
+        let cid1 = allocate_vsock_cid();
+        let cid2 = allocate_vsock_cid();
+        assert!(cid2 > cid1);
+    }
+
     fn unique_temp_dir() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
@@ -1280,6 +1613,7 @@ mod tests {
                 snapshot: sandbox,
                 state_dir,
                 process,
+                gpu_bdf: None,
             },
         );
     }

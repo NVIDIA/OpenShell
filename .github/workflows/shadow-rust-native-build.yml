@@ -1,28 +1,80 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Shadow — Rust Native Build (openshell-gateway / openshell-sandbox)
+name: Rust Native Build (openshell-gateway / openshell-sandbox)
 
-# OS-49 Phase 4 / PR 4a — non-blocking shadow that builds openshell-gateway
-# and openshell-sandbox natively per-arch on the nv-gha-runners shared CPU
-# pool (`linux-{amd64,arm64}-cpu8`) with a GHA-backed sccache, and uploads
-# the resulting binaries as artifacts. Reuses the pattern from PR #853's
-# release-dev.yml "Build standalone {gateway,supervisor} binaries" jobs.
-#
-# The artifacts match the layout PR 4c expects when consuming `BINARY_SOURCE=
-# prebuilt` (wired up in #945): one binary per (component, arch), staged to
-# `deploy/docker/.build/prebuilt-binaries/<arch>/openshell-{gateway,sandbox}`.
-#
-# Dispatch 4-5 times after merge to collect cold + warm numbers and compare
-# against the Rust portion of docker-build.yml's 17.5 m ARC baseline. Success
-# criteria, gotchas, and dependency graph live on the OS-128 Linear issue.
+# OS-128 Phase 4: build Rust binaries natively per Linux architecture before
+# the Docker image build consumes them as prebuilt artifacts.
 
 on:
-  # workflow_dispatch only — keeps this shadow off main's required-check
-  # surface and avoids cluttering CI history with non-blocking failures
-  # while we're still collecting Phase 4 data. Dispatch from the Actions
-  # UI to collect cold/warm-cache numbers.
+  workflow_call:
+    inputs:
+      component:
+        description: "Binary component to build (gateway or sandbox)"
+        required: true
+        type: string
+      arch:
+        description: "Linux architecture to build (amd64 or arm64)"
+        required: true
+        type: string
+      cargo-version:
+        description: "Pre-computed cargo version (skips internal git-based computation)"
+        required: false
+        type: string
+        default: ""
+      features:
+        description: "Cargo features to enable"
+        required: false
+        type: string
+        default: "openshell-core/dev-settings"
+      retention-days:
+        description: "Artifact retention period"
+        required: false
+        type: number
+        default: 5
+      artifact-name:
+        description: "Artifact name override"
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
+    inputs:
+      component:
+        description: "Binary component to build"
+        required: true
+        type: choice
+        default: gateway
+        options:
+          - gateway
+          - sandbox
+      arch:
+        description: "Linux architecture to build"
+        required: true
+        type: choice
+        default: amd64
+        options:
+          - amd64
+          - arm64
+      cargo-version:
+        description: "Cargo version override"
+        required: false
+        type: string
+        default: ""
+      features:
+        description: "Cargo features to enable"
+        required: false
+        type: string
+        default: "openshell-core/dev-settings"
+      retention-days:
+        description: "Artifact retention period"
+        required: false
+        type: number
+        default: 5
+      artifact-name:
+        description: "Artifact name override"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -36,39 +88,28 @@ env:
   # backend instead of the EKS memcached used by ARC.
   SCCACHE_GHA_ENABLED: "true"
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   rust-native-build:
-    name: ${{ matrix.component }} (${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        component: [gateway, sandbox]
-        arch: [amd64, arm64]
-        include:
-          - component: gateway
-            crate: openshell-server
-            binary: openshell-gateway
-          - component: sandbox
-            crate: openshell-sandbox
-            binary: openshell-sandbox
-          - arch: amd64
-            runner: linux-amd64-cpu8
-            target: x86_64-unknown-linux-gnu
-          - arch: arm64
-            runner: linux-arm64-cpu8
-            target: aarch64-unknown-linux-gnu
-    runs-on: ${{ matrix.runner }}
+    name: ${{ inputs.component }} (${{ inputs.arch }})
+    runs-on: ${{ inputs.arch == 'arm64' && 'linux-arm64-cpu8' || 'linux-amd64-cpu8' }}
+    timeout-minutes: 60
     env:
+      COMPONENT: ${{ inputs.component }}
+      ARCH: ${{ inputs.arch }}
+      FEATURES: ${{ inputs.features }}
       # Partition the GHA sccache cache per (component, arch). Without this,
-      # concurrent matrix jobs collide on the same cache key and later-starting
+      # concurrent jobs collide on the same cache key and later-starting
       # writers hit 409 Conflict (PR #961 fix for shadow-shared-cpu-spike).
-      SCCACHE_GHA_VERSION: ${{ matrix.component }}-${{ matrix.arch }}
+      SCCACHE_GHA_VERSION: ${{ inputs.component }}-${{ inputs.arch }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -81,7 +122,46 @@ jobs:
         run: git fetch --tags --force
 
       - name: Install tools
-        run: mise install
+        run: mise install --locked
+
+      - name: Resolve build target
+        id: target
+        run: |
+          set -euo pipefail
+
+          case "$COMPONENT" in
+            gateway)
+              crate=openshell-server
+              binary=openshell-gateway
+              ;;
+            sandbox)
+              crate=openshell-sandbox
+              binary=openshell-sandbox
+              ;;
+            *)
+              echo "unsupported component: $COMPONENT" >&2
+              exit 1
+              ;;
+          esac
+
+          case "$ARCH" in
+            amd64)
+              target=x86_64-unknown-linux-gnu
+              ;;
+            arm64)
+              target=aarch64-unknown-linux-gnu
+              ;;
+            *)
+              echo "unsupported arch: $ARCH" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "crate=$crate"
+            echo "binary=$binary"
+            echo "target=$target"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Configure GHA sccache backend
         # Exposes ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN so sccache (wrapped
@@ -91,7 +171,7 @@ jobs:
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
-          shared-key: shadow-rust-native-${{ matrix.component }}-${{ matrix.arch }}
+          shared-key: rust-native-${{ inputs.component }}-${{ inputs.arch }}
           cache-directories: .cache/sccache
           cache-targets: "true"
 
@@ -99,7 +179,11 @@ jobs:
         id: version
         run: |
           set -euo pipefail
-          echo "cargo_version=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
+          if [[ -n "${{ inputs['cargo-version'] }}" ]]; then
+            echo "cargo_version=${{ inputs['cargo-version'] }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "cargo_version=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Patch workspace version
         if: steps.version.outputs.cargo_version != ''
@@ -107,50 +191,65 @@ jobs:
           set -euo pipefail
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ steps.version.outputs.cargo_version }}"'"/}' Cargo.toml
 
-      - name: Build ${{ matrix.binary }} (${{ matrix.target }})
-        # Matches docker-build.yml's default EXTRA_CARGO_FEATURES so the
-        # binary content is byte-comparable to what Dockerfile.images produces
-        # today (precondition for PR 4c's drop-in swap).
+      - name: Build ${{ steps.target.outputs.binary }} (${{ steps.target.outputs.target }})
+        env:
+          # Preserve the release-codegen setting used by the old Dockerfile
+          # Rust build path so image artifacts keep the same release profile.
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
         run: |
           set -euo pipefail
-          mise x -- cargo build \
-            --release \
-            --target ${{ matrix.target }} \
-            -p ${{ matrix.crate }} \
-            --bin ${{ matrix.binary }} \
-            --features openshell-core/dev-settings
+          args=(
+            --release
+            --target "${{ steps.target.outputs.target }}"
+            -p "${{ steps.target.outputs.crate }}"
+            --bin "${{ steps.target.outputs.binary }}"
+          )
+          if [[ -n "$FEATURES" ]]; then
+            args+=(--features "$FEATURES")
+          fi
+          if [[ -n "${{ steps.version.outputs.cargo_version }}" ]]; then
+            export GIT_DIR=/nonexistent
+          fi
+          mise x -- cargo build "${args[@]}"
 
       - name: Verify packaged binary
         run: |
           set -euo pipefail
-          BIN="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          BIN="target/${{ steps.target.outputs.target }}/release/${{ steps.target.outputs.binary }}"
           OUTPUT="$("$BIN" --version)"
           echo "$OUTPUT"
-          grep -q "^${{ matrix.binary }} " <<<"$OUTPUT"
+          grep -q "^${{ steps.target.outputs.binary }} " <<<"$OUTPUT"
           # Record glibc linkage so drift from the Ubuntu noble runtime base
-          # image is visible in logs (not asserted — the runtime check lands
-          # when PR 4c builds images on top of these artifacts).
-          ldd --version | head -1
-          ldd "$BIN" | head -20 || true
-
-      - name: sccache stats
-        if: always()
-        run: mise x -- sccache --show-stats
+          # image is visible in logs.
+          ldd --version
+          ldd "$BIN" || true
 
       - name: Stage binary for prebuilt layout
-        # Shape mirrors `deploy/docker/.build/prebuilt-binaries/<arch>/<bin>`
-        # so PR 4c can download the artifact directly into the build context.
         run: |
           set -euo pipefail
-          STAGE="prebuilt-binaries/${{ matrix.arch }}"
+          STAGE="prebuilt-binaries/$ARCH"
           mkdir -p "$STAGE"
-          install -m 0755 "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$STAGE/${{ matrix.binary }}"
+          install -m 0755 \
+            "target/${{ steps.target.outputs.target }}/release/${{ steps.target.outputs.binary }}" \
+            "$STAGE/${{ steps.target.outputs.binary }}"
           ls -lh "$STAGE/"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rust-binary-${{ matrix.component }}-linux-${{ matrix.arch }}
-          path: prebuilt-binaries/${{ matrix.arch }}/${{ matrix.binary }}
-          retention-days: 5
+          name: ${{ inputs['artifact-name'] != '' && inputs['artifact-name'] || format('rust-binary-{0}-linux-{1}', inputs.component, inputs.arch) }}
+          path: prebuilt-binaries/${{ inputs.arch }}/${{ steps.target.outputs.binary }}
+          retention-days: ${{ inputs['retention-days'] }}
           if-no-files-found: error
+
+      - name: sccache stats
+        if: always()
+        run: |
+          set +e
+          stats_bin="${SCCACHE_PATH:-sccache}"
+          "$stats_bin" --show-stats
+          status=$?
+          if [[ $status -ne 0 ]]; then
+            echo "::warning::sccache stats unavailable (exit $status)"
+          fi
+          exit 0

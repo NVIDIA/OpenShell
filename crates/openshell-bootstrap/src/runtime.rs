@@ -136,7 +136,7 @@ where
                  The file /opt/openshell/bin/openshell-sandbox was not found in the gateway \
                  container. Without it, sandbox pods cannot start.\n\n\
                  This usually means the cluster image was built or published without the \
-                 supervisor-builder stage.\n\n\
+                 staged prebuilt openshell-sandbox binary.\n\n\
                  To fix:\n  \
                  1. Rebuild the cluster image: mise run docker:build:cluster\n  \
                  2. Or update to a cluster image that includes the supervisor binary\n  \

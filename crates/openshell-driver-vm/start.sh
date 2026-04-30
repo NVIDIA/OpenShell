@@ -4,6 +4,16 @@
 
 set -euo pipefail
 
+# Under sudo, PATH is reset and user-local tools (mise, cargo) disappear.
+# Restore the invoking user's tool directories so mise and its shims work.
+if [ -n "${SUDO_USER:-}" ]; then
+    _sudo_home=$(getent passwd "${SUDO_USER}" | cut -d: -f6)
+    for _p in "${_sudo_home}/.local/bin" "${_sudo_home}/.local/share/mise/shims" "${_sudo_home}/.cargo/bin"; do
+        [ -d "${_p}" ] && PATH="${_p}:${PATH}"
+    done
+    export PATH
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CLI_BIN="${ROOT}/scripts/bin/openshell"
 COMPRESSED_DIR="${ROOT}/target/vm-runtime-compressed"
@@ -27,6 +37,13 @@ DRIVER_DIR_DEFAULT="${ROOT}/target/debug"
 DRIVER_DIR="${OPENSHELL_DRIVER_DIR:-${DRIVER_DIR_DEFAULT}}"
 
 export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${COMPRESSED_DIR}}"
+
+for arg in "$@"; do
+    if [ "${arg}" = "--gpu" ]; then
+        export OPENSHELL_VM_GPU=true
+        break
+    fi
+done
 
 mkdir -p "${STATE_DIR}"
 
@@ -73,13 +90,19 @@ check_supervisor_cross_toolchain() {
     fi
 }
 
-if [ ! -f "${COMPRESSED_DIR}/rootfs.tar.zst" ]; then
+if [ ! -s "${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR}/rootfs.tar.zst" ]; then
     check_supervisor_cross_toolchain
     echo "==> Building base VM rootfs tarball"
     mise run vm:rootfs -- --base
 fi
 
-if [ ! -f "${COMPRESSED_DIR}/rootfs.tar.zst" ] || ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q .; then
+if [ "${OPENSHELL_VM_GPU:-}" = "true" ] && [ ! -s "${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR}/rootfs-gpu.tar.zst" ]; then
+    check_supervisor_cross_toolchain
+    echo "==> Building GPU VM rootfs tarball"
+    mise run vm:rootfs -- --gpu
+fi
+
+if [ ! -s "${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR}/rootfs.tar.zst" ] || ! find "${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q .; then
     echo "==> Preparing embedded VM runtime"
     mise run vm:setup
 fi
@@ -106,12 +129,37 @@ export OPENSHELL_SSH_GATEWAY_PORT="${OPENSHELL_SSH_GATEWAY_PORT:-${SERVER_PORT}}
 export OPENSHELL_SSH_HANDSHAKE_SECRET="${OPENSHELL_SSH_HANDSHAKE_SECRET:-dev-vm-driver-secret}"
 export OPENSHELL_VM_DRIVER_STATE_DIR="${STATE_DIR}"
 
-echo "==> Gateway registration"
+# Resolve the VM runtime directory (contains vmlinux, virtiofsd, etc.)
+# so the child --internal-run-vm process can find it under sudo.
+if [ -z "${OPENSHELL_VM_RUNTIME_DIR:-}" ]; then
+    _candidate="${HOME}/.local/share/openshell/vm-runtime/0.0.0"
+    if [ -n "${SUDO_USER:-}" ]; then
+        _sudo_home=$(getent passwd "${SUDO_USER}" | cut -d: -f6)
+        _candidate="${_sudo_home}/.local/share/openshell/vm-runtime/0.0.0"
+    fi
+    if [ -f "${_candidate}/vmlinux" ]; then
+        export OPENSHELL_VM_RUNTIME_DIR="${_candidate}"
+    fi
+fi
+
+echo "==> Registering gateway"
 echo "    Name: ${GATEWAY_NAME}"
 echo "    Endpoint: ${LOCAL_GATEWAY_ENDPOINT}"
-echo "    Register: ${CLI_BIN} gateway add --name ${GATEWAY_NAME} ${LOCAL_GATEWAY_ENDPOINT}"
-echo "    Select:   ${CLI_BIN} gateway select ${GATEWAY_NAME}"
-echo "    Driver:   ${OPENSHELL_DRIVER_DIR}/openshell-driver-vm"
+echo "    Driver: ${OPENSHELL_DRIVER_DIR}/openshell-driver-vm"
+
+# GPU passthrough requires root, but gateway config must be written to the
+# real user's home directory — not /root/.config/openshell/.
+# Unset XDG_CONFIG_HOME so the CLI falls back to $HOME/.config (sudo -u
+# sets HOME correctly but may inherit XDG_CONFIG_HOME from the root env).
+if [ -n "${SUDO_USER:-}" ]; then
+    sudo -u "${SUDO_USER}" env -u XDG_CONFIG_HOME "PATH=${PATH}" "${CLI_BIN}" gateway destroy --name "${GATEWAY_NAME}" 2>/dev/null || true
+    sudo -u "${SUDO_USER}" env -u XDG_CONFIG_HOME "PATH=${PATH}" "${CLI_BIN}" gateway add --name "${GATEWAY_NAME}" "${LOCAL_GATEWAY_ENDPOINT}"
+    sudo -u "${SUDO_USER}" env -u XDG_CONFIG_HOME "PATH=${PATH}" "${CLI_BIN}" gateway select "${GATEWAY_NAME}"
+else
+    "${CLI_BIN}" gateway destroy --name "${GATEWAY_NAME}" 2>/dev/null || true
+    "${CLI_BIN}" gateway add --name "${GATEWAY_NAME}" "${LOCAL_GATEWAY_ENDPOINT}"
+    "${CLI_BIN}" gateway select "${GATEWAY_NAME}"
+fi
 
 echo "==> Starting OpenShell server with VM compute driver"
 exec "${ROOT}/target/debug/openshell-gateway"

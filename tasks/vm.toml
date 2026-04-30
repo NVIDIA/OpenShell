@@ -17,7 +17,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 ["gateway:vm"]
-description = "Build openshell-gateway + openshell-driver-vm and start the gateway with the VM driver"
+description = "Build openshell-gateway + openshell-driver-vm and start the gateway with the VM driver (pass -- --gpu for GPU support)"
 run = "crates/openshell-driver-vm/start.sh"
 
 [vm]

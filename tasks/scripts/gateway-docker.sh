@@ -136,10 +136,8 @@ if [[ "${HOST_OS}" == "Linux" && "${HOST_ARCH}" == "${DAEMON_ARCH}" ]]; then
   mkdir -p "${SUPERVISOR_OUT_DIR}"
   cp "${ROOT}/target/${SUPERVISOR_TARGET}/debug/openshell-sandbox" "${SUPERVISOR_BIN}"
 else
-  # Cross-compile via the existing Docker pipeline. The supervisor-output
-  # stage in deploy/docker/Dockerfile.images extracts just the openshell-
-  # sandbox binary, with the actual link happening inside Linux containers
-  # where FD limits are not a problem.
+  # Cross-compile through the prebuilt-binary staging helper, then use the
+  # supervisor-output stage to extract just the openshell-sandbox binary.
   #
   # This task is gated on a working Docker daemon above, so pin the
   # container-engine helper to docker — otherwise it auto-detects podman

@@ -169,6 +169,7 @@ Common reason phrases emitted by the sandbox include:
 | `resolves to <ip> which is not in allowed_ips, connection rejected` | The destination resolved to an IP outside the policy's `allowed_ips` allowlist. |
 | `DNS resolution failed for <host>:<port>` | The proxy could not resolve the destination. |
 | `port <n> is a blocked control-plane port, connection rejected` | The destination port matches a control-plane port (etcd, Kubernetes API, kubelet) and is always blocked. |
+| `request-target contains an encoded '/' (%2F)` | The L7 HTTP parser rejected an encoded slash. Configure `allow_encoded_slash: true` on a REST endpoint when the upstream requires encoded slashes. |
 | `l7 deny` | An L7 policy rule denied the request. |
 
 Invalid `allowed_ips` entries and entries that overlap always-blocked ranges are rejected at policy-load time, so they never reach the runtime denial path. The phrases above come from the proxy's per-CONNECT `allowed_ips` and SSRF checks, not from policy validation.

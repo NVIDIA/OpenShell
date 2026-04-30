@@ -346,7 +346,7 @@ impl ProvisioningDisplay {
     }
 
     /// Clear all progress output (spinner, spacer, and completed step lines).
-    fn clear(&mut self) {
+    fn clear(&self) {
         self.spacer.finish_and_clear();
         self.spinner.finish_and_clear();
         for bar in &self.completed_bars {
@@ -390,13 +390,16 @@ fn format_bytes(bytes: u64) -> String {
     const GB: u64 = 1024 * MB;
 
     if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
+        // GB-scale precision loss is acceptable for a human-readable label.
+        #[allow(clippy::cast_precision_loss)]
+        let gb = bytes as f64 / GB as f64;
+        format!("{gb:.1} GB")
     } else if bytes >= MB {
         format!("{} MB", bytes / MB)
     } else if bytes >= KB {
         format!("{} KB", bytes / KB)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }
 
@@ -428,9 +431,7 @@ const CLUSTER_DEPLOY_LOG_LINES: usize = 15;
 
 /// Return the current terminal width, falling back to 80 columns.
 fn term_width() -> usize {
-    crossterm::terminal::size()
-        .map(|(w, _)| w as usize)
-        .unwrap_or(80)
+    crossterm::terminal::size().map_or(80, |(w, _)| w as usize)
 }
 
 /// Build a horizontal rule of `─` characters with an optional centered label.
@@ -445,7 +446,7 @@ fn horizontal_rule(label: Option<&str>, width: usize) -> String {
             let remaining = width - text_len;
             let left = remaining / 2;
             let right = remaining - left;
-            format!("{}{}{}", "─".repeat(left), text_with_pad, "─".repeat(right),)
+            format!("{}{}{}", "─".repeat(left), text_with_pad, "─".repeat(right))
         }
         None => "─".repeat(width),
     }
@@ -625,11 +626,10 @@ impl GatewayDeployLogPanel {
     }
 
     fn update_spinner_message(&self) {
-        let msg = if let Some(detail) = &self.progress {
-            format!("{} ({})", self.status, detail.dimmed())
-        } else {
-            self.status.clone()
-        };
+        let msg = self.progress.as_ref().map_or_else(
+            || self.status.clone(),
+            |detail| format!("{} ({})", self.status, detail.dimmed()),
+        );
         self.spinner.set_message(msg);
     }
 
@@ -883,13 +883,11 @@ fn plaintext_gateway_metadata(
     remote: Option<&str>,
     local: bool,
 ) -> GatewayMetadata {
-    let (remote_host, resolved_host) = if let Some(dest) = remote {
+    let (remote_host, resolved_host) = remote.map_or((None, None), |dest| {
         let ssh_host = extract_host_from_ssh_destination(dest);
         let resolved = resolve_ssh_hostname(&ssh_host);
         (Some(dest.to_string()), Some(resolved))
-    } else {
-        (None, None)
-    };
+    });
 
     GatewayMetadata {
         name: name.to_string(),
@@ -1086,13 +1084,11 @@ pub async fn gateway_add(
         openshell_bootstrap::extract_and_store_pki(name, remote_opts.as_ref(), endpoint_port)
             .await?;
 
-        let (remote_host, resolved_host) = if let Some(dest) = remote {
+        let (remote_host, resolved_host) = remote.map_or((None, None), |dest| {
             let ssh_host = extract_host_from_ssh_destination(dest);
             let resolved = resolve_ssh_hostname(&ssh_host);
             (Some(dest.to_string()), Some(resolved))
-        } else {
-            (None, None)
-        };
+        });
 
         let metadata = GatewayMetadata {
             name: name.to_string(),
@@ -1186,7 +1182,7 @@ pub async fn gateway_login(name: &str) -> Result<()> {
     let token = crate::auth::browser_auth_flow(&metadata.gateway_endpoint).await?;
     openshell_bootstrap::edge_token::store_edge_token(name, &token)?;
 
-    eprintln!("{} Authenticated to gateway '{name}'", "✓".green().bold(),);
+    eprintln!("{} Authenticated to gateway '{name}'", "✓".green().bold());
 
     Ok(())
 }
@@ -1426,6 +1422,7 @@ fn print_failure_diagnosis(diagnosis: &openshell_bootstrap::errors::GatewayFailu
 }
 
 /// Provision or start a gateway (local or remote).
+#[allow(clippy::too_many_arguments)] // user-facing CLI command
 pub async fn gateway_admin_deploy(
     name: &str,
     remote: Option<&str>,
@@ -1452,18 +1449,16 @@ pub async fn gateway_admin_deploy(
     });
 
     // If the gateway is already running and we're not recreating, short-circuit.
-    if !recreate {
-        if let Some(existing) =
+    if !recreate
+        && let Some(existing) =
             openshell_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
-        {
-            if existing.container_running {
-                eprintln!(
-                    "{} Gateway '{name}' is already running.",
-                    "✓".green().bold()
-                );
-                return Ok(());
-            }
-        }
+        && existing.container_running
+    {
+        eprintln!(
+            "{} Gateway '{name}' is already running.",
+            "✓".green().bold()
+        );
+        return Ok(());
     }
 
     // When resuming an existing gateway (not recreating), prefer the port
@@ -1471,10 +1466,10 @@ pub async fn gateway_admin_deploy(
     // may have originally bootstrapped on a non-default port (e.g. `--port
     // 8082`) or with `--gateway-host host.docker.internal`, and a bare
     // `gateway start` without those flags should honour the original values.
-    let stored_metadata = if !recreate {
-        openshell_bootstrap::load_gateway_metadata(name).ok()
-    } else {
+    let stored_metadata = if recreate {
         None
+    } else {
+        openshell_bootstrap::load_gateway_metadata(name).ok()
     };
     let effective_port = stored_metadata
         .as_ref()
@@ -1690,6 +1685,7 @@ pub fn gateway_admin_info(name: &str) -> Result<()> {
 ///
 /// Connects to the Docker daemon (local or remote via SSH) and retrieves
 /// logs from the `openshell-cluster-{name}` container.
+#[allow(clippy::future_not_send)] // Holds stdout lock; CLI command, never sent across threads.
 pub async fn doctor_logs(
     name: &str,
     lines: Option<usize>,
@@ -1698,24 +1694,29 @@ pub async fn doctor_logs(
     ssh_key: Option<&str>,
 ) -> Result<()> {
     // Build remote options: explicit --remote flag, or auto-resolve from metadata
-    let remote_opts = if let Some(dest) = remote {
-        let mut opts = RemoteOptions::new(dest);
-        if let Some(key) = ssh_key {
-            opts = opts.with_ssh_key(key);
-        }
-        Some(opts)
-    } else if let Some(metadata) = get_gateway_metadata(name)
-        && metadata.is_remote
-        && let Some(ref host) = metadata.remote_host
-    {
-        let mut opts = RemoteOptions::new(host.clone());
-        if let Some(key) = ssh_key {
-            opts = opts.with_ssh_key(key);
-        }
-        Some(opts)
-    } else {
-        None
-    };
+    let remote_opts = remote.map_or_else(
+        || {
+            if let Some(metadata) = get_gateway_metadata(name)
+                && metadata.is_remote
+                && let Some(ref host) = metadata.remote_host
+            {
+                let mut opts = RemoteOptions::new(host.clone());
+                if let Some(key) = ssh_key {
+                    opts = opts.with_ssh_key(key);
+                }
+                Some(opts)
+            } else {
+                None
+            }
+        },
+        |dest| {
+            let mut opts = RemoteOptions::new(dest);
+            if let Some(key) = ssh_key {
+                opts = opts.with_ssh_key(key);
+            }
+            Some(opts)
+        },
+    );
 
     let stdout = std::io::stdout().lock();
     openshell_bootstrap::gateway_container_logs(remote_opts.as_ref(), name, lines, tail, stdout)
@@ -1746,15 +1747,18 @@ pub fn doctor_exec(
     };
 
     // Resolve remote destination: explicit --remote flag, or auto-resolve from metadata
-    let remote_host = if let Some(dest) = remote {
-        Some(dest.to_string())
-    } else if let Some(metadata) = get_gateway_metadata(name)
-        && metadata.is_remote
-    {
-        metadata.remote_host.clone()
-    } else {
-        None
-    };
+    let remote_host = remote.map_or_else(
+        || {
+            if let Some(metadata) = get_gateway_metadata(name)
+                && metadata.is_remote
+            {
+                metadata.remote_host
+            } else {
+                None
+            }
+        },
+        |dest| Some(dest.to_string()),
+    );
 
     let mut cmd = if let Some(ref host) = remote_host {
         validate_ssh_host(host)?;
@@ -1830,6 +1834,7 @@ pub fn doctor_llm() -> Result<()> {
 ///
 /// Checks Docker connectivity and reports the result. Returns exit code 0
 /// if all checks pass, 1 otherwise.
+#[allow(clippy::future_not_send)] // Holds stdout lock; CLI command, never sent across threads.
 pub async fn doctor_check() -> Result<()> {
     use std::io::Write;
     let mut stdout = std::io::stdout().lock();
@@ -1850,7 +1855,7 @@ pub async fn doctor_check() -> Result<()> {
             match std::env::var("DOCKER_HOST") {
                 Ok(val) => writeln!(stdout, "{val}").into_diagnostic()?,
                 Err(_) => writeln!(stdout, "(not set, using default socket)").into_diagnostic()?,
-            };
+            }
 
             writeln!(stdout, "\nAll checks passed.").into_diagnostic()?;
             Ok(())
@@ -1925,6 +1930,7 @@ pub async fn sandbox_create_with_bootstrap(
     upload: Option<&(String, Option<String>, bool)>,
     keep: bool,
     gpu: bool,
+    gpu_device: Option<&str>,
     editor: Option<Editor>,
     remote: Option<&str>,
     ssh_key: Option<&str>,
@@ -1944,11 +1950,15 @@ pub async fn sandbox_create_with_bootstrap(
         ));
     }
     let requested_gpu = gpu || from.is_some_and(source_requests_gpu);
-    let (tls, server, gateway_name) =
-        crate::bootstrap::run_bootstrap(remote, ssh_key, requested_gpu).await?;
+    let (tls, server, gateway_name) = Box::pin(crate::bootstrap::run_bootstrap(
+        remote,
+        ssh_key,
+        requested_gpu,
+    ))
+    .await?;
     // Disable bootstrap inside sandbox_create so that a transient connection
     // failure right after deploy does not trigger a second bootstrap attempt.
-    sandbox_create(
+    Box::pin(sandbox_create(
         &server,
         name,
         from,
@@ -1956,6 +1966,7 @@ pub async fn sandbox_create_with_bootstrap(
         upload,
         keep,
         gpu,
+        gpu_device,
         editor,
         remote,
         ssh_key,
@@ -1968,7 +1979,7 @@ pub async fn sandbox_create_with_bootstrap(
         auto_providers_override,
         &HashMap::new(),
         &tls,
-    )
+    ))
     .await
 }
 
@@ -2003,7 +2014,7 @@ async fn finalize_sandbox_create_session(
 }
 
 /// Create a sandbox with default settings.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)] // user-facing CLI command; default hasher is fine
 pub async fn sandbox_create(
     server: &str,
     name: Option<&str>,
@@ -2012,6 +2023,7 @@ pub async fn sandbox_create(
     upload: Option<&(String, Option<String>, bool)>,
     keep: bool,
     gpu: bool,
+    gpu_device: Option<&str>,
     editor: Option<Editor>,
     remote: Option<&str>,
     ssh_key: Option<&str>,
@@ -2071,8 +2083,12 @@ pub async fn sandbox_create(
                 return Err(err);
             }
             let requested_gpu = gpu || from.is_some_and(source_requests_gpu);
-            let (new_tls, new_server, _) =
-                crate::bootstrap::run_bootstrap(remote, ssh_key, requested_gpu).await?;
+            let (new_tls, new_server, _) = Box::pin(crate::bootstrap::run_bootstrap(
+                remote,
+                ssh_key,
+                requested_gpu,
+            ))
+            .await?;
             let c = grpc_client(&new_server, &new_tls)
                 .await
                 .wrap_err("bootstrap succeeded but failed to connect to gateway")?;
@@ -2119,6 +2135,7 @@ pub async fn sandbox_create(
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             gpu: requested_gpu,
+            gpu_device: gpu_device.unwrap_or_default().to_string(),
             policy,
             providers: configured_providers,
             template,
@@ -2334,7 +2351,7 @@ pub async fn sandbox_create(
                             let label = if size_label.is_empty() {
                                 "Image pulled".to_string()
                             } else {
-                                format!("Image pulled ({})", size_label)
+                                format!("Image pulled ({size_label})")
                             };
                             if let Some(d) = display.as_mut() {
                                 d.complete_step_with_label(
@@ -2373,10 +2390,10 @@ pub async fn sandbox_create(
                     eprintln!("  {} {} {}", ts.dimmed(), "WARN".yellow(), w.message);
                 }
             }
-            Some(openshell_core::proto::sandbox_stream_event::Payload::DraftPolicyUpdate(_)) => {
+            Some(openshell_core::proto::sandbox_stream_event::Payload::DraftPolicyUpdate(_))
+            | None => {
                 // Draft policy updates are handled in the draft panel, not during provisioning.
             }
-            None => {}
         }
     }
 
@@ -2419,6 +2436,7 @@ pub async fn sandbox_create(
                         &sandbox_name,
                         &base_dir,
                         &files,
+                        local,
                         dest,
                         &effective_tls,
                     )
@@ -2433,7 +2451,7 @@ pub async fn sandbox_create(
                     )
                     .await?;
                 }
-                eprintln!("  {} Files uploaded", "\u{2713}".green().bold(),);
+                eprintln!("  {} Files uploaded", "\u{2713}".green().bold());
             }
 
             // If --forward was requested, start the background port forward
@@ -2622,14 +2640,10 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
 }
 
 fn source_requests_gpu(source: &str) -> bool {
-    if let Ok(resolved) = resolve_from(source) {
-        match resolved {
-            ResolvedSource::Image(image) => image_requests_gpu(&image),
-            ResolvedSource::Dockerfile { .. } => false,
-        }
-    } else {
-        false
-    }
+    resolve_from(source).is_ok_and(|resolved| match resolved {
+        ResolvedSource::Image(image) => image_requests_gpu(&image),
+        ResolvedSource::Dockerfile { .. } => false,
+    })
 }
 
 fn image_requests_gpu(image: &str) -> bool {
@@ -2813,14 +2827,14 @@ pub async fn sandbox_get(
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase));
 
     // Display labels if present
-    if let Some(metadata) = &sandbox.metadata {
-        if !metadata.labels.is_empty() {
-            println!("  {} ", "Labels:".dimmed());
-            let mut labels: Vec<_> = metadata.labels.iter().collect();
-            labels.sort_by_key(|(k, _)| *k);
-            for (key, value) in labels {
-                println!("    {}: {}", key, value);
-            }
+    if let Some(metadata) = &sandbox.metadata
+        && !metadata.labels.is_empty()
+    {
+        println!("  {} ", "Labels:".dimmed());
+        let mut labels: Vec<_> = metadata.labels.iter().collect();
+        labels.sort_by_key(|(k, _)| *k);
+        for (key, value) in labels {
+            println!("    {key}: {value}");
         }
     }
 
@@ -2900,7 +2914,9 @@ pub async fn sandbox_exec_grpc(
     // Read stdin if piped (not a TTY), using spawn_blocking to avoid blocking
     // the async runtime. Cap the read at MAX_STDIN_PAYLOAD + 1 so we never
     // buffer more than the limit into memory.
-    let stdin_payload = if !std::io::stdin().is_terminal() {
+    let stdin_payload = if std::io::stdin().is_terminal() {
+        Vec::new()
+    } else {
         tokio::task::spawn_blocking(|| {
             let limit = (MAX_STDIN_PAYLOAD + 1) as u64;
             let mut buf = Vec::new();
@@ -2918,8 +2934,6 @@ pub async fn sandbox_exec_grpc(
         })
         .await
         .into_diagnostic()?? // first ? unwraps JoinError, second ? unwraps Result
-    } else {
-        Vec::new()
     };
 
     // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
@@ -3250,9 +3264,8 @@ async fn drain_and_shutdown_local_socket(mut socket: tokio::net::TcpStream) {
     let mut buf = [0u8; 4096];
     loop {
         match tokio::time::timeout(Duration::from_millis(25), socket.read(&mut buf)).await {
-            Ok(Ok(0)) | Err(_) => break,
-            Ok(Ok(_)) => continue,
-            Ok(Err(_)) => break,
+            Ok(Ok(0) | Err(_)) | Err(_) => break,
+            Ok(Ok(_)) => {}
         }
     }
     let _ = socket.shutdown().await;
@@ -3353,7 +3366,7 @@ pub async fn sandbox_list(
 
     if names_only {
         for sandbox in sandboxes {
-            println!("{}", sandbox.object_name().to_string());
+            println!("{}", sandbox.object_name());
         }
         return Ok(());
     }
@@ -3385,13 +3398,7 @@ pub async fn sandbox_list(
             Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
             _ => phase.to_string(),
         };
-        let created = format_epoch_ms(
-            sandbox
-                .metadata
-                .as_ref()
-                .map(|m| m.created_at_ms)
-                .unwrap_or(0),
-        );
+        let created = format_epoch_ms(sandbox.metadata.as_ref().map_or(0, |m| m.created_at_ms));
         println!(
             "{:<name_width$}  {:<created_width$}  {}",
             sandbox.object_name().to_string(),
@@ -3680,7 +3687,7 @@ async fn auto_create_provider(
         eprintln!(
             "{} Created provider {} ({}) from existing local state",
             "✓".green().bold(),
-            provider.object_name().to_string(),
+            provider.object_name(),
             provider.r#type
         );
         if seen_names.insert(provider.object_name().to_string()) {
@@ -3719,7 +3726,7 @@ async fn auto_create_provider(
                     eprintln!(
                         "{} Created provider {} ({}) from existing local state",
                         "✓".green().bold(),
-                        provider.object_name().to_string(),
+                        provider.object_name(),
                         provider.r#type
                     );
                     if seen_names.insert(provider.object_name().to_string()) {
@@ -3878,7 +3885,7 @@ pub async fn provider_create(
     println!(
         "{} Created provider {}",
         "✓".green().bold(),
-        provider.object_name().to_string()
+        provider.object_name()
     );
     Ok(())
 }
@@ -3902,12 +3909,8 @@ pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<
 
     println!("{}", "Provider:".cyan().bold());
     println!();
-    println!("  {} {}", "Id:".dimmed(), provider.object_id().to_string());
-    println!(
-        "  {} {}",
-        "Name:".dimmed(),
-        provider.object_name().to_string()
-    );
+    println!("  {} {}", "Id:".dimmed(), provider.object_id());
+    println!("  {} {}", "Name:".dimmed(), provider.object_name());
     println!("  {} {}", "Type:".dimmed(), provider.r#type);
     println!(
         "  {} {}",
@@ -3954,7 +3957,7 @@ pub async fn provider_list(
 
     if names_only {
         for provider in providers {
-            println!("{}", provider.object_name().to_string());
+            println!("{}", provider.object_name());
         }
         return Ok(());
     }
@@ -4068,7 +4071,7 @@ pub async fn provider_update(
     println!(
         "{} Updated provider {}",
         "✓".green().bold(),
-        provider.object_name().to_string()
+        provider.object_name()
     );
     Ok(())
 }
@@ -4660,9 +4663,9 @@ pub async fn sandbox_settings_get(
         "sandbox"
     };
 
-    println!("Sandbox:       {}", name);
+    println!("Sandbox:       {name}");
     println!("Config Rev:    {}", response.config_revision);
-    println!("Policy Source: {}", policy_source);
+    println!("Policy Source: {policy_source}");
     println!("Policy Hash:   {}", response.policy_hash);
 
     if response.settings.is_empty() {
@@ -4884,7 +4887,7 @@ pub async fn gateway_setting_delete(
             response.settings_revision
         );
     } else {
-        println!("{} Global setting {} not found", "!".yellow(), key,);
+        println!("{} Global setting {} not found", "!".yellow(), key);
     }
     Ok(())
 }
@@ -5407,6 +5410,7 @@ fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicy
 // Sandbox logs command
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)] // user-facing CLI command
 pub async fn sandbox_logs(
     server: &str,
     name: &str,

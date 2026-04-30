@@ -137,7 +137,7 @@ impl OpaEngine {
                     .severity(openshell_ocsf::SeverityId::Medium)
                     .status(openshell_ocsf::StatusId::Success)
                     .state(openshell_ocsf::StateId::Enabled, "validated")
-                    .unmapped("warning", serde_json::json!(w.to_string()))
+                    .unmapped("warning", serde_json::json!(w.clone()))
                     .message(format!("L7 policy validation warning: {w}"))
                     .build()
             );
@@ -278,15 +278,14 @@ impl OpaEngine {
             Some(value_to_string(&matched))
         };
 
-        match action_str.as_str() {
-            "allow" => Ok(NetworkAction::Allow { matched_policy }),
-            _ => {
-                let reason_val = engine
-                    .eval_rule("data.openshell.sandbox.deny_reason".into())
-                    .map_err(|e| miette::miette!("{e}"))?;
-                let reason = value_to_string(&reason_val);
-                Ok(NetworkAction::Deny { reason })
-            }
+        if action_str == "allow" {
+            Ok(NetworkAction::Allow { matched_policy })
+        } else {
+            let reason_val = engine
+                .eval_rule("data.openshell.sandbox.deny_reason".into())
+                .map_err(|e| miette::miette!("{e}"))?;
+            let reason = value_to_string(&reason_val);
+            Ok(NetworkAction::Deny { reason })
         }
     }
 
@@ -435,10 +434,10 @@ impl OpaEngine {
     /// match. This is used by the proxy to decide between full SSRF blocking
     /// and allowlist-based IP validation.
     pub fn query_allowed_ips(&self, input: &NetworkInput) -> Result<Vec<String>> {
-        match self.query_endpoint_config(input)? {
-            Some(val) => Ok(get_str_array(&val, "allowed_ips")),
-            None => Ok(vec![]),
-        }
+        Ok(self
+            .query_endpoint_config(input)?
+            .map(|val| get_str_array(&val, "allowed_ips"))
+            .unwrap_or_default())
     }
 
     /// Clone the inner regorus engine for per-tunnel L7 evaluation.
@@ -557,7 +556,7 @@ fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
                 .severity(openshell_ocsf::SeverityId::Medium)
                 .status(openshell_ocsf::StatusId::Success)
                 .state(openshell_ocsf::StateId::Enabled, "validated")
-                .unmapped("warning", serde_json::json!(w.to_string()))
+                .unmapped("warning", serde_json::json!(w.clone()))
                 .message(format!("L7 policy validation warning: {w}"))
                 .build()
         );
@@ -594,9 +593,8 @@ fn normalize_endpoint_ports(data: &mut serde_json::Value) {
         };
 
         for ep in endpoints.iter_mut() {
-            let ep_obj = match ep.as_object_mut() {
-                Some(obj) => obj,
-                None => continue,
+            let Some(ep_obj) = ep.as_object_mut() else {
+                continue;
             };
 
             // If "ports" already exists and is non-empty, keep it.
@@ -637,10 +635,12 @@ fn normalize_endpoint_ports(data: &mut serde_json::Value) {
 /// - Path is not a symlink
 /// - Resolution fails (binary doesn't exist in container)
 /// - Resolved path equals the original
+///
 /// Normalize a path by resolving `.` and `..` components without touching
 /// the filesystem. Only works correctly for absolute paths.
-fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
-    let mut result = std::path::PathBuf::new();
+#[cfg(any(target_os = "linux", test))]
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
     for component in path.components() {
         match component {
             std::path::Component::ParentDir => {
@@ -664,7 +664,7 @@ fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option
     // /proc/<pid>/root itself (a kernel pseudo-symlink to /) which
     // strips the prefix we need. read_link only reads the target of
     // the specified symlink, keeping us in the container's namespace.
-    let mut resolved = std::path::PathBuf::from(policy_path);
+    let mut resolved = PathBuf::from(policy_path);
 
     // Linux SYMLOOP_MAX is 40; stop before infinite loops
     for _ in 0..40 {
@@ -911,6 +911,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                             .collect();
                         ep["deny_rules"] = deny_rules.into();
                     }
+                    if e.allow_encoded_slash {
+                        ep["allow_encoded_slash"] = true.into();
+                    }
                     ep
                 })
                 .collect();
@@ -946,6 +949,13 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::needless_raw_string_hashes,
+    clippy::similar_names,
+    clippy::doc_markdown,
+    clippy::match_wildcard_for_single_variants,
+    reason = "Test code: test fixtures and panic-on-unexpected matches are idiomatic in tests."
+)]
 mod tests {
     use super::*;
 
@@ -1937,6 +1947,63 @@ process:
         let l7 = crate::l7::parse_l7_config(&config).unwrap();
         assert_eq!(l7.protocol, crate::l7::L7Protocol::Rest);
         assert_eq!(l7.enforcement, crate::l7::EnforcementMode::Enforce);
+    }
+
+    #[test]
+    fn l7_endpoint_config_preserves_proto_allow_encoded_slash() {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "npm".to_string(),
+            NetworkPolicyRule {
+                name: "npm".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "registry.npmjs.org".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    enforcement: "enforce".to_string(),
+                    access: "read-only".to_string(),
+                    allow_encoded_slash: true,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/node".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+
+        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
+        let input = NetworkInput {
+            host: "registry.npmjs.org".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let config = engine
+            .query_endpoint_config(&input)
+            .unwrap()
+            .expect("endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).unwrap();
+        assert!(l7.allow_encoded_slash);
     }
 
     #[test]
@@ -3673,9 +3740,8 @@ network_policies:
     #[cfg(target_os = "linux")]
     fn procfs_root_accessible() -> bool {
         use std::os::unix::fs::symlink;
-        let dir = match tempfile::tempdir() {
-            Ok(d) => d,
-            Err(_) => return false,
+        let Ok(dir) = tempfile::tempdir() else {
+            return false;
         };
         let target = dir.path().join("probe_target");
         let link = dir.path().join("probe_link");
@@ -3694,6 +3760,8 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_binary_with_real_symlink() {
+        use std::os::unix::fs::symlink;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
@@ -3701,7 +3769,6 @@ network_policies:
 
         // Create a real symlink in a temp directory and verify resolution
         // works through /proc/self/root (which maps to / on the host)
-        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("python3.11");
         let link = dir.path().join("python3");
@@ -3730,13 +3797,14 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_binary_non_symlink_returns_none() {
+        use std::io::Write;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
         }
 
         // A regular file should return None (no expansion needed)
-        use std::io::Write;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"regular file").unwrap();
         tmp.flush().unwrap();
@@ -3754,13 +3822,14 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_binary_multi_level_symlink() {
+        use std::os::unix::fs::symlink;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
         }
 
         // Test multi-level symlink resolution: python3 -> python3.11 -> cpython3.11
-        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let final_target = dir.path().join("cpython3.11");
         let mid_link = dir.path().join("python3.11");
@@ -3785,6 +3854,8 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn from_proto_with_pid_expands_symlinks_in_container() {
+        use std::os::unix::fs::symlink;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
@@ -3792,7 +3863,6 @@ network_policies:
 
         // End-to-end test: create a symlink, build engine with our PID,
         // verify the resolved path is allowed
-        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("node22");
         let link = dir.path().join("node");
@@ -3861,6 +3931,8 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn reload_from_proto_with_pid_resolves_symlinks() {
+        use std::os::unix::fs::symlink;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
@@ -3868,7 +3940,6 @@ network_policies:
 
         // Test hot-reload path: initial engine at pid=0, then reload with
         // real PID to trigger symlink resolution
-        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("python3.11");
         let link = dir.path().join("python3");

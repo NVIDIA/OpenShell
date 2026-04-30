@@ -448,9 +448,8 @@ where
                     break;
                 }
             }
-            Ok(Message::Close(_)) => break,
+            Ok(Message::Close(_)) | Err(_) => break,
             Ok(Message::Ping(_) | Message::Pong(_)) => {}
-            Err(_) => break,
         }
     }
     let _ = writer.shutdown().await;

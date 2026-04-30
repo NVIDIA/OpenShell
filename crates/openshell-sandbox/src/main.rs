@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenShell Sandbox - process sandbox and monitor.
+//! `OpenShell` Sandbox - process sandbox and monitor.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -16,7 +16,7 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 use openshell_sandbox::run_sandbox;
 
-/// OpenShell Sandbox - process isolation and monitoring.
+/// `OpenShell` Sandbox - process isolation and monitoring.
 #[derive(Parser, Debug)]
 #[command(name = "openshell-sandbox")]
 #[command(version = openshell_core::VERSION)]
@@ -40,7 +40,7 @@ struct Args {
     #[arg(long, short = 'i')]
     interactive: bool,
 
-    /// Sandbox ID for fetching policy via gRPC from OpenShell server.
+    /// Sandbox ID for fetching policy via gRPC from `OpenShell` server.
     /// Requires --openshell-endpoint to be set.
     #[arg(long, env = "OPENSHELL_SANDBOX_ID")]
     sandbox_id: Option<String>,
@@ -50,7 +50,7 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX")]
     sandbox: Option<String>,
 
-    /// OpenShell server gRPC endpoint for fetching policy.
+    /// `OpenShell` server gRPC endpoint for fetching policy.
     /// Required when using --sandbox-id.
     #[arg(long, env = "OPENSHELL_ENDPOINT")]
     openshell_endpoint: Option<String>,

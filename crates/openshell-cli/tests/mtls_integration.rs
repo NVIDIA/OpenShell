@@ -336,26 +336,25 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
-    type RelayStreamStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::RelayFrame, tonic::Status>,
-    >;
+    type RelayStreamStream =
+        tokio_stream::wrappers::ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
 
     async fn relay_stream(
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
-    ) -> Result<tonic::Response<Self::RelayStreamStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     type ForwardTcpStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::TcpForwardFrame, tonic::Status>,
+        Result<openshell_core::proto::TcpForwardFrame, Status>,
     >;
 
     async fn forward_tcp(
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::TcpForwardFrame>>,
-    ) -> Result<tonic::Response<Self::ForwardTcpStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<Self::ForwardTcpStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 }
 

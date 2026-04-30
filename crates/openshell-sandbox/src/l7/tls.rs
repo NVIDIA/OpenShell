@@ -313,10 +313,10 @@ pub fn parse_pem_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 /// Peek the first bytes of a stream and determine if it looks like a TLS
-/// ClientHello handshake.
+/// `ClientHello` handshake.
 ///
 /// A TLS record starts with:
-/// - byte 0: `0x16` (ContentType::Handshake)
+/// - byte 0: `0x16` (`ContentType::Handshake`)
 /// - bytes 1-2: TLS version (0x0301 = TLS 1.0, 0x0302 = TLS 1.1, 0x0303 = TLS 1.2/1.3)
 ///
 /// Returns `true` if the peeked bytes match the TLS handshake pattern.

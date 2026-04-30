@@ -93,6 +93,7 @@ type KrunAddNetUnixstream = unsafe extern "C" fn(
     flags: u32,
 ) -> i32;
 
+#[allow(clippy::struct_field_names)] // FFI struct mirrors libkrun's symbol naming
 pub struct LibKrun {
     pub krun_init_log: KrunInitLog,
     pub krun_create_ctx: KrunCreateCtx,
@@ -207,7 +208,10 @@ fn preload_runtime_support_libraries(runtime_dir: &Path) -> Result<Vec<PathBuf>,
                 .is_some_and(|name| {
                     #[cfg(target_os = "macos")]
                     {
-                        name.starts_with("libkrunfw") && name.ends_with(".dylib")
+                        name.starts_with("libkrunfw")
+                            && Path::new(name)
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("dylib"))
                     }
                     #[cfg(not(target_os = "macos"))]
                     {

@@ -96,32 +96,29 @@ async fn auth_connect(
 
     let safe_gateway = html_escape(&gateway_display);
 
-    match cf_token {
-        Some(token) => {
-            let nonce = uuid::Uuid::new_v4().to_string();
-            let csp = format!(
-                "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; connect-src http://127.0.0.1:*"
-            );
-            (
-                [(header::CONTENT_SECURITY_POLICY, csp)],
-                Html(render_connect_page(
-                    &safe_gateway,
-                    params.callback_port,
-                    &token,
-                    &params.code,
-                    &nonce,
-                )),
-            )
-                .into_response()
-        }
-        None => {
-            let csp = "default-src 'none'; style-src 'unsafe-inline'".to_string();
-            (
-                [(header::CONTENT_SECURITY_POLICY, csp)],
-                Html(render_waiting_page(params.callback_port, &params.code)),
-            )
-                .into_response()
-        }
+    if let Some(token) = cf_token {
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let csp = format!(
+            "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; connect-src http://127.0.0.1:*"
+        );
+        (
+            [(header::CONTENT_SECURITY_POLICY, csp)],
+            Html(render_connect_page(
+                &safe_gateway,
+                params.callback_port,
+                &token,
+                &params.code,
+                &nonce,
+            )),
+        )
+            .into_response()
+    } else {
+        let csp = "default-src 'none'; style-src 'unsafe-inline'".to_string();
+        (
+            [(header::CONTENT_SECURITY_POLICY, csp)],
+            Html(render_waiting_page(params.callback_port, &params.code)),
+        )
+            .into_response()
     }
 }
 

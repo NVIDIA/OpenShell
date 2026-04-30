@@ -53,6 +53,8 @@ message GetCapabilitiesResponse {
   string default_image = 3;
   // True when the driver can provision GPU-backed sandboxes.
   bool supports_gpu = 4;
+  // Number of GPUs available for sandbox assignment.
+  uint32 gpu_count = 5;
 }
 
 // Driver-owned sandbox model used for create requests and platform observations.
@@ -84,6 +86,10 @@ message DriverSandboxSpec {
   DriverSandboxTemplate template = 6;
   // Request NVIDIA GPU resources for this sandbox.
   bool gpu = 9;
+  // Optional PCI BDF address (e.g. "0000:2d:00.0") or device index
+  // (e.g. "0", "1"). When empty with gpu=true, the driver assigns the
+  // first available GPU.
+  string gpu_device = 10;
 }
 
 // Driver-owned runtime template consumed by the compute platform.

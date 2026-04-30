@@ -100,7 +100,7 @@ sequenceDiagram
     C->>C: entrypoint: /opt/openshell/bin/openshell-sandbox
 ```
 
-The supervisor image is a `FROM scratch` image containing only the `openshell-sandbox` binary. It is built by the `supervisor-output` target in `deploy/docker/Dockerfile.images`. The `image_volumes` field in the container spec mounts this image's filesystem at `/opt/openshell/bin` with `rw: false`, making it a read-only overlay that the sandbox cannot tamper with.
+The supervisor image is a `FROM scratch` image containing only the prebuilt `openshell-sandbox` binary. It is built by the `supervisor-output` target in `deploy/docker/Dockerfile.images`. The `image_volumes` field in the container spec mounts this image's filesystem at `/opt/openshell/bin` with `rw: false`, making it a read-only overlay that the sandbox cannot tamper with.
 
 ## Network Model
 
@@ -256,4 +256,4 @@ The Podman driver is designed for rootless operation. The following adaptations 
 - SSRF mitigation: `crates/openshell-core/src/net.rs` (IP classification: `is_always_blocked_ip`, `is_internal_ip`), `crates/openshell-sandbox/src/proxy.rs` (runtime enforcement on CONNECT/forward proxy), `crates/openshell-server/src/grpc/policy.rs` (load-time validation via `validate_rule_not_always_blocked`)
 - Sandbox supervisor: `crates/openshell-sandbox/src/` (Landlock, seccomp, netns, proxy -- shared by all drivers)
 - Container engine abstraction: `tasks/scripts/container-engine.sh` (build/deploy support for Docker and Podman)
-- Supervisor image build: `deploy/docker/Dockerfile.images` (lines 183-184, `supervisor-output` target)
+- Supervisor image build: `deploy/docker/Dockerfile.images` (`supervisor-output` target)

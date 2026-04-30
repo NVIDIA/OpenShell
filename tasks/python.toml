@@ -168,7 +168,7 @@ if [ -z "$CARGO_VERSION" ] && [ -n "${CI:-}" ]; then
 fi
 
 LOCK_HASH=$(sha256_16 Cargo.lock)
-RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-rustup-stable}
+RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-rustup-1.95.0}
 CACHE_SCOPE_INPUT="v1|python-wheels-macos|base|${LOCK_HASH}|${RUST_SCOPE}"
 CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "$CACHE_SCOPE_INPUT" | sha256_16_stdin)
 

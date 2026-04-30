@@ -1,98 +1,43 @@
-name: Shadow — Docker Build (local driver + GHA cache)
+name: Shadow Docker Build
 
-# OS-49 Phase 3 / PR 3 — non-blocking shadow of docker-build.yml.
-#
-# Exercises buildx's local (docker-container) driver plus GHA-cache
-# (type=gha, scoped per component+arch) so Docker builds no longer depend on
-# the in-cluster BuildKit pods. Per-arch matrix on nv-gha-runners; each job
-# builds a single platform natively (no QEMU). No multi-arch manifest
-# merging — that folds into the real cut-over in Phase 6.
-#
-# Plan, decision thresholds, and results: OS-127 Linear issue. Dispatch
-# manually 4–5 times after merge to collect cold + warm numbers.
+# OS-128 Phase 4: manual non-publishing exercise of the production Docker
+# image workflow. This stays off main's push surface because the image path is
+# not a required signal while the prebuilt-binary rollout is being measured.
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      platform:
+        description: "Target platform(s)"
+        required: false
+        type: string
+        default: "linux/amd64,linux/arm64"
 
 permissions:
   contents: read
-  packages: read
-
-env:
-  MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  packages: write
 
 jobs:
-  shadow-build:
-    name: shadow ${{ matrix.component }} (${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        component: [gateway, supervisor, cluster]
-        arch: [amd64, arm64]
-        include:
-          - arch: amd64
-            runner: linux-amd64-cpu8
-          - arch: arm64
-            runner: linux-arm64-cpu8
-    runs-on: ${{ matrix.runner }}
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
-        # Expose the nv-gha-runners buildkitd.toml (registry-mirror config)
-        # inside the container so docker/setup-buildx-action can read it.
-        # The file is pre-populated on every nv-gha-runner per:
-        # https://docs.gha-runners.nvidia.com/platform/best-practices/#use-docker-cache-for-buildkit
-        - /etc/buildkit:/etc/buildkit:ro
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+  gateway:
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: gateway
+      platform: ${{ inputs.platform }}
+      push: false
+    secrets: inherit
 
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+  supervisor:
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: supervisor
+      platform: ${{ inputs.platform }}
+      push: false
+    secrets: inherit
 
-      - name: Install tools
-        run: mise install
-
-      - name: Set up buildx (local driver)
-        uses: ./.github/actions/setup-buildx
-        with:
-          driver: local
-          # Bind-mounted above via container.volumes; without that, the file
-          # is on the host but invisible to the action (which runs inside
-          # the ci:latest container).
-          buildkitd-config: /etc/buildkit/buildkitd.toml
-
-      - name: Package Helm chart (cluster only)
-        if: matrix.component == 'cluster'
-        run: |
-          mkdir -p deploy/docker/.build/charts
-          helm package deploy/helm/openshell -d deploy/docker/.build/charts/
-
-      - name: Build ${{ matrix.component }} (${{ matrix.arch }})
-        # Matches docker-build.yml's default EXTRA_CARGO_FEATURES so CI image
-        # content is comparable. No --push: the shadow measures build/cache
-        # mechanics, not publish behavior. Multi-arch manifests are Phase 6.
-        run: |
-          docker buildx build \
-            --builder openshell \
-            --platform linux/${{ matrix.arch }} \
-            --cache-from type=gha,scope=${{ matrix.component }}-${{ matrix.arch }} \
-            --cache-to   type=gha,mode=max,scope=${{ matrix.component }}-${{ matrix.arch }} \
-            --build-arg EXTRA_CARGO_FEATURES=openshell-core/dev-settings \
-            --load \
-            --file deploy/docker/Dockerfile.images \
-            --target ${{ matrix.component }} \
-            .
-
-      - name: buildx du
-        if: always()
-        run: docker buildx du --builder openshell || true
+  cluster:
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: cluster
+      platform: ${{ inputs.platform }}
+      push: false
+    secrets: inherit

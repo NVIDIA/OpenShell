@@ -375,7 +375,7 @@ fn diagnose_missing_supervisor(gateway_name: &str) -> GatewayFailureDiagnosis {
             was not found in the gateway container. This binary is side-loaded into every \
             sandbox pod via a hostPath volume mount. Without it, all sandbox pods will \
             crash immediately with \"no such file or directory\". This typically means the \
-            cluster image was built or published without the supervisor-builder stage."
+            cluster image was built or published without the staged prebuilt openshell-sandbox binary."
             .to_string(),
         recovery_steps: vec![
             RecoveryStep::with_command(

@@ -86,7 +86,7 @@ async fn gateway_start_error_mentions_docker() {
 }
 
 /// When Docker is unavailable, the error output should include guidance
-/// about DOCKER_HOST since that's the likely fix for non-default runtimes.
+/// about `DOCKER_HOST` since that's the likely fix for non-default runtimes.
 #[tokio::test]
 async fn gateway_start_error_mentions_docker_host() {
     let (output, code, _) = run_without_docker(&["gateway", "start"]).await;

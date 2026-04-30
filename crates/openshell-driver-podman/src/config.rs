@@ -121,12 +121,13 @@ impl PodmanComputeConfig {
         }
         #[cfg(target_os = "linux")]
         {
-            if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-                PathBuf::from(xdg).join("podman/podman.sock")
-            } else {
-                let uid = nix::unistd::getuid();
-                PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
-            }
+            std::env::var("XDG_RUNTIME_DIR").map_or_else(
+                |_| {
+                    let uid = nix::unistd::getuid();
+                    PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
+                },
+                |xdg| PathBuf::from(xdg).join("podman/podman.sock"),
+            )
         }
     }
 }

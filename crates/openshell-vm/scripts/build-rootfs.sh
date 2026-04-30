@@ -366,9 +366,8 @@ chmod +x "${ROOTFS_DIR}/srv/openshell-vm-exec-agent.py"
 # ── Build and inject openshell-sandbox supervisor binary ─────────────
 # The supervisor binary runs inside every sandbox pod. It is side-loaded
 # from the node filesystem via a read-only hostPath volume mount at
-# /opt/openshell/bin. In the Docker-based gateway this is built in the
-# Dockerfile.cluster supervisor-builder stage; here we cross-compile
-# from the host using cargo-zigbuild.
+# /opt/openshell/bin. Container images consume a prebuilt supervisor
+# binary; here we cross-compile from the host using cargo-zigbuild.
 
 SUPERVISOR_TARGET="${RUST_TARGET}"
 SUPERVISOR_BIN="${PROJECT_ROOT}/target/${SUPERVISOR_TARGET}/release/openshell-sandbox"

@@ -135,7 +135,7 @@ jobs:
       - name: Install dependencies
         run: |
           set -euo pipefail
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           brew install lld dtc xz
 

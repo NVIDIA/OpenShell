@@ -81,7 +81,7 @@ trait StartupResume: Send + Sync {
 #[tonic::async_trait]
 impl StartupResume for DockerComputeDriver {
     async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
-        DockerComputeDriver::resume_sandbox(self, sandbox_id, sandbox_name)
+        Self::resume_sandbox(self, sandbox_id, sandbox_name)
             .await
             .map_err(|err| err.to_string())
     }
@@ -97,7 +97,7 @@ const ORPHAN_GRACE_PERIOD: Duration = Duration::from_secs(300);
 pub use openshell_core::ComputeDriverError as ComputeError;
 
 #[derive(Debug)]
-pub(crate) struct ManagedDriverProcess {
+pub struct ManagedDriverProcess {
     child: std::sync::Mutex<Option<tokio::process::Child>>,
     socket_path: std::path::PathBuf,
 }
@@ -210,9 +210,7 @@ impl ComputeDriver for RemoteComputeDriver {
     ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
         let mut client = self.client();
         let response = client.watch_sandboxes(request).await?;
-        let stream = response
-            .into_inner()
-            .map(|item| item.map_err(|status| status));
+        let stream = response.into_inner();
         Ok(tonic::Response::new(Box::pin(stream)))
     }
 }
@@ -1109,6 +1107,7 @@ fn driver_sandbox_spec_from_public(spec: &SandboxSpec) -> DriverSandboxSpec {
             .as_ref()
             .map(driver_sandbox_template_from_public),
         gpu: spec.gpu,
+        gpu_device: spec.gpu_device.clone(),
     }
 }
 
@@ -1131,8 +1130,6 @@ fn driver_sandbox_template_from_public(template: &SandboxTemplate) -> DriverSand
 fn extract_typed_resources(
     resources: &Option<prost_types::Struct>,
 ) -> Option<DriverResourceRequirements> {
-    let s = resources.as_ref()?;
-
     fn get_quantity(s: &prost_types::Struct, section: &str, key: &str) -> String {
         s.fields
             .get(section)
@@ -1146,6 +1143,8 @@ fn extract_typed_resources(
             })
             .unwrap_or_default()
     }
+
+    let s = resources.as_ref()?;
 
     let req = DriverResourceRequirements {
         cpu_request: get_quantity(s, "requests", "cpu"),
@@ -1168,7 +1167,7 @@ fn extract_typed_resources(
 }
 
 /// Build the opaque `platform_config` Struct from platform-specific public
-/// template fields (runtime_class_name, annotations, volume_claim_templates)
+/// template fields (`runtime_class_name`, annotations, `volume_claim_templates`)
 /// plus any resource fields beyond CPU/memory.
 fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Struct> {
     use prost_types::{Struct, Value, value::Kind};
@@ -1498,7 +1497,7 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
 
 #[cfg(test)]
 #[derive(Debug, Default)]
-pub(crate) struct NoopTestDriver;
+pub struct NoopTestDriver;
 
 #[cfg(test)]
 #[tonic::async_trait]
@@ -1516,6 +1515,7 @@ impl ComputeDriver for NoopTestDriver {
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 supports_gpu: false,
+                gpu_count: 0,
             },
         ))
     }
@@ -1591,7 +1591,7 @@ impl ComputeDriver for NoopTestDriver {
 }
 
 #[cfg(test)]
-pub(crate) async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
+pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
     ComputeRuntime {
         driver: Arc::new(NoopTestDriver),
         shutdown_cleanup: None,
@@ -1615,6 +1615,7 @@ mod tests {
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
         GetSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateResponse,
     };
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::{mpsc, oneshot};
 
@@ -1662,6 +1663,7 @@ mod tests {
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
                 supports_gpu: true,
+                gpu_count: 0,
             }))
         }
 
@@ -1787,8 +1789,8 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
                 name: name.to_string(),
-                created_at_ms: 1000000,
-                labels: std::collections::HashMap::new(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
             }),
             phase: phase as i32,
             ..Default::default()
@@ -1800,8 +1802,8 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
                 name: format!("session-{id}"),
-                created_at_ms: 1000000,
-                labels: std::collections::HashMap::new(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
             }),
             sandbox_id: sandbox_id.to_string(),
             token: format!("token-{id}"),
@@ -2330,7 +2332,6 @@ mod tests {
                     deleting: false,
                 }),
             }],
-            ..Default::default()
         }))
         .await;
 
@@ -2388,7 +2389,6 @@ mod tests {
                     last_transition_time: String::new(),
                 })),
             }],
-            ..Default::default()
         }))
         .await;
 
@@ -2521,8 +2521,8 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingResume {
-        calls: tokio::sync::Mutex<Vec<(String, String)>>,
-        results: tokio::sync::Mutex<std::collections::HashMap<String, Result<bool, String>>>,
+        calls: Mutex<Vec<(String, String)>>,
+        results: Mutex<HashMap<String, Result<bool, String>>>,
     }
 
     impl RecordingResume {

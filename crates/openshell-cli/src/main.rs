@@ -152,7 +152,7 @@ fn resolve_sandbox_name(name: Option<String>, gateway: &str) -> Result<String> {
              Specify a sandbox name or connect to one first: nav sandbox connect <name>"
         )
     })?;
-    eprintln!("{} Using sandbox '{}' (last used)", "→".bold(), last.bold(),);
+    eprintln!("{} Using sandbox '{}' (last used)", "→".bold(), last.bold());
     Ok(last)
 }
 
@@ -818,7 +818,7 @@ enum GatewayCommands {
         /// `nvidia.com/gpu` resources. Requires NVIDIA drivers and the
         /// NVIDIA Container Toolkit on the host.
         ///
-        /// When enabled, OpenShell auto-selects CDI when the Docker daemon has
+        /// When enabled, `OpenShell` auto-selects CDI when the Docker daemon has
         /// CDI enabled and falls back to Docker's NVIDIA GPU request path
         /// (`--gpus all`) otherwise.
         #[arg(long)]
@@ -1140,6 +1140,11 @@ enum SandboxCommands {
         #[arg(long)]
         gpu: bool,
 
+        /// Target a specific GPU by PCI address (e.g. "0000:2d:00.0") or index (e.g. "0", "1").
+        /// Only valid with --gpu. When omitted with --gpu, the first available GPU is assigned.
+        #[arg(long, requires = "gpu")]
+        gpu_device: Option<String>,
+
         /// SSH destination for remote bootstrap (e.g., user@hostname).
         /// Only used when no cluster exists yet; ignored if a cluster is
         /// already active.
@@ -1160,7 +1165,7 @@ enum SandboxCommands {
         policy: Option<String>,
 
         /// Forward a local port to the sandbox before the initial command or shell starts.
-        /// Accepts [bind_address:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
+        /// Accepts [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
         #[arg(long, conflicts_with = "no_keep")]
         forward: Option<String>,
 
@@ -1469,11 +1474,11 @@ enum PolicyCommands {
         #[arg(long = "remove-endpoint")]
         remove_endpoints: Vec<String>,
 
-        /// Add a REST allow rule: host:port:METHOD:path_glob.
+        /// Add a REST allow rule: `host:port:METHOD:path_glob`.
         #[arg(long = "add-allow")]
         add_allow: Vec<String>,
 
-        /// Add a REST deny rule: host:port:METHOD:path_glob.
+        /// Add a REST deny rule: `host:port:METHOD:path_glob`.
         #[arg(long = "add-deny")]
         add_deny: Vec<String>,
 
@@ -1553,7 +1558,7 @@ enum PolicyCommands {
     /// Prove properties of a sandbox policy — or find counterexamples.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Prove {
-        /// Path to OpenShell sandbox policy YAML.
+        /// Path to `OpenShell` sandbox policy YAML.
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: String,
 
@@ -1643,7 +1648,7 @@ enum ForwardCommands {
     /// Start forwarding a local port to a sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Start {
-        /// Port to forward: [bind_address:]port (e.g. 8080, 0.0.0.0:8080).
+        /// Port to forward: [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080).
         port: String,
 
         /// Sandbox name (defaults to last-used sandbox).
@@ -1685,13 +1690,14 @@ enum ForwardCommands {
         #[arg(long, default_value = "127.0.0.1")]
         target_host: String,
 
-        /// Local bind address and port: [bind_address:]port. Defaults to the target port. Use port 0 for dynamic assignment.
+        /// Local bind address and port as `[bind_address:]port`. Defaults to the target port. Use port 0 for dynamic assignment.
         #[arg(long)]
         local: Option<String>,
     },
 }
 
 #[tokio::main]
+#[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; OK at top level.
 async fn main() -> Result<()> {
     // Install the rustls crypto provider before completion runs — completers may
     // establish TLS connections to the gateway.
@@ -1761,7 +1767,7 @@ async fn main() -> Result<()> {
                 } else {
                     vec![]
                 };
-                run::gateway_admin_deploy(
+                Box::pin(run::gateway_admin_deploy(
                     &name,
                     remote.as_deref(),
                     ssh_key.as_deref(),
@@ -1773,7 +1779,7 @@ async fn main() -> Result<()> {
                     registry_username.as_deref(),
                     registry_token.as_deref(),
                     gpu,
-                )
+                ))
                 .await?;
             }
             GatewayCommands::Stop {
@@ -1890,7 +1896,7 @@ async fn main() -> Result<()> {
             } else {
                 println!("{}", "Gateway Status".cyan().bold());
                 println!();
-                println!("  {} No gateway configured.", "Status:".dimmed(),);
+                println!("  {} No gateway configured.", "Status:".dimmed());
                 println!();
                 println!(
                     "Deploy a gateway with: {}",
@@ -1908,16 +1914,15 @@ async fn main() -> Result<()> {
             ForwardCommands::Stop { port, name } => {
                 let name = match name {
                     Some(n) => n,
-                    None => match run::find_forward_by_port(port)? {
-                        Some(n) => {
+                    None => {
+                        if let Some(n) = run::find_forward_by_port(port)? {
                             eprintln!("→ Found forward on sandbox '{n}'");
                             n
-                        }
-                        None => {
-                            eprintln!("{} No active forward found for port {port}", "!".yellow(),);
+                        } else {
+                            eprintln!("{} No active forward found for port {port}", "!".yellow());
                             return Ok(());
                         }
-                    },
+                    }
                 };
                 if run::stop_forward(&name, port)? {
                     eprintln!(
@@ -2350,6 +2355,7 @@ async fn main() -> Result<()> {
                     no_keep,
                     editor,
                     gpu,
+                    gpu_device,
                     remote,
                     ssh_key,
                     providers,
@@ -2445,6 +2451,7 @@ async fn main() -> Result<()> {
                                 upload_spec.as_ref(),
                                 keep,
                                 gpu,
+                                gpu_device.as_deref(),
                                 editor,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
@@ -2468,6 +2475,7 @@ async fn main() -> Result<()> {
                                 upload_spec.as_ref(),
                                 keep,
                                 gpu,
+                                gpu_device.as_deref(),
                                 editor,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
@@ -2508,6 +2516,7 @@ async fn main() -> Result<()> {
                             &name,
                             &base_dir,
                             &files,
+                            local,
                             sandbox_dest,
                             &tls,
                         )
@@ -3314,7 +3323,7 @@ mod tests {
         });
     }
 
-    /// Verify the flag names the TUI uses to build its ProxyCommand are
+    /// Verify the flag names the TUI uses to build its `ProxyCommand` are
     /// accepted by the `SshProxy` subcommand and land in the right fields.
     /// This catches drift when CLI flags are renamed or restructured.
     #[test]

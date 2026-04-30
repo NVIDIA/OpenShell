@@ -33,10 +33,13 @@ pub fn spawn_session_reaper(store: Arc<Store>, interval: Duration) {
 }
 
 async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
 
     let records = store
         .list(SshSession::object_type(), 1000, 0)
@@ -92,10 +95,13 @@ mod tests {
     }
 
     fn now_ms() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX)
     }
 
     #[tokio::test]

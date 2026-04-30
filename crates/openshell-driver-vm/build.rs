@@ -7,7 +7,7 @@
 //! artifacts it needs to boot base VMs without depending on the openshell-vm
 //! binary or crate.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 fn main() {
@@ -22,6 +22,7 @@ fn main() {
             "libkrunfw.5.dylib.zst",
             "gvproxy.zst",
             "rootfs.tar.zst",
+            "rootfs-gpu.tar.zst",
         ] {
             println!("cargo:rerun-if-changed={dir}/{name}");
         }
@@ -36,7 +37,15 @@ fn main() {
         "linux" => ("libkrun.so", "libkrunfw.so.5"),
         _ => {
             println!("cargo:warning=VM runtime not available for {target_os}-{target_arch}");
-            generate_stub_resources(&out_dir, &["libkrun", "libkrunfw", "rootfs.tar.zst"]);
+            generate_stub_resources(
+                &out_dir,
+                &[
+                    "libkrun",
+                    "libkrunfw",
+                    "rootfs.tar.zst",
+                    "rootfs-gpu.tar.zst",
+                ],
+            );
             return;
         }
     };
@@ -53,6 +62,7 @@ fn main() {
                 &format!("{libkrunfw_name}.zst"),
                 "gvproxy.zst",
                 "rootfs.tar.zst",
+                "rootfs-gpu.tar.zst",
             ],
         );
         return;
@@ -71,6 +81,7 @@ fn main() {
                 &format!("{libkrunfw_name}.zst"),
                 "gvproxy.zst",
                 "rootfs.tar.zst",
+                "rootfs-gpu.tar.zst",
             ],
         );
         return;
@@ -84,6 +95,10 @@ fn main() {
         ),
         ("gvproxy.zst".to_string(), "gvproxy.zst".to_string()),
         ("rootfs.tar.zst".to_string(), "rootfs.tar.zst".to_string()),
+        (
+            "rootfs-gpu.tar.zst".to_string(),
+            "rootfs-gpu.tar.zst".to_string(),
+        ),
     ];
 
     let mut all_found = true;
@@ -111,7 +126,7 @@ fn main() {
                 e
             )
         });
-        let size = fs::metadata(&dst_path).map(|m| m.len()).unwrap_or(0);
+        let size = fs::metadata(&dst_path).map_or(0, |m| m.len());
         println!("cargo:warning=Embedded {src_name}: {size} bytes");
     }
 
@@ -124,12 +139,13 @@ fn main() {
                 &format!("{libkrunfw_name}.zst"),
                 "gvproxy.zst",
                 "rootfs.tar.zst",
+                "rootfs-gpu.tar.zst",
             ],
         );
     }
 }
 
-fn generate_stub_resources(out_dir: &PathBuf, names: &[&str]) {
+fn generate_stub_resources(out_dir: &Path, names: &[&str]) {
     for name in names {
         let path = out_dir.join(name);
         if !path.exists() {

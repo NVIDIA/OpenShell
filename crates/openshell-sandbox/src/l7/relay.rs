@@ -13,11 +13,11 @@ use crate::secrets::{self, SecretResolver};
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
-    NetworkActivityBuilder, SeverityId, Url as OcsfUrl, ocsf_emit,
+    NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Context for L7 request policy evaluation.
 pub struct L7EvalContext {
@@ -35,6 +35,50 @@ pub struct L7EvalContext {
     pub cmdline_paths: Vec<String>,
     /// Supervisor-only placeholder resolver for outbound headers.
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ParseRejectionMode {
+    L7Endpoint,
+    Passthrough,
+}
+
+fn parse_rejection_detail(error: &str, mode: ParseRejectionMode) -> String {
+    if error.contains("encoded '/' (%2F)") {
+        match mode {
+            ParseRejectionMode::L7Endpoint => format!(
+                "{error}; set allow_encoded_slash: true on this endpoint if the upstream requires encoded slashes"
+            ),
+            ParseRejectionMode::Passthrough => format!(
+                "{error}; passthrough credential relay uses strict path parsing, so configure this endpoint with protocol: rest and allow_encoded_slash: true for encoded-slash APIs, or use tls: skip if HTTP parsing is not needed"
+            ),
+        }
+    } else {
+        error.to_string()
+    }
+}
+
+fn emit_parse_rejection(ctx: &L7EvalContext, detail: &str, engine_type: &str) {
+    let policy_name = if ctx.policy_name.is_empty() {
+        "-"
+    } else {
+        &ctx.policy_name
+    };
+    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+        .firewall_rule(policy_name, engine_type)
+        .message(format!(
+            "HTTP request rejected before policy evaluation for {}:{}",
+            ctx.host, ctx.port
+        ))
+        .status_detail(detail)
+        .build();
+    ocsf_emit!(event);
 }
 
 /// Run protocol-aware L7 inspection on a tunnel.
@@ -150,13 +194,9 @@ where
                         "L7 connection closed"
                     );
                 } else {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Low)
-                        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                        .message(format!("HTTP parse error in L7 relay: {e}"))
-                        .build();
-                    ocsf_emit!(event);
+                    let detail =
+                        parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
+                    emit_parse_rejection(ctx, &detail, "l7");
                 }
                 return Ok(()); // Close connection on parse error
             }
@@ -218,13 +258,8 @@ where
         // Uses redacted_target (path only, no query params) to avoid logging secrets.
         {
             let (action_id, disposition_id, severity) = match decision_str {
-                "allow" => (
-                    ActionId::Allowed,
-                    DispositionId::Allowed,
-                    SeverityId::Informational,
-                ),
                 "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
-                "audit" => (
+                "allow" | "audit" => (
                     ActionId::Allowed,
                     DispositionId::Allowed,
                     SeverityId::Informational,
@@ -399,7 +434,10 @@ where
                 if is_benign_connection_error(&e) {
                     break;
                 }
-                return Err(e);
+                let detail =
+                    parse_rejection_detail(&e.to_string(), ParseRejectionMode::Passthrough);
+                emit_parse_rejection(ctx, &detail, "http-parser");
+                return Ok(());
             }
         };
 
@@ -472,4 +510,42 @@ where
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rejection_detail_adds_l7_hint_for_encoded_slash() {
+        let detail = parse_rejection_detail(
+            "HTTP request-target rejected: request-target contains an encoded '/' (%2F) which is not allowed on this endpoint",
+            ParseRejectionMode::L7Endpoint,
+        );
+
+        assert!(detail.contains("allow_encoded_slash: true"));
+        assert!(detail.contains("upstream requires encoded slashes"));
+    }
+
+    #[test]
+    fn parse_rejection_detail_adds_passthrough_hint_for_encoded_slash() {
+        let detail = parse_rejection_detail(
+            "HTTP request-target rejected: request-target contains an encoded '/' (%2F) which is not allowed on this endpoint",
+            ParseRejectionMode::Passthrough,
+        );
+
+        assert!(detail.contains("protocol: rest"));
+        assert!(detail.contains("allow_encoded_slash: true"));
+        assert!(detail.contains("tls: skip"));
+    }
+
+    #[test]
+    fn parse_rejection_detail_preserves_other_errors() {
+        let error = "HTTP headers contain invalid UTF-8";
+
+        assert_eq!(
+            parse_rejection_detail(error, ParseRejectionMode::L7Endpoint),
+            error
+        );
+    }
 }

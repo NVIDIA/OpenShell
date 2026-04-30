@@ -8,7 +8,7 @@ use std::fmt;
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 
 /// Public access to the placeholder prefix for fail-closed scanning in other modules.
-pub(crate) const PLACEHOLDER_PREFIX_PUBLIC: &str = PLACEHOLDER_PREFIX;
+pub const PLACEHOLDER_PREFIX_PUBLIC: &str = PLACEHOLDER_PREFIX;
 
 /// Characters that are valid in an env var key name (used to extract
 /// placeholder boundaries within concatenated strings like path segments).
@@ -23,7 +23,7 @@ fn is_env_key_char(b: u8) -> bool {
 /// Error returned when a placeholder cannot be resolved or a resolved secret
 /// contains prohibited characters.
 #[derive(Debug)]
-pub(crate) struct UnresolvedPlaceholderError {
+pub struct UnresolvedPlaceholderError {
     pub location: &'static str, // "header", "query_param", "path"
 }
 
@@ -39,18 +39,21 @@ impl fmt::Display for UnresolvedPlaceholderError {
 
 /// Result of rewriting an HTTP header block with credential resolution.
 #[derive(Debug)]
-pub(crate) struct RewriteResult {
+pub struct RewriteResult {
     /// The rewritten HTTP bytes (headers + body overflow).
     pub rewritten: Vec<u8>,
     /// A redacted version of the request target for logging.
     /// Contains `[CREDENTIAL]` in place of resolved credential values.
     /// `None` if the target was not modified.
+    // Kept on the public result struct as part of the API contract; consumed
+    // selectively by callers that emit redacted logs.
+    #[allow(dead_code)]
     pub redacted_target: Option<String>,
 }
 
 /// Result of rewriting a request target for OPA evaluation.
 #[derive(Debug)]
-pub(crate) struct RewriteTargetResult {
+pub struct RewriteTargetResult {
     /// The resolved target (real secrets) — for upstream forwarding only.
     pub resolved: String,
     /// The redacted target (`[CREDENTIAL]` in place of secrets) — for OPA + logs.
@@ -119,10 +122,9 @@ impl SecretResolver {
             .strip_prefix("Basic ")
             .or_else(|| trimmed.strip_prefix("basic "))
             .map(str::trim)
+            && let Some(rewritten) = self.rewrite_basic_auth_token(encoded)
         {
-            if let Some(rewritten) = self.rewrite_basic_auth_token(encoded) {
-                return Some(format!("Basic {rewritten}"));
-            }
+            return Some(format!("Basic {rewritten}"));
         }
 
         // Prefixed placeholder: `Bearer openshell:resolve:env:KEY`
@@ -172,7 +174,7 @@ impl SecretResolver {
     }
 }
 
-pub(crate) fn placeholder_for_env_key(key: &str) -> String {
+pub fn placeholder_for_env_key(key: &str) -> String {
     format!("{PLACEHOLDER_PREFIX}{key}")
 }
 
@@ -226,12 +228,26 @@ fn percent_encode_path_segment(input: &str) -> String {
     let mut encoded = String::with_capacity(input.len());
     for byte in input.bytes() {
         match byte {
-            // unreserved
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(byte as char);
-            }
-            // sub-delims + ":" + "@"
-            b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'=' | b':'
+            // unreserved + sub-delims + ":" + "@"
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b':'
             | b'@' => {
                 encoded.push(byte as char);
             }
@@ -254,11 +270,11 @@ fn percent_decode(input: &str) -> String {
             let lo = bytes.next();
             if let (Some(h), Some(l)) = (hi, lo) {
                 let hex = [h, l];
-                if let Ok(s) = std::str::from_utf8(&hex) {
-                    if let Ok(val) = u8::from_str_radix(s, 16) {
-                        decoded.push(val);
-                        continue;
-                    }
+                if let Ok(s) = std::str::from_utf8(&hex)
+                    && let Ok(val) = u8::from_str_radix(s, 16)
+                {
+                    decoded.push(val);
+                    continue;
                 }
                 // Invalid percent encoding — preserve verbatim
                 decoded.push(b'%');
@@ -318,46 +334,34 @@ struct RewriteLineResult {
 ///
 /// Given a request line like `GET /bot{TOKEN}/path?key={APIKEY} HTTP/1.1`,
 /// resolves placeholders in both path segments and query parameter values.
+// `resolver` (the credential resolver) and `resolved` (the resolved string
+// output) are intentionally distinct nouns; renaming would obscure intent.
+#[allow(clippy::similar_names)]
 fn rewrite_request_line(
     line: &str,
     resolver: &SecretResolver,
 ) -> Result<RewriteLineResult, UnresolvedPlaceholderError> {
     // Request line format: METHOD SP REQUEST-URI SP HTTP-VERSION
     let mut parts = line.splitn(3, ' ');
-    let method = match parts.next() {
-        Some(m) => m,
-        None => {
-            return Ok(RewriteLineResult {
-                line: line.to_string(),
-                redacted_target: None,
-            });
-        }
+    let unchanged = || {
+        Ok(RewriteLineResult {
+            line: line.to_string(),
+            redacted_target: None,
+        })
     };
-    let uri = match parts.next() {
-        Some(u) => u,
-        None => {
-            return Ok(RewriteLineResult {
-                line: line.to_string(),
-                redacted_target: None,
-            });
-        }
+    let Some(method) = parts.next() else {
+        return unchanged();
     };
-    let version = match parts.next() {
-        Some(v) => v,
-        None => {
-            return Ok(RewriteLineResult {
-                line: line.to_string(),
-                redacted_target: None,
-            });
-        }
+    let Some(uri) = parts.next() else {
+        return unchanged();
+    };
+    let Some(version) = parts.next() else {
+        return unchanged();
     };
 
     // Only rewrite if the URI contains a placeholder
     if !uri.contains(PLACEHOLDER_PREFIX) {
-        return Ok(RewriteLineResult {
-            line: line.to_string(),
-            redacted_target: None,
-        });
+        return unchanged();
     }
 
     // Split URI into path and query
@@ -382,9 +386,10 @@ fn rewrite_request_line(
     };
 
     // Reassemble
-    let resolved_uri = match &resolved_query {
-        Some(q) => format!("{resolved_path}?{q}"),
-        None => resolved_path.clone(),
+    let resolved_uri = if let Some(q) = resolved_query.as_ref() {
+        format!("{resolved_path}?{q}")
+    } else {
+        resolved_path
     };
     let redacted_uri = match &redacted_query {
         Some(q) => format!("{redacted_path}?{q}"),
@@ -404,6 +409,9 @@ fn rewrite_request_line(
 ///
 /// Returns `Some((resolved_path, redacted_path))` if any placeholders were found,
 /// `None` if no placeholders exist in the path.
+// `resolver` and `resolved` are intentionally distinct nouns; see comment at
+// `rewrite_request_line`.
+#[allow(clippy::similar_names)]
 fn rewrite_uri_path(
     path: &str,
     resolver: &SecretResolver,
@@ -446,6 +454,9 @@ fn rewrite_uri_path(
 ///
 /// Uses the placeholder grammar `openshell:resolve:env:[A-Za-z_][A-Za-z0-9_]*`
 /// to determine placeholder boundaries within concatenated text.
+// `resolver` and `resolved` are intentionally distinct nouns; see comment at
+// `rewrite_request_line`.
+#[allow(clippy::similar_names)]
 fn rewrite_path_segment(
     segment: &str,
     resolver: &SecretResolver,
@@ -561,7 +572,7 @@ fn rewrite_uri_query_params(
 ///
 /// Returns `Err` if any placeholder is detected but cannot be resolved
 /// (fail-closed behavior).
-pub(crate) fn rewrite_http_header_block(
+pub fn rewrite_http_header_block(
     raw: &[u8],
     resolver: Option<&SecretResolver>,
 ) -> Result<RewriteResult, UnresolvedPlaceholderError> {
@@ -627,22 +638,25 @@ pub(crate) fn rewrite_http_header_block(
     })
 }
 
-pub(crate) fn rewrite_header_line(line: &str, resolver: &SecretResolver) -> String {
+pub fn rewrite_header_line(line: &str, resolver: &SecretResolver) -> String {
     let Some((name, value)) = line.split_once(':') else {
         return line.to_string();
     };
 
-    match resolver.rewrite_header_value(value.trim()) {
-        Some(rewritten) => format!("{name}: {rewritten}"),
-        None => line.to_string(),
-    }
+    resolver.rewrite_header_value(value.trim()).map_or_else(
+        || line.to_string(),
+        |rewritten| format!("{name}: {rewritten}"),
+    )
 }
 
 /// Resolve placeholders in a request target (path + query) for OPA evaluation.
 ///
 /// Returns the resolved target (real secrets, for upstream) and a redacted
 /// version (`[CREDENTIAL]` in place of secrets, for OPA input and logs).
-pub(crate) fn rewrite_target_for_eval(
+// `resolver` and `resolved` are intentionally distinct nouns; see comment at
+// `rewrite_request_line`.
+#[allow(clippy::similar_names)]
+pub fn rewrite_target_for_eval(
     target: &str,
     resolver: &SecretResolver,
 ) -> Result<RewriteTargetResult, UnresolvedPlaceholderError> {
@@ -695,6 +709,10 @@ pub(crate) fn rewrite_target_for_eval(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::iter_on_single_items,
+    reason = "Test code: single-key fixtures are clearer as array literals than std::iter::once."
+)]
 mod tests {
     use super::*;
 

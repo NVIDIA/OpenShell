@@ -305,12 +305,11 @@ pub fn load_last_sandbox(gateway: &str) -> Option<String> {
 /// This should be called after a sandbox is deleted so that subsequent commands
 /// don't try to connect to a sandbox that no longer exists.
 pub fn clear_last_sandbox_if_matches(gateway: &str, sandbox: &str) {
-    if let Some(current) = load_last_sandbox(gateway) {
-        if current == sandbox {
-            if let Ok(path) = last_sandbox_path(gateway) {
-                let _ = std::fs::remove_file(path);
-            }
-        }
+    if let Some(current) = load_last_sandbox(gateway)
+        && current == sandbox
+        && let Ok(path) = last_sandbox_path(gateway)
+    {
+        let _ = std::fs::remove_file(path);
     }
 }
 

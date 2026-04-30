@@ -1017,7 +1017,7 @@ flowchart LR
 | `L7Protocol` | `Rest`, `Sql` | Supported application protocols |
 | `TlsMode` | `Auto` (default), `Skip` | TLS handling strategy — `Auto` peeks first bytes and terminates if TLS is detected; `Skip` bypasses detection entirely |
 | `EnforcementMode` | `Audit`, `Enforce` | What to do on L7 deny (log-only vs block) |
-| `L7EndpointConfig` | `{ protocol, tls, enforcement }` | Per-endpoint L7 configuration |
+| `L7EndpointConfig` | `{ protocol, tls, enforcement, allow_encoded_slash }` | Per-endpoint L7 configuration |
 | `L7Decision` | `{ allowed, reason, matched_rule }` | Result of L7 evaluation |
 | `L7RequestInfo` | `{ action, target, query_params }` | HTTP method, path, and decoded query multimap for policy evaluation |
 
@@ -1227,7 +1227,7 @@ Implements `L7Provider` for HTTP/1.1:
 
 `relay_with_inspection()` in `crates/openshell-sandbox/src/l7/relay.rs` is the main relay loop:
 
-1. Parse one HTTP request from client via the provider
+1. Parse one HTTP request from client via the provider. Parser and path-canonicalization failures close the connection and emit a denied OCSF network event with the rejection reason in `status_detail`.
 2. Resolve credential placeholders in the request target via `rewrite_target_for_eval()`. OPA receives the redacted path (`[CREDENTIAL]` markers); the resolved path goes only to upstream. If resolution fails, return HTTP 500 and close the connection.
 3. Build L7 input JSON with `request.method`, the **redacted** `request.path`, `request.query_params`, plus the CONNECT-level context (host, port, binary, ancestors, cmdline)
 4. Evaluate `data.openshell.sandbox.allow_request` and `data.openshell.sandbox.request_deny_reason`
@@ -1580,7 +1580,7 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 | Credential injection: resolved value contains CR/LF/null | Placeholder treated as unresolvable, fail-closed |
 | Credential injection: path credential contains traversal/separator | HTTP 500, connection closed (fail-closed) |
 | Credential injection: percent-encoded placeholder bypass attempt | HTTP 500, connection closed (fail-closed) |
-| L7 parse error | Close the connection |
+| L7 parse or path-canonicalization error | Emit denied OCSF network event with `status_detail`, close the connection |
 | SSH socket bind failure | Fatal -- reported through the readiness channel and aborts startup |
 | SSH server accept failure | Async task error logged, main process unaffected |
 | Supervisor session: connect failure | Emit `session_failed` OCSF event, sleep with exponential backoff (1s -> 30s) and reconnect |

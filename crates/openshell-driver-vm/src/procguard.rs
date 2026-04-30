@@ -43,11 +43,13 @@ pub fn die_with_parent() -> Result<(), String> {
     die_with_parent_cleanup(|| ())
 }
 
-/// Like [`die_with_parent`], but run `cleanup` (best-effort,
-/// async-signal-unsafe — it runs on the helper thread) immediately
-/// before terminating the process. Use this when we own children that
-/// cannot arm their own procguard; the cleanup hook is the only chance
-/// we get to send them SIGTERM after the kernel reparents us.
+/// Like [`die_with_parent`], but run `cleanup` before terminating.
+///
+/// The cleanup hook is best-effort and async-signal-unsafe — it runs on
+/// the helper thread immediately before terminating the process. Use this
+/// when we own children that cannot arm their own procguard; the cleanup
+/// hook is the only chance we get to send them SIGTERM after the kernel
+/// reparents us.
 ///
 /// On Linux the cleanup is a no-op: `PR_SET_PDEATHSIG` delivers SIGKILL
 /// directly to us, there is no Rust-controlled moment between "parent

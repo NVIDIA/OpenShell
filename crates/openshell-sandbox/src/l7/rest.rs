@@ -12,7 +12,7 @@ use crate::secrets::rewrite_http_header_block;
 use miette::{IntoDiagnostic, Result, miette};
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, warn};
+use tracing::debug;
 
 const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
 const RELAY_BUF_SIZE: usize = 8192;
@@ -233,6 +233,8 @@ fn rewrite_request_line_target(
     Ok(out)
 }
 
+// Used only in tests; kept as a `pub(crate)` helper for clarity.
+#[allow(dead_code)]
 pub(crate) fn parse_target_query(target: &str) -> Result<(String, HashMap<String, Vec<String>>)> {
     match target.split_once('?') {
         Some((path, query)) => Ok((path.to_string(), parse_query_params(query)?)),
@@ -475,12 +477,12 @@ fn parse_body_length(headers: &str) -> Result<BodyLength> {
             let len: u64 = val
                 .parse()
                 .map_err(|_| miette!("Request contains invalid Content-Length value"))?;
-            if let Some(prev) = cl_value {
-                if prev != len {
-                    return Err(miette!(
-                        "Request contains multiple Content-Length headers with differing values ({prev} vs {len})"
-                    ));
-                }
+            if let Some(prev) = cl_value
+                && prev != len
+            {
+                return Err(miette!(
+                    "Request contains multiple Content-Length headers with differing values ({prev} vs {len})"
+                ));
             }
             cl_value = Some(len);
         }
@@ -652,6 +654,9 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
 ///
 /// Note: callers that receive `Upgraded` are responsible for switching to
 /// raw bidirectional relay and forwarding the overflow bytes.
+// Public helper retained as part of the relay API surface; internal callers
+// currently use `relay_response` directly.
+#[allow(dead_code)]
 pub(crate) async fn relay_response_to_client<U, C>(
     upstream: &mut U,
     client: &mut C,
@@ -931,6 +936,13 @@ fn is_benign_close(err: &std::io::Error) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::iter_on_single_items,
+    clippy::manual_string_new,
+    clippy::collapsible_if,
+    clippy::cast_possible_truncation,
+    reason = "Test code: test fixtures and explicit value-shape assertions are idiomatic in tests."
+)]
 mod tests {
     use super::*;
     use crate::secrets::SecretResolver;

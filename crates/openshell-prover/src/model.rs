@@ -27,7 +27,7 @@ impl EndpointId {
     }
 }
 
-/// Z3-backed reachability model for an OpenShell sandbox policy.
+/// Z3-backed reachability model for an `OpenShell` sandbox policy.
 pub struct ReachabilityModel {
     pub policy: PolicyModel,
     pub credentials: CredentialSet,
@@ -169,18 +169,18 @@ impl ReachabilityModel {
                         allowed.iter().any(|m| write_set.contains(m.as_str()))
                     };
 
-                    let l7w_var = Bool::new_const(format!("l7_allows_write_{ek}"));
+                    let l7_write_var = Bool::new_const(format!("l7_allows_write_{ek}"));
                     if ep.is_l7_enforced() {
                         if has_write {
-                            self.solver.assert(&l7w_var);
+                            self.solver.assert(&l7_write_var);
                         } else {
-                            self.solver.assert(&!l7w_var.clone());
+                            self.solver.assert(&!l7_write_var.clone());
                         }
                     } else {
                         // L4-only: all methods pass through
-                        self.solver.assert(&l7w_var);
+                        self.solver.assert(&l7_write_var);
                     }
-                    self.l7_allows_write.insert(ek, l7w_var);
+                    self.l7_allows_write.insert(ek, l7_write_var);
                 }
             }
         }
@@ -256,13 +256,14 @@ impl ReachabilityModel {
             }
             self.credential_has_write.insert(host.clone(), cw_var);
 
-            let cd_var = Bool::new_const(format!("credential_has_destructive_{host}"));
+            let destructive_var = Bool::new_const(format!("credential_has_destructive_{host}"));
             if has_destructive {
-                self.solver.assert(&cd_var);
+                self.solver.assert(&destructive_var);
             } else {
-                self.solver.assert(&!cd_var.clone());
+                self.solver.assert(&!destructive_var.clone());
             }
-            self.credential_has_destructive.insert(host.clone(), cd_var);
+            self.credential_has_destructive
+                .insert(host.clone(), destructive_var);
         }
     }
 
@@ -364,7 +365,7 @@ impl ReachabilityModel {
             has_access,
             exfil,
             Bool::or(&[
-                Bool::and(&[!l7_enforced.clone(), http.clone()]),
+                Bool::and(&[!l7_enforced, http.clone()]),
                 Bool::and(&[l7_write, http]),
                 bypass,
             ]),

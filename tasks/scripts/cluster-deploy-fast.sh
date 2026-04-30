@@ -149,7 +149,7 @@ fi
 matches_gateway() {
   local path=$1
   case "${path}" in
-    Cargo.toml|Cargo.lock|proto/*|deploy/docker/cross-build.sh)
+    Cargo.toml|Cargo.lock|proto/*|tasks/scripts/stage-prebuilt-binaries.sh)
       return 0
       ;;
     deploy/docker/Dockerfile.images|tasks/scripts/docker-build-image.sh)
@@ -170,7 +170,7 @@ matches_gateway() {
 matches_supervisor() {
   local path=$1
   case "${path}" in
-    Cargo.toml|Cargo.lock|proto/*|deploy/docker/cross-build.sh)
+    Cargo.toml|Cargo.lock|proto/*|tasks/scripts/stage-prebuilt-binaries.sh)
       return 0
       ;;
     deploy/docker/Dockerfile.images|tasks/scripts/docker-build-image.sh)
@@ -210,13 +210,13 @@ compute_fingerprint() {
   # hashes.  This ensures that committed changes (e.g. after `git pull`
   # or amend) are detected even when there are no uncommitted edits.
   local committed_trees=""
-  case "${component}" in
-    gateway)
-      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh crates/openshell-core/ crates/openshell-driver-kubernetes/ crates/openshell-ocsf/ crates/openshell-policy/ crates/openshell-providers/ crates/openshell-router/ crates/openshell-server/ 2>/dev/null || true)
-      ;;
-    supervisor)
-      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh crates/openshell-core/ crates/openshell-policy/ crates/openshell-router/ crates/openshell-sandbox/ 2>/dev/null || true)
-      ;;
+	case "${component}" in
+	    gateway)
+	      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh tasks/scripts/stage-prebuilt-binaries.sh crates/openshell-core/ crates/openshell-driver-kubernetes/ crates/openshell-ocsf/ crates/openshell-policy/ crates/openshell-providers/ crates/openshell-router/ crates/openshell-server/ 2>/dev/null || true)
+	      ;;
+	    supervisor)
+	      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh tasks/scripts/stage-prebuilt-binaries.sh crates/openshell-core/ crates/openshell-policy/ crates/openshell-router/ crates/openshell-sandbox/ 2>/dev/null || true)
+	      ;;
     helm)
       committed_trees=$(git ls-tree HEAD deploy/helm/openshell/ 2>/dev/null || true)
       ;;
@@ -329,8 +329,8 @@ if [[ "${build_supervisor}" == "1" ]]; then
     x86_64)  HOST_ARCH=amd64 ;;
   esac
 
-  # Build the supervisor binary from the shared image build graph, then
-  # extract it via --output so fast deploys reuse the same Rust cache.
+	  # Stage the supervisor binary through the prebuilt path, then extract it
+	  # via --output from the minimal Docker target.
   SUPERVISOR_BUILD_DIR=$(mktemp -d)
   trap 'rm -rf "${SUPERVISOR_BUILD_DIR}"' EXIT
 
@@ -340,10 +340,9 @@ if [[ "${build_supervisor}" == "1" ]]; then
     _cargo_version=$(uv run python tasks/scripts/release.py get-version --cargo 2>/dev/null || true)
   fi
 
-  # Only set DOCKER_PLATFORM when actually cross-compiling.  Omitting it
-  # for native builds lets docker-build-image.sh pick the fast "docker"
-  # driver (same as gateway), which shares BuildKit cache mounts (sccache,
-  # cargo registry/target) and avoids docker-container IPC overhead.
+	  # Only set DOCKER_PLATFORM when the cluster architecture differs from the
+	  # local container engine architecture. Omitting it for native builds lets
+	  # docker-build-image.sh pick the fast default builder.
   _platform_env=()
   if [[ "${CLUSTER_ARCH}" != "${HOST_ARCH}" ]]; then
     _platform_env=(DOCKER_PLATFORM="linux/${CLUSTER_ARCH}")

@@ -18,6 +18,11 @@ description = "Build the CI Docker image"
 run = "tasks/scripts/docker-build-ci.sh"
 hide = true
 
+["build:docker:prebuilt"]
+description = "Build and stage Rust binaries consumed by Docker image builds"
+run = "tasks/scripts/stage-prebuilt-binaries.sh all"
+hide = true
+
 ["build:docker:gateway"]
 description = "Build the gateway Docker image"
 run = "tasks/scripts/docker-build-image.sh gateway"

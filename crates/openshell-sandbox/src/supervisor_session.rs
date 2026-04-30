@@ -101,11 +101,10 @@ fn relay_target_endpoint(open: &RelayOpen) -> Option<Endpoint> {
     };
     let host = target.host.trim();
     let port = u16::try_from(target.port).ok()?;
-    if let Ok(ip) = host.parse() {
-        Some(Endpoint::from_ip(ip, port))
-    } else {
-        Some(Endpoint::from_domain(host, port))
-    }
+    host.parse::<IpAddr>().map_or_else(
+        |_| Some(Endpoint::from_domain(host, port)),
+        |ip| Some(Endpoint::from_ip(ip, port)),
+    )
 }
 
 fn relay_target_kind(open: &RelayOpen) -> &'static str {
@@ -750,7 +749,9 @@ mod ocsf_event_tests {
     fn ssh_relay_open(channel_id: &str) -> RelayOpen {
         RelayOpen {
             channel_id: channel_id.to_string(),
-            target: Some(relay_open::Target::Ssh(Default::default())),
+            target: Some(relay_open::Target::Ssh(
+                openshell_core::proto::SshRelayTarget::default(),
+            )),
             service_id: String::new(),
         }
     }

@@ -162,7 +162,7 @@ fn resolve_single_tcp_peer_owner(entrypoint_pid: u32, peer_port: u16) -> Result<
 
 /// Like `resolve_tcp_peer_binary`, but also returns the PID that owns the socket.
 ///
-/// Needed for the ancestor walk: we must know the PID to walk `/proc/<pid>/status` PPid chain.
+/// Needed for the ancestor walk: we must know the PID to walk `/proc/<pid>/status` `PPid` chain.
 #[cfg(target_os = "linux")]
 pub fn resolve_tcp_peer_identity(entrypoint_pid: u32, peer_port: u16) -> Result<(PathBuf, u32)> {
     let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_port)?;
@@ -423,7 +423,7 @@ fn check_pid_fds(pid: u32, target: &str) -> bool {
 ///
 /// Performs a BFS walk of the process tree. If `/proc/<pid>/task/<tid>/children`
 /// is not available (requires `CONFIG_PROC_CHILDREN`), returns only the root PID.
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
     collect_descendant_pids_with_depth(root_pid)
         .into_iter()
@@ -480,7 +480,7 @@ pub fn file_sha256(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| miette::miette!("Failed to open {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
+    let mut buf = vec![0u8; 65536].into_boxed_slice();
     let mut total_read = 0u64;
     loop {
         let n = file
@@ -514,7 +514,7 @@ mod tests {
     /// binary for a brief window. Byte-level `starts_with` tolerates the kernel's
     /// `" (deleted)"` suffix on unlinked executables.
     #[cfg(target_os = "linux")]
-    fn wait_for_child_exec(pid: i32, target: &std::path::Path) {
+    fn wait_for_child_exec(pid: i32, target: &Path) {
         use std::os::unix::ffi::OsStrExt as _;
         let target_bytes = target.as_os_str().as_bytes();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -752,10 +752,7 @@ mod tests {
     fn collect_descendants_dedupes_pids() {
         let pid = std::process::id();
         let pids = collect_descendant_pids(pid);
-        let unique = pids
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
+        let unique = pids.iter().copied().collect::<HashSet<_>>();
         assert_eq!(pids.len(), unique.len());
     }
 
@@ -771,16 +768,20 @@ mod tests {
         let peer_port = stream.local_addr().unwrap().port();
         let (_accepted, _) = listener.accept().expect("accept");
 
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
         let child_pid = unsafe { libc::fork() };
         assert!(child_pid >= 0, "fork failed");
         if child_pid == 0 {
+            // libc/syscall FFI requires unsafe
+            #[allow(unsafe_code)]
             unsafe {
                 libc::sleep(30);
                 libc::_exit(0);
             }
         }
 
-        let child_pid_u32 = child_pid as u32;
+        let child_pid_u32 = child_pid.cast_unsigned();
         let entrypoint_pid = std::process::id();
         let deadline = Instant::now() + Duration::from_secs(2);
         let owners = loop {
@@ -790,18 +791,19 @@ mod tests {
                 .owners
                 .iter()
                 .map(|owner| owner.pid)
-                .collect::<std::collections::HashSet<_>>();
+                .collect::<HashSet<_>>();
             if owner_pids.contains(&entrypoint_pid) && owner_pids.contains(&child_pid_u32) {
                 break owners;
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for forked child to appear as a socket owner; got {:?}",
-                owner_pids
+                "timed out waiting for forked child to appear as a socket owner; got {owner_pids:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         };
 
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
         unsafe {
             libc::kill(child_pid, libc::SIGKILL);
             libc::waitpid(child_pid, std::ptr::null_mut(), 0);
@@ -811,7 +813,7 @@ mod tests {
             .owners
             .iter()
             .map(|owner| owner.pid)
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<HashSet<_>>();
         assert!(owner_pids.contains(&entrypoint_pid));
         assert!(owner_pids.contains(&child_pid_u32));
     }

@@ -475,6 +475,7 @@ Each endpoint defines a network destination and, optionally, L7 inspection behav
 | `access`       | `string`   | `""`            | Shorthand preset for common L7 rule sets. Mutually exclusive with `rules`.                                          |
 | `rules`        | `L7Rule[]` | `[]`            | Explicit L7 allow rules. Mutually exclusive with `access`.                                                          |
 | `allowed_ips`  | `string[]` | `[]`            | IP allowlist for SSRF override. Entries overlapping always-blocked ranges (loopback, link-local, unspecified) are rejected at load time. See [Private IP Access via `allowed_ips`](#private-ip-access-via-allowed_ips). |
+| `allow_encoded_slash` | `bool` | `false` | Preserves `%2F` inside L7 request path segments instead of rejecting the request. Required for endpoints such as npm scoped packages. |
 
 #### `NetworkBinary`
 
@@ -1462,7 +1463,7 @@ Evaluated on every CONNECT request and every forward proxy request. The same OPA
 | `network_action`          | Same input                                                                                                        | `"allow"` if endpoint + binary matched, `"deny"` otherwise                                    |
 | `deny_reason`             | Same input                                                                                                        | Human-readable string explaining why access was denied                                        |
 | `matched_network_policy`  | Same input                                                                                                        | Name of the matched policy (for audit logging)                                                |
-| `matched_endpoint_config` | Same input                                                                                                        | Raw endpoint object for L7 config extraction (returned if endpoint has `protocol` or `allowed_ips` field) |
+| `matched_endpoint_config` | Same input                                                                                                        | Raw endpoint object for L7 config extraction (returned if endpoint has `protocol`, `allowed_ips`, or explicit TLS config) |
 
 ### L7 Rules (per-request within tunnel)
 

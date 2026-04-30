@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(
+    clippy::match_same_arms,
+    clippy::cast_possible_truncation,
+    clippy::doc_markdown,
+    reason = "Integration test: dual-arm patterns and small-payload casts are idiomatic in test setup."
+)]
+
 //! Integration test: WebSocket upgrade through the L7 relay.
 //!
 //! Spins up a dummy WebSocket echo server, connects a client through the

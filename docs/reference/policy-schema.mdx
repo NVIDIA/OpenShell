@@ -161,6 +161,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `rules` | list of rule objects | No | Fine-grained per-method, per-path allow rules. Mutually exclusive with `access`. |
 | `deny_rules` | list of deny rule objects | No | L7 deny rules that block specific requests even when allowed by `access` or `rules`. Deny rules take precedence over allow rules. |
 | `allowed_ips` | list of string | No | CIDR or IP allowlist for SSRF override. Entries overlapping loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), or unspecified (`0.0.0.0`) are rejected at load time. |
+| `allow_encoded_slash` | bool | No | When `true`, L7 request parsing preserves `%2F` inside path segments instead of rejecting it. Use this for registries and APIs such as npm scoped packages (`/@scope%2Fname`). Defaults to `false`. |
 
 #### Access Levels
 
@@ -262,6 +263,9 @@ network_policies:
     endpoints:
       - host: registry.npmjs.org
         port: 443
+        protocol: rest
+        access: read-only
+        allow_encoded_slash: true
     binaries:
       - path: /usr/bin/npm
       - path: /usr/bin/node

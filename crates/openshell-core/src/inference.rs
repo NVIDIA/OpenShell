@@ -124,8 +124,9 @@ pub fn auth_for_provider_type(provider_type: &str) -> (AuthHeader, Vec<(String, 
 pub fn route_headers_for_provider_type(
     provider_type: &str,
 ) -> (AuthHeader, Vec<(String, String)>, Vec<String>) {
-    match profile_for(provider_type) {
-        Some(profile) => {
+    profile_for(provider_type).map_or_else(
+        || (AuthHeader::Bearer, Vec::new(), Vec::new()),
+        |profile| {
             let headers = profile
                 .default_headers
                 .iter()
@@ -137,9 +138,8 @@ pub fn route_headers_for_provider_type(
                 .map(|name| (*name).to_string())
                 .collect();
             (profile.auth.clone(), headers, passthrough_headers)
-        }
-        None => (AuthHeader::Bearer, Vec::new(), Vec::new()),
-    }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

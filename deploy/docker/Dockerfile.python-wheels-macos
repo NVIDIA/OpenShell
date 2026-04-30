@@ -36,7 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # arm64-apple-macosx-ld. Provide a linker alias to osxcross ld64.
 RUN ln -sf /osxcross/bin/arm64-apple-darwin25.1-ld /usr/local/bin/arm64-apple-macosx-ld
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95.0
 RUN rustup target add aarch64-apple-darwin
 RUN pip install --no-cache-dir maturin
 

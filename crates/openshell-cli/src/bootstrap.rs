@@ -101,7 +101,7 @@ fn is_connectivity_error(error: &miette::Report) -> bool {
 /// `false` to skip bootstrap. Otherwise returns `true` — a gateway is created
 /// automatically without prompting the user.
 pub fn confirm_bootstrap(override_value: Option<bool>) -> Result<bool> {
-    if let Some(false) = override_value {
+    if override_value == Some(false) {
         return Ok(false);
     }
     Ok(true)
