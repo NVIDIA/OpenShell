@@ -2533,6 +2533,7 @@ async fn handle_forward_proxy(
             return Ok(());
         }
     };
+    let mut forward_request_bytes = buf[..used].to_vec();
 
     // 4b. If the endpoint has L7 config, evaluate the request against
     //     L7 policy.  The forward proxy handles exactly one request per
@@ -2648,11 +2649,61 @@ async fn handle_forward_proxy(
                     return Ok(());
                 }
             };
+        let graphql = if l7_config.protocol == crate::l7::L7Protocol::Graphql {
+            let header_end = forward_request_bytes
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map_or(forward_request_bytes.len(), |p| p + 4);
+            let header_str = std::str::from_utf8(&forward_request_bytes[..header_end])
+                .map_err(|_| miette::miette!("Forward GraphQL headers contain invalid UTF-8"))?;
+            let body_length = crate::l7::rest::parse_body_length(header_str)?;
+            let mut graphql_request = crate::l7::provider::L7Request {
+                action: method.to_string(),
+                target: path.clone(),
+                query_params: query_params.clone(),
+                raw_header: forward_request_bytes,
+                body_length,
+            };
+            let info = match crate::l7::graphql::inspect_graphql_request(
+                client,
+                &mut graphql_request,
+                l7_config.graphql_max_body_bytes,
+            )
+            .await
+            {
+                Ok(info) => info,
+                Err(e) => {
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .message(format!("FORWARD_GRAPHQL_L7 request rejected: {e}"))
+                        .build();
+                    ocsf_emit!(event);
+                    respond(
+                        client,
+                        &build_json_error_response(
+                            400,
+                            "Bad Request",
+                            "invalid_graphql_request",
+                            &format!("GraphQL request rejected before policy evaluation: {e}"),
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            forward_request_bytes = graphql_request.raw_header;
+            Some(info)
+        } else {
+            None
+        };
         let request_info = crate::l7::L7RequestInfo {
             action: method.to_string(),
             target: path.clone(),
             query_params,
-            graphql: None,
+            graphql,
         };
 
         let (allowed, reason) =
@@ -2689,6 +2740,16 @@ async fn handle_forward_proxy(
                     SeverityId::Informational,
                 ),
             };
+            let engine_type = if l7_config.protocol == crate::l7::L7Protocol::Graphql {
+                "l7-graphql"
+            } else {
+                "l7"
+            };
+            let message_prefix = if l7_config.protocol == crate::l7::L7Protocol::Graphql {
+                "FORWARD_GRAPHQL_L7"
+            } else {
+                "FORWARD_L7"
+            };
             let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                 .activity(ActivityId::Other)
                 .action(action_id)
@@ -2704,9 +2765,9 @@ async fn handle_forward_proxy(
                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                         .with_cmd_line(&cmdline_str),
                 )
-                .firewall_rule(policy_str, "l7")
+                .firewall_rule(policy_str, engine_type)
                 .message(format!(
-                    "FORWARD_L7 {decision_str} {method} {host_lc}:{port}{path} reason={reason}"
+                    "{message_prefix} {decision_str} {method} {host_lc}:{port}{path} reason={reason}"
                 ))
                 .build();
             ocsf_emit!(event);
@@ -2992,7 +3053,12 @@ async fn handle_forward_proxy(
     }
 
     // 9. Rewrite request and forward to upstream
-    let rewritten = match rewrite_forward_request(buf, used, &path, secret_resolver.as_deref()) {
+    let rewritten = match rewrite_forward_request(
+        &forward_request_bytes,
+        forward_request_bytes.len(),
+        &path,
+        secret_resolver.as_deref(),
+    ) {
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(

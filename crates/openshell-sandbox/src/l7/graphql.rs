@@ -49,12 +49,20 @@ pub async fn parse_graphql_http_request<C: AsyncRead + AsyncWrite + Unpin + Send
         return Ok(None);
     };
 
-    let header_str = header_str(&request)?;
-    reject_unsupported_headers(header_str)?;
-    let body = read_body_for_inspection(client, &mut request, max_body_bytes).await?;
-    let info = classify_request(&request, &body);
+    let info = inspect_graphql_request(client, &mut request, max_body_bytes).await?;
 
     Ok(Some(GraphqlHttpRequest { request, info }))
+}
+
+pub(crate) async fn inspect_graphql_request<C: AsyncRead + Unpin>(
+    client: &mut C,
+    request: &mut L7Request,
+    max_body_bytes: usize,
+) -> Result<GraphqlRequestInfo> {
+    let header_str = header_str(request)?;
+    reject_unsupported_headers(header_str)?;
+    let body = read_body_for_inspection(client, request, max_body_bytes).await?;
+    Ok(classify_request(request, &body))
 }
 
 pub fn classify_request(request: &L7Request, body: &[u8]) -> GraphqlRequestInfo {
