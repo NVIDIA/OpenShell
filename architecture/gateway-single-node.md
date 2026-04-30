@@ -297,7 +297,8 @@ When environment variables are set, the entrypoint modifies the HelmChart manife
 
 GPU support is part of the single-node gateway bootstrap path rather than a separate architecture.
 
-- `openshell gateway start --gpu` threads GPU device options through `crates/openshell-cli`, `crates/openshell-bootstrap`, and `crates/openshell-bootstrap/src/docker.rs`.
+- `openshell gateway start` auto-detects GPU support and threads GPU device options through `crates/openshell-cli`, `crates/openshell-bootstrap`, and `crates/openshell-bootstrap/src/docker.rs`. Users can force passthrough with `--gpu` or disable auto-detection with `--no-gpu`.
+- Auto-detection enables passthrough when Docker reports NVIDIA CDI devices. For local non-CDI hosts, it also enables passthrough when `/dev/nvidia*` devices exist and Docker reports the NVIDIA runtime. Remote legacy-runtime hosts still require explicit `--gpu`.
 - When enabled, the cluster container is created with Docker `DeviceRequests`. The injection mechanism is selected based on whether CDI is enabled on the daemon (`SystemInfo.CDISpecDirs` via `GET /info`):
   - **CDI enabled** (daemon reports non-empty `CDISpecDirs`): CDI device injection — `driver="cdi"` with `nvidia.com/gpu=all`. Specs are expected to be pre-generated on the host (e.g. automatically by the `nvidia-cdi-refresh.service` or manually via `nvidia-ctk generate`).
   - **CDI not enabled**: `--gpus all` device request — `driver="nvidia"`, `count=-1`, which relies on the NVIDIA Container Runtime hook.
@@ -317,9 +318,11 @@ Host GPU drivers & NVIDIA Container Toolkit
                 └─ Pods: request nvidia.com/gpu in resource limits (CDI injection — no runtimeClassName needed)
 ```
 
-### `--gpu` flag
+### GPU flags
 
-The `--gpu` flag on `gateway start` enables GPU passthrough. OpenShell auto-selects CDI when enabled on the daemon and falls back to Docker's NVIDIA GPU request path (`--gpus all`) otherwise.
+`gateway start` enables GPU passthrough automatically when it detects NVIDIA GPU support. The `--gpu` flag forces GPU passthrough even when auto-detection does not find a device. The `--no-gpu` flag disables auto-detection.
+
+OpenShell auto-selects CDI when enabled on the daemon and falls back to Docker's NVIDIA GPU request path (`--gpus all`) otherwise.
 
 Device injection uses CDI (`deviceListStrategy: cdi-cri`): the device plugin injects devices via direct CDI device requests in the CRI. Sandbox pods only need `nvidia.com/gpu: 1` in their resource limits, and GPU pods do not set `runtimeClassName`.
 

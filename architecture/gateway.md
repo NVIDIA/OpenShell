@@ -606,7 +606,7 @@ The gateway reaches the sandbox exclusively through the supervisor-initiated `Co
 
 The Docker driver (`crates/openshell-driver-docker/src/lib.rs`) is an in-process compute backend for local standalone gateways. It creates one Docker container per sandbox, labels each container with `openshell.ai/managed-by=openshell`, `openshell.ai/sandbox-id`, `openshell.ai/sandbox-name`, and `openshell.ai/sandbox-namespace`, and bind-mounts a Linux `openshell-sandbox` supervisor binary into the container.
 
-- **Create**: Pulls or validates the sandbox image according to `sandbox_image_pull_policy`, creates a labeled container, mounts the supervisor binary and optional TLS material, and starts the container with the supervisor as entrypoint.
+- **Create**: Pulls or validates the sandbox image according to `sandbox_image_pull_policy`, creates a labeled container, mounts the supervisor binary and optional TLS material, and starts the container with the supervisor as entrypoint. When the sandbox spec requests GPU and Docker exposes NVIDIA CDI devices or the NVIDIA runtime, the driver adds a Docker `DeviceRequest` for those GPUs.
 - **List/Get/Watch**: Reads labeled containers in the configured sandbox namespace and derives driver-native sandbox status from Docker state plus supervisor relay readiness.
 - **Stop**: Stops the matching labeled container without deleting it.
 - **Delete**: Force-removes the matching labeled container.

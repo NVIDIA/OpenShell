@@ -8,9 +8,10 @@ use bollard::API_DEFAULT_VERSION;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, DeviceRequest, EndpointSettings, HostConfig, HostConfigCgroupnsModeEnum,
-    NetworkConnectRequest, NetworkCreateRequest, NetworkDisconnectRequest, PortBinding,
-    RestartPolicy, RestartPolicyNameEnum, VolumeCreateRequest,
+    ContainerCreateBody, DeviceInfo, DeviceRequest, EndpointSettings, HostConfig,
+    HostConfigCgroupnsModeEnum, NetworkConnectRequest, NetworkCreateRequest,
+    NetworkDisconnectRequest, PortBinding, RestartPolicy, RestartPolicyNameEnum, Runtime,
+    SystemInfo, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, InspectNetworkOptions,
@@ -19,6 +20,7 @@ use bollard::query_parameters::{
 };
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_core::config::CDI_GPU_DEVICE_ALL;
 use std::collections::HashMap;
 
 const REGISTRY_NAMESPACE_DEFAULT: &str = "openshell";
@@ -62,6 +64,92 @@ pub(crate) fn resolve_gpu_device_ids(gpu: &[String], cdi_enabled: bool) -> Vec<S
         }
         other => other.to_vec(),
     }
+}
+
+/// Detect concrete GPU device IDs for automatic gateway GPU enablement.
+///
+/// Auto-detection is intentionally stricter than explicit `--gpu`: CDI is
+/// selected only when Docker reports NVIDIA CDI devices, while the legacy
+/// NVIDIA runtime path is selected only when the local host exposes NVIDIA
+/// device files.
+pub(crate) fn auto_detect_gpu_device_ids(
+    info: Option<&SystemInfo>,
+    local_nvidia_devices_present: bool,
+) -> Vec<String> {
+    let Some(info) = info else {
+        return Vec::new();
+    };
+
+    let cdi_device_ids = nvidia_cdi_device_ids(info);
+    if !cdi_device_ids.is_empty() {
+        return cdi_device_ids;
+    }
+
+    if local_nvidia_devices_present && docker_info_has_nvidia_runtime(info) {
+        return vec!["legacy".to_string()];
+    }
+
+    Vec::new()
+}
+
+pub(crate) fn docker_info_cdi_enabled(info: Option<&SystemInfo>) -> bool {
+    info.and_then(|info| info.cdi_spec_dirs.as_ref())
+        .is_some_and(|dirs| !dirs.is_empty())
+}
+
+pub(crate) fn local_nvidia_devices_present() -> bool {
+    ["/dev/nvidia0", "/dev/nvidiactl", "/proc/driver/nvidia/gpus"]
+        .iter()
+        .any(|path| std::path::Path::new(path).exists())
+}
+
+fn nvidia_cdi_device_ids(info: &SystemInfo) -> Vec<String> {
+    let Some(devices) = info.discovered_devices.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut ids = devices
+        .iter()
+        .filter_map(nvidia_cdi_device_id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+
+    if ids.iter().any(|id| id == CDI_GPU_DEVICE_ALL) {
+        vec![CDI_GPU_DEVICE_ALL.to_string()]
+    } else {
+        ids
+    }
+}
+
+fn nvidia_cdi_device_id(device: &DeviceInfo) -> Option<String> {
+    let id = device.id.as_ref()?;
+    if id.contains("nvidia.com/gpu=")
+        || (id.contains("/gpu=") && device.source.as_deref().is_some_and(contains_nvidia))
+    {
+        return Some(id.clone());
+    }
+    None
+}
+
+fn docker_info_has_nvidia_runtime(info: &SystemInfo) -> bool {
+    info.runtimes.as_ref().is_some_and(|runtimes| {
+        runtimes
+            .iter()
+            .any(|(name, runtime)| is_nvidia_runtime(name, runtime))
+    })
+}
+
+fn is_nvidia_runtime(name: &str, runtime: &Runtime) -> bool {
+    contains_nvidia(name)
+        || runtime
+            .path
+            .as_deref()
+            .is_some_and(|path| path.contains("nvidia-container-runtime"))
+}
+
+fn contains_nvidia(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("nvidia")
 }
 
 const REGISTRY_MODE_EXTERNAL: &str = "external";
@@ -1465,5 +1553,51 @@ mod tests {
             "nvidia.com/gpu=1".to_string(),
         ];
         assert_eq!(resolve_gpu_device_ids(&multi, true), multi);
+    }
+
+    #[test]
+    fn auto_detect_gpu_prefers_reported_nvidia_cdi_devices() {
+        let info = SystemInfo {
+            discovered_devices: Some(vec![DeviceInfo {
+                source: Some("cdi".to_string()),
+                id: Some("nvidia.com/gpu=all".to_string()),
+            }]),
+            runtimes: Some(HashMap::from([("nvidia".to_string(), Runtime::default())])),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            auto_detect_gpu_device_ids(Some(&info), false),
+            vec!["nvidia.com/gpu=all".to_string()]
+        );
+    }
+
+    #[test]
+    fn auto_detect_gpu_uses_legacy_runtime_only_when_local_devices_exist() {
+        let info = SystemInfo {
+            runtimes: Some(HashMap::from([("nvidia".to_string(), Runtime::default())])),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            auto_detect_gpu_device_ids(Some(&info), false),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            auto_detect_gpu_device_ids(Some(&info), true),
+            vec!["legacy".to_string()]
+        );
+    }
+
+    #[test]
+    fn docker_info_cdi_enabled_requires_cdi_dirs() {
+        assert!(!docker_info_cdi_enabled(None));
+        assert!(!docker_info_cdi_enabled(Some(&SystemInfo::default())));
+
+        let info = SystemInfo {
+            cdi_spec_dirs: Some(vec!["/etc/cdi".to_string()]),
+            ..Default::default()
+        };
+        assert!(docker_info_cdi_enabled(Some(&info)));
     }
 }

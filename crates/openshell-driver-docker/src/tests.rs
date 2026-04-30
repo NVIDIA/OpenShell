@@ -51,6 +51,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             key: PathBuf::from("/tmp/tls.key"),
         }),
         daemon_version: "28.0.0".to_string(),
+        gpu_device_request: None,
     }
 }
 
@@ -168,6 +169,100 @@ fn build_container_create_body_clears_inherited_cmd() {
             .as_ref()
             .and_then(|labels| labels.get(SANDBOX_NAMESPACE_LABEL_KEY)),
         Some(&"default".to_string())
+    );
+}
+
+#[test]
+fn validate_sandbox_rejects_gpu_when_daemon_has_no_gpu_support() {
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().gpu = true;
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, false).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("NVIDIA GPU support"));
+}
+
+#[test]
+fn build_container_create_body_adds_legacy_gpu_device_request() {
+    let mut config = runtime_config();
+    config.gpu_device_request = Some(DockerGpuDeviceRequest::Nvidia);
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().gpu = true;
+
+    let create_body = build_container_create_body(&sandbox, &config).unwrap();
+    let device_requests = create_body
+        .host_config
+        .unwrap()
+        .device_requests
+        .expect("GPU sandbox should request Docker devices");
+
+    assert_eq!(device_requests.len(), 1);
+    assert_eq!(device_requests[0].driver.as_deref(), Some("nvidia"));
+    assert_eq!(device_requests[0].count, Some(-1));
+    assert_eq!(
+        device_requests[0].capabilities,
+        Some(vec![vec![
+            "gpu".to_string(),
+            "utility".to_string(),
+            "compute".to_string()
+        ]])
+    );
+}
+
+#[test]
+fn build_container_create_body_adds_cdi_gpu_device_request() {
+    let mut config = runtime_config();
+    config.gpu_device_request = Some(DockerGpuDeviceRequest::Cdi(vec![
+        "nvidia.com/gpu=all".to_string(),
+    ]));
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().gpu = true;
+
+    let create_body = build_container_create_body(&sandbox, &config).unwrap();
+    let device_requests = create_body
+        .host_config
+        .unwrap()
+        .device_requests
+        .expect("GPU sandbox should request Docker devices");
+
+    assert_eq!(device_requests.len(), 1);
+    assert_eq!(device_requests[0].driver.as_deref(), Some("cdi"));
+    assert_eq!(
+        device_requests[0].device_ids,
+        Some(vec!["nvidia.com/gpu=all".to_string()])
+    );
+}
+
+#[test]
+fn docker_gpu_device_request_prefers_cdi_devices_over_legacy_runtime() {
+    let info = SystemInfo {
+        discovered_devices: Some(vec![DeviceInfo {
+            source: Some("cdi".to_string()),
+            id: Some("nvidia.com/gpu=all".to_string()),
+        }]),
+        runtimes: Some(HashMap::from([("nvidia".to_string(), Runtime::default())])),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gpu_device_request_from_info(&info),
+        Some(DockerGpuDeviceRequest::Cdi(vec![
+            "nvidia.com/gpu=all".to_string()
+        ]))
+    );
+}
+
+#[test]
+fn docker_gpu_device_request_detects_legacy_nvidia_runtime() {
+    let info = SystemInfo {
+        runtimes: Some(HashMap::from([("nvidia".to_string(), Runtime::default())])),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gpu_device_request_from_info(&info),
+        Some(DockerGpuDeviceRequest::Nvidia)
     );
 }
 

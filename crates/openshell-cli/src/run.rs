@@ -1436,6 +1436,7 @@ pub async fn gateway_admin_deploy(
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     gpu: Vec<String>,
+    gpu_auto_detect: bool,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
@@ -1489,6 +1490,7 @@ pub async fn gateway_admin_deploy(
         .with_disable_tls(disable_tls)
         .with_disable_gateway_auth(disable_gateway_auth)
         .with_gpu(gpu)
+        .with_gpu_auto_detect(gpu_auto_detect)
         .with_recreate(recreate);
     if let Some(opts) = remote_opts {
         options = options.with_remote(opts);

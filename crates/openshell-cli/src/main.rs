@@ -821,6 +821,14 @@ enum GatewayCommands {
         /// (`--gpus all`) otherwise.
         #[arg(long)]
         gpu: bool,
+
+        /// Disable automatic NVIDIA GPU passthrough detection.
+        ///
+        /// By default, `gateway start` enables GPU passthrough when Docker
+        /// reports NVIDIA CDI devices, or when the local host exposes NVIDIA
+        /// devices and the NVIDIA Docker runtime is configured.
+        #[arg(long, conflicts_with = "gpu")]
+        no_gpu: bool,
     },
 
     /// Stop the gateway (preserves state).
@@ -1733,12 +1741,14 @@ async fn main() -> Result<()> {
                 registry_username,
                 registry_token,
                 gpu,
+                no_gpu,
             } => {
                 let gpu = if gpu {
                     vec!["auto".to_string()]
                 } else {
                     vec![]
                 };
+                let gpu_auto_detect = !no_gpu && gpu.is_empty();
                 run::gateway_admin_deploy(
                     &name,
                     remote.as_deref(),
@@ -1751,6 +1761,7 @@ async fn main() -> Result<()> {
                     registry_username.as_deref(),
                     registry_token.as_deref(),
                     gpu,
+                    gpu_auto_detect,
                 )
                 .await?;
             }
@@ -3406,6 +3417,31 @@ mod tests {
             }
             other => panic!("expected settings delete command, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn gateway_start_parses_no_gpu_flag() {
+        let cli = Cli::try_parse_from(["openshell", "gateway", "start", "--no-gpu"])
+            .expect("gateway start --no-gpu should parse");
+
+        match cli.command {
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::Start { no_gpu, gpu, .. }),
+            }) => {
+                assert!(no_gpu);
+                assert!(!gpu);
+            }
+            other => panic!("expected gateway start command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gateway_start_rejects_gpu_and_no_gpu_together() {
+        let result = Cli::try_parse_from(["openshell", "gateway", "start", "--gpu", "--no-gpu"]);
+        assert!(
+            result.is_err(),
+            "gateway start should reject conflicting GPU flags"
+        );
     }
 
     // ── sandbox create arg-shape tests ───────────────────────────────────

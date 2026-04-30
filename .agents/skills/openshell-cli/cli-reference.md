@@ -85,6 +85,8 @@ Provision or start a cluster (local or remote).
 | `--port <PORT>` | 8080 | Host port mapped to gateway |
 | `--gateway-host <HOST>` | none | Override gateway host in metadata |
 | `--recreate` | false | Destroy and recreate from scratch if a gateway already exists (skips interactive prompt) |
+| `--gpu` | false | Force NVIDIA GPU passthrough |
+| `--no-gpu` | false | Disable automatic NVIDIA GPU passthrough detection |
 
 ### `openshell gateway stop`
 

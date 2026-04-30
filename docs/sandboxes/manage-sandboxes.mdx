@@ -39,6 +39,8 @@ To request GPU resources, add `--gpu`:
 openshell sandbox create --gpu -- claude
 ```
 
+On GPU-capable Docker hosts, `openshell gateway start` enables gateway GPU passthrough automatically. Use `openshell gateway start --no-gpu` to disable auto-detection, or pass `openshell gateway start --gpu` to force GPU passthrough.
+
 ### Custom Containers
 
 Use `--from` to create a sandbox from a pre-built community package, a local directory, or a container image:

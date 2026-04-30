@@ -119,6 +119,9 @@ pub struct DeployOptions {
     /// - `["auto"]`    — resolved at deploy time: CDI if enabled on the daemon, else the non-CDI fallback
     /// - `[cdi-ids…]`  — CDI DeviceRequest with the given device IDs
     pub gpu: Vec<String>,
+    /// Detect NVIDIA GPU support during deploy and enable passthrough when no
+    /// explicit GPU device IDs were supplied.
+    pub gpu_auto_detect: bool,
     /// When true, destroy any existing gateway resources before deploying.
     /// When false, an existing gateway is left as-is and deployment is
     /// skipped (the caller is responsible for prompting the user first).
@@ -138,6 +141,7 @@ impl DeployOptions {
             registry_username: None,
             registry_token: None,
             gpu: vec![],
+            gpu_auto_detect: false,
             recreate: false,
         }
     }
@@ -199,6 +203,13 @@ impl DeployOptions {
     #[must_use]
     pub fn with_gpu(mut self, gpu: Vec<String>) -> Self {
         self.gpu = gpu;
+        self
+    }
+
+    /// Enable or disable automatic GPU passthrough detection.
+    #[must_use]
+    pub fn with_gpu_auto_detect(mut self, auto_detect: bool) -> Self {
+        self.gpu_auto_detect = auto_detect;
         self
     }
 
@@ -270,7 +281,8 @@ where
     let disable_gateway_auth = options.disable_gateway_auth;
     let registry_username = options.registry_username;
     let registry_token = options.registry_token;
-    let gpu = options.gpu;
+    let mut gpu = options.gpu;
+    let gpu_auto_detect = options.gpu_auto_detect;
     let recreate = options.recreate;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
@@ -296,17 +308,22 @@ where
         (preflight.docker, None)
     };
 
-    // CDI is considered enabled when the daemon reports at least one CDI spec
-    // directory via `GET /info` (`SystemInfo.CDISpecDirs`). An empty list or
-    // missing field means CDI is not configured and we fall back to the legacy
-    // NVIDIA `DeviceRequest` (driver="nvidia"). Detection is best-effort —
-    // failure to query daemon info is non-fatal.
-    let cdi_supported = target_docker
-        .info()
-        .await
-        .ok()
-        .and_then(|info| info.cdi_spec_dirs)
-        .is_some_and(|dirs| !dirs.is_empty());
+    // GPU discovery is best-effort. Explicit `--gpu` still uses the legacy
+    // CDI-enabled check below, while auto-detection only enables GPU when the
+    // daemon reports NVIDIA CDI devices or the local host has NVIDIA devices
+    // plus the NVIDIA Docker runtime.
+    let docker_info = target_docker.info().await.ok();
+    let cdi_supported = docker::docker_info_cdi_enabled(docker_info.as_ref());
+    if gpu_auto_detect && gpu.is_empty() {
+        let detected_gpu = docker::auto_detect_gpu_device_ids(
+            docker_info.as_ref(),
+            remote_opts.is_none() && docker::local_nvidia_devices_present(),
+        );
+        if !detected_gpu.is_empty() {
+            log("[status] Detected NVIDIA GPU support".to_string());
+            gpu = detected_gpu;
+        }
+    }
 
     // If an existing gateway is found, decide how to proceed:
     // - recreate: destroy everything and start fresh

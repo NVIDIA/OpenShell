@@ -8,8 +8,8 @@
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, HostConfig, Mount,
-    MountTypeEnum, RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, DeviceInfo, DeviceRequest,
+    HostConfig, Mount, MountTypeEnum, RestartPolicy, RestartPolicyNameEnum, Runtime, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -17,7 +17,7 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
+use openshell_core::config::{CDI_GPU_DEVICE_ALL, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
@@ -159,6 +159,7 @@ struct DockerDriverRuntimeConfig {
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
+    gpu_device_request: Option<DockerGpuDeviceRequest>,
 }
 
 #[derive(Clone)]
@@ -173,6 +174,12 @@ pub struct DockerComputeDriver {
 struct DockerResourceLimits {
     nano_cpus: Option<i64>,
     memory_bytes: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DockerGpuDeviceRequest {
+    Cdi(Vec<String>),
+    Nvidia,
 }
 
 type WatchStream =
@@ -195,6 +202,12 @@ impl DockerComputeDriver {
         let version = docker.version().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;
+        let gpu_device_request = docker
+            .info()
+            .await
+            .ok()
+            .as_ref()
+            .and_then(docker_gpu_device_request_from_info);
         let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
         let supervisor_bin = resolve_supervisor_bin(&docker, docker_config, &daemon_arch).await?;
         let guest_tls = docker_guest_tls_paths(config, docker_config)?;
@@ -212,6 +225,7 @@ impl DockerComputeDriver {
                 supervisor_bin,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
+                gpu_device_request,
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             supervisor_readiness,
@@ -230,11 +244,11 @@ impl DockerComputeDriver {
             driver_name: "docker".to_string(),
             driver_version: self.config.daemon_version.clone(),
             default_image: self.config.default_image.clone(),
-            supports_gpu: false,
+            supports_gpu: self.config.gpu_device_request.is_some(),
         }
     }
 
-    fn validate_sandbox(sandbox: &DriverSandbox) -> Result<(), Status> {
+    fn validate_sandbox(sandbox: &DriverSandbox, gpu_supported: bool) -> Result<(), Status> {
         let spec = sandbox
             .spec
             .as_ref()
@@ -249,9 +263,9 @@ impl DockerComputeDriver {
                 "docker sandboxes require a template image",
             ));
         }
-        if spec.gpu {
+        if spec.gpu && !gpu_supported {
             return Err(Status::failed_precondition(
-                "docker compute driver does not support gpu sandboxes",
+                "GPU sandbox requested, but the Docker daemon does not expose NVIDIA GPU support",
             ));
         }
         if !template.agent_socket_path.trim().is_empty() {
@@ -299,7 +313,7 @@ impl DockerComputeDriver {
     }
 
     async fn create_sandbox_inner(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
-        Self::validate_sandbox(sandbox)?;
+        Self::validate_sandbox(sandbox, self.config.gpu_device_request.is_some())?;
 
         if self
             .find_managed_container_summary(&sandbox.id, &sandbox.name)
@@ -673,7 +687,7 @@ impl ComputeDriver for DockerComputeDriver {
             .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        Self::validate_sandbox(&sandbox)?;
+        Self::validate_sandbox(&sandbox, self.config.gpu_device_request.is_some())?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
@@ -888,6 +902,7 @@ fn build_container_create_body(
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
+    let device_requests = docker_gpu_device_requests(spec.gpu, config)?;
     let mut labels = template.labels.clone();
     labels.insert(
         MANAGED_BY_LABEL_KEY.to_string(),
@@ -917,6 +932,7 @@ fn build_container_create_body(
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
             mounts: Some(build_mounts(config)),
+            device_requests,
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,
@@ -1002,6 +1018,101 @@ fn docker_resource_limits(
         nano_cpus: parse_cpu_limit(&resources.cpu_limit)?,
         memory_bytes: parse_memory_limit(&resources.memory_limit)?,
     })
+}
+
+fn docker_gpu_device_requests(
+    gpu_requested: bool,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<Option<Vec<DeviceRequest>>, Status> {
+    if !gpu_requested {
+        return Ok(None);
+    }
+
+    let Some(request) = config.gpu_device_request.as_ref() else {
+        return Err(Status::failed_precondition(
+            "GPU sandbox requested, but the Docker daemon does not expose NVIDIA GPU support",
+        ));
+    };
+
+    Ok(Some(vec![match request {
+        DockerGpuDeviceRequest::Cdi(device_ids) => DeviceRequest {
+            driver: Some("cdi".to_string()),
+            device_ids: Some(device_ids.clone()),
+            ..Default::default()
+        },
+        DockerGpuDeviceRequest::Nvidia => DeviceRequest {
+            driver: Some("nvidia".to_string()),
+            count: Some(-1),
+            capabilities: Some(vec![vec![
+                "gpu".to_string(),
+                "utility".to_string(),
+                "compute".to_string(),
+            ]]),
+            ..Default::default()
+        },
+    }]))
+}
+
+fn docker_gpu_device_request_from_info(info: &SystemInfo) -> Option<DockerGpuDeviceRequest> {
+    let cdi_device_ids = nvidia_cdi_device_ids(info);
+    if !cdi_device_ids.is_empty() {
+        return Some(DockerGpuDeviceRequest::Cdi(cdi_device_ids));
+    }
+
+    if docker_info_has_nvidia_runtime(info) {
+        return Some(DockerGpuDeviceRequest::Nvidia);
+    }
+
+    None
+}
+
+fn nvidia_cdi_device_ids(info: &SystemInfo) -> Vec<String> {
+    let Some(devices) = info.discovered_devices.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut ids = devices
+        .iter()
+        .filter_map(nvidia_cdi_device_id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+
+    if ids.iter().any(|id| id == CDI_GPU_DEVICE_ALL) {
+        vec![CDI_GPU_DEVICE_ALL.to_string()]
+    } else {
+        ids
+    }
+}
+
+fn nvidia_cdi_device_id(device: &DeviceInfo) -> Option<String> {
+    let id = device.id.as_ref()?;
+    if id.contains("nvidia.com/gpu=")
+        || (id.contains("/gpu=") && device.source.as_deref().is_some_and(contains_nvidia))
+    {
+        return Some(id.clone());
+    }
+    None
+}
+
+fn docker_info_has_nvidia_runtime(info: &SystemInfo) -> bool {
+    info.runtimes.as_ref().is_some_and(|runtimes| {
+        runtimes
+            .iter()
+            .any(|(name, runtime)| is_nvidia_runtime(name, runtime))
+    })
+}
+
+fn is_nvidia_runtime(name: &str, runtime: &Runtime) -> bool {
+    contains_nvidia(name)
+        || runtime
+            .path
+            .as_deref()
+            .is_some_and(|path| path.contains("nvidia-container-runtime"))
+}
+
+fn contains_nvidia(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("nvidia")
 }
 
 #[allow(clippy::cast_possible_truncation)]
