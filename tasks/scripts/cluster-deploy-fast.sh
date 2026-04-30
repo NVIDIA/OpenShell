@@ -436,6 +436,8 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     --set server.tls.certSecretName=openshell-server-tls \
     --set server.tls.clientCaSecretName=openshell-server-client-ca \
     --set server.tls.clientTlsSecretName=openshell-client-tls \
+    --set-string server.localDomain.cluster=${CLUSTER_NAME} \
+    --set-string server.localDomain.suffix=${LOCAL_DOMAIN_SUFFIX:-openshell.localhost} \
     ${HOST_GATEWAY_ARGS} \
     ${helm_wait_args}"
   helm_end=$(date +%s)

@@ -207,12 +207,8 @@ pub struct Config {
 /// Browser-facing local-domain routing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalDomainConfig {
-    /// Enable local-domain routing.
-    #[serde(default)]
-    pub enabled: bool,
-
     /// Cluster label used in `<cluster>.<suffix>` hostnames.
-    #[serde(default)]
+    #[serde(default = "default_local_domain_cluster")]
     pub cluster: String,
 
     /// Hostname suffix, defaults to `openshell.localhost`.
@@ -413,12 +409,10 @@ impl Config {
     #[must_use]
     pub fn with_local_domain(
         mut self,
-        enabled: bool,
         cluster: impl Into<String>,
         suffix: impl Into<String>,
     ) -> Self {
         self.local_domain = LocalDomainConfig {
-            enabled,
             cluster: cluster.into(),
             suffix: suffix.into(),
         };
@@ -429,8 +423,7 @@ impl Config {
 impl Default for LocalDomainConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            cluster: String::new(),
+            cluster: default_local_domain_cluster(),
             suffix: default_local_domain_suffix(),
         }
     }
@@ -442,6 +435,10 @@ fn default_bind_address() -> SocketAddr {
 
 fn default_local_domain_suffix() -> String {
     DEFAULT_LOCAL_DOMAIN_SUFFIX.to_string()
+}
+
+fn default_local_domain_cluster() -> String {
+    "openshell".to_string()
 }
 
 fn default_log_level() -> String {

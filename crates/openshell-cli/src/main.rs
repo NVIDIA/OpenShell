@@ -799,12 +799,6 @@ enum GatewayCommands {
         #[arg(long)]
         disable_gateway_auth: bool,
 
-        /// Enable browser-facing local-domain routing for this local gateway.
-        ///
-        /// This is enabled by default during the local-domain routing spike.
-        #[arg(long, default_value_t = true)]
-        local_domain: bool,
-
         /// Suffix for local-domain routes.
         #[arg(long, default_value = openshell_core::config::DEFAULT_LOCAL_DOMAIN_SUFFIX)]
         local_domain_suffix: String,
@@ -1780,7 +1774,6 @@ async fn main() -> Result<()> {
                 recreate,
                 plaintext,
                 disable_gateway_auth,
-                local_domain,
                 local_domain_suffix,
                 registry_username,
                 registry_token,
@@ -1800,7 +1793,6 @@ async fn main() -> Result<()> {
                     recreate,
                     plaintext,
                     disable_gateway_auth,
-                    local_domain,
                     &local_domain_suffix,
                     registry_username.as_deref(),
                     registry_token.as_deref(),

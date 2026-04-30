@@ -164,14 +164,13 @@ Run a local browser proxy for the active remote gateway:
 openshell gateway proxy
 ```
 
-The proxy binds an available local port and prints URLs like `http://<sandbox>--<service>.<gateway>.openshell.localhost:<port>/`. It forwards HTTP and WebSocket traffic to the selected remote gateway over the gateway's configured transport. Use this when remote wildcard DNS is not configured.
+The proxy binds an available local port and prints URLs like `http://<sandbox>--<service>.<gateway>.openshell.localhost:<port>/`. It forwards HTTP and WebSocket traffic to the selected remote gateway over the gateway's configured transport. Use this when remote wildcard DNS is not configured. Use the URL printed by `openshell service expose --domain` if the remote gateway uses a different local-domain cluster label.
 
 ## Advanced Start Options
 
 | Flag | Purpose |
 |---|---|
 | `--gpu` | Enable NVIDIA GPU passthrough. Requires NVIDIA drivers and the Container Toolkit on the host. OpenShell auto-selects CDI when enabled on the daemon and falls back to Docker's NVIDIA GPU request path (`--gpus all`) otherwise. |
-| `--local-domain` | Enable local browser URLs for exposed sandbox HTTP services, such as `https://my-sandbox--web.openshell.openshell.localhost:8080`. This is currently enabled by default for new local gateways during the local-domain routing spike. Recreate gateways created before this feature so the generated TLS certificate includes the local-domain SANs. |
 | `--local-domain-suffix` | Override the local-domain suffix. Defaults to `openshell.localhost`. |
 | `--plaintext` | Listen on HTTP instead of mTLS. Use behind a TLS-terminating reverse proxy. |
 | `--disable-gateway-auth` | Skip mTLS client certificate checks. Use when a reverse proxy cannot forward client certs. |

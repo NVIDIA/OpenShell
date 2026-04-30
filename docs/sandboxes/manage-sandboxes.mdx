@@ -121,7 +121,7 @@ OpenShell allocates a TTY automatically when both stdin and stdout are terminals
 
 ## Expose HTTP Services
 
-For local browser testing, use a new local gateway or recreate a gateway created before local-domain routing was enabled by default:
+Local-domain routing is enabled for gateways by default. Recreate gateways created before local-domain routing so their generated TLS certificate includes the local-domain SANs:
 
 ```shell
 openshell gateway start --recreate
@@ -136,7 +136,7 @@ openshell service expose my-sandbox web --target-port 8080 --domain
 OpenShell prints a URL in the form `https://<sandbox>--<service>.<gateway>.openshell.localhost:<port>/`. HTTP traffic enters the same gateway listener as gRPC and routes by the `Host` header before gateway routes such as `/auth`, so application paths are preserved for the sandbox service.
 
 <Note>
-This local-domain path is an early spike. It covers HTTP requests over the existing supervisor relay. Import the gateway CA and client certificate before using mTLS-protected browser access; see [Browser Certificates](/reference/browser-certificates). WebSocket upgrades, endpoint deletion, renewal, and remote/public domains are follow-up work.
+Import the gateway CA and client certificate before using mTLS-protected browser access; see [Browser Certificates](/reference/browser-certificates). Endpoint deletion, renewal, and remote/public domains are follow-up work.
 
 </Note>
 

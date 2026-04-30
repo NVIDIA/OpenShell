@@ -1432,7 +1432,6 @@ pub async fn gateway_admin_deploy(
     recreate: bool,
     disable_tls: bool,
     disable_gateway_auth: bool,
-    local_domain: bool,
     local_domain_suffix: &str,
     registry_username: Option<&str>,
     registry_token: Option<&str>,
@@ -1487,7 +1486,7 @@ pub async fn gateway_admin_deploy(
         .with_port(effective_port)
         .with_disable_tls(disable_tls)
         .with_disable_gateway_auth(disable_gateway_auth)
-        .with_local_domain(local_domain, local_domain_suffix)
+        .with_local_domain(local_domain_suffix)
         .with_gpu(gpu)
         .with_recreate(recreate);
     if let Some(opts) = remote_opts {
@@ -3553,9 +3552,28 @@ pub async fn service_expose(
         target_port,
     );
     if !response.url.is_empty() {
-        println!("  URL: {}", response.url.cyan());
+        let url = service_url_for_gateway(&response.url, server);
+        println!("  URL: {}", url.cyan());
     }
     Ok(())
+}
+
+fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String {
+    let (Ok(mut service_url), Ok(gateway_endpoint)) = (
+        url::Url::parse(service_url),
+        url::Url::parse(gateway_endpoint),
+    ) else {
+        return service_url.to_string();
+    };
+
+    if service_url.set_scheme(gateway_endpoint.scheme()).is_err() {
+        return service_url.to_string();
+    }
+    if service_url.set_port(gateway_endpoint.port()).is_err() {
+        return service_url.to_string();
+    }
+
+    service_url.to_string()
 }
 
 pub async fn provider_create(
@@ -5563,8 +5581,8 @@ mod tests {
         gateway_type_label, git_sync_files, http_health_check, image_requests_gpu,
         inferred_provider_type, parse_cli_setting_value, parse_credential_pairs,
         plaintext_gateway_is_remote, provisioning_timeout_message, ready_false_condition_message,
-        resolve_gateway_control_target_from, sandbox_should_persist, shell_escape,
-        source_requests_gpu, validate_gateway_name, validate_ssh_host,
+        resolve_gateway_control_target_from, sandbox_should_persist, service_url_for_gateway,
+        shell_escape, source_requests_gpu, validate_gateway_name, validate_ssh_host,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -5812,6 +5830,28 @@ mod tests {
     fn source_requests_gpu_detects_known_community_gpu_name() {
         assert!(source_requests_gpu("nvidia-gpu"));
         assert!(!source_requests_gpu("base"));
+    }
+
+    #[test]
+    fn service_url_for_gateway_uses_external_gateway_port() {
+        assert_eq!(
+            service_url_for_gateway(
+                "https://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://127.0.0.1:31886"
+            ),
+            "https://quiet-flamingo--openclaw.navigator.openshell.localhost:31886/"
+        );
+    }
+
+    #[test]
+    fn service_url_for_gateway_omits_default_external_port() {
+        assert_eq!(
+            service_url_for_gateway(
+                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://gateway.example.com"
+            ),
+            "https://quiet-flamingo--openclaw.navigator.openshell.localhost/"
+        );
     }
 
     #[test]

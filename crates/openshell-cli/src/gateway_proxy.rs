@@ -20,14 +20,15 @@ trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub async fn run(metadata: GatewayMetadata, tls: TlsOptions) -> Result<()> {
-    if !metadata.is_remote {
+    let upstream = Upstream::from_endpoint(&metadata.gateway_endpoint)?;
+    if !metadata.is_remote && upstream.is_local_endpoint() {
         return Err(miette::miette!(
-            "gateway proxy requires a remote gateway; '{}' is local",
-            metadata.name
+            "gateway proxy requires a remote gateway; '{}' points at local endpoint {}",
+            metadata.name,
+            metadata.gateway_endpoint
         ));
     }
 
-    let upstream = Upstream::from_endpoint(&metadata.gateway_endpoint)?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .into_diagnostic()?;
@@ -149,6 +150,15 @@ impl Upstream {
             port,
         })
     }
+
+    fn is_local_endpoint(&self) -> bool {
+        if self.host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        self.host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|addr| addr.is_loopback() || addr.is_unspecified())
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +187,17 @@ mod tests {
         assert_eq!(upstream.scheme, "http");
         assert_eq!(upstream.host, "10.0.0.5");
         assert_eq!(upstream.port, 31886);
+    }
+
+    #[test]
+    fn tailscale_hostname_is_not_local_endpoint() {
+        let upstream = Upstream::from_endpoint("http://spark.kiko-cordylus.ts.net:39284").unwrap();
+        assert!(!upstream.is_local_endpoint());
+    }
+
+    #[test]
+    fn loopback_endpoint_is_local_endpoint() {
+        let upstream = Upstream::from_endpoint("https://127.0.0.1:31886").unwrap();
+        assert!(upstream.is_local_endpoint());
     }
 }

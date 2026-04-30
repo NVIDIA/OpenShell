@@ -82,14 +82,10 @@ spec:
             - name: OPENSHELL_HOST_GATEWAY_IP
               value: {{ .Values.server.hostGatewayIP | quote }}
             {{- end }}
-            {{- if .Values.server.localDomain.enabled }}
-            - name: OPENSHELL_LOCAL_DOMAIN_ENABLED
-              value: "true"
             - name: OPENSHELL_LOCAL_DOMAIN_CLUSTER
               value: {{ .Values.server.localDomain.cluster | quote }}
             - name: OPENSHELL_LOCAL_DOMAIN_SUFFIX
               value: {{ .Values.server.localDomain.suffix | quote }}
-            {{- end }}
             - name: OPENSHELL_SSH_HANDSHAKE_SECRET
               valueFrom:
                 secretKeyRef:

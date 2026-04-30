@@ -34,9 +34,6 @@ pub fn endpoint_url(
     sandbox: &str,
     service: &str,
 ) -> Option<String> {
-    if !config.local_domain.enabled {
-        return None;
-    }
     let host = endpoint_host(&config.local_domain, sandbox, service)?;
     let scheme = if config.tls.is_some() {
         "https"
@@ -63,7 +60,7 @@ fn endpoint_host(config: &LocalDomainConfig, sandbox: &str, service: &str) -> Op
 }
 
 pub fn parse_host(host: &str, config: &LocalDomainConfig) -> Option<(String, String)> {
-    if !config.enabled || config.cluster.is_empty() || config.suffix.is_empty() {
+    if config.cluster.is_empty() || config.suffix.is_empty() {
         return None;
     }
 
@@ -352,7 +349,6 @@ mod tests {
 
     fn config() -> LocalDomainConfig {
         LocalDomainConfig {
-            enabled: true,
             cluster: "dev".to_string(),
             suffix: "openshell.localhost".to_string(),
         }
