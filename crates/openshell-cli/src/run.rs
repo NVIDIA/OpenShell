@@ -1137,12 +1137,52 @@ pub async fn gateway_add(
     }
 
     if endpoint.starts_with("http://") {
+        // Warn if mTLS certs exist for this gateway — the user likely
+        // meant to use https:// instead of http://.
+        let has_mtls_certs = openshell_core::paths::xdg_config_dir()
+            .map(|d| {
+                let mtls = d.join("openshell").join("gateways").join(name).join("mtls");
+                mtls.join("ca.crt").is_file()
+                    && mtls.join("tls.crt").is_file()
+                    && mtls.join("tls.key").is_file()
+            })
+            .unwrap_or(false);
+
+        if has_mtls_certs {
+            let https_endpoint = endpoint.replacen("http://", "https://", 1);
+            let suggestion = if is_loopback_gateway_endpoint(&endpoint) {
+                format!("openshell gateway add --local {https_endpoint}")
+            } else {
+                format!("openshell gateway add {https_endpoint}")
+            };
+            eprintln!(
+                "{} mTLS certificates found for gateway '{name}'. Did you mean to use https?",
+                "⚠".yellow().bold(),
+            );
+            eprintln!("  Try: {suggestion}");
+        }
+
         let metadata = plaintext_gateway_metadata(name, &endpoint, remote, local);
         let gateway_type = gateway_type_label(&metadata);
         let gateway_auth = gateway_auth_label(&metadata);
 
         store_gateway_metadata(name, &metadata)?;
         save_active_gateway(name)?;
+
+        // Verify the gateway is reachable.
+        let tls = TlsOptions::default();
+        match http_health_check(&endpoint, &tls).await {
+            Ok(Some(status)) if status.is_success() => {}
+            _ => {
+                eprintln!(
+                    "{} Gateway is not reachable at {endpoint}",
+                    "⚠".yellow().bold(),
+                );
+                if !has_mtls_certs {
+                    eprintln!("  Verify the gateway is running and the endpoint is correct.");
+                }
+            }
+        }
 
         eprintln!(
             "{} Gateway '{}' added and set as active",
@@ -1213,6 +1253,18 @@ pub async fn gateway_add(
         store_gateway_metadata(name, &metadata)?;
         save_active_gateway(name)?;
 
+        // Verify the gateway is reachable over mTLS.
+        let tls = TlsOptions::default().with_gateway_name(name);
+        match http_health_check(&endpoint, &tls).await {
+            Ok(Some(status)) if status.is_success() => {}
+            _ => {
+                eprintln!(
+                    "{} Gateway is not reachable at {endpoint}. Verify the gateway is running.",
+                    "⚠".yellow().bold(),
+                );
+            }
+        }
+
         eprintln!(
             "{} Gateway '{}' added and set as active",
             "✓".green().bold(),
@@ -1224,7 +1276,15 @@ pub async fn gateway_add(
             "Type:".dimmed(),
             if local { "local" } else { "remote" },
         );
-        eprintln!("{} TLS certificates extracted", "✓".green().bold());
+        eprintln!(
+            "{} TLS certificates {}",
+            "✓".green().bold(),
+            if certs_on_disk {
+                "already present"
+            } else {
+                "extracted"
+            }
+        );
     } else {
         // Cloud (edge-authenticated) gateway.
         let metadata = GatewayMetadata {
