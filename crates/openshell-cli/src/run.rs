@@ -1170,10 +1170,27 @@ pub async fn gateway_add(
         // is not registered.  Pass the endpoint port so the container can be
         // identified by its host port binding when multiple gateways run on
         // the same Docker host.
-        let endpoint_port = url::Url::parse(&endpoint).ok().and_then(|u| u.port());
-        eprintln!("• Extracting TLS certificates from gateway container...");
-        openshell_bootstrap::extract_and_store_pki(name, remote_opts.as_ref(), endpoint_port)
-            .await?;
+        //
+        // Skip extraction when client certs are already on disk (e.g.,
+        // RPM/systemd deployments where init-pki.sh pre-provisions them
+        // before the gateway starts).
+        let certs_on_disk = openshell_core::paths::xdg_config_dir()
+            .map(|d| {
+                let mtls = d.join("openshell").join("gateways").join(name).join("mtls");
+                mtls.join("ca.crt").is_file()
+                    && mtls.join("tls.crt").is_file()
+                    && mtls.join("tls.key").is_file()
+            })
+            .unwrap_or(false);
+
+        if certs_on_disk {
+            eprintln!("• TLS certificates already present, skipping extraction");
+        } else {
+            let endpoint_port = url::Url::parse(&endpoint).ok().and_then(|u| u.port());
+            eprintln!("• Extracting TLS certificates from gateway container...");
+            openshell_bootstrap::extract_and_store_pki(name, remote_opts.as_ref(), endpoint_port)
+                .await?;
+        }
 
         let (remote_host, resolved_host) = remote.map_or((None, None), |dest| {
             let ssh_host = extract_host_from_ssh_destination(dest);
