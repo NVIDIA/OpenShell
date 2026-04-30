@@ -882,6 +882,22 @@ impl VmDriver {
 
         match docker.inspect_image(image_ref).await {
             Ok(inspect) => {
+                if let Some(message) = local_docker_image_platform_mismatch(
+                    image_ref,
+                    inspect.os.as_deref(),
+                    inspect.architecture.as_deref(),
+                ) {
+                    if required_local_image {
+                        return Err(Status::failed_precondition(message));
+                    }
+                    warn!(
+                        image_ref = %image_ref,
+                        %message,
+                        "vm driver: local Docker image platform mismatch, falling back to registry"
+                    );
+                    return Ok(None);
+                }
+
                 let image_identity =
                     inspect
                         .id
@@ -1484,6 +1500,23 @@ fn is_openshell_local_build_image_ref(image_ref: &str) -> bool {
     image_ref.starts_with("openshell/sandbox-from:")
 }
 
+fn local_docker_image_platform_mismatch(
+    image_ref: &str,
+    actual_os: Option<&str>,
+    actual_arch: Option<&str>,
+) -> Option<String> {
+    let actual_os = actual_os.unwrap_or("unknown");
+    let actual_arch = actual_arch.unwrap_or("unknown");
+    let expected_os = "linux";
+    let expected_arch = linux_oci_arch();
+
+    (actual_os != expected_os || actual_arch != expected_arch).then(|| {
+        format!(
+            "local Docker image '{image_ref}' is {actual_os}/{actual_arch}, but VM sandboxes require {expected_os}/{expected_arch}"
+        )
+    })
+}
+
 fn is_docker_not_found_error(err: &BollardError) -> bool {
     matches!(
         err,
@@ -1949,19 +1982,23 @@ fn merge_layer_directory(source_dir: &Path, target_dir: &Path) -> Result<(), Str
         let file_type = metadata.file_type();
 
         if file_type.is_dir() {
-            if dest_path.exists()
-                && !fs::symlink_metadata(&dest_path)
-                    .map_err(|err| format!("stat {}: {err}", dest_path.display()))?
-                    .file_type()
-                    .is_dir()
+            if let Ok(dest_metadata) = fs::symlink_metadata(&dest_path)
+                && !dest_metadata.file_type().is_dir()
+                && !path_is_dir_or_symlink_to_dir(&dest_path)?
             {
                 remove_path_if_exists(&dest_path)?;
             }
             fs::create_dir_all(&dest_path)
                 .map_err(|err| format!("create {}: {err}", dest_path.display()))?;
             merge_layer_directory(&source_path, &dest_path)?;
-            fs::set_permissions(&dest_path, metadata.permissions())
-                .map_err(|err| format!("chmod {}: {err}", dest_path.display()))?;
+            if fs::symlink_metadata(&dest_path)
+                .map_err(|err| format!("stat {}: {err}", dest_path.display()))?
+                .file_type()
+                .is_dir()
+            {
+                fs::set_permissions(&dest_path, metadata.permissions())
+                    .map_err(|err| format!("chmod {}: {err}", dest_path.display()))?;
+            }
         } else if file_type.is_file() {
             remove_path_if_exists(&dest_path)?;
             if let Some(parent) = dest_path.parent() {
@@ -1988,6 +2025,14 @@ fn merge_layer_directory(source_dir: &Path, target_dir: &Path) -> Result<(), Str
     }
 
     Ok(())
+}
+
+fn path_is_dir_or_symlink_to_dir(path: &Path) -> Result<bool, String> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("stat {}: {err}", path.display())),
+    }
 }
 
 fn clear_directory_contents(dir: &Path) -> Result<(), String> {
@@ -2734,6 +2779,31 @@ mod tests {
     }
 
     #[test]
+    fn local_docker_image_platform_mismatch_checks_guest_platform() {
+        assert!(
+            local_docker_image_platform_mismatch(
+                "openshell/sandbox-from:123",
+                Some("linux"),
+                Some(linux_oci_arch()),
+            )
+            .is_none()
+        );
+
+        let err = local_docker_image_platform_mismatch(
+            "openshell/sandbox-from:123",
+            Some("linux"),
+            Some("wrong-arch"),
+        )
+        .expect("architecture mismatch should be reported");
+        assert!(err.contains("wrong-arch"));
+        assert!(err.contains(linux_oci_arch()));
+
+        let err = local_docker_image_platform_mismatch("openshell/sandbox-from:123", None, None)
+            .expect("unknown platform should be reported");
+        assert!(err.contains("unknown/unknown"));
+    }
+
+    #[test]
     fn apply_layer_dir_to_rootfs_honors_whiteouts() {
         let base = unique_temp_dir();
         let rootfs = base.join("rootfs");
@@ -2755,6 +2825,40 @@ mod tests {
         assert_eq!(
             fs::read_to_string(rootfs.join("dir/new.txt")).unwrap(),
             "new"
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn apply_layer_dir_to_rootfs_preserves_lower_symlink_dirs() {
+        let base = unique_temp_dir();
+        let rootfs = base.join("rootfs");
+        let layer = base.join("layer");
+
+        fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+        fs::write(rootfs.join("usr/bin/bash"), "bash").unwrap();
+        std::os::unix::fs::symlink("usr/bin", rootfs.join("bin")).unwrap();
+
+        fs::create_dir_all(layer.join("bin")).unwrap();
+        fs::write(layer.join("bin/foo"), "foo").unwrap();
+
+        apply_layer_dir_to_rootfs(&layer, &rootfs).unwrap();
+
+        assert!(
+            fs::symlink_metadata(rootfs.join("bin"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "lower /bin symlink should be preserved"
+        );
+        assert_eq!(
+            fs::read_to_string(rootfs.join("usr/bin/bash")).unwrap(),
+            "bash"
+        );
+        assert_eq!(
+            fs::read_to_string(rootfs.join("usr/bin/foo")).unwrap(),
+            "foo"
         );
 
         let _ = fs::remove_dir_all(base);

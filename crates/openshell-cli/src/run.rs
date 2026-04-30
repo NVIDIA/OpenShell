@@ -2861,13 +2861,20 @@ fn filename_looks_like_dockerfile(path: &Path) -> bool {
 }
 
 fn value_looks_like_local_source(value: &str) -> bool {
+    value_is_explicit_local_path(value) || value_looks_like_bare_dockerfile_name(value)
+}
+
+fn value_is_explicit_local_path(value: &str) -> bool {
     let path = Path::new(value);
     path.is_absolute()
         || matches!(value, "." | "..")
         || value.starts_with("./")
         || value.starts_with("../")
         || value.starts_with("~/")
-        || filename_looks_like_dockerfile(path)
+}
+
+fn value_looks_like_bare_dockerfile_name(value: &str) -> bool {
+    !value.contains('/') && !value.contains(':') && filename_looks_like_dockerfile(Path::new(value))
 }
 
 fn source_requests_gpu(source: &str) -> bool {
@@ -6082,6 +6089,18 @@ mod tests {
             err.to_string().contains("local --from path does not exist"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_from_keeps_dockerfile_named_image_refs_as_images() {
+        let image_ref = "ghcr.io/acme/dockerfile-runner:latest";
+
+        match resolve_from(image_ref).expect("expected image source") {
+            super::ResolvedSource::Image(image) => assert_eq!(image, image_ref),
+            super::ResolvedSource::Dockerfile { .. } => {
+                panic!("expected image ref, got Dockerfile source");
+            }
+        }
     }
 
     #[test]
