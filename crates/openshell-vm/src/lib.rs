@@ -1733,6 +1733,7 @@ fn bootstrap_gateway(rootfs: &Path, gateway_name: &str, gateway_port: u16) -> Re
         auth_mode: None,
         edge_team_domain: None,
         edge_auth_url: None,
+        vm_driver_state_dir: None,
     };
 
     let exec_socket = vm_exec_socket_path(rootfs);

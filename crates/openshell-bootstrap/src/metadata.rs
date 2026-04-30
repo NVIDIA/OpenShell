@@ -46,6 +46,10 @@ pub struct GatewayMetadata {
         alias = "cf_auth_url"
     )]
     pub edge_auth_url: Option<String>,
+
+    /// Local VM driver state directory for standalone VM gateways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_driver_state_dir: Option<PathBuf>,
 }
 
 impl GatewayMetadata {
@@ -136,6 +140,7 @@ pub fn create_gateway_metadata_with_host(
         auth_mode: disable_tls.then(|| "plaintext".to_string()),
         edge_team_domain: None,
         edge_auth_url: None,
+        vm_driver_state_dir: None,
     }
 }
 
@@ -463,6 +468,7 @@ mod tests {
             auth_mode: None,
             edge_team_domain: None,
             edge_auth_url: None,
+            vm_driver_state_dir: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: GatewayMetadata = serde_json::from_str(&json).unwrap();
@@ -558,6 +564,7 @@ mod tests {
             auth_mode: None,
             edge_team_domain: None,
             edge_auth_url: None,
+            vm_driver_state_dir: None,
         };
         assert_eq!(meta.gateway_host(), None);
     }
@@ -574,6 +581,7 @@ mod tests {
             auth_mode: None,
             edge_team_domain: None,
             edge_auth_url: None,
+            vm_driver_state_dir: None,
         };
         assert_eq!(meta.gateway_host(), Some("10.0.0.5"));
     }

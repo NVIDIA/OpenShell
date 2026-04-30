@@ -9,7 +9,7 @@ The `--from` flag accepts four kinds of input:
 | Input | Example | Behavior |
 |-------|---------|----------|
 | **Community sandbox name** | `--from openclaw` | Resolves to `ghcr.io/nvidia/openshell-community/sandboxes/openclaw:latest` |
-| **Dockerfile path** | `--from ./Dockerfile` | Builds the image, pushes it into the cluster, then creates the sandbox |
+| **Dockerfile path** | `--from ./Dockerfile` | Builds the image locally, makes it available to the local gateway, then creates the sandbox |
 | **Directory with Dockerfile** | `--from ./my-sandbox/` | Uses the directory as the build context |
 | **Full image reference** | `--from myregistry.com/img:tag` | Uses the image directly |
 
@@ -19,8 +19,9 @@ The CLI classifies the value in this order:
 
 1. **Existing file** whose name contains "Dockerfile" (case-insensitive) — treated as a Dockerfile to build.
 2. **Existing directory** containing a `Dockerfile` — treated as a build context directory.
-3. **Contains `/`, `:`, or `.`** — treated as a full container image reference.
-4. **Otherwise** — treated as a community sandbox name, expanded to `{OPENSHELL_COMMUNITY_REGISTRY}/{name}:latest`.
+3. **Missing explicit local path** (for example `./Dockerfile`, `../ctx`, or an absolute path) — rejected locally instead of sent to the gateway as an image pull.
+4. **Contains `/`, `:`, or `.`** — treated as a full container image reference.
+5. **Otherwise** — treated as a community sandbox name, expanded to `{OPENSHELL_COMMUNITY_REGISTRY}/{name}:latest`.
 
 The community registry prefix defaults to `ghcr.io/nvidia/openshell-community/sandboxes` and can be overridden with the `OPENSHELL_COMMUNITY_REGISTRY` environment variable.
 
@@ -33,8 +34,14 @@ The community registry prefix defaults to `ghcr.io/nvidia/openshell-community/sa
 When `--from` points to a Dockerfile or directory, the CLI:
 
 1. Builds the image locally via the Docker daemon (respecting `.dockerignore`).
-2. Pushes it into the cluster's containerd runtime using `docker save` / `ctr import`.
-3. Creates the sandbox with the resulting image tag.
+2. For a local Kubernetes gateway, pushes it into the cluster's containerd runtime using `docker save` / `ctr import`.
+3. For standalone local Docker and VM gateways, passes the ordinary image tag through. The Docker driver runs that tag directly; the VM driver resolves it from the local Docker daemon, exports the image filesystem, and prepares the VM rootfs in its own cache.
+4. Creates the sandbox with the resulting image tag.
+
+Local Dockerfile sources for VM gateways are trusted local-development inputs.
+Remote gateways continue to reject local Dockerfile sources because the gateway
+API does not yet validate or transfer local build artifacts across that
+boundary.
 
 ## How It Works
 

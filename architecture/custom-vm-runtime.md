@@ -20,8 +20,9 @@ kernel.
 The driver is spawned by `openshell-gateway` as a subprocess, talks to it over a
 Unix domain socket (`compute-driver.sock`) with the
 `openshell.compute.v1.ComputeDriver` gRPC surface, and manages per-sandbox
-microVMs. The runtime (libkrun + libkrunfw + gvproxy) and the sandbox rootfs are
-embedded directly in the driver binary — no sibling files required at runtime.
+microVMs. The runtime (libkrun + libkrunfw + gvproxy) and the sandbox
+supervisor are embedded directly in the driver binary; each sandbox guest
+rootfs is derived from a container image at create time.
 
 ## Architecture
 
@@ -30,7 +31,7 @@ graph TD
     subgraph Host["Host (macOS / Linux)"]
         GATEWAY["openshell-gateway<br/>(compute::vm::spawn)"]
         DRIVER["openshell-driver-vm<br/>(compute-driver.sock)"]
-        EMB["Embedded runtime (zstd)<br/>libkrun · libkrunfw · gvproxy<br/>+ sandbox rootfs.tar.zst"]
+        EMB["Embedded runtime (zstd)<br/>libkrun · libkrunfw · gvproxy<br/>+ openshell-sandbox.zst"]
         GVP["gvproxy (per sandbox)<br/>virtio-net · DHCP · DNS"]
 
         GATEWAY <-->|gRPC over UDS| DRIVER
@@ -58,8 +59,8 @@ never binds a host-side TCP listener.
 
 ## Embedded Runtime
 
-`openshell-driver-vm` embeds the VM runtime libraries and the sandbox rootfs as
-zstd-compressed byte arrays, extracting on demand:
+`openshell-driver-vm` embeds the VM runtime libraries and the sandbox
+supervisor as zstd-compressed byte arrays, extracting on demand:
 
 ```text
 ~/.local/share/openshell/vm-runtime/<version>/        # libkrun / libkrunfw / gvproxy
@@ -74,14 +75,20 @@ Old runtime cache versions are cleaned up when a new version is extracted.
 
 ### Sandbox rootfs preparation
 
-The rootfs tarball the driver embeds starts from the same minimal Ubuntu base
-used across the project, and is **rewritten into a supervisor-only sandbox
-guest** during extraction:
+Each VM sandbox starts from either a registry image fetched directly over OCI or
+a local Docker image reference produced by Dockerfile-based `--from` sources.
+For local Dockerfile sources, the CLI builds the image on the local Docker
+daemon and passes the ordinary image tag through `template.image`. The VM driver
+first checks the local Docker daemon for that tag; when present, it exports the
+image filesystem and **rewrites that filesystem into a supervisor-only sandbox
+guest** before caching it:
 
-- k3s state and Kubernetes manifests are stripped out
 - `/srv/openshell-vm-sandbox-init.sh` is installed as the guest entrypoint
-- the guest boots directly into `openshell-sandbox` — no k3s, no kube-proxy,
-  no CNI plugins
+- the bundled `openshell-sandbox` binary is copied into
+  `/opt/openshell/bin/openshell-sandbox`
+- k3s state and Kubernetes manifests are stripped out if the image contains them
+- the guest boots directly into `openshell-sandbox` — no k3s, no kube-proxy, no
+  CNI plugins
 
 See `crates/openshell-driver-vm/src/rootfs.rs` for the rewrite logic and
 `crates/openshell-driver-vm/scripts/openshell-vm-sandbox-init.sh` for the init
@@ -94,6 +101,48 @@ launched with `--internal-run-vm` it becomes a per-sandbox launcher. The driver
 spawns one launcher per sandbox as a subprocess, which in turn starts `gvproxy`
 and calls `krun_start_enter` to boot the guest. Keeping the launcher in the
 same binary means the driver ships a single artifact for both roles.
+
+When a sandbox sets `template.image` through `openshell sandbox create --from ...`,
+the VM driver treats that image as the base guest rootfs source for that
+sandbox. When `template.image` is omitted, the gateway fills it from the VM
+driver's advertised `default_image`, which matches the gateway's configured
+sandbox image. The driver:
+
+- resolves the image on the gateway host without Docker for registry and
+  community image refs
+- for local Dockerfile sources, the CLI builds through the host Docker socket
+  and passes the resulting ordinary Docker tag through `template.image`
+- unpacks the image filesystem, injects the VM sandbox init/supervisor files,
+  and validates required guest tools such as `bash`, `mount`, `ip`, and `sed`
+- caches the prepared guest rootfs under
+  `<vm-driver-state-dir>/images/<image-identity>/rootfs.tar`
+- extracts a private runtime copy under
+  `<vm-driver-state-dir>/sandboxes/<sandbox-id>/rootfs`
+
+The cache key uses an immutable image identity: repo digest for registry images
+and the local Docker image ID for images resolved from the local daemon.
+Different VM sandboxes can use different base images concurrently because the
+shared cache is per image, not global for the driver. Cached prepared rootfs
+entries remain on disk until the operator removes them from the VM driver state
+directory.
+
+Docker is therefore no longer required for VM sandboxes created from registry or
+community image refs. It is only required on the local CLI/gateway host when the
+source is a local Dockerfile or build context.
+
+Local Dockerfile sources are treated as trusted local-development inputs for VM
+gateways. Remote VM gateways still reject local Dockerfile sources until a
+gateway-side artifact validation and transfer boundary is designed.
+
+There is no embedded guest rootfs fallback anymore. VM sandboxes therefore
+require either `template.image` or a configured default sandbox image. This is
+still replace-the-rootfs semantics, so VM images must remain base-compatible
+with the sandbox guest init path. Distroless or `scratch` images are not
+expected to work.
+
+The separate `openshell-vm` binary still uses `vm:rootfs` to build a standalone
+embedded guest filesystem, but `openshell-driver-vm` no longer consumes that
+artifact.
 
 ## Network Plane
 
@@ -178,8 +227,8 @@ graph LR
 The `vm-runtime-<platform>.tar.zst` artifact is consumed by
 `openshell-driver-vm`'s `build.rs`, which embeds the library set into the
 binary via `include_bytes!()`. Setting `OPENSHELL_VM_RUNTIME_COMPRESSED_DIR`
-at build time (wired up by `crates/openshell-driver-vm/start.sh`) points the
-build at the staged artifacts.
+at build time (wired up by `tasks/scripts/gateway-vm.sh`, registered as
+`mise run gateway:vm`) points the build at the staged artifacts.
 
 ## Kernel Config Fragment
 
@@ -262,8 +311,8 @@ host platform.
 ### Driver Binary (`release-vm-dev.yml`)
 
 Builds the self-contained `openshell-driver-vm` binary for every platform,
-with the kernel runtime + sandbox rootfs embedded. Runs on every push to
-`main` that touches VM-related crates.
+with the kernel runtime + bundled sandbox supervisor embedded. Runs on every
+push to `main` that touches VM-related crates.
 
 The `download-kernel-runtime` job pulls the current `vm-runtime-<platform>.tar.zst`
 from the `vm-dev` release; the `build-openshell-driver-vm` jobs set
@@ -273,14 +322,15 @@ cross-compiled via osxcross (no macOS runner needed for the binary build —
 only for the kernel build).
 
 macOS driver binaries produced via osxcross are not codesigned. Development
-builds are signed automatically by `crates/openshell-driver-vm/start.sh`; a
-packaged release needs signing in CI.
+builds are signed automatically by `tasks/scripts/gateway-vm.sh`
+(registered as `mise run gateway:vm`); a packaged release needs signing in
+CI.
 
 ## Rollout Strategy
 
 1. Custom runtime is embedded by default when building `openshell-driver-vm`
    with `OPENSHELL_VM_RUNTIME_COMPRESSED_DIR` set (wired up by
-   `crates/openshell-driver-vm/start.sh`).
+   `tasks/scripts/gateway-vm.sh`).
 2. The sandbox init script validates kernel capabilities at boot and fails
    fast if missing.
 3. For development, override with `OPENSHELL_VM_RUNTIME_DIR` to use a local

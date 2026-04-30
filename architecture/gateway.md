@@ -135,7 +135,7 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | None | Default container image for sandbox pods |
 | `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | None | gRPC endpoint reachable from within the cluster (for supervisor callbacks) |
 | `--drivers` | `OPENSHELL_DRIVERS` | `kubernetes` | Compute backend to use. Current options are `kubernetes`, `docker`, and `vm`. |
-| `--vm-driver-state-dir` | `OPENSHELL_VM_DRIVER_STATE_DIR` | `target/openshell-vm-driver` | Host directory for VM sandbox rootfs, console logs, and runtime state |
+| `--vm-driver-state-dir` | `OPENSHELL_VM_DRIVER_STATE_DIR` | `target/openshell-vm-driver` | Host directory for VM sandbox rootfs, console logs, runtime state, and shared image-rootfs cache |
 | `--driver-dir` | `OPENSHELL_DRIVER_DIR` | unset | Override directory for `openshell-driver-vm`. When unset, the gateway searches `~/.local/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`, then a sibling binary. |
 | `--vm-krun-log-level` | `OPENSHELL_VM_KRUN_LOG_LEVEL` | `1` | libkrun log level for VM helper processes |
 | `--vm-driver-vcpus` | `OPENSHELL_VM_DRIVER_VCPUS` | `2` | Default vCPU count for VM sandboxes |
@@ -618,7 +618,7 @@ The Docker driver (`crates/openshell-driver-docker/src/lib.rs`) is an in-process
 
 `VmDriver` (`crates/openshell-driver-vm/src/driver.rs`) is served by the standalone `openshell-driver-vm` process. The gateway spawns that binary on demand and talks to it over the internal `openshell.compute.v1.ComputeDriver` gRPC contract via a Unix domain socket.
 
-- **Create**: The VM driver process allocates a sandbox-specific rootfs from its own embedded `rootfs.tar.zst`, injects an explicitly configured guest mTLS bundle when the gateway callback endpoint is `https://`, then re-execs itself in a hidden helper mode that loads libkrun directly and boots the supervisor.
+- **Create**: The VM driver process exports the selected sandbox image from the local Docker daemon, rewrites it into a sandbox-specific guest rootfs, injects an explicitly configured guest mTLS bundle when the gateway callback endpoint is `https://`, then re-execs itself in a hidden helper mode that loads libkrun directly and boots the supervisor.
 - **Networking**: The helper starts an embedded `gvproxy`, wires it into libkrun as virtio-net, and gives the guest outbound connectivity. No inbound TCP listener is needed — the supervisor reaches the gateway over its outbound `ConnectSupervisor` stream.
 - **Gateway callback**: The guest init script configures `eth0` for gvproxy networking, seeds `/etc/hosts` so `host.openshell.internal` resolves to the gvproxy gateway IP (`192.168.127.1`), preserves gvproxy's legacy `host.containers.internal` / `host.docker.internal` DNS answers, prefers the configured `OPENSHELL_GRPC_ENDPOINT`, and falls back to those aliases or the raw gateway IP when local hostname resolution is unavailable on macOS.
 - **Guest boot**: The sandbox guest runs a minimal init script that starts `openshell-sandbox` directly as PID 1 inside the VM.

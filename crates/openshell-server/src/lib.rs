@@ -149,7 +149,9 @@ pub async fn run_server(
         return Err(Error::config("database_url is required"));
     }
     let driver = configured_compute_driver(&config)?;
-    if config.ssh_handshake_secret.is_empty() && driver != ComputeDriverKind::Docker {
+    if config.ssh_handshake_secret.is_empty()
+        && !matches!(driver, ComputeDriverKind::Docker | ComputeDriverKind::Vm)
+    {
         return Err(Error::config(
             "ssh_handshake_secret is required. Set --ssh-handshake-secret or OPENSHELL_SSH_HANDSHAKE_SECRET",
         ));

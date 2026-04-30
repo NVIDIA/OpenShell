@@ -2845,6 +2845,7 @@ mod tests {
             auth_mode: Some("cloudflare_jwt".to_string()),
             edge_team_domain: None,
             edge_auth_url: None,
+            vm_driver_state_dir: None,
         }
     }
 
