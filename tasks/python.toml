@@ -83,23 +83,93 @@ ls -la "$WHEEL_OUTPUT_DIR"/*.whl
 hide = true
 
 ["build:python:wheel:linux:amd64"]
-description = "Build Python wheel for Linux amd64 natively"
+description = "Build Python wheel for Linux amd64 natively (host glibc; non-portable)"
 depends = ["EXPECTED_HOST_ARCH=amd64 WHEEL_OUTPUT_DIR=target/wheels/linux-amd64 build:python:wheel:linux"]
 hide = true
 
-["python:build:linux:amd64"]
-description = "Alias for build:python:wheel:linux:amd64"
-depends = ["build:python:wheel:linux:amd64"]
-hide = true
-
 ["build:python:wheel:linux:arm64"]
-description = "Build Python wheel for Linux arm64 natively"
+description = "Build Python wheel for Linux arm64 natively (host glibc; non-portable)"
 depends = ["EXPECTED_HOST_ARCH=arm64 WHEEL_OUTPUT_DIR=target/wheels/linux-arm64 build:python:wheel:linux"]
 hide = true
 
+["build:python:wheel:linux:docker"]
+description = "Build a portable manylinux_2_28 Python wheel via Docker (glibc >= 2.28)"
+depends = ["python:proto"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+source tasks/scripts/container-engine.sh
+
+WHEEL_OUTPUT_DIR=${WHEEL_OUTPUT_DIR:?Set WHEEL_OUTPUT_DIR to a per-platform wheel output directory}
+TARGETARCH=${TARGETARCH:?Set TARGETARCH to amd64 or arm64}
+
+sha256_16() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print substr($1, 1, 16)}'
+  else
+    shasum -a 256 "$1" | awk '{print substr($1, 1, 16)}'
+  fi
+}
+
+sha256_16_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print substr($1, 1, 16)}'
+  else
+    shasum -a 256 | awk '{print substr($1, 1, 16)}'
+  fi
+}
+
+CARGO_VERSION=${OPENSHELL_CARGO_VERSION:-}
+if [ -z "$CARGO_VERSION" ] && [ -n "${CI:-}" ]; then
+  CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
+fi
+
+LOCK_HASH=$(sha256_16 Cargo.lock)
+RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-rustup-1.95.0}
+CACHE_SCOPE_INPUT="v1|python-wheels-linux-${TARGETARCH}|manylinux_2_28|${LOCK_HASH}|${RUST_SCOPE}"
+CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "$CACHE_SCOPE_INPUT" | sha256_16_stdin)
+
+rm -rf "$WHEEL_OUTPUT_DIR"
+mkdir -p "$WHEEL_OUTPUT_DIR"
+
+ce build \
+  -f deploy/docker/Dockerfile.python-wheels-linux \
+  --target wheels \
+  --build-arg "TARGETARCH=${TARGETARCH}" \
+  --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}" \
+  ${CARGO_VERSION:+--build-arg "OPENSHELL_CARGO_VERSION=${CARGO_VERSION}"} \
+  ${OPENSHELL_IMAGE_TAG:+--build-arg "OPENSHELL_IMAGE_TAG=${OPENSHELL_IMAGE_TAG}"} \
+  --output "type=local,dest=${WHEEL_OUTPUT_DIR}" \
+  .
+
+ls -la "$WHEEL_OUTPUT_DIR"/*.whl
+"""
+hide = true
+
+["build:python:wheel:linux:amd64:docker"]
+description = "Build portable manylinux_2_28 wheel for Linux amd64"
+depends = ["TARGETARCH=amd64 WHEEL_OUTPUT_DIR=target/wheels/linux-amd64 build:python:wheel:linux:docker"]
+hide = true
+
+["build:python:wheel:linux:arm64:docker"]
+description = "Build portable manylinux_2_28 wheel for Linux arm64"
+depends = ["TARGETARCH=arm64 WHEEL_OUTPUT_DIR=target/wheels/linux-arm64 build:python:wheel:linux:docker"]
+hide = true
+
+# Release-pipeline aliases. These produce manylinux_2_28-tagged wheels via
+# Docker so the published artifacts install on any glibc >= 2.28 host (RHEL 8,
+# Ubuntu 18.04+, Debian 10+). The native `build:python:wheel:linux:amd64` /
+# `build:python:wheel:linux:arm64` tasks remain available for fast local
+# iteration and produce wheels tagged for the host glibc only.
+["python:build:linux:amd64"]
+description = "Build portable manylinux_2_28 wheel for Linux amd64 (release path)"
+depends = ["build:python:wheel:linux:amd64:docker"]
+hide = true
+
 ["python:build:linux:arm64"]
-description = "Alias for build:python:wheel:linux:arm64"
-depends = ["build:python:wheel:linux:arm64"]
+description = "Build portable manylinux_2_28 wheel for Linux arm64 (release path)"
+depends = ["build:python:wheel:linux:arm64:docker"]
 hide = true
 
 ["build:python:wheel:macos"]

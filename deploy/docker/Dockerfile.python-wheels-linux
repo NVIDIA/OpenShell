@@ -1,0 +1,119 @@
+# syntax=docker/dockerfile:1.6
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Build the Linux Python wheel inside a PyPA manylinux_2_28 container so the
+# resulting binary is compatible with any Linux distribution shipping glibc
+# >= 2.28 (RHEL 8, Ubuntu 18.04+, Debian 10+). The host CI runner is on noble
+# (glibc 2.39), which previously produced manylinux_2_39 wheels that uv refuses
+# to install on Ubuntu 22.04 / Debian 11 (glibc 2.31 / 2.35).
+
+ARG TARGETARCH
+ARG MANYLINUX_AMD64_IMAGE=quay.io/pypa/manylinux_2_28_x86_64:latest
+ARG MANYLINUX_ARM64_IMAGE=quay.io/pypa/manylinux_2_28_aarch64:latest
+ARG PYTHON_VERSION=cp312-cp312
+ARG RUST_VERSION=1.95.0
+
+# Selector stages — Docker resolves only the matching one based on TARGETARCH.
+FROM ${MANYLINUX_AMD64_IMAGE} AS base-amd64
+FROM ${MANYLINUX_ARM64_IMAGE} AS base-arm64
+FROM base-${TARGETARCH} AS builder
+
+ARG TARGETARCH
+ARG PYTHON_VERSION
+ARG RUST_VERSION
+ARG CARGO_TARGET_CACHE_SCOPE=default
+
+ENV PATH="/opt/python/${PYTHON_VERSION}/bin:/root/.cargo/bin:${PATH}"
+
+# manylinux_2_28 ships gcc-toolset-14, cmake, and patchelf. We add clang for
+# bindgen-driven crates (libclang-dev equivalent) and openssl-devel for any
+# Rust crates that link against the system libssl during dependency resolution.
+RUN dnf install -y --setopt=install_weak_deps=False \
+        clang \
+        llvm-devel \
+        openssl-devel \
+        perl-core \
+        perl-IPC-Cmd \
+    && dnf clean all
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal
+RUN python -m pip install --no-cache-dir maturin
+
+WORKDIR /build
+
+# Copy dependency manifests first for better layer caching.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/openshell-cli/Cargo.toml crates/openshell-cli/Cargo.toml
+COPY crates/openshell-core/Cargo.toml crates/openshell-core/Cargo.toml
+COPY crates/openshell-ocsf/Cargo.toml crates/openshell-ocsf/Cargo.toml
+COPY crates/openshell-providers/Cargo.toml crates/openshell-providers/Cargo.toml
+COPY crates/openshell-router/Cargo.toml crates/openshell-router/Cargo.toml
+COPY crates/openshell-sandbox/Cargo.toml crates/openshell-sandbox/Cargo.toml
+COPY crates/openshell-server/Cargo.toml crates/openshell-server/Cargo.toml
+COPY crates/openshell-bootstrap/Cargo.toml crates/openshell-bootstrap/Cargo.toml
+COPY crates/openshell-policy/Cargo.toml crates/openshell-policy/Cargo.toml
+COPY crates/openshell-prover/Cargo.toml crates/openshell-prover/Cargo.toml
+COPY crates/openshell-tui/Cargo.toml crates/openshell-tui/Cargo.toml
+COPY crates/openshell-core/build.rs crates/openshell-core/build.rs
+COPY proto/ proto/
+
+# Create dummy source files to build dependencies.
+RUN mkdir -p crates/openshell-cli/src crates/openshell-core/src crates/openshell-ocsf/src \
+        crates/openshell-policy/src crates/openshell-providers/src crates/openshell-prover/src \
+        crates/openshell-router/src crates/openshell-sandbox/src crates/openshell-server/src \
+        crates/openshell-bootstrap/src crates/openshell-tui/src && \
+    echo "fn main() {}" > crates/openshell-cli/src/main.rs && \
+    echo "fn main() {}" > crates/openshell-sandbox/src/main.rs && \
+    echo "fn main() {}" > crates/openshell-server/src/main.rs && \
+    touch crates/openshell-core/src/lib.rs && \
+    touch crates/openshell-ocsf/src/lib.rs && \
+    touch crates/openshell-providers/src/lib.rs && \
+    touch crates/openshell-router/src/lib.rs && \
+    touch crates/openshell-bootstrap/src/lib.rs && \
+    touch crates/openshell-policy/src/lib.rs && \
+    touch crates/openshell-prover/src/lib.rs && \
+    touch crates/openshell-tui/src/lib.rs
+
+# Warm the dependency build (cached unless Cargo.toml/lock changes).
+RUN --mount=type=cache,id=cargo-registry-python-wheels-linux-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
+    --mount=type=cache,id=cargo-git-python-wheels-linux-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
+    --mount=type=cache,id=cargo-target-python-wheels-linux-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
+    cargo build --release -p openshell-cli --features bundled-z3 2>/dev/null || true
+
+# Copy actual source code and Python packaging files.
+COPY crates/ crates/
+COPY pyproject.toml README.md ./
+COPY python/ python/
+
+# Touch source files so cargo rebuilds them (not the cached dummy).
+RUN touch crates/openshell-cli/src/main.rs \
+    crates/openshell-cli/src/lib.rs \
+    crates/openshell-bootstrap/src/lib.rs \
+    crates/openshell-core/src/lib.rs \
+    crates/openshell-providers/src/lib.rs \
+    crates/openshell-router/src/lib.rs \
+    crates/openshell-sandbox/src/main.rs \
+    crates/openshell-server/src/main.rs \
+    crates/openshell-core/build.rs \
+    proto/*.proto
+
+# Declare version ARGs here (not earlier) so the git-hash-bearing values do not
+# invalidate the expensive dependency-build layers above on every commit.
+ARG OPENSHELL_CARGO_VERSION
+ARG OPENSHELL_IMAGE_TAG
+RUN --mount=type=cache,id=cargo-registry-python-wheels-linux-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
+    --mount=type=cache,id=cargo-git-python-wheels-linux-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
+    --mount=type=cache,id=cargo-target-python-wheels-linux-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
+    if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
+      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
+    fi && \
+    maturin build --release --features bundled-z3 \
+      --compatibility manylinux_2_28 \
+      --out /wheels && \
+    ls -la /wheels/*.whl
+
+FROM scratch AS wheels
+COPY --from=builder /wheels/*.whl /
