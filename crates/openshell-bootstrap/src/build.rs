@@ -1,46 +1,24 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build and export container images for gateway runtimes.
+//! Build container images for gateway runtimes.
 //!
 //! This module wraps bollard's `build_image()` API to build a container image
 //! from a Dockerfile and build context. Kubernetes deployments reuse the
 //! existing push pipeline to import the image into the gateway's containerd
-//! runtime, while the VM backend can export the built image as a rootfs tar.
+//! runtime. VM deployments keep the built image in the local Docker daemon and
+//! pass an internal local-image reference to the VM driver.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bollard::Docker;
-use bollard::models::ContainerCreateBody;
-use bollard::query_parameters::{
-    BuildImageOptionsBuilder, CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder,
-};
+use bollard::query_parameters::BuildImageOptionsBuilder;
 use futures::StreamExt;
-use hmac::{Hmac, Mac};
 use miette::{IntoDiagnostic, Result, WrapErr};
-use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
-use url::{Position, Url};
 
 use crate::constants::container_name;
 use crate::push::push_local_images;
-
-/// Pseudo-image URI scheme used to hand a local rootfs tar artifact to the VM driver.
-pub const ROOTFS_TAR_IMAGE_REF_SCHEME: &str = "openshell-rootfs-tar";
-const ROOTFS_TAR_IMAGE_REF_VERSION: &str = "v1";
-type HmacSha256 = Hmac<Sha256>;
-
-/// Authenticated VM rootfs tar artifact decoded from an internal image reference.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RootfsTarImageRef {
-    pub path: PathBuf,
-    pub digest: String,
-}
 
 /// Build a container image from a Dockerfile using the local Docker daemon.
 ///
@@ -63,191 +41,6 @@ pub async fn build_local_image(
     build_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
     on_log(format!("Built image {tag}"));
     Ok(())
-}
-
-/// Encode a local rootfs tar path as an internal image reference understood by the VM driver.
-pub fn encode_rootfs_tar_image_ref(path: &Path) -> Result<String> {
-    let canonical = path
-        .canonicalize()
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to resolve rootfs tar path {}", path.display()))?;
-    let file_url = Url::from_file_path(&canonical).map_err(|()| {
-        miette::miette!("failed to encode rootfs tar path {}", canonical.display())
-    })?;
-    Ok(format!(
-        "{ROOTFS_TAR_IMAGE_REF_SCHEME}:{}",
-        &file_url[Position::BeforePath..]
-    ))
-}
-
-/// Encode a local rootfs tar path as an authenticated VM-driver artifact reference.
-pub fn encode_authenticated_rootfs_tar_image_ref(path: &Path, secret: &str) -> Result<String> {
-    let canonical = path
-        .canonicalize()
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to resolve rootfs tar path {}", path.display()))?;
-    let digest = compute_file_sha256_hex(&canonical)?;
-    let file_url = Url::from_file_path(&canonical).map_err(|()| {
-        miette::miette!("failed to encode rootfs tar path {}", canonical.display())
-    })?;
-    let file_url = file_url.to_string();
-    let signature = sign_rootfs_tar_image_ref(secret, &file_url, &digest)?;
-    Ok(format!(
-        "{ROOTFS_TAR_IMAGE_REF_SCHEME}:{ROOTFS_TAR_IMAGE_REF_VERSION}:{}:{digest}:{}",
-        URL_SAFE_NO_PAD.encode(file_url.as_bytes()),
-        URL_SAFE_NO_PAD.encode(signature),
-    ))
-}
-
-/// Decode a VM-driver rootfs tar image reference back to a local filesystem path.
-pub fn decode_rootfs_tar_image_ref(image_ref: &str) -> Option<PathBuf> {
-    let remainder = image_ref.strip_prefix(&format!("{ROOTFS_TAR_IMAGE_REF_SCHEME}:"))?;
-    let file_url = format!("file:{remainder}");
-    Url::parse(&file_url).ok()?.to_file_path().ok()
-}
-
-/// Decode and verify an authenticated VM-driver rootfs tar image reference.
-pub fn decode_authenticated_rootfs_tar_image_ref(
-    image_ref: &str,
-    secret: &str,
-) -> Result<Option<RootfsTarImageRef>> {
-    let Some(remainder) = image_ref.strip_prefix(&format!(
-        "{ROOTFS_TAR_IMAGE_REF_SCHEME}:{ROOTFS_TAR_IMAGE_REF_VERSION}:"
-    )) else {
-        return Ok(None);
-    };
-
-    let mut parts = remainder.split(':');
-    let encoded_url = parts
-        .next()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| miette::miette!("missing rootfs artifact path"))?;
-    let digest = parts
-        .next()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| miette::miette!("missing rootfs artifact digest"))?;
-    let encoded_signature = parts
-        .next()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| miette::miette!("missing rootfs artifact signature"))?;
-    if parts.next().is_some() {
-        return Err(miette::miette!("malformed rootfs artifact reference"));
-    }
-    validate_sha256_hex(digest)?;
-
-    let file_url_bytes = URL_SAFE_NO_PAD
-        .decode(encoded_url)
-        .map_err(|err| miette::miette!("invalid rootfs artifact path encoding: {err}"))?;
-    let file_url = String::from_utf8(file_url_bytes)
-        .map_err(|err| miette::miette!("invalid rootfs artifact path encoding: {err}"))?;
-
-    let signature = URL_SAFE_NO_PAD
-        .decode(encoded_signature)
-        .map_err(|err| miette::miette!("invalid rootfs artifact signature encoding: {err}"))?;
-    verify_rootfs_tar_image_ref_signature(secret, &file_url, digest, &signature)?;
-
-    let url = Url::parse(&file_url)
-        .into_diagnostic()
-        .wrap_err("invalid rootfs artifact URL")?;
-    if url.scheme() != "file" {
-        return Err(miette::miette!("rootfs artifact URL must use file scheme"));
-    }
-    let path = url
-        .to_file_path()
-        .map_err(|()| miette::miette!("rootfs artifact URL is not a local file path"))?;
-
-    Ok(Some(RootfsTarImageRef {
-        path,
-        digest: format!("sha256:{digest}"),
-    }))
-}
-
-/// Export a locally-built Docker image as a persistent rootfs tar artifact for the VM driver.
-pub async fn export_local_image_rootfs(
-    image_ref: &str,
-    on_log: &mut impl FnMut(String),
-) -> Result<PathBuf> {
-    let temp = tempfile::Builder::new()
-        .prefix("openshell-vm-rootfs-")
-        .suffix(".tar")
-        .tempfile()
-        .into_diagnostic()
-        .wrap_err("failed to allocate temporary VM rootfs artifact")?;
-    let temp_path = temp.path().to_path_buf();
-    let (_file, output_path) = temp.keep().into_diagnostic().wrap_err_with(|| {
-        format!(
-            "failed to persist temporary VM rootfs artifact {}",
-            temp_path.display()
-        )
-    })?;
-
-    on_log(format!(
-        "Exporting built image {image_ref} as VM rootfs artifact {}",
-        output_path.display()
-    ));
-    export_local_image_rootfs_to_path(image_ref, &output_path).await?;
-    on_log(format!(
-        "Exported VM rootfs artifact {}",
-        output_path.display()
-    ));
-    Ok(output_path)
-}
-
-fn compute_file_sha256_hex(path: &Path) -> Result<String> {
-    let mut file = File::open(path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to open {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buf)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn validate_sha256_hex(value: &str) -> Result<()> {
-    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        Ok(())
-    } else {
-        Err(miette::miette!("rootfs artifact digest must be sha256 hex"))
-    }
-}
-
-fn rootfs_tar_image_ref_message(file_url: &str, digest: &str) -> String {
-    format!("{ROOTFS_TAR_IMAGE_REF_VERSION}\n{file_url}\nsha256:{digest}")
-}
-
-fn rootfs_tar_image_ref_hmac(secret: &str) -> Result<HmacSha256> {
-    if secret.trim().is_empty() {
-        return Err(miette::miette!("rootfs artifact secret is empty"));
-    }
-    HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|err| miette::miette!("invalid rootfs artifact secret: {err}"))
-}
-
-fn sign_rootfs_tar_image_ref(secret: &str, file_url: &str, digest: &str) -> Result<Vec<u8>> {
-    let mut mac = rootfs_tar_image_ref_hmac(secret)?;
-    mac.update(rootfs_tar_image_ref_message(file_url, digest).as_bytes());
-    Ok(mac.finalize().into_bytes().to_vec())
-}
-
-fn verify_rootfs_tar_image_ref_signature(
-    secret: &str,
-    file_url: &str,
-    digest: &str,
-    signature: &[u8],
-) -> Result<()> {
-    let mut mac = rootfs_tar_image_ref_hmac(secret)?;
-    mac.update(rootfs_tar_image_ref_message(file_url, digest).as_bytes());
-    mac.verify_slice(signature)
-        .map_err(|_| miette::miette!("rootfs artifact signature verification failed"))
 }
 
 /// Push a locally-built image into the gateway's containerd runtime.
@@ -358,79 +151,6 @@ async fn build_image(
     }
 
     Ok(())
-}
-
-async fn export_local_image_rootfs_to_path(image_ref: &str, tar_path: &Path) -> Result<()> {
-    let docker = Docker::connect_with_local_defaults()
-        .into_diagnostic()
-        .wrap_err("failed to connect to local Docker daemon")?;
-    let container_name = format!(
-        "openshell-rootfs-export-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-    let create_options = CreateContainerOptionsBuilder::default()
-        .name(container_name.as_str())
-        .build();
-    let container = docker
-        .create_container(
-            Some(create_options),
-            ContainerCreateBody {
-                image: Some(image_ref.to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .into_diagnostic()
-        .wrap_err_with(|| {
-            format!("failed to create temporary export container for image {image_ref}")
-        })?;
-    let container_id = container.id;
-
-    let export_result = async {
-        if let Some(parent) = tar_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
-        }
-        let mut file = tokio::fs::File::create(tar_path)
-            .await
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to create {}", tar_path.display()))?;
-        let mut stream = docker.export_container(&container_id);
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to export image {image_ref}"))?;
-            file.write_all(&chunk)
-                .await
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to write {}", tar_path.display()))?;
-        }
-        file.flush()
-            .await
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to flush {}", tar_path.display()))
-    }
-    .await;
-
-    let cleanup_result = docker
-        .remove_container(
-            &container_id,
-            Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-        )
-        .await;
-
-    match (export_result, cleanup_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(err), _) => Err(err),
-        (Ok(()), Err(err)) => Err(err).into_diagnostic().wrap_err_with(|| {
-            format!("failed to remove temporary export container for {image_ref}")
-        }),
-    }
 }
 
 /// Create a tar archive of a directory for use as a Docker build context.
@@ -773,48 +493,5 @@ mod tests {
         }];
         assert!(is_ignored("node_modules", true, &patterns));
         assert!(is_ignored("node_modules/foo.js", false, &patterns));
-    }
-
-    #[test]
-    fn encode_and_decode_rootfs_tar_image_ref_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let tar_path = dir.path().join("rootfs tar.tar");
-        fs::write(&tar_path, "rootfs").unwrap();
-
-        let encoded = encode_rootfs_tar_image_ref(&tar_path).unwrap();
-        let decoded = decode_rootfs_tar_image_ref(&encoded).unwrap();
-
-        assert_eq!(decoded, tar_path.canonicalize().unwrap());
-    }
-
-    #[test]
-    fn authenticated_rootfs_tar_image_ref_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let tar_path = dir.path().join("rootfs tar.tar");
-        fs::write(&tar_path, "rootfs").unwrap();
-
-        let encoded = encode_authenticated_rootfs_tar_image_ref(&tar_path, "secret").unwrap();
-        let decoded = decode_authenticated_rootfs_tar_image_ref(&encoded, "secret")
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(decoded.path, tar_path.canonicalize().unwrap());
-        assert_eq!(
-            decoded.digest,
-            "sha256:3c47ef972d531d524daa15fa33dd885dd23de6221bbd10a29eb42ecfcf2ef422"
-        );
-    }
-
-    #[test]
-    fn authenticated_rootfs_tar_image_ref_rejects_wrong_secret() {
-        let dir = tempfile::tempdir().unwrap();
-        let tar_path = dir.path().join("rootfs.tar");
-        fs::write(&tar_path, "rootfs").unwrap();
-
-        let encoded = encode_authenticated_rootfs_tar_image_ref(&tar_path, "secret").unwrap();
-        let err = decode_authenticated_rootfs_tar_image_ref(&encoded, "wrong-secret")
-            .expect_err("wrong secret should fail");
-
-        assert!(err.to_string().contains("signature verification failed"));
     }
 }

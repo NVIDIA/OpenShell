@@ -50,10 +50,6 @@ pub struct GatewayMetadata {
     /// Local VM driver state directory for standalone VM gateways.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm_driver_state_dir: Option<PathBuf>,
-
-    /// Local secret used to authenticate VM rootfs artifact references.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vm_rootfs_artifact_secret: Option<String>,
 }
 
 impl GatewayMetadata {
@@ -145,7 +141,6 @@ pub fn create_gateway_metadata_with_host(
         edge_team_domain: None,
         edge_auth_url: None,
         vm_driver_state_dir: None,
-        vm_rootfs_artifact_secret: None,
     }
 }
 
@@ -474,7 +469,6 @@ mod tests {
             edge_team_domain: None,
             edge_auth_url: None,
             vm_driver_state_dir: None,
-            vm_rootfs_artifact_secret: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: GatewayMetadata = serde_json::from_str(&json).unwrap();
@@ -571,7 +565,6 @@ mod tests {
             edge_team_domain: None,
             edge_auth_url: None,
             vm_driver_state_dir: None,
-            vm_rootfs_artifact_secret: None,
         };
         assert_eq!(meta.gateway_host(), None);
     }
@@ -589,7 +582,6 @@ mod tests {
             edge_team_domain: None,
             edge_auth_url: None,
             vm_driver_state_dir: None,
-            vm_rootfs_artifact_secret: None,
         };
         assert_eq!(meta.gateway_host(), Some("10.0.0.5"));
     }

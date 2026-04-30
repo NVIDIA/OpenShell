@@ -184,7 +184,6 @@ mod tests {
                     edge_team_domain: None,
                     edge_auth_url: None,
                     vm_driver_state_dir: None,
-                    vm_rootfs_artifact_secret: None,
                 },
             )
             .unwrap();

@@ -164,7 +164,9 @@ The VM guest's serial console is appended to `<state-dir>/<sandbox-id>/console.l
   - Matching rustup target: `rustup target add aarch64-unknown-linux-gnu` (or `x86_64-unknown-linux-gnu` for an amd64 guest)
   - `cargo install --locked cargo-zigbuild` and `brew install zig` (or distro equivalent). `vm:supervisor` uses `cargo zigbuild` to cross-compile the in-VM `openshell-sandbox` supervisor binary.
 - [mise](https://mise.jdx.dev/) task runner
-- Docker-compatible socket on the CLI host when using `openshell sandbox create --from ./Dockerfile` or `--from ./dir`
+- Docker-compatible socket on the local CLI/gateway host when using
+  `openshell sandbox create --from ./Dockerfile` or `--from ./dir`; the CLI
+  builds the image and the VM driver exports it via the local Docker daemon
 - `gh` CLI (used by `mise run vm:setup` to download pre-built runtime artifacts)
 
 ## Relationship to `openshell-vm`

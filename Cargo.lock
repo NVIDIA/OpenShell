@@ -3278,18 +3278,15 @@ dependencies = [
  "bollard",
  "bytes",
  "futures",
- "hmac",
  "miette",
  "openshell-core",
  "rcgen",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tar",
  "tempfile",
  "tokio",
  "tracing",
- "url",
 ]
 
 [[package]]
@@ -3422,6 +3419,7 @@ dependencies = [
 name = "openshell-driver-vm"
 version = "0.0.0"
 dependencies = [
+ "bollard",
  "clap",
  "flate2",
  "futures",
@@ -3430,7 +3428,6 @@ dependencies = [
  "miette",
  "nix",
  "oci-client",
- "openshell-bootstrap",
  "openshell-core",
  "openshell-vfio",
  "polling",
