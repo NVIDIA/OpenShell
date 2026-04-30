@@ -8,8 +8,11 @@ use crate::rootfs::{
     create_rootfs_archive_from_dir, extract_rootfs_archive_to,
     prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
 };
+use bollard::Docker;
+use bollard::models::ContainerCreateBody;
+use bollard::query_parameters::{CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder};
 use flate2::read::GzDecoder;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -17,9 +20,6 @@ use oci_client::client::{Client as OciClient, ClientConfig};
 use oci_client::manifest::{ImageIndexEntry, OciDescriptor};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
-use openshell_bootstrap::build::{
-    ROOTFS_TAR_IMAGE_REF_SCHEME, decode_authenticated_rootfs_tar_image_ref,
-};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
@@ -89,8 +89,10 @@ const GUEST_TLS_CERT_PATH: &str = "/opt/openshell/tls/tls.crt";
 const GUEST_TLS_KEY_PATH: &str = "/opt/openshell/tls/tls.key";
 const IMAGE_CACHE_ROOT_DIR: &str = "images";
 const IMAGE_CACHE_ROOTFS_ARCHIVE: &str = "rootfs.tar";
+const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
+const VM_LOCAL_IMAGE_REF_PREFIX: &str = "openshell-vm-local-image:";
 static IMAGE_CACHE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -118,7 +120,6 @@ pub struct VmDriverConfig {
     pub gpu_enabled: bool,
     pub gpu_mem_mib: u32,
     pub gpu_vcpus: u8,
-    pub rootfs_artifact_secret: Option<String>,
 }
 
 impl Default for VmDriverConfig {
@@ -140,7 +141,6 @@ impl Default for VmDriverConfig {
             gpu_enabled: false,
             gpu_mem_mib: 8192,
             gpu_vcpus: 4,
-            rootfs_artifact_secret: None,
         }
     }
 }
@@ -760,32 +760,9 @@ impl VmDriver {
         sandbox_id: &str,
         image_ref: &str,
     ) -> Result<String, Status> {
-        if is_rootfs_tar_image_ref(image_ref) {
-            let secret = self
-                .config
-                .rootfs_artifact_secret
-                .as_deref()
-                .filter(|secret| !secret.trim().is_empty())
-                .ok_or_else(|| {
-                    Status::failed_precondition(
-                        "vm rootfs tar image references require a gateway-issued artifact secret",
-                    )
-                })?;
-            let artifact = decode_authenticated_rootfs_tar_image_ref(image_ref, secret)
-                .map_err(|err| {
-                    Status::failed_precondition(format!(
-                        "invalid vm rootfs artifact reference: {err}"
-                    ))
-                })?
-                .ok_or_else(|| {
-                    Status::failed_precondition("invalid vm rootfs artifact reference")
-                })?;
+        if let Some(local_image_ref) = parse_vm_local_image_ref(image_ref)? {
             return self
-                .ensure_cached_rootfs_tar_image_rootfs_archive(
-                    image_ref,
-                    &artifact.path,
-                    &artifact.digest,
-                )
+                .ensure_cached_local_image_rootfs_archive(sandbox_id, image_ref, local_image_ref)
                 .await;
         }
 
@@ -876,58 +853,60 @@ impl VmDriver {
         Ok(image_identity)
     }
 
-    async fn ensure_cached_rootfs_tar_image_rootfs_archive(
+    async fn ensure_cached_local_image_rootfs_archive(
         &self,
+        sandbox_id: &str,
         image_ref: &str,
-        rootfs_tar_path: &Path,
-        expected_digest: &str,
+        local_image_ref: &str,
     ) -> Result<String, Status> {
-        let rootfs_tar = rootfs_tar_path.to_path_buf();
-        let image_identity = tokio::task::spawn_blocking(move || compute_file_sha256(&rootfs_tar))
-            .await
-            .map_err(|err| {
-                Status::internal(format!("rootfs tar digest computation panicked: {err}"))
-            })?
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to fingerprint vm sandbox rootfs artifact '{}': {err}",
-                    rootfs_tar_path.display()
-                ))
-            })?;
-        if image_identity != expected_digest {
-            return Err(Status::failed_precondition(
-                "vm rootfs artifact digest does not match the authenticated reference",
-            ));
-        }
+        let docker = Docker::connect_with_local_defaults().map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to connect to local Docker daemon for vm local image '{image_ref}': {err}"
+            ))
+        })?;
+        let image_identity = local_docker_image_identity(&docker, local_image_ref).await?;
         let archive_path = image_cache_rootfs_archive(&self.config.state_dir, &image_identity);
 
+        self.publish_platform_event(
+            sandbox_id.to_string(),
+            platform_event(
+                "vm",
+                "Normal",
+                "Pulling",
+                format!("Pulling image \"{local_image_ref}\""),
+            ),
+        );
+
         if tokio::fs::metadata(&archive_path).await.is_ok() {
+            self.publish_pulled_event(sandbox_id, local_image_ref, &archive_path)
+                .await;
             return Ok(image_identity);
         }
 
         let _cache_guard = self.image_cache_lock.lock().await;
         if tokio::fs::metadata(&archive_path).await.is_ok() {
+            self.publish_pulled_event(sandbox_id, local_image_ref, &archive_path)
+                .await;
             return Ok(image_identity);
         }
 
-        self.build_cached_rootfs_tar_image_rootfs_archive(
-            image_ref,
-            rootfs_tar_path,
-            &image_identity,
-        )
-        .await?;
+        self.build_cached_local_image_rootfs_archive(&docker, local_image_ref, &image_identity)
+            .await?;
+        self.publish_pulled_event(sandbox_id, local_image_ref, &archive_path)
+            .await;
         Ok(image_identity)
     }
 
-    async fn build_cached_rootfs_tar_image_rootfs_archive(
+    async fn build_cached_local_image_rootfs_archive(
         &self,
+        docker: &Docker,
         image_ref: &str,
-        rootfs_tar_path: &Path,
         image_identity: &str,
     ) -> Result<(), Status> {
         let cache_dir = image_cache_dir(&self.config.state_dir, image_identity);
         let archive_path = image_cache_rootfs_archive(&self.config.state_dir, image_identity);
         let staging_dir = image_cache_staging_dir(&self.config.state_dir, image_identity);
+        let exported_rootfs = staging_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
         let prepared_rootfs = staging_dir.join("rootfs");
         let prepared_archive = staging_dir.join(IMAGE_CACHE_ROOTFS_ARCHIVE);
 
@@ -953,24 +932,29 @@ impl VmDriver {
                 Status::internal(format!("create image cache staging dir failed: {err}"))
             })?;
 
+        if let Err(err) =
+            export_local_image_rootfs_to_path(docker, image_ref, &exported_rootfs).await
+        {
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            return Err(err);
+        }
+
         let image_ref_owned = image_ref.to_string();
         let image_identity_owned = image_identity.to_string();
-        let rootfs_tar_path_owned = rootfs_tar_path.to_path_buf();
+        let exported_rootfs_for_build = exported_rootfs.clone();
         let prepared_rootfs_for_build = prepared_rootfs.clone();
         let prepared_archive_for_build = prepared_archive.clone();
         let build_result = tokio::task::spawn_blocking(move || {
-            extract_rootfs_archive_to(&rootfs_tar_path_owned, &prepared_rootfs_for_build)?;
-            prepare_sandbox_rootfs_from_image_root(
-                &prepared_rootfs_for_build,
+            prepare_exported_rootfs_archive(
+                &image_ref_owned,
                 &image_identity_owned,
+                &exported_rootfs_for_build,
+                &prepared_rootfs_for_build,
+                &prepared_archive_for_build,
             )
-            .map_err(|err| {
-                format!("vm sandbox image '{image_ref_owned}' is not base-compatible: {err}")
-            })?;
-            create_rootfs_archive_from_dir(&prepared_rootfs_for_build, &prepared_archive_for_build)
         })
         .await
-        .map_err(|err| Status::internal(format!("rootfs artifact preparation panicked: {err}")))?;
+        .map_err(|err| Status::internal(format!("local image preparation panicked: {err}")))?;
 
         if let Err(err) = build_result {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
@@ -1436,10 +1420,122 @@ fn parse_registry_reference(image_ref: &str) -> Result<Reference, Status> {
     })
 }
 
-fn is_rootfs_tar_image_ref(image_ref: &str) -> bool {
-    image_ref
-        .strip_prefix(ROOTFS_TAR_IMAGE_REF_SCHEME)
-        .is_some_and(|rest| rest.starts_with(':'))
+#[allow(clippy::result_large_err)]
+fn parse_vm_local_image_ref(image_ref: &str) -> Result<Option<&str>, Status> {
+    let Some(local_image_ref) = image_ref.strip_prefix(VM_LOCAL_IMAGE_REF_PREFIX) else {
+        return Ok(None);
+    };
+    if local_image_ref.trim().is_empty() {
+        return Err(Status::failed_precondition(
+            "invalid vm local image reference: missing Docker image reference",
+        ));
+    }
+    Ok(Some(local_image_ref))
+}
+
+async fn local_docker_image_identity(docker: &Docker, image_ref: &str) -> Result<String, Status> {
+    let inspect = docker.inspect_image(image_ref).await.map_err(|err| {
+        Status::failed_precondition(format!(
+            "failed to inspect local Docker image '{image_ref}': {err}"
+        ))
+    })?;
+    inspect
+        .id
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "local Docker image '{image_ref}' inspect response has no image ID"
+            ))
+        })
+}
+
+async fn export_local_image_rootfs_to_path(
+    docker: &Docker,
+    image_ref: &str,
+    tar_path: &Path,
+) -> Result<(), Status> {
+    let container_name = format!(
+        "openshell-vm-rootfs-export-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let create_options = CreateContainerOptionsBuilder::default()
+        .name(container_name.as_str())
+        .build();
+    let container = docker
+        .create_container(
+            Some(create_options),
+            ContainerCreateBody {
+                image: Some(image_ref.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to create temporary export container for local Docker image '{image_ref}': {err}"
+            ))
+        })?;
+    let container_id = container.id;
+
+    let export_result = async {
+        if let Some(parent) = tar_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|err| {
+                Status::internal(format!(
+                    "create export dir {} failed: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let mut file = tokio::fs::File::create(tar_path).await.map_err(|err| {
+            Status::internal(format!("create {} failed: {err}", tar_path.display()))
+        })?;
+        let mut stream = docker.export_container(&container_id);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|err| {
+                Status::failed_precondition(format!(
+                    "failed to export local Docker image '{image_ref}': {err}"
+                ))
+            })?;
+            file.write_all(&chunk).await.map_err(|err| {
+                Status::internal(format!("write {} failed: {err}", tar_path.display()))
+            })?;
+        }
+        file.flush()
+            .await
+            .map_err(|err| Status::internal(format!("flush {} failed: {err}", tar_path.display())))
+    }
+    .await;
+
+    let cleanup_result = docker
+        .remove_container(
+            &container_id,
+            Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+        )
+        .await;
+
+    match (export_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(Status::internal(format!(
+            "failed to remove temporary export container for local Docker image '{image_ref}': {err}"
+        ))),
+    }
+}
+
+fn prepare_exported_rootfs_archive(
+    image_ref: &str,
+    image_identity: &str,
+    exported_rootfs: &Path,
+    prepared_rootfs: &Path,
+    prepared_archive: &Path,
+) -> Result<(), String> {
+    extract_rootfs_archive_to(exported_rootfs, prepared_rootfs)?;
+    prepare_sandbox_rootfs_from_image_root(prepared_rootfs, image_identity)
+        .map_err(|err| format!("vm sandbox image '{image_ref}' is not base-compatible: {err}"))?;
+    create_rootfs_archive_from_dir(prepared_rootfs, prepared_archive)
 }
 
 fn registry_client() -> OciClient {
@@ -1698,10 +1794,6 @@ fn verify_descriptor_digest(path: &Path, expected_digest: &str) -> Result<(), St
             path.display()
         ))
     }
-}
-
-fn compute_file_sha256(path: &Path) -> Result<String, String> {
-    compute_file_sha256_hex(path).map(|digest| format!("sha256:{digest}"))
 }
 
 fn compute_file_sha256_hex(path: &Path) -> Result<String, String> {
@@ -2585,29 +2677,28 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn ensure_cached_image_rootfs_archive_rejects_unsigned_rootfs_tar_refs() {
-        let base = unique_temp_dir();
-        fs::create_dir_all(&base).unwrap();
-        let artifact = base.join("rootfs.tar");
-        fs::write(&artifact, "not a real rootfs").unwrap();
-        let image_ref = openshell_bootstrap::build::encode_rootfs_tar_image_ref(&artifact).unwrap();
-        let driver = test_driver(VmDriverConfig {
-            state_dir: base.join("driver-state"),
-            ..Default::default()
-        });
-
-        let err = driver
-            .ensure_cached_image_rootfs_archive("sandbox-123", &image_ref)
-            .await
-            .expect_err("unsigned rootfs tar refs must be rejected");
-
-        assert_eq!(err.code(), Code::FailedPrecondition);
-        assert!(
-            err.message().contains("gateway-issued artifact secret"),
-            "unexpected error: {}",
-            err.message()
+    #[test]
+    fn parse_vm_local_image_ref_classifies_prefixed_refs() {
+        assert_eq!(
+            parse_vm_local_image_ref("openshell-vm-local-image:openshell/sandbox-from:123")
+                .unwrap(),
+            Some("openshell/sandbox-from:123")
         );
+        assert_eq!(parse_vm_local_image_ref("ubuntu:24.04").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_vm_local_image_ref_rejects_empty_refs() {
+        for image_ref in ["openshell-vm-local-image:", "openshell-vm-local-image:   "] {
+            let err =
+                parse_vm_local_image_ref(image_ref).expect_err("empty local image refs must fail");
+            assert_eq!(err.code(), Code::FailedPrecondition);
+            assert!(
+                err.message().contains("missing Docker image reference"),
+                "unexpected error: {}",
+                err.message()
+            );
+        }
     }
 
     #[test]
@@ -2778,15 +2869,56 @@ mod tests {
     }
 
     #[test]
-    fn compute_file_sha256_returns_prefixed_digest() {
+    fn prepare_exported_rootfs_archive_rewrites_docker_exported_rootfs() {
         let base = unique_temp_dir();
-        fs::create_dir_all(&base).unwrap();
-        let file = base.join("rootfs.tar");
-        fs::write(&file, b"openshell").unwrap();
+        let source_rootfs = base.join("source-rootfs");
+        let exported_rootfs = base.join("exported-rootfs.tar");
+        let prepared_rootfs = base.join("prepared-rootfs");
+        let prepared_archive = base.join("prepared-rootfs.tar");
+        let extracted = base.join("extracted");
 
+        for path in [
+            "bin/bash",
+            "bin/mount",
+            "bin/sed",
+            "sbin/ip",
+            "opt/openshell/bin/openshell-sandbox",
+            "usr/local/bin/k3s",
+        ] {
+            let path = source_rootfs.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        fs::create_dir_all(source_rootfs.join("opt/openshell/manifests")).unwrap();
+        fs::write(source_rootfs.join("opt/openshell/manifests/old.yaml"), "").unwrap();
+
+        create_rootfs_archive_from_dir(&source_rootfs, &exported_rootfs).unwrap();
+        prepare_exported_rootfs_archive(
+            "openshell/sandbox-from:123",
+            "sha256:local-image",
+            &exported_rootfs,
+            &prepared_rootfs,
+            &prepared_archive,
+        )
+        .unwrap();
+        extract_rootfs_archive_to(&prepared_archive, &extracted).unwrap();
+
+        assert!(extracted.join("srv/openshell-vm-sandbox-init.sh").is_file());
+        assert!(
+            extracted
+                .join("opt/openshell/bin/openshell-sandbox")
+                .is_file()
+        );
+        assert!(!extracted.join("usr/local/bin/k3s").exists());
+        assert!(!extracted.join("opt/openshell/manifests").exists());
         assert_eq!(
-            compute_file_sha256(&file).unwrap(),
-            "sha256:dc5cbc21a452a783ec453e8a8603101dfec5c7d6a19b6c645889bec8b97c2390"
+            fs::read_to_string(extracted.join("opt/openshell/.rootfs-type")).unwrap(),
+            "sandbox\n"
+        );
+        assert!(
+            fs::read_to_string(extracted.join(".openshell-rootfs-variant"))
+                .unwrap()
+                .contains("sha256:local-image")
         );
 
         let _ = fs::remove_dir_all(base);
@@ -2897,21 +3029,6 @@ mod tests {
             "openshell-vm-driver-test-{}-{nanos}-{suffix}",
             std::process::id()
         ))
-    }
-
-    fn test_driver(config: VmDriverConfig) -> VmDriver {
-        VmDriver {
-            config,
-            launcher_bin: PathBuf::from("openshell-driver-vm"),
-            registry: Arc::new(Mutex::new(HashMap::new())),
-            image_cache_lock: Arc::new(Mutex::new(())),
-            events: broadcast::channel(WATCH_BUFFER).0,
-            gpu_inventory: None,
-            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
-                Ipv4Addr::new(10, 0, 128, 0),
-                17,
-            ))),
-        }
     }
 
     fn spawn_exited_child() -> Child {

@@ -55,7 +55,9 @@ openshell sandbox create --from my-registry.example.com/my-image:latest
 
 The CLI resolves community names against the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog, pulls the bundled Dockerfile and policy, builds the image locally, and creates the sandbox. For the full catalog and how to contribute your own, refer to [Community Sandboxes](/sandboxes/community-sandboxes).
 
-Local Dockerfile sources build into the host Docker daemon. Use them with a Docker-backed gateway, or publish the image to a registry and pass the registry reference.
+Local directories and Dockerfiles require a local gateway because the CLI builds
+through the local Docker daemon. Use a registry image reference for remote
+gateways.
 
 ### Label a Sandbox
 

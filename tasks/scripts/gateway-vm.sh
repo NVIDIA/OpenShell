@@ -85,7 +85,6 @@ register_gateway_metadata() {
   local endpoint=$2
   local port=$3
   local vm_driver_state_dir=$4
-  local rootfs_artifact_secret=$5
   local config_home gateway_dir
 
   config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
@@ -100,8 +99,7 @@ register_gateway_metadata() {
   "is_remote": false,
   "gateway_port": ${port},
   "auth_mode": "plaintext",
-  "vm_driver_state_dir": "${vm_driver_state_dir}",
-  "vm_rootfs_artifact_secret": "${rootfs_artifact_secret}"
+  "vm_driver_state_dir": "${vm_driver_state_dir}"
 }
 EOF
   chmod 600 "${gateway_dir}/metadata.json" 2>/dev/null || true
@@ -150,10 +148,6 @@ check_supervisor_cross_toolchain() {
   if [ "${missing}" -ne 0 ]; then
     exit 1
   fi
-}
-
-generate_rootfs_artifact_secret() {
-  od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
 }
 
 VM_GPU="$(normalize_bool "${OPENSHELL_VM_GPU:-false}")"
@@ -219,12 +213,6 @@ VM_DRIVER_STATE_DIR_DEFAULT="${OPENSHELL_VM_DRIVER_STATE_ROOT:-/tmp}/openshell-v
 VM_DRIVER_STATE_DIR="${OPENSHELL_VM_DRIVER_STATE_DIR:-${VM_DRIVER_STATE_DIR_DEFAULT}}"
 
 DISABLE_TLS="$(normalize_bool "${OPENSHELL_DISABLE_TLS:-true}")"
-ROOTFS_ARTIFACT_SECRET="${OPENSHELL_VM_ROOTFS_ARTIFACT_SECRET:-$(generate_rootfs_artifact_secret)}"
-if [[ ! "${ROOTFS_ARTIFACT_SECRET}" =~ ^[A-Za-z0-9._~=-]+$ ]]; then
-  echo "ERROR: OPENSHELL_VM_ROOTFS_ARTIFACT_SECRET must contain only URL-safe characters" >&2
-  exit 2
-fi
-export OPENSHELL_VM_ROOTFS_ARTIFACT_SECRET="${ROOTFS_ARTIFACT_SECRET}"
 
 # Build prerequisites: VM runtime artifacts + bundled supervisor.
 if [ ! -d "${COMPRESSED_DIR}" ] \
@@ -264,7 +252,7 @@ mkdir -p "${STATE_DIR}"
 mkdir -p "${VM_DRIVER_STATE_DIR}"
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
-register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}" "${VM_DRIVER_STATE_DIR}" "${ROOTFS_ARTIFACT_SECRET}"
+register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}" "${VM_DRIVER_STATE_DIR}"
 save_active_gateway "${GATEWAY_NAME}"
 
 echo "Starting standalone VM gateway..."

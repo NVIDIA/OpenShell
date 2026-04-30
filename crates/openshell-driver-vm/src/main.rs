@@ -105,9 +105,6 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_GPU_VCPUS", default_value_t = 4)]
     gpu_vcpus: u8,
 
-    #[arg(long, env = "OPENSHELL_VM_ROOTFS_ARTIFACT_SECRET", hide = true)]
-    rootfs_artifact_secret: Option<String>,
-
     #[arg(long, hide = true)]
     vm_backend: Option<String>,
 
@@ -188,7 +185,6 @@ async fn main() -> Result<()> {
         gpu_enabled: args.gpu,
         gpu_mem_mib: args.gpu_mem_mib,
         gpu_vcpus: args.gpu_vcpus,
-        rootfs_artifact_secret: args.rootfs_artifact_secret,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;

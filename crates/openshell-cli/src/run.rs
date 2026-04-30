@@ -2849,6 +2849,12 @@ fn image_requests_gpu(image: &str) -> bool {
     image_name.contains("gpu")
 }
 
+const VM_LOCAL_IMAGE_REF_SCHEME: &str = "openshell-vm-local-image";
+
+fn vm_local_image_ref(image_ref: &str) -> String {
+    format!("{VM_LOCAL_IMAGE_REF_SCHEME}:{image_ref}")
+}
+
 fn dockerfile_sources_supported_for_gateway(metadata: Option<&GatewayMetadata>) -> bool {
     !metadata.is_some_and(|metadata| metadata.is_remote)
 }
@@ -2857,8 +2863,9 @@ fn dockerfile_sources_supported_for_gateway(metadata: Option<&GatewayMetadata>) 
 ///
 /// For local Kubernetes gateways running in Docker, this imports the built image
 /// into the gateway runtime and returns the Docker tag. For local VM gateways,
-/// this exports the built image as a rootfs tar artifact and returns an internal
-/// pseudo-image URI understood by the VM driver.
+/// this returns an internal local-image URI. The VM driver resolves that URI
+/// against the local Docker daemon and prepares the VM rootfs on the gateway
+/// host.
 async fn build_from_dockerfile(
     dockerfile: &Path,
     context: &Path,
@@ -2918,34 +2925,18 @@ async fn build_from_dockerfile(
         return Ok(tag);
     }
 
-    let rootfs_tar = openshell_bootstrap::build::export_local_image_rootfs(&tag, &mut on_log)
-        .await
-        .wrap_err("failed to export built image as a VM rootfs artifact")?;
-    let artifact_secret = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.vm_rootfs_artifact_secret.as_deref())
-        .filter(|secret| !secret.trim().is_empty())
-        .ok_or_else(|| {
-            miette!(
-                "local Dockerfile sources for VM gateways require authenticated rootfs artifact metadata; restart gateway '{}' with a current `mise run gateway:vm`",
-                gateway_name
-            )
-        })?;
-    let artifact_ref = openshell_bootstrap::build::encode_authenticated_rootfs_tar_image_ref(
-        &rootfs_tar,
-        artifact_secret,
-    )?;
+    let local_image_ref = vm_local_image_ref(&tag);
 
     eprintln!();
     eprintln!(
-        "{} VM rootfs artifact {} is ready for gateway '{}'.",
+        "{} Image {} will be resolved by the local VM driver for gateway '{}'.",
         "✓".green().bold(),
-        rootfs_tar.display().to_string().cyan(),
+        tag.cyan(),
         gateway_name,
     );
     eprintln!();
 
-    Ok(artifact_ref)
+    Ok(local_image_ref)
 }
 
 /// Load sandbox policy YAML.
@@ -5769,6 +5760,7 @@ mod tests {
         parse_credential_pairs, plaintext_gateway_is_remote, provisioning_timeout_message,
         ready_false_condition_message, resolve_gateway_control_target_from, sandbox_should_persist,
         shell_escape, source_requests_gpu, validate_gateway_name, validate_ssh_host,
+        vm_local_image_ref,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -6027,7 +6019,6 @@ mod tests {
             edge_team_domain: None,
             edge_auth_url: None,
             vm_driver_state_dir: None,
-            vm_rootfs_artifact_secret: None,
         };
 
         assert!(!dockerfile_sources_supported_for_gateway(Some(&metadata)));
@@ -6046,11 +6037,18 @@ mod tests {
             edge_team_domain: None,
             edge_auth_url: None,
             vm_driver_state_dir: None,
-            vm_rootfs_artifact_secret: None,
         };
 
         assert!(dockerfile_sources_supported_for_gateway(Some(&metadata)));
         assert!(dockerfile_sources_supported_for_gateway(None));
+    }
+
+    #[test]
+    fn vm_local_image_ref_wraps_docker_image_ref() {
+        assert_eq!(
+            vm_local_image_ref("openshell/sandbox-from:123"),
+            "openshell-vm-local-image:openshell/sandbox-from:123"
+        );
     }
 
     #[test]

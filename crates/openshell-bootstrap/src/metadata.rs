@@ -69,10 +69,6 @@ pub struct GatewayMetadata {
     /// Local VM driver state directory for standalone VM gateways.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm_driver_state_dir: Option<PathBuf>,
-
-    /// Local secret used to authenticate VM rootfs artifact references.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vm_rootfs_artifact_secret: Option<String>,
 }
 
 impl GatewayMetadata {
