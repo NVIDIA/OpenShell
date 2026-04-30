@@ -3,12 +3,13 @@
 
 //! Local browser proxy for remote gateway service domains.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use miette::{IntoDiagnostic, Result};
 use openshell_bootstrap::GatewayMetadata;
 use rustls::pki_types::ServerName;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
@@ -53,7 +54,7 @@ pub async fn run(metadata: GatewayMetadata, tls: TlsOptions) -> Result<()> {
                 let upstream = Arc::clone(&upstream);
                 let tls = Arc::clone(&tls);
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(client, upstream, tls).await {
+                    if let Err(err) = handle_connection(client, peer, upstream, tls).await {
                         warn!(peer = %peer, error = %err, "gateway proxy connection failed");
                     }
                 });
@@ -73,15 +74,145 @@ fn local_service_url_pattern(gateway_name: &str, port: u16) -> String {
 }
 
 async fn handle_connection(
-    mut client: TcpStream,
+    client: TcpStream,
+    peer: SocketAddr,
     upstream: Arc<Upstream>,
     tls: Arc<TlsOptions>,
 ) -> Result<()> {
     client.set_nodelay(true).into_diagnostic()?;
-    let mut upstream = connect_upstream(&upstream, &tls).await?;
-    debug!("gateway proxy connected upstream");
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+    let endpoint_label = upstream.endpoint_label();
+    let transport_label = upstream.transport_label(&tls);
+    let upstream = connect_upstream(&upstream, &tls).await?;
+    debug!(peer = %peer, "gateway proxy connected upstream");
+    eprintln!(
+        "→ proxy {peer} -> {} via {}",
+        endpoint_label, transport_label
+    );
+
+    let (mut client_reader, mut client_writer) = tokio::io::split(client);
+    let (mut upstream_reader, mut upstream_writer) = tokio::io::split(upstream);
+
+    let request = relay_with_logging(
+        &mut client_reader,
+        &mut upstream_writer,
+        ProxyDirection::Request,
+        peer,
+    );
+    let response = relay_with_logging(
+        &mut upstream_reader,
+        &mut client_writer,
+        ProxyDirection::Response,
+        peer,
+    );
+    let (request_result, response_result) = tokio::join!(request, response);
+    if let Err(err) = request_result {
+        warn!(peer = %peer, error = %err, "gateway proxy request relay failed");
+    }
+    if let Err(err) = response_result {
+        warn!(peer = %peer, error = %err, "gateway proxy response relay failed");
+    }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ProxyDirection {
+    Request,
+    Response,
+}
+
+async fn relay_with_logging<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    direction: ProxyDirection,
+    peer: SocketAddr,
+) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut total = 0;
+    let mut logged = false;
+    let mut buffer = [0_u8; 16 * 1024];
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            writer.shutdown().await?;
+            return Ok(total);
+        }
+        if !logged {
+            log_first_proxy_chunk(direction, peer, &buffer[..read]);
+            logged = true;
+        }
+        writer.write_all(&buffer[..read]).await?;
+        total += u64::try_from(read).unwrap_or(0);
+    }
+}
+
+fn log_first_proxy_chunk(direction: ProxyDirection, peer: SocketAddr, bytes: &[u8]) {
+    match direction {
+        ProxyDirection::Request => {
+            let (line, host) = request_line_and_host(bytes);
+            eprintln!(
+                "  request {peer}: {} host={}",
+                line.unwrap_or("<non-http>"),
+                host.unwrap_or("<missing>")
+            );
+        }
+        ProxyDirection::Response => {
+            if let Some(line) = first_line(bytes).filter(|line| line.starts_with("HTTP/")) {
+                eprintln!("  response {peer}: {line}");
+            } else {
+                eprintln!(
+                    "  response {peer}: non-http first bytes [{}] ascii={}",
+                    hex_preview(bytes),
+                    ascii_preview(bytes)
+                );
+            }
+        }
+    }
+}
+
+fn request_line_and_host(bytes: &[u8]) -> (Option<&str>, Option<&str>) {
+    let text = std::str::from_utf8(bytes).ok();
+    let line = first_line(bytes);
+    let host = text.and_then(|text| {
+        text.split("\r\n")
+            .find_map(|line| line.strip_prefix("Host:").map(str::trim))
+            .or_else(|| {
+                text.split('\n')
+                    .find_map(|line| line.strip_prefix("Host:").map(str::trim))
+            })
+    });
+    (line, host)
+}
+
+fn first_line(bytes: &[u8]) -> Option<&str> {
+    let end = bytes
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .or_else(|| bytes.iter().position(|byte| *byte == b'\n'))?;
+    std::str::from_utf8(&bytes[..end]).ok()
+}
+
+fn hex_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn ascii_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(32)
+        .map(|byte| match byte {
+            0x20..=0x7e => char::from(*byte),
+            _ => '.',
+        })
+        .collect()
 }
 
 async fn connect_upstream(upstream: &Upstream, tls: &TlsOptions) -> Result<Box<dyn ProxyStream>> {
@@ -159,6 +290,20 @@ impl Upstream {
             .parse::<std::net::IpAddr>()
             .is_ok_and(|addr| addr.is_loopback() || addr.is_unspecified())
     }
+
+    fn endpoint_label(&self) -> String {
+        format!("{}://{}:{}", self.scheme, self.host, self.port)
+    }
+
+    fn transport_label(&self, tls: &TlsOptions) -> &'static str {
+        if tls.is_bearer_auth() {
+            "edge tunnel"
+        } else if self.scheme == "https" {
+            "mTLS"
+        } else {
+            "plain HTTP"
+        }
+    }
 }
 
 #[cfg(test)]
@@ -199,5 +344,18 @@ mod tests {
     fn loopback_endpoint_is_local_endpoint() {
         let upstream = Upstream::from_endpoint("https://127.0.0.1:31886").unwrap();
         assert!(upstream.is_local_endpoint());
+    }
+
+    #[test]
+    fn parses_request_line_and_host() {
+        let (line, host) = request_line_and_host(
+            b"GET / HTTP/1.1\r\nHost: luscious-sawfish--openclaw.spark.openshell.localhost:53068\r\n\r\n",
+        );
+
+        assert_eq!(line, Some("GET / HTTP/1.1"));
+        assert_eq!(
+            host,
+            Some("luscious-sawfish--openclaw.spark.openshell.localhost:53068")
+        );
     }
 }
