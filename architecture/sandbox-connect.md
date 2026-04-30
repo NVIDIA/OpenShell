@@ -12,7 +12,7 @@ Gateway connectivity is **supervisor-initiated**: the gateway never dials the sa
 
 There is also a gateway-side `ExecSandbox` gRPC RPC that executes commands inside sandboxes without requiring an external SSH client. It uses the same relay mechanism.
 
-The OS-88 forwarding path also carries arbitrary TCP services: `openshell service forward <sandbox> --target-port <port>` binds a local TCP listener, opens one `ForwardTcp` bidirectional gRPC stream per accepted local connection, and sends `TcpForwardInit { target.tcp, authorization_token }` with a `TcpRelayTarget` for the requested loopback port inside the sandbox. This avoids the SSH `direct-tcpip` transport and keeps gateway auth, typed routing, session-token authorization, and relay target validation in the OpenShell protocol.
+The OS-88 forwarding path also carries arbitrary TCP services: `openshell forward service <sandbox> --target-port <port>` binds a local TCP listener, opens one `ForwardTcp` bidirectional gRPC stream per accepted local connection, and sends `TcpForwardInit { target.tcp, authorization_token }` with a `TcpRelayTarget` for the requested loopback port inside the sandbox. This avoids the SSH `direct-tcpip` transport and keeps gateway auth, typed routing, session-token authorization, and relay target validation in the OpenShell protocol.
 
 ### Podman and relay environment
 
@@ -41,7 +41,7 @@ The supervisor-initiated direction gives the model two properties:
 
 If `target` is absent, the supervisor treats the relay as `SshRelayTarget` for compatibility with older gateways or messages. The supervisor opens the target before sending `RelayOpenResult { success: true }`; if validation or dialing fails, it sends `success: false` with the error and does not start a `RelayStream`.
 
-### CLI service forward over gRPC
+### CLI forward service over gRPC
 
 **Files**: `proto/openshell.proto`, `crates/openshell-cli/src/run.rs`, `crates/openshell-server/src/grpc/sandbox.rs`
 
