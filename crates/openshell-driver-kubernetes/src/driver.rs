@@ -1029,8 +1029,7 @@ fn sandbox_template_to_k8s(
 
     // Per-sandbox platform_config.host_users overrides the cluster-wide default.
     let use_user_namespaces = platform_config_bool(template, "host_users")
-        .map(|host_users| !host_users)
-        .unwrap_or(enable_user_namespaces);
+        .map_or(enable_user_namespaces, |host_users| !host_users);
 
     if use_user_namespaces {
         spec.insert("hostUsers".to_string(), serde_json::json!(false));
@@ -2051,13 +2050,12 @@ mod tests {
     fn user_namespaces_per_sandbox_override_enables() {
         let template = SandboxTemplate {
             platform_config: Some(Struct {
-                fields: [(
+                fields: std::iter::once((
                     "host_users".to_string(),
                     Value {
                         kind: Some(Kind::BoolValue(false)),
                     },
-                )]
-                .into_iter()
+                ))
                 .collect(),
             }),
             ..SandboxTemplate::default()
@@ -2096,13 +2094,12 @@ mod tests {
     fn user_namespaces_per_sandbox_override_disables() {
         let template = SandboxTemplate {
             platform_config: Some(Struct {
-                fields: [(
+                fields: std::iter::once((
                     "host_users".to_string(),
                     Value {
                         kind: Some(Kind::BoolValue(true)),
                     },
-                )]
-                .into_iter()
+                ))
                 .collect(),
             }),
             ..SandboxTemplate::default()
@@ -2144,13 +2141,12 @@ mod tests {
     fn platform_config_bool_extracts_value() {
         let template = SandboxTemplate {
             platform_config: Some(Struct {
-                fields: [(
+                fields: std::iter::once((
                     "my_bool".to_string(),
                     Value {
                         kind: Some(Kind::BoolValue(true)),
                     },
-                )]
-                .into_iter()
+                ))
                 .collect(),
             }),
             ..SandboxTemplate::default()
@@ -2164,13 +2160,12 @@ mod tests {
     fn platform_config_bool_returns_none_for_non_bool() {
         let template = SandboxTemplate {
             platform_config: Some(Struct {
-                fields: [(
+                fields: std::iter::once((
                     "a_string".to_string(),
                     Value {
                         kind: Some(Kind::StringValue("hello".to_string())),
                     },
-                )]
-                .into_iter()
+                ))
                 .collect(),
             }),
             ..SandboxTemplate::default()
