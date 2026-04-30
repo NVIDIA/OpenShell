@@ -2,13 +2,15 @@ name: PR Gate
 description: >
   Resolve PR metadata for a `pull-request/<N>` push from copy-pr-bot and decide
   whether the workflow should run. Sets `should-run=true` only when the pushed
-  SHA still matches the PR head SHA and the PR carries the required label. For
-  non-`push` events (e.g. `workflow_dispatch`), always sets `should-run=true`.
+  SHA still matches the PR head SHA. If `required_label` is provided, the PR
+  must also carry that label. For non-`push` events (e.g. `workflow_dispatch`),
+  always sets `should-run=true`.
 
 inputs:
   required_label:
-    description: PR label required to enable the run (e.g. "test:e2e").
-    required: true
+    description: Optional PR label required to enable the run (e.g. "test:e2e").
+    required: false
+    default: ""
 
 outputs:
   should_run:
@@ -43,10 +45,14 @@ runs:
         fi
 
         head_sha="$(jq -r '.head.sha' <<< "$PR_INFO")"
-        has_label="$(jq -r --arg L "$REQUIRED_LABEL" '[.labels[].name] | index($L) != null' <<< "$PR_INFO")"
+        if [ -z "$REQUIRED_LABEL" ]; then
+          has_label=true
+        else
+          has_label="$(jq -r --arg L "$REQUIRED_LABEL" '[.labels[].name] | index($L) != null' <<< "$PR_INFO")"
+        fi
 
         # Only trust copied pull-request/* pushes that still match the PR head
-        # SHA and carry the required label.
+        # SHA and, when configured, carry the required label.
         if [ "$head_sha" = "$GITHUB_SHA_VALUE" ] && [ "$has_label" = "true" ]; then
           should_run=true
         else
