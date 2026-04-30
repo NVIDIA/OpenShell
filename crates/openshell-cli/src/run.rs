@@ -867,6 +867,32 @@ fn is_loopback_gateway_endpoint(endpoint: &str) -> bool {
     }
 }
 
+/// Check whether mTLS client certs exist on disk for the gateway that
+/// would serve this endpoint.
+///
+/// Loopback endpoints (`localhost`, `127.0.0.1`, `::1`) resolve to the
+/// `"openshell"` gateway name, matching the convention used by
+/// `init-pki.sh` and the TLS cert resolver in `tls.rs`.
+fn mtls_certs_exist_for_endpoint(name: &str, endpoint: &str) -> bool {
+    let cert_name = if is_loopback_gateway_endpoint(endpoint) {
+        "openshell"
+    } else {
+        name
+    };
+    openshell_core::paths::xdg_config_dir()
+        .map(|d| {
+            let mtls = d
+                .join("openshell")
+                .join("gateways")
+                .join(cert_name)
+                .join("mtls");
+            mtls.join("ca.crt").is_file()
+                && mtls.join("tls.crt").is_file()
+                && mtls.join("tls.key").is_file()
+        })
+        .unwrap_or(false)
+}
+
 fn plaintext_gateway_is_remote(endpoint: &str, remote: Option<&str>, local: bool) -> bool {
     if local {
         return false;
@@ -1139,14 +1165,7 @@ pub async fn gateway_add(
     if endpoint.starts_with("http://") {
         // Warn if mTLS certs exist for this gateway — the user likely
         // meant to use https:// instead of http://.
-        let has_mtls_certs = openshell_core::paths::xdg_config_dir()
-            .map(|d| {
-                let mtls = d.join("openshell").join("gateways").join(name).join("mtls");
-                mtls.join("ca.crt").is_file()
-                    && mtls.join("tls.crt").is_file()
-                    && mtls.join("tls.key").is_file()
-            })
-            .unwrap_or(false);
+        let has_mtls_certs = mtls_certs_exist_for_endpoint(name, &endpoint);
 
         if has_mtls_certs {
             let https_endpoint = endpoint.replacen("http://", "https://", 1);
@@ -1214,14 +1233,7 @@ pub async fn gateway_add(
         // Skip extraction when client certs are already on disk (e.g.,
         // RPM/systemd deployments where init-pki.sh pre-provisions them
         // before the gateway starts).
-        let certs_on_disk = openshell_core::paths::xdg_config_dir()
-            .map(|d| {
-                let mtls = d.join("openshell").join("gateways").join(name).join("mtls");
-                mtls.join("ca.crt").is_file()
-                    && mtls.join("tls.crt").is_file()
-                    && mtls.join("tls.key").is_file()
-            })
-            .unwrap_or(false);
+        let certs_on_disk = mtls_certs_exist_for_endpoint(name, &endpoint);
 
         if certs_on_disk {
             eprintln!("• TLS certificates already present, skipping extraction");
