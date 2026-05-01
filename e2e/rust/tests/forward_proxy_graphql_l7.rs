@@ -350,6 +350,7 @@ def connect_status(query):
             f"\r\n"
         ).encode() + body
         sock.sendall(request)
+        sock.shutdown(socket.SHUT_WR)
         response = read_until(sock, b"\r\n\r\n")
         return int(response.split()[1])
 
@@ -373,6 +374,7 @@ def connect_get_status(query):
             f"\r\n"
         ).encode()
         sock.sendall(request)
+        sock.shutdown(socket.SHUT_WR)
         response = read_until(sock, b"\r\n\r\n")
         return int(response.split()[1])
 
@@ -397,6 +399,7 @@ def connect_duplicate_get_status():
             f"\r\n"
         ).encode()
         sock.sendall(request)
+        sock.shutdown(socket.SHUT_WR)
         response = read_until(sock, b"\r\n\r\n")
         return int(response.split()[1])
 
@@ -421,6 +424,7 @@ def connect_persisted_get_status(hash_value):
             f"\r\n"
         ).encode()
         sock.sendall(request)
+        sock.shutdown(socket.SHUT_WR)
         response = read_until(sock, b"\r\n\r\n")
         return int(response.split()[1])
 
