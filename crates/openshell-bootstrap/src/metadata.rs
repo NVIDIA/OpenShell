@@ -538,14 +538,9 @@ mod tests {
         let meta = GatewayMetadata {
             name: "test".to_string(),
             gateway_endpoint: "https://127.0.0.1:8080".to_string(),
-            is_remote: false,
             gateway_port: 8080,
-            remote_host: None,
-            resolved_host: None,
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
             client_lifecycle_managed: Some(false),
+            ..Default::default()
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains(r#""client_lifecycle_managed":false"#));
@@ -558,14 +553,8 @@ mod tests {
         let meta = GatewayMetadata {
             name: "test".to_string(),
             gateway_endpoint: "https://127.0.0.1:8080".to_string(),
-            is_remote: false,
             gateway_port: 8080,
-            remote_host: None,
-            resolved_host: None,
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
-            client_lifecycle_managed: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(!json.contains("client_lifecycle_managed"));

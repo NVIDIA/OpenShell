@@ -879,18 +879,16 @@ fn mtls_certs_exist_for_endpoint(name: &str, endpoint: &str) -> bool {
     } else {
         name
     };
-    openshell_core::paths::xdg_config_dir()
-        .map(|d| {
-            let mtls = d
-                .join("openshell")
-                .join("gateways")
-                .join(cert_name)
-                .join("mtls");
-            mtls.join("ca.crt").is_file()
-                && mtls.join("tls.crt").is_file()
-                && mtls.join("tls.key").is_file()
-        })
-        .unwrap_or(false)
+    openshell_core::paths::xdg_config_dir().is_ok_and(|d| {
+        let mtls = d
+            .join("openshell")
+            .join("gateways")
+            .join(cert_name)
+            .join("mtls");
+        mtls.join("ca.crt").is_file()
+            && mtls.join("tls.crt").is_file()
+            && mtls.join("tls.key").is_file()
+    })
 }
 
 fn plaintext_gateway_is_remote(endpoint: &str, remote: Option<&str>, local: bool) -> bool {
@@ -6450,14 +6448,9 @@ mod tests {
         let metadata = GatewayMetadata {
             name: "localhost".to_string(),
             gateway_endpoint: "http://localhost:8080".to_string(),
-            is_remote: false,
-            gateway_port: 0,
-            remote_host: None,
-            resolved_host: None,
             auth_mode: Some("plaintext".to_string()),
-            edge_team_domain: None,
-            edge_auth_url: None,
             client_lifecycle_managed: Some(false),
+            ..Default::default()
         };
         let target = resolve_gateway_control_target_from(Some(metadata), None);
         assert!(matches!(target, GatewayControlTarget::ExternalRegistration));
@@ -6469,14 +6462,9 @@ mod tests {
         let metadata = GatewayMetadata {
             name: "openshell".to_string(),
             gateway_endpoint: "https://127.0.0.1:8080".to_string(),
-            is_remote: false,
             gateway_port: 8080,
-            remote_host: None,
-            resolved_host: None,
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
             client_lifecycle_managed: Some(true),
+            ..Default::default()
         };
         let target = resolve_gateway_control_target_from(Some(metadata), None);
         assert!(matches!(target, GatewayControlTarget::Local));
@@ -6489,14 +6477,8 @@ mod tests {
         let metadata = GatewayMetadata {
             name: "openshell".to_string(),
             gateway_endpoint: "https://127.0.0.1:8080".to_string(),
-            is_remote: false,
             gateway_port: 8080,
-            remote_host: None,
-            resolved_host: None,
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
-            client_lifecycle_managed: None,
+            ..Default::default()
         };
         let target = resolve_gateway_control_target_from(Some(metadata), None);
         assert!(matches!(target, GatewayControlTarget::Local));
