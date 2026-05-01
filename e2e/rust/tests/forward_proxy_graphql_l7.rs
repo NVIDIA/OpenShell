@@ -33,7 +33,10 @@ impl DockerServer {
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
+        if self.path == "/" or self.path.startswith("/graphql?"):
+            self.send_response(200)
+        else:
+            self.send_response(418)
         self.end_headers()
         self.wfile.write(b'{"ok":true}')
     def do_POST(self):
@@ -150,6 +153,12 @@ network_policies:
         port: {port}
         protocol: graphql
         enforcement: enforce
+        persisted_queries: allow_registered
+        graphql_persisted_queries:
+          abc123:
+            operation_type: query
+            operation_name: Viewer
+            fields: [viewer]
         allowed_ips:
           - "172.0.0.0/8"
         rules:
@@ -221,6 +230,79 @@ def forward_status(query):
         error.read()
         return error.code
 
+def forward_get_status(query):
+    encoded = urllib.parse.urlencode({{"query": query}})
+    request = urllib.request.Request(
+        f"http://{{HOST}}:{{PORT}}/graphql?{{encoded}}",
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            response.read()
+            return response.status
+    except urllib.error.HTTPError as error:
+        error.read()
+        return error.code
+
+def forward_duplicate_get_status():
+    safe = urllib.parse.quote_plus(QUERY_VIEWER)
+    unsafe = urllib.parse.quote_plus(MUTATION_DELETE)
+    request = urllib.request.Request(
+        f"http://{{HOST}}:{{PORT}}/graphql?query={{safe}}&query={{unsafe}}",
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            response.read()
+            return response.status
+    except urllib.error.HTTPError as error:
+        error.read()
+        return error.code
+
+def forward_persisted_get_status(hash_value):
+    extensions = json.dumps({{"persistedQuery": {{"version": 1, "sha256Hash": hash_value}}}})
+    encoded = urllib.parse.urlencode({{"operationName": "Viewer", "extensions": extensions}})
+    request = urllib.request.Request(
+        f"http://{{HOST}}:{{PORT}}/graphql?{{encoded}}",
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            response.read()
+            return response.status
+    except urllib.error.HTTPError as error:
+        error.read()
+        return error.code
+
+def proxy_parts():
+    proxy_url = (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+    )
+    parsed = urllib.parse.urlparse(proxy_url)
+    return parsed.hostname, parsed.port or 80
+
+def forward_chunked_status(query):
+    proxy_host, proxy_port = proxy_parts()
+    target = f"{{HOST}}:{{PORT}}"
+    body = json.dumps({{"query": query}}).encode()
+    chunk = f"{{len(body):x}}\r\n".encode() + body + b"\r\n0\r\n\r\n"
+
+    with socket.create_connection((proxy_host, proxy_port), timeout=15) as sock:
+        request = (
+            f"POST http://{{target}}/graphql HTTP/1.1\r\n"
+            f"Host: {{target}}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+        ).encode() + chunk
+        sock.sendall(request)
+        response = read_until(sock, b"\r\n\r\n")
+        return int(response.split()[1])
+
 def read_until(sock, marker):
     data = b""
     while marker not in data:
@@ -231,18 +313,11 @@ def read_until(sock, marker):
     return data
 
 def connect_status(query):
-    proxy_url = (
-        os.environ.get("HTTPS_PROXY")
-        or os.environ.get("https_proxy")
-        or os.environ.get("HTTP_PROXY")
-        or os.environ.get("http_proxy")
-    )
-    parsed = urllib.parse.urlparse(proxy_url)
-    proxy_port = parsed.port or 80
+    proxy_host, proxy_port = proxy_parts()
     target = f"{{HOST}}:{{PORT}}"
     body = json.dumps({{"query": query}}).encode()
 
-    with socket.create_connection((parsed.hostname, proxy_port), timeout=15) as sock:
+    with socket.create_connection((proxy_host, proxy_port), timeout=15) as sock:
         sock.sendall(
             f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode()
         )
@@ -262,12 +337,119 @@ def connect_status(query):
         response = read_until(sock, b"\r\n\r\n")
         return int(response.split()[1])
 
+def connect_get_status(query):
+    proxy_host, proxy_port = proxy_parts()
+    target = f"{{HOST}}:{{PORT}}"
+    encoded = urllib.parse.urlencode({{"query": query}})
+
+    with socket.create_connection((proxy_host, proxy_port), timeout=15) as sock:
+        sock.sendall(
+            f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode()
+        )
+        connect_response = read_until(sock, b"\r\n\r\n")
+        if not connect_response.startswith(b"HTTP/1.1 200"):
+            return int(connect_response.split()[1])
+
+        request = (
+            f"GET /graphql?{{encoded}} HTTP/1.1\r\n"
+            f"Host: {{target}}\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+        ).encode()
+        sock.sendall(request)
+        response = read_until(sock, b"\r\n\r\n")
+        return int(response.split()[1])
+
+def connect_duplicate_get_status():
+    proxy_host, proxy_port = proxy_parts()
+    target = f"{{HOST}}:{{PORT}}"
+    safe = urllib.parse.quote_plus(QUERY_VIEWER)
+    unsafe = urllib.parse.quote_plus(MUTATION_DELETE)
+
+    with socket.create_connection((proxy_host, proxy_port), timeout=15) as sock:
+        sock.sendall(
+            f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode()
+        )
+        connect_response = read_until(sock, b"\r\n\r\n")
+        if not connect_response.startswith(b"HTTP/1.1 200"):
+            return int(connect_response.split()[1])
+
+        request = (
+            f"GET /graphql?query={{safe}}&query={{unsafe}} HTTP/1.1\r\n"
+            f"Host: {{target}}\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+        ).encode()
+        sock.sendall(request)
+        response = read_until(sock, b"\r\n\r\n")
+        return int(response.split()[1])
+
+def connect_persisted_get_status(hash_value):
+    proxy_host, proxy_port = proxy_parts()
+    target = f"{{HOST}}:{{PORT}}"
+    extensions = json.dumps({{"persistedQuery": {{"version": 1, "sha256Hash": hash_value}}}})
+    encoded = urllib.parse.urlencode({{"operationName": "Viewer", "extensions": extensions}})
+
+    with socket.create_connection((proxy_host, proxy_port), timeout=15) as sock:
+        sock.sendall(
+            f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode()
+        )
+        connect_response = read_until(sock, b"\r\n\r\n")
+        if not connect_response.startswith(b"HTTP/1.1 200"):
+            return int(connect_response.split()[1])
+
+        request = (
+            f"GET /graphql?{{encoded}} HTTP/1.1\r\n"
+            f"Host: {{target}}\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+        ).encode()
+        sock.sendall(request)
+        response = read_until(sock, b"\r\n\r\n")
+        return int(response.split()[1])
+
+def connect_chunked_status(query):
+    proxy_host, proxy_port = proxy_parts()
+    target = f"{{HOST}}:{{PORT}}"
+    body = json.dumps({{"query": query}}).encode()
+    chunk = f"{{len(body):x}}\r\n".encode() + body + b"\r\n0\r\n\r\n"
+
+    with socket.create_connection((proxy_host, proxy_port), timeout=15) as sock:
+        sock.sendall(
+            f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode()
+        )
+        connect_response = read_until(sock, b"\r\n\r\n")
+        if not connect_response.startswith(b"HTTP/1.1 200"):
+            return int(connect_response.split()[1])
+
+        request = (
+            f"POST /graphql HTTP/1.1\r\n"
+            f"Host: {{target}}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+        ).encode() + chunk
+        sock.sendall(request)
+        response = read_until(sock, b"\r\n\r\n")
+        return int(response.split()[1])
+
 results = {{
     "forward_query_allowed": forward_status(QUERY_VIEWER),
+    "forward_get_query_allowed": forward_get_status(QUERY_VIEWER),
+    "forward_duplicate_get_denied": forward_duplicate_get_status(),
+    "forward_persisted_get_allowed": forward_persisted_get_status("abc123"),
+    "forward_unregistered_persisted_get_denied": forward_persisted_get_status("missing"),
+    "forward_chunked_query_allowed": forward_chunked_status(QUERY_VIEWER),
     "forward_unlisted_field_denied": forward_status(QUERY_REPOSITORY),
     "forward_mutation_allowed": forward_status(MUTATION_CREATE),
     "forward_deny_rule_denied": forward_status(MUTATION_DELETE),
     "connect_query_allowed": connect_status(QUERY_VIEWER),
+    "connect_get_query_allowed": connect_get_status(QUERY_VIEWER),
+    "connect_duplicate_get_denied": connect_duplicate_get_status(),
+    "connect_persisted_get_allowed": connect_persisted_get_status("abc123"),
+    "connect_unregistered_persisted_get_denied": connect_persisted_get_status("missing"),
+    "connect_chunked_query_allowed": connect_chunked_status(QUERY_VIEWER),
     "connect_unlisted_field_denied": connect_status(QUERY_REPOSITORY),
     "connect_mutation_allowed": connect_status(MUTATION_CREATE),
     "connect_deny_rule_denied": connect_status(MUTATION_DELETE),
@@ -290,10 +472,20 @@ print(json.dumps(results, sort_keys=True))
 
     for (key, expected) in [
         ("forward_query_allowed", 200),
+        ("forward_get_query_allowed", 200),
+        ("forward_duplicate_get_denied", 403),
+        ("forward_persisted_get_allowed", 200),
+        ("forward_unregistered_persisted_get_denied", 403),
+        ("forward_chunked_query_allowed", 200),
         ("forward_unlisted_field_denied", 403),
         ("forward_mutation_allowed", 200),
         ("forward_deny_rule_denied", 403),
         ("connect_query_allowed", 200),
+        ("connect_get_query_allowed", 200),
+        ("connect_duplicate_get_denied", 403),
+        ("connect_persisted_get_allowed", 200),
+        ("connect_unregistered_persisted_get_denied", 403),
+        ("connect_chunked_query_allowed", 200),
         ("connect_unlisted_field_denied", 403),
         ("connect_mutation_allowed", 200),
         ("connect_deny_rule_denied", 403),

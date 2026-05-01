@@ -2534,6 +2534,7 @@ async fn handle_forward_proxy(
         }
     };
     let mut forward_request_bytes = buf[..used].to_vec();
+    let mut upstream_target = path.clone();
 
     // 4b. If the endpoint has L7 config, evaluate the request against
     //     L7 policy.  The forward proxy handles exactly one request per
@@ -2617,6 +2618,12 @@ async fn handle_forward_proxy(
         let query_params =
             match crate::l7::path::canonicalize_request_target(&path, &canonicalize_options) {
                 Ok((canon, query)) => {
+                    upstream_target = match query.as_deref() {
+                        Some(raw_query) if !raw_query.is_empty() => {
+                            format!("{}?{raw_query}", canon.path)
+                        }
+                        _ => canon.path.clone(),
+                    };
                     let params = query
                         .as_deref()
                         .map_or_else(std::collections::HashMap::new, |q| {
@@ -3056,7 +3063,7 @@ async fn handle_forward_proxy(
     let rewritten = match rewrite_forward_request(
         &forward_request_bytes,
         forward_request_bytes.len(),
-        &path,
+        &upstream_target,
         secret_resolver.as_deref(),
     ) {
         Ok(bytes) => bytes,
@@ -4166,6 +4173,30 @@ mod tests {
         assert!(
             !rewritten_str.contains(".."),
             "outbound bytes must not leak the pre-canonical form, got: {rewritten_str:?}"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_forward_request_preserves_canonical_query_on_the_wire() {
+        let raw = b"GET http://host/public/../graphql?query=query+Viewer+%7B+viewer+%7B+login+%7D+%7D HTTP/1.1\r\nHost: host\r\n\r\n";
+        let (canon, raw_query) = crate::l7::path::canonicalize_request_target(
+            "/public/../graphql?query=query+Viewer+%7B+viewer+%7B+login+%7D+%7D",
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .expect("canonicalization should preserve query separately");
+        let upstream_target = match raw_query.as_deref() {
+            Some(raw_query) if !raw_query.is_empty() => format!("{}?{raw_query}", canon.path),
+            _ => canon.path,
+        };
+
+        let rewritten = rewrite_forward_request(raw, raw.len(), &upstream_target, None)
+            .expect("rewrite_forward_request should succeed");
+        let rewritten_str = String::from_utf8_lossy(&rewritten);
+        assert!(
+            rewritten_str.starts_with(
+                "GET /graphql?query=query+Viewer+%7B+viewer+%7B+login+%7D+%7D HTTP/1.1\r\n"
+            ),
+            "outbound request line must preserve canonical query, got: {rewritten_str:?}"
         );
     }
 

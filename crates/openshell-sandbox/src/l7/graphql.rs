@@ -90,13 +90,11 @@ fn classify_request_inner(
 }
 
 fn classify_get(request: &L7Request) -> std::result::Result<Vec<GraphqlOperationInfo>, String> {
-    let query = first_query_value(&request.query_params, "query");
-    let operation_name = first_query_value(&request.query_params, "operationName");
-    let extensions = first_query_value(&request.query_params, "extensions")
+    let query = unique_query_value(&request.query_params, "query")?;
+    let operation_name = unique_query_value(&request.query_params, "operationName")?;
+    let extensions = unique_query_value(&request.query_params, "extensions")?
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
-    let id = first_query_value(&request.query_params, "id")
-        .or_else(|| first_query_value(&request.query_params, "documentId"))
-        .or_else(|| first_query_value(&request.query_params, "queryId"));
+    let id = unique_persisted_query_id(&request.query_params)?;
 
     classify_envelope(
         query.as_deref(),
@@ -311,12 +309,37 @@ fn persisted_query_hash(extensions: Option<&Value>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn first_query_value(params: &HashMap<String, Vec<String>>, key: &str) -> Option<String> {
-    params
-        .get(key)
-        .and_then(|values| values.first())
-        .filter(|value| !value.is_empty())
-        .cloned()
+fn unique_query_value(
+    params: &HashMap<String, Vec<String>>,
+    key: &str,
+) -> std::result::Result<Option<String>, String> {
+    let Some(values) = params.get(key) else {
+        return Ok(None);
+    };
+    if values.len() > 1 {
+        return Err(format!(
+            "GraphQL GET parameter {key:?} must not appear more than once"
+        ));
+    }
+    Ok(values.first().filter(|value| !value.is_empty()).cloned())
+}
+
+fn unique_persisted_query_id(
+    params: &HashMap<String, Vec<String>>,
+) -> std::result::Result<Option<String>, String> {
+    let mut selected: Option<(String, String)> = None;
+    for key in ["id", "documentId", "queryId"] {
+        let Some(value) = unique_query_value(params, key)? else {
+            continue;
+        };
+        if let Some((existing_key, _)) = selected {
+            return Err(format!(
+                "GraphQL GET persisted-query id parameters {existing_key:?} and {key:?} must not be combined"
+            ));
+        }
+        selected = Some((key.to_string(), value));
+    }
+    Ok(selected.map(|(_, value)| value))
 }
 
 async fn read_body_for_inspection<C: AsyncRead + Unpin>(
@@ -566,5 +589,32 @@ mod tests {
         assert!(op.persisted_query);
         assert_eq!(op.operation_name.as_deref(), Some("Viewer"));
         assert_eq!(op.persisted_query_hash.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn graphql_get_rejects_duplicate_query_parameter() {
+        let req = request(
+            "GET",
+            "/graphql?query=query+Viewer+%7B+viewer+%7B+login+%7D+%7D&query=mutation+Delete+%7B+volumeDelete(volumeId%3A%22x%22)+%7B+id+%7D+%7D",
+        );
+        let info = classify_request(&req, b"");
+        assert!(
+            info.error
+                .as_deref()
+                .is_some_and(|err| err.contains("must not appear more than once")),
+            "expected duplicate control parameter error, got {info:?}"
+        );
+    }
+
+    #[test]
+    fn graphql_get_rejects_ambiguous_persisted_query_ids() {
+        let req = request("GET", "/graphql?id=one&queryId=two");
+        let info = classify_request(&req, b"");
+        assert!(
+            info.error
+                .as_deref()
+                .is_some_and(|err| err.contains("must not be combined")),
+            "expected ambiguous persisted-query id error, got {info:?}"
+        );
     }
 }
