@@ -125,6 +125,29 @@ fn build_environment_sets_docker_tls_paths() {
 }
 
 #[test]
+fn build_environment_keeps_path_driver_controlled() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.environment
+        .insert("PATH".to_string(), "/malicious/spec/bin".to_string());
+    spec.template
+        .as_mut()
+        .unwrap()
+        .environment
+        .insert("PATH".to_string(), "/malicious/template/bin".to_string());
+
+    let env = build_environment(&sandbox, &runtime_config());
+    let path_entries = env
+        .iter()
+        .filter(|entry| entry.starts_with("PATH="))
+        .collect::<Vec<_>>();
+
+    let expected_path = format!("PATH={SUPERVISOR_PATH}");
+    assert_eq!(path_entries.len(), 1);
+    assert_eq!(path_entries[0], &expected_path);
+}
+
+#[test]
 fn build_mounts_uses_docker_tls_directory() {
     let mounts = build_mounts(&runtime_config());
     let targets = mounts

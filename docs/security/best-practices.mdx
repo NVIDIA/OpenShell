@@ -209,7 +209,7 @@ OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude run
 ### Enforcement Application Order
 
 The sandbox supervisor applies enforcement in a specific order during process startup.
-This ordering is intentional: named network-namespace setup still relies on privileged helpers, and privilege dropping still needs `/etc/group` and `/etc/passwd`, which Landlock subsequently restricts.
+This ordering is intentional: named network-namespace setup still relies on privileged helpers resolved from fixed absolute system paths, and privilege dropping still needs `/etc/group` and `/etc/passwd`, which Landlock subsequently restricts.
 
 1. Privileged supervisor bootstrap helpers, including network-namespace setup and optional `iptables` probes.
 2. Supervisor startup prelude seccomp (`PR_SET_NO_NEW_PRIVS` plus the early syscall denylist) synchronized across runtime threads.

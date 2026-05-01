@@ -55,6 +55,7 @@ const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 const SANDBOX_COMMAND: &str = "sleep infinity";
+const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 
@@ -820,10 +821,7 @@ fn bind_mount(source: &Path, target: &str, read_only: bool) -> Mount {
 fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) -> Vec<String> {
     let mut environment = HashMap::from([
         ("HOME".to_string(), "/root".to_string()),
-        (
-            "PATH".to_string(),
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-        ),
+        ("PATH".to_string(), SUPERVISOR_PATH.to_string()),
         ("TERM".to_string(), "xterm".to_string()),
         (
             "OPENSHELL_LOG_LEVEL".to_string(),
@@ -852,6 +850,9 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         "OPENSHELL_SANDBOX_COMMAND".to_string(),
         SANDBOX_COMMAND.to_string(),
     );
+    // The root supervisor executes namespace helpers during bootstrap; keep
+    // their search path driver-owned even when the template/spec set PATH.
+    environment.insert("PATH".to_string(), SUPERVISOR_PATH.to_string());
     if config.guest_tls.is_some() {
         environment.insert(
             "OPENSHELL_TLS_CA".to_string(),
