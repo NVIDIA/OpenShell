@@ -92,6 +92,7 @@ Skills connect into pipelines. Individual skill files don't describe these relat
 - **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
 
 Workflow state labels use the `state:*` prefix, and security work uses `topic:security`. GitHub issue templates assign built-in issue types where applicable, and agent-created issues should use issue types or manual follow-up rather than type labels.
+New issues opened by members of the `mon-maintainers` GitHub team are automatically labeled `state:triage-needed` by the issue triage workflow.
 
 ## Prerequisites
 
