@@ -234,8 +234,6 @@ fn rewrite_request_line_target(
     Ok(out)
 }
 
-// Used only in tests; kept as a `pub(crate)` helper for clarity.
-#[allow(dead_code)]
 pub(crate) fn parse_target_query(target: &str) -> Result<(String, HashMap<String, Vec<String>>)> {
     match target.split_once('?') {
         Some((path, query)) => Ok((path.to_string(), parse_query_params(query)?)),
@@ -695,28 +693,6 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
         .windows(2)
         .position(|w| w == b"\r\n")
         .map(|offset| start + offset)
-}
-
-/// Read and relay a full HTTP response (headers + body) from upstream to client.
-///
-/// Returns a [`RelayOutcome`] indicating whether the connection is reusable,
-/// consumed, or has been upgraded (101 Switching Protocols).
-///
-/// Note: callers that receive `Upgraded` are responsible for switching to
-/// raw bidirectional relay and forwarding the overflow bytes.
-// Public helper retained as part of the relay API surface; internal callers
-// currently use `relay_response` directly.
-#[allow(dead_code)]
-pub(crate) async fn relay_response_to_client<U, C>(
-    upstream: &mut U,
-    client: &mut C,
-    request_method: &str,
-) -> Result<RelayOutcome>
-where
-    U: AsyncRead + Unpin,
-    C: AsyncWrite + Unpin,
-{
-    relay_response(request_method, upstream, client).await
 }
 
 async fn relay_response<U, C>(
