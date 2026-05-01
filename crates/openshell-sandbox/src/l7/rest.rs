@@ -72,8 +72,17 @@ impl L7Provider for RestProvider {
         reason: &str,
         client: &mut C,
     ) -> Result<()> {
-        send_deny_response(req, policy_name, reason, client, None).await
+        send_deny_response(req, policy_name, reason, client, None, None).await
     }
+}
+
+/// Extra sandbox-side context included in agent-readable deny responses when
+/// the relay has it available.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DenyResponseContext<'a> {
+    pub(crate) host: Option<&'a str>,
+    pub(crate) port: Option<u16>,
+    pub(crate) binary: Option<&'a str>,
 }
 
 impl RestProvider {
@@ -85,8 +94,9 @@ impl RestProvider {
         reason: &str,
         client: &mut C,
         redacted_target: Option<&str>,
+        context: Option<DenyResponseContext<'_>>,
     ) -> Result<()> {
-        send_deny_response(req, policy_name, reason, client, redacted_target).await
+        send_deny_response(req, policy_name, reason, client, redacted_target, context).await
     }
 }
 
@@ -452,14 +462,9 @@ async fn send_deny_response<C: AsyncWrite + Unpin>(
     reason: &str,
     client: &mut C,
     redacted_target: Option<&str>,
+    context: Option<DenyResponseContext<'_>>,
 ) -> Result<()> {
-    let target = redacted_target.unwrap_or(&req.target);
-    let body = serde_json::json!({
-        "error": "policy_denied",
-        "policy": policy_name,
-        "rule": format!("{} {}", req.action, target),
-        "detail": reason
-    });
+    let body = deny_response_body(req, policy_name, reason, redacted_target, context);
     let body_bytes = body.to_string();
     let response = format!(
         "HTTP/1.1 403 Forbidden\r\n\
@@ -479,6 +484,91 @@ async fn send_deny_response<C: AsyncWrite + Unpin>(
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
     Ok(())
+}
+
+fn deny_response_body(
+    req: &L7Request,
+    policy_name: &str,
+    reason: &str,
+    redacted_target: Option<&str>,
+    context: Option<DenyResponseContext<'_>>,
+) -> serde_json::Value {
+    let target = redacted_target.unwrap_or(&req.target);
+    let context = context.unwrap_or_default();
+    let host = non_empty(context.host);
+    let binary = non_empty(context.binary);
+
+    let mut rule_missing = serde_json::Map::new();
+    rule_missing.insert("type".to_string(), serde_json::json!("rest_allow"));
+    rule_missing.insert("layer".to_string(), serde_json::json!("l7"));
+    rule_missing.insert("method".to_string(), serde_json::json!(req.action));
+    rule_missing.insert("path".to_string(), serde_json::json!(target));
+    if let Some(host) = host {
+        rule_missing.insert("host".to_string(), serde_json::json!(host));
+    }
+    if let Some(port) = context.port {
+        rule_missing.insert("port".to_string(), serde_json::json!(port));
+    }
+    if let Some(binary) = binary {
+        rule_missing.insert("binary".to_string(), serde_json::json!(binary));
+    }
+
+    let mut body = serde_json::Map::new();
+    body.insert("error".to_string(), serde_json::json!("policy_denied"));
+    body.insert("policy".to_string(), serde_json::json!(policy_name));
+    body.insert(
+        "rule".to_string(),
+        serde_json::json!(format!("{} {}", req.action, target)),
+    );
+    body.insert("detail".to_string(), serde_json::json!(reason));
+    body.insert("layer".to_string(), serde_json::json!("l7"));
+    body.insert("protocol".to_string(), serde_json::json!("rest"));
+    body.insert("method".to_string(), serde_json::json!(req.action));
+    body.insert("path".to_string(), serde_json::json!(target));
+    if let Some(host) = host {
+        body.insert("host".to_string(), serde_json::json!(host));
+    }
+    if let Some(port) = context.port {
+        body.insert("port".to_string(), serde_json::json!(port));
+    }
+    if let Some(binary) = binary {
+        body.insert("binary".to_string(), serde_json::json!(binary));
+    }
+    body.insert(
+        "rule_missing".to_string(),
+        serde_json::Value::Object(rule_missing),
+    );
+    body.insert(
+        "next_steps".to_string(),
+        serde_json::json!([
+            {
+                "action": "read_skill",
+                "path": "/etc/openshell/skills/policy_advisor.md"
+            },
+            {
+                "action": "inspect_policy",
+                "method": "GET",
+                "url": "http://policy.local/v1/policy/current"
+            },
+            {
+                "action": "inspect_recent_denials",
+                "method": "GET",
+                "url": "http://policy.local/v1/denials?last=5"
+            },
+            {
+                "action": "submit_proposal",
+                "method": "POST",
+                "url": "http://policy.local/v1/proposals",
+                "body_type": "PolicyMergeOperation"
+            }
+        ]),
+    );
+
+    serde_json::Value::Object(body)
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 /// Parse Content-Length or Transfer-Encoding from HTTP headers.
@@ -976,6 +1066,109 @@ mod tests {
     use base64::Engine as _;
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
+
+    #[test]
+    fn deny_response_body_is_agent_readable_and_redacted() {
+        let req = L7Request {
+            action: "PUT".to_string(),
+            target: "/repos/NVIDIA/OpenShell/contents/README.md?access_token=secret-token"
+                .to_string(),
+            query_params: HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: BodyLength::ContentLength(128),
+        };
+
+        let body = deny_response_body(
+            &req,
+            "github-readonly",
+            "no matching L7 allow rule",
+            Some("/repos/NVIDIA/OpenShell/contents/README.md"),
+            Some(DenyResponseContext {
+                host: Some("api.github.com"),
+                port: Some(443),
+                binary: Some("/usr/bin/gh"),
+            }),
+        );
+
+        assert_eq!(body["error"], "policy_denied");
+        assert_eq!(body["policy"], "github-readonly");
+        assert_eq!(body["layer"], "l7");
+        assert_eq!(body["protocol"], "rest");
+        assert_eq!(body["method"], "PUT");
+        assert_eq!(body["host"], "api.github.com");
+        assert_eq!(body["port"], 443);
+        assert_eq!(body["binary"], "/usr/bin/gh");
+        assert_eq!(body["path"], "/repos/NVIDIA/OpenShell/contents/README.md");
+        assert_eq!(
+            body["rule"],
+            "PUT /repos/NVIDIA/OpenShell/contents/README.md"
+        );
+        assert_eq!(body["rule_missing"]["type"], "rest_allow");
+        assert_eq!(body["rule_missing"]["layer"], "l7");
+        assert_eq!(body["rule_missing"]["method"], "PUT");
+        assert_eq!(
+            body["rule_missing"]["path"],
+            "/repos/NVIDIA/OpenShell/contents/README.md"
+        );
+        assert_eq!(body["rule_missing"]["host"], "api.github.com");
+        assert_eq!(body["rule_missing"]["port"], 443);
+        assert_eq!(body["rule_missing"]["binary"], "/usr/bin/gh");
+        assert_eq!(body["next_steps"][0]["action"], "read_skill");
+        assert_eq!(
+            body["next_steps"][0]["path"],
+            "/etc/openshell/skills/policy_advisor.md"
+        );
+        assert_eq!(body["next_steps"][3]["body_type"], "PolicyMergeOperation");
+        assert!(
+            !body.to_string().contains("secret-token"),
+            "deny body must not leak query params or credential values"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_deny_response_writes_structured_json_403() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let send = tokio::spawn(async move {
+            let req = L7Request {
+                action: "POST".to_string(),
+                target: "/user/repos".to_string(),
+                query_params: HashMap::new(),
+                raw_header: Vec::new(),
+                body_length: BodyLength::ContentLength(64),
+            };
+            send_deny_response(
+                &req,
+                "github-readonly",
+                "no matching L7 allow rule",
+                &mut server,
+                None,
+                Some(DenyResponseContext {
+                    host: Some("api.github.com"),
+                    port: Some(443),
+                    binary: Some("/usr/bin/gh"),
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        send.await.unwrap();
+
+        let response = String::from_utf8(received).unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(response.contains("Content-Type: application/json"));
+        assert!(response.contains("X-OpenShell-Policy: github-readonly"));
+
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["error"], "policy_denied");
+        assert_eq!(body["method"], "POST");
+        assert_eq!(body["path"], "/user/repos");
+        assert_eq!(body["rule_missing"]["host"], "api.github.com");
+        assert_eq!(body["next_steps"][2]["action"], "inspect_recent_denials");
+    }
 
     #[test]
     fn parse_content_length() {

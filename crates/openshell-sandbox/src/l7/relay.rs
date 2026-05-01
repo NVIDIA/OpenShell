@@ -584,6 +584,11 @@ where
                     &reason,
                     client,
                     Some(&redacted_target),
+                    Some(crate::l7::rest::DenyResponseContext {
+                        host: Some(&ctx.host),
+                        port: Some(ctx.port),
+                        binary: Some(&ctx.binary_path),
+                    }),
                 )
                 .await?;
             return Ok(());
