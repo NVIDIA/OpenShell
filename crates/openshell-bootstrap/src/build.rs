@@ -116,6 +116,7 @@ async fn build_image(
     let no_progress_secs: u64 = std::env::var("OPENSHELL_BUILD_NO_PROGRESS_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_BUILD_NO_PROGRESS_TIMEOUT_SECS);
     let no_progress_timeout = Duration::from_secs(no_progress_secs);
 
