@@ -220,8 +220,7 @@ struct Args {
     #[arg(
         long = "service-base-domain",
         env = "OPENSHELL_SERVICE_BASE_DOMAINS",
-        value_delimiter = ',',
-        default_value = openshell_core::config::DEFAULT_SERVICE_BASE_DOMAIN
+        value_delimiter = ','
     )]
     service_base_domains: Vec<String>,
 }

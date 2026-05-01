@@ -33,8 +33,8 @@ pub const DEFAULT_NETWORK_NAME: &str = "openshell";
 /// Default root used to derive browser-facing sandbox service domains.
 pub const DEFAULT_SERVICE_BASE_DOMAIN_ROOT: &str = "openshell.localhost";
 
-/// Default browser-facing sandbox service base domain.
-pub const DEFAULT_SERVICE_BASE_DOMAIN: &str = "openshell.openshell.localhost";
+/// Default gateway name used when no gateway-specific service base domain exists.
+pub const DEFAULT_GATEWAY_NAME: &str = "openshell";
 
 /// Default OCI image for the openshell-sandbox supervisor binary.
 pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
@@ -440,7 +440,9 @@ fn default_bind_address() -> SocketAddr {
 }
 
 fn default_service_base_domains() -> Vec<String> {
-    vec![DEFAULT_SERVICE_BASE_DOMAIN.to_string()]
+    vec![default_service_base_domain_for_gateway(
+        DEFAULT_GATEWAY_NAME,
+    )]
 }
 
 pub fn default_service_base_domain_for_gateway(name: &str) -> String {
