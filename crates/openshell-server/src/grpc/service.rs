@@ -13,7 +13,7 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::ServerState;
-use crate::local_domain;
+use crate::service_routing;
 
 const MAX_SERVICE_NAME_LEN: usize = 28;
 const MAX_SANDBOX_NAME_LEN: usize = 28;
@@ -38,7 +38,7 @@ pub(super) async fn handle_expose_service(
 
     let now =
         super::current_time_ms().map_err(|e| Status::internal(format!("clock error: {e}")))?;
-    let key = local_domain::endpoint_key(&req.sandbox, &req.service);
+    let key = service_routing::endpoint_key(&req.sandbox, &req.service);
     let id = match state
         .store
         .get_message_by_name::<ServiceEndpoint>(&key)
@@ -70,7 +70,7 @@ pub(super) async fn handle_expose_service(
         .map_err(|e| Status::internal(format!("persist endpoint failed: {e}")))?;
 
     let url = if req.domain {
-        local_domain::endpoint_url(&state.config, &req.sandbox, &req.service).unwrap_or_default()
+        service_routing::endpoint_url(&state.config, &req.sandbox, &req.service).unwrap_or_default()
     } else {
         String::new()
     };
@@ -88,7 +88,7 @@ fn validate_endpoint_name(field: &str, value: &str, max_len: usize) -> Result<()
     }
     if value.len() > max_len {
         return Err(Status::invalid_argument(format!(
-            "{field} must be at most {max_len} characters for local-domain routing"
+            "{field} must be at most {max_len} characters for sandbox service routing"
         )));
     }
     if value.contains("--") {

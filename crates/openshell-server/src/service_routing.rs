@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Local-domain HTTP routing for sandbox service endpoints.
+//! Browser-facing HTTP routing for sandbox service endpoints.
 
 use axum::{body::Body, response::IntoResponse};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use openshell_core::ObjectId;
-use openshell_core::config::LocalDomainConfig;
+use openshell_core::config::ServiceRoutingConfig;
 use openshell_core::proto::{Sandbox, SandboxPhase, ServiceEndpoint};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,7 +35,7 @@ pub fn endpoint_url(
     sandbox: &str,
     service: &str,
 ) -> Option<String> {
-    let host = endpoint_host(&config.local_domain, sandbox, service)?;
+    let host = endpoint_host(&config.service_routing, sandbox, service)?;
     let scheme = if config.tls.is_some() {
         "https"
     } else {
@@ -50,44 +50,43 @@ pub fn endpoint_url(
     })
 }
 
-fn endpoint_host(config: &LocalDomainConfig, sandbox: &str, service: &str) -> Option<String> {
-    if config.cluster.is_empty() || config.suffix.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{}--{}.{}.{}",
-        sandbox, service, config.cluster, config.suffix
-    ))
+fn endpoint_host(config: &ServiceRoutingConfig, sandbox: &str, service: &str) -> Option<String> {
+    let base_domain = config.service_base_domains.first()?;
+    Some(format!("{sandbox}--{service}.{base_domain}"))
 }
 
-pub fn parse_host(host: &str, config: &LocalDomainConfig) -> Option<(String, String)> {
-    if config.cluster.is_empty() || config.suffix.is_empty() {
-        return None;
-    }
-
+pub fn parse_host(host: &str, config: &ServiceRoutingConfig) -> Option<(String, String)> {
     let host = host.split_once(':').map_or(host, |(name, _)| name);
-    let expected_suffix = format!(".{}.{}", config.cluster, config.suffix);
-    let encoded = host.strip_suffix(&expected_suffix)?;
-    let (sandbox, service) = encoded.split_once("--")?;
-    if sandbox.is_empty() || service.is_empty() || sandbox.contains("--") || service.contains("--")
-    {
-        return None;
+    for base_domain in &config.service_base_domains {
+        let expected_suffix = format!(".{base_domain}");
+        let Some(encoded) = host.strip_suffix(&expected_suffix) else {
+            continue;
+        };
+        let (sandbox, service) = encoded.split_once("--")?;
+        if sandbox.is_empty()
+            || service.is_empty()
+            || sandbox.contains("--")
+            || service.contains("--")
+        {
+            return None;
+        }
+        return Some((sandbox.to_string(), service.to_string()));
     }
-    Some((sandbox.to_string(), service.to_string()))
+    None
 }
 
-pub fn is_local_domain_request<B>(req: &Request<B>, config: &LocalDomainConfig) -> bool {
+pub fn is_sandbox_service_request<B>(req: &Request<B>, config: &ServiceRoutingConfig) -> bool {
     request_host(req).is_some_and(|host| parse_host(host, config).is_some())
 }
 
-pub async fn proxy_local_domain_request(
+pub async fn proxy_sandbox_service_request(
     state: Arc<ServerState>,
     req: Request<Body>,
 ) -> impl IntoResponse {
     let Some(host) = request_host(&req) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((sandbox_name, service_name)) = parse_host(host, &state.config.local_domain) else {
+    let Some((sandbox_name, service_name)) = parse_host(host, &state.config.service_routing) else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -113,7 +112,7 @@ async fn proxy_to_endpoint(
         .get_message::<Sandbox>(&endpoint.sandbox_id)
         .await
         .map_err(|err| {
-            warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "local-domain: failed to load sandbox");
+            warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: failed to load sandbox");
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -135,7 +134,7 @@ async fn proxy_to_endpoint(
         )
         .await
         .map_err(|err| {
-            warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "local-domain: supervisor relay unavailable");
+            warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: supervisor relay unavailable");
             StatusCode::BAD_GATEWAY
         })?;
 
@@ -148,27 +147,27 @@ async fn proxy_to_endpoint(
         .handshake(TokioIo::new(relay))
         .await
         .map_err(|err| {
-            warn!(error = %err, "local-domain: failed to start upstream HTTP client");
+            warn!(error = %err, "sandbox service routing: failed to start upstream HTTP client");
             StatusCode::BAD_GATEWAY
         })?;
 
     if websocket_upgrade {
         tokio::spawn(async move {
             if let Err(err) = conn.with_upgrades().await {
-                warn!(error = %err, "local-domain: upstream WebSocket connection failed");
+                warn!(error = %err, "sandbox service routing: upstream WebSocket connection failed");
             }
         });
     } else {
         tokio::spawn(async move {
             if let Err(err) = conn.await {
-                warn!(error = %err, "local-domain: upstream HTTP connection failed");
+                warn!(error = %err, "sandbox service routing: upstream HTTP connection failed");
             }
         });
     }
 
     let upstream = build_upstream_request(req, target_port, websocket_upgrade)?;
     let mut response = sender.send_request(upstream).await.map_err(|err| {
-        warn!(error = %err, "local-domain: upstream HTTP request failed");
+        warn!(error = %err, "sandbox service routing: upstream HTTP request failed");
         StatusCode::BAD_GATEWAY
     })?;
 
@@ -185,10 +184,10 @@ async fn proxy_to_endpoint(
                     let _ = upstream.shutdown().await;
                 }
                 (Err(err), _) => {
-                    warn!(error = %err, "local-domain: downstream WebSocket upgrade failed");
+                    warn!(error = %err, "sandbox service routing: downstream WebSocket upgrade failed");
                 }
                 (_, Err(err)) => {
-                    warn!(error = %err, "local-domain: upstream WebSocket upgrade failed");
+                    warn!(error = %err, "sandbox service routing: upstream WebSocket upgrade failed");
                 }
             }
         });
@@ -211,7 +210,7 @@ async fn load_endpoint(
         .get_message_by_name::<ServiceEndpoint>(&key)
         .await
         .map_err(|err| {
-            warn!(error = %err, endpoint = %key, "local-domain: failed to load service endpoint");
+            warn!(error = %err, endpoint = %key, "sandbox service routing: failed to load service endpoint");
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)
@@ -349,15 +348,17 @@ fn is_gateway_auth_cookie(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn config() -> LocalDomainConfig {
-        LocalDomainConfig {
-            cluster: "dev".to_string(),
-            suffix: "openshell.localhost".to_string(),
+    fn config() -> ServiceRoutingConfig {
+        ServiceRoutingConfig {
+            service_base_domains: vec![
+                "dev.openshell.localhost".to_string(),
+                "svc.gateway.localhost".to_string(),
+            ],
         }
     }
 
     #[test]
-    fn parses_local_domain_host() {
+    fn parses_sandbox_service_host() {
         assert_eq!(
             parse_host("my-sandbox--web.dev.openshell.localhost", &config()),
             Some(("my-sandbox".to_string(), "web".to_string()))
@@ -365,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_local_domain_host_with_port() {
+    fn parses_sandbox_service_host_with_port() {
         assert_eq!(
             parse_host("my-sandbox--web.dev.openshell.localhost:8080", &config()),
             Some(("my-sandbox".to_string(), "web".to_string()))
@@ -373,7 +374,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_cluster() {
+    fn parses_alternate_service_base_domain() {
+        assert_eq!(
+            parse_host("my-sandbox--web.svc.gateway.localhost", &config()),
+            Some(("my-sandbox".to_string(), "web".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_base_domain() {
         assert_eq!(
             parse_host("my-sandbox--web.prod.openshell.localhost", &config()),
             None
@@ -381,32 +390,32 @@ mod tests {
     }
 
     #[test]
-    fn identifies_local_domain_request_from_host_header() {
+    fn identifies_sandbox_service_request_from_host_header() {
         let request = Request::builder()
             .uri("/")
             .header(header::HOST, "my-sandbox--web.dev.openshell.localhost")
             .body(Body::empty())
             .unwrap();
-        assert!(is_local_domain_request(&request, &config()));
+        assert!(is_sandbox_service_request(&request, &config()));
     }
 
     #[test]
-    fn identifies_local_domain_request_from_http2_authority() {
+    fn identifies_sandbox_service_request_from_http2_authority() {
         let request = Request::builder()
             .uri("https://my-sandbox--web.dev.openshell.localhost/")
             .body(Body::empty())
             .unwrap();
-        assert!(is_local_domain_request(&request, &config()));
+        assert!(is_sandbox_service_request(&request, &config()));
     }
 
     #[test]
-    fn ignores_non_local_domain_request() {
+    fn ignores_non_sandbox_service_request() {
         let request = Request::builder()
             .uri("/")
             .header(header::HOST, "127.0.0.1:8080")
             .body(Body::empty())
             .unwrap();
-        assert!(!is_local_domain_request(&request, &config()));
+        assert!(!is_sandbox_service_request(&request, &config()));
     }
 
     #[test]

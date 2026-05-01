@@ -799,9 +799,10 @@ enum GatewayCommands {
         #[arg(long)]
         disable_gateway_auth: bool,
 
-        /// Suffix for local-domain routes.
-        #[arg(long, default_value = openshell_core::config::DEFAULT_LOCAL_DOMAIN_SUFFIX)]
-        local_domain_suffix: String,
+        /// Base domain accepted for sandbox service routes. May be repeated.
+        /// Defaults to `<gateway>.openshell.localhost`.
+        #[arg(long = "service-base-domain")]
+        service_base_domains: Vec<String>,
 
         /// Username for authenticating with the container image registry.
         ///
@@ -1702,7 +1703,7 @@ enum ServiceCommands {
         #[arg(long)]
         target_port: u16,
 
-        /// Print and enable the local-domain URL for this service.
+        /// Print and enable the browser URL for this sandbox service.
         #[arg(long)]
         domain: bool,
     },
@@ -1770,7 +1771,7 @@ async fn main() -> Result<()> {
                 recreate,
                 plaintext,
                 disable_gateway_auth,
-                local_domain_suffix,
+                service_base_domains,
                 registry_username,
                 registry_token,
                 gpu,
@@ -1789,7 +1790,7 @@ async fn main() -> Result<()> {
                     recreate,
                     plaintext,
                     disable_gateway_auth,
-                    &local_domain_suffix,
+                    service_base_domains,
                     registry_username.as_deref(),
                     registry_token.as_deref(),
                     gpu,

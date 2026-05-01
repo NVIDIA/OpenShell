@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: "Browser Certificates"
-description: "Trust an OpenShell gateway CA and install the client certificate for browser access to local-domain sandbox services."
+description: "Trust an OpenShell gateway CA and install the client certificate for browser access to sandbox services."
 keywords: "Generative AI, Cybersecurity, Browser Certificates, Firefox, mTLS, Local Domain"
 position: 2
 ---
 
-OpenShell local-domain URLs use the same gateway mTLS model as the CLI. Your browser needs two certificate changes before it can open `https://<sandbox>--<service>.<gateway>.openshell.localhost:<port>/`:
+OpenShell sandbox service URLs use the same gateway mTLS model as the CLI. Your browser needs two certificate changes before it can open `https://<sandbox>--<service>.<gateway>.openshell.localhost:<port>/`:
 
 - Trust the gateway CA so the browser accepts the gateway server certificate.
 - Install the client certificate so the gateway accepts the browser connection.
@@ -75,7 +75,7 @@ pk12util \
   -W ""
 ```
 
-Find the active profile directory in `about:profiles` before running the commands. Restart Firefox after importing. If Firefox prompts for a client certificate when you visit the local-domain URL, choose the `OpenShell <gateway> client` certificate.
+Find the active profile directory in `about:profiles` before running the commands. Restart Firefox after importing. If Firefox prompts for a client certificate when you visit the sandbox service URL, choose the `OpenShell <gateway> client` certificate.
 
 ## Chrome, Edge, and Safari on macOS
 
@@ -129,7 +129,7 @@ Restart the browser after importing certificates.
 
 ## Troubleshooting
 
-If the browser still shows a certificate warning, recreate gateways created before local-domain routing so their server certificate includes local-domain SANs:
+If the browser still shows a certificate warning, recreate gateways created before sandbox service routing so their server certificate includes service base domain SANs:
 
 ```shell
 openshell gateway start --recreate

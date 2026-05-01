@@ -30,8 +30,11 @@ pub const DEFAULT_SSH_HANDSHAKE_SKEW_SECS: u64 = 300;
 /// Default Podman bridge network name.
 pub const DEFAULT_NETWORK_NAME: &str = "openshell";
 
-/// Default suffix for browser-facing local-domain routes.
-pub const DEFAULT_LOCAL_DOMAIN_SUFFIX: &str = "openshell.localhost";
+/// Default root used to derive browser-facing sandbox service domains.
+pub const DEFAULT_SERVICE_BASE_DOMAIN_ROOT: &str = "openshell.localhost";
+
+/// Default browser-facing sandbox service base domain.
+pub const DEFAULT_SERVICE_BASE_DOMAIN: &str = "openshell.openshell.localhost";
 
 /// Default OCI image for the openshell-sandbox supervisor binary.
 pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
@@ -199,21 +202,18 @@ pub struct Config {
     #[serde(default)]
     pub host_gateway_ip: String,
 
-    /// Local-domain routing configuration for browser-facing sandbox HTTP services.
+    /// Browser-facing sandbox service routing configuration.
     #[serde(default)]
-    pub local_domain: LocalDomainConfig,
+    pub service_routing: ServiceRoutingConfig,
 }
 
-/// Browser-facing local-domain routing configuration.
+/// Browser-facing sandbox service routing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocalDomainConfig {
-    /// Cluster label used in `<cluster>.<suffix>` hostnames.
-    #[serde(default = "default_local_domain_cluster")]
-    pub cluster: String,
-
-    /// Hostname suffix, defaults to `openshell.localhost`.
-    #[serde(default = "default_local_domain_suffix")]
-    pub suffix: String,
+pub struct ServiceRoutingConfig {
+    /// Base domains accepted for `sandbox--service.<base-domain>` routes.
+    /// The first domain is used when the gateway prints endpoint URLs.
+    #[serde(default = "default_service_base_domains")]
+    pub service_base_domains: Vec<String>,
 }
 
 /// TLS configuration.
@@ -267,7 +267,7 @@ impl Config {
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
-            local_domain: LocalDomainConfig::default(),
+            service_routing: ServiceRoutingConfig::default(),
         }
     }
 
@@ -405,26 +405,32 @@ impl Config {
         self
     }
 
-    /// Configure local-domain routing for browser-facing sandbox HTTP services.
+    /// Configure browser-facing sandbox service base domains.
     #[must_use]
-    pub fn with_local_domain(
-        mut self,
-        cluster: impl Into<String>,
-        suffix: impl Into<String>,
-    ) -> Self {
-        self.local_domain = LocalDomainConfig {
-            cluster: cluster.into(),
-            suffix: suffix.into(),
+    pub fn with_service_base_domains<I, S>(mut self, domains: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let domains: Vec<String> = domains
+            .into_iter()
+            .filter_map(|domain| normalize_service_base_domain(domain.into()))
+            .collect();
+        self.service_routing = ServiceRoutingConfig {
+            service_base_domains: if domains.is_empty() {
+                default_service_base_domains()
+            } else {
+                domains
+            },
         };
         self
     }
 }
 
-impl Default for LocalDomainConfig {
+impl Default for ServiceRoutingConfig {
     fn default() -> Self {
         Self {
-            cluster: default_local_domain_cluster(),
-            suffix: default_local_domain_suffix(),
+            service_base_domains: default_service_base_domains(),
         }
     }
 }
@@ -433,12 +439,17 @@ fn default_bind_address() -> SocketAddr {
     "0.0.0.0:8080".parse().expect("valid default address")
 }
 
-fn default_local_domain_suffix() -> String {
-    DEFAULT_LOCAL_DOMAIN_SUFFIX.to_string()
+fn default_service_base_domains() -> Vec<String> {
+    vec![DEFAULT_SERVICE_BASE_DOMAIN.to_string()]
 }
 
-fn default_local_domain_cluster() -> String {
-    "openshell".to_string()
+pub fn default_service_base_domain_for_gateway(name: &str) -> String {
+    format!("{name}.{DEFAULT_SERVICE_BASE_DOMAIN_ROOT}")
+}
+
+fn normalize_service_base_domain(domain: String) -> Option<String> {
+    let domain = domain.trim().trim_matches('.');
+    (!domain.is_empty()).then(|| domain.to_string())
 }
 
 fn default_log_level() -> String {

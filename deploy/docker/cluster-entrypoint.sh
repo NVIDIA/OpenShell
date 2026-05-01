@@ -514,11 +514,10 @@ if [ -f "$HELMCHART" ]; then
         sed -i "s|__DISABLE_TLS__|false|g" "$HELMCHART"
     fi
 
-    LOCAL_DOMAIN_CLUSTER="${LOCAL_DOMAIN_CLUSTER:-openshell}"
-    LOCAL_DOMAIN_SUFFIX="${LOCAL_DOMAIN_SUFFIX:-openshell.localhost}"
-    echo "Enabling local-domain routing: ${LOCAL_DOMAIN_CLUSTER}.${LOCAL_DOMAIN_SUFFIX}"
-    sed -i "s|__LOCAL_DOMAIN_CLUSTER__|${LOCAL_DOMAIN_CLUSTER}|g" "$HELMCHART"
-    sed -i "s|__LOCAL_DOMAIN_SUFFIX__|${LOCAL_DOMAIN_SUFFIX}|g" "$HELMCHART"
+    SERVICE_BASE_DOMAINS_VALUE="${SERVICE_BASE_DOMAINS:-openshell.openshell.localhost}"
+    SERVICE_BASE_DOMAINS_YAML="[\"$(printf "%s" "${SERVICE_BASE_DOMAINS_VALUE}" | sed 's|,|","|g')\"]"
+    echo "Enabling sandbox service routing for: ${SERVICE_BASE_DOMAINS_VALUE}"
+    sed -i "s|__SERVICE_BASE_DOMAINS__|${SERVICE_BASE_DOMAINS_YAML}|g" "$HELMCHART"
 fi
 
 # Inject host gateway IP into the HelmChart manifest so sandbox pods can

@@ -104,8 +104,8 @@ pub struct DeployOptions {
     /// Disable gateway authentication (mTLS client certificate requirement).
     /// Ignored when `disable_tls` is true.
     pub disable_gateway_auth: bool,
-    /// Hostname suffix used for local-domain routing.
-    pub local_domain_suffix: String,
+    /// Base domains accepted for sandbox service routing.
+    pub service_base_domains: Vec<String>,
     /// Registry authentication username. Defaults to `__token__` when a
     /// `registry_token` is provided but no username is set. Only needed
     /// for private registries — public GHCR repos pull without auth.
@@ -138,7 +138,7 @@ impl DeployOptions {
             gateway_host: None,
             disable_tls: false,
             disable_gateway_auth: false,
-            local_domain_suffix: openshell_core::config::DEFAULT_LOCAL_DOMAIN_SUFFIX.to_string(),
+            service_base_domains: Vec::new(),
             registry_username: None,
             registry_token: None,
             gpu: vec![],
@@ -182,8 +182,12 @@ impl DeployOptions {
     }
 
     #[must_use]
-    pub fn with_local_domain(mut self, suffix: impl Into<String>) -> Self {
-        self.local_domain_suffix = suffix.into();
+    pub fn with_service_base_domains<I, S>(mut self, domains: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.service_base_domains = domains.into_iter().map(Into::into).collect();
         self
     }
 
@@ -278,7 +282,11 @@ where
     let gateway_host = options.gateway_host;
     let disable_tls = options.disable_tls;
     let disable_gateway_auth = options.disable_gateway_auth;
-    let local_domain_suffix = options.local_domain_suffix;
+    let service_base_domains = if options.service_base_domains.is_empty() {
+        vec![openshell_core::config::default_service_base_domain_for_gateway(&name)]
+    } else {
+        options.service_base_domains
+    };
     let registry_username = options.registry_username;
     let registry_token = options.registry_token;
     let gpu = options.gpu;
@@ -415,8 +423,10 @@ where
             {
                 sans.push(host.clone());
             }
-            sans.push(format!("{name}.{local_domain_suffix}"));
-            sans.push(format!("*.{name}.{local_domain_suffix}"));
+            for base_domain in &service_base_domains {
+                sans.push(base_domain.clone());
+                sans.push(format!("*.{base_domain}"));
+            }
             (sans, gateway_host)
         };
 
@@ -466,8 +476,7 @@ where
             port,
             disable_tls,
             disable_gateway_auth,
-            &name,
-            &local_domain_suffix,
+            &service_base_domains,
             registry_username.as_deref(),
             registry_token.as_deref(),
             &device_ids,

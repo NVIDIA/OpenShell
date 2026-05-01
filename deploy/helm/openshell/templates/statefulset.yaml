@@ -78,10 +78,8 @@ spec:
             - name: OPENSHELL_HOST_GATEWAY_IP
               value: {{ .Values.server.hostGatewayIP | quote }}
             {{- end }}
-            - name: OPENSHELL_LOCAL_DOMAIN_CLUSTER
-              value: {{ .Values.server.localDomain.cluster | quote }}
-            - name: OPENSHELL_LOCAL_DOMAIN_SUFFIX
-              value: {{ .Values.server.localDomain.suffix | quote }}
+            - name: OPENSHELL_SERVICE_BASE_DOMAINS
+              value: {{ join "," .Values.server.serviceBaseDomains | quote }}
             - name: OPENSHELL_SSH_HANDSHAKE_SECRET
               valueFrom:
                 secretKeyRef:

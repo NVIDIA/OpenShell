@@ -216,21 +216,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_DISABLE_GATEWAY_AUTH")]
     disable_gateway_auth: bool,
 
-    /// Cluster label used in local-domain hostnames.
+    /// Base domains accepted for sandbox service routing.
     #[arg(
-        long,
-        env = "OPENSHELL_LOCAL_DOMAIN_CLUSTER",
-        default_value = "openshell"
+        long = "service-base-domain",
+        env = "OPENSHELL_SERVICE_BASE_DOMAINS",
+        value_delimiter = ',',
+        default_value = openshell_core::config::DEFAULT_SERVICE_BASE_DOMAIN
     )]
-    local_domain_cluster: String,
-
-    /// Suffix used in local-domain hostnames.
-    #[arg(
-        long,
-        env = "OPENSHELL_LOCAL_DOMAIN_SUFFIX",
-        default_value = openshell_core::config::DEFAULT_LOCAL_DOMAIN_SUFFIX
-    )]
-    local_domain_suffix: String,
+    service_base_domains: Vec<String>,
 }
 
 pub fn command() -> Command {
@@ -322,7 +315,7 @@ async fn run_from_args(args: Args) -> Result<()> {
         .with_ssh_connect_path(args.ssh_connect_path)
         .with_sandbox_ssh_port(args.sandbox_ssh_port)
         .with_ssh_handshake_skew_secs(args.ssh_handshake_skew_secs)
-        .with_local_domain(args.local_domain_cluster, args.local_domain_suffix);
+        .with_service_base_domains(args.service_base_domains);
 
     if let Some(image) = args.sandbox_image {
         config = config.with_sandbox_image(image);

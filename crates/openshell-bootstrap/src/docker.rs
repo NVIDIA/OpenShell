@@ -503,8 +503,7 @@ pub async fn ensure_container(
     gateway_port: u16,
     disable_tls: bool,
     disable_gateway_auth: bool,
-    local_domain_cluster: &str,
-    local_domain_suffix: &str,
+    service_base_domains: &[String],
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     device_ids: &[String],
@@ -745,8 +744,10 @@ pub async fn ensure_container(
         // gateway port for remote clusters must match.
         env_vars.push(format!("SSH_GATEWAY_PORT={gateway_port}"));
     }
-    env_vars.push(format!("LOCAL_DOMAIN_CLUSTER={local_domain_cluster}"));
-    env_vars.push(format!("LOCAL_DOMAIN_SUFFIX={local_domain_suffix}"));
+    env_vars.push(format!(
+        "SERVICE_BASE_DOMAINS={}",
+        service_base_domains.join(",")
+    ));
 
     // Pass image configuration to the cluster entrypoint.
     // The effective tag is resolved from the runtime IMAGE_TAG env var (if set)

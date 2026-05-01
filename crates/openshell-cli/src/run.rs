@@ -1432,7 +1432,7 @@ pub async fn gateway_admin_deploy(
     recreate: bool,
     disable_tls: bool,
     disable_gateway_auth: bool,
-    local_domain_suffix: &str,
+    service_base_domains: Vec<String>,
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     gpu: Vec<String>,
@@ -1486,7 +1486,7 @@ pub async fn gateway_admin_deploy(
         .with_port(effective_port)
         .with_disable_tls(disable_tls)
         .with_disable_gateway_auth(disable_gateway_auth)
-        .with_local_domain(local_domain_suffix)
+        .with_service_base_domains(service_base_domains)
         .with_gpu(gpu)
         .with_recreate(recreate);
     if let Some(opts) = remote_opts {

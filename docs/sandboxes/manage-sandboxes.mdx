@@ -121,7 +121,7 @@ OpenShell allocates a TTY automatically when both stdin and stdout are terminals
 
 ## Expose HTTP Services
 
-Local-domain routing is enabled for gateways by default. Recreate gateways created before local-domain routing so their generated TLS certificate includes the local-domain SANs:
+Sandbox service routing is enabled for gateways by default. Recreate gateways created before this routing mode so their generated TLS certificate includes the service base domain SANs:
 
 ```shell
 openshell gateway start --recreate
