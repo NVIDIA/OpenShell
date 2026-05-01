@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use openshell_core::config::DEFAULT_SERVER_PORT;
 use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
 };
 use std::fs;
+use std::net::{IpAddr, Ipv4Addr};
 use tempfile::TempDir;
 
 const TLS_MOUNT_DIR: &str = "/etc/openshell/tls/client";
@@ -41,6 +43,11 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         image_pull_policy: String::new(),
         sandbox_namespace: "default".to_string(),
         grpc_endpoint: "https://localhost:8443".to_string(),
+        network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
+        gateway_bind_address: docker_gateway_bind_address(
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+        ),
         ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
         stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
         log_level: "info".to_string(),
@@ -57,16 +64,73 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
 #[test]
 fn container_visible_endpoint_rewrites_loopback_hosts() {
     assert_eq!(
-        container_visible_openshell_endpoint("https://localhost:8443"),
-        "https://host.openshell.internal:8443/"
+        docker_container_openshell_endpoint(
+            "https://localhost:8443",
+            HOST_OPENSHELL_INTERNAL,
+            DEFAULT_SERVER_PORT,
+        ),
+        "https://host.openshell.internal:8080/"
     );
     assert_eq!(
-        container_visible_openshell_endpoint("http://127.0.0.1:8080"),
+        docker_container_openshell_endpoint(
+            "http://127.0.0.1:8080",
+            HOST_OPENSHELL_INTERNAL,
+            DEFAULT_SERVER_PORT,
+        ),
         "http://host.openshell.internal:8080/"
     );
     assert_eq!(
-        container_visible_openshell_endpoint("https://gateway.internal:8443"),
-        "https://gateway.internal:8443"
+        docker_container_openshell_endpoint(
+            "https://gateway.internal:8443",
+            HOST_OPENSHELL_INTERNAL,
+            DEFAULT_SERVER_PORT,
+        ),
+        "https://host.openshell.internal:8080/"
+    );
+}
+
+#[test]
+fn docker_bridge_gateway_ip_requires_ipv4_gateway() {
+    let network = bollard::models::NetworkInspect {
+        driver: Some(DOCKER_NETWORK_DRIVER.to_string()),
+        ipam: Some(bollard::models::Ipam {
+            config: Some(vec![
+                bollard::models::IpamConfig {
+                    gateway: Some("fd00::1".to_string()),
+                    ..Default::default()
+                },
+                bollard::models::IpamConfig {
+                    gateway: Some("172.18.0.1".to_string()),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_bridge_gateway_ip(DEFAULT_DOCKER_NETWORK_NAME, &network).unwrap(),
+        IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1))
+    );
+
+    let ipv6_only_network = bollard::models::NetworkInspect {
+        driver: Some(DOCKER_NETWORK_DRIVER.to_string()),
+        ipam: Some(bollard::models::Ipam {
+            config: Some(vec![bollard::models::IpamConfig {
+                gateway: Some("fd00::1".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    assert!(
+        docker_bridge_gateway_ip(DEFAULT_DOCKER_NETWORK_NAME, &ipv6_only_network)
+            .unwrap_err()
+            .to_string()
+            .contains("IPv4 IPAM gateway")
     );
 }
 
@@ -191,6 +255,26 @@ fn build_container_create_body_clears_inherited_cmd() {
             .as_ref()
             .and_then(|labels| labels.get(SANDBOX_NAMESPACE_LABEL_KEY)),
         Some(&"default".to_string())
+    );
+    let host_config = create_body.host_config.as_ref().unwrap();
+    assert_eq!(
+        host_config.network_mode.as_deref(),
+        Some(DEFAULT_DOCKER_NETWORK_NAME)
+    );
+    assert_eq!(
+        host_config.extra_hosts.as_ref(),
+        Some(&vec![
+            "host.docker.internal:172.18.0.1".to_string(),
+            "host.openshell.internal:172.18.0.1".to_string()
+        ])
+    );
+    assert_eq!(
+        create_body
+            .networking_config
+            .as_ref()
+            .and_then(|config| config.endpoints_config.as_ref())
+            .and_then(|endpoints| endpoints.get(DEFAULT_DOCKER_NETWORK_NAME)),
+        Some(&EndpointSettings::default())
     );
 }
 

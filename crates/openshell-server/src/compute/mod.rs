@@ -36,6 +36,7 @@ use openshell_driver_podman::{
 };
 use prost::Message;
 use std::fmt;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -231,6 +232,7 @@ pub struct ComputeRuntime {
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
     sync_lock: Arc<Mutex<()>>,
+    gateway_bind_addresses: Vec<SocketAddr>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -252,6 +254,7 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
         _allows_loopback_endpoints: bool,
+        gateway_bind_addresses: Vec<SocketAddr>,
     ) -> Result<Self, ComputeError> {
         let default_image = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
@@ -271,6 +274,7 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
             sync_lock: Arc::new(Mutex::new(())),
+            gateway_bind_addresses,
         })
     }
 
@@ -288,6 +292,7 @@ impl ComputeRuntime {
                 .await
                 .map_err(|err| ComputeError::Message(err.to_string()))?,
         );
+        let gateway_bind_addresses = driver.gateway_bind_addresses();
         let shutdown_cleanup: Arc<dyn ShutdownCleanup> = driver.clone();
         let startup_resume: Arc<dyn StartupResume> = driver.clone();
         let driver: SharedComputeDriver = driver;
@@ -302,6 +307,7 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
             true,
+            gateway_bind_addresses,
         )
         .await
     }
@@ -329,6 +335,7 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
             false,
+            Vec::new(),
         )
         .await
     }
@@ -354,6 +361,7 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
             true,
+            Vec::new(),
         )
         .await
     }
@@ -381,6 +389,7 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
             true,
+            Vec::new(),
         )
         .await
     }
@@ -388,6 +397,11 @@ impl ComputeRuntime {
     #[must_use]
     pub fn default_image(&self) -> &str {
         &self.default_image
+    }
+
+    #[must_use]
+    pub fn gateway_bind_addresses(&self) -> &[SocketAddr] {
+        &self.gateway_bind_addresses
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
@@ -1640,6 +1654,7 @@ mod tests {
             tracing_log_bus: TracingLogBus::new(),
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
             sync_lock: Arc::new(Mutex::new(())),
+            gateway_bind_addresses: Vec::new(),
         }
     }
 

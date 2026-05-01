@@ -8,8 +8,9 @@
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, HostConfig, Mount,
-    MountTypeEnum, RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, EndpointSettings, HostConfig,
+    Mount, MountTypeEnum, NetworkCreateRequest, NetworkingConfig, RestartPolicy,
+    RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -17,7 +18,7 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
+use openshell_core::config::{DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
@@ -30,6 +31,7 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::{Config, Error, Result as CoreResult};
 use std::collections::HashMap;
 use std::io::Read;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -38,7 +40,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
-use url::{Host, Url};
+use url::Url;
 
 const WATCH_BUFFER: usize = 128;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -58,6 +60,7 @@ const SANDBOX_COMMAND: &str = "sleep infinity";
 const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
+const DOCKER_NETWORK_DRIVER: &str = "bridge";
 
 /// Default image holding the Linux `openshell-sandbox` binary. The gateway
 /// pulls this image and extracts the binary to a host-side cache when no
@@ -139,6 +142,9 @@ pub struct DockerComputeConfig {
 
     /// Host-side private key for Docker sandbox mTLS.
     pub guest_tls_key: Option<PathBuf>,
+
+    /// Docker bridge network that sandbox containers join.
+    pub network_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +160,8 @@ struct DockerDriverRuntimeConfig {
     image_pull_policy: String,
     sandbox_namespace: String,
     grpc_endpoint: String,
+    network_name: String,
+    gateway_bind_address: SocketAddr,
     ssh_socket_path: String,
     stop_timeout_secs: u32,
     log_level: String,
@@ -196,6 +204,20 @@ impl DockerComputeDriver {
         let version = docker.version().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;
+        let gateway_port = config.bind_address.port();
+        if gateway_port == 0 {
+            return Err(Error::config(
+                "docker compute driver requires a fixed non-zero gateway bind port",
+            ));
+        }
+        let network_name = docker_network_name(docker_config)?;
+        let bridge_gateway_ip = ensure_bridge_network(&docker, &network_name).await?;
+        let gateway_bind_address = docker_gateway_bind_address(bridge_gateway_ip, gateway_port);
+        let grpc_endpoint = docker_container_openshell_endpoint(
+            &config.grpc_endpoint,
+            HOST_OPENSHELL_INTERNAL,
+            gateway_port,
+        );
         let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
         let supervisor_bin = resolve_supervisor_bin(&docker, docker_config, &daemon_arch).await?;
         let guest_tls = docker_guest_tls_paths(config, docker_config)?;
@@ -206,7 +228,9 @@ impl DockerComputeDriver {
                 default_image: config.sandbox_image.clone(),
                 image_pull_policy: config.sandbox_image_pull_policy.clone(),
                 sandbox_namespace: config.sandbox_namespace.clone(),
-                grpc_endpoint: config.grpc_endpoint.clone(),
+                grpc_endpoint,
+                network_name,
+                gateway_bind_address,
                 ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
                 log_level: config.log_level.clone(),
@@ -224,6 +248,11 @@ impl DockerComputeDriver {
         });
 
         Ok(driver)
+    }
+
+    #[must_use]
+    pub fn gateway_bind_addresses(&self) -> Vec<SocketAddr> {
+        vec![self.config.gateway_bind_address]
     }
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
@@ -838,7 +867,7 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
 
     environment.insert(
         "OPENSHELL_ENDPOINT".to_string(),
-        container_visible_openshell_endpoint(&config.grpc_endpoint),
+        config.grpc_endpoint.clone(),
     );
     environment.insert("OPENSHELL_SANDBOX_ID".to_string(), sandbox.id.clone());
     environment.insert("OPENSHELL_SANDBOX".to_string(), sandbox.name.clone());
@@ -928,11 +957,24 @@ fn build_container_create_body(
                 "SYS_PTRACE".to_string(),
                 "SYSLOG".to_string(),
             ]),
+            network_mode: Some(config.network_name.clone()),
             extra_hosts: Some(vec![
-                format!("{HOST_DOCKER_INTERNAL}:host-gateway"),
-                format!("{HOST_OPENSHELL_INTERNAL}:host-gateway"),
+                format!(
+                    "{HOST_DOCKER_INTERNAL}:{}",
+                    config.gateway_bind_address.ip()
+                ),
+                format!(
+                    "{HOST_OPENSHELL_INTERNAL}:{}",
+                    config.gateway_bind_address.ip()
+                ),
             ]),
             ..Default::default()
+        }),
+        networking_config: Some(NetworkingConfig {
+            endpoints_config: Some(HashMap::from([(
+                config.network_name.clone(),
+                EndpointSettings::default(),
+            )])),
         }),
         ..Default::default()
     })
@@ -962,23 +1004,116 @@ fn sandbox_log_level(sandbox: &DriverSandbox, default_level: &str) -> String {
         .to_string()
 }
 
-fn container_visible_openshell_endpoint(endpoint: &str) -> String {
+fn docker_container_openshell_endpoint(endpoint: &str, host: &str, port: u16) -> String {
     let Ok(mut url) = Url::parse(endpoint) else {
         return endpoint.to_string();
     };
 
-    let should_rewrite = match url.host() {
-        Some(Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
-        Some(Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
-        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        None => false,
-    };
-
-    if should_rewrite && url.set_host(Some(HOST_OPENSHELL_INTERNAL)).is_ok() {
+    if url.set_host(Some(host)).is_ok() && url.set_port(Some(port)).is_ok() {
         return url.to_string();
     }
 
     endpoint.to_string()
+}
+
+fn docker_network_name(config: &DockerComputeConfig) -> CoreResult<String> {
+    let name = config.network_name.trim();
+    if name.is_empty() {
+        return Ok(DEFAULT_DOCKER_NETWORK_NAME.to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn docker_gateway_bind_address(ip: IpAddr, port: u16) -> SocketAddr {
+    SocketAddr::new(ip, port)
+}
+
+async fn ensure_bridge_network(docker: &Docker, network_name: &str) -> CoreResult<IpAddr> {
+    match docker.inspect_network(network_name, None).await {
+        Ok(network) => return validate_bridge_network(network_name, &network),
+        Err(err) if !is_not_found_error(&err) => {
+            return Err(Error::execution(format!(
+                "failed to inspect Docker network '{network_name}': {err}"
+            )));
+        }
+        Err(_) => {}
+    }
+
+    docker
+        .create_network(NetworkCreateRequest {
+            name: network_name.to_string(),
+            driver: Some(DOCKER_NETWORK_DRIVER.to_string()),
+            attachable: Some(true),
+            labels: Some(HashMap::from([(
+                MANAGED_BY_LABEL_KEY.to_string(),
+                MANAGED_BY_LABEL_VALUE.to_string(),
+            )])),
+            ..Default::default()
+        })
+        .await
+        .map(|_| ())
+        .or_else(|err| {
+            if is_conflict_error(&err) {
+                Ok(())
+            } else {
+                Err(Error::execution(format!(
+                    "failed to create Docker network '{network_name}': {err}"
+                )))
+            }
+        })?;
+
+    let network = docker
+        .inspect_network(network_name, None)
+        .await
+        .map_err(|err| {
+            Error::execution(format!(
+                "failed to inspect Docker network '{network_name}' after create: {err}"
+            ))
+        })?;
+    validate_bridge_network(network_name, &network)
+}
+
+fn validate_bridge_network(
+    network_name: &str,
+    network: &bollard::models::NetworkInspect,
+) -> CoreResult<IpAddr> {
+    if network.driver.as_deref() != Some(DOCKER_NETWORK_DRIVER) {
+        return Err(Error::config(format!(
+            "Docker network '{network_name}' must use the '{DOCKER_NETWORK_DRIVER}' driver, found '{}'",
+            network.driver.as_deref().unwrap_or("unknown")
+        )));
+    }
+
+    docker_bridge_gateway_ip(network_name, network)
+}
+
+fn docker_bridge_gateway_ip(
+    network_name: &str,
+    network: &bollard::models::NetworkInspect,
+) -> CoreResult<IpAddr> {
+    let Some(configs) = network.ipam.as_ref().and_then(|ipam| ipam.config.as_ref()) else {
+        return Err(Error::config(format!(
+            "Docker bridge network '{network_name}' does not expose IPAM gateway configuration"
+        )));
+    };
+
+    for config in configs {
+        let Some(gateway) = config.gateway.as_deref() else {
+            continue;
+        };
+        let ip = gateway.parse::<IpAddr>().map_err(|err| {
+            Error::config(format!(
+                "Docker bridge network '{network_name}' has invalid gateway '{gateway}': {err}"
+            ))
+        })?;
+        if matches!(ip, IpAddr::V4(_)) {
+            return Ok(ip);
+        }
+    }
+
+    Err(Error::config(format!(
+        "Docker bridge network '{network_name}' does not have an IPv4 IPAM gateway"
+    )))
 }
 
 fn docker_resource_limits(
@@ -1753,6 +1888,16 @@ fn is_not_found_error(err: &BollardError) -> bool {
         err,
         BollardError::DockerResponseServerError {
             status_code: 404,
+            ..
+        }
+    )
+}
+
+fn is_conflict_error(err: &BollardError) -> bool {
+    matches!(
+        err,
+        BollardError::DockerResponseServerError {
+            status_code: 409,
             ..
         }
     )

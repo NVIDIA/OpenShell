@@ -39,9 +39,11 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
 use std::collections::HashMap;
 use std::io::ErrorKind;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
@@ -195,12 +197,17 @@ pub async fn run_server(
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
 
-    // Bind the TCP listener
-    let listener = TcpListener::bind(config.bind_address)
-        .await
-        .map_err(|e| Error::transport(format!("failed to bind to {}: {e}", config.bind_address)))?;
-
-    info!(address = %config.bind_address, "Server listening");
+    let gateway_listener_addresses =
+        gateway_listener_addresses(config.bind_address, state.compute.gateway_bind_addresses());
+    let mut gateway_listeners = Vec::with_capacity(gateway_listener_addresses.len());
+    for address in gateway_listener_addresses {
+        let listener = TcpListener::bind(address)
+            .await
+            .map_err(|e| Error::transport(format!("failed to bind to {address}: {e}")))?;
+        let local_addr = listener.local_addr().unwrap_or(address);
+        info!(address = %local_addr, "Server listening");
+        gateway_listeners.push((listener, local_addr));
+    }
 
     // Bind the unauthenticated health endpoint on a separate port when configured.
     if let Some(health_bind_address) = config.health_bind_address {
@@ -259,53 +266,25 @@ pub async fn run_server(
         None
     };
 
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut listener_tasks = Vec::with_capacity(gateway_listeners.len());
+    for (listener, listen_addr) in gateway_listeners {
+        listener_tasks.push(tokio::spawn(serve_gateway_listener(
+            listener,
+            listen_addr,
+            service.clone(),
+            tls_acceptor.clone(),
+            shutdown_rx.clone(),
+        )));
+    }
 
-    // Accept connections until the gateway receives a graceful shutdown signal.
-    loop {
-        let (stream, addr) = tokio::select! {
-            _ = &mut shutdown => {
-                info!("Shutdown signal received; stopping gateway");
-                break;
-            }
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        error!(error = %e, "Failed to accept connection");
-                        continue;
-                    }
-                }
-            }
-        };
+    shutdown_signal().await;
+    info!("Shutdown signal received; stopping gateway");
+    let _ = shutdown_tx.send(true);
 
-        let service = service.clone();
-
-        if let Some(ref acceptor) = tls_acceptor {
-            let tls_acceptor = acceptor.clone();
-            tokio::spawn(async move {
-                match tls_acceptor.inner().accept(stream).await {
-                    Ok(tls_stream) => {
-                        if let Err(e) = service.serve(tls_stream).await {
-                            error!(error = %e, client = %addr, "Connection error");
-                        }
-                    }
-                    Err(e) => {
-                        if is_benign_tls_handshake_failure(&e) {
-                            debug!(error = %e, client = %addr, "TLS handshake closed early");
-                        } else {
-                            error!(error = %e, client = %addr, "TLS handshake failed");
-                        }
-                    }
-                }
-            });
-        } else {
-            tokio::spawn(async move {
-                if let Err(e) = service.serve(stream).await {
-                    error!(error = %e, client = %addr, "Connection error");
-                }
-            });
+    for task in listener_tasks {
+        if let Err(err) = task.await {
+            warn!(error = %err, "Gateway listener task failed during shutdown");
         }
     }
 
@@ -316,6 +295,99 @@ pub async fn run_server(
         .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
 
     Ok(())
+}
+
+fn gateway_listener_addresses(
+    bind_address: SocketAddr,
+    extra_addresses: &[SocketAddr],
+) -> Vec<SocketAddr> {
+    let mut addresses = vec![bind_address];
+    for address in extra_addresses {
+        if !addresses
+            .iter()
+            .any(|existing| listener_covers(*existing, *address))
+        {
+            addresses.push(*address);
+        }
+    }
+    addresses
+}
+
+fn listener_covers(existing: SocketAddr, requested: SocketAddr) -> bool {
+    if existing == requested {
+        return true;
+    }
+    if existing.port() != requested.port() {
+        return false;
+    }
+
+    match (existing.ip(), requested.ip()) {
+        (std::net::IpAddr::V4(existing), std::net::IpAddr::V4(_)) => existing.is_unspecified(),
+        (std::net::IpAddr::V6(existing), std::net::IpAddr::V6(_)) => existing.is_unspecified(),
+        _ => false,
+    }
+}
+
+async fn serve_gateway_listener(
+    listener: TcpListener,
+    listen_addr: SocketAddr,
+    service: MultiplexService,
+    tls_acceptor: Option<TlsAcceptor>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        let accepted = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+            accepted = listener.accept() => accepted,
+        };
+
+        let (stream, addr) = match accepted {
+            Ok(conn) => conn,
+            Err(e) => {
+                error!(error = %e, listen = %listen_addr, "Failed to accept connection");
+                continue;
+            }
+        };
+
+        spawn_gateway_connection(stream, addr, service.clone(), tls_acceptor.clone());
+    }
+}
+
+fn spawn_gateway_connection(
+    stream: TcpStream,
+    addr: SocketAddr,
+    service: MultiplexService,
+    tls_acceptor: Option<TlsAcceptor>,
+) {
+    if let Some(acceptor) = tls_acceptor {
+        tokio::spawn(async move {
+            match acceptor.inner().accept(stream).await {
+                Ok(tls_stream) => {
+                    if let Err(e) = service.serve(tls_stream).await {
+                        error!(error = %e, client = %addr, "Connection error");
+                    }
+                }
+                Err(e) => {
+                    if is_benign_tls_handshake_failure(&e) {
+                        debug!(error = %e, client = %addr, "TLS handshake closed early");
+                    } else {
+                        error!(error = %e, client = %addr, "TLS handshake failed");
+                    }
+                }
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            if let Err(e) = service.serve(stream).await {
+                error!(error = %e, client = %addr, "Connection error");
+            }
+        });
+    }
 }
 
 async fn shutdown_signal() {
@@ -488,9 +560,12 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::{configured_compute_driver, is_benign_tls_handshake_failure};
+    use super::{
+        configured_compute_driver, gateway_listener_addresses, is_benign_tls_handshake_failure,
+    };
     use openshell_core::{ComputeDriverKind, Config};
     use std::io::{Error, ErrorKind};
+    use std::net::SocketAddr;
 
     #[test]
     fn classifies_probe_style_tls_disconnects_as_benign() {
@@ -555,6 +630,28 @@ mod tests {
         assert_eq!(
             configured_compute_driver(&config).unwrap(),
             ComputeDriverKind::Docker
+        );
+    }
+
+    #[test]
+    fn gateway_listener_addresses_skip_driver_address_covered_by_wildcard() {
+        let primary: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
+
+        assert_eq!(
+            gateway_listener_addresses(primary, &[docker, docker]),
+            vec![primary]
+        );
+    }
+
+    #[test]
+    fn gateway_listener_addresses_include_driver_address_on_distinct_ip() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
+
+        assert_eq!(
+            gateway_listener_addresses(primary, &[docker, docker]),
+            vec![primary, docker]
         );
     }
 }

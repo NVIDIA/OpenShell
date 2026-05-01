@@ -7,7 +7,8 @@ use clap::{Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::ComputeDriverKind;
 use openshell_core::config::{
-    DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS, DEFAULT_SSH_PORT,
+    DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS,
+    DEFAULT_SSH_PORT,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -204,6 +205,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_DOCKER_TLS_KEY")]
     docker_tls_key: Option<PathBuf>,
 
+    /// Docker bridge network used for sandbox containers.
+    #[arg(
+        long,
+        env = "OPENSHELL_DOCKER_NETWORK_NAME",
+        default_value = DEFAULT_DOCKER_NETWORK_NAME
+    )]
+    docker_network_name: String,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -348,6 +357,7 @@ async fn run_from_args(args: Args) -> Result<()> {
         guest_tls_ca: args.docker_tls_ca,
         guest_tls_cert: args.docker_tls_cert,
         guest_tls_key: args.docker_tls_key,
+        network_name: args.docker_network_name,
     };
 
     if args.disable_tls {
