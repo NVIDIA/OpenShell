@@ -8,6 +8,7 @@
 //! and chunked transfer encoding for body framing.
 
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
+use crate::opa::PolicyGenerationGuard;
 use crate::secrets::rewrite_http_header_block;
 use miette::{IntoDiagnostic, Result, miette};
 use std::collections::HashMap;
@@ -340,6 +341,20 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    relay_http_request_with_resolver_guarded(req, client, upstream, resolver, None).await
+}
+
+pub(crate) async fn relay_http_request_with_resolver_guarded<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    resolver: Option<&crate::secrets::SecretResolver>,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
     let header_end = req
         .raw_header
         .windows(4)
@@ -349,6 +364,10 @@ where
     let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
         .map_err(|e| miette!("credential injection failed: {e}"))?;
 
+    if let Some(guard) = generation_guard {
+        guard.ensure_current()?;
+    }
+
     upstream
         .write_all(&rewrite_result.rewritten)
         .await
@@ -356,6 +375,9 @@ where
 
     let overflow = &req.raw_header[header_end..];
     if !overflow.is_empty() {
+        if let Some(guard) = generation_guard {
+            guard.ensure_current()?;
+        }
         upstream.write_all(overflow).await.into_diagnostic()?;
     }
     let overflow_len = overflow.len() as u64;
@@ -364,11 +386,17 @@ where
         BodyLength::ContentLength(len) => {
             let remaining = len.saturating_sub(overflow_len);
             if remaining > 0 {
-                relay_fixed(client, upstream, remaining).await?;
+                relay_fixed(client, upstream, remaining, generation_guard).await?;
             }
         }
         BodyLength::Chunked => {
-            relay_chunked(client, upstream, &req.raw_header[header_end..]).await?;
+            relay_chunked(
+                client,
+                upstream,
+                &req.raw_header[header_end..],
+                generation_guard,
+            )
+            .await?;
         }
         BodyLength::None => {}
     }
@@ -460,7 +488,7 @@ async fn send_deny_response<C: AsyncWrite + Unpin>(
 /// Per RFC 7230 Section 3.3.3, rejects requests containing both
 /// `Content-Length` and `Transfer-Encoding` headers to prevent request
 /// smuggling via CL/TE ambiguity.
-fn parse_body_length(headers: &str) -> Result<BodyLength> {
+pub(crate) fn parse_body_length(headers: &str) -> Result<BodyLength> {
     let mut has_te_chunked = false;
     let mut cl_value: Option<u64> = None;
 
@@ -504,7 +532,12 @@ fn parse_body_length(headers: &str) -> Result<BodyLength> {
 }
 
 /// Relay exactly `len` bytes from reader to writer.
-async fn relay_fixed<R, W>(reader: &mut R, writer: &mut W, len: u64) -> Result<()>
+async fn relay_fixed<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    len: u64,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -521,6 +554,9 @@ where
                 "Connection closed with {remaining} bytes remaining"
             ));
         }
+        if let Some(guard) = generation_guard {
+            guard.ensure_current()?;
+        }
         writer.write_all(&buf[..n]).await.into_diagnostic()?;
         remaining -= n as u64;
     }
@@ -536,7 +572,12 @@ where
 /// `already_forwarded` are overflow bytes that were already written to the
 /// writer during header parsing. They are seeded into the parser buffer so
 /// termination can still be detected when boundaries span reads.
-async fn relay_chunked<R, W>(reader: &mut R, writer: &mut W, already_forwarded: &[u8]) -> Result<()>
+async fn relay_chunked<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    already_forwarded: &[u8],
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -559,6 +600,9 @@ where
             let n = reader.read(&mut read_buf).await.into_diagnostic()?;
             if n == 0 {
                 return Err(miette!("Chunked body ended before chunk-size line"));
+            }
+            if let Some(guard) = generation_guard {
+                guard.ensure_current()?;
             }
             writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
             parse_buf.extend_from_slice(&read_buf[..n]);
@@ -588,6 +632,9 @@ where
                     let n = reader.read(&mut read_buf).await.into_diagnostic()?;
                     if n == 0 {
                         return Err(miette!("Chunked body ended before trailer terminator"));
+                    }
+                    if let Some(guard) = generation_guard {
+                        guard.ensure_current()?;
                     }
                     writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
                     parse_buf.extend_from_slice(&read_buf[..n]);
@@ -621,6 +668,9 @@ where
             let n = reader.read(&mut read_buf).await.into_diagnostic()?;
             if n == 0 {
                 return Err(miette!("Chunked body ended mid-chunk"));
+            }
+            if let Some(guard) = generation_guard {
+                guard.ensure_current()?;
             }
             writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
             parse_buf.extend_from_slice(&read_buf[..n]);
@@ -794,11 +844,11 @@ where
         BodyLength::ContentLength(len) => {
             let remaining = len.saturating_sub(overflow_len);
             if remaining > 0 {
-                relay_fixed(upstream, client, remaining).await?;
+                relay_fixed(upstream, client, remaining, None).await?;
             }
         }
         BodyLength::Chunked => {
-            relay_chunked(upstream, client, &buf[header_end..]).await?;
+            relay_chunked(upstream, client, &buf[header_end..], None).await?;
         }
         BodyLength::None => unreachable!(),
     }
@@ -945,8 +995,11 @@ fn is_benign_close(err: &std::io::Error) -> bool {
 )]
 mod tests {
     use super::*;
+    use crate::opa::OpaEngine;
     use crate::secrets::SecretResolver;
     use base64::Engine as _;
+
+    const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
 
     #[test]
     fn parse_content_length() {
@@ -1967,6 +2020,47 @@ mod tests {
         );
 
         upstream_task.await.expect("upstream task should complete");
+    }
+
+    #[tokio::test]
+    async fn relay_request_guard_blocks_stale_generation_before_upstream_write() {
+        let policy_data = "network_policies: {}\n";
+        let engine = OpaEngine::from_strings(TEST_POLICY, policy_data).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        engine.reload(TEST_POLICY, policy_data).unwrap();
+
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/api".to_string(),
+            query_params: HashMap::new(),
+            raw_header: b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let result = relay_http_request_with_resolver_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            None,
+            Some(&guard),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "stale generation must stop relay before upstream write"
+        );
+
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "stale request bytes must not reach upstream"
+        );
     }
 
     #[test]

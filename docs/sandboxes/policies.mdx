@@ -48,6 +48,8 @@ network_policies:
 
 Static sections are locked at sandbox creation. Changing them requires destroying and recreating the sandbox.
 Dynamic sections can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
+When a hot reload changes rules on an active HTTP L7 endpoint, existing keep-alive tunnels are closed before forwarding another parsed request. Credential-injection-only HTTP passthrough tunnels use the same reload boundary. Most HTTP clients reconnect automatically, and the next request is evaluated against the current policy.
+Raw streams are connection-scoped and outside L7 live-reload guarantees. This includes `tls: skip`, non-HTTP TCP payloads, HTTP upgrades such as WebSocket, and long-lived response streams such as SSE. A reload applies to the next connection or next parsed HTTP request; it does not interrupt an already-forwarded raw stream.
 
 | Section | Type | Description |
 |---|---|---|
@@ -445,7 +447,7 @@ Allow `pip install` and `uv pip install` to reach PyPI:
       - { path: /usr/local/bin/uv }
 ```
 
-Endpoints without `protocol` use TCP passthrough, where the proxy allows the stream without inspecting payloads.
+Endpoints without `protocol` use TCP passthrough, where the proxy allows the stream without inspecting payloads. If the stream is HTTP and TLS is auto-terminated, the proxy can still rewrite configured credential placeholders and closes keep-alive passthrough tunnels on policy reload before forwarding another request.
 </Tab>
 
 <Tab title="Granular rules">

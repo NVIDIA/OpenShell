@@ -11,7 +11,10 @@ use crate::policy::{FilesystemPolicy, LandlockCompatibility, LandlockPolicy, Pro
 use miette::Result;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 /// Baked-in rego rules for OPA policy evaluation.
 /// These rules define the network access decision logic and static config
@@ -64,6 +67,68 @@ pub struct SandboxConfig {
 /// (one eval per CONNECT request).
 pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
+    generation: Arc<AtomicU64>,
+}
+
+/// Generation guard captured when an HTTP tunnel or request path starts.
+#[derive(Clone)]
+pub struct PolicyGenerationGuard {
+    captured_generation: u64,
+    current_generation: Arc<AtomicU64>,
+}
+
+impl PolicyGenerationGuard {
+    pub fn captured_generation(&self) -> u64 {
+        self.captured_generation
+    }
+
+    pub fn current_generation(&self) -> u64 {
+        self.current_generation.load(Ordering::Acquire)
+    }
+
+    pub fn is_stale(&self) -> bool {
+        self.current_generation() != self.captured_generation
+    }
+
+    pub fn ensure_current(&self) -> Result<()> {
+        if self.is_stale() {
+            return Err(miette::miette!(
+                "policy generation is stale [captured_generation:{} current_generation:{}]",
+                self.captured_generation(),
+                self.current_generation(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Per-tunnel L7 policy evaluator bound to the engine generation captured when
+/// the tunnel was established.
+pub struct TunnelPolicyEngine {
+    engine: Mutex<regorus::Engine>,
+    generation_guard: PolicyGenerationGuard,
+}
+
+impl TunnelPolicyEngine {
+    pub fn captured_generation(&self) -> u64 {
+        self.generation_guard.captured_generation()
+    }
+
+    pub fn current_generation(&self) -> u64 {
+        self.generation_guard.current_generation()
+    }
+
+    pub fn is_stale(&self) -> bool {
+        self.generation_guard.is_stale()
+    }
+
+    pub fn generation_guard(&self) -> &PolicyGenerationGuard {
+        &self.generation_guard
+    }
+
+    pub(crate) fn engine(&self) -> &Mutex<regorus::Engine> {
+        &self.engine
+    }
 }
 
 impl OpaEngine {
@@ -84,6 +149,7 @@ impl OpaEngine {
             .map_err(|e| miette::miette!("{e}"))?;
         Ok(Self {
             engine: Mutex::new(engine),
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -101,6 +167,7 @@ impl OpaEngine {
             .map_err(|e| miette::miette!("{e}"))?;
         Ok(Self {
             engine: Mutex::new(engine),
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -162,6 +229,7 @@ impl OpaEngine {
             .map_err(|e| miette::miette!("{e}"))?;
         Ok(Self {
             engine: Mutex::new(engine),
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -233,6 +301,14 @@ impl OpaEngine {
     /// Uses the OPA `network_action` rule which returns one of:
     /// `"allow"` or `"deny"`.
     pub fn evaluate_network_action(&self, input: &NetworkInput) -> Result<NetworkAction> {
+        Ok(self.evaluate_network_action_with_generation(input)?.0)
+    }
+
+    /// Evaluate network action and return the policy generation used for the evaluation.
+    pub fn evaluate_network_action_with_generation(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<(NetworkAction, u64)> {
         let ancestor_strs: Vec<String> = input
             .ancestors
             .iter()
@@ -259,6 +335,7 @@ impl OpaEngine {
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.current_generation();
 
         engine
             .set_input_json(&input_json.to_string())
@@ -279,13 +356,13 @@ impl OpaEngine {
         };
 
         if action_str == "allow" {
-            Ok(NetworkAction::Allow { matched_policy })
+            Ok((NetworkAction::Allow { matched_policy }, generation))
         } else {
             let reason_val = engine
                 .eval_rule("data.openshell.sandbox.deny_reason".into())
                 .map_err(|e| miette::miette!("{e}"))?;
             let reason = value_to_string(&reason_val);
-            Ok(NetworkAction::Deny { reason })
+            Ok((NetworkAction::Deny { reason }, generation))
         }
     }
 
@@ -306,6 +383,7 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         *engine = new_engine;
+        self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -340,7 +418,27 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         *engine = new_engine;
+        self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// Current policy generation. Successful reloads increment this value.
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Return a guard for a previously captured policy generation.
+    pub fn generation_guard(&self, expected_generation: u64) -> Result<PolicyGenerationGuard> {
+        let generation = self.current_generation();
+        if generation != expected_generation {
+            return Err(miette::miette!(
+                "policy changed before HTTP relay started [expected_generation:{expected_generation} current_generation:{generation}]"
+            ));
+        }
+        Ok(PolicyGenerationGuard {
+            captured_generation: generation,
+            current_generation: Arc::clone(&self.generation),
+        })
     }
 
     /// Query static sandbox configuration from the OPA data module.
@@ -385,6 +483,14 @@ impl OpaEngine {
     /// to get the full endpoint object for the matched policy. Returns the raw
     /// `regorus::Value` which can be parsed by `l7::parse_l7_config()`.
     pub fn query_endpoint_config(&self, input: &NetworkInput) -> Result<Option<regorus::Value>> {
+        Ok(self.query_endpoint_config_with_generation(input)?.0)
+    }
+
+    /// Query L7 endpoint config and return the policy generation used for the query.
+    pub fn query_endpoint_config_with_generation(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<(Option<regorus::Value>, u64)> {
         let ancestor_strs: Vec<String> = input
             .ancestors
             .iter()
@@ -411,6 +517,7 @@ impl OpaEngine {
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.current_generation();
 
         engine
             .set_input_json(&input_json.to_string())
@@ -421,9 +528,9 @@ impl OpaEngine {
             .map_err(|e| miette::miette!("{e}"))?;
 
         if val == regorus::Value::Undefined {
-            Ok(None)
+            Ok((None, generation))
         } else {
-            Ok(Some(val))
+            Ok((Some(val), generation))
         }
     }
 
@@ -445,12 +552,24 @@ impl OpaEngine {
     /// With the `arc` feature enabled, this shares compiled policy via Arc
     /// and only duplicates interpreter state (~microseconds). The cloned
     /// engine can be used without Mutex contention.
-    pub fn clone_engine_for_tunnel(&self) -> Result<regorus::Engine> {
+    pub fn clone_engine_for_tunnel(&self, expected_generation: u64) -> Result<TunnelPolicyEngine> {
         let engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
-        Ok(engine.clone())
+        let generation = self.current_generation();
+        if generation != expected_generation {
+            return Err(miette::miette!(
+                "policy changed before L7 tunnel started [expected_generation:{expected_generation} current_generation:{generation}]"
+            ));
+        }
+        Ok(TunnelPolicyEngine {
+            engine: Mutex::new(engine.clone()),
+            generation_guard: PolicyGenerationGuard {
+                captured_generation: generation,
+                current_generation: Arc::clone(&self.generation),
+            },
+        })
     }
 }
 
@@ -2027,15 +2146,96 @@ process:
     #[test]
     fn l7_clone_engine_for_tunnel() {
         let engine = l7_engine();
-        let cloned = engine.clone_engine_for_tunnel().unwrap();
+        let cloned = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
         // Verify the cloned engine can evaluate
         let input_json = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
-        let mut eng = cloned;
+        let mut eng = cloned.engine().lock().unwrap();
         eng.set_input_json(&input_json.to_string()).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
         assert_eq!(val, regorus::Value::from(true));
+    }
+
+    #[test]
+    fn policy_generation_starts_at_zero_and_increments_on_successful_reload() {
+        let engine = l7_engine();
+        assert_eq!(engine.current_generation(), 0);
+
+        engine.reload(TEST_POLICY, L7_TEST_DATA).unwrap();
+
+        assert_eq!(engine.current_generation(), 1);
+    }
+
+    #[test]
+    fn policy_generation_does_not_increment_on_failed_reload() {
+        let engine = l7_engine();
+        engine.reload(TEST_POLICY, L7_TEST_DATA).unwrap();
+        assert_eq!(engine.current_generation(), 1);
+
+        let invalid_l7_data = r#"
+network_policies:
+  bad_api:
+    name: bad_api
+    endpoints:
+      - host: api.example.com
+        port: 8080
+        protocol: invalid-protocol
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        assert!(engine.reload(TEST_POLICY, invalid_l7_data).is_err());
+        assert_eq!(engine.current_generation(), 1);
+
+        let input_json = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        let cloned = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let mut eng = cloned.engine().lock().unwrap();
+        eng.set_input_json(&input_json.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .unwrap();
+        assert_eq!(val, regorus::Value::from(true));
+    }
+
+    #[test]
+    fn endpoint_config_generation_matches_query_generation() {
+        let engine = l7_engine();
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let (config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        assert!(config.is_some());
+        assert_eq!(generation, engine.current_generation());
+
+        engine.reload(TEST_POLICY, L7_TEST_DATA).unwrap();
+
+        let (config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        assert!(config.is_some());
+        assert_eq!(generation, engine.current_generation());
+        assert_eq!(generation, 1);
+    }
+
+    #[test]
+    fn tunnel_clone_rejects_stale_generation() {
+        let engine = l7_engine();
+        let captured_generation = engine.current_generation();
+        engine.reload(TEST_POLICY, L7_TEST_DATA).unwrap();
+
+        assert!(engine.clone_engine_for_tunnel(captured_generation).is_err());
     }
 
     // ========================================================================

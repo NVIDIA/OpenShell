@@ -203,7 +203,7 @@ The poll loop:
 2. Fetches the current policy via `GetSandboxSettings`, which returns the latest version, its policy payload, and a SHA-256 hash.
 3. Compares the returned version against the locally tracked `current_version`. If the server version is not greater, the loop sleeps and retries.
 4. On a new version, calls `OpaEngine::reload_from_proto()` which builds a complete new `regorus::Engine` through the same validated pipeline as the initial load (proto-to-JSON conversion, L7 validation, access preset expansion).
-5. If the new engine builds successfully, it atomically replaces the inner `Mutex<regorus::Engine>`. If it fails, the previous engine is untouched.
+5. If the new engine builds successfully, it atomically replaces the inner `Mutex<regorus::Engine>` and increments the policy generation. Active L7 keep-alive tunnels close before forwarding another request after they observe the new generation. If reload fails, the previous engine and generation are untouched.
 6. Reports success or failure back to the server via `ReportPolicyStatus`.
 
 See `crates/openshell-sandbox/src/grpc_client.rs` -- `CachedOpenShellClient`.
@@ -723,7 +723,11 @@ flowchart LR
 
 This is the single most important behavioral trigger in the policy language. An endpoint with no `protocol` field passes traffic opaquely after the L4 (CONNECT) check. Adding `protocol: rest` activates per-request HTTP parsing and policy evaluation inside the proxy.
 
-**Implementation path**: After L4 CONNECT is allowed, the proxy calls `query_l7_config()` which evaluates the Rego rule `data.openshell.sandbox.matched_endpoint_config`. This rule only matches endpoints that have a `protocol` field set (see `sandbox-policy.rego` line `ep.protocol`). If a config is returned, the proxy enters `relay_with_inspection()` instead of `copy_bidirectional()`. See `crates/openshell-sandbox/src/proxy.rs` -- `handle_tcp_connection()`.
+**Implementation path**: After L4 CONNECT is allowed, the proxy calls `query_l7_route_snapshot()` which evaluates the Rego rule `data.openshell.sandbox.matched_endpoint_config` and records the policy generation. If an endpoint `protocol` config is returned, the proxy enters `relay_with_inspection()` instead of `copy_bidirectional()`. See `crates/openshell-sandbox/src/proxy.rs` -- `handle_tcp_connection()`.
+
+For L7-inspected CONNECT tunnels, the proxy binds endpoint config and the per-tunnel policy engine clone to the policy generation observed at tunnel setup. If a live policy reload advances the generation, the relay closes the existing keep-alive tunnel before forwarding another request. HTTP passthrough tunnels without endpoint `protocol` use the same generation guard for parsed requests even though they do not evaluate L7 OPA rules. Clients should reconnect so the next request is evaluated under the current policy.
+
+Raw streams are connection-scoped and outside L7 live-reload guarantees. This includes endpoints with `tls: skip`, non-HTTP CONNECT payloads, SQL audit fallback passthrough, HTTP upgrades after `101 Switching Protocols`, and already-forwarded streaming response bodies such as SSE. A policy reload applies to the next connection or next parsed HTTP request; it does not terminate raw bytes already relayed outside the HTTP request parser.
 
 **Validation requirement**: When `protocol` is set, either `rules` or `access` must also be present. An endpoint with `protocol` but no rules/access is rejected at validation time because it would deny all traffic (no allow rules means nothing matches). See `crates/openshell-sandbox/src/l7/mod.rs` -- `validate_l7_policies()`.
 
@@ -758,9 +762,9 @@ If any condition fails, the proxy returns `403 Forbidden`.
 5. Resolves DNS and validates all IPs are private and within `allowed_ips`
 6. Connects to upstream
 7. Rewrites the request: absolute-form → origin-form (`GET /path HTTP/1.1`), strips hop-by-hop headers, adds `Via: 1.1 openshell-sandbox` and `Connection: close`
-8. Forwards the rewritten request, then relays bidirectionally using `tokio::io::copy_bidirectional` (supports chunked transfer, SSE streams, and other long-lived responses with no idle timeout)
+8. Relays the rewritten request and response through the shared guarded HTTP relay. This reuses the same request body framing, CL/TE rejection, credential rewrite fail-closed behavior, unsolicited `101` blocking, and policy-generation checks as CONNECT L7 HTTP.
 
-**V1 simplifications**: Forward proxy v1 injects `Connection: close` (no keep-alive). Every forward proxy connection handles exactly one request-response exchange. When an endpoint has L7 rules configured, the forward proxy evaluates the single request's method and path against L7 policy before forwarding.
+**V1 simplifications**: Forward proxy v1 injects `Connection: close` (no keep-alive). Every forward proxy connection handles exactly one request-response exchange. The request is bound to the policy generation used for the L4 allow decision and is checked again before upstream connect and request forwarding. When an endpoint has L7 rules configured, the forward proxy also evaluates the single request's method and path against L7 policy before forwarding.
 
 **Implementation**: See `crates/openshell-sandbox/src/proxy.rs` -- `handle_forward_proxy()`, `parse_proxy_uri()`, `rewrite_forward_request()`.
 
@@ -785,7 +789,7 @@ flowchart TD
     K -- No --> L["403 Forbidden"]
     K -- Yes --> M["TCP connect to upstream"]
     M --> N["Rewrite request to origin-form<br/>Add Via + Connection: close"]
-    N --> O["Forward request + copy_bidirectional"]
+    N --> O["Guarded HTTP relay"]
 ```
 
 #### Example: Forward Proxy Policy
@@ -836,7 +840,7 @@ TLS termination is automatic. The proxy peeks the first bytes of every CONNECT t
 
 **Certificate caching**: Per-hostname leaf certificates are cached (up to 256 entries, then the entire cache is cleared). See `crates/openshell-sandbox/src/l7/tls.rs` -- `CertCache`.
 
-**Credential injection**: When TLS is auto-terminated but no L7 policy is configured (no `protocol` field), the proxy enters a passthrough relay that rewrites credential placeholders in HTTP headers (via `SecretResolver`) and logs requests for observability, but does not evaluate L7 OPA rules. This means credential injection works on all HTTPS endpoints automatically.
+**Credential injection**: When TLS is auto-terminated but no L7 policy is configured (no `protocol` field), the proxy enters a passthrough relay that rewrites credential placeholders in HTTP headers (via `SecretResolver`) and logs requests for observability, but does not evaluate L7 OPA rules. The relay still closes parsed keep-alive HTTP tunnels after policy generation changes before forwarding another request. This means credential injection works on all HTTPS endpoints automatically.
 
 **Validation warnings**:
 
@@ -972,9 +976,11 @@ sequenceDiagram
     OPA-->>Proxy: allowed=true, matched_policy="api_policy"
     Proxy-->>Client: 200 Connection Established
 
-    Note over Proxy: Query L7 config for matched endpoint
-    Proxy->>OPA: query_endpoint_config(host, port, binary)
-    OPA-->>Proxy: {protocol: rest, enforcement: enforce}
+    Note over Proxy: Query L7 config and generation for matched endpoint
+    Proxy->>OPA: query_endpoint_config_with_generation(host, port, binary)
+    OPA-->>Proxy: {protocol: rest, enforcement: enforce}, generation=N
+    Proxy->>OPA: clone_engine_for_tunnel(generation=N)
+    OPA-->>Proxy: generation-bound tunnel evaluator
 
     Note over Proxy: Auto-detect TLS (peek first bytes)
     Note over Proxy: TLS ClientHello detected → terminate
@@ -988,9 +994,12 @@ sequenceDiagram
 
     loop Per HTTP request in tunnel
         Client->>Proxy: GET /repos/myorg/foo HTTP/1.1
+        Note over Proxy: Close if policy generation changed
         Note over Proxy: Parse HTTP request line + headers
+        Note over Proxy: Close if policy generation changed
         Proxy->>OPA: allow_request(method=GET, path=/repos/myorg/foo)
         OPA-->>Proxy: allowed=true
+        Note over Proxy: Close if policy generation changed
         Proxy->>Upstream: GET /repos/myorg/foo HTTP/1.1
         Upstream-->>Proxy: 200 OK (response body)
         Proxy-->>Client: 200 OK (response body)
