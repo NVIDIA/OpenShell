@@ -696,4 +696,113 @@ mod tests {
         assert!(!forwarded.to_ascii_lowercase().contains("trailer:"));
         assert!(req.raw_header.ends_with(body));
     }
+
+    #[tokio::test]
+    async fn absolute_form_chunked_graphql_post_classifies_after_inspection() {
+        let body = br#"{"query":"query Viewer { viewer { login } }"}"#;
+        let mut raw_header =
+            b"POST http://example.com/graphql HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                .to_vec();
+        raw_header.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+        raw_header.extend_from_slice(body);
+        raw_header.extend_from_slice(b"\r\n0\r\n\r\n");
+
+        let mut req = L7Request {
+            action: "POST".to_string(),
+            target: "/graphql".to_string(),
+            query_params: HashMap::new(),
+            raw_header,
+            body_length: BodyLength::Chunked,
+        };
+        let mut client = tokio::io::empty();
+
+        let info = inspect_graphql_request(&mut client, &mut req, DEFAULT_MAX_BODY_BYTES)
+            .await
+            .expect("absolute-form chunked body should inspect");
+
+        assert_eq!(info.error, None);
+        assert_eq!(info.operations[0].operation_type, "query");
+        assert_eq!(info.operations[0].fields, vec!["viewer"]);
+    }
+
+    #[tokio::test]
+    async fn absolute_form_chunked_graphql_post_is_allowed_by_field_policy() {
+        let body = br#"{"query":"query Viewer { viewer { login } }"}"#;
+        let mut raw_header =
+            b"POST http://host.openshell.internal:8080/graphql HTTP/1.1\r\nHost: host.openshell.internal:8080\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                .to_vec();
+        raw_header.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+        raw_header.extend_from_slice(body);
+        raw_header.extend_from_slice(b"\r\n0\r\n\r\n");
+
+        let mut req = L7Request {
+            action: "POST".to_string(),
+            target: "/graphql".to_string(),
+            query_params: HashMap::new(),
+            raw_header,
+            body_length: BodyLength::Chunked,
+        };
+        let mut client = tokio::io::empty();
+        let info = inspect_graphql_request(&mut client, &mut req, DEFAULT_MAX_BODY_BYTES)
+            .await
+            .expect("chunked body should inspect");
+
+        let data = r"
+network_policies:
+  test_graphql_l7:
+    name: test_graphql_l7
+    endpoints:
+      - host: host.openshell.internal
+        port: 8080
+        protocol: graphql
+        enforcement: enforce
+        persisted_queries: allow_registered
+        graphql_persisted_queries:
+          abc123:
+            operation_type: query
+            operation_name: Viewer
+            fields: [viewer]
+        rules:
+          - allow:
+              operation_type: query
+              fields: [viewer]
+          - allow:
+              operation_type: mutation
+              fields: [createIssue]
+        deny_rules:
+          - operation_type: mutation
+            fields: [deleteRepository]
+    binaries:
+      - { path: /usr/bin/python3 }
+";
+        let engine = crate::opa::OpaEngine::from_strings(
+            include_str!("../../data/sandbox-policy.rego"),
+            data,
+        )
+        .expect("policy should load");
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "host.openshell.internal".to_string(),
+            port: 8080,
+            policy_name: "test_graphql_l7".to_string(),
+            binary_path: "/usr/bin/python3".to_string(),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+            secret_resolver: None,
+        };
+        let request_info = crate::l7::L7RequestInfo {
+            action: req.action,
+            target: req.target,
+            query_params: req.query_params,
+            graphql: Some(info),
+        };
+
+        let (allowed, reason) = crate::l7::relay::evaluate_l7_request(
+            &std::sync::Mutex::new(engine.clone_engine_for_tunnel().unwrap()),
+            &ctx,
+            &request_info,
+        )
+        .expect("evaluation should complete");
+
+        assert!(allowed, "expected query to be allowed, got {reason}");
+    }
 }

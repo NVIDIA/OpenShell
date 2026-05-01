@@ -289,18 +289,19 @@ def forward_persisted_get_status(hash_value):
         error.read()
         return error.code
 
-def proxy_parts():
-    proxy_url = (
-        os.environ.get("HTTPS_PROXY")
-        or os.environ.get("https_proxy")
-        or os.environ.get("HTTP_PROXY")
-        or os.environ.get("http_proxy")
-    )
+def proxy_parts(*names):
+    proxy_url = next((os.environ.get(name) for name in names if os.environ.get(name)), None)
     parsed = urllib.parse.urlparse(proxy_url)
     return parsed.hostname, parsed.port or 80
 
+def forward_proxy_parts():
+    return proxy_parts("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
+
+def connect_proxy_parts():
+    return proxy_parts("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
+
 def forward_chunked_status(query):
-    proxy_host, proxy_port = proxy_parts()
+    proxy_host, proxy_port = forward_proxy_parts()
     target = f"{{HOST}}:{{PORT}}"
     body = json.dumps({{"query": query}}).encode()
     chunk = f"{{len(body):x}}\r\n".encode() + body + b"\r\n0\r\n\r\n"
@@ -329,7 +330,7 @@ def read_until(sock, marker):
     return data
 
 def connect_status(query):
-    proxy_host, proxy_port = proxy_parts()
+    proxy_host, proxy_port = connect_proxy_parts()
     target = f"{{HOST}}:{{PORT}}"
     body = json.dumps({{"query": query}}).encode()
 
@@ -355,7 +356,7 @@ def connect_status(query):
         return int(response.split()[1])
 
 def connect_get_status(query):
-    proxy_host, proxy_port = proxy_parts()
+    proxy_host, proxy_port = connect_proxy_parts()
     target = f"{{HOST}}:{{PORT}}"
     encoded = urllib.parse.urlencode({{"query": query}})
 
@@ -379,7 +380,7 @@ def connect_get_status(query):
         return int(response.split()[1])
 
 def connect_duplicate_get_status():
-    proxy_host, proxy_port = proxy_parts()
+    proxy_host, proxy_port = connect_proxy_parts()
     target = f"{{HOST}}:{{PORT}}"
     safe = urllib.parse.quote_plus(QUERY_VIEWER)
     unsafe = urllib.parse.quote_plus(MUTATION_DELETE)
@@ -404,7 +405,7 @@ def connect_duplicate_get_status():
         return int(response.split()[1])
 
 def connect_persisted_get_status(hash_value):
-    proxy_host, proxy_port = proxy_parts()
+    proxy_host, proxy_port = connect_proxy_parts()
     target = f"{{HOST}}:{{PORT}}"
     extensions = json.dumps({{"persistedQuery": {{"version": 1, "sha256Hash": hash_value}}}})
     encoded = urllib.parse.urlencode({{"operationName": "Viewer", "extensions": extensions}})
@@ -429,7 +430,7 @@ def connect_persisted_get_status(hash_value):
         return int(response.split()[1])
 
 def connect_chunked_status(query):
-    proxy_host, proxy_port = proxy_parts()
+    proxy_host, proxy_port = connect_proxy_parts()
     target = f"{{HOST}}:{{PORT}}"
     body = json.dumps({{"query": query}}).encode()
     chunk = f"{{len(body):x}}\r\n".encode() + body + b"\r\n0\r\n\r\n"
