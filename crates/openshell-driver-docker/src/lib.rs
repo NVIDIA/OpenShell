@@ -54,6 +54,7 @@ const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 const SANDBOX_COMMAND: &str = "sleep infinity";
+const HOST_OPENSHELL_INTERNAL_HOSTS_ENTRY: &str = "host.openshell.internal:127.0.0.1";
 
 /// Default image holding the Linux `openshell-sandbox` binary. The gateway
 /// pulls this image and extracts the binary to a host-side cache when no
@@ -964,6 +965,10 @@ fn build_container_create_body(
             // the sandboxed workload and forces workload traffic through
             // its policy proxy.
             network_mode: Some("host".to_string()),
+            // Keep a stable host alias available inside the container without
+            // requiring users to edit the host's /etc/hosts. In host network
+            // mode this resolves back to the host loopback gateway.
+            extra_hosts: Some(vec![HOST_OPENSHELL_INTERNAL_HOSTS_ENTRY.to_string()]),
             ..Default::default()
         }),
         ..Default::default()

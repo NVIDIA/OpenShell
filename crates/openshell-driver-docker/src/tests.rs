@@ -238,7 +238,11 @@ fn build_container_create_body_uses_host_network() {
         Some("host".to_string()),
         "sandbox must use host networking so 127.0.0.1 reaches the host gateway"
     );
-    assert!(host_config.extra_hosts.is_none());
+    assert_eq!(
+        host_config.extra_hosts,
+        Some(vec!["host.openshell.internal:127.0.0.1".to_string()]),
+        "sandbox should expose a stable host alias without host /etc/hosts edits"
+    );
 }
 
 #[test]
