@@ -205,21 +205,58 @@ install_deb_package() {
 }
 
 start_user_gateway() {
-  info "starting openshell-gateway user service as ${TARGET_USER}..."
+  info "restarting openshell-gateway user service as ${TARGET_USER}..."
 
   if ! as_target_user systemctl --user daemon-reload; then
     info "could not reach the user systemd manager for ${TARGET_USER}"
-    info "start the gateway later with: systemctl --user enable --now openshell-gateway"
+    info "restart the gateway later with: systemctl --user enable openshell-gateway && systemctl --user restart openshell-gateway"
     info "then register it with: openshell gateway add http://127.0.0.1:17670 --local --name local"
     return 0
   fi
 
-  as_target_user systemctl --user enable --now openshell-gateway
+  as_target_user systemctl --user enable openshell-gateway
+  as_target_user systemctl --user restart openshell-gateway
   as_target_user systemctl --user is-active --quiet openshell-gateway
 
   info "registering local gateway as ${TARGET_USER}..."
-  as_target_user openshell gateway add http://127.0.0.1:17670 --local --name local \
-    || as_target_user openshell gateway select local
+  register_local_gateway
+}
+
+remove_local_gateway_registration() {
+  [ -n "$TARGET_HOME" ] || error "cannot resolve home directory for ${TARGET_USER}"
+  _config_dir="${TARGET_HOME}/.config/openshell"
+
+  # The install-dev gateway is a user service. Replace the CLI registration
+  # directly instead of asking `gateway destroy` to tear down Docker resources.
+  as_target_user sh -c '
+    config_dir=$1
+    rm -rf "${config_dir}/gateways/local"
+    active="${config_dir}/active_gateway"
+    if [ "$(cat "$active" 2>/dev/null || true)" = "local" ]; then
+      rm -f "$active"
+    fi
+  ' sh "$_config_dir"
+}
+
+register_local_gateway() {
+  if _add_output="$(as_target_user openshell gateway add http://127.0.0.1:17670 --local --name local 2>&1)"; then
+    [ -z "$_add_output" ] || printf '%s\n' "$_add_output" >&2
+    return 0
+  else
+    _add_status=$?
+  fi
+
+  case "$_add_output" in
+    *"already exists"*)
+      info "local gateway already exists; removing and re-adding it..."
+      remove_local_gateway_registration
+      as_target_user openshell gateway add http://127.0.0.1:17670 --local --name local
+      ;;
+    *)
+      printf '%s\n' "$_add_output" >&2
+      return "$_add_status"
+      ;;
+  esac
 }
 
 main() {
