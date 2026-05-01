@@ -8,43 +8,34 @@ permissions:
   issues: write
 
 jobs:
-  label-mon-maintainer-issues:
+  label-maintainer-issues:
     runs-on: ubuntu-latest
     if: github.repository_owner == 'NVIDIA'
-    env:
-      ORG_READ_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
     steps:
-      - name: Require org read token
-        if: env.ORG_READ_TOKEN == ''
-        run: |
-          echo "::error::ORG_READ_TOKEN is required to check mon-maintainers membership."
-          exit 1
-
-      - name: Check mon-maintainers membership
-        id: mon-maintainer
+      - name: Check maintainer permissions
+        id: maintainer
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.ORG_READ_TOKEN }}
           result-encoding: string
           script: |
             const author = context.payload.issue.user.login;
 
             try {
-              const { data } = await github.rest.teams.getMembershipForUserInOrg({
-                org: context.repo.owner,
-                team_slug: 'mon-maintainers',
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
                 username: author,
               });
 
-              if (data.state === 'active') {
-                console.log(`${author} is an active mon-maintainers member.`);
+              if (['admin', 'maintain', 'write'].includes(data.permission)) {
+                console.log(`${author} has maintainer permissions: ${data.permission}.`);
                 return 'true';
               }
 
-              console.log(`${author} has mon-maintainers membership state: ${data.state}`);
+              console.log(`${author} does not have maintainer permissions: ${data.permission}.`);
             } catch (e) {
               if (e.status === 404) {
-                console.log(`${author} is not a mon-maintainers member.`);
+                console.log(`${author} is not a repository collaborator.`);
                 return 'false';
               }
 
@@ -54,7 +45,7 @@ jobs:
             return 'false';
 
       - name: Add triage label
-        if: steps.mon-maintainer.outputs.result == 'true'
+        if: steps.maintainer.outputs.result == 'true'
         uses: actions/github-script@v7
         with:
           script: |
