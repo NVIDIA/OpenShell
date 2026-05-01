@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: RPM Package
+
+on:
+  workflow_call:
+    inputs:
+      checkout-ref:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-rpm-linux:
+    name: Build RPM Package (Linux ${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: build-amd64
+          - arch: aarch64
+            runner: build-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    container:
+      image: fedora:latest
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            packit rpm-build \
+            rust cargo gcc gcc-c++ make cmake pkg-config \
+            clang-devel z3-devel systemd-rpm-macros \
+            pandoc python3-devel git-core \
+            cargo-rpm-macros
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.checkout-ref }}
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Build RPMs via Packit
+        run: packit build locally
+
+      - name: Collect RPM artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          find ~/rpmbuild/RPMS/ -name '*.rpm' -exec cp {} artifacts/ \;
+          echo "=== Built RPMs ==="
+          ls -lah artifacts/
+
+      - name: Upload RPM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-linux-${{ matrix.arch }}
+          path: artifacts/*.rpm
+          retention-days: 5

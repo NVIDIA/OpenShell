@@ -662,12 +662,20 @@ jobs:
       checkout-ref: ${{ inputs.tag || github.ref }}
     secrets: inherit
 
+  build-rpm:
+    name: Build RPM Packages
+    needs: [compute-versions]
+    uses: ./.github/workflows/rpm-package.yml
+    with:
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
   # ---------------------------------------------------------------------------
   # Create a tagged GitHub Release with CLI binaries and wheels
   # ---------------------------------------------------------------------------
   release:
     name: Release
-    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, tag-ghcr-release, build-deb]
+    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, tag-ghcr-release, build-deb, build-rpm]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     outputs:
@@ -712,6 +720,13 @@ jobs:
           path: release/
           merge-multiple: true
 
+      - name: Download RPM package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rpm-linux-*
+          path: release/
+          merge-multiple: true
+
       - name: Capture wheel filenames
         id: wheel_filenames
         run: |
@@ -729,6 +744,7 @@ jobs:
             openshell-aarch64-unknown-linux-musl.tar.gz \
             openshell-aarch64-apple-darwin.tar.gz \
             openshell_*.deb \
+            openshell-*.rpm \
             *.whl > openshell-checksums-sha256.txt
           cat openshell-checksums-sha256.txt
           sha256sum \
@@ -762,6 +778,7 @@ jobs:
             release/openshell-aarch64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-apple-darwin.tar.gz
             release/openshell_*.deb
+            release/openshell-*.rpm
             release/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-gateway-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-gateway-aarch64-apple-darwin.tar.gz
