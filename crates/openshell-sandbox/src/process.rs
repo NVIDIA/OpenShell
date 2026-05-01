@@ -614,6 +614,17 @@ mod tests {
         }
     }
 
+    /// Unknown names may yield `Ok(None)` (`… not found …`) or `Err` when NSS fails first
+    /// (e.g. `ENOENT: No such file or directory`).
+    fn assert_unknown_identity_lookup_failed(msg: &str) {
+        assert!(
+            msg.contains("not found")
+                || msg.contains("ENOENT")
+                || msg.contains("No such file or directory"),
+            "expected unknown user/group lookup failure (…not found… or ENOENT): {msg}"
+        );
+    }
+
     #[test]
     fn drop_privileges_noop_when_no_user_or_group() {
         let policy = policy_with_process(ProcessPolicy {
@@ -696,10 +707,7 @@ mod tests {
         let result = drop_privileges(&policy);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("not found"),
-            "expected 'not found' in error: {msg}"
-        );
+        assert_unknown_identity_lookup_failed(&msg);
     }
 
     #[test]
@@ -712,10 +720,7 @@ mod tests {
         let result = drop_privileges(&policy);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("not found"),
-            "expected 'not found' in error: {msg}"
-        );
+        assert_unknown_identity_lookup_failed(&msg);
     }
 
     #[cfg(unix)]
