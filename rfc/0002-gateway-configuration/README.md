@@ -183,7 +183,7 @@ The chart renders this into a `ConfigMap` mounted at `/etc/openshell/gateway.tom
 
 ## Implementation plan
 
-The implementation is already prototyped on the `scratch/server-config-file` branch. The remaining work to reach merge-ready state:
+The remaining work to reach merge-ready state:
 
 1. **Review and clean up `gateway_config_file.rs`** — the merge logic and TOML schema are implemented; polish error messages and add inline documentation.
 2. **Extend test coverage** — add tests for TLS merge paths, partial-TLS error, health-port collision, and unknown-field rejection.
@@ -214,5 +214,7 @@ The implementation is already prototyped on the `scratch/server-config-file` bra
 ## Open questions
 
 1. **Schema versioning** — the `version` field is reserved but not acted on. Should the parser reject files with `version > 1`, or just warn? Define this before the first stable release.
-2. **Multiple config files / layering** — should the gateway support a system-level config at `/etc/openshell/gateway.toml` and a user-level override? Probably not needed initially, but worth deciding before the format is widely adopted.
+2. **Directory-based config (`conf.d` pattern)** — a `--config-dir` flag that globs all `*.toml` files in a directory, sorts them alphabetically, and deep-merges them in order (later files win per key). CLI/env overrides still sit above everything. This maps cleanly to Kubernetes: a base `ConfigMap` as `10-base.toml`, driver config as `20-kubernetes.toml`, and credentials from a projected `Secret` as `90-credentials.toml` — all mounted into the same directory without a monolithic file. This is the approach taken by cri-o and kubelet, inspired by systemd's `conf.d` convention.
+
+   Deferred to a follow-on: the single `--config` file is sufficient for v1, and the directory loader can be added without any schema changes. Before implementing, three design decisions must be settled: (a) whether `--config` and `--config-dir` are mutually exclusive or composable and if so which takes lower precedence; (b) whether a later file's array value (e.g. `compute_drivers`) replaces or appends — replace is simpler and less surprising; (c) `deny_unknown_fields` validation must apply to the final merged result rather than each individual file, since partial drop-in files won't contain all sections.
 3. **`database_url` as a secret** — should `database_url` be excluded from the TOML file schema and forced through environment / secrets injection to prevent accidental plaintext commits? Or is the operator's responsibility sufficient?
