@@ -16,6 +16,7 @@ use tracing::{info, warn};
 
 use crate::ServerState;
 use crate::persistence::{ObjectType, Store};
+use crate::supervisor_session::RelayTarget;
 
 const HEADER_SANDBOX_ID: &str = "x-sandbox-id";
 const HEADER_TOKEN: &str = "x-sandbox-token";
@@ -158,7 +159,7 @@ async fn ssh_connect(
     // direct-connect path tolerated ~34s here for similar reasons.
     let (channel_id, relay_rx) = match state
         .supervisor_sessions
-        .open_relay(&sandbox_id, None, Duration::from_secs(30))
+        .open_relay(&sandbox_id, RelayTarget::Ssh, None, Duration::from_secs(30))
         .await
     {
         Ok(pair) => pair,

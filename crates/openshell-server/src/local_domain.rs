@@ -16,6 +16,7 @@ use tracing::warn;
 
 use crate::ServerState;
 use crate::persistence::{ObjectType, Store};
+use crate::supervisor_session::RelayTarget;
 
 const ENDPOINT_OBJECT_TYPE: &str = "service_endpoint";
 
@@ -128,7 +129,8 @@ async fn proxy_to_endpoint(
         .supervisor_sessions
         .open_relay(
             sandbox.object_id(),
-            Some(target_port),
+            RelayTarget::loopback_tcp(target_port),
+            Some(endpoint.object_id().to_string()),
             Duration::from_secs(15),
         )
         .await

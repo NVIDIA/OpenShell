@@ -108,11 +108,10 @@ service OpenShell {
   // on its ConnectSupervisor stream. The first RelayFrame carries a
   // RelayInit with the channel_id to associate the new HTTP/2 stream with
   // the pending relay slot on the gateway. Subsequent frames carry raw bytes in either
-  // direction between the gateway-side waiter (ssh_tunnel / exec handler)
-  // and the supervisor-side local SSH daemon bridge.
+  // direction between the gateway-side waiter and the supervisor-side local
+  // target bridge.
   //
-  // This rides the same TCP+TLS+HTTP/2 connection as ConnectSupervisor —
-  // no new TLS handshake, no reverse HTTP CONNECT.
+  // This rides the same TCP+TLS+HTTP/2 connection as ConnectSupervisor.
   rpc RelayStream(stream RelayFrame) returns (stream RelayFrame);
 
   // Watch a sandbox and stream updates.
@@ -876,13 +875,27 @@ message GatewayHeartbeat {}
 // On receiving this, the supervisor should initiate a RelayStream RPC to
 // the gateway, sending a RelayInit in the first RelayFrame to associate
 // the new HTTP/2 stream with the pending relay slot. The supervisor
-// bridges that stream to the local SSH daemon.
+// bridges that stream to the requested local target.
 message RelayOpen {
   // Gateway-allocated channel identifier (UUID).
   string channel_id = 1;
-  // Optional loopback TCP target port inside the sandbox. Zero preserves the
-  // existing SSH relay behavior and targets the supervisor's SSH Unix socket.
-  uint32 target_port = 2;
+  // Target the supervisor should dial inside the sandbox.
+  // If absent, supervisors treat the relay as SSH for compatibility.
+  oneof target {
+    SshRelayTarget ssh = 2;
+    TcpRelayTarget tcp = 3;
+  }
+  // Optional service identifier for audit/correlation.
+  string service_id = 5;
+}
+
+// Built-in SSH relay target.
+message SshRelayTarget {}
+
+// TCP target dialed by the supervisor from inside the sandbox.
+message TcpRelayTarget {
+  // Target port. Must fit in u16 and be non-zero.
+  uint32 port = 1;
 }
 
 // Initial RelayStream frame sent by the supervisor to claim a pending relay.

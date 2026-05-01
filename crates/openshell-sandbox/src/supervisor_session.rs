@@ -16,7 +16,7 @@ use std::time::Duration;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
     GatewayMessage, RelayFrame, RelayInit, SupervisorHeartbeat, SupervisorHello, SupervisorMessage,
-    gateway_message, supervisor_message,
+    gateway_message, relay_open, supervisor_message,
 };
 use openshell_ocsf::{
     ActivityId, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext, SeverityId, StatusId,
@@ -302,9 +302,7 @@ fn handle_gateway_message(
         }
         Some(gateway_message::Payload::RelayOpen(open)) => {
             let channel_id = open.channel_id.clone();
-            let target_port = u16::try_from(open.target_port)
-                .ok()
-                .filter(|port| *port > 0);
+            let target = RelayTarget::from_open(open);
             let sandbox_id = sandbox_id.to_string();
             let channel = channel.clone();
             let ssh_socket_path = ssh_socket_path.to_path_buf();
@@ -313,14 +311,8 @@ fn handle_gateway_message(
             ocsf_emit!(event);
 
             tokio::spawn(async move {
-                match handle_relay_open(
-                    &channel_id,
-                    target_port,
-                    &ssh_socket_path,
-                    channel,
-                    netns_fd,
-                )
-                .await
+                match handle_relay_open(&channel_id, target, &ssh_socket_path, channel, netns_fd)
+                    .await
                 {
                     Ok(()) => {
                         let event = relay_closed_event(crate::ocsf_ctx(), &channel_id);
@@ -351,6 +343,24 @@ fn handle_gateway_message(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum RelayTarget {
+    Ssh,
+    Tcp { port: u16 },
+}
+
+impl RelayTarget {
+    fn from_open(open: &openshell_core::proto::RelayOpen) -> Self {
+        match open.target.as_ref() {
+            Some(relay_open::Target::Tcp(target)) => u16::try_from(target.port)
+                .ok()
+                .filter(|port| *port > 0)
+                .map_or(Self::Ssh, |port| Self::Tcp { port }),
+            Some(relay_open::Target::Ssh(_)) | None => Self::Ssh,
+        }
+    }
+}
+
 /// Handle a `RelayOpen` by initiating a `RelayStream` RPC on the gateway and
 /// bridging that stream to the local SSH daemon.
 ///
@@ -359,7 +369,7 @@ fn handle_gateway_message(
 /// frames carry raw SSH bytes in `data`.
 async fn handle_relay_open(
     channel_id: &str,
-    target_port: Option<u16>,
+    target: RelayTarget,
     ssh_socket_path: &std::path::Path,
     channel: Channel,
     netns_fd: Option<RawFd>,
@@ -389,7 +399,7 @@ async fn handle_relay_open(
         .map_err(|e| format!("relay_stream RPC failed: {e}"))?;
     let inbound = response.into_inner();
 
-    if let Some(port) = target_port {
+    if let RelayTarget::Tcp { port } = target {
         let service = connect_target_port(port, netns_fd).await?;
         debug!(channel_id = %channel_id, port = port, "relay bridge: connected to local TCP service");
         bridge_relay_stream(channel_id, inbound, out_tx, service).await
