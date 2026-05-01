@@ -32,6 +32,18 @@ impl DockerServer {
         let script = r#"from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class Handler(BaseHTTPRequestHandler):
+    def read_chunked(self):
+        while True:
+            size_line = self.rfile.readline()
+            if not size_line:
+                return
+            size = int(size_line.split(b";", 1)[0].strip(), 16)
+            if size == 0:
+                while self.rfile.readline().strip():
+                    pass
+                return
+            self.rfile.read(size)
+            self.rfile.read(2)
     def do_GET(self):
         if self.path == "/" or self.path.startswith("/graphql?"):
             self.send_response(200)
@@ -40,7 +52,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'{"ok":true}')
     def do_POST(self):
-        _ = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            self.read_chunked()
+        else:
+            _ = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
