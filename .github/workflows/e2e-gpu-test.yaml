@@ -80,3 +80,45 @@ jobs:
 
       - name: Run tests
         run: mise run --no-deps --skip-deps e2e:python:gpu
+
+      - name: Dump WSL GPU diagnostics
+        if: ${{ failure() && matrix.name == 'wsl-amd64' }}
+        shell: bash
+        run: |
+          set +e
+
+          cluster_container="openshell-cluster-${OPENSHELL_GATEWAY}"
+          kube="KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl"
+
+          echo "::group::Runner and Docker state"
+          uname -a || true
+          docker version || true
+          docker info || true
+          docker ps -a || true
+          docker logs --tail=300 "${cluster_container}" || true
+          echo "::endgroup::"
+
+          echo "::group::Kubernetes cluster state"
+          docker exec "${cluster_container}" sh -lc "${kube} get nodes -o wide" || true
+          docker exec "${cluster_container}" sh -lc "${kube} describe nodes" || true
+          docker exec "${cluster_container}" sh -lc "${kube} get runtimeclass -o yaml" || true
+          docker exec "${cluster_container}" sh -lc "${kube} get pods -A -o wide --show-labels" || true
+          docker exec "${cluster_container}" sh -lc "${kube} get events -A --sort-by=.lastTimestamp" || true
+          echo "::endgroup::"
+
+          echo "::group::OpenShell sandbox state"
+          docker exec "${cluster_container}" sh -lc "${kube} -n openshell get sandboxes -o wide" || true
+          docker exec "${cluster_container}" sh -lc "${kube} -n openshell get sandboxes -o yaml" || true
+          docker exec "${cluster_container}" sh -lc "${kube} -n openshell get pods -o wide --show-labels" || true
+          docker exec "${cluster_container}" sh -lc "${kube} -n openshell describe pods" || true
+          docker exec "${cluster_container}" sh -lc "${kube} -n openshell logs statefulset/openshell --all-containers --tail=500" || true
+          echo "::endgroup::"
+
+          echo "::group::Agent sandbox controller and GPU plugin"
+          docker exec "${cluster_container}" sh -lc "${kube} -n agent-sandbox-system get pods -o wide" || true
+          docker exec "${cluster_container}" sh -lc "${kube} -n agent-sandbox-system describe pods" || true
+          docker exec "${cluster_container}" sh -lc "${kube} -n agent-sandbox-system logs statefulset/agent-sandbox-controller --all-containers --tail=500" || true
+          docker exec "${cluster_container}" sh -lc "${kube} -n nvidia-device-plugin get pods -o wide" || true
+          docker exec "${cluster_container}" sh -lc "${kube} -n nvidia-device-plugin describe pods" || true
+          docker exec "${cluster_container}" sh -lc "${kube} -n nvidia-device-plugin logs daemonset/nvidia-device-plugin --all-containers --tail=300" || true
+          echo "::endgroup::"
