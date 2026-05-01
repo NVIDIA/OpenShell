@@ -60,7 +60,7 @@ pub(super) async fn handle_expose_service(
         sandbox_name: req.sandbox.clone(),
         service_name: req.service.clone(),
         target_port: req.target_port,
-        domain: req.domain,
+        domain: true,
     };
 
     state
@@ -69,11 +69,8 @@ pub(super) async fn handle_expose_service(
         .await
         .map_err(|e| Status::internal(format!("persist endpoint failed: {e}")))?;
 
-    let url = if req.domain {
-        service_routing::endpoint_url(&state.config, &req.sandbox, &req.service).unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let url = service_routing::endpoint_url(&state.config, &req.sandbox, &req.service)
+        .unwrap_or_default();
 
     Ok(Response::new(ServiceEndpointResponse {
         endpoint: Some(endpoint),

@@ -3407,7 +3407,6 @@ pub async fn service_expose(
     sandbox: &str,
     service: &str,
     target_port: u16,
-    domain: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -3416,7 +3415,7 @@ pub async fn service_expose(
             sandbox: sandbox.to_string(),
             service: service.to_string(),
             target_port: u32::from(target_port),
-            domain,
+            domain: true,
         })
         .await
         .map_err(|status| miette::miette!("expose service failed: {status}"))?
