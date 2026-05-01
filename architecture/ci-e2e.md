@@ -19,7 +19,7 @@ These three goals do not compose cleanly: the safety goal forces `push: pull-req
 | `.github/copy-pr-bot.yaml` | (config) | Tells copy-pr-bot to mirror trusted PRs into `pull-request/<N>` branches. Pre-existed. |
 | `.github/workflows/branch-e2e.yml` | `push: pull-request/[0-9]+` + `workflow_dispatch` | Runs non-GPU E2E on `build-arm64`. |
 | `.github/workflows/test-gpu.yml` | `push: pull-request/[0-9]+` + `workflow_dispatch` | Runs GPU E2E on self-hosted GPU runners. |
-| `.github/workflows/shadow-branch-e2e.yml`, `.github/workflows/shadow-e2e-test.yml` | `push: pull-request/[0-9]+` + `workflow_dispatch` | Non-required shared-runner E2E shadow coverage for OS-49 Phase 5. |
+| `.github/workflows/shadow-branch-e2e.yml` | `push: pull-request/[0-9]+` + `workflow_dispatch` | Non-required shared-runner E2E shadow coverage for OS-49 Phase 5. |
 | `.github/actions/pr-gate/action.yml` | (composite) | Resolves PR metadata for a `pull-request/<N>` push and decides whether the run should proceed. Label enforcement is optional, so non-required shadows can validate mirror metadata without introducing another PR label. |
 | `.github/workflows/e2e-gate.yml` | `pull_request` + `workflow_run` | Posts the required `E2E Gate` check on the PR. Re-evaluates after the gated workflow completes. |
 | `.github/workflows/e2e-gate-check.yml` | `workflow_call` | Reusable gate logic shared by E2E and GPU E2E. |
@@ -30,7 +30,7 @@ These three goals do not compose cleanly: the safety goal forces `push: pull-req
 
 OS-49 Phase 5 adds non-required shadow workflows for the non-release workflows being prepared for shared-runner cutover. They all use `workflow_dispatch` for manual bake runs and `push: pull-request/[0-9]+` for copy-pr-bot mirrored PRs.
 
-`shadow-branch-checks.yml` and `shadow-ci-image.yml` use `pr-gate` without a required label. That still verifies the mirror SHA matches the source PR head SHA, but does not require a new GitHub label for every ordinary CI shadow run. `shadow-branch-e2e.yml` and `shadow-e2e-test.yml` keep the existing `test:e2e` gate because they publish temporary images and run the expensive E2E suite.
+`shadow-branch-checks.yml` and `shadow-ci-image.yml` use `pr-gate` without a required label. That still verifies the mirror SHA matches the source PR head SHA, but does not require a new GitHub label for every ordinary CI shadow run. `shadow-branch-e2e.yml` keeps the existing `test:e2e` gate because it publishes temporary images and runs the expensive E2E suite. It shadows the top-level `branch-e2e.yml` workflow, which already exercises the reusable `e2e-test.yml` worker path, so Phase 5 does not keep a second direct `e2e-test.yml` shadow workflow.
 
 ## Trigger taxonomy
 
