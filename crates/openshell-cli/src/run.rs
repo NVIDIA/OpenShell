@@ -1053,9 +1053,14 @@ pub async fn gateway_add(
     }
 
     // Derive a gateway name from the hostname when none is provided.
+    // Loopback endpoints use the canonical "openshell" name, matching the
+    // convention in init-pki.sh, default_tls_dir, and bootstrap.
     let derived_name;
     let name = if let Some(n) = name {
         n
+    } else if is_loopback_gateway_endpoint(&endpoint) {
+        derived_name = "openshell".to_string();
+        &derived_name
     } else {
         // Parse out just the host portion of the URL.
         derived_name = url::Url::parse(&endpoint)
@@ -6667,12 +6672,14 @@ mod tests {
                 .expect("register plaintext gateway");
             });
 
-            let metadata = load_gateway_metadata("127.0.0.1").expect("load stored gateway");
+            // Loopback endpoints derive the canonical "openshell" gateway
+            // name, matching init-pki.sh and default_tls_dir conventions.
+            let metadata = load_gateway_metadata("openshell").expect("load stored gateway");
             assert_eq!(metadata.auth_mode.as_deref(), Some("plaintext"));
             assert!(!metadata.is_remote);
             assert_eq!(metadata.client_lifecycle_managed, Some(false));
             assert_eq!(metadata.gateway_endpoint, "http://127.0.0.1:8080");
-            assert_eq!(load_active_gateway().as_deref(), Some("127.0.0.1"));
+            assert_eq!(load_active_gateway().as_deref(), Some("openshell"));
         });
     }
 

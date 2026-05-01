@@ -589,9 +589,9 @@ mod tests {
     fn grpc_endpoint_https_with_tls() {
         let mut cfg = PodmanComputeConfig {
             gateway_port: 8080,
-            guest_tls_ca: Some(std::path::PathBuf::from("/tls/ca.crt")),
-            guest_tls_cert: Some(std::path::PathBuf::from("/tls/tls.crt")),
-            guest_tls_key: Some(std::path::PathBuf::from("/tls/tls.key")),
+            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
+            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
+            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
             ..PodmanComputeConfig::default()
         };
         if cfg.grpc_endpoint.is_empty() {
@@ -605,7 +605,7 @@ mod tests {
     fn grpc_endpoint_partial_tls_falls_back_to_http() {
         let mut cfg = PodmanComputeConfig {
             gateway_port: 8080,
-            guest_tls_ca: Some(std::path::PathBuf::from("/tls/ca.crt")),
+            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
             // guest_tls_cert and guest_tls_key not set — incomplete TLS config.
             ..PodmanComputeConfig::default()
         };

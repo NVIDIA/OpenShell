@@ -10,6 +10,25 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+/// Returns `true` when `SELinux` is enabled (enforcing or permissive).
+///
+/// Checks whether selinuxfs is mounted, matching Podman's own detection
+/// logic. Bind-mount relabeling (the `z` mount option) is needed in both
+/// enforcing and permissive modes: enforcing blocks access outright, while
+/// permissive floods the audit log with AVC denials that mask real issues.
+///
+/// On non-`SELinux` systems (Ubuntu, macOS, Alpine) the directory does not
+/// exist and this returns `false`, leaving mount options unchanged.
+#[cfg(target_os = "linux")]
+fn is_selinux_enabled() -> bool {
+    std::path::Path::new("/sys/fs/selinux").is_dir()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_selinux_enabled() -> bool {
+    false
+}
+
 /// Label key for the sandbox ID.
 pub const LABEL_SANDBOX_ID: &str = "openshell.sandbox-id";
 /// Label key for the sandbox name.
@@ -518,7 +537,13 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
                 &config.guest_tls_cert,
                 &config.guest_tls_key,
             ) {
-                let ro = vec!["ro".into(), "rbind".into()];
+                let mut ro = vec!["ro".into(), "rbind".into()];
+                // On SELinux-enabled systems (Fedora, RHEL), bind-mounted
+                // files need the shared relabel option so the container
+                // process can read them through the SELinux MAC policy.
+                if is_selinux_enabled() {
+                    ro.push("z".into());
+                }
                 m.push(Mount {
                     kind: "bind".into(),
                     source: ca.display().to_string(),
@@ -981,6 +1006,22 @@ mod tests {
         assert!(
             bind_dests.contains(&"/etc/openshell/tls/client/tls.key"),
             "should bind-mount client key"
+        );
+
+        // Verify SELinux relabel option is present iff SELinux is enabled.
+        let tls_binds: Vec<&Value> = mounts
+            .iter()
+            .filter(|m| m["type"].as_str() == Some("bind"))
+            .collect();
+        let has_z = tls_binds.iter().all(|m| {
+            m["options"]
+                .as_array()
+                .is_some_and(|opts| opts.iter().any(|o| o.as_str() == Some("z")))
+        });
+        assert_eq!(
+            has_z,
+            is_selinux_enabled(),
+            "TLS bind mounts should include 'z' option iff SELinux is enabled"
         );
     }
 
