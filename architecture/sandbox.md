@@ -1032,7 +1032,7 @@ flowchart LR
 | `L7Protocol` | `Rest`, `Graphql`, `Sql` | Supported application protocols |
 | `TlsMode` | `Auto` (default), `Skip` | TLS handling strategy — `Auto` peeks first bytes and terminates if TLS is detected; `Skip` bypasses detection entirely |
 | `EnforcementMode` | `Audit`, `Enforce` | What to do on L7 deny (log-only vs block) |
-| `L7EndpointConfig` | `{ protocol, tls, enforcement, allow_encoded_slash, graphql_max_body_bytes }` | Per-endpoint L7 configuration |
+| `L7EndpointConfig` | `{ protocol, path, tls, enforcement, allow_encoded_slash, graphql_max_body_bytes }` | Per-endpoint L7 configuration, including optional path scoping for shared host:port APIs |
 | `L7Decision` | `{ allowed, reason, matched_rule }` | Result of L7 evaluation |
 | `L7RequestInfo` | `{ action, target, query_params, graphql }` | HTTP method, path, decoded query multimap, and optional GraphQL classification for policy evaluation |
 

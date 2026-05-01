@@ -3570,6 +3570,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
+ "glob",
  "hex",
  "hmac",
  "ipnet",

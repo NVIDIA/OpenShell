@@ -680,7 +680,7 @@ async fn handle_tcp_connection(
     // so log consumers can distinguish L4-only decisions from tunnel lifecycle events.
     let connect_msg = if l7_route
         .as_ref()
-        .is_some_and(|route| route.config.is_some())
+        .is_some_and(|route| !route.configs.is_empty())
     {
         "CONNECT_L7"
     } else {
@@ -766,24 +766,39 @@ async fn handle_tcp_connection(
                     crate::l7::tls::tls_connect_upstream(upstream, &host_lc, tls.upstream_config())
                         .await?;
 
-                if let Some(l7_config) = l7_route.as_ref().and_then(|route| route.config.as_ref()) {
+                if let Some(route) = l7_route.as_ref().filter(|route| !route.configs.is_empty()) {
                     // L7 inspection on terminated TLS traffic.
-                    let tunnel_engine =
-                        match opa_engine.clone_engine_for_tunnel(l7_config.generation) {
-                            Ok(engine) => engine,
-                            Err(e) => {
-                                emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
-                                return Ok(());
-                            }
-                        };
-                    crate::l7::relay::relay_with_inspection(
-                        &l7_config.config,
-                        tunnel_engine,
-                        &mut tls_client,
-                        &mut tls_upstream,
-                        &ctx,
-                    )
-                    .await
+                    let tunnel_engine = match opa_engine.clone_engine_for_tunnel(route.generation) {
+                        Ok(engine) => engine,
+                        Err(e) => {
+                            emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+                            return Ok(());
+                        }
+                    };
+                    if route.configs.len() == 1 {
+                        crate::l7::relay::relay_with_inspection(
+                            &route.configs[0].config,
+                            tunnel_engine,
+                            &mut tls_client,
+                            &mut tls_upstream,
+                            &ctx,
+                        )
+                        .await
+                    } else {
+                        let configs: Vec<crate::l7::L7EndpointConfig> = route
+                            .configs
+                            .iter()
+                            .map(|snapshot| snapshot.config.clone())
+                            .collect();
+                        crate::l7::relay::relay_with_route_selection(
+                            &configs,
+                            tunnel_engine,
+                            &mut tls_client,
+                            &mut tls_upstream,
+                            &ctx,
+                        )
+                        .await
+                    }
                 } else {
                     // No L7 config — relay with credential injection only.
                     let generation = l7_route
@@ -843,23 +858,39 @@ async fn handle_tcp_connection(
         }
     } else if is_http {
         // Plaintext HTTP detected.
-        if let Some(l7_config) = l7_route.as_ref().and_then(|route| route.config.as_ref()) {
-            let tunnel_engine = match opa_engine.clone_engine_for_tunnel(l7_config.generation) {
+        if let Some(route) = l7_route.as_ref().filter(|route| !route.configs.is_empty()) {
+            let tunnel_engine = match opa_engine.clone_engine_for_tunnel(route.generation) {
                 Ok(engine) => engine,
                 Err(e) => {
                     emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
                     return Ok(());
                 }
             };
-            if let Err(e) = crate::l7::relay::relay_with_inspection(
-                &l7_config.config,
-                tunnel_engine,
-                &mut client,
-                &mut upstream,
-                &ctx,
-            )
-            .await
-            {
+            let relay_result = if route.configs.len() == 1 {
+                crate::l7::relay::relay_with_inspection(
+                    &route.configs[0].config,
+                    tunnel_engine,
+                    &mut client,
+                    &mut upstream,
+                    &ctx,
+                )
+                .await
+            } else {
+                let configs: Vec<crate::l7::L7EndpointConfig> = route
+                    .configs
+                    .iter()
+                    .map(|snapshot| snapshot.config.clone())
+                    .collect();
+                crate::l7::relay::relay_with_route_selection(
+                    &configs,
+                    tunnel_engine,
+                    &mut client,
+                    &mut upstream,
+                    &ctx,
+                )
+                .await
+            };
+            if let Err(e) = relay_result {
                 if is_benign_relay_error(&e) {
                     debug!(host = %host_lc, port = port, error = %e, "L7 connection closed");
                 } else {
@@ -1619,12 +1650,11 @@ async fn write_all(writer: &mut (impl tokio::io::AsyncWrite + Unpin), data: &[u8
 #[derive(Debug, Clone)]
 struct L7ConfigSnapshot {
     config: crate::l7::L7EndpointConfig,
-    generation: u64,
 }
 
 #[derive(Debug, Clone)]
 struct L7RouteSnapshot {
-    config: Option<L7ConfigSnapshot>,
+    configs: Vec<L7ConfigSnapshot>,
     generation: u64,
 }
 
@@ -1671,14 +1701,13 @@ fn query_l7_route_snapshot(
         cmdline_paths: decision.cmdline_paths.clone(),
     };
 
-    match engine.query_endpoint_config_with_generation(&input) {
-        Ok((Some(val), generation)) => Some(L7RouteSnapshot {
-            config: crate::l7::parse_l7_config(&val)
-                .map(|config| L7ConfigSnapshot { config, generation }),
-            generation,
-        }),
-        Ok((None, generation)) => Some(L7RouteSnapshot {
-            config: None,
+    match engine.query_endpoint_configs_with_generation(&input) {
+        Ok((vals, generation)) => Some(L7RouteSnapshot {
+            configs: vals
+                .into_iter()
+                .filter_map(|val| crate::l7::parse_l7_config(&val))
+                .map(|config| L7ConfigSnapshot { config })
+                .collect(),
             generation,
         }),
         Err(e) => {
@@ -1693,6 +1722,16 @@ fn query_l7_route_snapshot(
             None
         }
     }
+}
+
+fn select_l7_config_for_path<'a>(
+    configs: &'a [L7ConfigSnapshot],
+    path: &str,
+) -> Option<&'a L7ConfigSnapshot> {
+    configs
+        .iter()
+        .filter(|snapshot| snapshot.config.matches_path(path))
+        .max_by_key(|snapshot| snapshot.config.path_specificity())
 }
 
 /// Query the TLS mode for an endpoint, independent of L7 config.
@@ -2540,16 +2579,16 @@ async fn handle_forward_proxy(
     //     L7 policy.  The forward proxy handles exactly one request per
     //     connection (Connection: close), so a single evaluation suffices.
     if let Some(route) = query_l7_route_snapshot(&opa_engine, &decision, &host_lc, port)
-        && let Some(l7_config) = route.config
+        && !route.configs.is_empty()
     {
-        if l7_config.generation != forward_generation_guard.captured_generation() {
+        if route.generation != forward_generation_guard.captured_generation() {
             emit_l7_tunnel_close_after_policy_change(
                 &host_lc,
                 port,
                 miette::miette!(
                     "policy changed before forward L7 evaluation [expected_generation:{} current_generation:{}]",
                     forward_generation_guard.captured_generation(),
-                    l7_config.generation,
+                    route.generation,
                 ),
             );
             respond(
@@ -2564,7 +2603,7 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         }
-        let tunnel_engine = match opa_engine.clone_engine_for_tunnel(l7_config.generation) {
+        let tunnel_engine = match opa_engine.clone_engine_for_tunnel(route.generation) {
             Ok(engine) => engine,
             Err(e) => {
                 emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
@@ -2612,7 +2651,10 @@ async fn handle_forward_proxy(
         // while the upstream re-normalizes the raw input and dispatches on a
         // potentially different path.
         let canonicalize_options = crate::l7::path::CanonicalizeOptions {
-            allow_encoded_slash: l7_config.config.allow_encoded_slash,
+            allow_encoded_slash: route
+                .configs
+                .iter()
+                .any(|snapshot| snapshot.config.allow_encoded_slash),
             ..Default::default()
         };
         let query_params =
@@ -2656,7 +2698,20 @@ async fn handle_forward_proxy(
                     return Ok(());
                 }
             };
-        let graphql = if l7_config.protocol == crate::l7::L7Protocol::Graphql {
+        let Some(l7_config) = select_l7_config_for_path(&route.configs, &path) else {
+            respond(
+                client,
+                &build_json_error_response(
+                    403,
+                    "Forbidden",
+                    "policy_denied",
+                    &format!("{method} {host_lc}:{port}{path} did not match an L7 endpoint path"),
+                ),
+            )
+            .await?;
+            return Ok(());
+        };
+        let graphql = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
             let header_end = forward_request_bytes
                 .windows(4)
                 .position(|w| w == b"\r\n\r\n")
@@ -2674,7 +2729,7 @@ async fn handle_forward_proxy(
             let info = match crate::l7::graphql::inspect_graphql_request(
                 client,
                 &mut graphql_request,
-                l7_config.graphql_max_body_bytes,
+                l7_config.config.graphql_max_body_bytes,
             )
             .await
             {
@@ -2713,21 +2768,32 @@ async fn handle_forward_proxy(
             graphql,
         };
 
-        let (allowed, reason) =
-            crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
-                .unwrap_or_else(|e| {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Low)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .message(format!("L7 eval failed, denying request: {e}"))
-                        .build();
-                    ocsf_emit!(event);
-                    (false, format!("L7 evaluation error: {e}"))
-                });
+        let parse_error_reason = request_info
+            .graphql
+            .as_ref()
+            .and_then(|info| info.error.as_deref())
+            .map(|error| format!("GraphQL request rejected: {error}"));
+        let force_deny = parse_error_reason.is_some();
+        let (allowed, reason) = parse_error_reason.map_or_else(
+            || {
+                crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
+                    .unwrap_or_else(|e| {
+                        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::Low)
+                            .status(StatusId::Failure)
+                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                            .message(format!("L7 eval failed, denying request: {e}"))
+                            .build();
+                        ocsf_emit!(event);
+                        (false, format!("L7 evaluation error: {e}"))
+                    })
+            },
+            |reason| (false, reason),
+        );
 
         let decision_str = match (allowed, l7_config.config.enforcement) {
+            (_, _) if force_deny => "deny",
             (true, _) => "allow",
             (false, crate::l7::EnforcementMode::Audit) => "audit",
             (false, crate::l7::EnforcementMode::Enforce) => "deny",
@@ -2747,12 +2813,12 @@ async fn handle_forward_proxy(
                     SeverityId::Informational,
                 ),
             };
-            let engine_type = if l7_config.protocol == crate::l7::L7Protocol::Graphql {
+            let engine_type = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
                 "l7-graphql"
             } else {
                 "l7"
             };
-            let message_prefix = if l7_config.protocol == crate::l7::L7Protocol::Graphql {
+            let message_prefix = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
                 "FORWARD_GRAPHQL_L7"
             } else {
                 "FORWARD_L7"
@@ -2780,8 +2846,8 @@ async fn handle_forward_proxy(
             ocsf_emit!(event);
         }
 
-        let effectively_denied =
-            !allowed && l7_config.config.enforcement == crate::l7::EnforcementMode::Enforce;
+        let effectively_denied = force_deny
+            || (!allowed && l7_config.config.enforcement == crate::l7::EnforcementMode::Enforce);
 
         if effectively_denied {
             emit_denial_simple(
@@ -3183,6 +3249,40 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn l7_route_selection_prefers_path_specific_graphql_endpoint() {
+        let configs = vec![
+            L7ConfigSnapshot {
+                config: crate::l7::L7EndpointConfig {
+                    protocol: crate::l7::L7Protocol::Rest,
+                    path: "/**".to_string(),
+                    tls: crate::l7::TlsMode::Auto,
+                    enforcement: crate::l7::EnforcementMode::Enforce,
+                    graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+                    allow_encoded_slash: false,
+                },
+            },
+            L7ConfigSnapshot {
+                config: crate::l7::L7EndpointConfig {
+                    protocol: crate::l7::L7Protocol::Graphql,
+                    path: "/graphql".to_string(),
+                    tls: crate::l7::TlsMode::Auto,
+                    enforcement: crate::l7::EnforcementMode::Enforce,
+                    graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+                    allow_encoded_slash: false,
+                },
+            },
+        ];
+
+        let selected =
+            select_l7_config_for_path(&configs, "/graphql").expect("expected path-specific route");
+        assert_eq!(selected.config.protocol, crate::l7::L7Protocol::Graphql);
+
+        let selected =
+            select_l7_config_for_path(&configs, "/repos/org/repo").expect("expected REST route");
+        assert_eq!(selected.config.protocol, crate::l7::L7Protocol::Rest);
+    }
 
     // -- is_internal_ip: IPv4 --
 

@@ -179,7 +179,7 @@ default allow_request = false
 _policy_allows_l7(policy) if {
 	some ep
 	ep := policy.endpoints[_]
-	endpoint_matches_request(ep, input.network)
+	endpoint_matches_l7_request(ep, input.network, input.request)
 	request_allowed_for_endpoint(input.request, ep)
 }
 
@@ -207,7 +207,7 @@ default deny_request = false
 _policy_denies_l7(policy) if {
 	some ep
 	ep := policy.endpoints[_]
-	endpoint_matches_request(ep, input.network)
+	endpoint_matches_l7_request(ep, input.network, input.request)
 	request_denied_for_endpoint(input.request, ep)
 }
 
@@ -248,6 +248,16 @@ request_denied_for_endpoint(request, endpoint) if {
 	deny_rule.operation_type
 	op := request.graphql.operations[_]
 	graphql_deny_rule_matches_operation(op, deny_rule, endpoint)
+}
+
+# A GraphQL endpoint path is authoritative once it matches. If the parsed
+# GraphQL request is malformed, hash-only without a trusted registry entry, or
+# contains an operation outside the GraphQL allow rules, a broader REST rule on
+# the same host:port must not allow it through.
+request_denied_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "graphql"
+	is_object(request.graphql)
+	not graphql_request_allowed(request, endpoint)
 }
 
 # Deny query matching: fail-closed semantics.
@@ -314,7 +324,7 @@ request_deny_reason := reason if {
 	input.request
 	deny_request
 	graphql_request_has_operations(input.request)
-	reason := "GraphQL operation blocked by deny rule"
+	reason := "GraphQL operation blocked by endpoint policy"
 }
 
 request_deny_reason := reason if {
@@ -630,6 +640,21 @@ endpoint_matches_request(ep, network) if {
 	object.get(ep, "host", "") == ""
 	count(object.get(ep, "allowed_ips", [])) > 0
 	ep.ports[_] == network.port
+}
+
+endpoint_matches_l7_request(ep, network, request) if {
+	endpoint_matches_request(ep, network)
+	endpoint_path_matches_request(ep, request)
+}
+
+endpoint_path_matches_request(ep, request) if {
+	object.get(ep, "path", "") == ""
+}
+
+endpoint_path_matches_request(ep, request) if {
+	path := object.get(ep, "path", "")
+	path != ""
+	path_matches(request.path, path)
 }
 
 # An endpoint has extended config if it specifies L7 protocol, allowed_ips,

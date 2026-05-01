@@ -469,6 +469,7 @@ Each endpoint defines a network destination and, optionally, L7 inspection behav
 | `host`         | `string`   | _(required)_    | Hostname or glob pattern to match (case-insensitive). Supports wildcards (`*.example.com`). Optional when `allowed_ips` is set (see [Hostless Endpoints](#hostless-endpoints-allowed_ips-without-host)). See [Host Wildcards](#host-wildcards). |
 | `port`         | `integer`  | _(required)_    | TCP port to match. Mutually exclusive with `ports` — if both are set, `ports` takes precedence. See [Multi-Port Endpoints](#multi-port-endpoints). |
 | `ports`        | `integer[]`| `[]`            | Multiple TCP ports to match. When non-empty, the endpoint covers all listed ports. Backwards compatible with `port`. See [Multi-Port Endpoints](#multi-port-endpoints). |
+| `path`         | `string`   | `""`            | Optional HTTP path glob for L7 endpoint selection when multiple protocols share a host:port, such as `/repos/**` and `/graphql`. Empty matches all paths. |
 | `protocol`     | `string`   | `""`            | Application protocol for L7 inspection. See [Behavioral Trigger: L7 Inspection](#behavioral-trigger-l7-inspection). |
 | `tls`          | `string`   | `""` (auto)      | TLS handling mode. Absent or empty: auto-detect and terminate TLS if detected. `"skip"`: bypass TLS detection entirely. `"terminate"` and `"passthrough"` are deprecated (treated as auto). See [Behavioral Trigger: TLS Handling](#behavioral-trigger-tls-handling). |
 | `enforcement`  | `string`   | `"audit"`       | L7 enforcement mode: `"enforce"` or `"audit"`                                                                       |
@@ -739,7 +740,7 @@ flowchart LR
 
 This is the single most important behavioral trigger in the policy language. An endpoint with no `protocol` field passes traffic opaquely after the L4 (CONNECT) check. Adding `protocol: rest` or `protocol: graphql` activates per-request HTTP parsing and policy evaluation inside the proxy.
 
-**Implementation path**: After L4 CONNECT is allowed, the proxy calls `query_l7_route_snapshot()` which evaluates the Rego rule `data.openshell.sandbox.matched_endpoint_config` and records the policy generation. If an endpoint `protocol` config is returned, the proxy enters `relay_with_inspection()` instead of `copy_bidirectional()`. See `crates/openshell-sandbox/src/proxy.rs` -- `handle_tcp_connection()`.
+**Implementation path**: After L4 CONNECT is allowed, the proxy calls `query_l7_route_snapshot()` which evaluates the Rego rule `data.openshell.sandbox._matching_endpoint_configs` and records the policy generation. If one or more endpoint `protocol` configs are returned, the proxy enters path-aware L7 route selection instead of `copy_bidirectional()`. See `crates/openshell-sandbox/src/proxy.rs` -- `handle_tcp_connection()`.
 
 For L7-inspected CONNECT tunnels, the proxy binds endpoint config and the per-tunnel policy engine clone to the policy generation observed at tunnel setup. If a live policy reload advances the generation, the relay closes the existing keep-alive tunnel before forwarding another request. HTTP passthrough tunnels without endpoint `protocol` use the same generation guard for parsed requests even though they do not evaluate L7 OPA rules. Clients should reconnect so the next request is evaluated under the current policy.
 

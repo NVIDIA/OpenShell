@@ -125,6 +125,247 @@ where
     }
 }
 
+/// Run HTTP L7 inspection with per-request protocol selection.
+///
+/// This is used when multiple L7 endpoints share a host:port, for example a
+/// REST API under `/repos/**` and a GraphQL API under `/graphql`.
+pub async fn relay_with_route_selection<C, U>(
+    configs: &[L7EndpointConfig],
+    engine: TunnelPolicyEngine,
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let provider =
+        crate::l7::rest::RestProvider::with_options(crate::l7::path::CanonicalizeOptions {
+            allow_encoded_slash: configs.iter().any(|config| config.allow_encoded_slash),
+            ..Default::default()
+        });
+
+    loop {
+        if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
+
+        let mut req = match provider.parse_request(client).await {
+            Ok(Some(req)) => req,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                if is_benign_connection_error(&e) {
+                    debug!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %e,
+                        "L7 route-selected connection closed"
+                    );
+                } else {
+                    let detail =
+                        parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
+                    emit_parse_rejection(ctx, &detail, "l7");
+                }
+                return Ok(());
+            }
+        };
+
+        let Some(config) = select_l7_config_for_path(configs, &req.target) else {
+            crate::l7::rest::RestProvider::default()
+                .deny(
+                    &req,
+                    &ctx.policy_name,
+                    "no L7 endpoint path matched request",
+                    client,
+                )
+                .await?;
+            return Ok(());
+        };
+
+        let graphql_info = if config.protocol == L7Protocol::Graphql {
+            match crate::l7::graphql::inspect_graphql_request(
+                client,
+                &mut req,
+                config.graphql_max_body_bytes,
+            )
+            .await
+            {
+                Ok(info) => Some(info),
+                Err(e) => {
+                    if is_benign_connection_error(&e) {
+                        debug!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            error = %e,
+                            "GraphQL L7 connection closed"
+                        );
+                    } else {
+                        let detail =
+                            parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
+                        emit_parse_rejection(ctx, &detail, "l7-graphql");
+                    }
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
+        if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
+
+        let (eval_target, redacted_target) = if let Some(ref resolver) = ctx.secret_resolver {
+            match secrets::rewrite_target_for_eval(&req.target, resolver) {
+                Ok(result) => (result.resolved, result.redacted),
+                Err(e) => {
+                    warn!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %e,
+                        "credential resolution failed in request target, rejecting"
+                    );
+                    let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    client.write_all(response).await.into_diagnostic()?;
+                    client.flush().await.into_diagnostic()?;
+                    return Ok(());
+                }
+            }
+        } else {
+            (req.target.clone(), req.target.clone())
+        };
+
+        let request_info = L7RequestInfo {
+            action: req.action.clone(),
+            target: redacted_target.clone(),
+            query_params: req.query_params.clone(),
+            graphql: graphql_info.clone(),
+        };
+
+        let parse_error_reason = graphql_info
+            .as_ref()
+            .and_then(|info| info.error.as_deref())
+            .map(|error| format!("GraphQL request rejected: {error}"));
+        let force_deny = parse_error_reason.is_some();
+        let (allowed, reason) = if let Some(reason) = parse_error_reason {
+            (false, reason)
+        } else {
+            evaluate_l7_request(&engine, ctx, &request_info)?
+        };
+
+        if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
+
+        let decision_str = match (allowed, config.enforcement) {
+            (_, _) if force_deny => "deny",
+            (true, _) => "allow",
+            (false, EnforcementMode::Audit) => "audit",
+            (false, EnforcementMode::Enforce) => "deny",
+        };
+        let engine_type = if config.protocol == L7Protocol::Graphql {
+            "l7-graphql"
+        } else {
+            "l7"
+        };
+        emit_l7_request_log(
+            ctx,
+            &request_info,
+            &redacted_target,
+            decision_str,
+            engine_type,
+            &reason,
+            graphql_info.as_ref(),
+        );
+
+        let _ = &eval_target;
+
+        if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
+            let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+                &req,
+                client,
+                upstream,
+                ctx.secret_resolver.as_deref(),
+                Some(engine.generation_guard()),
+            )
+            .await?;
+            match outcome {
+                RelayOutcome::Reusable => {}
+                RelayOutcome::Consumed => return Ok(()),
+                RelayOutcome::Upgraded { overflow } => {
+                    return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+                }
+            }
+        } else {
+            crate::l7::rest::RestProvider::default()
+                .deny_with_redacted_target(
+                    &req,
+                    &ctx.policy_name,
+                    &reason,
+                    client,
+                    Some(&redacted_target),
+                )
+                .await?;
+            return Ok(());
+        }
+    }
+}
+
+fn select_l7_config_for_path<'a>(
+    configs: &'a [L7EndpointConfig],
+    path: &str,
+) -> Option<&'a L7EndpointConfig> {
+    configs
+        .iter()
+        .filter(|config| config.matches_path(path))
+        .max_by_key(|config| config.path_specificity())
+}
+
+fn emit_l7_request_log(
+    ctx: &L7EvalContext,
+    request_info: &L7RequestInfo,
+    redacted_target: &str,
+    decision_str: &str,
+    engine_type: &str,
+    reason: &str,
+    graphql_info: Option<&crate::l7::graphql::GraphqlRequestInfo>,
+) {
+    let (action_id, disposition_id, severity) = match decision_str {
+        "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
+        "allow" | "audit" => (
+            ActionId::Allowed,
+            DispositionId::Allowed,
+            SeverityId::Informational,
+        ),
+        _ => (
+            ActionId::Other,
+            DispositionId::Other,
+            SeverityId::Informational,
+        ),
+    };
+    let summary = graphql_info
+        .map(|info| format!(" {}", graphql_log_summary(info)))
+        .unwrap_or_default();
+    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+        .activity(ActivityId::Other)
+        .action(action_id)
+        .disposition(disposition_id)
+        .severity(severity)
+        .http_request(HttpRequest::new(
+            &request_info.action,
+            OcsfUrl::new("http", &ctx.host, redacted_target, ctx.port),
+        ))
+        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+        .firewall_rule(&ctx.policy_name, engine_type)
+        .message(format!(
+            "L7_REQUEST {decision_str} {} {}:{}{}{} reason={}",
+            request_info.action, ctx.host, ctx.port, redacted_target, summary, reason,
+        ))
+        .build();
+    ocsf_emit!(event);
+}
+
 /// Handle an upgraded connection (101 Switching Protocols).
 ///
 /// Forwards any overflow bytes from the upgrade response to the client, then

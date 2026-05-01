@@ -61,6 +61,9 @@ pub enum EnforcementMode {
 #[derive(Debug, Clone)]
 pub struct L7EndpointConfig {
     pub protocol: L7Protocol,
+    /// Optional endpoint-level HTTP path glob used to select between L7
+    /// protocols that share the same host:port.
+    pub path: String,
     pub tls: TlsMode,
     pub enforcement: EnforcementMode,
     /// Maximum GraphQL request body bytes to buffer for inspection.
@@ -142,11 +145,39 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
 
     Some(L7EndpointConfig {
         protocol,
+        path: get_object_str(val, "path").unwrap_or_default(),
         tls,
         enforcement,
         graphql_max_body_bytes,
         allow_encoded_slash,
     })
+}
+
+impl L7EndpointConfig {
+    pub fn matches_path(&self, path: &str) -> bool {
+        endpoint_path_matches(&self.path, path)
+    }
+
+    pub fn path_specificity(&self) -> usize {
+        if self.path.is_empty() {
+            0
+        } else {
+            self.path.chars().filter(|c| *c != '*').count()
+        }
+    }
+}
+
+pub fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
+    if pattern.is_empty() || pattern == "**" || pattern == "/**" {
+        return true;
+    }
+    if pattern == path {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return path == prefix || path.starts_with(&format!("{prefix}/"));
+    }
+    glob::Pattern::new(pattern).is_ok_and(|glob| glob.matches(path))
 }
 
 /// Parse the `tls` field from an endpoint config, independent of L7 protocol.
@@ -352,6 +383,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 .and_then(|v| v.as_array())
                 .is_some_and(|a| !a.is_empty());
             let host = ep.get("host").and_then(|v| v.as_str()).unwrap_or("");
+            let endpoint_path = ep.get("path").and_then(|v| v.as_str()).unwrap_or("");
 
             // Read ports from either "ports" array or scalar "port".
             let ports: Vec<u64> = ep.get("ports").and_then(|v| v.as_array()).map_or_else(
@@ -365,6 +397,17 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 |arr| arr.iter().filter_map(serde_json::Value::as_u64).collect(),
             );
             let loc = format!("{name}.endpoints[{i}]");
+
+            if !endpoint_path.is_empty() {
+                if !endpoint_path.starts_with('/') && endpoint_path != "**" {
+                    errors.push(format!(
+                        "{loc}: endpoint path must start with '/' or be '**', got '{endpoint_path}'"
+                    ));
+                }
+                if let Some(warning) = check_glob_syntax(endpoint_path) {
+                    warnings.push(format!("{loc}.path: {warning}"));
+                }
+            }
 
             // Validate host wildcard patterns.
             if host.contains('*') {

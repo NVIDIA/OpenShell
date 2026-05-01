@@ -89,6 +89,8 @@ struct NetworkPolicyRuleDef {
 struct NetworkEndpointDef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     host: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    path: String,
     /// Single port (backwards compat). Mutually exclusive with `ports`.
     /// Uses `u16` to reject invalid values >65535 at parse time.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -245,6 +247,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                         };
                         NetworkEndpoint {
                             host: e.host,
+                            path: e.path,
                             port: normalized_ports.first().copied().unwrap_or(0),
                             ports: normalized_ports,
                             protocol: e.protocol,
@@ -409,6 +412,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                         };
                         NetworkEndpointDef {
                             host: e.host.clone(),
+                            path: e.path.clone(),
                             port,
                             ports,
                             protocol: e.protocol.clone(),
@@ -1390,6 +1394,34 @@ network_policies:
         let ep = &policy.network_policies["test"].endpoints[0];
         assert_eq!(ep.ports, vec![443]);
         assert_eq!(ep.port, 443);
+    }
+
+    #[test]
+    fn round_trip_preserves_endpoint_path() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    name: test
+    endpoints:
+      - host: api.example.com
+        port: 443
+        path: "/graphql"
+        protocol: graphql
+        rules:
+          - allow:
+              operation_type: query
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep1 = &proto1.network_policies["test"].endpoints[0];
+        let ep2 = &proto2.network_policies["test"].endpoints[0];
+        assert_eq!(ep1.path, "/graphql");
+        assert_eq!(ep1.path, ep2.path);
     }
 
     #[test]

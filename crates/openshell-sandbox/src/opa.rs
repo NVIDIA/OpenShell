@@ -491,6 +491,15 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(Option<regorus::Value>, u64)> {
+        let (configs, generation) = self.query_endpoint_configs_with_generation(input)?;
+        Ok((configs.into_iter().next(), generation))
+    }
+
+    /// Query all matching endpoint configs and return the policy generation used for the query.
+    pub fn query_endpoint_configs_with_generation(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<(Vec<regorus::Value>, u64)> {
         let ancestor_strs: Vec<String> = input
             .ancestors
             .iter()
@@ -524,13 +533,13 @@ impl OpaEngine {
             .map_err(|e| miette::miette!("{e}"))?;
 
         let val = engine
-            .eval_rule("data.openshell.sandbox.matched_endpoint_config".into())
+            .eval_rule("data.openshell.sandbox._matching_endpoint_configs".into())
             .map_err(|e| miette::miette!("{e}"))?;
 
-        if val == regorus::Value::Undefined {
-            Ok((None, generation))
-        } else {
-            Ok((Some(val), generation))
+        match val {
+            regorus::Value::Undefined => Ok((Vec::new(), generation)),
+            regorus::Value::Array(values) => Ok((values.to_vec(), generation)),
+            other => Ok((vec![other], generation)),
         }
     }
 
@@ -939,6 +948,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                         vec![]
                     };
                     let mut ep = serde_json::json!({"host": e.host, "ports": ports});
+                    if !e.path.is_empty() {
+                        ep["path"] = e.path.clone().into();
+                    }
                     if !e.protocol.is_empty() {
                         ep["protocol"] = e.protocol.clone().into();
                     }
@@ -2096,6 +2108,62 @@ process:
             }]),
         );
         assert!(!eval_l7(&engine, &mutation));
+    }
+
+    #[test]
+    fn l7_endpoint_path_scopes_rest_and_graphql_on_same_host() {
+        let data = r#"
+network_policies:
+  mixed_api:
+    name: mixed_api
+    endpoints:
+      - host: api.github.test
+        port: 443
+        path: "/repos/**"
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: "*"
+              path: "/**"
+      - host: api.github.test
+        port: 443
+        path: "/graphql"
+        protocol: graphql
+        enforcement: enforce
+        rules:
+          - allow:
+              operation_type: query
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+
+        let rest_write = l7_input("api.github.test", 443, "POST", "/repos/org/repo/issues");
+        assert!(eval_l7(&engine, &rest_write));
+
+        let graphql_query = l7_graphql_input(
+            "api.github.test",
+            serde_json::json!([{
+                "operation_type": "query",
+                "fields": ["viewer"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(eval_l7(&engine, &graphql_query));
+
+        let graphql_mutation = l7_graphql_input(
+            "api.github.test",
+            serde_json::json!([{
+                "operation_type": "mutation",
+                "fields": ["deleteRepository"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(
+            !eval_l7(&engine, &graphql_mutation),
+            "REST rules on the same host must not allow a GraphQL mutation"
+        );
     }
 
     #[test]

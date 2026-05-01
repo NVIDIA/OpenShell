@@ -451,7 +451,7 @@ Endpoints without `protocol` use TCP passthrough, where the proxy allows the str
 </Tab>
 
 <Tab title="Granular rules">
-Allow Claude and the GitHub CLI to reach `api.github.com` with per-path rules: read-only (GET, HEAD, OPTIONS) and GraphQL (POST) for all paths; full write access for `alpha-repo`; and create/edit issues only for `bravo-repo`. Replace `<org_name>` with your GitHub org or username.
+Allow Claude and the GitHub CLI to reach `api.github.com` with separate REST and GraphQL endpoint scopes: read-only REST for general API paths, GraphQL operation inspection on `/graphql`, full REST write access for `alpha-repo`, and create/edit issues only for `bravo-repo`. Replace `<org_name>` with your GitHub org or username.
 
 <Tip>
 For an end-to-end walkthrough that combines this policy with a GitHub credential provider and sandbox creation, refer to [GitHub Sandbox](/get-started/tutorials/github-sandbox).
@@ -464,6 +464,7 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
     endpoints:
       - host: api.github.com
         port: 443
+        path: "/**"
         protocol: rest
         enforcement: enforce
         rules:
@@ -477,9 +478,6 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
               method: OPTIONS
               path: "/**"
           - allow:
-              method: POST
-              path: "/graphql"
-          - allow:
               method: "*"
               path: "/repos/<org_name>/alpha-repo/**"
           - allow:
@@ -488,12 +486,26 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
           - allow:
               method: PATCH
               path: "/repos/<org_name>/bravo-repo/issues/*"
+      - host: api.github.com
+        port: 443
+        path: "/graphql"
+        protocol: graphql
+        enforcement: enforce
+        rules:
+          - allow:
+              operation_type: query
+          - allow:
+              operation_type: mutation
+              fields: [createIssue, updateIssue, addComment]
+        deny_rules:
+          - operation_type: mutation
+            fields: [deleteRepository, deleteRef, updateBranchProtectionRule]
     binaries:
       - { path: /usr/local/bin/claude }
       - { path: /usr/bin/gh }
 ```
 
-Endpoints with `protocol: rest` enable HTTP request inspection. The proxy auto-detects TLS on HTTPS endpoints, terminates it, and checks each HTTP request against the `rules` list.
+Endpoints with `protocol: rest` enable HTTP request inspection. Endpoints with `protocol: graphql` parse GraphQL-over-HTTP payloads before evaluating rules. The endpoint-level `path` field lets both protocols share `api.github.com:443` without treating GraphQL payloads as plain REST `POST /graphql` requests.
 </Tab>
 
 </Tabs>
@@ -536,6 +548,7 @@ GraphQL endpoint policies currently require full policy YAML applied with `opens
     endpoints:
       - host: api.github.com
         port: 443
+        path: "/graphql"
         protocol: graphql
         enforcement: enforce
         rules:

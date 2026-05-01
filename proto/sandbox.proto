@@ -111,6 +111,11 @@ message NetworkEndpoint {
   // Maximum GraphQL request body bytes to buffer for inspection.
   // Defaults to 65536 when unset.
   uint32 graphql_max_body_bytes = 14;
+  // Optional HTTP path glob that scopes this L7 endpoint on shared host:port APIs.
+  // Example: use path "/graphql" for protocol "graphql" and "/repos/**" for
+  // protocol "rest" when both surfaces live under api.example.com:443.
+  // Empty means all paths.
+  string path = 15;
 }
 
 // Trusted GraphQL operation classification.
