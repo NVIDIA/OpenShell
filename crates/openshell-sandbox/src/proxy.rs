@@ -2799,7 +2799,7 @@ async fn handle_forward_proxy(
                     403,
                     "Forbidden",
                     "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} denied by L7 policy"),
+                    &format!("{method} {host_lc}:{port}{path} denied by L7 policy: {reason}"),
                 ),
             )
             .await?;

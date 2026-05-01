@@ -223,6 +223,7 @@ import urllib.request
 
 HOST = "host.openshell.internal"
 PORT = {port}
+DETAILS = {{}}
 
 QUERY_VIEWER = "query Viewer {{ viewer {{ login }} }}"
 QUERY_REPOSITORY = "query Repo {{ repository(owner:\"o\", name:\"r\") {{ id }} }}"
@@ -317,7 +318,8 @@ def forward_chunked_status(query):
         ).encode() + chunk
         sock.sendall(request)
         sock.shutdown(socket.SHUT_WR)
-        response = read_until(sock, b"\r\n\r\n")
+        response, body = read_response(sock)
+        DETAILS["forward_chunked_query_allowed_detail"] = body.decode(errors="replace")
         return int(response.split()[1])
 
 def read_until(sock, marker):
@@ -328,6 +330,21 @@ def read_until(sock, marker):
             break
         data += chunk
     return data
+
+def read_response(sock):
+    response = read_until(sock, b"\r\n\r\n")
+    headers, _, body = response.partition(b"\r\n\r\n")
+    content_length = 0
+    for line in headers.split(b"\r\n")[1:]:
+        if line.lower().startswith(b"content-length:"):
+            content_length = int(line.split(b":", 1)[1].strip())
+            break
+    while len(body) < content_length:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        body += chunk
+    return response, body
 
 def connect_status(query):
     proxy_host, proxy_port = connect_proxy_parts()
@@ -476,6 +493,7 @@ results = {{
     "connect_mutation_allowed": connect_status(MUTATION_CREATE),
     "connect_deny_rule_denied": connect_status(MUTATION_DELETE),
 }}
+results.update(DETAILS)
 print(json.dumps(results, sort_keys=True))
 "#,
         port = server.port,
