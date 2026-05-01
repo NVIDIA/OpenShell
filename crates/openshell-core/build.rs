@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::env;
+use std::path::{Path, PathBuf};
+
+const PROTO_REL: &str = "../../proto";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Git-derived version ---
@@ -17,6 +20,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- Protobuf compilation ---
+    // Re-run when anything under proto/ changes (including newly added .proto files).
+    println!("cargo:rerun-if-changed={PROTO_REL}");
     // Use bundled protoc from protobuf-src.  The system protoc (from apt-get)
     // does not bundle the well-known type includes (google/protobuf/struct.proto
     // etc.), so we must use protobuf-src which ships both the binary and the
@@ -28,26 +33,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::set_var("PROTOC", protobuf_src::protoc());
     }
 
-    let proto_files = [
-        "../../proto/openshell.proto",
-        "../../proto/datamodel.proto",
-        "../../proto/sandbox.proto",
-        "../../proto/compute_driver.proto",
-        "../../proto/inference.proto",
-        "../../proto/test.proto",
-    ];
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    let proto_root = manifest_dir.join(PROTO_REL);
+
+    let mut proto_files = Vec::new();
+    collect_proto_files(&proto_root, &mut proto_files)?;
+    proto_files.sort();
 
     // Configure tonic-build
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&proto_files, &["../../proto"])?;
+        .compile_protos(&proto_files, &[proto_root.as_path()])?;
 
-    // Tell cargo to rerun if the proto file changes
-    for proto_file in proto_files {
-        println!("cargo:rerun-if-changed={proto_file}");
+    Ok(())
+}
+
+fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_proto_files(&path, out)?;
+        } else if path.extension().is_some_and(|ext| ext == "proto") {
+            out.push(path);
+        }
     }
-
     Ok(())
 }
 
