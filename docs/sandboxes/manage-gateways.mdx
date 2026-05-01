@@ -156,16 +156,6 @@ openshell gateway info
 openshell gateway info --name my-remote-cluster
 ```
 
-## Proxy Remote Service URLs
-
-Run a local browser proxy for the active remote gateway:
-
-```shell
-openshell gateway proxy
-```
-
-The proxy binds an available local port and prints URLs like `http://<sandbox>--<service>.<gateway>.openshell.localhost:<port>/`. It forwards HTTP and WebSocket traffic to the selected remote gateway over the gateway's configured transport. Use this when remote wildcard DNS is not configured. Use the URL printed by `openshell service expose --domain` if the remote gateway uses a different local-domain cluster label.
-
 ## Advanced Start Options
 
 | Flag | Purpose |

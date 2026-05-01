@@ -282,7 +282,6 @@ When environment variables are set, the entrypoint modifies the HelmChart manife
 - `PUSH_IMAGE_REFS`: In push mode, parses comma-separated image refs and rewrites the exact gateway, sandbox, and pki-job image references (matching on path component `/gateway:`, `/sandbox:`, `/pki-job:`).
 - `IMAGE_TAG`: Replaces `:latest` tags with the specified tag on gateway, sandbox, and pki-job images. Handles both quoted and unquoted `tag: latest` formats.
 - `IMAGE_PULL_POLICY`: Replaces `pullPolicy: Always` with the specified policy (e.g., `IfNotPresent`).
-- `SANDBOX_IMAGE_PULL_POLICY`: Sets `server.sandboxImagePullPolicy` for sandbox pods. Defaults to `IfNotPresent` and can be overridden with `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY` on the host.
 - `SSH_GATEWAY_HOST` / `SSH_GATEWAY_PORT`: Replaces `__SSH_GATEWAY_HOST__` and `__SSH_GATEWAY_PORT__` placeholders.
 - `EXTRA_SANS`: Builds a YAML flow-style list from the comma-separated SANs and replaces `extraSANs: []`.
 
@@ -413,7 +412,6 @@ Variables set on the container by `ensure_container()` in `docker.rs`:
 | `SSH_GATEWAY_PORT` | Configured host port (default `8080`) | Remote deploys only |
 | `IMAGE_TAG` | Image tag (e.g., `"dev"`) | When `IMAGE_TAG` env is set or push mode |
 | `IMAGE_PULL_POLICY` | `"IfNotPresent"` | Push mode only |
-| `SANDBOX_IMAGE_PULL_POLICY` | `"IfNotPresent"` | Always; override with `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY` |
 | `PUSH_IMAGE_REFS` | Comma-separated image refs | Push mode only |
 
 ## Host-Side Environment Variables

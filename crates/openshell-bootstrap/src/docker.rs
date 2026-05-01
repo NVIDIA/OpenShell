@@ -759,8 +759,6 @@ pub async fn ensure_container(
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| image::DEFAULT_IMAGE_TAG.to_string());
-    let sandbox_image_pull_policy = env_non_empty("OPENSHELL_SANDBOX_IMAGE_PULL_POLICY")
-        .unwrap_or_else(|| "IfNotPresent".to_string());
     if push_mode {
         if let Ok(images) = std::env::var("OPENSHELL_PUSH_IMAGES")
             && !images.trim().is_empty()
@@ -772,9 +770,6 @@ pub async fn ensure_container(
     } else {
         env_vars.push(format!("IMAGE_TAG={effective_tag}"));
     }
-    env_vars.push(format!(
-        "SANDBOX_IMAGE_PULL_POLICY={sandbox_image_pull_policy}"
-    ));
 
     // Disable TLS: pass through to the entrypoint so the HelmChart manifest
     // configures the server pod for plaintext HTTP.

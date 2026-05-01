@@ -468,9 +468,6 @@ if [ -f "$HELMCHART" ]; then
     fi
     sed -i "s|__IMAGE_PULL_POLICY__|${IMAGE_PULL_POLICY_VALUE}|g" "$HELMCHART"
 
-    SANDBOX_IMAGE_PULL_POLICY_VALUE="${SANDBOX_IMAGE_PULL_POLICY:-\"\"}"
-    sed -i "s|__SANDBOX_IMAGE_PULL_POLICY__|${SANDBOX_IMAGE_PULL_POLICY_VALUE}|g" "$HELMCHART"
-
     DB_URL_VALUE="${DB_URL:-\"sqlite:/var/openshell/openshell.db\"}"
     sed -i "s|__DB_URL__|${DB_URL_VALUE}|g" "$HELMCHART"
 fi

@@ -30,7 +30,6 @@ spec:
       pullPolicy: __IMAGE_PULL_POLICY__
     server:
       sandboxImage: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
-      sandboxImagePullPolicy: __SANDBOX_IMAGE_PULL_POLICY__
       dbUrl: __DB_URL__
       sshGatewayHost: __SSH_GATEWAY_HOST__
       sshGatewayPort: __SSH_GATEWAY_PORT__

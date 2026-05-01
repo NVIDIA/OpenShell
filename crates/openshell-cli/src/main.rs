@@ -933,10 +933,6 @@ enum GatewayCommands {
         name: Option<String>,
     },
 
-    /// Start a local proxy for browser access to remote gateway services.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Proxy,
-
     /// Show gateway deployment details.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Info {
@@ -1850,23 +1846,6 @@ async fn main() -> Result<()> {
             }
             GatewayCommands::Select { name } => {
                 run::gateway_select(name.as_deref(), &cli.gateway)?;
-            }
-            GatewayCommands::Proxy => {
-                let name = resolve_gateway_name(&cli.gateway).ok_or_else(|| {
-                    miette::miette!(
-                        "No active gateway.\n\
-                         Set one with: openshell gateway select <name>"
-                    )
-                })?;
-                let metadata = get_gateway_metadata(&name).ok_or_else(|| {
-                    miette::miette!(
-                        "Unknown gateway '{name}'.\n\
-                         List available gateways: openshell gateway select"
-                    )
-                })?;
-                let mut tls = tls.with_gateway_name(&metadata.name);
-                apply_edge_auth(&mut tls, &metadata.name);
-                openshell_cli::gateway_proxy::run(metadata, tls).await?;
             }
             GatewayCommands::Info { name } => {
                 let name = name

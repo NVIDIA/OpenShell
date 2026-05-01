@@ -418,24 +418,13 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     cluster_exec "kubectl -n openshell create secret generic openshell-ssh-handshake --from-literal=secret='${SSH_HANDSHAKE_SECRET}' --dry-run=client -o yaml | kubectl apply -f -"
   fi
 
-  # Preserve bootstrap-rendered values across fast deploys. Helm upgrade does
-  # not reuse values by default, so omitting these would silently reset a
-  # plaintext gateway back to TLS or drop hostAliases.
-  HELMCHART_VALUES=$(cluster_exec "kubectl -n kube-system get helmchart openshell -o jsonpath='{.spec.valuesContent}' 2>/dev/null" 2>/dev/null) || true
-  HOST_GATEWAY_IP=$(printf "%s\n" "${HELMCHART_VALUES}" | awk '/hostGatewayIP:/ {print $2; exit}') || true
+  # Retrieve the host gateway IP from the entrypoint-rendered HelmChart CR so
+  # that hostAliases for host.openshell.internal are preserved across fast deploys.
+  HOST_GATEWAY_IP=$(cluster_exec "kubectl -n kube-system get helmchart openshell -o jsonpath='{.spec.valuesContent}' 2>/dev/null \
+    | grep hostGatewayIP | awk '{print \$2}'" 2>/dev/null) || true
   HOST_GATEWAY_ARGS=""
   if [[ -n "${HOST_GATEWAY_IP}" ]]; then
     HOST_GATEWAY_ARGS="--set server.hostGatewayIP=${HOST_GATEWAY_IP}"
-  fi
-
-  DISABLE_TLS=$(printf "%s\n" "${HELMCHART_VALUES}" | awk '/disableTls:/ {print $2; exit}') || true
-  DISABLE_GATEWAY_AUTH=$(printf "%s\n" "${HELMCHART_VALUES}" | awk '/disableGatewayAuth:/ {print $2; exit}') || true
-  TLS_MODE_ARGS=""
-  if [[ "${DISABLE_TLS}" == "true" || "${DISABLE_TLS}" == "false" ]]; then
-    TLS_MODE_ARGS="${TLS_MODE_ARGS} --set server.disableTls=${DISABLE_TLS}"
-  fi
-  if [[ "${DISABLE_GATEWAY_AUTH}" == "true" || "${DISABLE_GATEWAY_AUTH}" == "false" ]]; then
-    TLS_MODE_ARGS="${TLS_MODE_ARGS} --set server.disableGatewayAuth=${DISABLE_GATEWAY_AUTH}"
   fi
 
   cluster_exec "helm upgrade openshell ${CONTAINER_CHART_DIR} \
@@ -449,7 +438,6 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     --set server.tls.clientTlsSecretName=openshell-client-tls \
     --set-string server.localDomain.cluster=${CLUSTER_NAME} \
     --set-string server.localDomain.suffix=${LOCAL_DOMAIN_SUFFIX:-openshell.localhost} \
-    ${TLS_MODE_ARGS} \
     ${HOST_GATEWAY_ARGS} \
     ${helm_wait_args}"
   helm_end=$(date +%s)
