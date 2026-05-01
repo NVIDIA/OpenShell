@@ -9,7 +9,7 @@
 
 Name:           openshell
 Version:        0.0.37
-Release:        1.20260501111549922934.rpm.51.g7c400fa8%{?dist}
+Release:        1.20260501160805739969.rpm.73.ge7c4151d%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
@@ -26,6 +26,7 @@ ExclusiveArch:  x86_64 aarch64
 # Rust toolchain via additional_repos in the COPR build config.
 BuildRequires:  rust >= 1.88
 BuildRequires:  cargo
+BuildRequires:  cargo-rpm-macros >= 25
 BuildRequires:  gcc
 BuildRequires:  gcc-c++
 BuildRequires:  make
@@ -82,18 +83,9 @@ management, agent execution, and inference routing via gRPC.
 %prep
 %autosetup -n %{name}-%{version}
 
-# Extract vendored Cargo dependencies
+# Extract vendored Cargo dependencies and configure offline build
 tar xf %{SOURCE1}
-
-# Configure Cargo to use vendored dependencies for offline build
-mkdir -p .cargo
-cat > .cargo/config.toml << 'EOF'
-[source.crates-io]
-replace-with = "vendored-sources"
-
-[source.vendored-sources]
-directory = "vendor"
-EOF
+%cargo_prep -v vendor
 
 # Patch workspace version from placeholder to actual version
 sed -i 's/^version = "0.0.0"/version = "%{version}"/' Cargo.toml
@@ -106,6 +98,13 @@ export CARGO_BUILD_JOBS=%{_smp_build_ncpus}
 # real tags in the ghcr.io/nvidia/openshell registry.
 export OPENSHELL_IMAGE_TAG=latest
 cargo build --release --bin openshell --bin openshell-gateway
+
+# Generate vendored crate manifest and license metadata.
+# cargo-vendor.txt is consumed by an RPM generator (from cargo-rpm-macros)
+# to emit Provides: bundled(crate(...)) = version for every vendored dep.
+%cargo_vendor_manifest
+%{cargo_license_summary}
+%{cargo_license} > LICENSE.dependencies
 
 # Build man pages from markdown
 pandoc -s -t man deploy/man/openshell.1.md -o openshell.1
@@ -247,12 +246,16 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata
 
 %files
 %license LICENSE
+%license LICENSE.dependencies
+%license cargo-vendor.txt
 %doc README.md
 %{_bindir}/%{name}
 %{_mandir}/man1/openshell.1*
 
 %files gateway
 %license LICENSE
+%license LICENSE.dependencies
+%license cargo-vendor.txt
 %doc %{_docdir}/%{name}-gateway/QUICKSTART.md
 %doc %{_docdir}/%{name}-gateway/CONFIGURATION.md
 %doc %{_docdir}/%{name}-gateway/TROUBLESHOOTING.md
