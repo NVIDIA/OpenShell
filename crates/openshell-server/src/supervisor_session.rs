@@ -363,8 +363,9 @@ impl SupervisorSessionRegistry {
                 .lock()
                 .unwrap()
                 .get(&channel_id)
-                .map(|pending| (pending.target.clone(), pending.service_id.clone()))
-                .unwrap_or((RelayTarget::Ssh, None));
+                .map_or((RelayTarget::Ssh, None), |pending| {
+                    (pending.target.clone(), pending.service_id.clone())
+                });
             let msg = GatewayMessage {
                 payload: Some(gateway_message::Payload::RelayOpen(RelayOpen {
                     channel_id: channel_id.clone(),
