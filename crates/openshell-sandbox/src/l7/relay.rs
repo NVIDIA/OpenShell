@@ -455,13 +455,27 @@ where
             graphql: Some(graphql_info.clone()),
         };
 
-        let (allowed, reason) = evaluate_l7_request(engine, ctx, &request_info)?;
+        // Malformed or ambiguous GraphQL requests, such as duplicated GET
+        // control parameters, are rejected before policy evaluation. This
+        // keeps parser-differential cases fail-closed even if the endpoint is
+        // otherwise in audit mode.
+        let parse_error_reason = graphql_info
+            .error
+            .as_deref()
+            .map(|error| format!("GraphQL request rejected: {error}"));
+        let force_deny = parse_error_reason.is_some();
+        let (allowed, reason) = if let Some(reason) = parse_error_reason {
+            (false, reason)
+        } else {
+            evaluate_l7_request(engine, ctx, &request_info)?
+        };
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
         }
 
         let decision_str = match (allowed, config.enforcement) {
+            (_, _) if force_deny => "deny",
             (true, _) => "allow",
             (false, EnforcementMode::Audit) => "audit",
             (false, EnforcementMode::Enforce) => "deny",
@@ -503,7 +517,7 @@ where
 
         let _ = &eval_target;
 
-        if allowed || config.enforcement == EnforcementMode::Audit {
+        if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
                 &req,
                 client,
