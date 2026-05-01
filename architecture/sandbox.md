@@ -535,22 +535,22 @@ Internet (filtered by OPA policy)
 #### Creation sequence (`NetworkNamespace::create()`)
 
 1. Generate UUID-based short ID (first 8 chars)
-2. `/usr/sbin/ip netns add sandbox-{id}` -- create the namespace
-3. `/usr/sbin/ip link add veth-h-{id} type veth peer name veth-s-{id}` -- create veth pair
-4. `/usr/sbin/ip link set veth-s-{id} netns sandbox-{id}` -- move sandbox veth into namespace
+2. `ip netns add sandbox-{id}` -- create the namespace
+3. `ip link add veth-h-{id} type veth peer name veth-s-{id}` -- create veth pair
+4. `ip link set veth-s-{id} netns sandbox-{id}` -- move sandbox veth into namespace
 5. Configure host side: assign `10.200.0.1/24`, bring up
 6. Configure sandbox side (inside namespace): assign `10.200.0.2/24`, bring up loopback, add default route via `10.200.0.1`
 7. Open `/var/run/netns/sandbox-{id}` FD for later `setns()` calls
 
-The supervisor resolves `ip` and `nsenter` from fixed absolute-path allowlists such as `/usr/sbin/ip` and `/usr/bin/nsenter`; it does not use the process `PATH` for privileged namespace helpers. Each step has rollback on failure -- if any `ip` command fails, previously created resources are cleaned up.
+Each step has rollback on failure -- if any `ip` command fails, previously created resources are cleaned up.
 
 #### Cleanup on drop
 
 `NetworkNamespace` implements `Drop`:
 
 1. Close the namespace FD
-2. Delete the host-side veth (`/usr/sbin/ip link delete veth-h-{id}`) -- this automatically removes the peer
-3. Delete the namespace (`/usr/sbin/ip netns delete sandbox-{id}`)
+2. Delete the host-side veth (`ip link delete veth-h-{id}`) -- this automatically removes the peer
+3. Delete the namespace (`ip netns delete sandbox-{id}`)
 
 #### Bypass detection
 
@@ -560,7 +560,7 @@ The network namespace routes all sandbox traffic through the veth pair, but a mi
 
 ##### iptables rules
 
-`install_bypass_rules()` installs OUTPUT chain rules inside the sandbox network namespace using `iptables` (IPv4) and `ip6tables` (IPv6, best-effort). Rules are installed via an absolute `nsenter --net=/var/run/netns/{namespace} -- /usr/sbin/iptables ...` style invocation rather than `ip netns exec`, so helper lookup does not depend on `PATH`. The rules are evaluated in order:
+`install_bypass_rules()` installs OUTPUT chain rules inside the sandbox network namespace using `iptables` (IPv4) and `ip6tables` (IPv6, best-effort). Rules are installed via `ip netns exec {namespace} iptables ...`. The rules are evaluated in order:
 
 | # | Rule | Target | Purpose |
 |---|------|--------|---------|
@@ -576,7 +576,7 @@ The LOG rules use the `--log-uid` flag to include the UID of the process that in
 
 The proxy port defaults to `3128` unless the policy specifies a different `http_addr`. IPv6 rules mirror the IPv4 rules via `ip6tables`; IPv6 rule installation failure is non-fatal (logged as warning) since IPv4 is the primary path.
 
-**Graceful degradation:** If iptables is not available in the fixed absolute search paths, a warning is logged and rule installation is skipped entirely. The network namespace still provides isolation via routing — processes can only reach the proxy's IP, but without bypass rules they get a timeout rather than an immediate rejection. LOG rule failure is also non-fatal — if the `xt_LOG` kernel module is not loaded, the REJECT rules are still installed for fast-fail behavior.
+**Graceful degradation:** If iptables is not available (checked via `which iptables`), a warning is logged and rule installation is skipped entirely. The network namespace still provides isolation via routing — processes can only reach the proxy's IP, but without bypass rules they get a timeout rather than an immediate rejection. LOG rule failure is also non-fatal — if the `xt_LOG` kernel module is not loaded, the REJECT rules are still installed for fast-fail behavior.
 
 ##### /dev/kmsg monitor
 
@@ -668,7 +668,7 @@ Bypass detection requires the `iptables` package for rule installation (in addit
 | `CAP_NET_ADMIN` | Creating veth pairs, assigning IPs, configuring routes, installing iptables bypass detection rules |
 | `CAP_SYS_PTRACE` | Proxy reading `/proc/<pid>/fd/` and `/proc/<pid>/exe` for processes running as a different user |
 
-The `iproute2` package must be installed (provides the `ip` command in `/usr/sbin`, `/sbin`, `/usr/bin`, or `/bin`). The `util-linux` package must provide `nsenter` in one of those same trusted system directories. The `iptables` package is required for bypass detection rules; if absent, the namespace still provides routing-based isolation but without fast-fail rejection or diagnostic logging for bypass attempts.
+The `iproute2` package must be installed (provides the `ip` command). The `iptables` package is required for bypass detection rules; if absent, the namespace still provides routing-based isolation but without fast-fail rejection or diagnostic logging for bypass attempts.
 
 If namespace creation fails (e.g., missing capabilities), startup fails in `Proxy` mode. This preserves fail-closed behavior: either network namespace isolation is active, or the sandbox does not run.
 
