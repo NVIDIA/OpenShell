@@ -384,10 +384,53 @@ async fn read_body_for_inspection<C: AsyncRead + Unpin>(
             Ok(body)
         }
         BodyLength::Chunked => {
-            read_chunked_body_for_inspection(client, request, header_end, overflow, max_body_bytes)
-                .await
+            let body = read_chunked_body_for_inspection(
+                client,
+                request,
+                header_end,
+                overflow,
+                max_body_bytes,
+            )
+            .await?;
+            normalize_chunked_request_to_content_length(request, header_end, &body)?;
+            Ok(body)
         }
     }
+}
+
+fn normalize_chunked_request_to_content_length(
+    request: &mut L7Request,
+    header_end: usize,
+    body: &[u8],
+) -> Result<()> {
+    let header_str = std::str::from_utf8(&request.raw_header[..header_end])
+        .map_err(|_| miette!("GraphQL HTTP headers contain invalid UTF-8"))?;
+    let header_str = header_str
+        .strip_suffix("\r\n\r\n")
+        .ok_or_else(|| miette!("GraphQL HTTP headers missing terminator"))?;
+
+    let mut normalized = Vec::with_capacity(header_str.len() + body.len() + 32);
+    for (idx, line) in header_str.split("\r\n").enumerate() {
+        if idx > 0 {
+            let name = line
+                .split_once(':')
+                .map(|(name, _)| name.trim().to_ascii_lowercase());
+            if matches!(
+                name.as_deref(),
+                Some("transfer-encoding" | "content-length" | "trailer")
+            ) {
+                continue;
+            }
+        }
+        normalized.extend_from_slice(line.as_bytes());
+        normalized.extend_from_slice(b"\r\n");
+    }
+    normalized.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+    normalized.extend_from_slice(body);
+
+    request.raw_header = normalized;
+    request.body_length = BodyLength::ContentLength(body.len() as u64);
+    Ok(())
 }
 
 async fn read_chunked_body_for_inspection<C: AsyncRead + Unpin>(
@@ -427,21 +470,6 @@ async fn read_chunked_body_for_inspection<C: AsyncRead + Unpin>(
             ));
         }
 
-        let chunk_end = pos
-            .checked_add(chunk_size)
-            .ok_or_else(|| miette!("GraphQL chunk size overflow"))?;
-        let chunk_with_crlf_end = chunk_end
-            .checked_add(2)
-            .ok_or_else(|| miette!("GraphQL chunk size overflow"))?;
-        while raw.len() < chunk_with_crlf_end {
-            read_more(client, &mut raw, max_body_bytes).await?;
-        }
-        decoded.extend_from_slice(&raw[pos..chunk_end]);
-        if raw.get(chunk_end..chunk_with_crlf_end) != Some(&b"\r\n"[..]) {
-            return Err(miette!("GraphQL chunk payload missing terminating CRLF"));
-        }
-        pos = chunk_with_crlf_end;
-
         if chunk_size == 0 {
             loop {
                 let trailer_end = loop {
@@ -459,6 +487,21 @@ async fn read_chunked_body_for_inspection<C: AsyncRead + Unpin>(
                 }
             }
         }
+
+        let chunk_end = pos
+            .checked_add(chunk_size)
+            .ok_or_else(|| miette!("GraphQL chunk size overflow"))?;
+        let chunk_with_crlf_end = chunk_end
+            .checked_add(2)
+            .ok_or_else(|| miette!("GraphQL chunk size overflow"))?;
+        while raw.len() < chunk_with_crlf_end {
+            read_more(client, &mut raw, max_body_bytes).await?;
+        }
+        decoded.extend_from_slice(&raw[pos..chunk_end]);
+        if raw.get(chunk_end..chunk_with_crlf_end) != Some(&b"\r\n"[..]) {
+            return Err(miette!("GraphQL chunk payload missing terminating CRLF"));
+        }
+        pos = chunk_with_crlf_end;
     }
 }
 
@@ -616,5 +659,41 @@ mod tests {
                 .is_some_and(|err| err.contains("must not be combined")),
             "expected ambiguous persisted-query id error, got {info:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn chunked_graphql_post_is_normalized_after_inspection() {
+        let body = br#"{"query":"query Viewer { viewer { login } }"}"#;
+        let mut raw_header =
+            b"POST /graphql HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sig\r\nX-Test: yes\r\n\r\n"
+                .to_vec();
+        raw_header.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+        raw_header.extend_from_slice(body);
+        raw_header.extend_from_slice(b"\r\n0\r\nX-Sig: ignored\r\n\r\n");
+
+        let mut req = L7Request {
+            action: "POST".to_string(),
+            target: "/graphql".to_string(),
+            query_params: HashMap::new(),
+            raw_header,
+            body_length: BodyLength::Chunked,
+        };
+        let mut client = tokio::io::empty();
+
+        let info = inspect_graphql_request(&mut client, &mut req, DEFAULT_MAX_BODY_BYTES)
+            .await
+            .expect("chunked body should inspect");
+
+        assert_eq!(info.error, None);
+        assert!(matches!(
+            req.body_length,
+            BodyLength::ContentLength(len) if len == body.len() as u64
+        ));
+        let forwarded = String::from_utf8_lossy(&req.raw_header);
+        assert!(forwarded.contains(&format!("Content-Length: {}", body.len())));
+        assert!(forwarded.contains("X-Test: yes\r\n"));
+        assert!(!forwarded.to_ascii_lowercase().contains("transfer-encoding"));
+        assert!(!forwarded.to_ascii_lowercase().contains("trailer:"));
+        assert!(req.raw_header.ends_with(body));
     }
 }
