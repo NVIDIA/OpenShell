@@ -29,6 +29,12 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 **Homebrew dev cask (macOS Apple Silicon):**
 
 ```bash
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-dev.sh | sh
+```
+
+Or install the cask directly:
+
+```bash
 brew tap nvidia/openshell https://github.com/NVIDIA/OpenShell.git
 brew install --cask nvidia/openshell/openshell-dev
 ```

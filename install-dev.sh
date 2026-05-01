@@ -5,7 +5,8 @@
 # Install the OpenShell development build from the rolling GitHub `dev` release.
 #
 # This script is intended as a convenient installer for development builds. It
-# currently supports Debian packages on Linux amd64 and arm64 only.
+# supports Debian packages on Linux amd64/arm64 and the Homebrew dev cask on
+# macOS Apple Silicon.
 #
 set -e
 
@@ -14,6 +15,9 @@ REPO="NVIDIA/OpenShell"
 GITHUB_URL="https://github.com/${REPO}"
 RELEASE_TAG="dev"
 CHECKSUMS_NAME="openshell-checksums-sha256.txt"
+HOMEBREW_TAP="nvidia/openshell"
+HOMEBREW_TAP_URL="${GITHUB_URL}.git"
+HOMEBREW_CASK="${HOMEBREW_TAP}/openshell-dev"
 
 info() {
   printf '%s: %s\n' "$APP_NAME" "$*" >&2
@@ -26,7 +30,7 @@ error() {
 
 usage() {
   cat <<EOF
-install-dev.sh - Install the OpenShell development Debian package
+install-dev.sh - Install the OpenShell development build
 
 USAGE:
     curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-dev.sh -o install-dev.sh
@@ -41,7 +45,8 @@ NOTES:
     This installs the rolling development release from:
     ${GITHUB_URL}/releases/tag/${RELEASE_TAG}
 
-    Only Linux amd64 and arm64 Debian packages are supported right now.
+    Linux amd64 and arm64 install the development Debian package.
+    macOS Apple Silicon installs the Homebrew dev cask.
 EOF
 }
 
@@ -142,6 +147,26 @@ check_platform() {
   require_cmd dpkg
 }
 
+check_homebrew_platform() {
+  if [ "$(uname -s)" != "Darwin" ]; then
+    error "unsupported OS: $(uname -s); Homebrew dev cask requires macOS"
+  fi
+
+  case "$(uname -m)" in
+    arm64|aarch64)
+      ;;
+    *)
+      error "unsupported architecture: $(uname -m); Homebrew dev cask requires Apple Silicon"
+      ;;
+  esac
+
+  if [ "$(id -u)" -eq 0 ]; then
+    error "Homebrew must not be run as root; rerun this installer as your user"
+  fi
+
+  require_cmd brew
+}
+
 get_deb_arch() {
   _arch="$(dpkg --print-architecture)"
 
@@ -228,6 +253,7 @@ remove_local_gateway_registration() {
 
   # The install-dev gateway is a user service. Replace the CLI registration
   # directly instead of asking `gateway destroy` to tear down Docker resources.
+  # shellcheck disable=SC2016
   as_target_user sh -c '
     config_dir=$1
     rm -rf "${config_dir}/gateways/local"
@@ -259,21 +285,54 @@ register_local_gateway() {
   esac
 }
 
+install_homebrew_cask() {
+  check_homebrew_platform
+
+  info "tapping ${HOMEBREW_TAP}..."
+  brew tap "${HOMEBREW_TAP}" "${HOMEBREW_TAP_URL}"
+
+  if brew list --cask openshell-dev >/dev/null 2>&1; then
+    info "reinstalling ${HOMEBREW_CASK}..."
+    brew reinstall --cask "${HOMEBREW_CASK}"
+  else
+    info "installing ${HOMEBREW_CASK}..."
+    brew install --cask "${HOMEBREW_CASK}"
+  fi
+
+  _brew_prefix="$(brew --prefix)"
+  _openshell_bin="${_brew_prefix}/bin/openshell"
+  if [ -x "$_openshell_bin" ]; then
+    _installed_version="$("$_openshell_bin" --version 2>/dev/null || true)"
+    if [ -n "$_installed_version" ]; then
+      info "installed ${_installed_version} via Homebrew"
+    else
+      info "installed OpenShell development cask via Homebrew"
+    fi
+  else
+    info "installed OpenShell development cask via Homebrew"
+  fi
+}
+
 main() {
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
+  for arg in "$@"; do
+    case "$arg" in
       --help)
         usage
         exit 0
         ;;
       *)
-        error "unknown option: $1"
+        error "unknown option: $arg"
         ;;
     esac
-    shift
   done
 
   require_cmd curl
+
+  if [ "$(uname -s)" = "Darwin" ]; then
+    install_homebrew_cask
+    return 0
+  fi
+
   check_platform
 
   TARGET_USER="$(target_user)"

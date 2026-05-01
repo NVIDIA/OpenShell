@@ -52,6 +52,8 @@ brew install --cask nvidia/openshell/openshell-dev
 
 The archive exposes `openshell`, `openshell-gateway`, and `openshell-driver-vm` through cask `binary` stanzas. The gateway entrypoint is a wrapper that sets `OPENSHELL_DRIVER_DIR` to the bundled driver directory before executing the real gateway binary. The cask signs the VM driver with the Hypervisor entitlement during `postflight`.
 
+`install-dev.sh` installs the same dev cask automatically on macOS Apple Silicon. On Linux amd64 and arm64, it installs the rolling development Debian package.
+
 ## Python Wheels
 
 OpenShell also publishes Python wheels for `linux/amd64`, `linux/arm64`, and macOS ARM64.
