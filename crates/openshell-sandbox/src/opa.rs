@@ -2080,6 +2080,30 @@ process:
     }
 
     #[test]
+    fn l7_graphql_unregistered_hash_only_query_has_deny_reason() {
+        let engine = l7_engine();
+        let input = l7_graphql_input(
+            "api.graphql.com",
+            serde_json::json!([{
+                "operation_type": "",
+                "operation_name": "Viewer",
+                "fields": [],
+                "persisted_query": true,
+                "persisted_query_hash": "missing"
+            }]),
+        );
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.openshell.sandbox.request_deny_reason".into())
+            .unwrap();
+        assert_eq!(
+            val,
+            regorus::Value::String("GraphQL persisted query is not registered".into())
+        );
+    }
+
+    #[test]
     fn l7_graphql_parse_error_denied() {
         let engine = l7_engine();
         let input = l7_graphql_error_input("api.graphql.com", "GraphQL document parse error");

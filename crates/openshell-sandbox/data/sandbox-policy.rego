@@ -324,6 +324,7 @@ request_deny_reason := reason if {
 	input.request
 	deny_request
 	graphql_request_has_operations(input.request)
+	not graphql_request_has_unregistered_persisted_query(input.request, matched_endpoint_config)
 	reason := "GraphQL operation blocked by endpoint policy"
 }
 
