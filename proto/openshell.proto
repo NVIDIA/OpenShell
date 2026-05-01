@@ -577,6 +577,11 @@ message GetSandboxProviderEnvironmentRequest {
 message GetSandboxProviderEnvironmentResponse {
   // Provider credential environment variables.
   map<string, string> environment = 1;
+  // Subset of keys in `environment` whose value is the real credential and
+  // must be injected directly into the agent process — bypassing the
+  // canonical placeholder substitution and L7 proxy rewriting. Sourced from
+  // each provider's `passthrough_credentials` list.
+  repeated string passthrough_keys = 2;
 }
 
 // ---------------------------------------------------------------------------

@@ -147,6 +147,30 @@ openshell provider create --name google --type generic --credential YOUTUBE_API_
 
 The agent sends `GET /youtube/v3/search?part=snippet&key=<placeholder>`. The proxy resolves the placeholder in the query parameter value and percent-encodes the result before forwarding.
 
+## Selective Passthrough
+
+Some SDKs reject the placeholder before any HTTP request is made — for example Slack's `@slack/web-api` checks the `xoxb-` prefix on bot tokens, and OAuth libraries parse JWT structure in process. Other credentials never reach the wire at all (Slack signing-secret HMAC, Discord interaction-signature verification) or flow through transports the proxy cannot rewrite (WebSocket payloads after HTTP `101 Switching Protocols`).
+
+For these cases, mark a credential key as **passthrough**: the supervisor injects the real value directly into the agent process instead of a placeholder.
+
+```shell
+openshell provider create \
+  --name slack \
+  --type generic \
+  --credential SLACK_BOT_TOKEN=xoxb-real-value \
+  --credential SLACK_SIGNING_SECRET=real-signing-secret \
+  --passthrough SLACK_BOT_TOKEN \
+  --passthrough SLACK_SIGNING_SECRET
+```
+
+`--passthrough` is repeatable. Each key must also appear in `--credential`. The same flag is available on `openshell provider update`.
+
+<Warning>
+Passthrough drops the "agent never sees the real secret" invariant for the listed keys. The real value sits in `/proc/<agent-pid>/environ` and any descendant process inherits it. Use it only when the consumer demonstrably fails with the canonical placeholder — prefer the placeholder model whenever the consumer permits it.
+</Warning>
+
+`openshell provider get <name>` annotates passthrough keys in its output, and `openshell provider list` shows a `PASSTHROUGH` column with the per-provider count.
+
 ## Supported Provider Types
 
 The following provider types are supported.

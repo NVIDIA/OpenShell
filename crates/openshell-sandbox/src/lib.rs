@@ -269,21 +269,22 @@ pub async fn run_sandbox(
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
-    let provider_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+    let resolved = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
         match grpc_client::fetch_provider_environment(endpoint, id).await {
-            Ok(env) => {
+            Ok(resolved) => {
                 ocsf_emit!(
                     ConfigStateChangeBuilder::new(ocsf_ctx())
                         .severity(SeverityId::Informational)
                         .status(StatusId::Success)
                         .state(StateId::Enabled, "loaded")
                         .message(format!(
-                            "Fetched provider environment [env_count:{}]",
-                            env.len()
+                            "Fetched provider environment [env_count:{} passthrough_count:{}]",
+                            resolved.environment.len(),
+                            resolved.passthrough_keys.len()
                         ))
                         .build()
                 );
-                env
+                resolved
             }
             Err(e) => {
                 ocsf_emit!(
@@ -296,14 +297,17 @@ pub async fn run_sandbox(
                         ))
                         .build()
                 );
-                std::collections::HashMap::new()
+                grpc_client::ProviderEnvironment::default()
             }
         }
     } else {
-        std::collections::HashMap::new()
+        grpc_client::ProviderEnvironment::default()
     };
 
-    let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
+    let (provider_env, secret_resolver) = SecretResolver::from_provider_env_with_passthrough(
+        resolved.environment,
+        &resolved.passthrough_keys,
+    );
     let secret_resolver = secret_resolver.map(Arc::new);
 
     // Create identity cache for SHA256 TOFU when OPA is active

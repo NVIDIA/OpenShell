@@ -115,6 +115,7 @@ impl TestOpenShell {
                 r#type: provider_type.to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         );
     }
@@ -293,6 +294,11 @@ impl OpenShell for TestOpenShell {
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
             config: merge(existing.config, provider.config),
+            passthrough_credentials: if provider.passthrough_credentials.is_empty() {
+                existing.passthrough_credentials
+            } else {
+                provider.passthrough_credentials
+            },
         };
         let updated_name = updated.object_name().to_string();
         providers.insert(updated_name, updated.clone());

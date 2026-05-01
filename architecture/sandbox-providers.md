@@ -35,6 +35,9 @@ Provider is defined in `proto/datamodel.proto`:
 - `type`: canonical provider slug (`claude`, `gitlab`, `github`, etc.)
 - `credentials`: `map<string, string>` for secret values
 - `config`: `map<string, string>` for non-secret settings
+- `passthrough_credentials`: `repeated string` listing credential keys whose
+  real value is injected directly into the agent process, bypassing the
+  canonical placeholder substitution (see [Selective Passthrough](#selective-passthrough)).
 
 The gRPC surface is defined in `proto/openshell.proto`:
 
@@ -362,6 +365,92 @@ CLI: openshell sandbox create -- claude
                       |     +-- Each SSH shell: cmd.env("ANTHROPIC_API_KEY", "openshell:resolve:env:ANTHROPIC_API_KEY")
                       +-- Proxy rewrites outbound auth header placeholders -> real secrets
 ```
+
+## Selective Passthrough
+
+The canonical placeholder model breaks for credentials that:
+
+- are validated **in-process** by an SDK before any network call (Slack
+  `@slack/web-api` checks the `xoxb-` prefix; `@slack/socket-mode` checks
+  `xapp-`; OAuth libraries parse JWT structure; AWS SDKs validate access-key
+  format),
+- are sent over **transports the L7 proxy cannot rewrite** (WebSocket payloads
+  after HTTP `101 Switching Protocols` upgrade — for example Discord's
+  IDENTIFY frame), or
+- are consumed by **in-process crypto** that never reaches the wire (Slack
+  signing-secret HMAC, Discord interaction-signature verification).
+
+For these cases the operator can opt specific credential keys into
+**passthrough**: the supervisor injects the **real value** into the agent's
+environment instead of the canonical
+`openshell:resolve:env:<KEY>` placeholder, and the resolver does not learn
+that key. The L7 proxy therefore performs no substitution for it.
+
+### Configuration
+
+Each entry in `Provider.passthrough_credentials` must:
+
+- be a valid environment-variable name (matches `^[A-Za-z_][A-Za-z0-9_]*$`),
+- be present as a key in `Provider.credentials`,
+- appear at most once.
+
+The gateway rejects updates that violate any of these conditions.
+
+**Update merge semantics.** Proto3 cannot distinguish "field unset" from
+"field set to empty list" for repeated strings, so the gateway uses a
+two-mode merge:
+
+- **Empty incoming list** (caller is not declaring passthrough) — preserve
+  the existing list, but auto-prune any entries whose credential was deleted
+  in the same update. Without this prune, marking a credential passthrough
+  and then deleting that credential would lock the provider in an invalid
+  state.
+- **Non-empty incoming list** — replace the stored list verbatim. Strict
+  validation still applies, so an explicit entry naming a non-existent
+  credential is rejected (treated as a caller bug, not a state-rescue
+  request).
+
+**Clearing the list.** Because proto3 cannot signal "set to empty" for
+repeated strings, there is no direct update that wipes the passthrough
+list while leaving credentials intact. Available paths:
+
+- delete the underlying credentials (auto-prune removes the corresponding
+  passthrough entries),
+- replace the list with a non-empty subset (send the entries you want to
+  keep), or
+- recreate the provider.
+
+### Resolution and merge across providers
+
+`resolve_provider_environment()` collects credentials and the union of
+passthrough keys across all providers attached to a sandbox. When two providers
+declare the same credential key, the first provider's value wins (existing
+semantics) and the passthrough flag follows the **winning** value: a
+passthrough opt-in declared on the second provider has no effect.
+
+### Supervisor injection
+
+`SecretResolver::from_provider_env_with_passthrough()` consumes both the env
+map and the passthrough key list. For each credential:
+
+- key in passthrough list → child env receives the real value; resolver does
+  not register a placeholder entry;
+- otherwise → child env receives the canonical placeholder and the resolver
+  maps it to the real value for on-the-wire substitution.
+
+If every key is passthrough the resolver is `None` and no L7 substitution
+runs.
+
+### Security trade-off
+
+Passthrough drops the "agent never sees the real secret" invariant for the
+listed keys. The real value is at rest in `/proc/<agent-pid>/environ` and any
+descendant process inherits it. Use sparingly:
+
+- prefer canonical placeholders whenever the consumer permits it;
+- only opt in keys whose consumer demonstrably fails with the placeholder
+  (in-process format check, opaque transport, in-process crypto);
+- document each opt-in in the provider's deployment notes.
 
 ## Persistence and Validation
 

@@ -150,11 +150,30 @@ pub(super) async fn update_provider_record(
         ));
     }
 
+    let merged_credentials = merge_map(existing.credentials, provider.credentials);
+    let merged_config = merge_map(existing.config, provider.config);
+    // Passthrough merge with orphan pruning: when the caller does not declare a
+    // new passthrough list (empty incoming = preserve), drop any entries whose
+    // credential was deleted in this same update. Without this, deleting a
+    // credential that was marked passthrough leaves the provider in a state
+    // that fails validation, and the operator cannot recover without
+    // recreating the provider. When the caller declares a non-empty list, keep
+    // strict validation — an explicit orphan is a caller bug and must surface.
+    let merged_passthrough = if provider.passthrough_credentials.is_empty() {
+        existing
+            .passthrough_credentials
+            .into_iter()
+            .filter(|key| merged_credentials.contains_key(key))
+            .collect()
+    } else {
+        provider.passthrough_credentials
+    };
     let updated = Provider {
         metadata: existing.metadata,
         r#type: existing.r#type,
-        credentials: merge_map(existing.credentials, provider.credentials),
-        config: merge_map(existing.config, provider.config),
+        credentials: merged_credentials,
+        config: merged_config,
+        passthrough_credentials: merged_passthrough,
     };
 
     // Ensure metadata is valid (defense in depth - existing.metadata should always be valid)
@@ -207,21 +226,38 @@ fn merge_map(
 // Provider environment resolution
 // ---------------------------------------------------------------------------
 
+/// Resolved provider environment for a sandbox.
+#[derive(Debug)]
+pub(super) struct ProviderEnvironment {
+    /// Credential environment variables (canonical and passthrough mixed).
+    pub environment: std::collections::HashMap<String, String>,
+    /// Subset of `environment` keys whose value is the real credential and
+    /// must be injected directly into the agent process — bypassing the
+    /// canonical placeholder substitution and L7 proxy rewriting.
+    pub passthrough_keys: Vec<String>,
+}
+
 /// Resolve provider credentials into environment variables.
 ///
 /// For each provider name in the list, fetches the provider from the store and
-/// collects credential key-value pairs. Returns a map of environment variables
-/// to inject into the sandbox. When duplicate keys appear across providers, the
-/// first provider's value wins.
+/// collects credential key-value pairs and the passthrough opt-in list.
+/// Returns a [`ProviderEnvironment`] describing the env map and which keys are
+/// passthrough. When duplicate keys appear across providers, the first
+/// provider's value wins; a key is treated as passthrough if any provider that
+/// owns the winning value lists it as passthrough.
 pub(super) async fn resolve_provider_environment(
     store: &Store,
     provider_names: &[String],
-) -> Result<std::collections::HashMap<String, String>, Status> {
+) -> Result<ProviderEnvironment, Status> {
     if provider_names.is_empty() {
-        return Ok(std::collections::HashMap::new());
+        return Ok(ProviderEnvironment {
+            environment: std::collections::HashMap::new(),
+            passthrough_keys: Vec::new(),
+        });
     }
 
     let mut env = std::collections::HashMap::new();
+    let mut passthrough = std::collections::HashSet::new();
 
     for name in provider_names {
         let provider = store
@@ -230,20 +266,37 @@ pub(super) async fn resolve_provider_environment(
             .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
 
+        let provider_passthrough: std::collections::HashSet<&str> = provider
+            .passthrough_credentials
+            .iter()
+            .map(String::as_str)
+            .collect();
+
         for (key, value) in &provider.credentials {
-            if is_valid_env_key(key) {
-                env.entry(key.clone()).or_insert_with(|| value.clone());
-            } else {
+            if !is_valid_env_key(key) {
                 warn!(
                     provider_name = %name,
                     key = %key,
                     "skipping credential with invalid env var key"
                 );
+                continue;
+            }
+            if !env.contains_key(key) {
+                env.insert(key.clone(), value.clone());
+                if provider_passthrough.contains(key.as_str()) {
+                    passthrough.insert(key.clone());
+                }
             }
         }
     }
 
-    Ok(env)
+    let mut passthrough_keys: Vec<String> = passthrough.into_iter().collect();
+    passthrough_keys.sort();
+
+    Ok(ProviderEnvironment {
+        environment: env,
+        passthrough_keys,
+    })
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {
@@ -392,6 +445,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            passthrough_credentials: Vec::new(),
         }
     }
 
@@ -437,6 +491,7 @@ mod tests {
                 .collect(),
                 config: std::iter::once(("endpoint".to_string(), "https://gitlab.com".to_string()))
                     .collect(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -505,6 +560,7 @@ mod tests {
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -529,6 +585,7 @@ mod tests {
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -557,6 +614,7 @@ mod tests {
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -604,6 +662,7 @@ mod tests {
                 r#type: String::new(),
                 credentials: std::iter::once(("SECONDARY".to_string(), String::new())).collect(),
                 config: std::iter::once(("region".to_string(), String::new())).collect(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -655,6 +714,7 @@ mod tests {
                 r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -684,6 +744,7 @@ mod tests {
                 r#type: "openai".to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -715,6 +776,7 @@ mod tests {
                 r#type: String::new(),
                 credentials: std::iter::once((oversized_key, "value".to_string())).collect(),
                 config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -724,10 +786,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_provider_prunes_passthrough_for_deleted_credential() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: "slack".to_string(),
+                credentials: [
+                    ("SLACK_BOT_TOKEN".to_string(), "xoxb".to_string()),
+                    ("SLACK_SIGNING_SECRET".to_string(), "sig".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                config: HashMap::new(),
+                passthrough_credentials: vec![
+                    "SLACK_BOT_TOKEN".to_string(),
+                    "SLACK_SIGNING_SECRET".to_string(),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+
+        // Caller deletes the bot token without touching the passthrough list.
+        // The orphaned passthrough entry must be pruned, not block the update.
+        let updated = update_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: String::new(),
+                credentials: std::iter::once(("SLACK_BOT_TOKEN".to_string(), String::new()))
+                    .collect(),
+                config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!updated.credentials.contains_key("SLACK_BOT_TOKEN"));
+        assert!(updated.credentials.contains_key("SLACK_SIGNING_SECRET"));
+        assert_eq!(
+            updated.passthrough_credentials,
+            vec!["SLACK_SIGNING_SECRET".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_provider_rejects_explicit_passthrough_orphan() {
+        // When the caller declares a non-empty passthrough list, an entry that
+        // names a non-existent credential is a caller bug and must surface.
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack-explicit".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: "slack".to_string(),
+                credentials: std::iter::once(("API_KEY".to_string(), "v".to_string())).collect(),
+                config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = update_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack-explicit".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: String::new(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                passthrough_credentials: vec!["UNKNOWN_KEY".to_string()],
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("not present in credentials"));
+    }
+
+    #[tokio::test]
     async fn resolve_provider_env_empty_list_returns_empty() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         let result = resolve_provider_environment(&store, &[]).await.unwrap();
-        assert!(result.is_empty());
+        assert!(result.environment.is_empty());
+        assert!(result.passthrough_keys.is_empty());
     }
 
     #[tokio::test]
@@ -752,15 +924,23 @@ mod tests {
                 "https://api.anthropic.com".to_string(),
             ))
             .collect(),
+            passthrough_credentials: Vec::new(),
         };
         create_provider_record(&store, provider).await.unwrap();
 
         let result = resolve_provider_environment(&store, &["claude-local".to_string()])
             .await
             .unwrap();
-        assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
-        assert_eq!(result.get("CLAUDE_API_KEY"), Some(&"sk-abc".to_string()));
-        assert!(!result.contains_key("endpoint"));
+        assert_eq!(
+            result.environment.get("ANTHROPIC_API_KEY"),
+            Some(&"sk-abc".to_string())
+        );
+        assert_eq!(
+            result.environment.get("CLAUDE_API_KEY"),
+            Some(&"sk-abc".to_string())
+        );
+        assert!(!result.environment.contains_key("endpoint"));
+        assert!(result.passthrough_keys.is_empty());
     }
 
     #[tokio::test]
@@ -792,15 +972,19 @@ mod tests {
             .into_iter()
             .collect(),
             config: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
         create_provider_record(&store, provider).await.unwrap();
 
         let result = resolve_provider_environment(&store, &["test-provider".to_string()])
             .await
             .unwrap();
-        assert_eq!(result.get("VALID_KEY"), Some(&"value".to_string()));
-        assert!(!result.contains_key("nested.api_key"));
-        assert!(!result.contains_key("bad-key"));
+        assert_eq!(
+            result.environment.get("VALID_KEY"),
+            Some(&"value".to_string())
+        );
+        assert!(!result.environment.contains_key("nested.api_key"));
+        assert!(!result.environment.contains_key("bad-key"));
     }
 
     #[tokio::test]
@@ -822,6 +1006,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -839,6 +1024,7 @@ mod tests {
                 credentials: std::iter::once(("GITLAB_TOKEN".to_string(), "glpat-xyz".to_string()))
                     .collect(),
                 config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -850,8 +1036,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
-        assert_eq!(result.get("GITLAB_TOKEN"), Some(&"glpat-xyz".to_string()));
+        assert_eq!(
+            result.environment.get("ANTHROPIC_API_KEY"),
+            Some(&"sk-abc".to_string())
+        );
+        assert_eq!(
+            result.environment.get("GITLAB_TOKEN"),
+            Some(&"glpat-xyz".to_string())
+        );
     }
 
     #[tokio::test]
@@ -870,6 +1062,7 @@ mod tests {
                 credentials: std::iter::once(("SHARED_KEY".to_string(), "first-value".to_string()))
                     .collect(),
                 config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -890,6 +1083,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -901,7 +1095,114 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.get("SHARED_KEY"), Some(&"first-value".to_string()));
+        assert_eq!(
+            result.environment.get("SHARED_KEY"),
+            Some(&"first-value".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_propagates_passthrough_keys() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: "slack".to_string(),
+                credentials: [
+                    ("SLACK_BOT_TOKEN".to_string(), "xoxb-real".to_string()),
+                    ("SLACK_SIGNING_SECRET".to_string(), "sig-real".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                config: HashMap::new(),
+                passthrough_credentials: vec![
+                    "SLACK_BOT_TOKEN".to_string(),
+                    "SLACK_SIGNING_SECRET".to_string(),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["slack".to_string()])
+            .await
+            .unwrap();
+        let mut keys = result.passthrough_keys.clone();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "SLACK_BOT_TOKEN".to_string(),
+                "SLACK_SIGNING_SECRET".to_string(),
+            ]
+        );
+        assert_eq!(
+            result.environment.get("SLACK_BOT_TOKEN"),
+            Some(&"xoxb-real".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_skips_passthrough_when_first_provider_wins_canonical() {
+        // When two providers declare the same key but only the second marks it
+        // as passthrough, the first provider's value wins (existing semantics)
+        // and the key stays canonical.
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "first".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: "claude".to_string(),
+                credentials: std::iter::once(("API_KEY".to_string(), "first-value".to_string()))
+                    .collect(),
+                config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "second".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: "anthropic".to_string(),
+                credentials: std::iter::once(("API_KEY".to_string(), "second-value".to_string()))
+                    .collect(),
+                config: HashMap::new(),
+                passthrough_credentials: vec!["API_KEY".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+        let result =
+            resolve_provider_environment(&store, &["first".to_string(), "second".to_string()])
+                .await
+                .unwrap();
+        assert_eq!(
+            result.environment.get("API_KEY"),
+            Some(&"first-value".to_string())
+        );
+        assert!(
+            result.passthrough_keys.is_empty(),
+            "passthrough must follow the winning value, not the losing provider's opt-in"
+        );
     }
 
     #[tokio::test]
@@ -926,6 +1227,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -954,11 +1256,14 @@ mod tests {
             .unwrap()
             .unwrap();
         let spec = loaded.spec.unwrap();
-        let env = resolve_provider_environment(&store, &spec.providers)
+        let resolved = resolve_provider_environment(&store, &spec.providers)
             .await
             .unwrap();
 
-        assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&"sk-test".to_string()));
+        assert_eq!(
+            resolved.environment.get("ANTHROPIC_API_KEY"),
+            Some(&"sk-test".to_string())
+        );
     }
 
     #[tokio::test]
@@ -987,11 +1292,12 @@ mod tests {
             .unwrap()
             .unwrap();
         let spec = loaded.spec.unwrap();
-        let env = resolve_provider_environment(&store, &spec.providers)
+        let resolved = resolve_provider_environment(&store, &spec.providers)
             .await
             .unwrap();
 
-        assert!(env.is_empty());
+        assert!(resolved.environment.is_empty());
+        assert!(resolved.passthrough_keys.is_empty());
     }
 
     #[tokio::test]
