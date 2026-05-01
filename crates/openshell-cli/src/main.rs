@@ -1702,10 +1702,6 @@ enum ServiceCommands {
         /// Loopback TCP port inside the sandbox.
         #[arg(long)]
         target_port: u16,
-
-        /// Print and enable the browser URL for this sandbox service.
-        #[arg(long)]
-        domain: bool,
     },
 }
 
@@ -2028,14 +2024,12 @@ async fn main() -> Result<()> {
                     sandbox,
                     service,
                     target_port,
-                    domain,
                 }),
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_edge_auth(&mut tls, &ctx.name);
-            run::service_expose(&ctx.endpoint, &sandbox, &service, target_port, domain, &tls)
-                .await?;
+            run::service_expose(&ctx.endpoint, &sandbox, &service, target_port, &tls).await?;
         }
         // -----------------------------------------------------------
         // Top-level logs (was `sandbox logs`)

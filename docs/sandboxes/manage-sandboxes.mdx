@@ -130,7 +130,7 @@ openshell gateway start --recreate
 Expose a service that listens on loopback inside the sandbox:
 
 ```shell
-openshell service expose my-sandbox web --target-port 8080 --domain
+openshell service expose my-sandbox web --target-port 8080
 ```
 
 OpenShell prints a URL in the form `https://<sandbox>--<service>.<gateway>.openshell.localhost:<port>/`. HTTP traffic enters the same gateway listener as gRPC and routes by the `Host` header before gateway routes such as `/auth`, so application paths are preserved for the sandbox service.
