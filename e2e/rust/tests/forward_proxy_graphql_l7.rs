@@ -315,6 +315,7 @@ def forward_chunked_status(query):
             f"\r\n"
         ).encode() + chunk
         sock.sendall(request)
+        sock.shutdown(socket.SHUT_WR)
         response = read_until(sock, b"\r\n\r\n")
         return int(response.split()[1])
 
@@ -446,6 +447,7 @@ def connect_chunked_status(query):
             f"\r\n"
         ).encode() + chunk
         sock.sendall(request)
+        sock.shutdown(socket.SHUT_WR)
         response = read_until(sock, b"\r\n\r\n")
         return int(response.split()[1])
 
