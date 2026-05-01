@@ -317,7 +317,6 @@ def forward_chunked_status(query):
             f"\r\n"
         ).encode() + chunk
         sock.sendall(request)
-        sock.shutdown(socket.SHUT_WR)
         response, body = read_response(sock)
         DETAILS["forward_chunked_query_allowed_detail"] = body.decode(errors="replace")
         return int(response.split()[1])
