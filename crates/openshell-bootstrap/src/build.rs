@@ -9,14 +9,27 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use bollard::Docker;
 use bollard::query_parameters::BuildImageOptionsBuilder;
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
+use tokio::time::timeout;
 
 use crate::constants::container_name;
 use crate::push::push_local_images;
+
+/// Maximum gap between Docker build stream events before a build is treated
+/// as stuck.
+///
+/// Total silence longer than this on under-provisioned container runtimes
+/// (e.g. default Colima 2 vCPU / 2 GiB on macOS) reliably indicates a
+/// deadlocked builder that will never recover. The default leaves headroom
+/// for legitimately quiet steps (a single long `RUN` that produces no output)
+/// — override with `OPENSHELL_BUILD_NO_PROGRESS_TIMEOUT_SECS` if a specific
+/// build needs more time, or shorter for CI tightening.
+const DEFAULT_BUILD_NO_PROGRESS_TIMEOUT_SECS: u64 = 1800;
 
 /// Build a container image from a Dockerfile and push it into the gateway.
 ///
@@ -100,9 +113,29 @@ async fn build_image(
 
     let body = bollard::body_full(bytes::Bytes::from(context_tar));
     let mut stream = docker.build_image(options, None, Some(body));
+    let no_progress_secs: u64 = std::env::var("OPENSHELL_BUILD_NO_PROGRESS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_BUILD_NO_PROGRESS_TIMEOUT_SECS);
+    let no_progress_timeout = Duration::from_secs(no_progress_secs);
 
-    while let Some(result) = stream.next().await {
-        let info = result
+    loop {
+        let next = match timeout(no_progress_timeout, stream.next()).await {
+            Ok(Some(result)) => result,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(miette::miette!(
+                    "Docker build produced no output for {}s. This usually means the container \
+                     runtime is under-provisioned (CPU/memory) and the builder has deadlocked; \
+                     check `docker info` (NCPU, MemTotal) and increase Colima/Docker Desktop \
+                     resources before retrying. If a legitimate build step is just quiet, raise \
+                     the threshold with OPENSHELL_BUILD_NO_PROGRESS_TIMEOUT_SECS=<secs>.",
+                    no_progress_timeout.as_secs()
+                ));
+            }
+        };
+
+        let info = next
             .into_diagnostic()
             .wrap_err("Docker build stream error")?;
 
