@@ -62,7 +62,7 @@ File: `crates/openshell-server/src/inference.rs`
 
 The gateway implements the `Inference` gRPC service defined in `proto/inference.proto`.
 
-### Cluster inference set/get
+### Gateway inference set/get
 
 `SetClusterInference` takes a `provider_name` and `model_id`. It:
 
@@ -73,7 +73,7 @@ The gateway implements the `Inference` gRPC service defined in `proto/inference.
 5. Builds a managed route spec that stores only `provider_name` and `model_id`. The spec intentionally leaves `base_url`, `api_key`, and `protocols` empty -- these are resolved dynamically at bundle time from the provider record.
 6. Upserts the route with name `inference.local`. Version starts at 1 and increments monotonically on each update.
 
-`GetClusterInference` returns `provider_name`, `model_id`, and `version` for the managed route. Returns `NOT_FOUND` if cluster inference is not configured.
+`GetClusterInference` returns `provider_name`, `model_id`, and `version` for the managed route. Returns `NOT_FOUND` if gateway inference is not configured.
 
 ### Bundle delivery
 
@@ -87,7 +87,7 @@ The gateway implements the `Inference` gRPC service defined in `proto/inference.
 
 Because resolution happens at request time, credential rotation and endpoint changes on the provider record take effect on the next bundle fetch without re-running `SetClusterInference`.
 
-An empty route list is valid and indicates cluster inference is not yet configured.
+An empty route list is valid and indicates gateway inference is not yet configured.
 
 ### Proto definitions
 
@@ -109,7 +109,7 @@ Files:
 - `crates/openshell-sandbox/src/lib.rs` -- inference context initialization, route refresh
 - `crates/openshell-sandbox/src/grpc_client.rs` -- `fetch_inference_bundle()`
 
-In cluster mode, the sandbox starts a background refresh loop as soon as the inference context is created. The loop polls the gateway every 5 seconds by default (`OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS` override) and uses the bundle revision hash to skip no-op cache writes. The revision hash covers all route fields including `timeout_secs`, so any configuration change (provider, model, or timeout) triggers a cache update on the next poll.
+In gateway bundle mode, the sandbox starts a background refresh loop as soon as the inference context is created. The loop polls the gateway every 5 seconds by default (`OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS` override) and uses the bundle revision hash to skip no-op cache writes. The revision hash covers all route fields including `timeout_secs`, so any configuration change (provider, model, or timeout) triggers a cache update on the next poll.
 
 ### Interception flow
 
@@ -146,9 +146,9 @@ If no pattern matches, the proxy returns `403 Forbidden` with `{"error": "connec
 ### Route cache
 
 - `InferenceContext` holds a `Router`, the pattern list, and an `Arc<RwLock<Vec<ResolvedRoute>>>` route cache.
-- In cluster mode, `spawn_route_refresh()` polls `GetInferenceBundle` every 5 seconds (`OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS`). On failure, stale routes are kept.
+- In gateway bundle mode, `spawn_route_refresh()` polls `GetInferenceBundle` every 5 seconds (`OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS`). On failure, stale routes are kept.
 - In file mode (`--inference-routes`), routes load once at startup from YAML. No refresh task is spawned.
-- In cluster mode, an empty initial bundle still enables the inference context so the refresh task can pick up later configuration.
+- In gateway bundle mode, an empty initial bundle still enables the inference context so the refresh task can pick up later configuration.
 
 ### Bundle-to-route conversion
 
@@ -280,7 +280,7 @@ Validation at load time requires either `api_key` or `api_key_env` to resolve, a
 | Status | Condition |
 |--------|-----------|
 | `403` | Request on `inference.local` does not match a recognized inference API pattern |
-| `503` | Pattern matched but route cache is empty (cluster inference not configured) |
+| `503` | Pattern matched but route cache is empty (gateway inference not configured) |
 | `400` | No compatible route for the detected source protocol |
 | `401` | Upstream returned unauthorized |
 | `502` | Upstream protocol error or internal router error |
@@ -328,15 +328,15 @@ The system route is stored as a separate `InferenceRoute` record in the gateway 
 
 ## CLI Surface
 
-Cluster inference commands:
+Gateway inference commands:
 
-- `openshell inference set --provider <name> --model <id> [--timeout <secs>]` -- configures user-facing cluster inference
+- `openshell inference set --provider <name> --model <id> [--timeout <secs>]` -- configures user-facing gateway inference
 - `openshell inference set --system --provider <name> --model <id> [--timeout <secs>]` -- configures system inference
 - `openshell inference update [--provider <name>] [--model <id>] [--timeout <secs>]` -- updates individual fields without resetting others
 - `openshell inference get` -- displays both user and system inference configuration
 - `openshell inference get --system` -- displays only the system inference configuration
 
-The `--provider` flag references a provider record name (not a provider type). The provider must already exist in the cluster and have a supported inference type (`openai`, `anthropic`, or `nvidia`).
+The `--provider` flag references a provider record name (not a provider type). The provider must already exist on the gateway and have a supported inference type (`openai`, `anthropic`, or `nvidia`).
 
 The `--timeout` flag sets the per-request timeout in seconds for upstream inference calls. When omitted or set to `0`, the default of 60 seconds applies. Timeout changes propagate to running sandboxes within the route refresh interval (5 seconds by default).
 

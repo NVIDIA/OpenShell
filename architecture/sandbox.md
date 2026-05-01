@@ -913,29 +913,29 @@ pub struct InferenceContext {
 
 #### Design decision: standalone capability
 
-The sandbox is designed to operate both as part of a cluster and as a standalone component without any cluster infrastructure. This is intentional -- it enables local development workflows (e.g., a developer running a sandbox against a local LLM server without deploying the full stack), CI/CD environments where sandboxes run as isolated test harnesses, and air-gapped deployments where the gateway is not available. Everything the sandbox needs -- policy, inference routes -- can be provided without any dependency on the control plane.
+The sandbox is designed to operate both under a gateway-managed compute platform and as a standalone component without gateway infrastructure. This is intentional -- it enables local development workflows (e.g., a developer running a sandbox against a local LLM server without deploying the full stack), CI/CD environments where sandboxes run as isolated test harnesses, and air-gapped deployments where the gateway is not available. Everything the sandbox needs -- policy, inference routes -- can be provided without any dependency on the control plane.
 
 #### Route sources (priority order)
 
-1. **Route file (standalone mode)**: `--inference-routes` / `OPENSHELL_INFERENCE_ROUTES` points to a YAML file parsed by `RouterConfig::load_from_file()`. Routes are resolved via `config.resolve_routes()`. File loading or parsing errors are fatal (fail-fast), but an empty route list gracefully disables inference routing (returns `None`). The route file always takes precedence -- if both a route file and cluster credentials are present, the route file wins and the cluster bundle is not fetched.
+1. **Route file (standalone mode)**: `--inference-routes` / `OPENSHELL_INFERENCE_ROUTES` points to a YAML file parsed by `RouterConfig::load_from_file()`. Routes are resolved via `config.resolve_routes()`. File loading or parsing errors are fatal (fail-fast), but an empty route list gracefully disables inference routing (returns `None`). The route file always takes precedence -- if both a route file and gateway credentials are present, the route file wins and the gateway bundle is not fetched.
 
-2. **Cluster bundle (cluster mode)**: When `openshell_endpoint` is available (and no route file is configured), routes are fetched from the gateway via `grpc_client::fetch_inference_bundle()`, which calls the `GetInferenceBundle` gRPC RPC on the `Inference` service. The RPC takes no arguments (the bundle is cluster-scoped, not per-sandbox). The gateway returns a `GetInferenceBundleResponse` containing resolved `ResolvedRoute` entries for the managed cluster route. These proto messages are converted to router `ResolvedRoute` structs by `bundle_to_resolved_routes()`, which maps provider types to auth headers and default headers via `openshell_core::inference::auth_for_provider_type()`.
+2. **Gateway bundle (gateway mode)**: When `openshell_endpoint` is available (and no route file is configured), routes are fetched from the gateway via `grpc_client::fetch_inference_bundle()`, which calls the `GetInferenceBundle` gRPC RPC on the `Inference` service. The RPC takes no arguments (the bundle is gateway-scoped, not per-sandbox). The gateway returns a `GetInferenceBundleResponse` containing resolved `ResolvedRoute` entries for the managed gateway route. These proto messages are converted to router `ResolvedRoute` structs by `bundle_to_resolved_routes()`, which maps provider types to auth headers and default headers via `openshell_core::inference::auth_for_provider_type()`.
 
-3. **No source**: If neither route file nor cluster credentials are configured, `build_inference_context()` returns `None` and inference routing is disabled.
+3. **No source**: If neither route file nor gateway credentials are configured, `build_inference_context()` returns `None` and inference routing is disabled.
 
-#### Cluster mode graceful degradation
+#### Gateway mode graceful degradation
 
-In cluster mode, `fetch_inference_bundle()` failures are handled based on the error type:
+In gateway mode, `fetch_inference_bundle()` failures are handled based on the error type:
 
 - gRPC `PermissionDenied` or `NotFound` (detected via error message string matching): sandbox has no inference policy -- inference routing is silently disabled.
 - Other errors: logged as a warning, inference routing is disabled.
 - Empty initial route bundle: inference routing stays enabled with an empty cache and background refresh continues.
 
-Route sources handle empty route lists differently: file mode disables inference routing when the file resolves to zero routes, while cluster mode keeps inference routing active with an empty cache so refresh can pick up routes created later. File *loading errors* (missing file, parse failure) are fatal, while cluster *fetch errors* are non-fatal.
+Route sources handle empty route lists differently: file mode disables inference routing when the file resolves to zero routes, while gateway mode keeps inference routing active with an empty cache so refresh can pick up routes created later. File *loading errors* (missing file, parse failure) are fatal, while gateway *fetch errors* are non-fatal.
 
 #### Background route cache refresh
 
-In cluster mode (when no route file is configured), `spawn_route_refresh()` starts a background tokio task that refreshes the route cache every 30 seconds (`ROUTE_REFRESH_INTERVAL_SECS`). The task calls `fetch_inference_bundle()` on each tick and replaces the `RwLock<Vec<ResolvedRoute>>` contents. On fetch failure, the task logs a warning and keeps the stale routes. The `MissedTickBehavior::Skip` policy prevents refresh storms after temporary gateway outages.
+In gateway mode (when no route file is configured), `spawn_route_refresh()` starts a background tokio task that refreshes the route cache every 30 seconds (`ROUTE_REFRESH_INTERVAL_SECS`). The task calls `fetch_inference_bundle()` on each tick and replaces the `RwLock<Vec<ResolvedRoute>>` contents. On fetch failure, the task logs a warning and keeps the stale routes. The `MissedTickBehavior::Skip` policy prevents refresh storms after temporary gateway outages.
 
 ```mermaid
 flowchart TD
@@ -955,7 +955,7 @@ flowchart TD
     M -- Yes --> L
     M -- No --> N[Warn + None]
     H -- No --> L
-    F --> O[spawn_route_refresh if cluster mode]
+    F --> O[spawn_route_refresh if gateway mode]
     G --> O
 ```
 
@@ -1586,8 +1586,8 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 | SSRF: DNS resolution failure | Deny the specific CONNECT request |
 | Inference route file load/parse error | Fatal -- sandbox startup aborts |
 | Inference route file with empty routes | Inference routing disabled (graceful) |
-| Inference cluster bundle with empty routes | Inference routing stays enabled with empty cache; refresh can activate routes later |
-| Inference cluster bundle fetch failure | Warn + inference routing disabled (graceful) |
+| Inference gateway bundle with empty routes | Inference routing stays enabled with empty cache; refresh can activate routes later |
+| Inference gateway bundle fetch failure | Warn + inference routing disabled (graceful) |
 | Inference interception: missing InferenceContext | Denied outcome + structured CONNECT deny log |
 | Inference interception: missing TLS state | Denied outcome + structured CONNECT deny log |
 | Inference interception: TLS handshake failure | Denied outcome + structured CONNECT deny log |

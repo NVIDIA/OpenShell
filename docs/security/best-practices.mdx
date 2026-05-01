@@ -238,16 +238,16 @@ The agent never receives the provider API key.
 
 ## Gateway Security
 
-The gateway secures communication between the CLI, sandbox pods, and external clients with mutual TLS and token-based authentication.
+The gateway secures communication between the CLI, sandbox workloads, and external clients with mutual TLS and token-based authentication.
 
 ### mTLS
 
-Communication between the CLI, sandbox pods, and the gateway is secured by mutual TLS.
-OpenShell generates a cluster CA at bootstrap and distributes it through Kubernetes secrets.
+Communication between the CLI, sandbox workloads, and the gateway is secured by mutual TLS.
+For Helm deployments, provide a CA and certificate bundle through the Kubernetes secrets consumed by the chart.
 
 | Aspect | Detail |
 |---|---|
-| Default | mTLS required. Both client and server present certificates that the cluster CA signed. |
+| Default | mTLS required. Both client and server present certificates that the deployment CA signed. |
 | What you can change | Enable dual-auth mode (`allow_unauthenticated=true`) for Cloudflare Tunnel deployments, or disable TLS entirely for trusted reverse-proxy setups. |
 | Risk if relaxed | Dual-auth mode accepts clients without certificates and defers authentication to the HTTP layer (Cloudflare JWT). Disabling TLS removes transport-level authentication entirely. |
 | Recommendation | Use mTLS (the default) unless deploying behind Cloudflare or a trusted reverse proxy. |

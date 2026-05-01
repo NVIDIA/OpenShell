@@ -11,9 +11,7 @@ position: 2
 This page covers creating sandboxes and managing them. For background on what sandboxes are and how isolation works, refer to [About Sandboxes](/sandboxes/about).
 
 <Info>
-Docker must be running before you create a gateway or sandbox. If it is not, the CLI
-returns a connection-refused error (`os error 61`) without explaining
-the cause. Start Docker and try again.
+You need an active gateway before creating a sandbox. Docker-backed gateways require Docker to be running. Podman, Kubernetes, and MicroVM-backed gateways require their respective runtime or cluster to be reachable from the gateway.
 
 </Info>
 
@@ -25,11 +23,16 @@ Create a sandbox with a single command. For example, to create a sandbox with Cl
 openshell sandbox create -- claude
 ```
 
-Every sandbox requires a gateway. If you run `openshell sandbox create` without a gateway, the CLI auto-bootstraps a local gateway.
+Every sandbox requires a gateway. Register or select one before running sandbox commands:
+
+```shell
+openshell gateway add http://127.0.0.1:18080 --local --name local
+openshell gateway select local
+```
 
 ### Remote Gateways
 
-If you plan to run sandboxes on a remote host or a cloud-hosted gateway, set up the gateway first. Refer to [Manage Gateways](/sandboxes/manage-gateways) for deployment options and multi-gateway management.
+If you plan to run sandboxes on a remote host, Kubernetes cluster, or cloud-hosted gateway, set up the gateway first. Refer to [Manage Gateways](/sandboxes/manage-gateways) for deployment options and multi-gateway management.
 
 ### GPU Resources
 

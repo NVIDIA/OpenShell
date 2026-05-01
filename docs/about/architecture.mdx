@@ -8,7 +8,7 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Security, Archit
 position: 2
 ---
 
-OpenShell runs inside a Docker container. Each sandbox is an isolated environment managed through the gateway. Three components work together to keep agents secure.
+OpenShell runs sandboxes through a gateway that can use several compute platforms, including Kubernetes, Docker, Podman, and the experimental MicroVM runtime. Each sandbox is an isolated environment managed through the gateway. Three components work together to keep agents secure.
 
 ![OpenShell architecture diagram](/assets/images/architecture.svg)
 
@@ -42,7 +42,7 @@ For REST endpoints, the proxy auto-detects Transport Layer Security (TLS) by pee
 
 ## Gateway Lifecycle
 
-OpenShell preserves sandbox state across gateway restarts. After `openshell gateway stop` and `openshell gateway start`, running sandboxes resume from their saved state. Existing SSH sessions reconnect without re-authenticating.
+OpenShell preserves gateway state in the configured gateway database. Kubernetes deployments commonly use the Helm chart's persistent volume, while standalone gateway deployments can use local storage or Postgres. Sandbox state depends on the selected compute driver and the storage configured for sandbox workloads.
 
 ## Observability
 
@@ -50,13 +50,15 @@ The sandbox emits operational decisions as Open Cybersecurity Schema Framework (
 
 ## Deployment Modes
 
-OpenShell can run locally, on a remote host, or behind a cloud proxy. The architecture is identical in all cases. Only the Docker container location and authentication mode change.
+OpenShell is deployed by running or exposing a gateway, then registering that endpoint with the CLI. The gateway's compute driver determines where sandboxes run.
 
 | Mode | Description | Command |
 |---|---|---|
-| **Local** | The gateway runs inside Docker on your workstation. The CLI provisions it automatically on first use. | `openshell gateway start` |
-| **Remote** | The gateway runs on a remote host via SSH. Only Docker is required on the remote machine. | `openshell gateway start --remote user@host` |
-| **Cloud** | A gateway already running behind a reverse proxy (e.g. Cloudflare Access). Register and authenticate via browser. | `openshell gateway add https://gateway.example.com` |
+| **Docker local** | The gateway uses Docker to create local sandbox containers. | `mise run gateway:docker` |
+| **Podman local** | The gateway uses a Podman-compatible container runtime, commonly rootless. | Driver-specific gateway configuration |
+| **Kubernetes service** | The Helm chart deploys the gateway and configures the Kubernetes compute driver. | `helm upgrade --install ... --values values.yaml` |
+| **MicroVM** | The gateway uses the experimental VM compute driver. | Driver-specific gateway configuration |
+| **Cloud proxy** | A gateway already running behind a reverse proxy, such as Cloudflare Access. Register and authenticate via browser. | `openshell gateway add https://gateway.example.com` |
 
 You can register multiple gateways and switch between them with `openshell gateway select`. For the full deployment and management workflow, refer to the [Gateways](/sandboxes/manage-gateways) section.
 

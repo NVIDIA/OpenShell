@@ -10,20 +10,21 @@ position: 1
 
 Every OpenShell deployment starts with a *gateway* and one or more *sandboxes*. The gateway is the control plane that manages sandbox lifecycle, providers, and policies. A sandbox is the data plane, a safe, private execution environment where an AI agent runs. Each sandbox runs with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.
 
-## Gateway Types
+## Gateway Compute Platforms
 
-A gateway provisions sandboxes, brokers CLI requests, enforces policies, and manages provider credentials. OpenShell supports three deployment models, so the gateway can run wherever your workload requires.
+A gateway provisions sandboxes, brokers CLI requests, enforces policies, and manages provider credentials. OpenShell supports multiple compute platforms, so the gateway can run sandboxes wherever your workload requires.
 
-| Type | Where It Runs | Best For |
+| Platform | Where Sandboxes Run | Best For |
 |---|---|---|
-| **Local** | Docker on your workstation | Solo development and quick iteration. The CLI auto-bootstraps a local gateway if none exists. |
-| **Remote** | Docker on a remote host via SSH | Running sandboxes on a more powerful machine (for example, a DGX Spark) while keeping the CLI on your laptop. |
-| **Cloud** | Behind a reverse proxy (for example, Cloudflare Access) | Individual users accessing OpenShell behind a cloud VM. Cloud gateways are not yet intended for shared team access. |
+| Docker | Containers on the gateway host | Solo development, quick iteration, and single-machine gateways. |
+| Podman | Rootless containers on the gateway host | Workstations that avoid a rootful Docker daemon. |
+| Kubernetes | Pods in an operator-managed cluster | Shared clusters and cloud environments. |
+| MicroVM | VM-backed sandboxes | Experimental stronger-isolation workflows. |
 
-All three types expose the same API surface. Sandboxes, policies, and providers work identically regardless of where the gateway runs. The only difference is how the CLI reaches the gateway, whether through a direct Docker socket, SSH tunnel, or HTTPS through a proxy.
+All compute platforms expose the same gateway API surface. Sandboxes, policies, and providers work the same after the CLI registers the gateway endpoint. The difference is how the gateway creates sandbox workloads and how operators expose the gateway to users.
 
 <Tip>
-You do not need to deploy a gateway manually. Running `openshell sandbox create` without a gateway auto-bootstraps a local one for you.
+For local development, start a Docker-backed gateway from a source checkout with `mise run gateway:docker`, then register it with `openshell gateway add http://127.0.0.1:18080 --local --name local`.
 
 </Tip>
 

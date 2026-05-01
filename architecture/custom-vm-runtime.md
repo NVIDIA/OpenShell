@@ -86,9 +86,9 @@ guest** before caching it:
 - `/srv/openshell-vm-sandbox-init.sh` is installed as the guest entrypoint
 - the bundled `openshell-sandbox` binary is copied into
   `/opt/openshell/bin/openshell-sandbox`
-- k3s state and Kubernetes manifests are stripped out if the image contains them
-- the guest boots directly into `openshell-sandbox` — no k3s, no kube-proxy, no
-  CNI plugins
+- Kubernetes state and manifests are stripped out if the image contains them
+- the guest boots directly into `openshell-sandbox` -- no Kubernetes control
+  plane, no kube-proxy, no CNI plugins
 
 See `crates/openshell-driver-vm/src/rootfs.rs` for the rewrite logic and
 `crates/openshell-driver-vm/scripts/openshell-vm-sandbox-init.sh` for the init

@@ -339,7 +339,7 @@ Gateway (host, port 8080)
 | TLS | mTLS via K8s secrets | Disabled by default (loopback-only, `--disable-tls`) |
 | DNS | Kubernetes CoreDNS | Podman bridge DNS (aardvark-dns, `dns_enabled: true`) |
 | Network policy | K8s NetworkPolicy (ingress restricted to gateway) | iptables inside inner sandbox netns |
-| Supervisor delivery | hostPath volume from k3s node | OCI image volume mount (FROM scratch image) |
+| Supervisor delivery | Kubernetes driver managed pod image/template | OCI image volume mount (FROM scratch image) |
 | Secrets | K8s Secret volume mount (TLS certs); SSH handshake secret via env var | Podman `secret_env` API (hidden from `podman inspect`) |
 
 Both drivers use the same reverse gRPC relay (`ConnectSupervisor` + `RelayStream`) for SSH transport. The most significant difference is network reachability: in rootless Podman, the bridge network is not routable from the host, so all communication between host and container goes through either pasta port forwarding (`portmappings`) or the `host.containers.internal` hostname (resolved to `169.254.1.2` by pasta).

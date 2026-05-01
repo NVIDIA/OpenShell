@@ -9,23 +9,23 @@ graph TB
         CLI["OpenShell CLI<br/>(openshell)"]
         TUI["OpenShell TUI<br/>(openshell term)"]
         SDK["Python SDK<br/>(openshell)"]
-        LocalConfig["~/.config/openshell/<br/>clusters, mTLS certs,<br/>active_cluster"]
+        LocalConfig["~/.config/openshell/<br/>gateways, mTLS certs,<br/>active_gateway"]
     end
 
     %% ============================================================
-    %% KUBERNETES CLUSTER (single Docker container)
+    %% GATEWAY AND COMPUTE PLATFORM
     %% ============================================================
-    subgraph Cluster["OpenShell Cluster Container (Docker)"]
+    subgraph Cluster["Gateway and Compute Platform"]
 
-        subgraph K3s["k3s (v1.35.2-k3s1)"]
-            KubeAPI["Kubernetes API<br/>:6443"]
-            HelmController["Helm Controller"]
-            LocalPathProv["local-path-provisioner"]
-        end
+        ComputeDriver["Compute Driver<br/>(Docker, Podman,<br/>Kubernetes, VM)"]
+        DockerAPI["Docker API"]
+        PodmanAPI["Podman API"]
+        KubeAPI["Kubernetes API<br/>(optional)"]
+        VMDriver["VM Driver<br/>(experimental)"]
 
-        subgraph NSNamespace["openshell namespace"]
+        subgraph NSNamespace["Gateway runtime"]
 
-            subgraph GatewayPod["Gateway StatefulSet"]
+            subgraph GatewayPod["Gateway Process"]
                 Gateway["openshell-server<br/>:8080<br/>(gRPC + HTTP, mTLS)"]
                 SQLite[("SQLite DB<br/>/var/openshell/<br/>openshell.db")]
                 SupRegistry["SupervisorSessionRegistry<br/>(live sessions + pending relays)"]
@@ -33,7 +33,7 @@ graph TB
                 LogBus["TracingLogBus<br/>(in-memory broadcast)"]
             end
 
-            subgraph SandboxPod["Sandbox Pod (1 per sandbox)"]
+            subgraph SandboxPod["Sandbox Workload<br/>(container, pod, or VM)"]
 
                 subgraph Supervisor["Sandbox Supervisor<br/>(privileged user)"]
                     SSHServer["Embedded SSH<br/>Server (russh)<br/>Unix socket<br/>/run/openshell/ssh.sock"]
@@ -54,7 +54,7 @@ graph TB
             end
         end
 
-        subgraph ASNamespace["agent-sandbox-system namespace"]
+        subgraph ASNamespace["Kubernetes driver only"]
             CRDController["Agent Sandbox<br/>CRD Controller"]
         end
 
@@ -91,7 +91,7 @@ graph TB
     %% ============================================================
     %% CONNECTIONS: User Machine --> Cluster
     %% ============================================================
-    CLI -- "gRPC over HTTPS (mTLS)<br/>:30051 NodePort" --> Gateway
+    CLI -- "gRPC over HTTPS (mTLS)<br/>service / ingress / port-forward" --> Gateway
     TUI -- "gRPC polling (mTLS)<br/>every 2s" --> Gateway
     SDK -- "gRPC over HTTPS (mTLS)" --> Gateway
     CLI -- "HTTP CONNECT upgrade<br/>/connect/ssh (mTLS)" --> Gateway
@@ -102,8 +102,12 @@ graph TB
     %% ============================================================
     Gateway --> SQLite
     Gateway --> SupRegistry
-    Gateway -- "Watch + CRUD<br/>Sandbox CRDs" --> KubeAPI
-    KubeAPI -- "compute-driver events<br/>(status, platform events)" --> Gateway
+    Gateway -- "Create / delete / watch<br/>sandboxes" --> ComputeDriver
+    ComputeDriver --> DockerAPI
+    ComputeDriver --> PodmanAPI
+    ComputeDriver --> KubeAPI
+    ComputeDriver --> VMDriver
+    ComputeDriver -- "status, platform events" --> Gateway
 
     %% ============================================================
     %% CONNECTIONS: Supervisor session (inbound from sandbox)
@@ -146,9 +150,9 @@ graph TB
     InferenceRouter -- "HTTPS" --> NVIDIA_API
 
     %% ============================================================
-    %% CONNECTIONS: Cluster bootstrap
+    %% CONNECTIONS: Image pulls
     %% ============================================================
-    K3s -- "pulls images<br/>at runtime" --> GHCR
+    ComputeDriver -- "pulls or schedules workloads<br/>that pull images" --> GHCR
 
     %% ============================================================
     %% CLIENT SSH / EXEC (bytes tunneled via supervisor relay)
@@ -175,7 +179,7 @@ graph TB
     class Agent,Landlock,Seccomp,NetNS agent
     class SQLite datastore
     class Anthropic,OpenAI,NVIDIA_API,GitHub,GitLab,PyPI,NPM,LMStudio,VLLM,GHCR external
-    class KubeAPI,HelmController,LocalPathProv,CRDController k8s
+    class ComputeDriver,DockerAPI,PodmanAPI,KubeAPI,VMDriver,CRDController k8s
     class LocalConfig config
 ```
 
@@ -188,12 +192,12 @@ graph TB
 | Green | Sandbox supervisor | SSH server, HTTP CONNECT proxy, OPA engine, inference router |
 | Purple | Agent process & isolation | AI agent, Landlock, Seccomp, network namespace |
 | Indigo | Data stores | SQLite database |
-| Dark blue | Kubernetes infrastructure | K8s API, Helm controller, CRD controller |
+| Dark blue | Compute infrastructure | Docker API, Podman API, K8s API, VM driver |
 | Gray | External systems | AI APIs, code hosting, package registries, inference backends |
 
 ## Key Communication Flows
 
-1. **CLI/SDK to Gateway**: All control-plane traffic uses gRPC over HTTPS with mutual TLS (mTLS). Single multiplexed port (8080 inside cluster, 30051 NodePort).
+1. **CLI/SDK to Gateway**: Control-plane traffic uses gRPC over HTTPS with mutual TLS (mTLS) unless the gateway is explicitly deployed in plaintext mode behind a trusted transport. The gateway listens on one multiplexed service port.
 
 2. **Supervisor Session (inbound from sandbox)**: Each sandbox supervisor opens a persistent `ConnectSupervisor` bidi gRPC stream to the gateway over mTLS. The gateway tracks these in `SupervisorSessionRegistry`. When SSH or exec access is needed, the gateway sends `RelayOpen { channel_id }` on that stream; the supervisor responds by initiating a `RelayStream` RPC on the same HTTP/2 connection whose first frame is a `RelayInit { channel_id }`. Subsequent frames carry raw bytes in both directions. The gateway never dials the sandbox pod.
 

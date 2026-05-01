@@ -216,7 +216,7 @@ sequenceDiagram
    - Resolves sandbox name to ID via `GetSandbox` gRPC.
    - Creates an SSH session via `CreateSshSession` gRPC.
    - Builds a `ProxyCommand` string: `<openshell-exe> ssh-proxy --gateway <url> --sandbox-id <id> --token <token> --gateway-name <sni>`.
-   - If the gateway host is loopback but the cluster endpoint is not, `resolve_ssh_gateway()` overrides the host with the cluster endpoint's host.
+   - If the SSH gateway host is loopback but the registered gateway endpoint is not, `resolve_ssh_gateway()` overrides the host with the registered endpoint's host.
 3. `sandbox_connect()` builds an `ssh` command with:
    - `-o ProxyCommand=...`
    - `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null` (ephemeral host keys)
@@ -251,7 +251,7 @@ When `openshell sandbox create` launches a `--no-keep` command or shell, it keep
 - With `-d`/`--background`, SSH forks after auth and the CLI exits. The PID is tracked in `~/.config/openshell/forwards/<name>-<port>.pid` along with sandbox id metadata.
 - `openshell forward stop <port> <name>` validates PID ownership and then kills a background forward.
 - `openshell forward list` shows all tracked forwards.
-- `openshell forward stop` and `openshell forward list` are local operations and do not require resolving an active cluster.
+- `openshell forward stop` and `openshell forward list` are local operations and do not require resolving an active gateway.
 - `openshell sandbox create --forward <port>` starts a background forward before connect/exec, including when no trailing command is provided.
 - `openshell sandbox delete` auto-stops any active forwards for the deleted sandbox.
 
@@ -546,9 +546,9 @@ The gateway builds the remote command by shell-escaping arguments, prepending so
 
 **File**: `crates/openshell-core/src/forward.rs` -- `resolve_ssh_gateway()`
 
-When the gateway returns a loopback address (`127.0.0.1`, `0.0.0.0`, `localhost`, or `::1`), the client overrides it with the host from the cluster endpoint URL. This handles the common case where the gateway defaults to `127.0.0.1` but the cluster is running on a remote machine.
+When the gateway returns a loopback address (`127.0.0.1`, `0.0.0.0`, `localhost`, or `::1`), the client overrides it with the host from the registered gateway endpoint URL. This handles the common case where the gateway defaults to `127.0.0.1` but the gateway is running on a remote machine.
 
-The override only applies if the cluster endpoint itself is not also a loopback address. If both are loopback, the original address is kept.
+The override only applies if the registered gateway endpoint itself is not also a loopback address. If both are loopback, the original address is kept.
 
 This function is shared between the CLI and TUI via the `openshell-core::forward` module.
 

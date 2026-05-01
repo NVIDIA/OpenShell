@@ -6,11 +6,11 @@ This project is a platform for securely running AI agents in isolated sandbox en
 
 This platform solves that problem by creating sandboxed execution environments where agents run with exactly the permissions they need and nothing more. Every sandbox is governed by a policy that defines which files the agent can access, which network hosts it can reach, and which system operations it can perform. All outbound network traffic is forced through a controlled proxy that inspects and enforces access rules in real time.
 
-The platform packages the entire infrastructure -- orchestration gateway, sandbox runtime, networking, and Kubernetes cluster -- into a single deployable unit. A user can go from zero to a running, secured sandbox in two commands. The system handles cluster provisioning, credential management, policy enforcement, and secure remote access without requiring the user to configure Kubernetes, networking, or security policies manually.
+The platform runs a gateway control plane and uses a configured compute driver to run agents in isolated sandbox environments. Supported compute platforms include Docker, Podman, Kubernetes, and the experimental MicroVM runtime. The system handles credential management, policy enforcement, and secure remote access while leaving runtime and cluster provisioning to the operator.
 
 ## How the Subsystems Fit Together
 
-The following diagram shows how the major subsystems interact at a high level. Users interact through the CLI, which communicates with a central gateway. The gateway manages sandbox lifecycle in Kubernetes, and each sandbox enforces its own policy locally. Inference API calls to `inference.local` are routed locally within the sandbox by an embedded inference router, without traversing the gateway at request time.
+The following diagram shows how the major subsystems interact at a high level. Users interact through the CLI, which communicates with a central gateway. The gateway manages sandbox lifecycle through a compute driver, and each sandbox enforces its own policy locally. Inference API calls to `inference.local` are routed locally within the sandbox by an embedded inference router, without traversing the gateway at request time.
 
 ```mermaid
 flowchart TB
@@ -18,11 +18,12 @@ flowchart TB
         CLI["Command-Line Interface"]
     end
 
-    subgraph CLUSTER["Kubernetes Cluster (single Docker container)"]
+    subgraph PLATFORM["Compute Platform"]
         SERVER["Gateway / Control Plane"]
         DB["Database (SQLite or Postgres)"]
+        DRIVER["Compute Driver<br/>(Docker, Podman,<br/>Kubernetes, VM)"]
 
-        subgraph SBX["Sandbox Pod"]
+        subgraph SBX["Sandbox Workload"]
             SUPERVISOR["Sandbox Supervisor"]
             PROXY["Network Proxy"]
             ROUTER["Inference Router"]
@@ -40,7 +41,8 @@ flowchart TB
     CLI -- "gRPC / HTTPS" --> SERVER
     CLI -- "SSH over HTTP CONNECT" --> SERVER
     SERVER -- "CRUD + Watch" --> DB
-    SERVER -- "Create / Delete Pods" --> SBX
+    SERVER -- "Create / Delete / Watch" --> DRIVER
+    DRIVER -- "Manage sandbox workload" --> SBX
     SUPERVISOR -- "Fetch Policy + Credentials + Inference Bundle" --> SERVER
     SUPERVISOR -- "Spawn + Restrict" --> CHILD
     CHILD -- "All network traffic" --> PROXY
@@ -92,42 +94,41 @@ For more detail, see [Sandbox Architecture](sandbox.md) (Proxy Routing section).
 
 ### Gateway / Control Plane
 
-The gateway is the central orchestration service. It provides the API that the CLI talks to and manages the lifecycle of sandboxes in Kubernetes.
+The gateway is the central orchestration service. It provides the API that the CLI talks to and manages sandbox lifecycle through the selected compute driver.
 
 Key responsibilities:
 
-- **Sandbox lifecycle management**: Creating, deleting, and monitoring sandboxes. When a user creates a sandbox, the gateway provisions a Kubernetes pod with the correct container image, policy, and environment configuration.
+- **Sandbox lifecycle management**: Creating, deleting, and monitoring sandboxes. When a user creates a sandbox, the gateway asks the selected compute driver to provision a workload with the correct image, policy, and environment configuration.
 - **gRPC and HTTP APIs**: The gateway exposes a gRPC API for structured operations (sandbox CRUD, provider management, SSH session creation) and HTTP endpoints for health checks. Both protocols share a single network port through protocol multiplexing.
 - **Data persistence**: Sandbox records, provider credentials, SSH sessions, and inference routes are stored in a database (SQLite by default, Postgres as an option).
 - **TLS termination**: The gateway supports TLS with automatic protocol negotiation, so gRPC and HTTP clients can connect securely on the same port.
 - **SSH tunnel gateway**: The gateway provides the entry point for SSH connections into sandboxes (see Sandbox Connect below).
 - **Real-time updates**: The gateway streams sandbox status changes to the CLI, so users see live progress when a sandbox is starting up.
-- **Inference bundle resolution**: The gateway stores cluster-level inference configuration (provider name + model ID) and resolves it into bundles containing endpoint URLs, API keys, supported protocols, provider type, and auth metadata. Sandboxes fetch these bundles at startup and refresh them periodically. The gateway does not proxy inference traffic at request time -- it only provides configuration.
+- **Inference bundle resolution**: The gateway stores gateway-level inference configuration (provider name + model ID) and resolves it into bundles containing endpoint URLs, API keys, supported protocols, provider type, and auth metadata. Sandboxes fetch these bundles at startup and refresh them periodically. The gateway does not proxy inference traffic at request time -- it only provides configuration.
 
 For more detail, see [Gateway Architecture](gateway.md).
 
-### Cluster Bootstrap and Infrastructure
+### Gateway Deployment Infrastructure
 
-The entire platform -- Kubernetes, the gateway, networking, and pre-loaded container images -- is packaged into a single Docker container. This means the only dependency a user needs is Docker.
+The gateway can run as a standalone process, a container, or a Kubernetes workload installed by the Helm chart in `deploy/helm/openshell`. Operators supply the compute platform and configure the driver that the gateway should use for sandboxes.
 
-The bootstrap system handles:
+The deployment layer handles:
 
-- **Provisioning**: Creating the Docker container with an embedded Kubernetes (k3s) cluster, pre-loaded with all required images and Helm charts.
-- **Local and remote deployment**: The same bootstrap flow works for local development (Docker on the user's machine) and remote deployment (Docker on a remote host, accessed via SSH).
-- **Health monitoring**: After starting the cluster, the system polls for readiness -- waiting for Kubernetes to start, for components to deploy, and for health checks to pass.
-- **Credential management**: If TLS is enabled, the bootstrap process automatically extracts client certificates and stores them locally for the CLI to use.
-- **Idempotent operation**: Running the deploy command again is safe. It reuses existing infrastructure or recreates only what changed.
+- **Gateway startup**: Running the gateway process or installing the Kubernetes Helm release.
+- **Runtime configuration**: Supplying image references, service exposure, sandbox runtime configuration, callback endpoints, and TLS material.
+- **Credential distribution**: Providing TLS and SSH relay material to the gateway and sandbox workloads.
+- **Compute driver configuration**: Selecting Docker, Podman, Kubernetes, or VM-backed sandbox execution.
 
-The target onboarding experience is two commands:
+The target onboarding experience is:
 
 ```bash
-pip install <package>
-openshell sandbox create --remote user@host -- claude
+mise run gateway:docker
+openshell gateway add <gateway-endpoint>
 ```
 
-The first command installs the CLI. The second command bootstraps the cluster on the remote host (if needed) and launches a sandbox running the specified agent.
+The first command is one local development example. Kubernetes operators use `helm upgrade --install openshell ./deploy/helm/openshell --namespace openshell` instead. The second command registers the reachable endpoint with the CLI.
 
-For more detail, see [Cluster Bootstrap Architecture](cluster-single-node.md).
+For more detail, see [Gateway Deployment and Compute Platforms](gateway-single-node.md).
 
 ### Sandbox Connect (SSH Tunneling)
 
@@ -171,7 +172,7 @@ The inference routing system transparently intercepts AI inference API calls fro
 
 **How it works end-to-end:**
 
-1. An operator configures cluster-level inference via `openshell cluster inference set --provider <name> --model <id>`. This stores a reference to the named provider and model on the gateway.
+1. An operator configures gateway-level inference via `openshell inference set --provider <name> --model <id>`. This stores a reference to the named provider and model on the gateway.
 2. When a sandbox starts, the supervisor fetches an inference bundle from the gateway via the `GetInferenceBundle` RPC. The gateway resolves the stored provider reference into a complete route: endpoint URL, API key, supported protocols, provider type, and auth metadata. The sandbox refreshes this bundle eagerly in the background every 5 seconds by default (override with `OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS`).
 3. The agent sends requests to `https://inference.local` using standard OpenAI or Anthropic SDK calls.
 4. The sandbox proxy intercepts the HTTPS CONNECT to `inference.local` (bypassing OPA policy evaluation), TLS-terminates the connection using the sandbox's ephemeral CA, and parses the HTTP request.
@@ -184,9 +185,9 @@ The inference routing system transparently intercepts AI inference API calls fro
 - The sandbox never sees the real API key for the backend -- credential isolation is maintained through the gateway's bundle resolution.
 - Routing is explicit via `inference.local`; OPA network policy is not involved in inference routing.
 - Provider-specific behavior (auth header style, default headers, supported protocols) is centralized in `InferenceProviderProfile` definitions in `openshell-core`. Supported inference provider types are openai, anthropic, and nvidia.
-- Cluster inference is managed via CLI (`openshell cluster inference set/get`).
+- Gateway inference is managed via CLI (`openshell inference set/get`).
 
-**Inference routes** are stored on the gateway as protobuf objects (`InferenceRoute` in `proto/inference.proto`). Cluster inference uses a managed singleton route entry keyed by `inference.local` and configured from provider + model settings. Endpoint, credentials, and protocols are resolved from the referenced provider record at bundle fetch time, so rotating a provider's API key takes effect on the next bundle refresh without reconfiguring the route.
+**Inference routes** are stored on the gateway as protobuf objects (`InferenceRoute` in `proto/inference.proto`). Gateway inference uses a managed singleton route entry keyed by `inference.local` and configured from provider + model settings. Endpoint, credentials, and protocols are resolved from the referenced provider record at bundle fetch time, so rotating a provider's API key takes effect on the next bundle refresh without reconfiguring the route.
 
 **Components involved:**
 
@@ -196,20 +197,19 @@ The inference routing system transparently intercepts AI inference API calls fro
 | Inference pattern detection | `crates/openshell-sandbox/src/l7/inference.rs` | Matches HTTP method + path against known inference API patterns |
 | Local inference router | `crates/openshell-router/src/lib.rs` | Selects a compatible route by protocol and proxies to the backend |
 | Provider profiles | `crates/openshell-core/src/inference.rs` | Centralized auth, headers, protocols, and endpoint defaults per provider type |
-| Gateway inference service | `crates/openshell-server/src/inference.rs` | Stores cluster inference config, resolves bundles with credentials from provider records |
+| Gateway inference service | `crates/openshell-server/src/inference.rs` | Stores gateway inference config, resolves bundles with credentials from provider records |
 | Proto definitions | `proto/inference.proto` | `ClusterInferenceConfig`, `ResolvedRoute`, bundle RPCs |
 
 ### Container and Build System
 
-The platform produces three container images:
+The platform publishes the gateway image and relies on community-maintained sandbox images:
 
 | Image | Purpose |
 |---|---|
-| **Sandbox** | Runs inside each sandbox pod. Contains the sandbox supervisor binary, Python runtime, and agent tooling. Uses a multi-user setup (privileged supervisor, restricted agent user). |
 | **Gateway** | Runs the control plane. Contains the gateway binary, database migrations, and an embedded SSH client for sandbox management. |
-| **Cluster** | An airgapped Kubernetes image with k3s, pre-loaded sandbox and gateway images, Helm charts, and an API gateway. This is the single container that users deploy. |
+| **Sandbox** | Runs each sandbox workload. Maintained in the OpenShell Community repository or supplied by the user. |
 
-Builds use multi-stage Dockerfiles with caching to keep rebuild times fast. A Helm chart handles Kubernetes-level configuration (service ports, health checks, security contexts, resource limits). Build automation is managed through mise tasks.
+Builds use multi-stage Dockerfiles with caching to keep rebuild times fast. The Helm chart handles Kubernetes-level configuration such as service ports, health checks, security contexts, resource limits, storage, and TLS secret mounts. Docker, Podman, and VM-backed deployments configure equivalent runtime concerns through their driver-specific gateway configuration.
 
 For more detail, see [Container Management](build-containers.md).
 
@@ -222,7 +222,7 @@ Sandbox behavior is governed by policies written in YAML and evaluated by an emb
 - **Process privileges**: What user/group the agent runs as.
 - **L7 inspection rules**: Protocol-level constraints on HTTP API calls for specific endpoints.
 
-Inference routing to `inference.local` is configured separately at the cluster level and does not require network policy entries. The OPA engine evaluates only explicit network policies; `inference.local` connections bypass OPA entirely and are handled by the proxy's dedicated inference interception path.
+Inference routing to `inference.local` is configured separately at the gateway level and does not require network policy entries. The OPA engine evaluates only explicit network policies; `inference.local` connections bypass OPA entirely and are handled by the proxy's dedicated inference interception path.
 
 Policies are not intended to be hand-edited by end users in normal operation. They are associated with sandboxes at creation time and fetched by the sandbox supervisor at startup via gRPC. For development and testing, policies can also be loaded from local files. A gateway-global policy can override all sandbox policies via `openshell policy set --global`.
 
@@ -234,17 +234,17 @@ For more detail on the policy language, see [Policy Language](security-policy.md
 
 The CLI is the primary way users interact with the platform. It provides commands organized into four groups:
 
-- **Gateway management** (`openshell gateway`): Deploy, stop, destroy, and inspect clusters. Supports both local and remote (SSH) targets.
+- **Gateway management** (`openshell gateway`): Register, select, and inspect gateway endpoints.
 - **Sandbox management** (`openshell sandbox`): Create sandboxes (with optional file upload and provider auto-discovery), connect to sandboxes via SSH, and delete sandboxes.
-- **Top-level commands**: `openshell status` (cluster health), `openshell logs` (sandbox logs), `openshell forward` (port forwarding), `openshell policy` (sandbox policy management), `openshell settings` (effective sandbox settings and global/sandbox key updates).
+- **Top-level commands**: `openshell status` (gateway health), `openshell logs` (sandbox logs), `openshell forward` (port forwarding), `openshell policy` (sandbox policy management), `openshell settings` (effective sandbox settings and global/sandbox key updates).
 - **Provider management** (`openshell provider`): Create, update, list, and delete external service credentials.
-- **Inference management** (`openshell cluster inference`): Configure cluster-level inference by specifying a provider and model. The gateway resolves endpoint and credential details from the named provider record.
+- **Inference management** (`openshell inference`): Configure gateway-level inference by specifying a provider and model. The gateway resolves endpoint and credential details from the named provider record.
 
 The CLI resolves which gateway to operate on through a priority chain: explicit `--gateway` flag, then the `OPENSHELL_GATEWAY` environment variable, then the active gateway set by `openshell gateway select`. Gateway names are exposed to shell completion from local metadata, and `openshell gateway select` opens an interactive chooser on a TTY while falling back to a printed list in non-interactive use. The CLI supports TLS client certificates for mutual authentication with the gateway.
 
 ## How Users Get Started
 
-The onboarding flow is designed to require minimal setup. Docker is the only prerequisite.
+The onboarding flow starts from a reachable gateway endpoint.
 
 **Step 1: Install the CLI.**
 
@@ -258,22 +258,7 @@ pip install <package>
 openshell sandbox create -- claude
 ```
 
-If no cluster exists, the CLI automatically bootstraps one. It provisions a local Kubernetes cluster inside a Docker container, waits for it to become healthy, discovers the user's AI provider credentials from local configuration files, uploads them to the gateway, and launches a sandbox running the specified agent -- all from a single command.
-
-For remote deployment (running the sandbox on a different machine):
-
-```bash
-openshell sandbox create --remote user@hostname -- claude
-```
-
-This performs the same bootstrap flow on the remote host via SSH.
-
-For development and testing against the current checkout, use
-`scripts/remote-deploy.sh` instead. That helper syncs the local repository to
-an SSH-reachable machine, builds the CLI and Docker images on the remote host,
-and then runs `openshell gateway start` there. It defaults to secure gateway
-startup and only enables `--plaintext`, `--disable-gateway-auth`, or
-`--recreate` when explicitly requested.
+Before creating a sandbox, start or deploy the gateway on the selected compute platform and register the reachable endpoint with the CLI.
 
 **Step 3: Connect to a running sandbox.**
 
@@ -287,10 +272,10 @@ This opens an interactive SSH session into the sandbox, with all provider creden
 
 | Document | Description |
 |---|---|
-| [Cluster Bootstrap](cluster-single-node.md) | How the platform bootstraps a Kubernetes cluster from a single Docker container, for local and remote targets. |
+| [Gateway Deployment and Compute Platforms](gateway-single-node.md) | How the gateway runs across Docker, Podman, Kubernetes with Helm, and the experimental VM driver. |
 | [Gateway Architecture](gateway.md) | The control plane gateway: API multiplexing, gRPC services, persistence, TLS, and sandbox orchestration. |
 | [Gateway Communication](gateway-deploy-connect.md) | How the CLI resolves a gateway and communicates with it over mTLS, plaintext HTTP/2, or an edge-authenticated WebSocket tunnel. |
-| [Gateway Security](gateway-security.md) | mTLS enforcement, PKI bootstrap, certificate hierarchy, and the gateway trust model. |
+| [Gateway Security](gateway-security.md) | mTLS enforcement, PKI provisioning, certificate hierarchy, and the gateway trust model. |
 | [Sandbox Architecture](sandbox.md) | The sandbox execution environment: policy enforcement, Landlock, seccomp, network namespaces, and the network proxy. |
 | [Container Management](build-containers.md) | Container images, Dockerfiles, Helm charts, build tasks, and CI/CD. |
 | [Sandbox Connect](sandbox-connect.md) | SSH tunneling into sandboxes through the gateway. |

@@ -41,7 +41,7 @@ All open issues are actionable — if it's in the issue tracker, it's ready to b
 This project ships with [agent skills](#agent-skills-for-contributors) that can diagnose problems, explore the codebase, generate policies, and walk you through common workflows. Before filing an issue:
 
 1. Clone the repo and point your coding agent at it.
-2. Load the relevant skill - `debug-openshell-cluster` for cluster problems, `debug-inference` for inference setup problems, `openshell-cli` for usage questions, `generate-sandbox-policy` for policy help.
+2. Load the relevant skill - `debug-openshell-cluster` for gateway or deployment problems, `debug-inference` for inference setup problems, `openshell-cli` for usage questions, `generate-sandbox-policy` for policy help.
 3. Have your agent investigate. Let it run diagnostics, read the architecture docs, and attempt a fix.
 4. If the agent cannot resolve it, open an issue **with the agent's diagnostic output attached**. The issue template requires this.
 
@@ -49,7 +49,7 @@ This project ships with [agent skills](#agent-skills-for-contributors) that can 
 
 - A real bug that your agent confirmed and could not fix.
 - A feature proposal with a design — not a "please build this" request.
-- An infrastructure problem that the `debug-openshell-cluster` skill could not resolve.
+- An infrastructure problem that the gateway deployment troubleshooting skill could not resolve.
 - An inference setup problem that the `debug-inference` skill could not resolve.
 - Security vulnerabilities must follow [SECURITY.md](SECURITY.md) — **not** GitHub issues.
 
@@ -66,7 +66,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Category        | Skill                     | Purpose                                                                                             |
 | --------------- | ------------------------- | --------------------------------------------------------------------------------------------------- |
 | Getting Started | `openshell-cli`           | CLI usage, sandbox lifecycle, provider management, BYOC workflows                                   |
-| Getting Started | `debug-openshell-cluster` | Diagnose cluster startup failures and health issues                                                 |
+| Getting Started | `debug-openshell-cluster` | Diagnose gateway deployment and health issues                                                       |
 | Getting Started | `debug-inference`         | Diagnose `inference.local`, host-backed local inference, and direct external inference setup issues |
 | Contributing    | `create-spike`            | Investigate a problem, produce a structured GitHub issue                                            |
 | Contributing    | `build-from-issue`        | Plan and implement work from a GitHub issue (maintainer workflow)                                   |
@@ -152,8 +152,8 @@ cargo build -p openshell-prover --features bundled-z3
 # One-time trust
 mise trust
 
-# Launch a sandbox (deploys a cluster if one isn't running)
-mise run sandbox
+# Run a standalone Docker-backed gateway for local development
+mise run gateway:docker
 ```
 
 ## Building the `openshell` CLI
@@ -170,16 +170,16 @@ openshell --help
 openshell sandbox create -- codex
 ```
 
-### Cluster debugging helpers
+### Kubernetes debugging helpers
 
-Two additional scripts in `scripts/bin/` provide gateway-aware wrappers for cluster debugging:
+Two additional scripts in `scripts/bin/` provide gateway-aware wrappers for Kubernetes debugging:
 
 | Script    | What it does                                                                         |
 | --------- | ------------------------------------------------------------------------------------ |
-| `kubectl` | Runs `kubectl` inside the active gateway's k3s container via `openshell doctor exec` |
-| `k9s`     | Runs `k9s` inside the active gateway's k3s container via `openshell doctor exec`     |
+| `kubectl` | Runs `kubectl` using the active development context                                  |
+| `k9s`     | Opens a Kubernetes terminal UI for the active development context                    |
 
-These work for both local and remote gateways (SSH is handled automatically). Examples:
+Use these when developing against a Kubernetes-backed gateway. Examples:
 
 ```bash
 kubectl get pods -A
@@ -194,8 +194,8 @@ These are the primary `mise` tasks for day-to-day development:
 
 | Task               | Purpose                                                 |
 | ------------------ | ------------------------------------------------------- |
-| `mise run cluster` | Bootstrap or incremental deploy                         |
-| `mise run sandbox` | Create a sandbox on the running cluster                 |
+| `mise run gateway:docker` | Run a standalone Docker-backed gateway for local development |
+| `mise run sandbox` | Create or reconnect to the dev sandbox                  |
 | `mise run test`    | Default test suite                                      |
 | `mise run e2e`     | Default end-to-end test lane                            |
 | `mise run ci`      | Full local CI checks (lint, compile/type checks, tests) |

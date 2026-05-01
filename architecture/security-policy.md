@@ -31,7 +31,7 @@ The YAML data file is preprocessed before loading into the OPA engine: L7 polici
 
 ### gRPC Mode (Production)
 
-When the sandbox runs inside a managed cluster, it fetches its typed protobuf policy from the gateway:
+When the sandbox runs under a gateway-managed compute platform, it fetches its typed protobuf policy from the gateway:
 
 ```bash
 openshell-sandbox \
@@ -681,7 +681,7 @@ network_policies:
 
 Inference routing to `inference.local` is handled by the proxy's `InferenceContext`, not by the OPA policy engine or an `inference` block in the policy YAML. The proxy intercepts HTTPS CONNECT requests to `inference.local` and routes matching inference API requests (e.g., `POST /v1/chat/completions`, `POST /v1/messages`) through the sandbox-local `openshell-router`. See [Inference Routing](inference-routing.md) for details on route configuration and the router architecture.
 
-The proxy always runs in proxy mode so that `inference.local` is addressable from within the sandbox's network namespace. Inference route sources are configured separately from policy: via `--inference-routes` (file mode) or fetched from the gateway's inference bundle (cluster mode). See `crates/openshell-sandbox/src/proxy.rs` -- `InferenceContext`, `crates/openshell-sandbox/src/l7/inference.rs`.
+The proxy always runs in proxy mode so that `inference.local` is addressable from within the sandbox's network namespace. Inference route sources are configured separately from policy: via `--inference-routes` (file mode) or fetched from the gateway's inference bundle (gateway mode). See `crates/openshell-sandbox/src/proxy.rs` -- `InferenceContext`, `crates/openshell-sandbox/src/l7/inference.rs`.
 
 ---
 

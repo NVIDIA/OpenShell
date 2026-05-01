@@ -8,7 +8,7 @@
 
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
 
-OpenShell is built agent-first. The project ships with agent skills for everything from cluster debugging to policy generation, and we expect contributors to use them.
+OpenShell is built agent-first. The project ships with agent skills for everything from gateway troubleshooting to policy generation, and we expect contributors to use them.
 
 > **Alpha software — single-player mode.** OpenShell is proof-of-life: one developer, one environment, one gateway. We are building toward multi-tenant enterprise deployments, but the starting point is getting your own environment up and running. Expect rough edges. Bring your agent.
 
@@ -16,7 +16,8 @@ OpenShell is built agent-first. The project ships with agent skills for everythi
 
 ### Prerequisites
 
-- **Docker** — Docker Desktop (or a Docker daemon) must be running.
+- **A reachable OpenShell gateway** backed by Docker, Podman, Kubernetes, or the experimental MicroVM runtime.
+- **Docker** — Docker Desktop or Docker Engine must be running for local Docker-backed gateways and local image builds.
 
 ### Install
 
@@ -34,13 +35,29 @@ uv tool install -U openshell
 
 Both methods install the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION` (binary) or pin the version with `uv tool install openshell==<version>`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
 
+### Register a gateway
+
+For local development from a source checkout, start a Docker-backed gateway:
+
+```bash
+git clone https://github.com/NVIDIA/OpenShell.git
+cd OpenShell
+mise trust
+mise run gateway:docker
+```
+
+In another terminal, register the endpoint:
+
+```bash
+openshell gateway add http://127.0.0.1:18080 --local --name local
+openshell status
+```
+
 ### Create a sandbox
 
 ```bash
 openshell sandbox create -- claude  # or opencode, codex, copilot
 ```
-
-A gateway is created automatically on first use. To deploy on a remote host instead, pass `--remote user@host` to the create command.
 
 The sandbox container includes the following tools by default:
 
@@ -99,7 +116,7 @@ OpenShell isolates each sandbox in its own container with policy-enforced egress
 | **Policy Engine**  | Enforces filesystem, network, and process constraints from application layer down to kernel. |
 | **Privacy Router** | Privacy-aware LLM routing that keeps sensitive context on sandbox compute.                   |
 
-Under the hood, all these components run as a [K3s](https://k3s.io/) Kubernetes cluster inside a single Docker container — no separate K8s install required. The `openshell gateway` commands take care of provisioning the container and cluster.
+Under the hood, OpenShell runs a gateway control plane that manages sandbox lifecycle through a configured compute driver. Supported compute platforms include Docker, Podman, Kubernetes through the Helm chart in `deploy/helm/openshell`, and the experimental MicroVM runtime.
 
 ## Protection Layers
 
@@ -128,7 +145,7 @@ OpenShell can pass host GPUs into sandboxes for local inference, fine-tuning, or
 openshell sandbox create --gpu --from [gpu-enabled-sandbox] -- claude
 ```
 
-The CLI auto-bootstraps a GPU-enabled gateway on first use, auto-selecting CDI when available and otherwise falling back to Docker's NVIDIA GPU request path (`--gpus all`). GPU intent is also inferred automatically for community images with `gpu` in the name.
+Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall back to Docker's NVIDIA GPU request path (`--gpus all`). GPU intent is also inferred automatically for community images with `gpu` in the name.
 
 **Requirements:** NVIDIA drivers and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) must be installed on the host. The sandbox image itself must include the appropriate GPU drivers and libraries for your workload — the default `base` image does not. See the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for building a custom sandbox image with GPU support.
 
@@ -171,7 +188,7 @@ openshell term
   <img src="fern/assets/images/openshell-terminal.png" alt="OpenShell Terminal UI">
 </p>
 
-The TUI gives you a live, keyboard-driven view of your cluster. Navigate with `Tab` to switch panels, `j`/`k` to move through lists, `Enter` to select, and `:` for command mode. Cluster health and sandbox status auto-refresh every two seconds.
+The TUI gives you a live, keyboard-driven view of your gateway and sandboxes. Navigate with `Tab` to switch panels, `j`/`k` to move through lists, `Enter` to select, and `:` for command mode. Gateway health and sandbox status auto-refresh every two seconds.
 
 ## Community Sandboxes and BYOC
 
@@ -195,7 +212,7 @@ cd OpenShell
 # Point your agent here — it will discover the skills in .agents/skills/ automatically
 ```
 
-Your agent can load skills for CLI usage (`openshell-cli`), cluster troubleshooting (`debug-openshell-cluster`), inference troubleshooting (`debug-inference`), policy generation (`generate-sandbox-policy`), and more. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full skills table.
+Your agent can load skills for CLI usage (`openshell-cli`), gateway troubleshooting (`debug-openshell-cluster`), inference troubleshooting (`debug-inference`), policy generation (`generate-sandbox-policy`), and more. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full skills table.
 
 ## Built With Agents
 
