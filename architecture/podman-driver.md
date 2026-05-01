@@ -112,7 +112,7 @@ When the Podman driver's TLS configuration is set (`tls_ca`, `tls_cert`, `tls_ke
 
 The supervisor reads these env vars and uses them to establish an mTLS connection back to the gateway.
 
-The RPM packaging auto-generates a self-signed PKI on first start via `init-pki.sh`. Client certs are placed in the CLI auto-discovery directory (`~/.config/openshell/gateways/openshell/mtls/`) so the CLI connects with mTLS without manual configuration. See `deploy/rpm/GATEWAY-CONFIG.md` for the full RPM configuration reference.
+The RPM packaging auto-generates a self-signed PKI on first start via `init-pki.sh`. Client certs are placed in the CLI auto-discovery directory (`~/.config/openshell/gateways/openshell/mtls/`) so the CLI connects with mTLS without manual configuration. See `deploy/rpm/CONFIGURATION.md` for the full RPM configuration reference and `deploy/rpm/QUICKSTART.md` for the quick start guide.
 
 ## Network Model
 

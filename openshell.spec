@@ -9,7 +9,7 @@
 
 Name:           openshell
 Version:        0.0.37
-Release:        1.20260430141223488997.rpm.46.g7ff80c76%{?dist}
+Release:        1.20260501111549922934.rpm.51.g7c400fa8%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
@@ -34,6 +34,9 @@ BuildRequires:  pkg-config
 BuildRequires:  clang-devel
 BuildRequires:  z3-devel
 BuildRequires:  systemd-rpm-macros
+
+# Man page generation
+BuildRequires:  pandoc
 
 # Python sub-package build dependencies
 BuildRequires:  python3-devel
@@ -104,6 +107,11 @@ export CARGO_BUILD_JOBS=%{_smp_build_ncpus}
 export OPENSHELL_IMAGE_TAG=latest
 cargo build --release --bin openshell --bin openshell-gateway
 
+# Build man pages from markdown
+pandoc -s -t man deploy/man/openshell.1.md -o openshell.1
+pandoc -s -t man deploy/man/openshell-gateway.8.md -o openshell-gateway.8
+pandoc -s -t man deploy/man/openshell-gateway.env.5.md -o openshell-gateway.env.5
+
 %install
 # --- CLI binary ---
 install -Dpm 0755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
@@ -111,64 +119,35 @@ install -Dpm 0755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
 # --- Gateway binary ---
 install -Dpm 0755 target/release/%{name}-gateway %{buildroot}%{_bindir}/%{name}-gateway
 
-# --- Gateway systemd unit ---
-install -d %{buildroot}%{_unitdir}
-cat > %{buildroot}%{_unitdir}/%{name}-gateway.service << 'EOF'
-[Unit]
-Description=OpenShell Gateway
-Documentation=https://github.com/NVIDIA/OpenShell
-After=network-online.target podman.service
-Requires=podman.service
-
-[Service]
-Type=exec
-EnvironmentFile=/etc/sysconfig/openshell-gateway
-ExecStart=/usr/bin/openshell-gateway
-StateDirectory=openshell
-Restart=on-failure
-RestartSec=5
-
-# Security hardening
-NoNewPrivileges=yes
-ProtectSystem=strict
-PrivateTmp=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
 # --- Gateway systemd user unit (rootless Podman) ---
 # Installed to the systemd user unit directory so any user can run:
 #   systemctl --user enable --now openshell-gateway.service
-# This will automatically start podman.service via Requires= dependency.
+# Podman socket activation provides the container API.
 install -d %{buildroot}%{_userunitdir}
 cat > %{buildroot}%{_userunitdir}/%{name}-gateway.service << 'EOF'
 [Unit]
 Description=OpenShell Gateway (user)
 Documentation=https://github.com/NVIDIA/OpenShell
-After=podman.service
-Requires=podman.service
+After=podman.socket
+Requires=podman.socket
 
 [Service]
 Type=exec
 # Self-contained defaults for rootless operation with mTLS.
 #
-# PKI is auto-generated on first start. Client certs are placed in
-# ~/.config/openshell/gateways/openshell/mtls/ so the CLI discovers
-# them automatically. See /usr/share/doc/openshell-gateway/ for details.
-#
-# The SSH handshake secret is auto-generated on first start into
-# ~/.config/openshell/gateway.env (mode 0600). To override, edit
-# that file or use: systemctl --user edit openshell-gateway.service
+# PKI and gateway.env are auto-generated on first start. Client certs
+# are placed in ~/.config/openshell/gateways/openshell/mtls/ so the
+# CLI discovers them automatically.
+# See /usr/share/doc/openshell-gateway/ for details.
 
 # Auto-generate PKI on first start if not present.
 # %%S expands to $XDG_STATE_HOME (~/.local/state) in user units.
 ExecStartPre=%{_libexecdir}/openshell/init-pki.sh %%S/openshell/tls
 
-# Auto-generate SSH handshake secret on first start if not present.
+# Auto-generate gateway.env (SSH handshake secret + commented config
+# reference) on first start if not present.
 # %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
-ExecStartPre=/bin/sh -c 'ENV=%%E/openshell/gateway.env; [ -f "$ENV" ] || { mkdir -p %%E/openshell && echo "OPENSHELL_SSH_HANDSHAKE_SECRET=$(od -An -tx1 -N32 /dev/urandom | tr -dc 0-9a-f)" > "$ENV" && chmod 600 "$ENV"; }'
+ExecStartPre=%{_libexecdir}/openshell/init-gateway-env.sh %%E/openshell/gateway.env
 EnvironmentFile=-%%E/openshell/gateway.env
 Environment=OPENSHELL_BIND_HOST=0.0.0.0
 Environment=OPENSHELL_DRIVERS=podman
@@ -198,78 +177,21 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 WantedBy=default.target
 EOF
 
-# --- Gateway environment file ---
-# Provides defaults for the Podman driver and GHCR image references.
-# Mode 0640: contains the SSH handshake secret -- must not be world-readable.
-# Admins can override these values by editing this file.
-install -d %{buildroot}%{_sysconfdir}/sysconfig
-install -pm 0640 /dev/null %{buildroot}%{_sysconfdir}/sysconfig/%{name}-gateway
-cat > %{buildroot}%{_sysconfdir}/sysconfig/%{name}-gateway << 'EOF'
-# OpenShell Gateway configuration
-# See: openshell-gateway --help for all available options.
-
-# ---- Required settings ----
-
-# Shared secret for gateway-to-sandbox SSH handshake authentication.
-# REQUIRED: Generate a value before starting the service:
-#   openssl rand -hex 32
-# The same secret must be shared with every sandbox that connects to
-# this gateway.
-OPENSHELL_SSH_HANDSHAKE_SECRET=
-
-# Database URL for gateway state persistence.
-# For the system unit this defaults to /var/lib/openshell/gateway.db.
-# The user unit overrides this to ~/.local/state/openshell/gateway.db.
-OPENSHELL_DB_URL=sqlite:///var/lib/openshell/gateway.db
-
-# ---- Optional settings ----
-
-# Compute driver: use Podman for sandbox container lifecycle.
-OPENSHELL_DRIVERS=podman
-
-# Supervisor image mounted into sandbox containers.
-OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
-
-# Default sandbox base image.
-OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
-
-# Bind address. Default 0.0.0.0 listens on all interfaces; mTLS
-# prevents unauthenticated access.
-OPENSHELL_BIND_HOST=0.0.0.0
-
-# ---- TLS (mTLS enabled by default) ----
-# A self-signed PKI is auto-generated on first start by init-pki.sh.
-# Client certs are placed in ~/.config/openshell/gateways/openshell/mtls/
-# so the CLI discovers them automatically.
-#
-# To use externally-managed certs, replace the paths below.
-# To rotate certs, delete the TLS state directory and restart.
-# To disable TLS (NOT RECOMMENDED), uncomment the line below and
-# remove or comment out the OPENSHELL_TLS_* and OPENSHELL_PODMAN_TLS_*
-# variables.
-# OPENSHELL_DISABLE_TLS=true
-
-# Server TLS (gateway listens with these certs).
-OPENSHELL_TLS_CERT=/var/lib/openshell/tls/server/tls.crt
-OPENSHELL_TLS_KEY=/var/lib/openshell/tls/server/tls.key
-OPENSHELL_TLS_CLIENT_CA=/var/lib/openshell/tls/ca.crt
-
-# Podman driver: client certs bind-mounted into sandbox containers.
-OPENSHELL_PODMAN_TLS_CA=/var/lib/openshell/tls/ca.crt
-OPENSHELL_PODMAN_TLS_CERT=/var/lib/openshell/tls/client/tls.crt
-OPENSHELL_PODMAN_TLS_KEY=/var/lib/openshell/tls/client/tls.key
-EOF
-
-# --- Gateway state directory ---
-install -d %{buildroot}%{_sharedstatedir}/%{name}
-
-# --- PKI bootstrap script ---
+# --- PKI bootstrap script and gateway env generator ---
 install -d %{buildroot}%{_libexecdir}/%{name}
 install -pm 0755 deploy/rpm/init-pki.sh %{buildroot}%{_libexecdir}/%{name}/init-pki.sh
+install -pm 0755 deploy/rpm/init-gateway-env.sh %{buildroot}%{_libexecdir}/%{name}/init-gateway-env.sh
 
 # --- Gateway documentation ---
 install -d %{buildroot}%{_docdir}/%{name}-gateway
-install -pm 0644 deploy/rpm/GATEWAY-CONFIG.md %{buildroot}%{_docdir}/%{name}-gateway/GATEWAY-CONFIG.md
+install -pm 0644 deploy/rpm/QUICKSTART.md %{buildroot}%{_docdir}/%{name}-gateway/QUICKSTART.md
+install -pm 0644 deploy/rpm/CONFIGURATION.md %{buildroot}%{_docdir}/%{name}-gateway/CONFIGURATION.md
+install -pm 0644 deploy/rpm/TROUBLESHOOTING.md %{buildroot}%{_docdir}/%{name}-gateway/TROUBLESHOOTING.md
+
+# --- Man pages ---
+install -Dpm 0644 openshell.1 %{buildroot}%{_mandir}/man1/openshell.1
+install -Dpm 0644 openshell-gateway.8 %{buildroot}%{_mandir}/man8/openshell-gateway.8
+install -Dpm 0644 openshell-gateway.env.5 %{buildroot}%{_mandir}/man5/openshell-gateway.env.5
 
 # --- Python SDK ---
 # Install Python SDK modules (test files are intentionally excluded)
@@ -315,38 +237,31 @@ touch %{buildroot}%{python3_sitelib}/%{name}-%{version}.dist-info/RECORD
 PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata import version; v = version('openshell'); print(v); assert v == '%{version}', f'expected %{version}, got {v}'"
 
 %post gateway
-# Generate SSH handshake secret on fresh install if not already set.
-# Uses /dev/urandom to avoid requiring openssl at install time.
-SYSCONFIG=%{_sysconfdir}/sysconfig/%{name}-gateway
-if [ -f "$SYSCONFIG" ] && grep -q '^OPENSHELL_SSH_HANDSHAKE_SECRET=$' "$SYSCONFIG" 2>/dev/null; then
-    SECRET=$(head -c 32 /dev/urandom | od -A n -t x1 | tr -d ' \n')
-    sed -i "s/^OPENSHELL_SSH_HANDSHAKE_SECRET=$/OPENSHELL_SSH_HANDSHAKE_SECRET=${SECRET}/" "$SYSCONFIG"
-fi
-%systemd_post %{name}-gateway.service
 %systemd_user_post %{name}-gateway.service
 
 %preun gateway
-%systemd_preun %{name}-gateway.service
 %systemd_user_preun %{name}-gateway.service
 
 %postun gateway
-%systemd_postun_with_restart %{name}-gateway.service
 %systemd_user_postun_with_restart %{name}-gateway.service
 
 %files
 %license LICENSE
 %doc README.md
 %{_bindir}/%{name}
+%{_mandir}/man1/openshell.1*
 
 %files gateway
 %license LICENSE
-%doc %{_docdir}/%{name}-gateway/GATEWAY-CONFIG.md
+%doc %{_docdir}/%{name}-gateway/QUICKSTART.md
+%doc %{_docdir}/%{name}-gateway/CONFIGURATION.md
+%doc %{_docdir}/%{name}-gateway/TROUBLESHOOTING.md
 %{_bindir}/%{name}-gateway
-%{_unitdir}/%{name}-gateway.service
 %{_userunitdir}/%{name}-gateway.service
 %{_libexecdir}/%{name}/init-pki.sh
-%attr(0640,root,root) %config(noreplace) %{_sysconfdir}/sysconfig/%{name}-gateway
-%dir %{_sharedstatedir}/%{name}
+%{_libexecdir}/%{name}/init-gateway-env.sh
+%{_mandir}/man8/openshell-gateway.8*
+%{_mandir}/man5/openshell-gateway.env.5*
 
 %files -n python3-%{name}
 %license LICENSE

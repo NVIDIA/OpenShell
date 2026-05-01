@@ -1,27 +1,10 @@
 # OpenShell Gateway Configuration (RPM)
 
-This document covers the configuration of the OpenShell gateway when
-installed via the RPM package on Fedora and RHEL systems.
+Configuration reference for the OpenShell gateway when installed via
+the RPM package on Fedora and RHEL systems.
 
-## Quick start
-
-```shell
-# Enable and start the gateway (rootless Podman, mTLS enabled):
-systemctl --user enable --now openshell-gateway
-
-# Verify the gateway is running:
-openshell sandbox list
-
-# Make the service persist across reboots without an active login:
-sudo loginctl enable-linger $USER
-```
-
-On first start, the gateway auto-generates:
-
-- A self-signed PKI bundle (CA, server cert, client cert) for mTLS
-- An SSH handshake secret for sandbox authentication
-
-No manual certificate setup is required.
+For first-time setup, see QUICKSTART.md. For troubleshooting, see
+TROUBLESHOOTING.md.
 
 ## TLS (mTLS)
 
@@ -34,8 +17,8 @@ though it listens on all interfaces (`0.0.0.0`).
 On first start, the `init-pki.sh` script generates certificates using
 OpenSSL:
 
-| File | Purpose | Location (user unit) |
-|------|---------|---------------------|
+| File | Purpose | Location |
+|------|---------|----------|
 | CA certificate | Root of trust | `~/.local/state/openshell/tls/ca.crt` |
 | CA private key | Signs server and client certs | `~/.local/state/openshell/tls/ca.key` |
 | Server certificate | Gateway TLS identity | `~/.local/state/openshell/tls/server/tls.crt` |
@@ -68,28 +51,33 @@ Names:
 - `host.docker.internal`
 - `127.0.0.1`
 
+To connect from a remote machine, you need externally-managed
+certificates with additional SANs. See "Remote CLI access" in
+TROUBLESHOOTING.md.
+
 ### Using externally-managed certificates
 
 To use certificates from an external CA or cert-manager:
 
-1. Place the server cert, key, and CA cert on the filesystem
-1. Edit `/etc/sysconfig/openshell-gateway` (system unit) or use
-   `systemctl --user edit openshell-gateway` (user unit) to override:
+1. Place the server cert, key, and CA cert on the filesystem.
 
-```shell
-OPENSHELL_TLS_CERT=/path/to/server/tls.crt
-OPENSHELL_TLS_KEY=/path/to/server/tls.key
-OPENSHELL_TLS_CLIENT_CA=/path/to/ca.crt
-```
+1. Edit `~/.config/openshell/gateway.env` or use
+   `systemctl --user edit openshell-gateway` to override:
+
+   ```shell
+   OPENSHELL_TLS_CERT=/path/to/server/tls.crt
+   OPENSHELL_TLS_KEY=/path/to/server/tls.key
+   OPENSHELL_TLS_CLIENT_CA=/path/to/ca.crt
+   ```
 
 1. Place the client cert where the CLI expects it:
 
-```
-~/.config/openshell/gateways/openshell/mtls/
-  ca.crt
-  tls.crt
-  tls.key
-```
+   ```
+   ~/.config/openshell/gateways/openshell/mtls/
+     ca.crt
+     tls.crt
+     tls.key
+   ```
 
 ### Rotating certificates
 
@@ -106,14 +94,14 @@ The gateway regenerates the PKI on next start.
 
 To disable TLS (not recommended for production):
 
-1. Edit the sysconfig file or use a systemd override:
+1. Edit `~/.config/openshell/gateway.env`:
 
-```shell
-OPENSHELL_DISABLE_TLS=true
-```
+   ```shell
+   OPENSHELL_DISABLE_TLS=true
+   ```
 
-1. Remove or comment out the `OPENSHELL_TLS_*` and
-   `OPENSHELL_PODMAN_TLS_*` variables.
+1. Comment out the `OPENSHELL_TLS_*` and `OPENSHELL_PODMAN_TLS_*`
+   variables if they are set.
 
 1. Restart the gateway.
 
@@ -141,11 +129,19 @@ Inside the container, the supervisor reads them from:
 - `/etc/openshell/tls/client/tls.crt`
 - `/etc/openshell/tls/client/tls.key`
 
+On SELinux-enabled systems, the Podman driver automatically applies the
+`:z` relabel option to these bind mounts. No manual SELinux
+configuration is required.
+
 ## Configuration reference
 
-All settings are controlled via environment variables. The system unit
-reads from `/etc/sysconfig/openshell-gateway`. The user unit reads from
-`~/.config/openshell/gateway.env` and systemd `Environment=` directives.
+All settings are controlled via environment variables. The user unit
+reads from `~/.config/openshell/gateway.env` (generated on first start)
+and from `Environment=` directives in the systemd unit.
+
+Values in `gateway.env` override the unit defaults. Use
+`systemctl --user edit openshell-gateway` to add overrides that persist
+across package upgrades.
 
 ### Gateway settings
 
@@ -153,9 +149,13 @@ reads from `/etc/sysconfig/openshell-gateway`. The user unit reads from
 |----------|---------|-------------|
 | `OPENSHELL_BIND_HOST` | `0.0.0.0` | IP address to bind all listeners to |
 | `OPENSHELL_SERVER_PORT` | `8080` | Port for the gRPC/HTTP API |
+| `OPENSHELL_HEALTH_PORT` | `0` (disabled) | Port for unauthenticated health endpoints (`/healthz`, `/readyz`). Set to a non-zero value to enable. |
+| `OPENSHELL_METRICS_PORT` | `0` (disabled) | Port for Prometheus metrics (`/metrics`). Set to a non-zero value to enable. |
+| `OPENSHELL_LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `OPENSHELL_DRIVERS` | `podman` | Compute driver (`podman`, `docker`, `kubernetes`) |
-| `OPENSHELL_DB_URL` | (varies) | SQLite database URL for state persistence |
+| `OPENSHELL_DB_URL` | `sqlite://$XDG_STATE_HOME/openshell/gateway.db` | SQLite database URL for state persistence |
 | `OPENSHELL_SSH_HANDSHAKE_SECRET` | (auto-generated) | Shared secret for sandbox SSH authentication |
+| `OPENSHELL_DISABLE_GATEWAY_AUTH` | (unset) | Set to `true` to skip mTLS client certificate checks |
 
 ### TLS settings
 
@@ -173,29 +173,75 @@ reads from `/etc/sysconfig/openshell-gateway`. The user unit reads from
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENSHELL_SUPERVISOR_IMAGE` | `ghcr.io/.../supervisor:latest` | Supervisor binary OCI image |
-| `OPENSHELL_SANDBOX_IMAGE` | `ghcr.io/.../sandboxes/base:latest` | Default sandbox base image |
+| `OPENSHELL_SUPERVISOR_IMAGE` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor binary OCI image |
+| `OPENSHELL_SANDBOX_IMAGE` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox base image |
+| `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY` | `missing` | Image pull policy: `always`, `missing`, `never`, `newer` |
+
+### Podman driver settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENSHELL_PODMAN_SOCKET` | `$XDG_RUNTIME_DIR/podman/podman.sock` | Podman API Unix socket path |
+| `OPENSHELL_NETWORK_NAME` | `openshell` | Podman bridge network name for sandbox containers |
+| `OPENSHELL_STOP_TIMEOUT` | `10` | Container stop timeout in seconds (SIGTERM then SIGKILL) |
+
+### Image management
+
+The gateway pulls container images automatically on first sandbox
+creation. The default pull policy is `missing`, which means images are
+pulled once and then cached by Podman.
+
+To update cached images:
+
+```shell
+podman pull ghcr.io/nvidia/openshell/supervisor:latest
+podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+```
+
+Or set `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY=always` to pull on every
+sandbox creation.
+
+To pin specific image versions instead of `:latest`:
+
+```shell
+OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:v0.0.37
+OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:v0.0.37
+```
+
+For air-gapped environments:
+
+1. On a connected machine, pull and save the images:
+
+   ```shell
+   podman pull ghcr.io/nvidia/openshell/supervisor:latest
+   podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+   podman save -o supervisor.tar ghcr.io/nvidia/openshell/supervisor:latest
+   podman save -o sandbox.tar ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+   ```
+
+1. Transfer the tarballs to the air-gapped host and load them:
+
+   ```shell
+   podman load -i supervisor.tar
+   podman load -i sandbox.tar
+   ```
+
+1. Set pull policy to `never`:
+
+   ```shell
+   OPENSHELL_SANDBOX_IMAGE_PULL_POLICY=never
+   ```
 
 ## File locations
-
-### User unit (systemctl --user)
 
 | Purpose | Path |
 |---------|------|
 | Gateway binary | `/usr/bin/openshell-gateway` |
 | CLI binary | `/usr/bin/openshell` |
-| Systemd unit | `/usr/lib/systemd/user/openshell-gateway.service` |
+| Systemd user unit | `/usr/lib/systemd/user/openshell-gateway.service` |
 | PKI bootstrap script | `/usr/libexec/openshell/init-pki.sh` |
+| Env generator script | `/usr/libexec/openshell/init-gateway-env.sh` |
 | TLS certificates | `~/.local/state/openshell/tls/` |
 | CLI client certs | `~/.config/openshell/gateways/openshell/mtls/` |
 | Gateway database | `~/.local/state/openshell/gateway.db` |
-| SSH handshake secret | `~/.config/openshell/gateway.env` |
-
-### System unit (systemctl)
-
-| Purpose | Path |
-|---------|------|
-| Systemd unit | `/usr/lib/systemd/system/openshell-gateway.service` |
-| Configuration | `/etc/sysconfig/openshell-gateway` |
-| TLS certificates | `/var/lib/openshell/tls/` |
-| Gateway database | `/var/lib/openshell/gateway.db` |
+| Gateway configuration | `~/.config/openshell/gateway.env` |
