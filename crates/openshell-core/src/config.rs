@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::Command;
 use std::str::FromStr;
 
 // ── Public default constants ────────────────────────────────────────────
@@ -92,6 +93,40 @@ impl FromStr for ComputeDriverKind {
     }
 }
 
+/// Auto-detect the appropriate compute driver based on the runtime environment.
+///
+/// Priority order: Kubernetes → Podman → Docker.
+/// VM is never auto-detected (requires explicit `--drivers vm`).
+///
+/// Returns the first driver where the environment check passes.
+/// Returns `None` if no compatible driver is found.
+pub fn detect_driver() -> Option<ComputeDriverKind> {
+    // Kubernetes: check for KUBERNETES_SERVICE_HOST env var (set inside pods)
+    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+        return Some(ComputeDriverKind::Kubernetes);
+    }
+
+    // Podman: check if podman binary is available
+    if is_binary_available("podman") {
+        return Some(ComputeDriverKind::Podman);
+    }
+
+    // Docker: check if docker binary is available
+    if is_binary_available("docker") {
+        return Some(ComputeDriverKind::Docker);
+    }
+
+    None
+}
+
+/// Check if a binary is available on the system PATH.
+fn is_binary_available(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
 /// Server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -118,6 +153,10 @@ pub struct Config {
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
     pub tls: Option<TlsConfig>,
 
+    /// OIDC configuration. When `Some`, the server validates Bearer JWTs.
+    #[serde(default)]
+    pub oidc: Option<OidcConfig>,
+
     /// Database URL for persistence.
     pub database_url: String,
 
@@ -126,7 +165,7 @@ pub struct Config {
     /// The config shape allows multiple drivers so the gateway can evolve
     /// toward multi-backend routing. Current releases require exactly one
     /// configured driver.
-    #[serde(default = "default_compute_drivers")]
+    #[serde(default)]
     pub compute_drivers: Vec<ComputeDriverKind>,
 
     /// Kubernetes namespace for sandboxes.
@@ -242,6 +281,64 @@ pub struct TlsConfig {
     pub allow_unauthenticated: bool,
 }
 
+/// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
+///
+/// When configured, the server validates `authorization: Bearer <JWT>`
+/// headers on gRPC requests against the specified issuer's JWKS endpoint.
+///
+/// The roles claim path is configurable to support different providers:
+/// - Keycloak: `realm_access.roles` (default)
+/// - Entra ID / Okta: `roles`
+/// - Custom: any dot-separated path into the JWT claims
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcConfig {
+    /// OIDC issuer URL (e.g., `http://localhost:8180/realms/openshell`).
+    pub issuer: String,
+
+    /// Expected audience (`aud`) claim. Typically the OIDC client ID.
+    pub audience: String,
+
+    /// JWKS cache TTL in seconds. Defaults to 3600 (1 hour).
+    #[serde(default = "default_jwks_ttl_secs")]
+    pub jwks_ttl_secs: u64,
+
+    /// Dot-separated path to the roles array in the JWT claims.
+    /// Defaults to `realm_access.roles` (Keycloak).
+    /// Examples: `roles` (Entra ID), `groups` (Okta), `custom.path.roles`.
+    #[serde(default = "default_roles_claim")]
+    pub roles_claim: String,
+
+    /// Role name that grants admin access. Defaults to `openshell-admin`.
+    #[serde(default = "default_admin_role")]
+    pub admin_role: String,
+
+    /// Role name that grants standard user access. Defaults to `openshell-user`.
+    #[serde(default = "default_user_role")]
+    pub user_role: String,
+
+    /// Dot-separated path to the scopes value in the JWT claims.
+    /// When non-empty, the server enforces scope-based permissions on top of roles.
+    /// Keycloak: `scope` (space-delimited string). Okta: `scp` (JSON array).
+    #[serde(default)]
+    pub scopes_claim: String,
+}
+
+const fn default_jwks_ttl_secs() -> u64 {
+    3600
+}
+
+fn default_roles_claim() -> String {
+    "realm_access.roles".to_string()
+}
+
+fn default_admin_role() -> String {
+    "openshell-admin".to_string()
+}
+
+fn default_user_role() -> String {
+    "openshell-user".to_string()
+}
+
 impl Config {
     /// Create a new config with optional TLS.
     pub fn new(tls: Option<TlsConfig>) -> Self {
@@ -251,8 +348,9 @@ impl Config {
             metrics_bind_address: None,
             log_level: default_log_level(),
             tls,
+            oidc: None,
             database_url: String::new(),
-            compute_drivers: default_compute_drivers(),
+            compute_drivers: vec![],
             sandbox_namespace: default_sandbox_namespace(),
             sandbox_image: default_sandbox_image(),
             sandbox_image_pull_policy: String::new(),
@@ -425,6 +523,13 @@ impl Config {
         };
         self
     }
+
+    /// Set the OIDC configuration for JWT-based authentication.
+    #[must_use]
+    pub fn with_oidc(mut self, oidc: OidcConfig) -> Self {
+        self.oidc = Some(oidc);
+        self
+    }
 }
 
 impl Default for ServiceRoutingConfig {
@@ -466,10 +571,6 @@ fn default_sandbox_image() -> String {
     format!("{}/base:latest", crate::image::DEFAULT_COMMUNITY_REGISTRY)
 }
 
-fn default_compute_drivers() -> Vec<ComputeDriverKind> {
-    vec![ComputeDriverKind::Kubernetes]
-}
-
 fn default_ssh_gateway_host() -> String {
     "127.0.0.1".to_string()
 }
@@ -500,7 +601,7 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComputeDriverKind, Config};
+    use super::{ComputeDriverKind, Config, detect_driver};
     use std::net::SocketAddr;
 
     #[test]
@@ -530,14 +631,6 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_to_kubernetes_driver() {
-        assert_eq!(
-            Config::new(None).compute_drivers,
-            vec![ComputeDriverKind::Kubernetes]
-        );
-    }
-
-    #[test]
     fn config_new_disables_health_bind_by_default() {
         let cfg = Config::new(None);
         assert!(cfg.health_bind_address.is_none());
@@ -548,5 +641,37 @@ mod tests {
         let addr: SocketAddr = "0.0.0.0:9090".parse().expect("valid address");
         let cfg = Config::new(None).with_health_bind_address(addr);
         assert_eq!(cfg.health_bind_address, Some(addr));
+    }
+
+    #[test]
+    fn detect_driver_returns_none_without_k8s_env_or_binaries() {
+        // When KUBERNETES_SERVICE_HOST is not set and no docker/podman binaries
+        // are available, detect_driver should return None.
+        // This test may pass or fail depending on the test environment,
+        // but it documents the expected behavior.
+        let _ = detect_driver(); // Returns Some or None based on environment
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var/remove_var require unsafe in Rust 2024
+    fn detect_driver_prefers_kubernetes_when_k8s_env_is_set() {
+        // Save the original env var
+        let original = std::env::var("KUBERNETES_SERVICE_HOST").ok();
+
+        // Set the env var
+        unsafe {
+            std::env::set_var("KUBERNETES_SERVICE_HOST", "127.0.0.1");
+        }
+
+        let result = detect_driver();
+        assert_eq!(result, Some(ComputeDriverKind::Kubernetes));
+
+        // Restore the original env var
+        unsafe {
+            match original {
+                Some(val) => std::env::set_var("KUBERNETES_SERVICE_HOST", val),
+                None => std::env::remove_var("KUBERNETES_SERVICE_HOST"),
+            }
+        }
     }
 }

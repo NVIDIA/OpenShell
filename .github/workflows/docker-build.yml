@@ -32,6 +32,11 @@ on:
         required: false
         type: string
         default: ""
+      image-tag:
+        description: "Image tag base to build/push (defaults to the GitHub SHA)"
+        required: false
+        type: string
+        default: ""
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -55,6 +60,7 @@ jobs:
       binary_component: ${{ steps.resolve.outputs.binary_component }}
       binary_name: ${{ steps.resolve.outputs.binary_name }}
       artifact_prefix: ${{ steps.resolve.outputs.artifact_prefix }}
+      image_tag_base: ${{ steps.resolve.outputs.image_tag_base }}
     steps:
       - name: Resolve component and platform matrix
         id: resolve
@@ -76,6 +82,11 @@ jobs:
               exit 1
               ;;
           esac
+
+          image_tag_base="${{ inputs['image-tag'] }}"
+          if [[ -z "$image_tag_base" ]]; then
+            image_tag_base="$GITHUB_SHA"
+          fi
 
           platform_input="${{ inputs.platform }}"
           platform_input="${platform_input//[[:space:]]/}"
@@ -122,6 +133,7 @@ jobs:
             echo "binary_component=$binary_component"
             echo "binary_name=$binary_name"
             echo "artifact_prefix=rust-binary-${component}-${binary_component}"
+            echo "image_tag_base=$image_tag_base"
           } >> "$GITHUB_OUTPUT"
 
   rust-binary:
@@ -162,12 +174,12 @@ jobs:
         # inside the container so setup-buildx can read it.
         - /etc/buildkit:/etc/buildkit:ro
     env:
-      IMAGE_TAG: ${{ needs.resolve.outputs.platform_count == '1' && github.sha || format('{0}-{1}', github.sha, matrix.arch) }}
+      IMAGE_TAG: ${{ needs.resolve.outputs.platform_count == '1' && needs.resolve.outputs.image_tag_base || format('{0}-{1}', needs.resolve.outputs.image_tag_base, matrix.arch) }}
       IMAGE_REGISTRY: ghcr.io/nvidia/openshell
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
       DOCKER_PLATFORM: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -264,9 +276,9 @@ jobs:
           image="ghcr.io/nvidia/openshell/${{ inputs.component }}"
           refs=()
           for arch in ${{ needs.resolve.outputs.arches }}; do
-            refs+=("${image}:${GITHUB_SHA}-${arch}")
+            refs+=("${image}:${{ needs.resolve.outputs.image_tag_base }}-${arch}")
           done
           docker buildx imagetools create \
             --prefer-index=false \
-            -t "${image}:${GITHUB_SHA}" \
+            -t "${image}:${{ needs.resolve.outputs.image_tag_base }}" \
             "${refs[@]}"

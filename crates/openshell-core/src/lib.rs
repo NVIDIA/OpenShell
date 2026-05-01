@@ -20,7 +20,7 @@ pub mod paths;
 pub mod proto;
 pub mod settings;
 
-pub use config::{ComputeDriverKind, Config, TlsConfig};
+pub use config::{ComputeDriverKind, Config, OidcConfig, TlsConfig};
 pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{ObjectId, ObjectLabels, ObjectName};
 

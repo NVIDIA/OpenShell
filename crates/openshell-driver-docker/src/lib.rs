@@ -8,8 +8,8 @@
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, HostConfig, Mount,
-    MountTypeEnum, RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, DeviceRequest, HostConfig,
+    Mount, MountTypeEnum, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -17,7 +17,7 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
+use openshell_core::config::{CDI_GPU_DEVICE_ALL, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
@@ -159,6 +159,7 @@ struct DockerDriverRuntimeConfig {
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
+    supports_gpu: bool,
 }
 
 #[derive(Clone)]
@@ -195,6 +196,12 @@ impl DockerComputeDriver {
         let version = docker.version().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;
+        let supports_gpu = docker
+            .info()
+            .await
+            .ok()
+            .and_then(|info| info.cdi_spec_dirs)
+            .is_some_and(|dirs| !dirs.is_empty());
         let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
         let supervisor_bin = resolve_supervisor_bin(&docker, docker_config, &daemon_arch).await?;
         let guest_tls = docker_guest_tls_paths(config, docker_config)?;
@@ -212,6 +219,7 @@ impl DockerComputeDriver {
                 supervisor_bin,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
+                supports_gpu,
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             supervisor_readiness,
@@ -230,12 +238,15 @@ impl DockerComputeDriver {
             driver_name: "docker".to_string(),
             driver_version: self.config.daemon_version.clone(),
             default_image: self.config.default_image.clone(),
-            supports_gpu: false,
+            supports_gpu: self.config.supports_gpu,
             gpu_count: 0,
         }
     }
 
-    fn validate_sandbox(sandbox: &DriverSandbox) -> Result<(), Status> {
+    fn validate_sandbox(
+        sandbox: &DriverSandbox,
+        config: &DockerDriverRuntimeConfig,
+    ) -> Result<(), Status> {
         let spec = sandbox
             .spec
             .as_ref()
@@ -250,9 +261,9 @@ impl DockerComputeDriver {
                 "docker sandboxes require a template image",
             ));
         }
-        if spec.gpu {
+        if spec.gpu && !config.supports_gpu {
             return Err(Status::failed_precondition(
-                "docker compute driver does not support gpu sandboxes",
+                "docker GPU sandboxes require Docker CDI support. Enable CDI on the Docker daemon, then restart the OpenShell gateway/server so GPU capability is detected.",
             ));
         }
         if !template.agent_socket_path.trim().is_empty() {
@@ -300,7 +311,7 @@ impl DockerComputeDriver {
     }
 
     async fn create_sandbox_inner(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
-        Self::validate_sandbox(sandbox)?;
+        Self::validate_sandbox(sandbox, &self.config)?;
 
         if self
             .find_managed_container_summary(&sandbox.id, &sandbox.name)
@@ -674,7 +685,7 @@ impl ComputeDriver for DockerComputeDriver {
             .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        Self::validate_sandbox(&sandbox)?;
+        Self::validate_sandbox(&sandbox, &self.config)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
@@ -876,6 +887,16 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         .collect()
 }
 
+fn docker_gpu_device_requests(gpu: bool) -> Option<Vec<DeviceRequest>> {
+    gpu.then(|| {
+        vec![DeviceRequest {
+            driver: Some("cdi".to_string()),
+            device_ids: Some(vec![CDI_GPU_DEVICE_ALL.to_string()]),
+            ..Default::default()
+        }]
+    })
+}
+
 fn build_container_create_body(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
@@ -917,6 +938,7 @@ fn build_container_create_body(
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
+            device_requests: docker_gpu_device_requests(spec.gpu),
             mounts: Some(build_mounts(config)),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
@@ -928,6 +950,13 @@ fn build_container_create_body(
                 "SYS_PTRACE".to_string(),
                 "SYSLOG".to_string(),
             ]),
+            // AppArmor's default Docker profile blocks mount(2) with MS_SHARED
+            // even when SYS_ADMIN is granted, which prevents ip-netns from
+            // creating network namespaces for proxy-mode isolation. The sandbox
+            // enforces its own isolation via seccomp, Landlock, and network
+            // namespaces, so the host AppArmor profile adds no meaningful
+            // defence here.
+            security_opt: Some(vec!["apparmor=unconfined".to_string()]),
             extra_hosts: Some(vec![
                 format!("{HOST_DOCKER_INTERNAL}:host-gateway"),
                 format!("{HOST_OPENSHELL_INTERNAL}:host-gateway"),

@@ -34,6 +34,9 @@ pub struct TlsOptions {
     /// Edge auth bearer token — when set, disables mTLS client certs and
     /// injects authentication headers on every gRPC request instead.
     pub edge_token: Option<String>,
+    /// OIDC bearer token — when set, injects `authorization: Bearer <token>`
+    /// on every gRPC request. Takes precedence over `edge_token`.
+    pub oidc_token: Option<String>,
 }
 
 impl TlsOptions {
@@ -44,6 +47,7 @@ impl TlsOptions {
             key,
             gateway_name: None,
             edge_token: None,
+            oidc_token: None,
         }
     }
 
@@ -90,9 +94,9 @@ impl TlsOptions {
         }
     }
 
-    /// Returns `true` when using edge token auth (no mTLS client certs).
+    /// Returns `true` when using bearer token auth (edge or OIDC).
     pub fn is_bearer_auth(&self) -> bool {
-        self.edge_token.is_some()
+        self.edge_token.is_some() || self.oidc_token.is_some()
     }
 }
 
@@ -258,9 +262,10 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         return endpoint.connect().await.into_diagnostic();
     }
 
-    // When edge bearer auth is active and the server is HTTPS,
+    // When Cloudflare edge bearer auth is active and the server is HTTPS,
     // route traffic through a local WebSocket tunnel proxy instead.
-    if tls.is_bearer_auth() && server.starts_with("https://") {
+    // OIDC tokens bypass the tunnel — they connect directly.
+    if tls.edge_token.is_some() && server.starts_with("https://") {
         let token = tls
             .edge_token
             .as_deref()
@@ -283,10 +288,26 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         .http2_keep_alive_interval(Duration::from_secs(10))
         .keep_alive_while_idle(true);
 
-    let tls_config = if tls.is_bearer_auth() {
-        // Bearer mode without HTTPS (e.g. http:// direct) — no tunnel needed,
-        // but also no TLS config to set. This branch shouldn't normally happen
-        // (edge endpoints are always HTTPS) but handle gracefully.
+    let tls_config = if tls.oidc_token.is_some() {
+        // OIDC bearer auth over HTTPS: use mTLS certs for the transport layer
+        // when available (server may still require client certs), and layer
+        // the Bearer token on top via the interceptor.
+        require_tls_materials(server, tls).map_or_else(
+            |_| {
+                let resolved = tls.with_default_paths(server);
+                resolved
+                    .ca
+                    .as_ref()
+                    .and_then(|ca_path| std::fs::read(ca_path).ok())
+                    .map_or_else(ClientTlsConfig::new, |ca_pem| {
+                        ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem))
+                    })
+            },
+            |materials| build_tonic_tls_config(&materials),
+        )
+    } else if tls.edge_token.is_some() {
+        // Edge bearer mode — routed through tunnel above; if we reach here
+        // the server is not HTTPS so connect plaintext.
         return endpoint.connect().await.into_diagnostic();
     } else {
         // Standard mTLS: private CA + client cert.
@@ -308,22 +329,39 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
     Ok(OpenShellClient::with_interceptor(channel, interceptor))
 }
 
-/// Interceptor that injects edge authentication headers into every outgoing
-/// gRPC request. When no token is set, acts as a no-op.
+/// Interceptor that injects authentication headers into every outgoing gRPC request.
 ///
-/// Currently sends Cloudflare Access headers for compatibility:
-/// - `Cf-Access-Jwt-Assertion` header
-/// - `CF_Authorization` cookie
+/// Supports OIDC Bearer tokens (standard `authorization` header) and
+/// Cloudflare Access tokens (custom headers). When no token is set, acts
+/// as a no-op. OIDC takes precedence over edge tokens.
 #[derive(Clone)]
+#[allow(clippy::struct_field_names)]
 pub struct EdgeAuthInterceptor {
+    /// Standard `authorization: Bearer <token>` for OIDC.
+    bearer_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    /// CF-specific `Cf-Access-Jwt-Assertion` header.
     header_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    /// CF-specific `Cookie: CF_Authorization=<token>` header.
     cookie_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
 }
 
 impl EdgeAuthInterceptor {
     /// Create an interceptor from [`TlsOptions`].  Returns a no-op interceptor
-    /// when no edge token is configured.
+    /// when no auth token is configured.
     pub fn maybe_from(tls: &TlsOptions) -> Result<Self> {
+        // OIDC bearer token takes precedence.
+        if let Some(ref token) = tls.oidc_token {
+            let bearer: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
+                format!("Bearer {token}")
+                    .parse()
+                    .map_err(|_| miette::miette!("invalid OIDC token value"))?;
+            return Ok(Self {
+                bearer_value: Some(bearer),
+                header_value: None,
+                cookie_value: None,
+            });
+        }
+
         let (header_value, cookie_value) = match tls.edge_token.as_deref() {
             Some(t) => {
                 let hv: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = t
@@ -338,6 +376,7 @@ impl EdgeAuthInterceptor {
             None => (None, None),
         };
         Ok(Self {
+            bearer_value: None,
             header_value,
             cookie_value,
         })
@@ -349,6 +388,9 @@ impl tonic::service::Interceptor for EdgeAuthInterceptor {
         &mut self,
         mut req: tonic::Request<()>,
     ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+        if let Some(ref val) = self.bearer_value {
+            req.metadata_mut().insert("authorization", val.clone());
+        }
         if let Some(ref val) = self.header_value {
             req.metadata_mut()
                 .insert("cf-access-jwt-assertion", val.clone());

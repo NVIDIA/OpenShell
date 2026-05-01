@@ -30,6 +30,10 @@ description = "Pull-mode deploy using local registry pushes"
 run = "tasks/scripts/cluster-deploy-fast.sh all"
 hide = true
 
+["cluster:stop"]
+description = "Stop and remove the local cluster container"
+run = "tasks/scripts/cluster-stop.sh"
+
 ["cluster:push:gateway"]
 description = "Tag and push gateway image to pull registry"
 run = "tasks/scripts/cluster-push-component.sh gateway"

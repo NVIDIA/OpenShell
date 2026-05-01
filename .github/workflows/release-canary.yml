@@ -104,7 +104,7 @@ jobs:
       # to advertise a reachable address instead.
       OPENSHELL_GATEWAY_HOST: host.docker.internal
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Determine release tag
         id: release

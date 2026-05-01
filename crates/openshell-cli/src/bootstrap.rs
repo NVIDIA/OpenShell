@@ -191,13 +191,22 @@ pub async fn run_bootstrap(
 
     // Deploy the gateway. The deploy flow auto-resumes from existing state
     // when it finds one. If that fails, fall back to a full recreate.
-    let handle = match deploy_gateway_with_panel(build_options(false), &gateway_name, location)
-        .await
+    let handle = match Box::pin(deploy_gateway_with_panel(
+        build_options(false),
+        &gateway_name,
+        location,
+    ))
+    .await
     {
         Ok(handle) => handle,
         Err(resume_err) => {
             tracing::warn!("auto-bootstrap resume failed, falling back to recreate: {resume_err}");
-            deploy_gateway_with_panel(build_options(true), &gateway_name, location).await?
+            Box::pin(deploy_gateway_with_panel(
+                build_options(true),
+                &gateway_name,
+                location,
+            ))
+            .await?
         }
     };
     let server = handle.gateway_endpoint().to_string();

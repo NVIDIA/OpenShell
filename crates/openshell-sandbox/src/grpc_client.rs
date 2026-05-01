@@ -14,6 +14,7 @@ use openshell_core::proto::{
     SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, UpdateConfigRequest,
     inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
 
@@ -83,10 +84,54 @@ pub async fn connect_channel_pub(endpoint: &str) -> Result<Channel> {
     connect_channel(endpoint).await
 }
 
-/// Connect to the `OpenShell` server (mTLS or plaintext based on endpoint scheme).
-async fn connect(endpoint: &str) -> Result<OpenShellClient<Channel>> {
+/// Interceptor that injects the sandbox shared secret into every gRPC request.
+///
+/// The server validates this header on sandbox-to-server RPCs (`GetSandboxConfig`,
+/// `GetSandboxProviderEnvironment`, etc.) instead of requiring an OIDC Bearer token.
+#[derive(Clone)]
+pub struct SandboxSecretInterceptor {
+    secret: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+}
+
+impl tonic::service::Interceptor for SandboxSecretInterceptor {
+    fn call(
+        &mut self,
+        mut req: tonic::Request<()>,
+    ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+        if let Some(ref val) = self.secret {
+            req.metadata_mut().insert("x-sandbox-secret", val.clone());
+        }
+        Ok(req)
+    }
+}
+
+type AuthenticatedClient = OpenShellClient<InterceptedService<Channel, SandboxSecretInterceptor>>;
+type AuthenticatedInferenceClient =
+    InferenceClient<InterceptedService<Channel, SandboxSecretInterceptor>>;
+
+fn sandbox_secret_interceptor() -> SandboxSecretInterceptor {
+    let secret = std::env::var("OPENSHELL_SSH_HANDSHAKE_SECRET")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    SandboxSecretInterceptor { secret }
+}
+
+/// Connect to the `OpenShell` server with sandbox secret authentication.
+async fn connect(endpoint: &str) -> Result<AuthenticatedClient> {
     let channel = connect_channel(endpoint).await?;
-    Ok(OpenShellClient::new(channel))
+    Ok(OpenShellClient::with_interceptor(
+        channel,
+        sandbox_secret_interceptor(),
+    ))
+}
+
+/// Connect to the inference service with sandbox secret authentication.
+async fn connect_inference(endpoint: &str) -> Result<AuthenticatedInferenceClient> {
+    let channel = connect_channel(endpoint).await?;
+    Ok(InferenceClient::with_interceptor(
+        channel,
+        sandbox_secret_interceptor(),
+    ))
 }
 
 /// Fetch sandbox policy from `OpenShell` server via gRPC.
@@ -106,7 +151,7 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<Pro
 
 /// Fetch sandbox policy using an existing client connection.
 async fn fetch_policy_with_client(
-    client: &mut OpenShellClient<Channel>,
+    client: &mut AuthenticatedClient,
     sandbox_id: &str,
 ) -> Result<Option<ProtoSandboxPolicy>> {
     let response = client
@@ -130,7 +175,7 @@ async fn fetch_policy_with_client(
 
 /// Sync a locally-discovered policy using an existing client connection.
 async fn sync_policy_with_client(
-    client: &mut OpenShellClient<Channel>,
+    client: &mut AuthenticatedClient,
     sandbox: &str,
     policy: &ProtoSandboxPolicy,
 ) -> Result<()> {
@@ -220,7 +265,7 @@ pub async fn fetch_provider_environment(
 /// and status reporting, avoiding per-request TLS handshake overhead.
 #[derive(Clone)]
 pub struct CachedOpenShellClient {
-    client: OpenShellClient<Channel>,
+    client: AuthenticatedClient,
 }
 
 /// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
@@ -239,13 +284,12 @@ pub struct SettingsPollResult {
 impl CachedOpenShellClient {
     pub async fn connect(endpoint: &str) -> Result<Self> {
         debug!(endpoint = %endpoint, "Connecting openshell gRPC client for policy polling");
-        let channel = connect_channel(endpoint).await?;
-        let client = OpenShellClient::new(channel);
+        let client = connect(endpoint).await?;
         Ok(Self { client })
     }
 
     /// Get a clone of the underlying tonic client for direct RPC calls.
-    pub fn raw_client(&self) -> OpenShellClient<Channel> {
+    pub fn raw_client(&self) -> AuthenticatedClient {
         self.client.clone()
     }
 
@@ -329,8 +373,7 @@ impl CachedOpenShellClient {
 pub async fn fetch_inference_bundle(endpoint: &str) -> Result<GetInferenceBundleResponse> {
     debug!(endpoint = %endpoint, "Fetching inference route bundle");
 
-    let channel = connect_channel(endpoint).await?;
-    let mut client = InferenceClient::new(channel);
+    let mut client = connect_inference(endpoint).await?;
 
     let response = client
         .get_inference_bundle(GetInferenceBundleRequest {})
@@ -338,4 +381,33 @@ pub async fn fetch_inference_bundle(endpoint: &str) -> Result<GetInferenceBundle
         .into_diagnostic()?;
 
     Ok(response.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_secret_interceptor_injects_header() {
+        let mut interceptor = SandboxSecretInterceptor {
+            secret: Some("test-secret".parse().unwrap()),
+        };
+        let request =
+            tonic::service::Interceptor::call(&mut interceptor, tonic::Request::new(())).unwrap();
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-sandbox-secret")
+                .and_then(|v| v.to_str().ok()),
+            Some("test-secret")
+        );
+    }
+
+    #[test]
+    fn sandbox_secret_interceptor_is_noop_without_secret() {
+        let mut interceptor = SandboxSecretInterceptor { secret: None };
+        let request =
+            tonic::service::Interceptor::call(&mut interceptor, tonic::Request::new(())).unwrap();
+        assert!(request.metadata().get("x-sandbox-secret").is_none());
+    }
 }

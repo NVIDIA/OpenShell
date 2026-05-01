@@ -39,6 +39,10 @@ To request GPU resources, add `--gpu`:
 openshell sandbox create --gpu -- claude
 ```
 
+For Docker-backed sandboxes, GPU injection uses Docker CDI. If you enable Docker
+CDI after the gateway starts, restart the gateway so OpenShell can detect the
+updated Docker daemon capability.
+
 ### Custom Containers
 
 Use `--from` to create a sandbox from a pre-built community package, a local directory, or a container image:
