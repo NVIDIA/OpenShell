@@ -114,7 +114,7 @@ fn main() {
                 e
             )
         });
-        let size = fs::metadata(&dst_path).map(|m| m.len()).unwrap_or(0);
+        let size = fs::metadata(&dst_path).map_or(0, |m| m.len());
         println!("cargo:warning=Embedded {src_name}: {size} bytes");
     }
 

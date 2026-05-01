@@ -6116,6 +6116,7 @@ mod tests {
             edge_team_domain: None,
             edge_auth_url: None,
             vm_driver_state_dir: None,
+            ..Default::default()
         };
 
         assert!(!dockerfile_sources_supported_for_gateway(Some(&metadata)));
@@ -6134,6 +6135,7 @@ mod tests {
             edge_team_domain: None,
             edge_auth_url: None,
             vm_driver_state_dir: None,
+            ..Default::default()
         };
 
         assert!(dockerfile_sources_supported_for_gateway(Some(&metadata)));
