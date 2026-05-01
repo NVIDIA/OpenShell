@@ -36,6 +36,8 @@ When `--from` points to a Dockerfile or directory, the CLI:
 2. Pushes it into the cluster's containerd runtime using `docker save` / `ctr import`.
 3. Creates the sandbox with the resulting image tag.
 
+The build step aborts with a clear error if the Docker build stream stays silent for longer than `OPENSHELL_BUILD_NO_PROGRESS_TIMEOUT_SECS` seconds (default 1800). This is a guard against deadlocked container runtimes — most commonly an under-provisioned VM (e.g. macOS Colima with the default 2 vCPU / 2 GiB) where BuildKit can stop emitting events partway through a multi-step build and never recover. Raise the value if a legitimate build step is just quiet, or lower it for tighter CI budgets.
+
 ## How It Works
 
 The supervisor binary (`openshell-sandbox`) is **always side-loaded** from the k3s node filesystem via a read-only `hostPath` volume. It is never baked into sandbox images. This applies to all sandbox pods — whether using the default community base image, a custom image, or a user-built Dockerfile.
