@@ -40,6 +40,7 @@ jobs:
     outputs:
       python_version: ${{ steps.v.outputs.python }}
       cargo_version: ${{ steps.v.outputs.cargo }}
+      deb_version: ${{ steps.v.outputs.deb }}
       # Semver without 'v' prefix (e.g. 0.6.0), used for image tags and release body
       semver: ${{ steps.v.outputs.semver }}
     steps:
@@ -60,6 +61,7 @@ jobs:
           set -euo pipefail
           echo "python=$(uv run python tasks/scripts/release.py get-version --python)" >> "$GITHUB_OUTPUT"
           echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
+          echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)" >> "$GITHUB_OUTPUT"
           echo "semver=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
   build-gateway:
@@ -642,12 +644,31 @@ jobs:
           path: artifacts/*.tar.gz
           retention-days: 5
 
+  build-driver-vm-linux:
+    name: Build Driver VM Linux
+    needs: [compute-versions]
+    uses: ./.github/workflows/driver-vm-linux.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
+  build-deb:
+    name: Build Debian Packages
+    needs: [compute-versions, build-cli-linux, build-gateway-binary-linux, build-driver-vm-linux]
+    uses: ./.github/workflows/deb-package.yml
+    with:
+      deb-version: ${{ needs.compute-versions.outputs.deb_version }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
   # ---------------------------------------------------------------------------
   # Create a tagged GitHub Release with CLI binaries and wheels
   # ---------------------------------------------------------------------------
   release:
     name: Release
-    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, tag-ghcr-release]
+    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, tag-ghcr-release, build-deb]
     runs-on: build-amd64
     timeout-minutes: 10
     outputs:
@@ -685,6 +706,13 @@ jobs:
           path: release/
           merge-multiple: true
 
+      - name: Download Debian package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-linux-*
+          path: release/
+          merge-multiple: true
+
       - name: Capture wheel filenames
         id: wheel_filenames
         run: |
@@ -701,6 +729,7 @@ jobs:
             openshell-x86_64-unknown-linux-musl.tar.gz \
             openshell-aarch64-unknown-linux-musl.tar.gz \
             openshell-aarch64-apple-darwin.tar.gz \
+            openshell_*.deb \
             *.whl > openshell-checksums-sha256.txt
           cat openshell-checksums-sha256.txt
           sha256sum \
@@ -733,6 +762,7 @@ jobs:
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-apple-darwin.tar.gz
+            release/openshell_*.deb
             release/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-gateway-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-gateway-aarch64-apple-darwin.tar.gz

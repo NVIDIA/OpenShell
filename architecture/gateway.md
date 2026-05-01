@@ -118,11 +118,12 @@ The gateway boots in `cli::run_cli` (`crates/openshell-server/src/cli.rs`) and p
 
 ## Configuration
 
-All configuration is via CLI flags with environment variable fallbacks. The `--db-url` flag is required. The `--ssh-handshake-secret` flag is required for non-Docker drivers; Docker sandboxes do not receive a handshake secret.
+All configuration is via CLI flags with environment variable fallbacks. The `--db-url` flag is required.
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--port` | `OPENSHELL_SERVER_PORT` | `8080` | TCP listen port (binds `0.0.0.0`) |
+| `--port` | `OPENSHELL_SERVER_PORT` | `8080` | TCP listen port |
+| `--bind-address` | `OPENSHELL_BIND_ADDRESS` | `0.0.0.0` | Address for the main gateway listener |
 | `--log-level` | `OPENSHELL_LOG_LEVEL` | `info` | Tracing log level filter |
 | `--tls-cert` | `OPENSHELL_TLS_CERT` | None | Path to PEM certificate file |
 | `--tls-key` | `OPENSHELL_TLS_KEY` | None | Path to PEM private key file |
@@ -136,7 +137,7 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 | `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | None | gRPC endpoint reachable from within the cluster (for supervisor callbacks) |
 | `--drivers` | `OPENSHELL_DRIVERS` | `kubernetes` | Compute backend to use. Current options are `kubernetes`, `docker`, and `vm`. |
 | `--vm-driver-state-dir` | `OPENSHELL_VM_DRIVER_STATE_DIR` | `target/openshell-vm-driver` | Host directory for VM sandbox rootfs, console logs, and runtime state |
-| `--driver-dir` | `OPENSHELL_DRIVER_DIR` | unset | Override directory for `openshell-driver-vm`. When unset, the gateway searches `~/.local/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`, then a sibling binary. |
+| `--driver-dir` | `OPENSHELL_DRIVER_DIR` | unset | Override directory for `openshell-driver-vm`. When unset, the gateway searches `~/.local/libexec/openshell`, `/usr/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`, then a sibling binary. |
 | `--vm-krun-log-level` | `OPENSHELL_VM_KRUN_LOG_LEVEL` | `1` | libkrun log level for VM helper processes |
 | `--vm-driver-vcpus` | `OPENSHELL_VM_DRIVER_VCPUS` | `2` | Default vCPU count for VM sandboxes |
 | `--vm-driver-mem-mib` | `OPENSHELL_VM_DRIVER_MEM_MIB` | `2048` | Default memory allocation for VM sandboxes in MiB |

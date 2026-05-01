@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Distribution package tasks
+
+["package:deb"]
+description = "Build a Debian package from supplied OpenShell binaries"
+run = "tasks/scripts/package-deb.sh"
+hide = true
+
+["package:deb:amd64"]
+description = "Build an amd64 Debian package from supplied OpenShell binaries"
+env = { OPENSHELL_DEB_ARCH = "amd64" }
+run = "tasks/scripts/package-deb.sh"
+hide = true
+
+["package:deb:arm64"]
+description = "Build an arm64 Debian package from supplied OpenShell binaries"
+env = { OPENSHELL_DEB_ARCH = "arm64" }
+run = "tasks/scripts/package-deb.sh"
+hide = true
+
+["package:deb:install"]
+description = "Build OpenShell from source and install the deb locally (requires sudo)"
+run = "tasks/scripts/package-deb-install.sh"

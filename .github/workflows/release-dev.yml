@@ -29,6 +29,7 @@ jobs:
     outputs:
       python_version: ${{ steps.v.outputs.python }}
       cargo_version: ${{ steps.v.outputs.cargo }}
+      deb_version: ${{ steps.v.outputs.deb }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -46,6 +47,7 @@ jobs:
           set -euo pipefail
           echo "python=$(uv run python tasks/scripts/release.py get-version --python)" >> "$GITHUB_OUTPUT"
           echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
+          echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)" >> "$GITHUB_OUTPUT"
 
   build-gateway:
     needs: [compute-versions]
@@ -615,12 +617,31 @@ jobs:
           path: artifacts/*.tar.gz
           retention-days: 5
 
+  build-driver-vm-linux:
+    name: Build Driver VM Linux
+    needs: [compute-versions]
+    uses: ./.github/workflows/driver-vm-linux.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      image-tag: dev
+      checkout-ref: ${{ github.sha }}
+    secrets: inherit
+
+  build-deb:
+    name: Build Debian Packages
+    needs: [compute-versions, build-cli-linux, build-gateway-binary-linux, build-driver-vm-linux]
+    uses: ./.github/workflows/deb-package.yml
+    with:
+      deb-version: ${{ needs.compute-versions.outputs.deb_version }}
+      checkout-ref: ${{ github.sha }}
+    secrets: inherit
+
   # ---------------------------------------------------------------------------
   # Create / update the dev GitHub Release with CLI binaries and wheels
   # ---------------------------------------------------------------------------
   release-dev:
     name: Release Dev
-    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos]
+    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, build-deb]
     runs-on: build-amd64
     timeout-minutes: 10
     outputs:
@@ -656,6 +677,13 @@ jobs:
           path: release/
           merge-multiple: true
 
+      - name: Download Debian package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-linux-*
+          path: release/
+          merge-multiple: true
+
       - name: Capture wheel filenames
         id: wheel_filenames
         run: |
@@ -672,6 +700,7 @@ jobs:
             openshell-x86_64-unknown-linux-musl.tar.gz \
             openshell-aarch64-unknown-linux-musl.tar.gz \
             openshell-aarch64-apple-darwin.tar.gz \
+            openshell_*.deb \
             *.whl > openshell-checksums-sha256.txt
           cat openshell-checksums-sha256.txt
           sha256sum \
@@ -684,7 +713,7 @@ jobs:
             openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz > openshell-sandbox-checksums-sha256.txt
           cat openshell-sandbox-checksums-sha256.txt
 
-      - name: Prune stale wheel assets from dev release
+      - name: Prune stale wheel and deb assets from dev release
         uses: actions/github-script@v7
         env:
           WHEEL_VERSION: ${{ needs.compute-versions.outputs.python_version }}
@@ -717,19 +746,22 @@ jobs:
             }
 
             // Delete stale wheels
-            let kept = 0, deleted = 0;
+            let kept = 0, deleted = 0, debDeleted = 0;
             for (const asset of assets) {
-              if (!asset.name.endsWith('.whl')) continue;
-              if (asset.name.startsWith(currentPrefix)) {
+              if (asset.name.endsWith('.deb')) {
+                core.info(`Deleting stale deb package: ${asset.name} (id=${asset.id})`);
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
+                debDeleted++;
+              } else if (asset.name.endsWith('.whl') && asset.name.startsWith(currentPrefix)) {
                 core.info(`Keeping current wheel: ${asset.name}`);
                 kept++;
-              } else {
+              } else if (asset.name.endsWith('.whl')) {
                 core.info(`Deleting stale wheel: ${asset.name} (id=${asset.id})`);
                 await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
                 deleted++;
               }
             }
-            core.info(`Summary: kept=${kept}, deleted=${deleted}`);
+            core.info(`Summary: kept_wheels=${kept}, deleted_wheels=${deleted}, deleted_debs=${debDeleted}`);
 
       - name: Move dev tag
         run: |
@@ -760,6 +792,7 @@ jobs:
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-apple-darwin.tar.gz
+            release/openshell_*.deb
             release/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-gateway-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-gateway-aarch64-apple-darwin.tar.gz

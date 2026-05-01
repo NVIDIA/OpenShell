@@ -9,7 +9,7 @@ use openshell_core::ComputeDriverKind;
 use openshell_core::config::{
     DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS, DEFAULT_SSH_PORT,
 };
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -22,9 +22,17 @@ use crate::{run_server, tracing_bus::TracingLogBus};
 #[command(version = openshell_core::VERSION)]
 #[command(about = "OpenShell gRPC/HTTP server", long_about = None)]
 struct Args {
-    /// Port to bind the server to (all interfaces).
+    /// Port to bind the server to.
     #[arg(long, default_value_t = DEFAULT_SERVER_PORT, env = "OPENSHELL_SERVER_PORT")]
     port: u16,
+
+    /// Address to bind the server to.
+    #[arg(
+        long,
+        default_value_t = IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        env = "OPENSHELL_BIND_ADDRESS"
+    )]
+    bind_address: IpAddr,
 
     /// Port for unauthenticated health endpoints (healthz, readyz).
     /// Set to 0 to disable the dedicated health listener.
@@ -138,8 +146,9 @@ struct Args {
     /// Directory searched for compute-driver binaries (e.g.
     /// `openshell-driver-vm`) when an explicit binary override isn't
     /// configured. When unset, the gateway searches
-    /// `$HOME/.local/libexec/openshell`, `/usr/local/libexec/openshell`,
-    /// `/usr/local/libexec`, then a sibling of the gateway binary.
+    /// `$HOME/.local/libexec/openshell`, `/usr/libexec/openshell`,
+    /// `/usr/local/libexec/openshell`, `/usr/local/libexec`, then a sibling
+    /// of the gateway binary.
     #[arg(long, env = "OPENSHELL_DRIVER_DIR")]
     driver_dir: Option<PathBuf>,
 
@@ -286,7 +295,7 @@ async fn run_from_args(args: Args) -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
     );
 
-    let bind = SocketAddr::from(([0, 0, 0, 0], args.port));
+    let bind = SocketAddr::from((args.bind_address, args.port));
 
     let tls = if args.disable_tls {
         None
@@ -428,7 +437,9 @@ fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, S
 
 #[cfg(test)]
 mod tests {
-    use super::command;
+    use super::{Args, command};
+    use clap::Parser;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn command_uses_gateway_binary_name() {
@@ -443,5 +454,25 @@ mod tests {
         let cmd = command();
         let version = cmd.get_version().unwrap();
         assert_eq!(version.to_string(), openshell_core::VERSION);
+    }
+
+    #[test]
+    fn command_defaults_bind_address_to_all_interfaces() {
+        let args =
+            Args::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn command_parses_bind_address() {
+        let args = Args::try_parse_from([
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--bind-address",
+            "127.0.0.1",
+        ])
+        .unwrap();
+        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 }

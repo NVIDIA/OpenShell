@@ -10,7 +10,12 @@
     ".opencode/**",
     ".github/**",
     "THIRD-PARTY-NOTICES/**",
-    "CLAUDE.md"
+    "CLAUDE.md",
+    "target/**",
+    "e2e/rust/target/**",
+    "scripts/lint-mermaid/node_modules/**",
+    ".venv/**",
+    "artifacts/**"
   ],
   "config": {
     "default": true,

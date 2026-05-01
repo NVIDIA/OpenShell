@@ -113,6 +113,7 @@ impl VmComputeConfig {
         if let Some(home) = home {
             dirs.push(home.join(".local").join("libexec").join("openshell"));
         }
+        push_unique_path(&mut dirs, PathBuf::from("/usr/libexec/openshell"));
         push_unique_path(&mut dirs, PathBuf::from("/usr/local/libexec/openshell"));
         push_unique_path(&mut dirs, PathBuf::from("/usr/local/libexec"));
         dirs
@@ -148,8 +149,8 @@ pub struct VmGuestTlsPaths {
 /// 1. `{driver_dir}/openshell-driver-vm`, where `driver_dir` comes from
 ///    `--driver-dir` / `OPENSHELL_DRIVER_DIR`.
 /// 2. Conventional install directories:
-///    `~/.local/libexec/openshell`, `/usr/local/libexec/openshell`,
-///    `/usr/local/libexec`.
+///    `~/.local/libexec/openshell`, `/usr/libexec/openshell`,
+///    `/usr/local/libexec/openshell`, `/usr/local/libexec`.
 /// 3. Sibling of the gateway's own executable (last-resort fallback so
 ///    local development builds still work out of the box).
 pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf> {
@@ -186,7 +187,7 @@ pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf
         .collect::<Vec<_>>()
         .join(", ");
     Err(Error::config(format!(
-        "vm compute driver binary not found (searched {searched_display}); install it under --driver-dir / OPENSHELL_DRIVER_DIR, a conventional libexec path such as ~/.local/libexec/openshell or /usr/local/libexec{{,/openshell}}, or place it next to the gateway binary"
+        "vm compute driver binary not found (searched {searched_display}); install it under --driver-dir / OPENSHELL_DRIVER_DIR, a conventional libexec path such as ~/.local/libexec/openshell, /usr/libexec/openshell, or /usr/local/libexec{{,/openshell}}, or place it next to the gateway binary"
     )))
 }
 
@@ -441,12 +442,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_driver_search_dirs_include_usr_local_libexec_fallbacks() {
+    fn resolve_driver_search_dirs_include_libexec_fallbacks() {
         let dirs = resolve_driver_search_dirs(&VmComputeConfig {
             driver_dir: None,
             ..Default::default()
         });
 
+        assert!(dirs.contains(&PathBuf::from("/usr/libexec/openshell")));
         assert!(dirs.contains(&PathBuf::from("/usr/local/libexec/openshell")));
         assert!(dirs.contains(&PathBuf::from("/usr/local/libexec")));
     }
