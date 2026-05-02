@@ -304,9 +304,9 @@ Traffic flows through several layers from the host to the gateway process:
 | Container | `30051` | Hardcoded in `crates/openshell-bootstrap/src/docker.rs` |
 | k3s NodePort | `30051` | `deploy/helm/openshell/values.yaml` (`service.nodePort`) |
 | k3s Service | `8080` | `deploy/helm/openshell/values.yaml` (`service.port`) |
-| Server bind | `8080` | `--port` flag / `OPENSHELL_SERVER_PORT` env var |
+| Server bind | `0.0.0.0:8080` in deployed containers | `--bind-address 0.0.0.0 --port 8080` / `OPENSHELL_BIND_ADDRESS` + `OPENSHELL_SERVER_PORT` |
 
-Docker maps `host_port → 30051/tcp`. Inside k3s, the NodePort service maps `30051 → 8080 (pod port)`. The server binds `0.0.0.0:8080`.
+Docker maps `host_port → 30051/tcp`. Inside k3s, the NodePort service maps `30051 → 8080 (pod port)`. The deployed gateway container binds `0.0.0.0:8080` explicitly.
 
 ## Security Model Summary
 

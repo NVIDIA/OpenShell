@@ -107,14 +107,16 @@ The gateway boots in `cli::run_cli` (`crates/openshell-server/src/cli.rs`) and p
       - `docker` constructs `openshell-driver-docker` in-process and manages local containers labeled with the configured sandbox namespace.
       - `vm` spawns the standalone `openshell-driver-vm` binary as a local compute-driver process, resolves it from `--driver-dir`, conventional libexec install paths, or a sibling of the gateway binary, connects to it over a Unix domain socket, and keeps the libkrun/rootfs runtime out of the gateway binary.
    3. Build `ServerState` (shared via `Arc<ServerState>` across all handlers), including a fresh `SupervisorSessionRegistry`.
-   4. **Spawn background tasks**:
+   4. Resume persisted sandboxes that were stopped during the previous gateway shutdown.
+   5. **Spawn background tasks**:
       - `ComputeRuntime::spawn_watchers` -- consumes the compute-driver watch stream, republishes platform events, and runs a periodic `ListSandboxes` snapshot reconcile.
       - `ssh_tunnel::spawn_session_reaper` -- sweeps expired or revoked SSH session tokens from the store hourly.
       - `supervisor_session::spawn_relay_reaper` -- sweeps orphaned pending relay channels every 30 seconds.
-   5. Create `MultiplexService`.
-   6. Bind `TcpListener` on `config.bind_address`.
-   7. Optionally create `TlsAcceptor` from cert/key files.
-   8. Enter the accept loop: for each connection, spawn a tokio task that optionally performs a TLS handshake, then calls `MultiplexService::serve()`.
+   6. Create `MultiplexService`.
+   7. Bind the primary gateway listener and any compute-driver requested listeners. Docker requests the Docker bridge gateway address with the normal gateway port, so sandbox containers can call back over the bridge without joining the host network.
+   8. Bind optional health and metrics listeners.
+   9. Optionally create `TlsAcceptor` from cert/key files.
+   10. Spawn a task per gateway listener. Each accepted connection optionally performs a TLS handshake, then calls `MultiplexService::serve()`.
 
 ## Configuration
 
@@ -122,8 +124,8 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
+| `--bind-address` | `OPENSHELL_BIND_ADDRESS` | `127.0.0.1` | IP address for gateway, health, and metrics listeners. Container deployments pass `0.0.0.0` explicitly. |
 | `--port` | `OPENSHELL_SERVER_PORT` | `8080` | TCP listen port |
-| `--bind-address` | `OPENSHELL_BIND_ADDRESS` | `0.0.0.0` | Address for the main gateway listener |
 | `--log-level` | `OPENSHELL_LOG_LEVEL` | `info` | Tracing log level filter |
 | `--tls-cert` | `OPENSHELL_TLS_CERT` | None | Path to PEM certificate file |
 | `--tls-key` | `OPENSHELL_TLS_KEY` | None | Path to PEM private key file |
@@ -136,6 +138,7 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | None | Default container image for sandbox pods |
 | `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | None | gRPC endpoint reachable from within the cluster (for supervisor callbacks) |
 | `--drivers` | `OPENSHELL_DRIVERS` | `kubernetes` | Compute backend to use. Current options are `kubernetes`, `docker`, and `vm`. |
+| `--docker-network-name` | `OPENSHELL_DOCKER_NETWORK_NAME` | `openshell-docker` | Docker bridge network that local Docker sandboxes join |
 | `--vm-driver-state-dir` | `OPENSHELL_VM_DRIVER_STATE_DIR` | `target/openshell-vm-driver` | Host directory for VM sandbox rootfs, console logs, and runtime state |
 | `--driver-dir` | `OPENSHELL_DRIVER_DIR` | unset | Override directory for `openshell-driver-vm`. When unset, the gateway searches `~/.local/libexec/openshell`, `/usr/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`, then a sibling binary. |
 | `--vm-krun-log-level` | `OPENSHELL_VM_KRUN_LOG_LEVEL` | `1` | libkrun log level for VM helper processes |
@@ -608,6 +611,9 @@ The gateway reaches the sandbox exclusively through the supervisor-initiated `Co
 The Docker driver (`crates/openshell-driver-docker/src/lib.rs`) is an in-process compute backend for local standalone gateways. It creates one Docker container per sandbox, labels each container with `openshell.ai/managed-by=openshell`, `openshell.ai/sandbox-id`, `openshell.ai/sandbox-name`, and `openshell.ai/sandbox-namespace`, and bind-mounts a Linux `openshell-sandbox` supervisor binary into the container.
 
 - **Create**: Pulls or validates the sandbox image according to `sandbox_image_pull_policy`, creates a labeled container, mounts the supervisor binary and optional TLS material, and starts the container with the supervisor as entrypoint.
+- **Bridge networking**: Ensures a local Docker bridge network exists (`openshell-docker` by default) and starts every sandbox container on that network instead of using `network_mode=host`.
+- **Gateway callback routing**: On native Linux Docker, injects `host.openshell.internal` with the bridge gateway IP and reports that bridge gateway IP plus the normal gateway port to `run_server()` as an extra listener. If the primary listener already binds the wildcard address for that port, the extra address is covered and is not bound a second time. On Docker Desktop, the bridge gateway IP belongs to Docker Desktop's VM rather than the macOS/Windows host, so the driver maps `host.openshell.internal` to Docker's `host-gateway` alias and does not request an extra listener. `OPENSHELL_ENDPOINT` inside Docker sandboxes uses the configured scheme and points at `host.openshell.internal:<gateway-port>` in both cases.
+- **Environment ownership**: Merges template and spec environment first, then overwrites driver-owned supervisor variables, including `PATH`, `OPENSHELL_ENDPOINT`, `OPENSHELL_SANDBOX_ID`, `OPENSHELL_SSH_SOCKET_PATH`, and `OPENSHELL_SANDBOX_COMMAND`. This keeps privileged supervisor setup from resolving helper binaries through a user-controlled search path.
 - **List/Get/Watch**: Reads labeled containers in the configured sandbox namespace and derives driver-native sandbox status from Docker state plus supervisor relay readiness.
 - **Stop**: Stops the matching labeled container without deleting it.
 - **Delete**: Force-removes the matching labeled container.
