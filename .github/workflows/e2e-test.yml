@@ -11,7 +11,7 @@ on:
         description: "GitHub Actions runner label"
         required: false
         type: string
-        default: "build-amd64"
+        default: "linux-amd64-cpu8"
 
 permissions:
   contents: read

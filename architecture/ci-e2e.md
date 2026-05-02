@@ -6,7 +6,7 @@ This document describes the architecture of the E2E CI flow: every workflow invo
 
 Three independent goals shape the design:
 
-1. **Self-hosted runner safety.** E2E runs on `build-arm64` and on GPU runners. GitHub's [security hardening guide](https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#hardening-for-self-hosted-runners) states bluntly: "Self-hosted runners should almost never be used for public repositories on GitHub, because any user can open pull requests against the repository and compromise the environment." Our workaround is the same one used elsewhere in NVIDIA's GHA infrastructure: copy-pr-bot mirrors trusted PRs into `pull-request/<N>` branches inside this repository, and the self-hosted workflows trigger on `push` to those mirror branches rather than on `pull_request`.
+1. **Self-hosted runner safety.** Required PR checks, E2E, and GPU tests run on NVIDIA self-hosted runners. GitHub's [security hardening guide](https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#hardening-for-self-hosted-runners) states bluntly: "Self-hosted runners should almost never be used for public repositories on GitHub, because any user can open pull requests against the repository and compromise the environment." Our workaround is the same one used elsewhere in NVIDIA's GHA infrastructure: copy-pr-bot mirrors trusted PRs into `pull-request/<N>` branches inside this repository, and the self-hosted workflows trigger on `push` to those mirror branches rather than on `pull_request`.
 2. **Label as a hard merge gate.** When a PR carries `test:e2e` (or `test:e2e-gpu`), the corresponding suite *must* have actually executed and passed for the PR head SHA. The label has to be enforcing, not advisory: it blocks merge unless the suite ran with the label set.
 3. **Per-job least privilege on the GitHub token.** Each workflow declares `permissions: {}` at the top, and each job declares only what it needs. This follows the hardening pattern described at <https://astral.sh/blog/open-source-security-at-astral>.
 
@@ -17,20 +17,21 @@ These three goals do not compose cleanly: the safety goal forces `push: pull-req
 | File | Trigger | Role |
 |---|---|---|
 | `.github/copy-pr-bot.yaml` | (config) | Tells copy-pr-bot to mirror trusted PRs into `pull-request/<N>` branches. Pre-existed. |
-| `.github/workflows/branch-e2e.yml` | `push: pull-request/[0-9]+` + `workflow_dispatch` | Runs non-GPU E2E on `build-arm64`. |
+| `.github/workflows/branch-checks.yml` | `push: pull-request/[0-9]+` + `workflow_dispatch` | Runs required branch checks on `linux-amd64-cpu8` and `linux-arm64-cpu8`. |
+| `.github/workflows/branch-e2e.yml` | `push: pull-request/[0-9]+` + `workflow_dispatch` | Runs non-GPU E2E on `linux-arm64-cpu8`. |
 | `.github/workflows/test-gpu.yml` | `push: pull-request/[0-9]+` + `workflow_dispatch` | Runs GPU E2E on self-hosted GPU runners. |
-| `.github/workflows/shadow-branch-e2e.yml` | `push: pull-request/[0-9]+` + `workflow_dispatch` | Non-required shared-runner E2E shadow coverage for OS-49 Phase 5. |
+| `.github/workflows/shadow-branch-e2e.yml` | `push: pull-request/[0-9]+` + `workflow_dispatch` | Historical non-required shared-runner E2E shadow coverage for OS-49 Phase 5. |
 | `.github/actions/pr-gate/action.yml` | (composite) | Resolves PR metadata for a `pull-request/<N>` push and decides whether the run should proceed. Label enforcement is optional, so non-required shadows can validate mirror metadata without introducing another PR label. |
 | `.github/workflows/e2e-gate.yml` | `pull_request` + `workflow_run` | Posts the required `E2E Gate` check on the PR. Re-evaluates after the gated workflow completes. |
 | `.github/workflows/e2e-gate-check.yml` | `workflow_call` | Reusable gate logic shared by E2E and GPU E2E. |
 | `.github/workflows/e2e-label-help.yml` | `pull_request_target: [labeled]` | Posts a PR comment when a `test:e2e*` label is applied, telling the maintainer the next manual step (re-run an existing run, or `/ok to test <SHA>` to refresh the mirror). Does *not* dispatch the workflow itself - see "Why we don't auto-dispatch" below. |
 | `.github/workflows/e2e-test.yml`, `e2e-gpu-test.yaml`, `docker-build.yml` | `workflow_call` | Reusable worker workflows. Unchanged by this design - called from the gated workflows and from release workflows. |
 
-## OS-49 shadow runner coverage
+## OS-49 runner migration
 
-OS-49 Phase 5 adds non-required shadow workflows for the non-release workflows being prepared for shared-runner cutover. They all use `workflow_dispatch` for manual bake runs and `push: pull-request/[0-9]+` for copy-pr-bot mirrored PRs.
+OS-49 Phase 5 added non-required shadow workflows for the non-release workflows being prepared for shared-runner cutover. Phase 6 promotes the validated shared-runner path into the real non-release workflows.
 
-`shadow-branch-checks.yml` and `shadow-ci-image.yml` use `pr-gate` without a required label. That still verifies the mirror SHA matches the source PR head SHA, but does not require a new GitHub label for every ordinary CI shadow run. `shadow-branch-e2e.yml` keeps the existing `test:e2e` gate because it publishes temporary images and runs the expensive E2E suite. It shadows the top-level `branch-e2e.yml` workflow, which already exercises the reusable `e2e-test.yml` worker path, so Phase 5 does not keep a second direct `e2e-test.yml` shadow workflow.
+`branch-checks.yml` uses `pr-gate` without a required label. That still verifies the mirror SHA matches the source PR head SHA, but does not require a new GitHub label for ordinary required checks. `branch-e2e.yml` keeps the existing `test:e2e` gate because it publishes temporary images and runs the expensive E2E suite. `ci-image.yml` now builds amd64 and arm64 CI images natively on shared CPU runners and merges the multi-arch manifest after both per-arch images are pushed.
 
 ## Trigger taxonomy
 
@@ -147,10 +148,13 @@ Labels persist as PR metadata and survive re-runs and force-pushes. Comment-base
 
 ## Permission posture
 
-Every workflow declares `permissions: {}` at the top. Per-job grants are the minimum needed:
+The gated E2E workflows declare `permissions: {}` at the top. Branch checks and CI image publishing use the minimum workflow/job grants needed for checkout, package pulls, and package pushes.
 
 | Workflow | Job | Grants |
 |---|---|---|
+| `branch-checks.yml` | workflow default | `contents: read`, `packages: read` |
+| | `pr_metadata` | `contents: read`, `pull-requests: read` |
+| `ci-image.yml` | workflow default | `contents: read`, `packages: write` |
 | `branch-e2e.yml`, `test-gpu.yml` | `pr_metadata` | `contents: read`, `pull-requests: read` |
 | | `build-*` | `contents: read`, `packages: write` |
 | | `e2e*` | `contents: read`, `packages: read` |

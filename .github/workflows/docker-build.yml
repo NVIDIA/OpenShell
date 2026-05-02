@@ -26,7 +26,7 @@ on:
         description: "Deprecated; per-arch native runners are selected automatically"
         required: false
         type: string
-        default: "build-amd64"
+        default: "linux-amd64-cpu8"
       cargo-version:
         description: "Pre-computed cargo version (skips internal git-based computation)"
         required: false

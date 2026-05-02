@@ -1,21 +1,45 @@
 name: Branch Checks
 
 on:
-  pull_request:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  SCCACHE_GHA_ENABLED: "true"
 
 permissions:
   contents: read
   packages: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  pr_metadata:
+    name: Resolve PR metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: gate
+        uses: ./.github/actions/pr-gate
+
   mise-lockfile:
     name: mise Lockfile
-    runs-on: build-amd64
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -27,16 +51,7 @@ jobs:
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Detect mise config changes
-        id: changed
-        uses: tj-actions/changed-files@aa08304bd477b800d468db44fe10f6c61f7f7b11 # v42.1.0
-        with:
-          files: |
-            mise.toml
-            mise.lock
-
       - name: Verify mise.lock is in sync with mise.toml
-        if: steps.changed.outputs.any_changed == 'true'
         run: |
           mise lock
           if ! git diff --exit-code mise.lock; then
@@ -46,7 +61,9 @@ jobs:
 
   license-headers:
     name: License Headers
-    runs-on: build-amd64
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -63,11 +80,15 @@ jobs:
 
   rust:
     name: Rust (${{ matrix.runner }})
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
     strategy:
       fail-fast: false
       matrix:
-        runner: [build-amd64, build-arm64]
+        runner: [linux-amd64-cpu8, linux-arm64-cpu8]
     runs-on: ${{ matrix.runner }}
+    env:
+      SCCACHE_GHA_VERSION: branch-checks-rust-${{ matrix.runner }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -79,9 +100,8 @@ jobs:
       - name: Install tools
         run: mise install --locked
 
-      - name: Configure sccache remote cache
-        if: vars.SCCACHE_MEMCACHED_ENDPOINT != ''
-        run: echo "SCCACHE_MEMCACHED_ENDPOINT=${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}" >> "$GITHUB_ENV"
+      - name: Configure GHA sccache backend
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
@@ -103,14 +123,24 @@ jobs:
 
       - name: sccache stats
         if: always()
-        run: mise x -- sccache --show-stats
+        run: |
+          set +e
+          stats_bin="${SCCACHE_PATH:-sccache}"
+          "$stats_bin" --show-stats
+          status=$?
+          if [[ $status -ne 0 ]]; then
+            echo "::warning::sccache stats unavailable (exit $status)"
+          fi
+          exit 0
 
   python:
     name: Python (${{ matrix.runner }})
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
     strategy:
       fail-fast: false
       matrix:
-        runner: [build-amd64, build-arm64]
+        runner: [linux-amd64-cpu8, linux-arm64-cpu8]
     runs-on: ${{ matrix.runner }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -134,7 +164,9 @@ jobs:
 
   markdown:
     name: Markdown
-    runs-on: build-amd64
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -144,7 +176,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install tools
-        run: mise install
+        run: mise install --locked
 
       - name: Lint
         run: mise run markdown:lint

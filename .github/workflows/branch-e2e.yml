@@ -34,7 +34,6 @@ jobs:
     with:
       component: gateway
       platform: linux/arm64
-      runner: build-arm64
 
   build-cluster:
     needs: [pr_metadata]
@@ -46,7 +45,6 @@ jobs:
     with:
       component: cluster
       platform: linux/arm64
-      runner: build-arm64
 
   e2e:
     needs: [pr_metadata, build-gateway, build-cluster]
@@ -57,4 +55,4 @@ jobs:
     uses: ./.github/workflows/e2e-test.yml
     with:
       image-tag: ${{ github.sha }}
-      runner: build-arm64
+      runner: linux-arm64-cpu8

@@ -6,7 +6,9 @@ For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CO
 
 ## Overview
 
-E2E tests run on self-hosted runners (`build-arm64`, GPU runners). To keep untrusted PR code off those runners we use NVIDIA's copy-pr-bot, which mirrors trusted PR commits to internal `pull-request/<N>` branches in this repository. The gated workflows trigger on pushes to those branches, not on the original PR.
+PR CI that runs on NVIDIA self-hosted runners uses NVIDIA's copy-pr-bot. The bot mirrors trusted PR commits to internal `pull-request/<N>` branches in this repository. The gated workflows trigger on pushes to those branches, not on the original PR.
+
+`Branch Checks` run automatically after copy-pr-bot mirrors the PR. E2E suites are opt-in because they are more expensive and publish temporary images.
 
 Two opt-in labels enable the suites:
 
@@ -63,11 +65,11 @@ Prerequisites:
 Flow:
 
 1. Open the PR. copy-pr-bot mirrors it to `pull-request/<N>` automatically.
-2. The first push of `pull-request/<N>` runs `Branch E2E Checks`, but it skips the build/E2E jobs because no label is set yet. The PR's `E2E Gate` check passes as a no-op (no label, no requirement).
-3. A maintainer applies `test:e2e` and/or `test:e2e-gpu`. `E2E Label Help` posts a comment with a link to the existing `Branch E2E Checks` run.
+2. The mirror push runs `Branch Checks` automatically. The first `Branch E2E Checks` / `GPU Test` run only resolves metadata and skips expensive jobs unless the matching label is already set.
+3. A maintainer applies `test:e2e` and/or `test:e2e-gpu`. `E2E Label Help` posts a comment with a link to the existing gated workflow run.
 4. The maintainer opens that link and clicks **Re-run all jobs**. This time `pr_metadata` sees the label and the build/E2E jobs run.
 5. When the run finishes, the `E2E Gate` check on the PR flips to green automatically.
-6. New commits push to the mirror automatically and re-trigger `Branch E2E Checks`. Because the label is still set, those runs execute the build/E2E jobs without manual re-run.
+6. New commits push to the mirror automatically and re-trigger `Branch Checks` plus any labeled E2E/GPU workflows.
 
 ### Forked PR
 
@@ -102,6 +104,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 
 | File | Role |
 |---|---|
+| `.github/workflows/branch-checks.yml` | Required non-E2E PR checks. Triggers on `push: pull-request/[0-9]+`. |
 | `.github/workflows/branch-e2e.yml` | Non-GPU E2E. Triggers on `push: pull-request/[0-9]+`. |
 | `.github/workflows/test-gpu.yml` | GPU E2E. Triggers on `push: pull-request/[0-9]+`. |
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set. |
