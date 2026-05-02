@@ -160,6 +160,7 @@ openshell gateway info --name my-remote-cluster
 
 | Flag | Purpose |
 |---|---|
+| `--drivers` | Compute driver to use: `kubernetes`, `docker`, `podman`, or `vm`. When omitted, the gateway auto-detects the driver based on the runtime environment, checking in priority order: Kubernetes → Podman → Docker. The `vm` driver is never auto-detected and must be set explicitly. |
 | `--gpu` | Enable NVIDIA GPU passthrough. Requires NVIDIA drivers and the Container Toolkit on the host. OpenShell auto-selects CDI when enabled on the daemon and falls back to Docker's NVIDIA GPU request path (`--gpus all`) otherwise. |
 | `--plaintext` | Listen on HTTP instead of mTLS. Use behind a TLS-terminating reverse proxy. |
 | `--disable-gateway-auth` | Skip mTLS client certificate checks. Use when a reverse proxy cannot forward client certs. |
