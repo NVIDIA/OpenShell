@@ -7,9 +7,10 @@ use clap::{Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::ComputeDriverKind;
 use openshell_core::config::{
-    DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS, DEFAULT_SSH_PORT,
+    DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS,
+    DEFAULT_SSH_PORT,
 };
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -22,17 +23,13 @@ use crate::{run_server, tracing_bus::TracingLogBus};
 #[command(version = openshell_core::VERSION)]
 #[command(about = "OpenShell gRPC/HTTP server", long_about = None)]
 struct Args {
+    /// IP address to bind the server, health, and metrics listeners to.
+    #[arg(long, default_value = "127.0.0.1", env = "OPENSHELL_BIND_ADDRESS")]
+    bind_address: IpAddr,
+
     /// Port to bind the server to.
     #[arg(long, default_value_t = DEFAULT_SERVER_PORT, env = "OPENSHELL_SERVER_PORT")]
     port: u16,
-
-    /// Address to bind the server to.
-    #[arg(
-        long,
-        default_value_t = IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        env = "OPENSHELL_BIND_ADDRESS"
-    )]
-    bind_address: IpAddr,
 
     /// Port for unauthenticated health endpoints (healthz, readyz).
     /// Set to 0 to disable the dedicated health listener.
@@ -215,6 +212,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_DOCKER_TLS_KEY")]
     docker_tls_key: Option<PathBuf>,
 
+    /// Docker bridge network used for sandbox containers.
+    #[arg(
+        long,
+        env = "OPENSHELL_DOCKER_NETWORK_NAME",
+        default_value = DEFAULT_DOCKER_NETWORK_NAME
+    )]
+    docker_network_name: String,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -295,7 +300,7 @@ async fn run_from_args(args: Args) -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
     );
 
-    let bind = SocketAddr::from((args.bind_address, args.port));
+    let bind = SocketAddr::new(args.bind_address, args.port);
 
     let tls = if args.disable_tls {
         None
@@ -332,7 +337,7 @@ async fn run_from_args(args: Args) -> Result<()> {
                 args.port
             ));
         }
-        let health_bind = SocketAddr::from(([0, 0, 0, 0], args.health_port));
+        let health_bind = SocketAddr::new(args.bind_address, args.health_port);
         config = config.with_health_bind_address(health_bind);
     }
 
@@ -349,7 +354,7 @@ async fn run_from_args(args: Args) -> Result<()> {
                 args.health_port
             ));
         }
-        let metrics_bind = SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
+        let metrics_bind = SocketAddr::new(args.bind_address, args.metrics_port);
         config = config.with_metrics_bind_address(metrics_bind);
     }
 
@@ -416,6 +421,7 @@ async fn run_from_args(args: Args) -> Result<()> {
         guest_tls_ca: args.docker_tls_ca,
         guest_tls_cert: args.docker_tls_cert,
         guest_tls_key: args.docker_tls_key,
+        network_name: args.docker_network_name,
     };
 
     if args.disable_tls {
@@ -457,10 +463,10 @@ mod tests {
     }
 
     #[test]
-    fn command_defaults_bind_address_to_all_interfaces() {
+    fn command_defaults_bind_address_to_loopback() {
         let args =
             Args::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
-        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 
     #[test]

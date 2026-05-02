@@ -22,6 +22,7 @@ bytes = { workspace = true }
 bollard = { version = "0.20" }
 tar = "0.4"
 tempfile = "3"
+url = { workspace = true }
 
 [lints]
 workspace = true
