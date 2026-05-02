@@ -475,7 +475,12 @@ pub(super) async fn handle_exec_sandbox(
     // typically called during normal operation (not right after create).
     let (channel_id, relay_rx) = state
         .supervisor_sessions
-        .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
+        .open_relay(
+            sandbox.object_id(),
+            crate::supervisor_session::RelayTarget::Ssh,
+            None,
+            std::time::Duration::from_secs(15),
+        )
         .await
         .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
@@ -706,8 +711,7 @@ fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String>
 ///
 /// This is the relay equivalent of `stream_exec_over_ssh`. Instead of dialing a
 /// sandbox endpoint directly, the SSH transport runs over a `DuplexStream` that
-/// is bridged to the supervisor's local SSH daemon via a reverse HTTP CONNECT
-/// tunnel.
+/// is bridged to the supervisor's local SSH daemon through `RelayStream`.
 #[allow(clippy::too_many_arguments)]
 async fn stream_exec_over_relay(
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,

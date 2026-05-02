@@ -1,0 +1,138 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Browser Certificates"
+description: "Trust an OpenShell gateway CA and install the client certificate for browser access to sandbox services."
+keywords: "Generative AI, Cybersecurity, Browser Certificates, Firefox, mTLS, Local Domain"
+position: 2
+---
+
+OpenShell sandbox service URLs use the same gateway mTLS model as the CLI. Your browser needs two certificate changes before it can open `https://<sandbox>--<service>.<gateway>.openshell.localhost:<port>/`:
+
+- Trust the gateway CA so the browser accepts the gateway server certificate.
+- Install the client certificate so the gateway accepts the browser connection.
+
+The CLI stores gateway certificates under `~/.config/openshell/gateways/<gateway>/mtls/`:
+
+| File | Browser use |
+|---|---|
+| `ca.crt` | Import as a trusted certificate authority. |
+| `tls.crt` and `tls.key` | Convert to PKCS#12, then import as the browser client certificate. |
+
+## Create a Client Certificate Bundle
+
+Browsers import client certificates as PKCS#12 (`.p12`) bundles. Create one from the OpenShell PEM files:
+
+```shell
+GATEWAY=navigator  # replace with your gateway name
+MTLS_DIR="$HOME/.config/openshell/gateways/$GATEWAY/mtls"
+
+openssl pkcs12 -export \
+  -inkey "$MTLS_DIR/tls.key" \
+  -in "$MTLS_DIR/tls.crt" \
+  -certfile "$MTLS_DIR/ca.crt" \
+  -name "OpenShell $GATEWAY client" \
+  -out "$MTLS_DIR/openshell-$GATEWAY-client.p12" \
+  -passout pass:
+```
+
+This writes `openshell-<gateway>-client.p12` with an empty import password. If you set a password, enter it when the browser asks during import.
+
+## Firefox
+
+Firefox uses its own NSS certificate database and does not always use the macOS keychain.
+
+### Manual Import
+
+Open Firefox settings and import both certificates:
+
+1. Open `about:preferences#privacy`.
+2. Scroll to **Certificates** and select **View Certificates**.
+3. In **Authorities**, select **Import**, choose `~/.config/openshell/gateways/<gateway>/mtls/ca.crt`, and enable **Trust this CA to identify websites**.
+4. In **Your Certificates**, select **Import**, choose `~/.config/openshell/gateways/<gateway>/mtls/openshell-<gateway>-client.p12`, and enter the PKCS#12 password. If you used the command above, leave it blank.
+5. Restart Firefox.
+
+### CLI Import
+
+Install the NSS tools, close Firefox, then import into the active Firefox profile:
+
+```shell
+brew install nss
+
+GATEWAY=navigator  # replace with your gateway name
+MTLS_DIR="$HOME/.config/openshell/gateways/$GATEWAY/mtls"
+PROFILE="$HOME/Library/Application Support/Firefox/Profiles/<profile-directory>"
+
+certutil -A \
+  -d "sql:$PROFILE" \
+  -n "OpenShell $GATEWAY CA" \
+  -t "CT,C,C" \
+  -i "$MTLS_DIR/ca.crt"
+
+pk12util \
+  -d "sql:$PROFILE" \
+  -i "$MTLS_DIR/openshell-$GATEWAY-client.p12" \
+  -W ""
+```
+
+Find the active profile directory in `about:profiles` before running the commands. Restart Firefox after importing. If Firefox prompts for a client certificate when you visit the sandbox service URL, choose the `OpenShell <gateway> client` certificate.
+
+## Chrome, Edge, and Safari on macOS
+
+Chrome, Edge, and Safari generally use the macOS keychain. Import the CA into your login keychain and mark it trusted:
+
+```shell
+GATEWAY=navigator  # replace with your gateway name
+MTLS_DIR="$HOME/.config/openshell/gateways/$GATEWAY/mtls"
+
+security add-trusted-cert \
+  -d \
+  -r trustRoot \
+  -k "$HOME/Library/Keychains/login.keychain-db" \
+  "$MTLS_DIR/ca.crt"
+```
+
+macOS Keychain may reject the default OpenSSL 3 PKCS#12 bundle. Create a Keychain-compatible bundle:
+
+```shell
+GATEWAY=navigator  # replace with your gateway name
+MTLS_DIR="$HOME/.config/openshell/gateways/$GATEWAY/mtls"
+
+openssl pkcs12 -export -legacy \
+  -inkey "$MTLS_DIR/tls.key" \
+  -in "$MTLS_DIR/tls.crt" \
+  -certfile "$MTLS_DIR/ca.crt" \
+  -name "OpenShell $GATEWAY client" \
+  -out "$MTLS_DIR/openshell-$GATEWAY-client-keychain.p12" \
+  -passout pass:openshell
+```
+
+Import it for Safari from the command line:
+
+```shell
+security import "$MTLS_DIR/openshell-$GATEWAY-client-keychain.p12" \
+  -k "$HOME/Library/Keychains/login.keychain-db" \
+  -P "openshell" \
+  -f pkcs12 \
+  -T "/Applications/Safari.app"
+```
+
+Or import the client `.p12` into Keychain Access:
+
+1. Open **Keychain Access**.
+2. Select the **login** keychain.
+3. Choose **File > Import Items**.
+4. Select `~/.config/openshell/gateways/<gateway>/mtls/openshell-<gateway>-client-keychain.p12`.
+5. Enter the PKCS#12 password. If you used the command above, enter `openshell`.
+
+Restart the browser after importing certificates.
+
+## Troubleshooting
+
+If the browser still shows a certificate warning, recreate gateways created before sandbox service routing so their server certificate includes service base domain SANs:
+
+```shell
+openshell gateway start --recreate
+```
+
+If the gateway rejects the browser connection, confirm the client certificate is installed in **Your Certificates** in Firefox or in the login keychain on macOS.

@@ -70,6 +70,7 @@ Development task entrypoints split bootstrap behavior:
 
 For `mise run cluster`, `.env` acts as local source-of-truth for `GATEWAY_NAME`, `GATEWAY_PORT`, and `OPENSHELL_GATEWAY`. Missing keys are appended; existing values are preserved. If `GATEWAY_PORT` is missing, the task selects a free local port and persists it.
 Fast mode ensures a local registry (`127.0.0.1:5000`) is running and configures k3s to mirror pulls via `host.docker.internal:5000`, so the cluster task can push/pull local component images consistently.
+Sandbox service routing is always configured for gateway deployments. Bootstrap derives a default service base domain from the gateway name, and fast deploy passes the same domain through Helm so incremental deploys do not reset it.
 
 ## Bootstrap Sequence Diagram
 

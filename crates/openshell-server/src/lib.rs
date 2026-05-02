@@ -30,6 +30,7 @@ mod persistence;
 pub(crate) mod policy_store;
 mod sandbox_index;
 mod sandbox_watch;
+mod service_routing;
 mod ssh_tunnel;
 pub mod supervisor_session;
 mod tls;

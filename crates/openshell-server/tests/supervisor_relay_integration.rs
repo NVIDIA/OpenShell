@@ -27,7 +27,7 @@ use openshell_core::proto::{
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
-use openshell_server::supervisor_session::SupervisorSessionRegistry;
+use openshell_server::supervisor_session::{RelayTarget, SupervisorSessionRegistry};
 use openshell_server::{MultiplexedService, health_router};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -140,6 +140,12 @@ impl OpenShell for RelayGateway {
         &self,
         _: tonic::Request<openshell_core::proto::CreateSshSessionRequest>,
     ) -> Result<Response<openshell_core::proto::CreateSshSessionResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn expose_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::ExposeServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
     async fn revoke_ssh_session(
@@ -373,7 +379,7 @@ async fn relay_round_trips_bytes() {
     let mut session_rx = register_session(&registry, "sbx");
 
     let (channel_id, relay_rx) = registry
-        .open_relay("sbx", Duration::from_secs(2))
+        .open_relay("sbx", RelayTarget::Ssh, None, Duration::from_secs(2))
         .await
         .expect("open_relay");
 
@@ -403,7 +409,7 @@ async fn relay_closes_cleanly_when_gateway_drops() {
     let mut session_rx = register_session(&registry, "sbx");
 
     let (channel_id, relay_rx) = registry
-        .open_relay("sbx", Duration::from_secs(2))
+        .open_relay("sbx", RelayTarget::Ssh, None, Duration::from_secs(2))
         .await
         .expect("open_relay");
     let _ = session_rx.recv().await.expect("RelayOpen");
@@ -428,7 +434,7 @@ async fn relay_sees_eof_when_supervisor_closes() {
     let mut session_rx = register_session(&registry, "sbx");
 
     let (channel_id, relay_rx) = registry
-        .open_relay("sbx", Duration::from_secs(2))
+        .open_relay("sbx", RelayTarget::Ssh, None, Duration::from_secs(2))
         .await
         .expect("open_relay");
     let _ = session_rx.recv().await.expect("RelayOpen");
@@ -473,7 +479,12 @@ async fn open_relay_times_out_when_no_session() {
     let _channel = spawn_gateway(Arc::clone(&registry)).await;
 
     let err = registry
-        .open_relay("missing", Duration::from_millis(100))
+        .open_relay(
+            "missing",
+            RelayTarget::Ssh,
+            None,
+            Duration::from_millis(100),
+        )
         .await
         .expect_err("should time out");
     assert_eq!(err.code(), tonic::Code::Unavailable);
@@ -486,13 +497,13 @@ async fn concurrent_relays_multiplex_independently() {
     let mut session_rx = register_session(&registry, "sbx");
 
     let (id_a, rx_a) = registry
-        .open_relay("sbx", Duration::from_secs(2))
+        .open_relay("sbx", RelayTarget::Ssh, None, Duration::from_secs(2))
         .await
         .expect("open_relay a");
     let _ = session_rx.recv().await.expect("RelayOpen a");
 
     let (id_b, rx_b) = registry
-        .open_relay("sbx", Duration::from_secs(2))
+        .open_relay("sbx", RelayTarget::Ssh, None, Duration::from_secs(2))
         .await
         .expect("open_relay b");
     let _ = session_rx.recv().await.expect("RelayOpen b");
@@ -539,7 +550,8 @@ async fn open_relay_enforces_per_sandbox_cap_under_concurrent_burst() {
     for _ in 0..64 {
         let r = Arc::clone(&registry);
         handles.push(tokio::spawn(async move {
-            r.open_relay("sbx", Duration::from_secs(1)).await
+            r.open_relay("sbx", RelayTarget::Ssh, None, Duration::from_secs(1))
+                .await
         }));
     }
 
@@ -566,7 +578,7 @@ async fn open_relay_enforces_per_sandbox_cap_under_concurrent_burst() {
     // leak onto unrelated tenants.
     let _other_rx = register_session_with_capacity(&registry, "sbx-other", 8);
     registry
-        .open_relay("sbx-other", Duration::from_secs(1))
+        .open_relay("sbx-other", RelayTarget::Ssh, None, Duration::from_secs(1))
         .await
         .expect("other sandbox should not be affected by sbx cap");
 }

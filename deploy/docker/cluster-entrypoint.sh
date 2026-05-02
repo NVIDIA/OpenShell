@@ -468,9 +468,6 @@ if [ -f "$HELMCHART" ]; then
     fi
     sed -i "s|__IMAGE_PULL_POLICY__|${IMAGE_PULL_POLICY_VALUE}|g" "$HELMCHART"
 
-    SANDBOX_IMAGE_PULL_POLICY_VALUE="${SANDBOX_IMAGE_PULL_POLICY:-\"\"}"
-    sed -i "s|__SANDBOX_IMAGE_PULL_POLICY__|${SANDBOX_IMAGE_PULL_POLICY_VALUE}|g" "$HELMCHART"
-
     DB_URL_VALUE="${DB_URL:-\"sqlite:/var/openshell/openshell.db\"}"
     sed -i "s|__DB_URL__|${DB_URL_VALUE}|g" "$HELMCHART"
 fi
@@ -535,6 +532,11 @@ if [ -f "$HELMCHART" ]; then
     else
         sed -i "s|__DISABLE_TLS__|false|g" "$HELMCHART"
     fi
+
+    SERVICE_BASE_DOMAINS_VALUE="${SERVICE_BASE_DOMAINS:-openshell.openshell.localhost}"
+    SERVICE_BASE_DOMAINS_YAML="[\"$(printf "%s" "${SERVICE_BASE_DOMAINS_VALUE}" | sed 's|,|","|g')\"]"
+    echo "Enabling sandbox service routing for: ${SERVICE_BASE_DOMAINS_VALUE}"
+    sed -i "s|__SERVICE_BASE_DOMAINS__|${SERVICE_BASE_DOMAINS_YAML}|g" "$HELMCHART"
 fi
 
 # Inject host gateway IP into the HelmChart manifest so sandbox pods can

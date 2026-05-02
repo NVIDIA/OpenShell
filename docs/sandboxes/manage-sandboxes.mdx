@@ -123,6 +123,27 @@ OpenShell allocates a TTY automatically when both stdin and stdout are terminals
 
 ## Monitor and Debug
 
+## Expose HTTP Services
+
+Sandbox service routing is enabled for gateways by default. Recreate gateways created before this routing mode so their generated TLS certificate includes the service base domain SANs:
+
+```shell
+openshell gateway start --recreate
+```
+
+Expose a service that listens on loopback inside the sandbox:
+
+```shell
+openshell service expose my-sandbox web --target-port 8080
+```
+
+OpenShell prints a URL in the form `https://<sandbox>--<service>.<gateway>.openshell.localhost:<port>/`. HTTP traffic enters the same gateway listener as gRPC and routes by the `Host` header before gateway routes such as `/auth`, so application paths are preserved for the sandbox service.
+
+<Note>
+Import the gateway CA and client certificate before using mTLS-protected browser access; see [Browser Certificates](/reference/browser-certificates). Endpoint deletion, renewal, and remote/public domains are follow-up work.
+
+</Note>
+
 List all sandboxes:
 
 ```shell

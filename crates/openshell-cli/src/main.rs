@@ -200,6 +200,7 @@ const HELP_TEMPLATE: &str = "\
 
 \x1b[1mSANDBOX COMMANDS\x1b[0m
   sandbox:     Manage sandboxes
+  service:     Expose sandbox services
   forward:     Manage port forwarding to a sandbox
   logs:        View sandbox logs
   policy:      Manage sandbox policy
@@ -413,6 +414,13 @@ enum Commands {
     Forward {
         #[command(subcommand)]
         command: Option<ForwardCommands>,
+    },
+
+    /// Expose sandbox services.
+    #[command(help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Service {
+        #[command(subcommand)]
+        command: Option<ServiceCommands>,
     },
 
     /// View sandbox logs.
@@ -825,6 +833,11 @@ enum GatewayCommands {
         /// Ignored when --plaintext is set.
         #[arg(long)]
         disable_gateway_auth: bool,
+
+        /// Base domain accepted for sandbox service routes. May be repeated.
+        /// Defaults to `<gateway>.openshell.localhost`.
+        #[arg(long = "service-base-domain")]
+        service_base_domains: Vec<String>,
 
         /// Username for authenticating with the container image registry.
         ///
@@ -1774,6 +1787,24 @@ enum ForwardCommands {
     List,
 }
 
+#[derive(Subcommand, Debug)]
+enum ServiceCommands {
+    /// Expose an HTTP service running inside a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Expose {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: String,
+
+        /// Service name.
+        service: String,
+
+        /// Loopback TCP port inside the sandbox.
+        #[arg(long)]
+        target_port: u16,
+    },
+}
+
 #[tokio::main]
 #[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; OK at top level.
 async fn main() -> Result<()> {
@@ -1836,6 +1867,7 @@ async fn main() -> Result<()> {
                 recreate,
                 plaintext,
                 disable_gateway_auth,
+                service_base_domains,
                 registry_username,
                 registry_token,
                 gpu,
@@ -1862,6 +1894,7 @@ async fn main() -> Result<()> {
                     recreate,
                     plaintext,
                     disable_gateway_auth,
+                    service_base_domains,
                     registry_username.as_deref(),
                     registry_token.as_deref(),
                     gpu,
@@ -2118,6 +2151,22 @@ async fn main() -> Result<()> {
             }
         },
 
+        // -----------------------------------------------------------
+        // Service exposure
+        // -----------------------------------------------------------
+        Some(Commands::Service {
+            command:
+                Some(ServiceCommands::Expose {
+                    sandbox,
+                    service,
+                    target_port,
+                }),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name);
+            run::service_expose(&ctx.endpoint, &sandbox, &service, target_port, &tls).await?;
+        }
         // -----------------------------------------------------------
         // Top-level logs (was `sandbox logs`)
         // -----------------------------------------------------------
@@ -2866,6 +2915,13 @@ async fn main() -> Result<()> {
             Cli::command()
                 .find_subcommand_mut("forward")
                 .expect("forward subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Service { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("service")
+                .expect("service subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
         }

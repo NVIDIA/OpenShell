@@ -25,13 +25,14 @@ use openshell_bootstrap::{
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
-    ExecSandboxRequest, GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource, PolicyStatus, Provider,
-    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
-    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
+    ExecSandboxRequest, ExposeServiceRequest, GetClusterInferenceRequest, GetDraftHistoryRequest,
+    GetDraftPolicyRequest, GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource,
+    PolicyStatus, Provider, RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy,
+    SandboxSpec, SandboxTemplate, SetClusterInferenceRequest, SettingScope, SettingValue,
+    UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
+    setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -1579,6 +1580,7 @@ fn print_failure_diagnosis(diagnosis: &openshell_bootstrap::errors::GatewayFailu
 
 /// Provision or start a gateway (local or remote).
 #[allow(clippy::too_many_arguments)] // user-facing CLI command
+#[allow(clippy::fn_params_excessive_bools)]
 pub async fn gateway_admin_deploy(
     name: &str,
     remote: Option<&str>,
@@ -1588,6 +1590,7 @@ pub async fn gateway_admin_deploy(
     recreate: bool,
     disable_tls: bool,
     disable_gateway_auth: bool,
+    service_base_domains: Vec<String>,
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     gpu: Vec<String>,
@@ -1649,6 +1652,7 @@ pub async fn gateway_admin_deploy(
         .with_port(effective_port)
         .with_disable_tls(disable_tls)
         .with_disable_gateway_auth(disable_gateway_auth)
+        .with_service_base_domains(service_base_domains)
         .with_gpu(gpu)
         .with_recreate(recreate);
     if let Some(opts) = remote_opts {
@@ -3712,6 +3716,57 @@ fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
+pub async fn service_expose(
+    server: &str,
+    sandbox: &str,
+    service: &str,
+    target_port: u16,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .expose_service(ExposeServiceRequest {
+            sandbox: sandbox.to_string(),
+            service: service.to_string(),
+            target_port: u32::from(target_port),
+            domain: true,
+        })
+        .await
+        .map_err(|status| miette::miette!("expose service failed: {status}"))?
+        .into_inner();
+
+    println!(
+        "{} Exposed service {} on sandbox {} -> 127.0.0.1:{}",
+        "✓".green().bold(),
+        service.bold(),
+        sandbox.bold(),
+        target_port,
+    );
+    if !response.url.is_empty() {
+        let url = service_url_for_gateway(&response.url, server);
+        println!("  URL: {}", url.cyan());
+    }
+    Ok(())
+}
+
+fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String {
+    let (Ok(mut service_url), Ok(gateway_endpoint)) = (
+        url::Url::parse(service_url),
+        url::Url::parse(gateway_endpoint),
+    ) else {
+        return service_url.to_string();
+    };
+
+    if service_url.set_scheme(gateway_endpoint.scheme()).is_err() {
+        return service_url.to_string();
+    }
+    if service_url.set_port(gateway_endpoint.port()).is_err() {
+        return service_url.to_string();
+    }
+
+    service_url.to_string()
+}
+
 pub async fn provider_create(
     server: &str,
     name: &str,
@@ -5717,8 +5772,8 @@ mod tests {
         gateway_type_label, git_sync_files, http_health_check, image_requests_gpu,
         inferred_provider_type, parse_cli_setting_value, parse_credential_pairs,
         plaintext_gateway_is_remote, provisioning_timeout_message, ready_false_condition_message,
-        resolve_gateway_control_target_from, sandbox_should_persist, shell_escape,
-        source_requests_gpu, validate_gateway_name, validate_ssh_host,
+        resolve_gateway_control_target_from, sandbox_should_persist, service_url_for_gateway,
+        shell_escape, source_requests_gpu, validate_gateway_name, validate_ssh_host,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -5962,6 +6017,28 @@ mod tests {
     fn source_requests_gpu_detects_known_community_gpu_name() {
         assert!(source_requests_gpu("nvidia-gpu"));
         assert!(!source_requests_gpu("base"));
+    }
+
+    #[test]
+    fn service_url_for_gateway_uses_external_gateway_port() {
+        assert_eq!(
+            service_url_for_gateway(
+                "https://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://127.0.0.1:31886"
+            ),
+            "https://quiet-flamingo--openclaw.navigator.openshell.localhost:31886/"
+        );
+    }
+
+    #[test]
+    fn service_url_for_gateway_omits_default_external_port() {
+        assert_eq!(
+            service_url_for_gateway(
+                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://gateway.example.com"
+            ),
+            "https://quiet-flamingo--openclaw.navigator.openshell.localhost/"
+        );
     }
 
     #[test]

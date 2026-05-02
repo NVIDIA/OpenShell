@@ -227,6 +227,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_DISABLE_GATEWAY_AUTH")]
     disable_gateway_auth: bool,
 
+    /// Base domains accepted for sandbox service routing.
+    #[arg(
+        long = "service-base-domain",
+        env = "OPENSHELL_SERVICE_BASE_DOMAINS",
+        value_delimiter = ','
+    )]
+    service_base_domains: Vec<String>,
+
     /// OIDC issuer URL for JWT-based authentication.
     /// When set, the server validates `authorization: Bearer` tokens on gRPC
     /// requests against the issuer's JWKS endpoint.
@@ -361,7 +369,8 @@ async fn run_from_args(args: Args) -> Result<()> {
         .with_ssh_gateway_port(args.ssh_gateway_port)
         .with_ssh_connect_path(args.ssh_connect_path)
         .with_sandbox_ssh_port(args.sandbox_ssh_port)
-        .with_ssh_handshake_skew_secs(args.ssh_handshake_skew_secs);
+        .with_ssh_handshake_skew_secs(args.ssh_handshake_skew_secs)
+        .with_service_base_domains(args.service_base_domains);
 
     if let Some(image) = args.sandbox_image {
         config = config.with_sandbox_image(image);
