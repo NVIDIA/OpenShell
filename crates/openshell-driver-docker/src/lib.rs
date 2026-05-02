@@ -229,7 +229,7 @@ impl DockerComputeDriver {
                 "docker compute driver requires a fixed non-zero gateway bind port",
             ));
         }
-        let network_name = docker_network_name(docker_config)?;
+        let network_name = docker_network_name(docker_config);
         let bridge_gateway_ip = ensure_bridge_network(&docker, &network_name).await?;
         let gateway_route = docker_gateway_route(&info, bridge_gateway_ip, gateway_port);
         let grpc_endpoint = docker_container_openshell_endpoint(
@@ -1056,12 +1056,12 @@ fn docker_container_openshell_endpoint(endpoint: &str, host: &str, port: u16) ->
     endpoint.to_string()
 }
 
-fn docker_network_name(config: &DockerComputeConfig) -> CoreResult<String> {
+fn docker_network_name(config: &DockerComputeConfig) -> String {
     let name = config.network_name.trim();
     if name.is_empty() {
-        return Ok(DEFAULT_DOCKER_NETWORK_NAME.to_string());
+        return DEFAULT_DOCKER_NETWORK_NAME.to_string();
     }
-    Ok(name.to_string())
+    name.to_string()
 }
 
 fn docker_gateway_route(
