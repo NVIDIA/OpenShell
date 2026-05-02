@@ -370,13 +370,22 @@ impl CachedOpenShellClient {
 }
 
 /// Fetch the resolved inference route bundle from the server.
-pub async fn fetch_inference_bundle(endpoint: &str) -> Result<GetInferenceBundleResponse> {
-    debug!(endpoint = %endpoint, "Fetching inference route bundle");
+pub async fn fetch_inference_bundle(
+    endpoint: &str,
+    sandbox_id: &str,
+) -> Result<GetInferenceBundleResponse> {
+    debug!(
+        endpoint = %endpoint,
+        sandbox_id = %sandbox_id,
+        "Fetching inference route bundle"
+    );
 
     let mut client = connect_inference(endpoint).await?;
 
     let response = client
-        .get_inference_bundle(GetInferenceBundleRequest {})
+        .get_inference_bundle(GetInferenceBundleRequest {
+            sandbox_id: sandbox_id.to_string(),
+        })
         .await
         .into_diagnostic()?;
 

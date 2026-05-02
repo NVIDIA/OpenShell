@@ -950,6 +950,20 @@ impl ComputeRuntime {
     async fn cleanup_sandbox_owned_records(&self, sandbox: &Sandbox) {
         self.cleanup_sandbox_ssh_sessions(sandbox.object_id()).await;
 
+        if let Err(e) = crate::inference::delete_sandbox_inference_config(
+            self.store.as_ref(),
+            sandbox.object_id(),
+        )
+        .await
+        {
+            warn!(
+                sandbox_id = %sandbox.object_id(),
+                sandbox_name = %sandbox.object_name(),
+                error = %e,
+                "Failed to delete sandbox inference config during cleanup"
+            );
+        }
+
         if let Err(e) = self
             .store
             .delete_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_name())

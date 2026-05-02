@@ -1094,6 +1094,56 @@ enum InferenceCommands {
         #[arg(long)]
         system: bool,
     },
+
+    /// Manage gateway-owned inference overrides for individual sandboxes.
+    #[command(help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Sandbox {
+        #[command(subcommand)]
+        command: InferenceSandboxCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum InferenceSandboxCommands {
+    /// Set one sandbox's inference.local provider and model.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Set {
+        /// Sandbox whose inference.local route should use this override.
+        #[arg(long, value_name = "NAME", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: String,
+
+        /// Provider name.
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
+        provider: String,
+
+        /// Model identifier to force for generation calls.
+        #[arg(long)]
+        model: String,
+
+        /// Skip endpoint verification before saving the override.
+        #[arg(long)]
+        no_verify: bool,
+
+        /// Request timeout in seconds for inference calls (0 = default 60s).
+        #[arg(long, default_value_t = 0)]
+        timeout: u64,
+    },
+
+    /// Get one sandbox's inference.local override.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Sandbox whose inference.local override should be displayed.
+        #[arg(long, value_name = "NAME", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: String,
+    },
+
+    /// Clear one sandbox's inference.local override.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Clear {
+        /// Sandbox whose inference.local override should be removed.
+        #[arg(long, value_name = "NAME", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: String,
+    },
 }
 
 // -----------------------------------------------------------------------
@@ -2429,6 +2479,26 @@ async fn main() -> Result<()> {
                     let route_name = if system { Some("sandbox-system") } else { None };
                     run::gateway_inference_get(endpoint, route_name, &tls).await?;
                 }
+                InferenceCommands::Sandbox { command } => match command {
+                    InferenceSandboxCommands::Set {
+                        sandbox,
+                        provider,
+                        model,
+                        no_verify,
+                        timeout,
+                    } => {
+                        run::gateway_inference_sandbox_set(
+                            endpoint, &sandbox, &provider, &model, no_verify, timeout, &tls,
+                        )
+                        .await?;
+                    }
+                    InferenceSandboxCommands::Clear { sandbox } => {
+                        run::gateway_inference_sandbox_clear(endpoint, &sandbox, &tls).await?;
+                    }
+                    InferenceSandboxCommands::Get { sandbox } => {
+                        run::gateway_inference_sandbox_get(endpoint, &sandbox, &tls).await?;
+                    }
+                },
             }
         }
 
@@ -3262,6 +3332,37 @@ mod tests {
                     ..
                 })
             })
+        ));
+    }
+
+    #[test]
+    fn inference_sandbox_set_parses_override_flags() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "inference",
+            "sandbox",
+            "set",
+            "--sandbox",
+            "sandbox-1",
+            "--provider",
+            "openai-dev",
+            "--model",
+            "gpt-4.1",
+            "--no-verify",
+        ])
+        .expect("inference sandbox set should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Inference {
+                command: Some(InferenceCommands::Sandbox {
+                    command: InferenceSandboxCommands::Set {
+                        ref sandbox,
+                        no_verify: true,
+                        ..
+                    }
+                })
+            }) if sandbox == "sandbox-1"
         ));
     }
 

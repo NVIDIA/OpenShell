@@ -914,7 +914,7 @@ The sandbox is designed to operate both as part of a cluster and as a standalone
 
 1. **Route file (standalone mode)**: `--inference-routes` / `OPENSHELL_INFERENCE_ROUTES` points to a YAML file parsed by `RouterConfig::load_from_file()`. Routes are resolved via `config.resolve_routes()`. File loading or parsing errors are fatal (fail-fast), but an empty route list gracefully disables inference routing (returns `None`). The route file always takes precedence -- if both a route file and cluster credentials are present, the route file wins and the cluster bundle is not fetched.
 
-2. **Cluster bundle (cluster mode)**: When `openshell_endpoint` is available (and no route file is configured), routes are fetched from the gateway via `grpc_client::fetch_inference_bundle()`, which calls the `GetInferenceBundle` gRPC RPC on the `Inference` service. The RPC takes no arguments (the bundle is cluster-scoped, not per-sandbox). The gateway returns a `GetInferenceBundleResponse` containing resolved `ResolvedRoute` entries for the managed cluster route. These proto messages are converted to router `ResolvedRoute` structs by `bundle_to_resolved_routes()`, which maps provider types to auth headers and default headers via `openshell_core::inference::auth_for_provider_type()`.
+2. **Cluster bundle (cluster mode)**: When `openshell_endpoint` is available (and no route file is configured), routes are fetched from the gateway via `grpc_client::fetch_inference_bundle()`, which calls the `GetInferenceBundle` gRPC RPC on the `Inference` service. The request includes the sandbox ID. The gateway returns a `GetInferenceBundleResponse` containing resolved `ResolvedRoute` entries after applying cluster defaults and any gateway-owned override for that sandbox. These proto messages are converted to router `ResolvedRoute` structs by `bundle_to_resolved_routes()`, which maps provider types to auth headers and default headers via `openshell_core::inference::auth_for_provider_type()`.
 
 3. **No source**: If neither route file nor cluster credentials are configured, `build_inference_context()` returns `None` and inference routing is disabled.
 
@@ -930,7 +930,7 @@ Route sources handle empty route lists differently: file mode disables inference
 
 #### Background route cache refresh
 
-In cluster mode (when no route file is configured), `spawn_route_refresh()` starts a background tokio task that refreshes the route cache every 30 seconds (`ROUTE_REFRESH_INTERVAL_SECS`). The task calls `fetch_inference_bundle()` on each tick and replaces the `RwLock<Vec<ResolvedRoute>>` contents. On fetch failure, the task logs a warning and keeps the stale routes. The `MissedTickBehavior::Skip` policy prevents refresh storms after temporary gateway outages.
+In cluster mode (when no route file is configured), `spawn_route_refresh()` starts a background tokio task that refreshes the route cache every 5 seconds by default (`ROUTE_REFRESH_INTERVAL_SECS`). The task calls `fetch_inference_bundle()` with the sandbox ID and replaces the `RwLock<Vec<ResolvedRoute>>` contents only when the returned revision changes. On fetch failure, the task logs a warning and keeps the stale routes.
 
 ```mermaid
 flowchart TD

@@ -114,17 +114,20 @@ grpcurl -plaintext -import-path proto -proto openshell.proto \
 # Correct secret — should succeed (returns an empty bundle when no routes are configured)
 grpcurl -plaintext -import-path proto -proto inference.proto \
   -H "x-sandbox-secret: test" \
+  -d '{"sandbox_id":"test-sandbox"}' \
   127.0.0.1:8080 openshell.inference.v1.Inference/GetInferenceBundle
 # Expected: success with { "routes": [], ... }
 
 # Wrong secret — should fail at auth
 grpcurl -plaintext -import-path proto -proto inference.proto \
   -H "x-sandbox-secret: wrong" \
+  -d '{"sandbox_id":"test-sandbox"}' \
   127.0.0.1:8080 openshell.inference.v1.Inference/GetInferenceBundle
 # Expected: Code: Unauthenticated, Message: invalid sandbox secret
 
 # No secret — should fail at auth
 grpcurl -plaintext -import-path proto -proto inference.proto \
+  -d '{"sandbox_id":"test-sandbox"}' \
   127.0.0.1:8080 openshell.inference.v1.Inference/GetInferenceBundle
 # Expected: Code: Unauthenticated, Message: sandbox secret required
 ```

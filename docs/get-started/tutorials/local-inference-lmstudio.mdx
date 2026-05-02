@@ -141,7 +141,7 @@ If the command succeeds, OpenShell has verified that the upstream is reachable a
 
 </div>
 
-The active `inference.local` route is gateway-scoped, so only one provider and model pair is active at a time. Re-run `openshell inference set` whenever you want to switch between OpenAI-compatible and Anthropic-compatible clients.
+The active `inference.local` route is the gateway default. Re-run `openshell inference set` whenever you want to switch the default between OpenAI-compatible and Anthropic-compatible clients. Use `openshell inference sandbox set` when only one sandbox should use a different provider and model.
 
 Confirm the saved config:
 

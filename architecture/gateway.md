@@ -88,7 +88,7 @@ Proto definitions consumed by the gateway:
 |------------|---------|---------|
 | `proto/openshell.proto` | `openshell.v1` | `OpenShell` service, public sandbox resource model, provider/SSH/watch/policy messages, supervisor session messages (`ConnectSupervisor`, `RelayStream`, `RelayFrame`) |
 | `proto/compute_driver.proto` | `openshell.compute.v1` | Internal `ComputeDriver` service, driver-native sandbox observations, compute watch stream envelopes |
-| `proto/inference.proto` | `openshell.inference.v1` | `Inference` service: `SetClusterInference`, `GetClusterInference`, `GetInferenceBundle` |
+| `proto/inference.proto` | `openshell.inference.v1` | `Inference` service: `SetClusterInference`, `GetClusterInference`, sandbox override RPCs, `GetInferenceBundle` |
 | `proto/datamodel.proto` | `openshell.datamodel.v1` | `Provider` |
 | `proto/sandbox.proto` | `openshell.sandbox.v1` | Sandbox supervisor policy, settings, and config messages |
 
@@ -395,27 +395,30 @@ These RPCs support the sandbox-initiated policy recommendation pipeline. The san
 
 Defined in `proto/inference.proto`, implemented in `crates/openshell-server/src/inference.rs` as `InferenceService`.
 
-The gateway acts as the control plane for inference configuration. It stores a single managed cluster inference route (named `inference.local`) and delivers resolved route bundles to sandbox pods. The gateway does not execute inference requests -- sandboxes connect directly to inference backends using the credentials and endpoints provided in the bundle.
+The gateway acts as the control plane for inference configuration. It stores a managed cluster inference route (named `inference.local`), optional per-sandbox inference overrides, and delivers resolved route bundles to sandbox pods. The gateway does not execute inference requests -- sandboxes connect directly to inference backends using the credentials and endpoints provided in the bundle.
 
 #### Cluster Inference Configuration
 
-The gateway manages a single cluster-wide inference route that maps to a provider record. When set, the route stores only a `provider_name` and `model_id` reference. At bundle resolution time, the gateway looks up the referenced provider and derives the endpoint URL, API key, protocols, and provider type from it. This late-binding design means provider credential rotations are automatically reflected in the next bundle fetch without updating the route itself.
+The gateway manages a cluster-wide default inference route that maps to a provider record. When set, the route stores only a `provider_name` and `model_id` reference. At bundle resolution time, the gateway looks up the referenced provider and derives the endpoint URL, API key, protocols, and provider type from it. This late-binding design means provider credential rotations are automatically reflected in the next bundle fetch without updating the route itself.
 
 | RPC | Description |
 |-----|-------------|
 | `SetClusterInference` | Configures the cluster inference route. Validates `provider_name` and `model_id` are non-empty, verifies the named provider exists and has a supported type for inference (openai, anthropic, nvidia), validates the provider has a usable API key, then upserts the `inference.local` route record. Increments a monotonic `version` on each update. Returns the configured `provider_name`, `model_id`, and `version`. |
 | `GetClusterInference` | Returns the current cluster inference configuration (`provider_name`, `model_id`, `version`). Returns `NotFound` if no cluster inference is configured, or `FailedPrecondition` if the stored route has empty provider/model metadata. |
+| `SetSandboxInference` | Configures one sandbox's `inference.local` override after validating that the sandbox ID exists. The gateway stores it under `sandbox/<sandbox_id>/inference.local` and exposes it to the sandbox as the normal `inference.local` route. |
+| `GetSandboxInference` | Returns one sandbox's configured override. Returns `NotFound` when the sandbox falls back to the cluster default. |
+| `ClearSandboxInference` | Removes one sandbox's override so the sandbox falls back to the cluster default on the next bundle refresh. |
 | `GetInferenceBundle` | Returns the resolved inference route bundle for sandbox consumption. See [Route Bundle Delivery](#route-bundle-delivery) below. |
 
 #### Route Bundle Delivery
 
-The `GetInferenceBundle` RPC resolves the managed cluster route into a `GetInferenceBundleResponse` containing fully materialized route data that sandboxes can use directly.
+The `GetInferenceBundle` RPC resolves the sandbox override for the requested sandbox ID, falls back to the cluster default when no override exists, and returns a `GetInferenceBundleResponse` containing fully materialized route data that sandboxes can use directly.
 
-The trait method delegates to `resolve_inference_bundle(store)` (`crates/openshell-server/src/inference.rs`), which takes `&Store` instead of `&self`. This extraction decouples bundle resolution from `ServerState`, enabling direct unit testing against an in-memory SQLite store without constructing a full server.
+The trait method delegates to `resolve_inference_bundle(store, sandbox_id)` (`crates/openshell-server/src/inference.rs`), which takes `&Store` instead of `&self`. This extraction decouples bundle resolution from `ServerState`, enabling direct unit testing against an in-memory SQLite store without constructing a full server.
 
 The `GetInferenceBundleResponse` includes:
 
-- **`routes`** -- a list of `ResolvedRoute` messages containing base URL, model ID, API key, protocols, and provider type. Currently contains zero or one routes (the managed cluster route).
+- **`routes`** -- a list of `ResolvedRoute` messages containing base URL, model ID, API key, protocols, and provider type. A sandbox override replaces the cluster default for that sandbox's `inference.local` route.
 - **`revision`** -- a hex-encoded hash computed from route contents. Sandboxes compare this value to detect when their route set has changed.
 - **`generated_at_ms`** -- epoch milliseconds when the bundle was assembled.
 

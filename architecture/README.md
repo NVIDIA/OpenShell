@@ -171,8 +171,8 @@ The inference routing system transparently intercepts AI inference API calls fro
 
 **How it works end-to-end:**
 
-1. An operator configures cluster-level inference via `openshell cluster inference set --provider <name> --model <id>`. This stores a reference to the named provider and model on the gateway.
-2. When a sandbox starts, the supervisor fetches an inference bundle from the gateway via the `GetInferenceBundle` RPC. The gateway resolves the stored provider reference into a complete route: endpoint URL, API key, supported protocols, provider type, and auth metadata. The sandbox refreshes this bundle eagerly in the background every 5 seconds by default (override with `OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS`).
+1. An operator configures gateway-level inference via `openshell inference set --provider <name> --model <id>`. This stores a default provider/model route on the gateway. Operators can also configure one sandbox to use a different provider/model through a gateway-owned sandbox inference override.
+2. When a sandbox starts, the supervisor fetches an inference bundle from the gateway via the `GetInferenceBundle` RPC, passing its sandbox ID. The gateway resolves that sandbox's override if one exists, otherwise falls back to the gateway default, then resolves provider references into complete routes: endpoint URL, API key, supported protocols, provider type, and auth metadata. The sandbox refreshes this bundle eagerly in the background every 5 seconds by default (override with `OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS`).
 3. The agent sends requests to `https://inference.local` using standard OpenAI or Anthropic SDK calls.
 4. The sandbox proxy intercepts the HTTPS CONNECT to `inference.local` (bypassing OPA policy evaluation), TLS-terminates the connection using the sandbox's ephemeral CA, and parses the HTTP request.
 5. Known inference API patterns are detected (e.g., `POST /v1/chat/completions` for OpenAI, `POST /v1/messages` for Anthropic, `GET /v1/models` for model discovery). Matching requests are forwarded to the first compatible route by the `openshell-router`, which rewrites the auth header, injects provider-specific default headers (e.g., `anthropic-version` for Anthropic), and overrides the model field in the request body.
@@ -184,9 +184,9 @@ The inference routing system transparently intercepts AI inference API calls fro
 - The sandbox never sees the real API key for the backend -- credential isolation is maintained through the gateway's bundle resolution.
 - Routing is explicit via `inference.local`; OPA network policy is not involved in inference routing.
 - Provider-specific behavior (auth header style, default headers, supported protocols) is centralized in `InferenceProviderProfile` definitions in `openshell-core`. Supported inference provider types are openai, anthropic, and nvidia.
-- Cluster inference is managed via CLI (`openshell cluster inference set/get`).
+- Gateway inference is managed via CLI (`openshell inference set/get`), with optional per-sandbox overrides under `openshell inference sandbox`.
 
-**Inference routes** are stored on the gateway as protobuf objects (`InferenceRoute` in `proto/inference.proto`). Cluster inference uses a managed singleton route entry keyed by `inference.local` and configured from provider + model settings. Endpoint, credentials, and protocols are resolved from the referenced provider record at bundle fetch time, so rotating a provider's API key takes effect on the next bundle refresh without reconfiguring the route.
+**Inference routes** are stored on the gateway as protobuf objects (`InferenceRoute` in `proto/inference.proto`). Cluster inference uses a managed default route entry keyed by `inference.local`. Sandbox inference overrides use gateway-owned route records keyed by sandbox ID. Endpoint, credentials, and protocols are resolved from the referenced provider record at bundle fetch time, so rotating a provider's API key takes effect on the next bundle refresh without reconfiguring the route.
 
 **Components involved:**
 
@@ -196,7 +196,7 @@ The inference routing system transparently intercepts AI inference API calls fro
 | Inference pattern detection | `crates/openshell-sandbox/src/l7/inference.rs` | Matches HTTP method + path against known inference API patterns |
 | Local inference router | `crates/openshell-router/src/lib.rs` | Selects a compatible route by protocol and proxies to the backend |
 | Provider profiles | `crates/openshell-core/src/inference.rs` | Centralized auth, headers, protocols, and endpoint defaults per provider type |
-| Gateway inference service | `crates/openshell-server/src/inference.rs` | Stores cluster inference config, resolves bundles with credentials from provider records |
+| Gateway inference service | `crates/openshell-server/src/inference.rs` | Stores cluster inference defaults and sandbox overrides, resolves bundles with credentials from provider records |
 | Proto definitions | `proto/inference.proto` | `ClusterInferenceConfig`, `ResolvedRoute`, bundle RPCs |
 
 ### Container and Build System
@@ -238,7 +238,7 @@ The CLI is the primary way users interact with the platform. It provides command
 - **Sandbox management** (`openshell sandbox`): Create sandboxes (with optional file upload and provider auto-discovery), connect to sandboxes via SSH, and delete sandboxes.
 - **Top-level commands**: `openshell status` (cluster health), `openshell logs` (sandbox logs), `openshell forward` (port forwarding), `openshell policy` (sandbox policy management), `openshell settings` (effective sandbox settings and global/sandbox key updates).
 - **Provider management** (`openshell provider`): Create, update, list, and delete external service credentials.
-- **Inference management** (`openshell cluster inference`): Configure cluster-level inference by specifying a provider and model. The gateway resolves endpoint and credential details from the named provider record.
+- **Inference management** (`openshell inference`): Configure gateway-level inference by specifying a provider and model. Optionally configure individual sandboxes to use a different provider/model. The gateway resolves endpoint and credential details from the named provider record.
 
 The CLI resolves which gateway to operate on through a priority chain: explicit `--gateway` flag, then the `OPENSHELL_GATEWAY` environment variable, then the active gateway set by `openshell gateway select`. Gateway names are exposed to shell completion from local metadata, and `openshell gateway select` opens an interactive chooser on a TTY while falling back to a printed list in non-interactive use. The CLI supports TLS client certificates for mutual authentication with the gateway.
 

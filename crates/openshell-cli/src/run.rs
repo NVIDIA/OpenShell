@@ -24,14 +24,16 @@ use openshell_bootstrap::{
 };
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
-    CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
-    ExecSandboxRequest, GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
+    ClearSandboxInferenceRequest, CreateProviderRequest, CreateSandboxRequest,
+    DeleteProviderRequest, DeleteSandboxRequest, ExecSandboxRequest, GetClusterInferenceRequest,
+    GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest, GetProviderRequest,
+    GetSandboxConfigRequest, GetSandboxInferenceRequest, GetSandboxLogsRequest,
     GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
     ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource, PolicyStatus, Provider,
     RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
-    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
+    SetClusterInferenceRequest, SetSandboxInferenceRequest, SettingScope, SettingValue,
+    UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
+    setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -4173,6 +4175,124 @@ pub async fn gateway_inference_get(
         print_inference_route(&mut client, "System inference", "sandbox-system").await;
     }
     Ok(())
+}
+
+pub async fn gateway_inference_sandbox_set(
+    server: &str,
+    sandbox: &str,
+    provider_name: &str,
+    model_id: &str,
+    no_verify: bool,
+    timeout_secs: u64,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let sandbox_id = resolve_sandbox_id_for_inference(server, sandbox, tls).await?;
+    let mut client = grpc_inference_client(server, tls).await?;
+    let response = client
+        .set_sandbox_inference(SetSandboxInferenceRequest {
+            sandbox_id,
+            provider_name: provider_name.to_string(),
+            model_id: model_id.to_string(),
+            no_verify,
+            timeout_secs,
+        })
+        .await
+        .map_err(format_inference_status)?
+        .into_inner();
+
+    println!("{}", "Sandbox inference override configured:".cyan().bold());
+    println!();
+    println!("  {} {}", "Sandbox:".dimmed(), sandbox);
+    println!("  {} inference.local", "Route:".dimmed());
+    println!("  {} {}", "Provider:".dimmed(), response.provider_name);
+    println!("  {} {}", "Model:".dimmed(), response.model_id);
+    println!("  {} {}", "Version:".dimmed(), response.version);
+    print_timeout(response.timeout_secs);
+    if response.validation_performed {
+        println!("  {}", "Validated Endpoints:".dimmed());
+        for endpoint in response.validated_endpoints {
+            println!("    - {} ({})", endpoint.url, endpoint.protocol);
+        }
+    }
+    Ok(())
+}
+
+pub async fn gateway_inference_sandbox_get(
+    server: &str,
+    sandbox: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let sandbox_id = resolve_sandbox_id_for_inference(server, sandbox, tls).await?;
+    let mut client = grpc_inference_client(server, tls).await?;
+    let response = client
+        .get_sandbox_inference(GetSandboxInferenceRequest { sandbox_id })
+        .await
+        .map_err(format_inference_status)?
+        .into_inner();
+
+    println!("{}", "Sandbox inference override:".cyan().bold());
+    println!();
+    println!("  {} {}", "Sandbox:".dimmed(), sandbox);
+    println!("  {} inference.local", "Route:".dimmed());
+    println!("  {} {}", "Provider:".dimmed(), response.provider_name);
+    println!("  {} {}", "Model:".dimmed(), response.model_id);
+    println!("  {} {}", "Version:".dimmed(), response.version);
+    print_timeout(response.timeout_secs);
+    Ok(())
+}
+
+pub async fn gateway_inference_sandbox_clear(
+    server: &str,
+    sandbox: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let sandbox_id = resolve_sandbox_id_for_inference(server, sandbox, tls).await?;
+    let mut client = grpc_inference_client(server, tls).await?;
+    let response = client
+        .clear_sandbox_inference(ClearSandboxInferenceRequest {
+            sandbox_id: sandbox_id.clone(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if response.cleared {
+        println!(
+            "{} Cleared sandbox inference override for {}",
+            "✓".green().bold(),
+            sandbox
+        );
+    } else {
+        println!(
+            "{} Sandbox inference override for {} was not configured",
+            "!".yellow(),
+            sandbox
+        );
+    }
+    Ok(())
+}
+
+async fn resolve_sandbox_id_for_inference(
+    server: &str,
+    sandbox: &str,
+    tls: &TlsOptions,
+) -> Result<String> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .get_sandbox(GetSandboxRequest {
+            name: sandbox.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+
+    if sandbox.object_id().is_empty() {
+        return Err(miette::miette!("sandbox missing metadata"));
+    }
+
+    Ok(sandbox.object_id().to_string())
 }
 
 async fn print_inference_route(

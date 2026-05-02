@@ -735,6 +735,9 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
     let _env = test_env(&fake_ssh_dir, &xdg_dir);
     let tls = test_tls(&server);
     install_fake_ssh(&fake_ssh_dir);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let forward_port = listener.local_addr().unwrap().port();
+    drop(listener);
 
     run::sandbox_create(
         &server.endpoint,
@@ -750,7 +753,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         None,
         &[],
         None,
-        Some(openshell_core::forward::ForwardSpec::new(8080)),
+        Some(openshell_core::forward::ForwardSpec::new(forward_port)),
         &["echo".to_string(), "OK".to_string()],
         Some(false),
         Some(false),

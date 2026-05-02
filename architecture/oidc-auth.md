@@ -243,8 +243,8 @@ Scopes provide opt-in, per-method access control on top of roles. When `--oidc-s
 | `provider:write` | CreateProvider, UpdateProvider, DeleteProvider |
 | `config:read` | GetGatewayConfig, GetSandboxConfig, GetDraftPolicy, GetDraftHistory |
 | `config:write` | UpdateConfig (Bearer), ApproveDraftChunk, ApproveAllDraftChunks, RejectDraftChunk, EditDraftChunk, UndoDraftChunk, ClearDraftChunks |
-| `inference:read` | GetClusterInference |
-| `inference:write` | SetClusterInference |
+| `inference:read` | GetClusterInference, GetSandboxInference |
+| `inference:write` | SetClusterInference, SetSandboxInference, ClearSandboxInference |
 | `openshell:all` | All of the above (wildcard) |
 
 Methods not listed in the scope map require `openshell:all`. Scopes cannot escalate privilege — `openshell:all` on a user-role token still cannot call admin methods.

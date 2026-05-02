@@ -86,7 +86,7 @@ This reads `ANTHROPIC_API_KEY` from your environment.
 
 ## Set Inference Routing
 
-Point `inference.local` at that provider and choose the model to use:
+Point `inference.local` at that provider and choose the default model for the gateway:
 
 ```shell
 openshell inference set \
@@ -104,6 +104,29 @@ openshell inference set \
 ```
 
 The value is in seconds. When `--timeout` is omitted (or set to `0`), the default of 60 seconds applies. Increase `--timeout` when you expect extended thinking phases so the full response completes before the request deadline.
+
+## Override One Sandbox's Backend
+
+The gateway default applies to every sandbox that does not have its own override. To give one sandbox a different backend while keeping the same `https://inference.local` endpoint inside the sandbox, configure that sandbox by name:
+
+```shell
+openshell inference sandbox set \
+    --sandbox <sandbox> \
+    --provider my-cloud-provider \
+    --model provider/model-name
+```
+
+Show the sandbox override:
+
+```shell
+openshell inference sandbox get --sandbox <sandbox>
+```
+
+Remove a sandbox override and return that sandbox to the gateway default:
+
+```shell
+openshell inference sandbox clear --sandbox <sandbox>
+```
 
 ## Verify the Active Config
 
@@ -181,9 +204,9 @@ curl https://inference.local/v1/responses \
 
 A successful response confirms the privacy router can reach the configured backend and the model is serving requests.
 
-- Gateway-scoped: Every sandbox using the active gateway sees the same `inference.local` backend.
+- Gateway default: Every sandbox using the active gateway sees the default `inference.local` backend unless it has a sandbox override.
 - HTTPS only: `inference.local` is intercepted only for HTTPS traffic.
-- Hot reload: Provider, model, and timeout changes are picked up by running sandboxes within about 5 seconds by default. No sandbox recreation is required.
+- Hot reload: Provider, model, timeout, and sandbox override changes are picked up by running sandboxes within about 5 seconds by default. No sandbox recreation is required.
 
 ## Next Steps
 

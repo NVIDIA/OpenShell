@@ -31,8 +31,10 @@ const ADMIN_METHODS: &[&str] = &[
     "/openshell.v1.OpenShell/EditDraftChunk",
     "/openshell.v1.OpenShell/UndoDraftChunk",
     "/openshell.v1.OpenShell/ClearDraftChunks",
-    // Cluster inference write
+    // Inference write
     "/openshell.inference.v1.Inference/SetClusterInference",
+    "/openshell.inference.v1.Inference/SetSandboxInference",
+    "/openshell.inference.v1.Inference/ClearSandboxInference",
 ];
 
 /// Exhaustive mapping of Bearer-authenticated gRPC methods to required scopes.
@@ -85,9 +87,21 @@ const SCOPED_METHODS: &[(&str, &str)] = &[
         "/openshell.inference.v1.Inference/GetClusterInference",
         "inference:read",
     ),
+    (
+        "/openshell.inference.v1.Inference/GetSandboxInference",
+        "inference:read",
+    ),
     // inference:write
     (
         "/openshell.inference.v1.Inference/SetClusterInference",
+        "inference:write",
+    ),
+    (
+        "/openshell.inference.v1.Inference/SetSandboxInference",
+        "inference:write",
+    ),
+    (
+        "/openshell.inference.v1.Inference/ClearSandboxInference",
         "inference:write",
     ),
 ];

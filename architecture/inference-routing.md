@@ -2,7 +2,7 @@
 
 Inference routing gives sandboxed agents access to LLM APIs through a single, explicit endpoint: `inference.local`. There is no implicit catch-all interception for arbitrary hosts. Requests are routed only when the process targets `inference.local` via HTTPS and the request matches a supported inference API pattern.
 
-All inference execution happens locally inside the sandbox via the `openshell-router` crate. The gateway is control-plane only: it stores configuration and delivers resolved route bundles to sandboxes over gRPC.
+All inference execution happens locally inside the sandbox via the `openshell-router` crate. The gateway is control-plane only: it stores cluster defaults, optional per-sandbox inference overrides, and delivers resolved route bundles to sandboxes over gRPC. Sandboxes never override or mutate routes; they only fetch the bundle the gateway resolves for their sandbox ID.
 
 ## Architecture Overview
 
@@ -15,7 +15,7 @@ sequenceDiagram
     participant Backend as Inference Backend
 
     Note over Gateway,Router: Control plane (startup + periodic refresh)
-    Gateway->>Router: GetInferenceBundle (routes, credentials)
+    Gateway->>Router: GetInferenceBundle(sandbox_id)
 
     Note over Agent,Backend: Data plane (per-request)
     Agent->>Proxy: CONNECT inference.local:443
@@ -71,19 +71,29 @@ The gateway implements the `Inference` gRPC service defined in `proto/inference.
 3. Validates the provider by resolving its route (checking that the provider type is supported and has a usable API key).
 4. By default, performs a lightweight provider-shaped probe against the resolved upstream endpoint (for example, a tiny chat/messages request with `max_tokens: 1`) to confirm the endpoint is reachable and accepts the expected auth/request shape. `--no-verify` disables this probe when the endpoint is not up yet.
 5. Builds a managed route spec that stores only `provider_name` and `model_id`. The spec intentionally leaves `base_url`, `api_key`, and `protocols` empty -- these are resolved dynamically at bundle time from the provider record.
-6. Upserts the route with name `inference.local`. Version starts at 1 and increments monotonically on each update.
+6. Upserts the cluster-scoped route with name `inference.local`. Version starts at 1 and increments monotonically on each update.
 
 `GetClusterInference` returns `provider_name`, `model_id`, and `version` for the managed route. Returns `NOT_FOUND` if cluster inference is not configured.
 
+### Sandbox inference overrides
+
+The gateway can store a provider/model override for a single sandbox's `inference.local` route without exposing a separate gateway cell and without changing sandbox-local policy. `SetSandboxInference` takes a canonical `sandbox_id`, `provider_name`, `model_id`, verification flag, and timeout. The sandbox must already exist. The stored route key is `sandbox/<sandbox_id>/inference.local`, while the route delivered to the sandbox remains `inference.local`.
+
+Sandbox overrides use the same provider/model validation, provider late-binding, endpoint verification, timeout, and versioning semantics as cluster inference. `GetSandboxInference` reads one sandbox override. `ClearSandboxInference` removes it so the sandbox falls back to the cluster default on the next bundle refresh.
+
+Sandbox creation stays independent from inference configuration. Operators can set or clear an override after the sandbox exists, and sandbox deletion removes the stored override.
+
 ### Bundle delivery
 
-`GetInferenceBundle` resolves the managed route at request time:
+`GetInferenceBundle` resolves routes at request time for a specific sandbox:
 
-1. Loads the `inference.local` route from the store.
-2. Looks up the referenced provider record by `provider_name`.
-3. Resolves endpoint, API key, protocols, and provider type from the provider record using the `InferenceProviderProfile` registry.
-4. If the provider's config map contains a base URL override key (e.g. `OPENAI_BASE_URL`), that value overrides the profile default.
-5. Returns a `GetInferenceBundleResponse` with the resolved route(s), a revision hash (DefaultHasher over route fields), and `generated_at_ms` timestamp.
+1. Looks for a sandbox override named `sandbox/<sandbox_id>/inference.local`.
+2. Falls back to the cluster default route `inference.local` when no sandbox override exists.
+3. Adds the cluster-scoped `sandbox-system` route for supervisor-only inference.
+4. Looks up each referenced provider record by `provider_name`.
+5. Resolves endpoint, API key, protocols, and provider type from provider records using the `InferenceProviderProfile` registry.
+6. If a provider's config map contains a base URL override key (for example `OPENAI_BASE_URL`), that value overrides the profile default.
+7. Returns a `GetInferenceBundleResponse` with resolved routes, a revision hash over route fields, and `generated_at_ms`.
 
 Because resolution happens at request time, credential rotation and endpoint changes on the provider record take effect on the next bundle fetch without re-running `SetClusterInference`.
 
@@ -97,6 +107,10 @@ Key messages:
 
 - `SetClusterInferenceRequest` -- `provider_name` + `model_id` + `timeout_secs` + optional `no_verify` override, with verification enabled by default
 - `SetClusterInferenceResponse` -- `provider_name` + `model_id` + `timeout_secs` + `version`
+- `SetSandboxInferenceRequest` -- `sandbox_id` + `provider_name` + `model_id` + `timeout_secs` + optional `no_verify` override
+- `GetSandboxInferenceRequest` -- `sandbox_id`
+- `ClearSandboxInferenceRequest` -- `sandbox_id`
+- `GetInferenceBundleRequest` -- `sandbox_id`
 - `GetInferenceBundleResponse` -- `repeated ResolvedRoute routes` + `revision` + `generated_at_ms`
 - `ResolvedRoute` -- `name`, `base_url`, `protocols`, `api_key`, `model_id`, `provider_type`, `timeout_secs`
 
@@ -109,7 +123,7 @@ Files:
 - `crates/openshell-sandbox/src/lib.rs` -- inference context initialization, route refresh
 - `crates/openshell-sandbox/src/grpc_client.rs` -- `fetch_inference_bundle()`
 
-In cluster mode, the sandbox starts a background refresh loop as soon as the inference context is created. The loop polls the gateway every 5 seconds by default (`OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS` override) and uses the bundle revision hash to skip no-op cache writes. The revision hash covers all route fields including `timeout_secs`, so any configuration change (provider, model, or timeout) triggers a cache update on the next poll.
+In cluster mode, the sandbox starts a background refresh loop as soon as the inference context is created. The loop polls the gateway every 5 seconds by default (`OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS` override) and includes its `sandbox_id`. The sandbox compares the returned revision hash to avoid no-op cache writes. The revision hash covers all route fields including `timeout_secs`, so any configuration change (provider, model, timeout, or sandbox override) triggers a cache update on the next poll.
 
 ### Interception flow
 
@@ -335,6 +349,9 @@ Cluster inference commands:
 - `openshell inference update [--provider <name>] [--model <id>] [--timeout <secs>]` -- updates individual fields without resetting others
 - `openshell inference get` -- displays both user and system inference configuration
 - `openshell inference get --system` -- displays only the system inference configuration
+- `openshell inference sandbox set --sandbox <name> --provider <name> --model <id> [--timeout <secs>]` -- configures one sandbox's `inference.local` override
+- `openshell inference sandbox get --sandbox <name>` -- displays one sandbox override
+- `openshell inference sandbox clear --sandbox <name>` -- removes one sandbox override so the sandbox falls back to the cluster route
 
 The `--provider` flag references a provider record name (not a provider type). The provider must already exist in the cluster and have a supported inference type (`openai`, `anthropic`, or `nvidia`).
 

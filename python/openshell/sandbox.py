@@ -375,14 +375,44 @@ class SandboxClient:
 
 
 @dataclass(frozen=True)
+class InferenceValidatedEndpoint:
+    url: str
+    protocol: str
+
+
+@dataclass(frozen=True)
 class ClusterInferenceConfig:
     provider_name: str
     model_id: str
     version: int
+    route_name: str = "inference.local"
+    timeout_secs: int = 0
+    validation_performed: bool = False
+    validated_endpoints: tuple[InferenceValidatedEndpoint, ...] = ()
+
+
+@dataclass(frozen=True)
+class SandboxInferenceConfig:
+    sandbox_id: str
+    provider_name: str
+    model_id: str
+    version: int
+    timeout_secs: int = 0
+    validation_performed: bool = False
+    validated_endpoints: tuple[InferenceValidatedEndpoint, ...] = ()
+
+
+def _validated_endpoints(
+    endpoints: Sequence[inference_pb2.ValidatedEndpoint],
+) -> tuple[InferenceValidatedEndpoint, ...]:
+    return tuple(
+        InferenceValidatedEndpoint(url=endpoint.url, protocol=endpoint.protocol)
+        for endpoint in endpoints
+    )
 
 
 class InferenceRouteClient:
-    """gRPC client for cluster-level inference configuration."""
+    """gRPC client for gateway-owned inference route configuration."""
 
     def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
         self._stub = inference_pb2_grpc.InferenceStub(channel)
@@ -397,13 +427,17 @@ class InferenceRouteClient:
         *,
         provider_name: str,
         model_id: str,
+        route_name: str = "inference.local",
         no_verify: bool = False,
+        timeout_secs: int = 0,
     ) -> ClusterInferenceConfig:
         response = self._stub.SetClusterInference(
             inference_pb2.SetClusterInferenceRequest(
                 provider_name=provider_name,
                 model_id=model_id,
+                route_name=route_name,
                 no_verify=no_verify,
+                timeout_secs=timeout_secs,
             ),
             timeout=self._timeout,
         )
@@ -411,18 +445,75 @@ class InferenceRouteClient:
             provider_name=response.provider_name,
             model_id=response.model_id,
             version=response.version,
+            route_name=response.route_name or "inference.local",
+            timeout_secs=response.timeout_secs,
+            validation_performed=response.validation_performed,
+            validated_endpoints=_validated_endpoints(response.validated_endpoints),
         )
 
-    def get_cluster(self) -> ClusterInferenceConfig:
+    def get_cluster(
+        self, *, route_name: str = "inference.local"
+    ) -> ClusterInferenceConfig:
         response = self._stub.GetClusterInference(
-            inference_pb2.GetClusterInferenceRequest(),
+            inference_pb2.GetClusterInferenceRequest(route_name=route_name),
             timeout=self._timeout,
         )
         return ClusterInferenceConfig(
             provider_name=response.provider_name,
             model_id=response.model_id,
             version=response.version,
+            route_name=response.route_name or "inference.local",
+            timeout_secs=response.timeout_secs,
         )
+
+    def set_sandbox(
+        self,
+        sandbox_id: str,
+        *,
+        provider_name: str,
+        model_id: str,
+        no_verify: bool = False,
+        timeout_secs: int = 0,
+    ) -> SandboxInferenceConfig:
+        response = self._stub.SetSandboxInference(
+            inference_pb2.SetSandboxInferenceRequest(
+                sandbox_id=sandbox_id,
+                provider_name=provider_name,
+                model_id=model_id,
+                no_verify=no_verify,
+                timeout_secs=timeout_secs,
+            ),
+            timeout=self._timeout,
+        )
+        return SandboxInferenceConfig(
+            sandbox_id=response.sandbox_id,
+            provider_name=response.provider_name,
+            model_id=response.model_id,
+            version=response.version,
+            timeout_secs=response.timeout_secs,
+            validation_performed=response.validation_performed,
+            validated_endpoints=_validated_endpoints(response.validated_endpoints),
+        )
+
+    def get_sandbox(self, sandbox_id: str) -> SandboxInferenceConfig:
+        response = self._stub.GetSandboxInference(
+            inference_pb2.GetSandboxInferenceRequest(sandbox_id=sandbox_id),
+            timeout=self._timeout,
+        )
+        return SandboxInferenceConfig(
+            sandbox_id=response.sandbox_id,
+            provider_name=response.provider_name,
+            model_id=response.model_id,
+            version=response.version,
+            timeout_secs=response.timeout_secs,
+        )
+
+    def clear_sandbox(self, sandbox_id: str) -> bool:
+        response = self._stub.ClearSandboxInference(
+            inference_pb2.ClearSandboxInferenceRequest(sandbox_id=sandbox_id),
+            timeout=self._timeout,
+        )
+        return bool(response.cleared)
 
 
 class Sandbox:

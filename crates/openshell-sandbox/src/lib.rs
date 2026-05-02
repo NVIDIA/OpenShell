@@ -954,13 +954,13 @@ async fn build_inference_context(
                 .map_err(|e| miette::miette!("failed to resolve routes from {path}: {e}"))?
         }
         InferenceRouteSource::Cluster => {
-            let (Some(_id), Some(endpoint)) = (sandbox_id, openshell_endpoint) else {
+            let (Some(id), Some(endpoint)) = (sandbox_id, openshell_endpoint) else {
                 return Ok(None);
             };
 
             // Cluster mode: fetch bundle from gateway
             info!(endpoint = %endpoint, "Fetching inference route bundle from gateway");
-            match grpc_client::fetch_inference_bundle(endpoint).await {
+            match grpc_client::fetch_inference_bundle(endpoint, id).await {
                 Ok(bundle) => {
                     initial_revision = Some(bundle.revision.clone());
                     ocsf_emit!(
@@ -1068,12 +1068,13 @@ async fn build_inference_context(
     // Spawn background route cache refresh for cluster mode at startup so
     // request handling never depends on control-plane latency.
     if matches!(source, InferenceRouteSource::Cluster)
-        && let (Some(_id), Some(endpoint)) = (sandbox_id, openshell_endpoint)
+        && let (Some(id), Some(endpoint)) = (sandbox_id, openshell_endpoint)
     {
         spawn_route_refresh(
             ctx.route_cache(),
             ctx.system_route_cache(),
             endpoint.to_string(),
+            id.to_string(),
             route_refresh_interval_secs(),
             initial_revision,
         );
@@ -1147,6 +1148,7 @@ pub(crate) fn spawn_route_refresh(
     user_cache: Arc<tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>>,
     system_cache: Arc<tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>>,
     endpoint: String,
+    sandbox_id: String,
     interval_secs: u64,
     initial_revision: Option<String>,
 ) {
@@ -1161,7 +1163,7 @@ pub(crate) fn spawn_route_refresh(
         loop {
             tick.tick().await;
 
-            match grpc_client::fetch_inference_bundle(&endpoint).await {
+            match grpc_client::fetch_inference_bundle(&endpoint, &sandbox_id).await {
                 Ok(bundle) => {
                     if current_revision.as_deref() == Some(&bundle.revision) {
                         trace!(revision = %bundle.revision, "Inference bundle unchanged");

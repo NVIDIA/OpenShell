@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any, cast
 
-from openshell._proto import openshell_pb2
+from openshell._proto import inference_pb2, openshell_pb2
 from openshell.sandbox import (
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
     _SANDBOX_PYTHON_BIN,
@@ -37,6 +37,9 @@ class _FakeStub:
 class _FakeInferenceStub:
     def __init__(self) -> None:
         self.request = None
+        self.sandbox_request = None
+        self.get_sandbox_request = None
+        self.clear_sandbox_request = None
 
     def SetClusterInference(self, request: Any, timeout: float | None = None) -> Any:
         self.request = request
@@ -46,8 +49,54 @@ class _FakeInferenceStub:
             provider_name = request.provider_name
             model_id = request.model_id
             version = 1
+            route_name = request.route_name or "inference.local"
+            timeout_secs = request.timeout_secs
+            validation_performed = True
+            validated_endpoints = (
+                inference_pb2.ValidatedEndpoint(
+                    url="mock://cluster",
+                    protocol="openai_chat_completions",
+                ),
+            )
 
         return _Response()
+
+    def SetSandboxInference(self, request: Any, timeout: float | None = None) -> Any:
+        self.sandbox_request = request
+        _ = timeout
+        return inference_pb2.SetSandboxInferenceResponse(
+            sandbox_id=request.sandbox_id,
+            provider_name=request.provider_name,
+            model_id=request.model_id,
+            version=1,
+            timeout_secs=request.timeout_secs,
+            validation_performed=True,
+            validated_endpoints=[
+                inference_pb2.ValidatedEndpoint(
+                    url="mock://sandbox",
+                    protocol="openai_chat_completions",
+                )
+            ],
+        )
+
+    def GetSandboxInference(self, request: Any, timeout: float | None = None) -> Any:
+        self.get_sandbox_request = request
+        _ = timeout
+        return inference_pb2.GetSandboxInferenceResponse(
+            sandbox_id=request.sandbox_id,
+            provider_name="openai-dev",
+            model_id="gpt-4.1",
+            version=2,
+            timeout_secs=90,
+        )
+
+    def ClearSandboxInference(self, request: Any, timeout: float | None = None) -> Any:
+        self.clear_sandbox_request = request
+        _ = timeout
+        return inference_pb2.ClearSandboxInferenceResponse(
+            sandbox_id=request.sandbox_id,
+            cleared=True,
+        )
 
 
 def _client_with_fake_stub(stub: _FakeStub) -> SandboxClient:
@@ -145,11 +194,72 @@ def test_inference_set_cluster_forwards_no_verify_flag() -> None:
     client._timeout = 30.0
     client._stub = cast("Any", stub)
 
-    client.set_cluster(
+    config = client.set_cluster(
         provider_name="openai-dev",
         model_id="gpt-4.1",
         no_verify=True,
+        timeout_secs=120,
     )
 
     assert stub.request is not None
     assert stub.request.no_verify is True
+    assert config.timeout_secs == 120
+    assert config.validation_performed is True
+    assert config.validated_endpoints[0].url == "mock://cluster"
+
+
+def test_inference_set_sandbox_forwards_override_request() -> None:
+    stub = _FakeInferenceStub()
+    client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
+    client._timeout = 30.0
+    client._stub = cast("Any", stub)
+
+    config = client.set_sandbox(
+        "sandbox-1",
+        provider_name="openai-dev",
+        model_id="gpt-4.1",
+        no_verify=True,
+        timeout_secs=120,
+    )
+
+    assert stub.sandbox_request is not None
+    assert stub.sandbox_request.sandbox_id == "sandbox-1"
+    assert stub.sandbox_request.provider_name == "openai-dev"
+    assert stub.sandbox_request.model_id == "gpt-4.1"
+    assert stub.sandbox_request.no_verify is True
+    assert config.sandbox_id == "sandbox-1"
+    assert config.provider_name == "openai-dev"
+    assert config.model_id == "gpt-4.1"
+    assert config.timeout_secs == 120
+    assert config.validation_performed is True
+    assert config.validated_endpoints[0].url == "mock://sandbox"
+
+
+def test_inference_get_sandbox_forwards_override_request() -> None:
+    stub = _FakeInferenceStub()
+    client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
+    client._timeout = 30.0
+    client._stub = cast("Any", stub)
+
+    config = client.get_sandbox("sandbox-1")
+
+    assert stub.get_sandbox_request is not None
+    assert stub.get_sandbox_request.sandbox_id == "sandbox-1"
+    assert config.sandbox_id == "sandbox-1"
+    assert config.provider_name == "openai-dev"
+    assert config.model_id == "gpt-4.1"
+    assert config.version == 2
+    assert config.timeout_secs == 90
+
+
+def test_inference_clear_sandbox_forwards_override_request() -> None:
+    stub = _FakeInferenceStub()
+    client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
+    client._timeout = 30.0
+    client._stub = cast("Any", stub)
+
+    cleared = client.clear_sandbox("sandbox-1")
+
+    assert stub.clear_sandbox_request is not None
+    assert stub.clear_sandbox_request.sandbox_id == "sandbox-1"
+    assert cleared is True
