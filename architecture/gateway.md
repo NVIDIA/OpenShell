@@ -124,7 +124,8 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--port` | `OPENSHELL_SERVER_PORT` | `8080` | TCP listen port (binds `0.0.0.0`) |
+| `--bind-address` | `OPENSHELL_BIND_ADDRESS` | `127.0.0.1` | IP address for gateway, health, and metrics listeners. Container deployments pass `0.0.0.0` explicitly. |
+| `--port` | `OPENSHELL_SERVER_PORT` | `8080` | TCP listen port |
 | `--log-level` | `OPENSHELL_LOG_LEVEL` | `info` | Tracing log level filter |
 | `--tls-cert` | `OPENSHELL_TLS_CERT` | None | Path to PEM certificate file |
 | `--tls-key` | `OPENSHELL_TLS_KEY` | None | Path to PEM private key file |
@@ -610,8 +611,8 @@ The gateway reaches the sandbox exclusively through the supervisor-initiated `Co
 The Docker driver (`crates/openshell-driver-docker/src/lib.rs`) is an in-process compute backend for local standalone gateways. It creates one Docker container per sandbox, labels each container with `openshell.ai/managed-by=openshell`, `openshell.ai/sandbox-id`, `openshell.ai/sandbox-name`, and `openshell.ai/sandbox-namespace`, and bind-mounts a Linux `openshell-sandbox` supervisor binary into the container.
 
 - **Create**: Pulls or validates the sandbox image according to `sandbox_image_pull_policy`, creates a labeled container, mounts the supervisor binary and optional TLS material, and starts the container with the supervisor as entrypoint.
-- **Bridge networking**: Ensures a local Docker bridge network exists (`openshell-docker` by default), starts every sandbox container on that network, and injects `host.openshell.internal` with the bridge gateway IP so supervisors can reach the gateway without `network_mode=host`.
-- **Private gateway listener**: Reports an additional gateway bind address on the Docker bridge gateway IP and the normal gateway port to `run_server()`. If the primary listener already binds the wildcard address for that port, the extra address is covered and is not bound a second time. `OPENSHELL_ENDPOINT` inside Docker sandboxes uses the configured scheme and points at `host.openshell.internal:<gateway-port>`.
+- **Bridge networking**: Ensures a local Docker bridge network exists (`openshell-docker` by default) and starts every sandbox container on that network instead of using `network_mode=host`.
+- **Gateway callback routing**: On native Linux Docker, injects `host.openshell.internal` with the bridge gateway IP and reports that bridge gateway IP plus the normal gateway port to `run_server()` as an extra listener. If the primary listener already binds the wildcard address for that port, the extra address is covered and is not bound a second time. On Docker Desktop, the bridge gateway IP belongs to Docker Desktop's VM rather than the macOS/Windows host, so the driver maps `host.openshell.internal` to Docker's `host-gateway` alias and does not request an extra listener. `OPENSHELL_ENDPOINT` inside Docker sandboxes uses the configured scheme and points at `host.openshell.internal:<gateway-port>` in both cases.
 - **Environment ownership**: Merges template and spec environment first, then overwrites driver-owned supervisor variables, including `PATH`, `OPENSHELL_ENDPOINT`, `OPENSHELL_SANDBOX_ID`, `OPENSHELL_SSH_SOCKET_PATH`, and `OPENSHELL_SANDBOX_COMMAND`. This keeps privileged supervisor setup from resolving helper binaries through a user-controlled search path.
 - **List/Get/Watch**: Reads labeled containers in the configured sandbox namespace and derives driver-native sandbox status from Docker state plus supervisor relay readiness.
 - **Stop**: Stops the matching labeled container without deleting it.

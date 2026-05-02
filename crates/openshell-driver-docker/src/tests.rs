@@ -7,7 +7,7 @@ use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
 };
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tempfile::TempDir;
 
 const TLS_MOUNT_DIR: &str = "/etc/openshell/tls/client";
@@ -44,10 +44,13 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         sandbox_namespace: "default".to_string(),
         grpc_endpoint: "https://localhost:8443".to_string(),
         network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
-        gateway_bind_address: docker_gateway_bind_address(
-            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
-            DEFAULT_SERVER_PORT,
-        ),
+        gateway_route: DockerGatewayRoute::Bridge {
+            bind_address: SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+                DEFAULT_SERVER_PORT,
+            ),
+            host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+        },
         ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
         stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
         log_level: "info".to_string(),
@@ -131,6 +134,59 @@ fn docker_bridge_gateway_ip_requires_ipv4_gateway() {
             .unwrap_err()
             .to_string()
             .contains("IPv4 IPAM gateway")
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
+    let info = SystemInfo {
+        operating_system: Some("Docker Desktop".to_string()),
+        labels: Some(vec![
+            "com.docker.desktop.address=unix:///tmp/docker.sock".to_string(),
+        ]),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+        ),
+        DockerGatewayRoute::HostGateway
+    );
+    assert_eq!(
+        docker_extra_hosts(&DockerGatewayRoute::HostGateway),
+        vec!["host.openshell.internal:host-gateway".to_string()]
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
+    let info = SystemInfo {
+        operating_system: Some("Ubuntu 24.04 LTS".to_string()),
+        ..Default::default()
+    };
+
+    let route = docker_gateway_route(
+        &info,
+        IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+        DEFAULT_SERVER_PORT,
+    );
+
+    assert_eq!(
+        route,
+        DockerGatewayRoute::Bridge {
+            bind_address: "172.18.0.1:8080".parse().unwrap(),
+            host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+        }
+    );
+    assert_eq!(
+        docker_extra_hosts(&route),
+        vec![
+            "host.docker.internal:172.18.0.1".to_string(),
+            "host.openshell.internal:172.18.0.1".to_string()
+        ]
     );
 }
 

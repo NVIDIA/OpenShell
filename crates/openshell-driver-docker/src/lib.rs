@@ -10,7 +10,7 @@ use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, EndpointSettings, HostConfig,
     Mount, MountTypeEnum, NetworkCreateRequest, NetworkingConfig, RestartPolicy,
-    RestartPolicyNameEnum,
+    RestartPolicyNameEnum, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -161,13 +161,22 @@ struct DockerDriverRuntimeConfig {
     sandbox_namespace: String,
     grpc_endpoint: String,
     network_name: String,
-    gateway_bind_address: SocketAddr,
+    gateway_route: DockerGatewayRoute,
     ssh_socket_path: String,
     stop_timeout_secs: u32,
     log_level: String,
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DockerGatewayRoute {
+    Bridge {
+        bind_address: SocketAddr,
+        host_alias_ip: IpAddr,
+    },
+    HostGateway,
 }
 
 #[derive(Clone)]
@@ -204,6 +213,9 @@ impl DockerComputeDriver {
         let version = docker.version().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;
+        let info = docker.info().await.map_err(|err| {
+            Error::execution(format!("failed to query Docker daemon info: {err}"))
+        })?;
         let gateway_port = config.bind_address.port();
         if gateway_port == 0 {
             return Err(Error::config(
@@ -212,7 +224,7 @@ impl DockerComputeDriver {
         }
         let network_name = docker_network_name(docker_config)?;
         let bridge_gateway_ip = ensure_bridge_network(&docker, &network_name).await?;
-        let gateway_bind_address = docker_gateway_bind_address(bridge_gateway_ip, gateway_port);
+        let gateway_route = docker_gateway_route(&info, bridge_gateway_ip, gateway_port);
         let grpc_endpoint = docker_container_openshell_endpoint(
             &config.grpc_endpoint,
             HOST_OPENSHELL_INTERNAL,
@@ -230,7 +242,7 @@ impl DockerComputeDriver {
                 sandbox_namespace: config.sandbox_namespace.clone(),
                 grpc_endpoint,
                 network_name,
-                gateway_bind_address,
+                gateway_route,
                 ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
                 log_level: config.log_level.clone(),
@@ -252,7 +264,10 @@ impl DockerComputeDriver {
 
     #[must_use]
     pub fn gateway_bind_addresses(&self) -> Vec<SocketAddr> {
-        vec![self.config.gateway_bind_address]
+        match self.config.gateway_route {
+            DockerGatewayRoute::Bridge { bind_address, .. } => vec![bind_address],
+            DockerGatewayRoute::HostGateway => Vec::new(),
+        }
     }
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
@@ -958,16 +973,7 @@ fn build_container_create_body(
                 "SYSLOG".to_string(),
             ]),
             network_mode: Some(config.network_name.clone()),
-            extra_hosts: Some(vec![
-                format!(
-                    "{HOST_DOCKER_INTERNAL}:{}",
-                    config.gateway_bind_address.ip()
-                ),
-                format!(
-                    "{HOST_OPENSHELL_INTERNAL}:{}",
-                    config.gateway_bind_address.ip()
-                ),
-            ]),
+            extra_hosts: Some(docker_extra_hosts(&config.gateway_route)),
             ..Default::default()
         }),
         networking_config: Some(NetworkingConfig {
@@ -1024,8 +1030,48 @@ fn docker_network_name(config: &DockerComputeConfig) -> CoreResult<String> {
     Ok(name.to_string())
 }
 
-fn docker_gateway_bind_address(ip: IpAddr, port: u16) -> SocketAddr {
-    SocketAddr::new(ip, port)
+fn docker_gateway_route(
+    info: &SystemInfo,
+    bridge_gateway_ip: IpAddr,
+    port: u16,
+) -> DockerGatewayRoute {
+    if is_docker_desktop(info) {
+        DockerGatewayRoute::HostGateway
+    } else {
+        DockerGatewayRoute::Bridge {
+            bind_address: SocketAddr::new(bridge_gateway_ip, port),
+            host_alias_ip: bridge_gateway_ip,
+        }
+    }
+}
+
+fn is_docker_desktop(info: &SystemInfo) -> bool {
+    let operating_system = info
+        .operating_system
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if operating_system.contains("docker desktop") {
+        return true;
+    }
+
+    info.labels.as_ref().is_some_and(|labels| {
+        labels
+            .iter()
+            .any(|label| label.starts_with("com.docker.desktop."))
+    })
+}
+
+fn docker_extra_hosts(route: &DockerGatewayRoute) -> Vec<String> {
+    match route {
+        DockerGatewayRoute::Bridge { host_alias_ip, .. } => vec![
+            format!("{HOST_DOCKER_INTERNAL}:{host_alias_ip}"),
+            format!("{HOST_OPENSHELL_INTERNAL}:{host_alias_ip}"),
+        ],
+        DockerGatewayRoute::HostGateway => {
+            vec![format!("{HOST_OPENSHELL_INTERNAL}:host-gateway")]
+        }
+    }
 }
 
 async fn ensure_bridge_network(docker: &Docker, network_name: &str) -> CoreResult<IpAddr> {
