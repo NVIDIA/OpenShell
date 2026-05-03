@@ -31,6 +31,17 @@ OpenShell publishes standalone `openshell-gateway` release assets for manual dow
 
 These artifacts are attached to GitHub releases. `openshell gateway start` continues to use the published cluster and gateway container images.
 
+## Debian Package
+
+OpenShell publishes Debian packages for Linux on the following architectures:
+
+| Platform              | Artifact pattern                  |
+| --------------------- | --------------------------------- |
+| Linux x86_64 (amd64)  | `openshell_<version>_amd64.deb`   |
+| Linux aarch64 (arm64) | `openshell_<version>_arm64.deb`   |
+
+Each package includes the CLI, the gateway binary, and the VM compute driver. Download the package from the [GitHub releases page](https://github.com/NVIDIA/OpenShell/releases) and install it with `dpkg -i`.
+
 ## Software Prerequisites
 
 The following software must be installed on the host before using the OpenShell CLI:
