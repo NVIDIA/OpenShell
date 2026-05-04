@@ -154,6 +154,7 @@ fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
             &info,
             IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
             DEFAULT_SERVER_PORT,
+            None,
         ),
         DockerGatewayRoute::HostGateway
     );
@@ -174,6 +175,7 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
         &info,
         IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         DEFAULT_SERVER_PORT,
+        None,
     );
 
     assert_eq!(
@@ -189,6 +191,51 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
             "host.docker.internal:172.18.0.1".to_string(),
             "host.openshell.internal:172.18.0.1".to_string()
         ]
+    );
+}
+
+#[test]
+fn docker_gateway_route_prefers_configured_host_gateway_ip() {
+    let info = SystemInfo {
+        operating_system: Some("Ubuntu 24.04 LTS".to_string()),
+        ..Default::default()
+    };
+
+    let route = docker_gateway_route(
+        &info,
+        IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+        DEFAULT_SERVER_PORT,
+        Some(IpAddr::V4(Ipv4Addr::new(172, 20, 0, 4))),
+    );
+
+    assert_eq!(
+        route,
+        DockerGatewayRoute::Bridge {
+            bind_address: "172.20.0.4:8080".parse().unwrap(),
+            host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 20, 0, 4)),
+        }
+    );
+    assert_eq!(
+        docker_extra_hosts(&route),
+        vec![
+            "host.docker.internal:172.20.0.4".to_string(),
+            "host.openshell.internal:172.20.0.4".to_string()
+        ]
+    );
+}
+
+#[test]
+fn parse_optional_host_gateway_ip_rejects_invalid_values() {
+    assert_eq!(parse_optional_host_gateway_ip("").unwrap(), None);
+    assert_eq!(
+        parse_optional_host_gateway_ip("172.20.0.4").unwrap(),
+        Some(IpAddr::V4(Ipv4Addr::new(172, 20, 0, 4)))
+    );
+    assert!(
+        parse_optional_host_gateway_ip("not-an-ip")
+            .unwrap_err()
+            .to_string()
+            .contains("OPENSHELL_HOST_GATEWAY_IP")
     );
 }
 

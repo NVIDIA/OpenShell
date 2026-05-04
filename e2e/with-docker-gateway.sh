@@ -61,6 +61,9 @@ GATEWAY_PID=""
 GATEWAY_LOG="${WORKDIR}/gateway.log"
 GATEWAY_CONFIG_DIR=""
 E2E_NAMESPACE=""
+DOCKER_NETWORK_NAME=""
+DOCKER_NETWORK_CONNECTED_CONTAINER=""
+DOCKER_NETWORK_MANAGED=0
 GPU_MODE="${OPENSHELL_E2E_DOCKER_GPU:-0}"
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
@@ -105,6 +108,20 @@ cleanup() {
       # shellcheck disable=SC2086
       docker rm -f ${stale} >/dev/null 2>&1 || true
     fi
+  fi
+
+  if [ -n "${DOCKER_NETWORK_CONNECTED_CONTAINER}" ] \
+     && [ -n "${DOCKER_NETWORK_NAME}" ] \
+     && command -v docker >/dev/null 2>&1; then
+    docker network disconnect -f \
+      "${DOCKER_NETWORK_NAME}" \
+      "${DOCKER_NETWORK_CONNECTED_CONTAINER}" >/dev/null 2>&1 || true
+  fi
+
+  if [ "${DOCKER_NETWORK_MANAGED}" = "1" ] \
+     && [ -n "${DOCKER_NETWORK_NAME}" ] \
+     && command -v docker >/dev/null 2>&1; then
+    docker network rm "${DOCKER_NETWORK_NAME}" >/dev/null 2>&1 || true
   fi
 
   if [ "${exit_code}" -ne 0 ] && [ -f "${GATEWAY_LOG}" ]; then
@@ -170,6 +187,70 @@ PY
 
 pick_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
+}
+
+ensure_e2e_docker_network() {
+  local network=$1
+
+  if docker network inspect "${network}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  docker network create \
+    --driver bridge \
+    --attachable \
+    --label openshell.ai/managed-by=openshell \
+    --label "openshell.ai/sandbox-namespace=${E2E_NAMESPACE}" \
+    "${network}" >/dev/null
+  DOCKER_NETWORK_MANAGED=1
+}
+
+github_actions_container_id() {
+  if [ "${GITHUB_ACTIONS:-}" != "true" ] || [ ! -f /.dockerenv ]; then
+    return 1
+  fi
+
+  local container
+  container="$(hostname)"
+  if docker inspect "${container}" >/dev/null 2>&1; then
+    printf '%s\n' "${container}"
+    return 0
+  fi
+
+  return 1
+}
+
+connect_current_container_to_docker_network() {
+  local network=$1
+  local container
+
+  if ! container="$(github_actions_container_id)"; then
+    return 1
+  fi
+
+  local connect_err="${WORKDIR}/docker-network-connect.err"
+  if ! docker network connect \
+    --alias host.openshell.internal \
+    "${network}" \
+    "${container}" 2>"${connect_err}"; then
+    if ! grep -qi "already exists" "${connect_err}"; then
+      cat "${connect_err}" >&2
+      return 1
+    fi
+  fi
+
+  DOCKER_NETWORK_CONNECTED_CONTAINER="${container}"
+
+  local container_ip
+  container_ip="$(docker inspect \
+    --format "{{with index .NetworkSettings.Networks \"${network}\"}}{{.IPAddress}}{{end}}" \
+    "${container}")"
+  if [ -z "${container_ip}" ]; then
+    echo "ERROR: failed to resolve current job container IP on Docker network ${network}" >&2
+    return 1
+  fi
+
+  GATEWAY_HOST_ALIAS_IP="${container_ip}"
 }
 
 if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
@@ -327,13 +408,23 @@ mkdir -p "${STATE_DIR}"
 
 GATEWAY_ENDPOINT="https://host.openshell.internal:${HOST_PORT}"
 E2E_NAMESPACE="e2e-docker-$$-${HOST_PORT}"
+DOCKER_NETWORK_NAME="${E2E_NAMESPACE}"
+GATEWAY_HOST_ALIAS_IP=""
+
+ensure_e2e_docker_network "${DOCKER_NETWORK_NAME}"
+if connect_current_container_to_docker_network "${DOCKER_NETWORK_NAME}"; then
+  echo "Connected CI job container to Docker network ${DOCKER_NETWORK_NAME} (${GATEWAY_HOST_ALIAS_IP})."
+else
+  GATEWAY_HOST_ALIAS_IP=""
+fi
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
-"${GATEWAY_BIN}" \
+GATEWAY_ARGS=(
   --bind-address 0.0.0.0 \
   --port "${HOST_PORT}" \
   --drivers docker \
   --sandbox-namespace "${E2E_NAMESPACE}" \
+  --docker-network-name "${DOCKER_NETWORK_NAME}" \
   --tls-cert "${PKI_DIR}/server.crt" \
   --tls-key "${PKI_DIR}/server.key" \
   --tls-client-ca "${PKI_DIR}/ca.crt" \
@@ -344,8 +435,12 @@ echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPAC
   --docker-tls-cert "${PKI_DIR}/client.crt" \
   --docker-tls-key "${PKI_DIR}/client.key" \
   --sandbox-image "${SANDBOX_IMAGE}" \
-  --sandbox-image-pull-policy IfNotPresent \
-  >"${GATEWAY_LOG}" 2>&1 &
+  --sandbox-image-pull-policy IfNotPresent
+)
+if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
+  GATEWAY_ARGS+=(--host-gateway-ip "${GATEWAY_HOST_ALIAS_IP}")
+fi
+"${GATEWAY_BIN}" "${GATEWAY_ARGS[@]}" >"${GATEWAY_LOG}" 2>&1 &
 GATEWAY_PID=$!
 
 GATEWAY_NAME="openshell-e2e-docker-${HOST_PORT}"
@@ -358,12 +453,13 @@ export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-180}"
 echo "Waiting for gateway to become healthy..."
 elapsed=0
 timeout=120
+last_status_output=""
 while [ "${elapsed}" -lt "${timeout}" ]; do
   if ! kill -0 "${GATEWAY_PID}" 2>/dev/null; then
     echo "ERROR: openshell-gateway exited before becoming healthy"
     exit 1
   fi
-  if "${CLI_BIN}" status >/dev/null 2>&1; then
+  if last_status_output="$("${CLI_BIN}" status 2>&1)"; then
     echo "Gateway healthy after ${elapsed}s."
     break
   fi
@@ -372,6 +468,13 @@ while [ "${elapsed}" -lt "${timeout}" ]; do
 done
 if [ "${elapsed}" -ge "${timeout}" ]; then
   echo "ERROR: gateway did not become healthy within ${timeout}s"
+  echo "=== last openshell status output ==="
+  if [ -n "${last_status_output}" ]; then
+    printf '%s\n' "${last_status_output}"
+  else
+    echo "<no output>"
+  fi
+  echo "=== end openshell status output ==="
   exit 1
 fi
 
