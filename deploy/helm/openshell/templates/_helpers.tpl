@@ -75,9 +75,3 @@ the supervisor and gateway images stay in sync across releases.
 {{- printf "%s:%s" .Values.supervisor.image.repository (.Values.supervisor.image.tag | default .Chart.AppVersion) }}
 {{- end }}
 
-{{/*
-Namespaced Issuer (selfSigned) for cert-manager CA bootstrap.
-*/}}
-{{- define "openshell.issuerSelfSigned" -}}
-{{- printf "%s-selfsigned" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-" }}
-{{- end }}
