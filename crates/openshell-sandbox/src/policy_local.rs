@@ -18,6 +18,11 @@ use tokio::sync::RwLock;
 pub const POLICY_LOCAL_HOST: &str = "policy.local";
 
 const MAX_POLICY_LOCAL_BODY_BYTES: usize = 64 * 1024;
+/// Hard ceiling on how long a single request body read can stall. Bounds a
+/// slowloris-style upload from an in-sandbox process; the proxy listener only
+/// accepts loopback connections, so practical impact is limited, but this is
+/// cheap defense-in-depth.
+const POLICY_LOCAL_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const DEFAULT_DENIALS_LIMIT: usize = 10;
 const MAX_DENIALS_LIMIT: usize = 100;
 /// OCSF rolling appender keeps three files (daily rotation); read the most
@@ -139,11 +144,29 @@ async fn recent_denials_response(
     let limit = parse_last_query(query).unwrap_or(DEFAULT_DENIALS_LIMIT);
     let log_dir = ctx.ocsf_log_dir.clone();
 
+    // Distinguish "OCSF JSONL is enabled and no denials happened" from "OCSF
+    // JSONL is disabled, so we have nothing to read." Without this flag the
+    // agent sees `[]` in both cases and cannot tell the difference.
+    let log_available = matches!(
+        collect_ocsf_log_files(&log_dir, 1),
+        Ok(files) if !files.is_empty()
+    );
+
     let denials = tokio::task::spawn_blocking(move || read_recent_denials(&log_dir, limit))
         .await
         .unwrap_or_else(|_| Vec::new());
 
-    (200, serde_json::json!({ "denials": denials }))
+    let mut payload = serde_json::json!({
+        "denials": denials,
+        "log_available": log_available,
+    });
+    if !log_available {
+        payload["note"] = serde_json::json!(
+            "no OCSF JSONL log file is present; enable the `ocsf_json_enabled` sandbox setting to populate"
+        );
+    }
+
+    (200, payload)
 }
 
 fn parse_last_query(query: &str) -> Option<usize> {
@@ -244,9 +267,14 @@ fn denial_summary_from_event(value: &serde_json::Value) -> Option<serde_json::Va
     if let Some(time) = value.get("time").and_then(serde_json::Value::as_i64) {
         summary.insert("time_ms".to_string(), serde_json::json!(time));
     }
-    if let Some(message) = value.get("message").and_then(serde_json::Value::as_str) {
-        summary.insert("message".to_string(), serde_json::json!(message));
-    }
+    // Deliberately do NOT echo `message` from the OCSF event. The proxy's
+    // shorthand denial messages can include the request path with query
+    // string (e.g., `?access_token=…`), which would expose secrets back to an
+    // in-sandbox agent that is by definition outside the trust boundary
+    // protecting that token. The structured fields below (host, port, method,
+    // path, binary, policy) carry everything the agent needs to draft a
+    // proposal, and `path` is sourced from `http_request.url.path` which
+    // already excludes the query string.
     if let Some(dst) = value.get("dst_endpoint") {
         if let Some(host) = dst
             .get("hostname")
@@ -535,15 +563,21 @@ where
     if body.len() > content_length {
         body.truncate(content_length);
     }
-    while body.len() < content_length {
-        let remaining = content_length - body.len();
-        let mut chunk = vec![0u8; remaining.min(8192)];
-        let n = client.read(&mut chunk).await.into_diagnostic()?;
-        if n == 0 {
-            return Err(miette::miette!("policy.local request body ended early"));
+    let read_loop = async {
+        while body.len() < content_length {
+            let remaining = content_length - body.len();
+            let mut chunk = vec![0u8; remaining.min(8192)];
+            let n = client.read(&mut chunk).await.into_diagnostic()?;
+            if n == 0 {
+                return Err(miette::miette!("policy.local request body ended early"));
+            }
+            body.extend_from_slice(&chunk[..n]);
         }
-        body.extend_from_slice(&chunk[..n]);
-    }
+        Ok::<(), miette::Report>(())
+    };
+    tokio::time::timeout(POLICY_LOCAL_BODY_READ_TIMEOUT, read_loop)
+        .await
+        .map_err(|_| miette::miette!("policy.local request body read timed out"))??;
 
     Ok(body)
 }
@@ -886,11 +920,52 @@ mod tests {
         let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf());
         let (status, payload) = recent_denials_response(&ctx, "last=10").await;
         assert_eq!(status, 200);
+        assert_eq!(payload["log_available"], true);
         let denials = payload["denials"].as_array().unwrap();
         assert_eq!(denials.len(), 2);
         // Newest first.
-        assert_eq!(denials[0]["message"], "second");
-        assert_eq!(denials[1]["message"], "first");
+        assert_eq!(denials[0]["host"], "second.example");
+        assert_eq!(denials[1]["host"], "first.example");
+        assert!(
+            denials[0].get("message").is_none(),
+            "denial summaries must not echo the OCSF `message` field; it can leak credentials in query strings"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_denials_signals_when_log_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf());
+        let (status, payload) = recent_denials_response(&ctx, "").await;
+        assert_eq!(status, 200);
+        assert_eq!(payload["log_available"], false);
+        assert_eq!(payload["denials"].as_array().unwrap().len(), 0);
+        assert!(
+            payload["note"]
+                .as_str()
+                .unwrap()
+                .contains("ocsf_json_enabled")
+        );
+    }
+
+    #[test]
+    fn denial_summary_does_not_leak_message_field() {
+        // OCSF `message` strings can include the request path with query
+        // (e.g., `?access_token=…`); the summary must drop them.
+        let evt = serde_json::json!({
+            "class_uid": 4002,
+            "action_id": 2,
+            "message": "FORWARD denied PUT api.github.com:443/x?access_token=secret-token",
+            "dst_endpoint": {"hostname": "api.github.com", "port": 443},
+            "http_request": {"http_method": "PUT", "url": {"path": "/x"}}
+        });
+        let summary = denial_summary_from_event(&evt).unwrap();
+        assert_eq!(summary["path"], "/x");
+        assert!(summary.get("message").is_none());
+        assert!(
+            !summary.to_string().contains("secret-token"),
+            "summary must not include credentials from the source message"
+        );
     }
 
     #[tokio::test]
