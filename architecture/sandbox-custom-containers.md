@@ -112,7 +112,7 @@ The `openshell-sandbox` supervisor adapts to arbitrary environments:
 | Community name resolution | Bare names like `openclaw` expand to the GHCR community registry, making the common case simple |
 | Auto build/import for Dockerfiles | Eliminates the two-step build/import + create workflow for local gateway development |
 | `OPENSHELL_COMMUNITY_REGISTRY` env var | Allows organizations to host their own community sandbox registry |
-| Driver-owned supervisor delivery | Each compute driver decides how to deliver `openshell-sandbox` without depending on a k3s cluster image. |
+| Driver-owned supervisor delivery | Each compute driver decides how to deliver `openshell-sandbox` for its runtime. |
 | Read-only supervisor delivery | The supervisor should be mounted or packaged read-only where the driver supports it, and the startup seccomp prelude blocks remount syscalls that would otherwise reopen it for writes once privileged bootstrap has completed. |
 | Command override | Ensures `openshell-sandbox` is the entrypoint regardless of the image's default CMD |
 | Clear `run_as_user/group` for custom images | Prevents startup failure when the image lacks the default `sandbox` user |

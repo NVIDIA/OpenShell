@@ -16,8 +16,8 @@ OpenShell is built agent-first. The project ships with agent skills for everythi
 
 ### Prerequisites
 
-- **A reachable OpenShell gateway** backed by Docker, Podman, Kubernetes, or the experimental MicroVM runtime.
-- **Docker** — Docker Desktop or Docker Engine must be running for local Docker-backed gateways and local image builds.
+- **A supported host** — macOS, Windows with WSL 2, or Linux.
+- **A local runtime** — Docker, Podman, or host virtualization enabled for MicroVM-backed sandboxes.
 
 ### Install
 
@@ -34,8 +34,6 @@ uv tool install -U openshell
 ```
 
 Both methods install the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION` (binary) or pin the version with `uv tool install openshell==<version>`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
-
-### Register a gateway
 
 For local development from a source checkout, start a Docker-backed gateway:
 
@@ -116,7 +114,7 @@ OpenShell isolates each sandbox in its own container with policy-enforced egress
 | **Policy Engine**  | Enforces filesystem, network, and process constraints from application layer down to kernel. |
 | **Privacy Router** | Privacy-aware LLM routing that keeps sensitive context on sandbox compute.                   |
 
-Under the hood, OpenShell runs a gateway control plane that manages sandbox lifecycle through a configured compute driver. Supported compute platforms include Docker, Podman, Kubernetes through the Helm chart in `deploy/helm/openshell`, and the experimental MicroVM runtime.
+Under the hood, OpenShell runs a gateway control plane that manages sandbox lifecycle through a configured compute driver. Supported compute platforms include Docker, Podman, MicroVM, and Kubernetes through the Helm chart in `deploy/helm/openshell`.
 
 ## Protection Layers
 

@@ -344,7 +344,7 @@ graph LR
 
 ### Gateway Security Context
 
-The gateway container runs with a hardened security context (`deploy/helm/openshell/values.yaml:25`):
+The gateway workload runs with a hardened security context (`deploy/helm/openshell/values.yaml:25`):
 
 ```yaml
 securityContext:

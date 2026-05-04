@@ -241,7 +241,7 @@ This architecture ships as three core binaries, a standalone VM binary for quick
 
 `openshell` **(CLI).** The user-facing binary. Distributed as a standalone executable for macOS (aarch64, x86_64), Linux (aarch64, x86_64), and Windows (x86_64). Talks to the gateway over gRPC. No runtime dependencies beyond the OS.
 
-`openshell-gateway` **(Gateway).** The control-plane binary. Runs the gRPC API server, manages sandbox state, coordinates the compute/credentials/control-plane-identity/sandbox-identity subsystems, and launches driver processes. Distributed as a standalone executable and as the entrypoint of the gateway container image.
+`openshell-gateway` **(Gateway).** The control-plane binary. Runs the gRPC API server, manages sandbox state, coordinates the compute/credentials/control-plane-identity/sandbox-identity subsystems, and launches driver processes. Distributed as a standalone executable and as the entrypoint of the gateway image.
 
 `openshell-supervisor` **(Supervisor).** The sandbox-side security boundary. Runs inside every sandbox environment, connects outbound to the gateway, and enforces policy. Distributed as a standalone executable and as the entrypoint of the supervisor container image.
 

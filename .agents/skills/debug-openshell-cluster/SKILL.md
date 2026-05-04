@@ -52,7 +52,7 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 | Platform | Primary checks |
 |---|---|
-| Docker | Gateway process/container logs, Docker daemon health, sandbox containers, image pulls. |
+| Docker | Gateway process logs, Docker daemon health, sandbox containers, image pulls. |
 | Podman | Podman socket, rootless networking, sandbox containers, image pulls. |
 | Kubernetes | Helm release, StatefulSet, service, secrets, sandbox pods, events. |
 | VM | VM driver logs, rootfs availability, host virtualization support. |
@@ -62,14 +62,14 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 ```bash
 docker info
 docker ps --filter name=openshell
-docker logs <gateway-container> --tail=200
+docker logs <container> --tail=200
 openshell status
 ```
 
 Common findings:
 
 - Docker daemon unavailable: start Docker Desktop or Docker Engine.
-- Gateway container stopped: inspect exit status and logs.
+- Gateway process stopped: inspect exit status and logs.
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox never registers: check gateway logs and supervisor callback endpoint.
 
@@ -84,7 +84,7 @@ mise run gateway:docker
 ```bash
 podman info
 podman ps --filter name=openshell
-podman logs <gateway-container> --tail=200
+podman logs <container> --tail=200
 openshell status
 ```
 

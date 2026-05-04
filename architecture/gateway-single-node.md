@@ -1,6 +1,6 @@
 # Gateway Deployment and Compute Platforms
 
-This document describes the target OpenShell gateway deployment model after removing the embedded k3s implementation. OpenShell no longer centers deployment on a Docker-wrapped Kubernetes cluster image. Operators run a gateway endpoint and configure the compute driver that should create sandboxes.
+This document describes the OpenShell gateway deployment model. Operators run a gateway endpoint and configure the compute driver that should create sandboxes.
 
 The Helm chart remains in this repository as the supported Kubernetes deployment artifact. Docker, Podman, and the experimental MicroVM runtime remain first-class compute platforms for local and specialized deployments.
 
@@ -8,7 +8,6 @@ The Helm chart remains in this repository as the supported Kubernetes deployment
 
 - Keep the gateway deployable as a standard process, container, or Kubernetes Helm release.
 - Keep the Helm chart for Kubernetes deployments.
-- Remove the published k3s cluster image and Docker-wrapped Kubernetes bootstrap flow from the documented architecture.
 - Keep the gateway image independent from the compute runtime.
 - Make compute-platform dependencies explicit.
 - Preserve CLI gateway registration and selection as the way users target an already-running gateway.
@@ -16,7 +15,6 @@ The Helm chart remains in this repository as the supported Kubernetes deployment
 Out of scope:
 
 - Provisioning Kubernetes, Docker, Podman, or VM host infrastructure.
-- Replacing all existing legacy CLI bootstrap code.
 - Defining a new one-command mTLS import flow for every deployment type.
 
 ## Components
@@ -120,18 +118,6 @@ flowchart LR
 
 The gateway process manages all OpenShell control-plane APIs. It persists records in SQLite or Postgres, watches sandbox state through the selected compute driver, and brokers SSH access through supervisor-initiated relay streams.
 
-## Removed k3s Responsibilities
-
-The target architecture removes these responsibilities from OpenShell:
-
-- Publishing `ghcr.io/nvidia/openshell/cluster`.
-- Running a k3s server inside a privileged Docker container.
-- Copying Helm charts into `/var/lib/rancher/k3s/server/static/charts`.
-- Auto-installing manifests through the k3s Helm controller.
-- Importing images into k3s containerd.
-- Side-loading the supervisor binary from a k3s node hostPath baked into the cluster image.
-- Running k3s-specific DNS proxy, stale-node cleanup, and healthcheck scripts.
-
 ## Operational Notes
 
 - Gateway endpoint registration should use `openshell gateway add <endpoint>` regardless of compute platform.
@@ -140,4 +126,4 @@ The target architecture removes these responsibilities from OpenShell:
 - Podman driver changes should be validated with `mise run e2e:podman`.
 - VM driver changes should be validated with `mise run e2e:vm`.
 - Gateway image changes should be validated by building `deploy/docker/Dockerfile.images` target `gateway`.
-- Published docs should describe gateway deployment and endpoint registration, not cluster-image bootstrap.
+- Published docs should describe gateway deployment and endpoint registration.

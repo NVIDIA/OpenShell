@@ -170,24 +170,6 @@ openshell --help
 openshell sandbox create -- codex
 ```
 
-### Kubernetes debugging helpers
-
-Two additional scripts in `scripts/bin/` provide gateway-aware wrappers for Kubernetes debugging:
-
-| Script    | What it does                                                                         |
-| --------- | ------------------------------------------------------------------------------------ |
-| `kubectl` | Runs `kubectl` using the active development context                                  |
-| `k9s`     | Opens a Kubernetes terminal UI for the active development context                    |
-
-Use these when developing against a Kubernetes-backed gateway. Examples:
-
-```bash
-kubectl get pods -A
-kubectl logs -n openshell statefulset/openshell
-k9s
-k9s -n openshell
-```
-
 ## Main Tasks
 
 These are the primary `mise` tasks for day-to-day development:

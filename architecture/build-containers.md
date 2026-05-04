@@ -1,6 +1,6 @@
 # Container Images and Deployment Packaging
 
-OpenShell publishes the gateway container image and keeps Kubernetes Helm packaging in this repository. Sandbox images are maintained in the separate OpenShell Community repository.
+OpenShell publishes the gateway image and keeps Kubernetes Helm packaging in this repository. Sandbox images are maintained in the separate OpenShell Community repository.
 
 ## Gateway Image
 

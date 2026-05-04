@@ -12,7 +12,7 @@ proxy validates the resolved IP against that CIDR allowlist instead of
 blanket-blocking. Loopback and link-local remain always-blocked regardless.
 
 The default sandbox policy (baked into the community base image) includes a `cluster_pods`
-entry that allows any binary to reach port 8080 on the k3s pod network:
+entry that allows any binary to reach port 8080 on the configured pod network:
 
 ```yaml
 cluster_pods:
@@ -27,27 +27,26 @@ cluster_pods:
 
 ## Launch the demo server
 
-Build the image and push it to the local cluster registry:
+Build the image and push it to a registry that your Kubernetes cluster can pull from:
 
 ```bash
-docker build -t 127.0.0.1:5000/demo/private-api:latest examples/private-ip-routing/
-docker push 127.0.0.1:5000/demo/private-api:latest
+docker build -t registry.example.com/demo/private-api:latest examples/private-ip-routing/
+docker push registry.example.com/demo/private-api:latest
 ```
 
 Deploy the pod:
 
 ```bash
-docker exec openshell-cluster-openshell \
-  kubectl run private-api \
-    --image=127.0.0.1:5000/demo/private-api:latest \
-    --port=8080 \
-    --restart=Never
+kubectl run private-api \
+  --image=registry.example.com/demo/private-api:latest \
+  --port=8080 \
+  --restart=Never
 ```
 
 Wait for it to be running and note the pod IP:
 
 ```bash
-docker exec openshell-cluster-openshell kubectl get pod private-api -o wide
+kubectl get pod private-api -o wide
 ```
 
 Example output:
@@ -86,5 +85,5 @@ request returns `HTTP/1.1 403 Forbidden`.
 ## Cleanup
 
 ```bash
-docker exec openshell-cluster-openshell kubectl delete pod private-api
+kubectl delete pod private-api
 ```

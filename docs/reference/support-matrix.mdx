@@ -10,7 +10,7 @@ This page lists the host platform, compute platform, software, runtime, and kern
 
 ## Supported Platforms
 
-OpenShell publishes multi-architecture gateway container images for `linux/amd64` and `linux/arm64`. The CLI and standalone gateway binary are supported on the following host platforms:
+OpenShell publishes multi-architecture gateway images for `linux/amd64` and `linux/arm64`. The CLI and standalone gateway binary are supported on the following host platforms:
 
 | Platform                         | Architecture          | Status    |
 | -------------------------------- | --------------------- | --------- |
@@ -60,13 +60,13 @@ Sandbox container images are maintained in the [openshell-community](https://git
 
 ## Container Images
 
-OpenShell publishes the gateway container image for `linux/amd64` and `linux/arm64`.
+OpenShell publishes the gateway image for `linux/amd64` and `linux/arm64`.
 
 | Image | Reference | Pulled When |
 |---|---|---|
 | Gateway | `ghcr.io/nvidia/openshell/gateway:latest` | Helm chart install or upgrade, or standalone container deployment |
 
-The Helm chart in `deploy/helm/openshell` deploys the gateway StatefulSet, service account, service, persistent storage, and network policy for Kubernetes. OpenShell no longer publishes a k3s cluster image.
+The Helm chart in `deploy/helm/openshell` deploys the gateway StatefulSet, service account, service, persistent storage, and network policy for Kubernetes.
 
 Sandbox images are maintained separately in the [openshell-community](https://github.com/nvidia/openshell-community) repository.
 

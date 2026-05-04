@@ -115,7 +115,7 @@ Set the active gateway. Writes to `~/.config/openshell/active_gateway`. When cal
 
 ### `openshell doctor logs`
 
-Fetch logs from a legacy gateway container when metadata supports it. For Helm deployments, prefer `kubectl -n openshell logs statefulset/openshell`.
+Fetch logs when gateway metadata supports it. For Helm deployments, prefer `kubectl -n openshell logs statefulset/openshell`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -127,7 +127,7 @@ Fetch logs from a legacy gateway container when metadata supports it. For Helm d
 
 ### `openshell doctor exec -- <COMMAND...>`
 
-Run a command inside a legacy gateway container when metadata supports it. For Helm deployments, prefer direct `kubectl` and `helm` commands.
+Run a diagnostic command when gateway metadata supports it. For Helm deployments, prefer direct `kubectl` and `helm` commands.
 
 | Flag | Default | Description |
 |------|---------|-------------|
