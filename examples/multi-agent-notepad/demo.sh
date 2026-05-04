@@ -294,7 +294,7 @@ worker() {
     output_file="$(mktemp)"
     repo_path="runs/${RUN_ID}/notes/agent-${AGENT_INDEX}.md"
 
-    render_template /sandbox/prompts/worker.md "$slice" > "$prompt_file"
+    render_template /sandbox/payload/prompts/worker.md "$slice" > "$prompt_file"
     run_codex_to_file "$prompt_file" "$output_file"
     put_contents "$repo_path" "$output_file" "Add agent ${AGENT_INDEX} note for ${RUN_ID}"
     printf 'wrote %s\n' "$repo_path"
@@ -312,7 +312,7 @@ synthesis() {
         get_contents_file "runs/${RUN_ID}/notes/agent-${i}.md" "${notes_dir}/agent-${i}.md"
     done
 
-    render_template /sandbox/prompts/synthesis.md "" > "$prompt_file"
+    render_template /sandbox/payload/prompts/synthesis.md "" > "$prompt_file"
     {
         printf '\n\n## Worker Notes\n\n'
         for i in $(seq 1 "$AGENT_COUNT"); do
@@ -363,7 +363,7 @@ run_sandbox() {
         --policy "$POLICY_FILE" \
         --upload "${PAYLOAD_DIR}:/sandbox" \
         --no-tty \
-        -- bash /sandbox/demo-runner.sh "$@"
+        -- bash /sandbox/payload/demo-runner.sh "$@"
 }
 
 run_worker() {

@@ -18,10 +18,10 @@ use std::fs;
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 
-/// Create a sandbox with `--upload dir:/sandbox/data` and run a command that
-/// reads the uploaded files, verifying the content appears in stdout.
+/// Create a sandbox with `--upload dir:/sandbox/data` and verify directory
+/// uploads preserve the source basename at `/sandbox/data/<dirname>/...`.
 #[tokio::test]
-async fn create_with_upload_provides_files_to_command() {
+async fn create_with_upload_directory_preserves_source_basename() {
     let tmpdir = tempfile::tempdir().expect("create tmpdir");
 
     // Create a directory with files to upload.
