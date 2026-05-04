@@ -306,11 +306,7 @@ impl DockerComputeDriver {
                 "docker sandboxes require a template image",
             ));
         }
-        if spec.gpu && !config.supports_gpu {
-            return Err(Status::failed_precondition(
-                "docker GPU sandboxes require Docker CDI support. Enable CDI on the Docker daemon, then restart the OpenShell gateway/server so GPU capability is detected.",
-            ));
-        }
+        Self::validate_gpu_request(spec.gpu, config.supports_gpu)?;
         if !template.agent_socket_path.trim().is_empty() {
             return Err(Status::failed_precondition(
                 "docker compute driver does not support template.agent_socket_path",
@@ -327,6 +323,15 @@ impl DockerComputeDriver {
         }
 
         let _ = docker_resource_limits(template)?;
+        Ok(())
+    }
+
+    fn validate_gpu_request(gpu: bool, supports_gpu: bool) -> Result<(), Status> {
+        if gpu && !supports_gpu {
+            return Err(Status::failed_precondition(
+                "docker GPU sandboxes require Docker CDI support. Enable CDI on the Docker daemon, then restart the OpenShell gateway/server so GPU capability is detected.",
+            ));
+        }
         Ok(())
     }
 

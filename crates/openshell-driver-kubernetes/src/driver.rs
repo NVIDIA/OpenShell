@@ -195,6 +195,10 @@ impl KubernetesComputeDriver {
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
         let gpu_requested = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu);
+        self.validate_gpu_request(gpu_requested).await
+    }
+
+    async fn validate_gpu_request(&self, gpu_requested: bool) -> Result<(), tonic::Status> {
         if gpu_requested
             && !self.has_gpu_capacity().await.map_err(|err| {
                 tonic::Status::internal(format!("check GPU node capacity failed: {err}"))
