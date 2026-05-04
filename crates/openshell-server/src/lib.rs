@@ -487,17 +487,12 @@ async fn build_compute_runtime(
                     supervisor_image,
                     supervisor_image_pull_policy,
                     grpc_endpoint: config.grpc_endpoint.clone(),
-                    // Filesystem path to the supervisor's Unix-socket SSH daemon.
-                    // The path lives in a root-only directory so only the
-                    // supervisor can connect; the gateway reaches it through the
-                    // RelayStream bridge, not directly. Override via
-                    // `sandbox_ssh_socket_path` in the config for deployments
-                    // where multiple supervisors share a filesystem.
                     ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
                     ssh_handshake_secret: config.ssh_handshake_secret.clone(),
                     ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
                     client_tls_secret_name: config.client_tls_secret_name.clone(),
                     host_gateway_ip: config.host_gateway_ip.clone(),
+                    enable_user_namespaces: config.enable_user_namespaces,
                 },
                 store,
                 sandbox_index,

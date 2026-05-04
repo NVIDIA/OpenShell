@@ -90,6 +90,10 @@ spec:
             - name: OPENSHELL_HOST_GATEWAY_IP
               value: {{ .Values.server.hostGatewayIP | quote }}
             {{- end }}
+            {{- if .Values.server.enableUserNamespaces }}
+            - name: OPENSHELL_ENABLE_USER_NAMESPACES
+              value: "true"
+            {{- end }}
             - name: OPENSHELL_SSH_HANDSHAKE_SECRET
               valueFrom:
                 secretKeyRef:

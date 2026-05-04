@@ -63,6 +63,9 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")]
     supervisor_image_pull_policy: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
+    enable_user_namespaces: bool,
 }
 
 #[tokio::main]
@@ -88,6 +91,7 @@ async fn main() -> Result<()> {
         ssh_handshake_skew_secs: args.ssh_handshake_skew_secs,
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
         host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
+        enable_user_namespaces: args.enable_user_namespaces,
     })
     .await
     .into_diagnostic()?;
