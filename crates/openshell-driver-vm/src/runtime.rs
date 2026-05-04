@@ -346,6 +346,8 @@ fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
 
     if config.gpu_bdf.is_some() {
         parts.push("firmware_class.path=/lib/firmware".to_string());
+        parts.push("modprobe.blacklist=nouveau".to_string());
+        parts.push("nouveau.modeset=0".to_string());
     }
 
     parts.join(" ")

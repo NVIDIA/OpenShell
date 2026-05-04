@@ -123,6 +123,28 @@ CONFIG_MEMCG=y
 CONFIG_POSIX_MQUEUE=y
 CONFIG_POSIX_MQUEUE_SYSCTL=y
 
+# ── PCI/PCIe (required for GPU passthrough via QEMU vfio-pci) ────────────
+# The libkrunfw base config disables CONFIG_PCI. GPU sandboxes using the
+# QEMU backend pass the GPU through as a PCIe device on a q35 machine.
+# Without PCI core support the guest kernel cannot see any PCI bus, so the
+# nvidia driver loads but finds zero devices.
+CONFIG_PCI=y
+CONFIG_PCI_MSI=y
+CONFIG_PCIEPORTBUS=y
+
+# ── Loadable kernel modules (required for GPU passthrough) ──────────────
+# The libkrunfw base config disables CONFIG_MODULES. GPU sandboxes need it
+# to load nvidia.ko, nvidia-uvm.ko, and nvidia-modeset.ko at boot via
+# modprobe. Without this, the guest kernel rejects all module loads.
+#
+# SECURITY NOTE: This enables module loading for ALL VMs (including
+# non-GPU), expanding the guest kernel attack surface. The sandbox
+# supervisor's seccomp profile must block init_module/finit_module
+# syscalls for the sandbox user to prevent arbitrary module loading.
+# Tracked: consider per-purpose kernel builds (GPU vs non-GPU).
+CONFIG_MODULES=y
+CONFIG_MODULE_UNLOAD=y
+
 # ── Security features required by the sandbox runtime ───────────────────
 CONFIG_SECURITY_LANDLOCK=y
 CONFIG_SECCOMP_FILTER=y
