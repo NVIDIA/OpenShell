@@ -221,7 +221,7 @@ pub fn validate_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
 /// this exact version; a mismatch causes `modprobe` failures at boot.
 ///
 /// Keep in sync with:
-///   - `tasks/scripts/vm/build-nvidia-modules.sh` (KERNEL_TREE path)
+///   - `tasks/scripts/vm/build-nvidia-modules.sh` (`KERNEL_TREE` path)
 ///   - `openshell-vm-sandbox-init.sh` `setup_gpu()` expected version
 const GUEST_KERNEL_VERSION: &str = "6.12.76";
 
@@ -271,13 +271,8 @@ pub fn inject_gpu_modules(rootfs: &Path, state_dir: &Path) -> Result<(), String>
 
     for ko in &ko_files {
         let dest = modules_dst.join(ko.file_name().unwrap());
-        let bytes_copied = fs::copy(ko, &dest).map_err(|e| {
-            format!(
-                "copy {} -> {}: {e}",
-                ko.display(),
-                dest.display()
-            )
-        })?;
+        let bytes_copied = fs::copy(ko, &dest)
+            .map_err(|e| format!("copy {} -> {}: {e}", ko.display(), dest.display()))?;
         tracing::info!(
             module = %ko.file_name().unwrap().to_string_lossy(),
             size_bytes = bytes_copied,
@@ -323,7 +318,7 @@ fn warn_missing_gpu_userspace(rootfs: &Path) {
 ///   1. `OPENSHELL_GPU_MODULES_DIR` env var (explicit override)
 ///   2. `<state_dir>/gpu-modules/` (operator pre-provisioned)
 ///   3. `<project_root>/target/libkrun-build/nvidia-modules/` (build tree,
-///       discovered relative to the driver executable)
+///      discovered relative to the driver executable)
 ///   4. Host `/lib/modules/<GUEST_KERNEL_VERSION>/kernel/drivers/nvidia/`
 fn resolve_gpu_modules_dir(state_dir: &Path) -> Result<PathBuf, String> {
     if let Ok(dir) = std::env::var("OPENSHELL_GPU_MODULES_DIR") {
@@ -379,9 +374,11 @@ fn resolve_gpu_modules_dir(state_dir: &Path) -> Result<PathBuf, String> {
 /// `OPENSHELL_GPU_MODULES_DIR` or pre-provision `<state_dir>/gpu-modules/`.
 fn discover_build_tree_modules() -> Option<PathBuf> {
     #[cfg(unix)]
-    if unsafe { libc::getuid() } == 0 {
-        tracing::debug!("build-tree GPU module discovery running as root; \
-                         prefer OPENSHELL_GPU_MODULES_DIR in production");
+    if nix::unistd::Uid::effective().is_root() {
+        tracing::debug!(
+            "build-tree GPU module discovery running as root; \
+                         prefer OPENSHELL_GPU_MODULES_DIR in production"
+        );
     }
     let exe = std::env::current_exe().ok()?;
     // exe is typically target/{debug,release}/openshell-driver-vm
@@ -398,7 +395,9 @@ fn discover_build_tree_modules() -> Option<PathBuf> {
     // Also try CWD-relative (for `cargo run` or `mise run` from project root).
     let cwd_candidate = PathBuf::from("target/libkrun-build/nvidia-modules");
     if dir_has_ko_files(&cwd_candidate) {
-        let abs = cwd_candidate.canonicalize().unwrap_or(cwd_candidate.clone());
+        let abs = cwd_candidate
+            .canonicalize()
+            .unwrap_or_else(|_| cwd_candidate.clone());
         tracing::info!(
             path = %abs.display(),
             "auto-discovered GPU modules relative to CWD"
@@ -422,10 +421,13 @@ fn dir_has_ko_files(dir: &Path) -> bool {
         let path = entry.path();
         match path.extension().and_then(|e| e.to_str()) {
             Some("ko") => has_uncompressed = true,
-            Some("zst" | "xz") => {
-                if path.file_stem().and_then(|s| std::path::Path::new(s).extension()).is_some_and(|ext| ext == "ko") {
-                    has_compressed = true;
-                }
+            Some("zst" | "xz")
+                if path
+                    .file_stem()
+                    .and_then(|s| Path::new(s).extension())
+                    .is_some_and(|ext| ext == "ko") =>
+            {
+                has_compressed = true;
             }
             _ => {}
         }
@@ -458,18 +460,16 @@ fn inject_gpu_firmware(rootfs: &Path, modules_dir: &Path) {
     }
 
     // Try version-matched firmware next to the modules directory.
-    let fw_parent = modules_dir
-        .parent()
-        .map(|p| p.join("nvidia-firmware"));
+    let fw_parent = modules_dir.parent().map(|p| p.join("nvidia-firmware"));
 
-    if let Some(ref fw_dir) = fw_parent {
-        if fw_dir.is_dir() {
-            if let Err(e) = copy_dir_contents(fw_dir, &fw_dst) {
-                tracing::warn!(error = %e, "failed to copy version-matched firmware");
-            } else {
-                tracing::info!(src = %fw_dir.display(), "injected GPU firmware (version-matched)");
-                return;
-            }
+    if let Some(ref fw_dir) = fw_parent
+        && fw_dir.is_dir()
+    {
+        if let Err(e) = copy_dir_contents(fw_dir, &fw_dst) {
+            tracing::warn!(error = %e, "failed to copy version-matched firmware");
+        } else {
+            tracing::info!(src = %fw_dir.display(), "injected GPU firmware (version-matched)");
+            return;
         }
     }
 
@@ -489,7 +489,9 @@ fn inject_gpu_firmware(rootfs: &Path, modules_dir: &Path) {
     tracing::warn!(
         "no NVIDIA GSP firmware found; GPU guests may fail to initialize. \
          Place firmware in {:?} or host /lib/firmware/nvidia/",
-        fw_parent.as_deref().unwrap_or(Path::new("(unknown)"))
+        fw_parent
+            .as_deref()
+            .unwrap_or_else(|| Path::new("(unknown)"))
     );
 }
 
@@ -517,13 +519,13 @@ fn rootfs_has_firmware_bins(fw_dir: &Path) -> bool {
 /// images install `kmod` but lack the convenience symlinks in `/usr/sbin`.
 fn ensure_kmod_symlinks(rootfs: &Path) {
     let kmod_candidates = ["bin/kmod", "usr/bin/kmod", "sbin/kmod", "usr/sbin/kmod"];
-    let kmod_exists = kmod_candidates
-        .iter()
-        .any(|p| rootfs.join(p).exists());
+    let kmod_exists = kmod_candidates.iter().any(|p| rootfs.join(p).exists());
 
     if !kmod_exists {
-        tracing::warn!("kmod not found in rootfs; modprobe will fail. \
-                        Ensure the sandbox image installs the 'kmod' package.");
+        tracing::warn!(
+            "kmod not found in rootfs; modprobe will fail. \
+                        Ensure the sandbox image installs the 'kmod' package."
+        );
         return;
     }
 
@@ -845,13 +847,16 @@ mod tests {
 
         fs::create_dir_all(&modules_dir).expect("create modules dir");
         fs::create_dir_all(&rootfs).expect("create rootfs dir");
-        fs::write(modules_dir.join("nvidia.ko"), b"\x7fELF-fake-module-1").expect("write nvidia.ko");
+        fs::write(modules_dir.join("nvidia.ko"), b"\x7fELF-fake-module-1")
+            .expect("write nvidia.ko");
         fs::write(modules_dir.join("nvidia-uvm.ko"), b"\x7fELF-fake-module-2")
             .expect("write nvidia-uvm.ko");
 
-        unsafe { std::env::set_var("OPENSHELL_GPU_MODULES_DIR", &modules_dir) };
-        let result = inject_gpu_modules(&rootfs, Path::new("/dummy/state"));
-        unsafe { std::env::remove_var("OPENSHELL_GPU_MODULES_DIR") };
+        let result = temp_env::with_var(
+            "OPENSHELL_GPU_MODULES_DIR",
+            Some(modules_dir.as_os_str()),
+            || inject_gpu_modules(&rootfs, Path::new("/dummy/state")),
+        );
 
         result.expect("inject_gpu_modules should succeed");
 
@@ -870,9 +875,11 @@ mod tests {
         fs::create_dir_all(&modules_dir).expect("create modules dir");
         fs::write(modules_dir.join("readme.txt"), b"not a kernel module").expect("write txt");
 
-        unsafe { std::env::set_var("OPENSHELL_GPU_MODULES_DIR", &modules_dir) };
-        let result = inject_gpu_modules(Path::new("/dummy/rootfs"), Path::new("/dummy/state"));
-        unsafe { std::env::remove_var("OPENSHELL_GPU_MODULES_DIR") };
+        let result = temp_env::with_var(
+            "OPENSHELL_GPU_MODULES_DIR",
+            Some(modules_dir.as_os_str()),
+            || inject_gpu_modules(Path::new("/dummy/rootfs"), Path::new("/dummy/state")),
+        );
 
         let err = result.expect_err("should fail with no .ko files");
         assert!(
@@ -888,9 +895,11 @@ mod tests {
         let dir = unique_temp_dir();
         let missing = dir.join("does-not-exist");
 
-        unsafe { std::env::set_var("OPENSHELL_GPU_MODULES_DIR", &missing) };
-        let result = inject_gpu_modules(Path::new("/dummy/rootfs"), Path::new("/dummy/state"));
-        unsafe { std::env::remove_var("OPENSHELL_GPU_MODULES_DIR") };
+        let result = temp_env::with_var(
+            "OPENSHELL_GPU_MODULES_DIR",
+            Some(missing.as_os_str()),
+            || inject_gpu_modules(Path::new("/dummy/rootfs"), Path::new("/dummy/state")),
+        );
 
         let err = result.expect_err("should fail with missing directory");
         assert!(
@@ -916,8 +925,7 @@ mod tests {
 
         let content = fs::read(fw_dir.join("gsp.bin")).expect("read gsp.bin after injection");
         assert_eq!(
-            content,
-            b"original-firmware-content",
+            content, b"original-firmware-content",
             "firmware should not be overwritten when rootfs already has .bin files"
         );
 

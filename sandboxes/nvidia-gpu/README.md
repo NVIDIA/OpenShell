@@ -77,6 +77,7 @@ docker build \
 ### Changing the NVIDIA driver version
 
 Update all three locations:
+
 1. `sandboxes/nvidia-gpu/versions.env`
 2. `sandboxes/nvidia-gpu/Dockerfile` ARG `NVIDIA_DRIVER_VERSION`
 3. Rebuild kernel modules: `NVIDIA_OPEN_VERSION=<version> mise run vm:nvidia-modules`

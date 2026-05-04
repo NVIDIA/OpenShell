@@ -44,6 +44,9 @@ flate2 = "1"
 sha2 = "0.10"
 zstd = "0.13"
 
+[dev-dependencies]
+temp-env = "0.3"
+
 # smol-rs/polling drives the BSD/macOS parent-death detection in
 # procguard via kqueue's EVFILT_PROC / NOTE_EXIT filter. We could use
 # it on Linux too (via epoll + pidfd) but sticking with
