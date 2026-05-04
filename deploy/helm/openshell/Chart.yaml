@@ -5,5 +5,8 @@ apiVersion: v2
 name: openshell
 description: runtime environment for autonomous agents
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+# Updated to the release version by CI. The appVersion doubles as the default
+# image tag (image.tag defaults to appVersion when empty), so a released chart
+# automatically pulls the matching gateway and supervisor images.
+version: 0.0.0
+appVersion: "0.0.0"
