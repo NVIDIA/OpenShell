@@ -53,12 +53,12 @@ policy-management loop. Use `DEMO_POLICY_FILE` to point at a policy that also
 allows your chosen agent to reach its model/provider endpoints.
 
 ```bash
-export DEMO_GITHUB_OWNER=<owner>
-export DEMO_GITHUB_REPO=<repo>
-export DEMO_GITHUB_TOKEN=<token-with-contents-write>
-export DEMO_POLICY_FILE=/path/to/policy-that-allows-your-agent.yaml
-export DEMO_AGENT_PROVIDERS="my-agent-provider"
-export DEMO_AGENT_COMMAND='<agent command that reads /sandbox/payload/agent-task.md>'
+cp examples/agent-driven-policy-management/.env.sample .env.agent-policy-demo
+$EDITOR .env.agent-policy-demo
+
+set -a
+source .env.agent-policy-demo
+set +a
 
 bash examples/agent-driven-policy-management/demo.sh
 ```
