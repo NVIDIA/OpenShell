@@ -59,7 +59,7 @@ Every sandbox starts with **minimal outbound access**. You open additional acces
 
 ```bash
 # 1. Create a sandbox (starts with minimal outbound access)
-openshell sandbox create
+openshell sandbox create --name demo
 
 # 2. Inside the sandbox — blocked
 sandbox$ curl -sS https://api.github.com/zen
