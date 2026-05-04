@@ -53,11 +53,11 @@ policy-management loop. Use `DEMO_POLICY_FILE` to point at a policy that also
 allows your chosen agent to reach its model/provider endpoints.
 
 ```bash
-cp examples/agent-driven-policy-management/.env.sample .env.agent-policy-demo
-$EDITOR .env.agent-policy-demo
+cp examples/agent-driven-policy-management/.env.example .env
+$EDITOR .env
 
 set -a
-source .env.agent-policy-demo
+source .env
 set +a
 
 bash examples/agent-driven-policy-management/demo.sh
