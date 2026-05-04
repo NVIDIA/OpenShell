@@ -191,7 +191,7 @@ spec:
             secretName: {{ .Values.server.tls.certSecretName }}
         - name: tls-client-ca
           secret:
-            {{- if or .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+            {{- if .Values.pkiInitJob.enabled }}
             secretName: {{ .Values.server.tls.certSecretName }}
             items:
               - key: ca.crt
