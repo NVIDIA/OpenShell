@@ -70,6 +70,12 @@ spec:
             - name: OPENSHELL_SANDBOX_IMAGE_PULL_POLICY
               value: {{ .Values.server.sandboxImagePullPolicy | quote }}
             {{- end }}
+            - name: OPENSHELL_SUPERVISOR_IMAGE
+              value: {{ .Values.server.supervisorImage | quote }}
+            {{- if .Values.server.supervisorImagePullPolicy }}
+            - name: OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY
+              value: {{ .Values.server.supervisorImagePullPolicy | quote }}
+            {{- end }}
             - name: OPENSHELL_GRPC_ENDPOINT
               value: {{ if .Values.server.disableTls }}{{ .Values.server.grpcEndpoint | replace "https://" "http://" | quote }}{{ else }}{{ .Values.server.grpcEndpoint | quote }}{{ end }}
             {{- if .Values.server.sshGatewayHost }}

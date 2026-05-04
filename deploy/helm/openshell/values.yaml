@@ -78,6 +78,14 @@ server:
   # (Always for :latest, IfNotPresent otherwise).  Set to "Always" for dev
   # clusters so new images are picked up without manual eviction.
   sandboxImagePullPolicy: ""
+  # Image that provides the openshell-sandbox supervisor binary.  An init
+  # container copies the binary from this image into a shared emptyDir volume
+  # before the sandbox container starts.  Should match the gateway image tag
+  # so the supervisor and gateway versions stay in sync.
+  supervisorImage: "ghcr.io/nvidia/openshell/supervisor:latest"
+  # Kubernetes imagePullPolicy for the supervisor init container.
+  # Empty = Kubernetes default.
+  supervisorImagePullPolicy: ""
   # gRPC endpoint for sandboxes to callback to OpenShell (must be reachable from pods)
   grpcEndpoint: "https://openshell.openshell.svc.cluster.local:8080"
   # Public host/port returned to CLI clients for SSH proxy CONNECT requests.
