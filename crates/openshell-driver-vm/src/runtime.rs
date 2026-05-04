@@ -1325,6 +1325,17 @@ fn path_to_cstring(path: &Path) -> Result<CString, String> {
     CString::new(path).map_err(|e| format!("invalid path string {path}: {e}"))
 }
 
+#[cfg(target_os = "linux")]
+fn check_kvm_access() -> Result<(), String> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/kvm")
+        .map(|_| ())
+        .map_err(|e| {
+            format!("cannot open /dev/kvm: {e}\nKVM access is required to run microVMs on Linux.")
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1373,15 +1384,4 @@ mod tests {
         assert!(!cmdline.contains("VM_NET_DNS="));
         assert!(!cmdline.contains("GPU_ENABLED="));
     }
-}
-
-#[cfg(target_os = "linux")]
-fn check_kvm_access() -> Result<(), String> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .open("/dev/kvm")
-        .map(|_| ())
-        .map_err(|e| {
-            format!("cannot open /dev/kvm: {e}\nKVM access is required to run microVMs on Linux.")
-        })
 }
