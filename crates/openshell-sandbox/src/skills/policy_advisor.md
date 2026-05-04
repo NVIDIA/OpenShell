@@ -11,37 +11,32 @@ the proposal; do not try to bypass policy.
 
 ## Local API
 
-Use the sandbox-local policy API:
+The sandbox-local policy API is reachable at `http://policy.local`:
 
-- `GET http://policy.local/v1/policy/current`
-- `GET http://policy.local/v1/denials?last=10`
-- `POST http://policy.local/v1/proposals`
+- `GET /v1/policy/current` — current effective policy as YAML.
+- `GET /v1/denials?last=10` — most recent network/L7 denials seen by this
+  sandbox (newest first).
+- `POST /v1/proposals` — submit a proposal for developer approval.
 
-The MVP proposal endpoint accepts a JSON object containing an `intent_summary`
-and one or more `PolicyMergeOperation` objects. Start with a full `addRule`
-operation because the existing developer inbox reviews complete draft rules.
-
-You can also inspect your own logs:
-
-- `/var/log/openshell.YYYY-MM-DD.log` is the default shorthand log.
-- `/var/log/openshell-ocsf.YYYY-MM-DD.log` is present when OCSF JSONL logging is enabled.
+The proposal body takes an `intent_summary` and one or more `addRule`
+operations. Each `addRule` carries a complete narrow `NetworkPolicyRule`.
 
 ## Workflow
 
 1. Read the denial response body. Use `layer`, `method`, `path`, `host`,
    `port`, `binary`, `rule_missing`, and `detail` as evidence.
-2. Fetch the current policy from `policy.local`.
-3. Fetch recent denials if the response body is incomplete.
+2. Fetch the current policy from `/v1/policy/current`.
+3. Fetch recent denials from `/v1/denials` if the response body is incomplete.
 4. Prefer L7 REST rules for REST APIs. Use L4 only for non-REST protocols or
    when the client tunnels opaque traffic that OpenShell cannot inspect.
 5. Draft the narrowest rule: exact host, exact port, exact binary when known,
-   exact method, and the smallest safe path glob.
-6. Submit the proposal, tell the developer what you proposed, and wait for
-   approval before retrying the denied action.
+   exact method, and the smallest safe path.
+6. Submit the proposal, tell the developer what you proposed, and retry the
+   denied action only after approval.
 
-## Proposal Shapes
+## Proposal shape
 
-Submit a complete narrow REST-inspected rule:
+A complete narrow REST-inspected rule looks like this:
 
 ```json
 {
@@ -80,50 +75,23 @@ Submit a complete narrow REST-inspected rule:
 }
 ```
 
-For GitHub repository creation, keep the path exact:
-
-```json
-{
-  "intent_summary": "Allow gh to create a repository for the authenticated user.",
-  "operations": [
-    {
-      "addRule": {
-        "ruleName": "github_api_repo_create",
-        "rule": {
-          "name": "github_api_repo_create",
-          "endpoints": [
-            {
-              "host": "api.github.com",
-              "port": 443,
-              "protocol": "rest",
-              "enforcement": "enforce",
-              "rules": [
-                {
-                  "allow": {
-                    "method": "POST",
-                    "path": "/user/repos"
-                  }
-                }
-              ]
-            }
-          ],
-          "binaries": [
-            {
-              "path": "/usr/bin/gh"
-            }
-          ]
-        }
-      }
-    }
-  ]
-}
-```
-
 ## Norms
 
 - Do not propose wildcard hosts such as `**` or `*.com`.
 - Do not propose `access: full` to fix a single denied REST request.
-- Do not include query strings, tokens, credentials, or secret values.
+- Do not include query strings, tokens, credentials, or secret values in
+  paths.
 - Explain uncertainty in `intent_summary` instead of widening the rule.
-- If pushing with `git` fails, that may be a separate L4 or protocol-specific
-  path from GitHub REST API access; propose it separately.
+- If pushing with `git` fails, that is a separate L4 or protocol-specific
+  path from GitHub REST API access. Propose it separately.
+
+## Local logs (read-only)
+
+Two local files complement the API and are useful when debugging policy
+behavior:
+
+- `/var/log/openshell.YYYY-MM-DD.log` — shorthand log of sandbox activity.
+- `/var/log/openshell-ocsf.YYYY-MM-DD.log` — OCSF JSONL events when enabled.
+
+The `/v1/denials` endpoint reads these structured events for you; the files
+are listed here only as a fallback for inspection.
