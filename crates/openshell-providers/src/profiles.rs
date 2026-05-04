@@ -14,16 +14,16 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
-    include_str!("../profiles/anthropic.yaml"),
-    include_str!("../profiles/claude.yaml"),
-    include_str!("../profiles/codex.yaml"),
-    include_str!("../profiles/copilot.yaml"),
-    include_str!("../profiles/github.yaml"),
-    include_str!("../profiles/gitlab.yaml"),
-    include_str!("../profiles/nvidia.yaml"),
-    include_str!("../profiles/openai.yaml"),
-    include_str!("../profiles/opencode.yaml"),
-    include_str!("../profiles/outlook.yaml"),
+    include_str!("../../../providers/anthropic.yaml"),
+    include_str!("../../../providers/claude.yaml"),
+    include_str!("../../../providers/codex.yaml"),
+    include_str!("../../../providers/copilot.yaml"),
+    include_str!("../../../providers/github.yaml"),
+    include_str!("../../../providers/gitlab.yaml"),
+    include_str!("../../../providers/nvidia.yaml"),
+    include_str!("../../../providers/openai.yaml"),
+    include_str!("../../../providers/opencode.yaml"),
+    include_str!("../../../providers/outlook.yaml"),
 ];
 
 #[derive(Debug, thiserror::Error)]

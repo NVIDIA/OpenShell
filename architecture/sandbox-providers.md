@@ -49,8 +49,8 @@ The gRPC surface is defined in `proto/openshell.proto`:
 ## Provider Type Profiles
 
 Provider type profiles are declarative metadata for provider types. Built-in profiles
-live as one YAML document per provider under
-`crates/openshell-providers/profiles/` and are exposed through
+live as one YAML document per provider under the top-level `providers/` directory
+and are exposed through
 `ListProviderProfiles` and `GetProviderProfile`. The profile loader validates the
 YAML catalog and materializes the same proto-backed shape that future API imports
 will accept. Profiles describe credential names and environment variables, known
