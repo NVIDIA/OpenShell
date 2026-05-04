@@ -14,8 +14,13 @@ Run the first policy-advisor MVP loop from one host-side script:
 6. Approve the draft rule from outside the sandbox.
 7. Retry the same write and confirm it succeeds.
 
-The script is deterministic. It does not launch a real coding agent; it uses
-the same sandbox-local interfaces that the agent will use.
+`demo.sh` is deterministic. It does not launch a real coding agent; it uses the
+same sandbox-local interfaces that the agent will use.
+
+`dogfood.sh` runs the next loop: Codex starts inside the sandbox, observes the
+structured denial, reads `/etc/openshell/skills/policy_advisor.md`, drafts and
+submits a narrow proposal through `policy.local`, then retries after the host
+developer approves.
 
 ## Prerequisites
 
@@ -63,10 +68,34 @@ export DEMO_GITHUB_TOKEN="$(gh auth token)"
 bash examples/agent-driven-policy-management/demo.sh
 ```
 
+## Codex Dogfood
+
+Sign in to Codex locally, then run:
+
+```bash
+codex login
+
+export DEMO_GITHUB_OWNER=<owner>
+export DEMO_GITHUB_REPO=<repo>
+export DEMO_GITHUB_TOKEN="$(gh auth token)"
+
+bash examples/agent-driven-policy-management/dogfood.sh
+```
+
+The host script only orchestrates sandbox lifecycle and developer approval. The
+policy proposal is authored by Codex inside the sandbox from the installed
+skill, structured denial response, and `policy.local` API.
+
 The demo writes one markdown file under:
 
 ```text
 openshell-policy-advisor-demo/<run-id>.md
+```
+
+The dogfood run writes under:
+
+```text
+openshell-policy-advisor-dogfood/<run-id>.md
 ```
 
 Use a scratch repository or a demo branch if you do not want this file in a
@@ -80,4 +109,5 @@ export DEMO_BRANCH=main
 export DEMO_RUN_ID="$(date +%Y%m%d-%H%M%S)"
 export DEMO_FILE_DIR=openshell-policy-advisor-demo
 export DEMO_KEEP_SANDBOX=0
+export DEMO_APPROVAL_TIMEOUT_SECS=180
 ```
