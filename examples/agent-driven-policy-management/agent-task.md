@@ -1,45 +1,48 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Agent Policy Management Demo Task
+You are running inside an OpenShell sandbox. Your job is to write one
+markdown file to GitHub via the GitHub Contents API.
 
-You are inside an OpenShell sandbox. The user asked you to write one markdown
-file to GitHub using the GitHub Contents API.
-
-Target:
+## Target
 
 - Repository: `{{OWNER}}/{{REPO}}`
 - Branch: `{{BRANCH}}`
 - File path: `{{FILE_PATH}}`
 - Run id: `{{RUN_ID}}`
 
-Requirements:
+## What to do
 
-- Use ordinary shell commands and the `GITHUB_TOKEN` environment variable.
-- Do not print, echo, or reveal the token.
-- First try to write the file with `PUT /repos/{{OWNER}}/{{REPO}}/contents/{{FILE_PATH}}`.
-- If OpenShell returns `policy_denied`, read
-  `/etc/openshell/skills/policy_advisor.md` and follow the local API workflow
-  there.
-- Submit the narrowest proposal that permits only this write.
-- Do not include a `tls` field in the proposed endpoint unless you are
-  explicitly disabling TLS inspection.
-- After submitting a proposal, retry the write for up to 120 seconds. The
-  developer may approve while you are waiting.
-- Do not print the full GitHub response body. It can include temporary
-  `download_url` query tokens. Extract only `content.path`, `content.html_url`,
-  and `commit.sha`.
-- Finish with a short summary that says whether the write succeeded. Include
-  the GitHub file path and URL if GitHub returns them.
+1. PUT the file with `curl` against
+   `https://api.github.com/repos/{{OWNER}}/{{REPO}}/contents/{{FILE_PATH}}`.
+   Authenticate with the `GITHUB_TOKEN` environment variable. Do not echo the
+   token. Body content (base64-encoded into the JSON `content` field):
 
-Suggested file content:
+   ```
+   # OpenShell policy advisor demo
 
-```markdown
-# OpenShell policy advisor demo
+   Run id: {{RUN_ID}}
 
-Run id: {{RUN_ID}}
+   Written from inside an OpenShell sandbox after a narrowly-scoped policy
+   proposal was approved by the developer.
+   ```
 
-This file was written from inside an OpenShell sandbox after the agent read the
-policy advisor skill, submitted a narrow policy proposal, and waited for
-developer approval.
-```
+2. The first attempt will fail with HTTP 403 and a JSON body containing
+   `"error": "policy_denied"`. Read the body — it tells you which layer denied
+   you (`l7`/`rest`), which method/path was missing, and where to learn more.
+
+3. Read `/etc/openshell/skills/policy_advisor.md` and follow it. Submit the
+   narrowest possible proposal to `http://policy.local/v1/proposals` — exact
+   host, exact port, exact method, exact path, binary `/usr/bin/curl`. Do not
+   include query strings. Do not propose wildcard hosts.
+
+4. After submitting, retry the PUT every few seconds for up to 120 seconds.
+   The developer is approving from outside the sandbox; once approved, the
+   sandbox hot-reloads policy and the same PUT will succeed.
+
+5. Stop as soon as the PUT returns HTTP 200 or 201. Print a short summary
+   showing whether it succeeded, plus `content.path` and `content.html_url`
+   from the GitHub response. Do not print the full response body.
+
+If anything is unclear, prefer making a narrower proposal and asking for
+approval again over widening the rule.
