@@ -32,6 +32,7 @@ mod multiplex;
 mod persistence;
 pub(crate) mod policy_store;
 mod provider_refresh;
+mod readiness;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
@@ -63,7 +64,7 @@ pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
 use openshell_driver_kubernetes::KubernetesComputeConfig;
-use persistence::Store;
+pub use persistence::Store;
 use sandbox_index::SandboxIndex;
 use sandbox_watch::SandboxWatchBus;
 pub use tls::TlsAcceptor;
@@ -196,6 +197,7 @@ pub async fn run_server(
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
+
     let store = Arc::new(Store::connect(database_url).await?);
 
     let oidc_cache = if let Some(ref oidc) = config.oidc {
@@ -368,9 +370,12 @@ pub async fn run_server(
             ))
         })?;
         info!(address = %health_bind_address, "Health server listening");
+        // `health_router` returns immediately; the listener serves
+        // `Initializing → 503` until the background monitor publishes the
+        // first real probe outcome, so the endpoint is always responsive.
+        let router = health_router(store.clone());
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(health_listener, health_router().into_make_service()).await
-            {
+            if let Err(e) = axum::serve(health_listener, router.into_make_service()).await {
                 error!("Health server error: {e}");
             }
         });

@@ -191,6 +191,13 @@ helm upgrade --install openshell \
 
 The ServiceAccount must already have the Role and ClusterRole bindings described above.
 
+## Probes
+
+The gateway exposes `/healthz` for process liveness and `/readyz` for dependency-aware readiness on the health port. The Helm chart wires both into Kubernetes probes:
+
+- `startupProbe` and `livenessProbe` use `/healthz`.
+- `readinessProbe` uses `/readyz`, which reflects the latest result of an in-process background database check.
+
 ## Next Steps
 
 - To enable automatic certificate rotation with cert-manager, refer to [Managing Certificates](/kubernetes/managing-certificates).

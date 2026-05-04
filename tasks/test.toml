@@ -26,7 +26,12 @@ depends = ["e2e:python:gpu"]
 
 ["test:rust"]
 description = "Run Rust tests"
-run = "cargo test --workspace"
+run = [
+  # Run the workspace once without openshell-server so we can run that crate
+  # with test-only helpers enabled.
+  "cargo test --workspace --exclude openshell-server",
+  "cargo test -p openshell-server --features test-support",
+]
 hide = true
 
 ["test:python"]

@@ -28,7 +28,7 @@ use openshell_core::proto::{
     open_shell_server::{OpenShell, OpenShellServer},
 };
 use openshell_server::supervisor_session::SupervisorSessionRegistry;
-use openshell_server::{MultiplexedService, health_router};
+use openshell_server::{MultiplexedService, Store, health_router};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -417,7 +417,7 @@ async fn spawn_gateway(registry: Arc<SupervisorSessionRegistry>) -> Channel {
     let addr = listener.local_addr().unwrap();
 
     let grpc = OpenShellServer::new(RelayGateway { registry });
-    let service = MultiplexedService::new(grpc, health_router());
+    let service = MultiplexedService::new(grpc, health_router(test_health_store().await));
 
     tokio::spawn(async move {
         loop {
@@ -707,4 +707,14 @@ async fn open_relay_enforces_per_sandbox_cap_under_concurrent_burst() {
         .open_relay("sbx-other", Duration::from_secs(1))
         .await
         .expect("other sandbox should not be affected by sbx cap");
+}
+
+/// Build an in-memory store sufficient for wiring `health_router` in tests
+/// where the persistence layer itself is not under test.
+async fn test_health_store() -> Arc<Store> {
+    Arc::new(
+        Store::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite store for tests"),
+    )
 }

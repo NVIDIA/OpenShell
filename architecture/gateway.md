@@ -37,6 +37,12 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
+Dedicated health listeners expose `/healthz` (process liveness only) and
+`/readyz` (dependency-aware readiness). Readiness reflects the latest result
+of an in-process background task that pings the persistence layer on a
+fixed cadence; the handler reads a cached state, so responses are
+sub-millisecond and never race the kubelet probe timeout.
+
 Supported auth modes:
 
 | Mode | Use |
