@@ -692,7 +692,10 @@ fn supervisor_volume_mount() -> serde_json::Value {
 /// (e.g. at `/usr/local/bin/openshell-sandbox`). The init container resolves
 /// the binary via `command -v` and copies it into the shared emptyDir volume
 /// so the agent container can execute it from a fixed, writable path.
-fn supervisor_init_container(supervisor_image: &str, supervisor_image_pull_policy: &str) -> serde_json::Value {
+fn supervisor_init_container(
+    supervisor_image: &str,
+    supervisor_image_pull_policy: &str,
+) -> serde_json::Value {
     let copy_cmd = format!(
         "set -e && \
          mkdir -p {SUPERVISOR_MOUNT_PATH} && \
@@ -752,7 +755,10 @@ fn apply_supervisor_sideload(
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut();
     if let Some(init_containers) = init_containers {
-        init_containers.push(supervisor_init_container(supervisor_image, supervisor_image_pull_policy));
+        init_containers.push(supervisor_init_container(
+            supervisor_image,
+            supervisor_image_pull_policy,
+        ));
     }
 
     // 3. Find the agent container and add volume mount + command override
@@ -1048,7 +1054,6 @@ fn sandbox_template_to_k8s(
     host_gateway_ip: &str,
     inject_workspace: bool,
 ) -> serde_json::Value {
-
     let mut metadata = serde_json::Map::new();
     if !template.labels.is_empty() {
         metadata.insert("labels".to_string(), serde_json::json!(template.labels));
@@ -1543,10 +1548,7 @@ mod tests {
             .as_array()
             .expect("initContainers should exist");
         assert_eq!(init_containers.len(), 1);
-        assert_eq!(
-            init_containers[0]["name"],
-            SUPERVISOR_INIT_CONTAINER_NAME
-        );
+        assert_eq!(init_containers[0]["name"], SUPERVISOR_INIT_CONTAINER_NAME);
         assert_eq!(init_containers[0]["image"], "supervisor-image:latest");
         assert_eq!(init_containers[0]["imagePullPolicy"], "IfNotPresent");
 
