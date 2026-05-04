@@ -5268,11 +5268,7 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 }
 
 fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
-    if value.is_empty() {
-        fallback
-    } else {
-        value
-    }
+    if value.is_empty() { fallback } else { value }
 }
 
 /// Format a millisecond timestamp into a readable string.
