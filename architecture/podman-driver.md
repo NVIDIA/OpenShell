@@ -170,7 +170,7 @@ The SSH handshake secret is injected via Podman's `secret_env` API rather than a
 | gRPC endpoint (`OPENSHELL_ENDPOINT`) | Plaintext env var, override-protected | Yes | Yes |
 | Supervisor relay socket path (`OPENSHELL_SSH_SOCKET_PATH`) | Plaintext env var, override-protected (same value as `PodmanComputeConfig::sandbox_ssh_socket_path`) | Yes | Yes |
 
-The `build_env()` function in `container.rs` inserts user-supplied variables first, then unconditionally overwrites all security-critical variables to prevent spoofing via sandbox templates: `OPENSHELL_SANDBOX`, `OPENSHELL_SANDBOX_ID`, `OPENSHELL_ENDPOINT`, `OPENSHELL_SSH_SOCKET_PATH`, `OPENSHELL_SSH_LISTEN_ADDR`, `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS`, `OPENSHELL_CONTAINER_IMAGE`, `OPENSHELL_SANDBOX_COMMAND`.
+The `build_env()` function in `container.rs` inserts user-supplied variables first, then unconditionally overwrites all security-critical variables to prevent spoofing via sandbox templates: `OPENSHELL_SANDBOX`, `OPENSHELL_SANDBOX_ID`, `OPENSHELL_ENDPOINT`, `OPENSHELL_SSH_SOCKET_PATH`, `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS`, `OPENSHELL_CONTAINER_IMAGE`, `OPENSHELL_SANDBOX_COMMAND`.
 
 The `PodmanComputeConfig::Debug` impl redacts the handshake secret as `[REDACTED]`.
 

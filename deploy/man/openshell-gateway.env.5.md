@@ -47,7 +47,7 @@ the SSH handshake secret).
 
 ## Gateway
 
-**OPENSHELL_BIND_HOST** (default: 0.0.0.0)
+**OPENSHELL_BIND_ADDRESS** (default: 0.0.0.0)
 :   IP address to bind all listeners to.
 
 **OPENSHELL_SERVER_PORT** (default: 8080)

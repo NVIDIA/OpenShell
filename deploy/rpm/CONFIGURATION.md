@@ -147,7 +147,7 @@ across package upgrades.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENSHELL_BIND_HOST` | `0.0.0.0` | IP address to bind all listeners to |
+| `OPENSHELL_BIND_ADDRESS` | `0.0.0.0` | IP address to bind all listeners to |
 | `OPENSHELL_SERVER_PORT` | `8080` | Port for the gRPC/HTTP API |
 | `OPENSHELL_HEALTH_PORT` | `0` (disabled) | Port for unauthenticated health endpoints (`/healthz`, `/readyz`). Set to a non-zero value to enable. |
 | `OPENSHELL_METRICS_PORT` | `0` (disabled) | Port for Prometheus metrics (`/metrics`). Set to a non-zero value to enable. |

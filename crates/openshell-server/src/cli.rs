@@ -447,6 +447,44 @@ mod tests {
     use super::{Args, command};
     use clap::Parser;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: tests serialize environment mutation with ENV_LOCK.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+
+        #[allow(unsafe_code)]
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: tests serialize environment mutation with ENV_LOCK.
+            unsafe { std::env::remove_var(key) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            match self.original.as_deref() {
+                // SAFETY: tests serialize environment mutation with ENV_LOCK.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: tests serialize environment mutation with ENV_LOCK.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     #[test]
     fn command_uses_gateway_binary_name() {
@@ -465,6 +503,10 @@ mod tests {
 
     #[test]
     fn command_defaults_bind_address_to_loopback() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_BIND_ADDRESS");
         let args =
             Args::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
         assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -472,6 +514,10 @@ mod tests {
 
     #[test]
     fn command_parses_bind_address() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_BIND_ADDRESS");
         let args = Args::try_parse_from([
             "openshell-gateway",
             "--db-url",
@@ -481,5 +527,18 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn command_reads_bind_address_from_env() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::set("OPENSHELL_BIND_ADDRESS", "0.0.0.0");
+
+        let args = Args::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"])
+            .expect("env should provide bind address");
+
+        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     }
 }

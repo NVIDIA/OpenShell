@@ -31,9 +31,9 @@ gRPC and HTTP, secured by mutual TLS (mTLS) by default.
 
 # OPTIONS
 
-**--host** *IP*
-:   IP address to bind all listeners to. Default: **0.0.0.0**.
-    Environment: **OPENSHELL_BIND_HOST**.
+**--bind-address** *IP*
+:   IP address to bind all listeners to. Default: **127.0.0.1**.
+    Environment: **OPENSHELL_BIND_ADDRESS**.
 
 **--port** *PORT*
 :   Port for the gRPC/HTTP API. Default: **8080**.

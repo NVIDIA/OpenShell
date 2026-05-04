@@ -582,7 +582,6 @@ async fn build_compute_runtime(
                     gateway_port: config.bind_address.port(),
                     sandbox_ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
                     network_name,
-                    ssh_listen_addr: format!("0.0.0.0:{}", config.sandbox_ssh_port),
                     ssh_port: config.sandbox_ssh_port,
                     ssh_handshake_secret: config.ssh_handshake_secret.clone(),
                     ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,

@@ -88,8 +88,6 @@ pub struct PodmanComputeConfig {
     /// Name of the Podman bridge network.
     /// Created automatically if it does not exist.
     pub network_name: String,
-    /// SSH listen address passed to the sandbox binary.
-    pub ssh_listen_addr: String,
     /// SSH port inside the container.
     pub ssh_port: u16,
     /// Shared secret for the NSSH1 SSH handshake.
@@ -159,7 +157,6 @@ impl Default for PodmanComputeConfig {
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             sandbox_ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             network_name: DEFAULT_NETWORK_NAME.to_string(),
-            ssh_listen_addr: String::new(),
             ssh_port: DEFAULT_SSH_PORT,
             ssh_handshake_secret: String::new(),
             ssh_handshake_skew_secs: DEFAULT_SSH_HANDSHAKE_SKEW_SECS,
@@ -182,7 +179,6 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("gateway_port", &self.gateway_port)
             .field("sandbox_ssh_socket_path", &self.sandbox_ssh_socket_path)
             .field("network_name", &self.network_name)
-            .field("ssh_listen_addr", &self.ssh_listen_addr)
             .field("ssh_port", &self.ssh_port)
             .field("ssh_handshake_secret", &"[REDACTED]")
             .field("ssh_handshake_skew_secs", &self.ssh_handshake_skew_secs)

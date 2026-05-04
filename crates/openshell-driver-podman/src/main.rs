@@ -121,7 +121,6 @@ async fn main() -> Result<()> {
         gateway_port: args.gateway_port,
         sandbox_ssh_socket_path: args.sandbox_ssh_socket_path,
         network_name: args.network_name,
-        ssh_listen_addr: format!("0.0.0.0:{}", args.sandbox_ssh_port),
         ssh_port: args.sandbox_ssh_port,
         ssh_handshake_secret: args.ssh_handshake_secret,
         ssh_handshake_skew_secs: args.ssh_handshake_skew_secs,

@@ -270,10 +270,6 @@ fn build_env(
         "OPENSHELL_SSH_SOCKET_PATH".into(),
         config.sandbox_ssh_socket_path.clone(),
     );
-    env.insert(
-        "OPENSHELL_SSH_LISTEN_ADDR".into(),
-        config.ssh_listen_addr.clone(),
-    );
     // NOTE: The SSH handshake secret is injected via a Podman secret
     // (see the "secrets" field below) rather than a plaintext env var.
     // This prevents exposure through `podman inspect`.
@@ -922,7 +918,6 @@ mod tests {
             default_image: "test-image:latest".to_string(),
             grpc_endpoint: "http://localhost:50051".to_string(),
             sandbox_ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
-            ssh_listen_addr: "0.0.0.0:2222".to_string(),
             ssh_handshake_secret: "test-secret-value".to_string(),
             ..PodmanComputeConfig::default()
         }

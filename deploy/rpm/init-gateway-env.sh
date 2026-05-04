@@ -55,7 +55,7 @@ OPENSHELL_SSH_HANDSHAKE_SECRET=${SECRET}
 
 # Bind address. 0.0.0.0 listens on all interfaces; mTLS prevents
 # unauthenticated access.
-#OPENSHELL_BIND_HOST=0.0.0.0
+#OPENSHELL_BIND_ADDRESS=0.0.0.0
 
 # API port (default: 8080).
 #OPENSHELL_SERVER_PORT=8080
