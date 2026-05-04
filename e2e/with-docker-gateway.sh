@@ -298,6 +298,7 @@ E2E_NAMESPACE="e2e-docker-$$-${HOST_PORT}"
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
 "${GATEWAY_BIN}" \
+  --bind-address 0.0.0.0 \
   --port "${HOST_PORT}" \
   --drivers docker \
   --sandbox-namespace "${E2E_NAMESPACE}" \
