@@ -16,3 +16,10 @@
 .idea/
 *.tmproj
 .vscode/
+
+# Ignore development files
+skaffold.yaml
+values-keycloak.yaml
+values-ingress.yaml
+values-gateway.yaml
+values-skaffold.yaml

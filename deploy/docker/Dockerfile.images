@@ -13,6 +13,10 @@
 #
 # Rust binaries are built natively before the image build and staged at:
 #   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-{gateway,sandbox}
+#
+# For local dev (Skaffold), pass --build-arg BUILD_FROM_SOURCE=1 to compile
+# binaries inside Docker instead. BuildKit only executes the selected binary
+# staging stage, so missing prebuilt files do not cause a build failure.
 
 # Pin by tag AND manifest-list digest to prevent silent upstream republishes
 # from breaking the build. Update both when bumping k3s versions.
@@ -22,21 +26,66 @@ ARG K3S_DIGEST=sha256:4607083d3cac07e1ccde7317297271d13ed5f60f35a78f33fcef84858a
 ARG K9S_VERSION=v0.50.18
 ARG HELM_VERSION=v3.17.3
 ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
+# Controls binary source: 0 = prebuilt (release), 1 = compile in Docker (local dev).
+# Must be declared here (global scope) so it can be used in FROM instructions below.
+ARG BUILD_FROM_SOURCE=0
+
+# ---------------------------------------------------------------------------
+# Optional in-Docker Rust build (BUILD_FROM_SOURCE=1, local dev only)
+# ---------------------------------------------------------------------------
+FROM rust:1.95.0-slim-bookworm AS rust-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY proto/ proto/
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release \
+        --features "openshell-core/dev-settings" \
+        --bin openshell-gateway \
+        --bin openshell-sandbox \
+    && mkdir -p /build/out \
+    && install -m 0755 target/release/openshell-gateway /build/out/openshell-gateway \
+    && install -m 0755 target/release/openshell-sandbox /build/out/openshell-sandbox
 
 # ---------------------------------------------------------------------------
 # Per-arch binary stages
 # ---------------------------------------------------------------------------
-FROM scratch AS gateway-binary
+
+# Prebuilt path (release default, BUILD_FROM_SOURCE=0)
+FROM scratch AS gateway-binary-0
 ARG TARGETARCH
 # --chmod=755 preserves the executable bit through actions/upload-artifact +
 # download-artifact, which strip exec perms during the roundtrip.
 COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /build/out/openshell-gateway
 
-FROM scratch AS supervisor-binary
+# Source-built path (local dev, BUILD_FROM_SOURCE=1)
+FROM rust-builder AS gateway-binary-1
+
+FROM gateway-binary-${BUILD_FROM_SOURCE} AS gateway-binary
+
+# Prebuilt path (release default, BUILD_FROM_SOURCE=0)
+FROM scratch AS supervisor-binary-0
 ARG TARGETARCH
 # --chmod=755 preserves the executable bit through actions/upload-artifact +
 # download-artifact, which strip exec perms during the roundtrip.
 COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /build/out/openshell-sandbox
+
+# Source-built path (local dev, BUILD_FROM_SOURCE=1)
+FROM rust-builder AS supervisor-binary-1
+
+FROM supervisor-binary-${BUILD_FROM_SOURCE} AS supervisor-binary
 
 # Minimal extraction stage for fast-deploy: exports only the supervisor
 # binary (~20-40 MB) instead of the entire build environment (~968 MB).

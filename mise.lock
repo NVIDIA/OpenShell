@@ -120,6 +120,22 @@ url = "https://get.helm.sh/helm-v4.1.4-linux-amd64.tar.gz"
 checksum = "sha256:7c2eca678e8001fa863cdf8cbf6ac1b3799f9404a89eb55c08260ef5732e658d"
 url = "https://get.helm.sh/helm-v4.1.4-darwin-arm64.tar.gz"
 
+[[tools.k3d]]
+version = "5.8.3"
+backend = "aqua:k3d-io/k3d"
+
+[tools.k3d."platforms.linux-arm64"]
+checksum = "sha256:0b8110f2229631af7402fb828259330985918b08fefd38b7f1b788a1c8687216"
+url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-linux-arm64"
+
+[tools.k3d."platforms.linux-x64"]
+checksum = "sha256:dbaa79a76ace7f4ca230a1ff41dc7d8a5036a8ad0309e9c54f9bf3836dbe853e"
+url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-linux-amd64"
+
+[tools.k3d."platforms.macos-arm64"]
+checksum = "sha256:8da468daa7dc7cf7cdd4735f90a9bb05179fa27858250f62e3d8cdf5b5ca0698"
+url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-darwin-arm64"
+
 [[tools.kubectl]]
 version = "1.35.4"
 backend = "aqua:kubernetes/kubernetes/kubectl"
@@ -249,6 +265,19 @@ provenance = "github-attestations"
 [[tools.rust]]
 version = "1.95.0"
 backend = "core:rust"
+
+[[tools.skaffold]]
+version = "2.19.0"
+backend = "aqua:GoogleContainerTools/skaffold"
+
+[tools.skaffold."platforms.linux-arm64"]
+url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-arm64"
+
+[tools.skaffold."platforms.linux-x64"]
+url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-amd64"
+
+[tools.skaffold."platforms.macos-arm64"]
+url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-darwin-arm64"
 
 [[tools.uv]]
 version = "0.10.12"

@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Gateway API overlay — enables a Gateway and GRPCRoute for external access.
+#
+# Requires Envoy Gateway in the cluster (installed via skaffold.yaml).
+# Add this file to the openshell release valuesFiles to activate:
+#   uncomment values-gateway.yaml in deploy/helm/openshell/skaffold.yaml
+#
+# Envoy Gateway will create an Envoy proxy Deployment and a LoadBalancer
+# Service (named envoy-<namespace>-<gateway-name>-*) in the openshell namespace.
+#
+# To reach the gateway from outside a k3d cluster, port-forward to that service:
+#   kubectl -n openshell get svc -l gateway.envoyproxy.io/owning-gateway-name=openshell
+#   kubectl -n openshell port-forward svc/<envoy-service> 8080:80
+#   # then: grpcurl -plaintext localhost:8080 ...
+
+grpcRoute:
+  enabled: true
+  gateway:
+    create: true
+    className: "eg"
+  # Set one or more hostnames to scope the route, e.g.:
+  #   hostnames:
+  #     - openshell.example.com
+  hostnames: []

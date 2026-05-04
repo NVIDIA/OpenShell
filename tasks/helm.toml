@@ -7,3 +7,55 @@
 description = "Lint the openshell helm chart"
 run = "helm lint deploy/helm/openshell"
 hide = true
+
+["helm:skaffold:dev"]
+description = "Run skaffold dev for deploy/helm/openshell (iterative deploy)"
+dir = "deploy/helm/openshell"
+run = "skaffold dev"
+
+["helm:skaffold:run"]
+description = "Run skaffold run for deploy/helm/openshell (one-shot deploy)"
+dir = "deploy/helm/openshell"
+run = "skaffold run"
+
+["helm:skaffold:delete"]
+description = "Run skaffold delete for deploy/helm/openshell"
+dir = "deploy/helm/openshell"
+run = "skaffold delete"
+
+["helm:skaffold:diagnose"]
+description = "Run skaffold diagnose for deploy/helm/openshell"
+dir = "deploy/helm/openshell"
+run = "skaffold diagnose"
+hide = true
+
+# Local k3s via k3d (Docker required). On macOS this is the supported path for a lightweight cluster to pair with helm:skaffold:* .
+
+["helm:k3s:create"]
+description = "Create a local k3s cluster with k3d and merge kubeconfig (macOS/Linux + Docker; use with helm:skaffold:dev)"
+run = "tasks/scripts/helm-k3s-local.sh create"
+
+["helm:k3s:delete"]
+description = "Delete the local k3d cluster created by helm:k3s:create"
+run = "tasks/scripts/helm-k3s-local.sh delete"
+
+["helm:k3s:start"]
+description = "Start the local k3d cluster (after helm:k3s:stop)"
+run = "tasks/scripts/helm-k3s-local.sh start"
+hide = true
+
+["helm:k3s:stop"]
+description = "Stop the local k3d cluster without deleting it"
+run = "tasks/scripts/helm-k3s-local.sh stop"
+hide = true
+
+["helm:k3s:status"]
+description = "List local k3d clusters"
+run = "tasks/scripts/helm-k3s-local.sh status"
+hide = true
+
+# Install Envoy Gateway's GatewayClass into the cluster
+
+["helm:gateway:apply"]
+description = "Apply the Envoy GatewayClass manifest (run after helm:skaffold:run when gateway routing is enabled)"
+run = "kubectl apply -f deploy/kube/manifests/envoy-gateway-openshell.yaml"

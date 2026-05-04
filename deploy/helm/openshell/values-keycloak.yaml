@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OIDC configuration overlay for a local Keycloak instance in k3s.
+#
+# Run the one-time setup task first:
+#   mise run keycloak:k8s:setup
+#
+# Then layer this file on top of values.yaml when deploying:
+#   helm upgrade --install openshell . \
+#     -f values.yaml -f values-skaffold.yaml -f values-keycloak.yaml
+#
+# Or add this file to skaffold.yaml valuesFiles for iterative dev.
+#
+# Issuer note: the setup task configures Keycloak with KC_HOSTNAME set to the
+# in-cluster service hostname, so tokens always carry that hostname as `iss`
+# regardless of how they were obtained (e.g. via a localhost port-forward).
+# The gateway fetches JWKS from this URL inside the cluster.
+#
+# CLI token acquisition: keep a port-forward running while using openshell login:
+#   kubectl -n keycloak port-forward svc/keycloak 9090:80
+
+server:
+  oidc:
+    # Must match KC_HOSTNAME set by keycloak:k8s:setup (in-cluster service hostname).
+    issuer: "http://keycloak.keycloak.svc.cluster.local/realms/openshell"
+    # Must match the client ID in the imported realm (openshell-cli).
+    audience: "openshell-cli"
+    # Short TTL for dev so JWKS key rotation is picked up quickly.
+    # Use 3600 (default) in production.
+    jwksTtl: 60
+    # Keycloak puts realm roles at realm_access.roles in the JWT.
+    rolesClaim: "realm_access.roles"
+    # Leave both empty for authentication-only mode (any valid token is accepted).
+    adminRole: "openshell-admin"
+    userRole: "openshell-user"
