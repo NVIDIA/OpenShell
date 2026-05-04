@@ -615,10 +615,11 @@ impl VmDriver {
             )));
         }
 
-        let spec = sandbox.spec.as_ref();
-        let is_gpu = spec.is_some_and(|s| s.gpu);
-        let gpu_device = spec.map_or("", |s| s.gpu_device.as_str());
-        let gpu_bdf = if is_gpu {
+        let gpu_device = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| requested_gpu_device(spec.gpu, &spec.gpu_device));
+        let gpu_bdf = if let Some(gpu_device) = gpu_device {
             Some(self.assign_gpu_to_record(&sandbox.id, gpu_device).await?)
         } else {
             None
@@ -2620,6 +2621,10 @@ fn validate_sandbox_id(sandbox_id: &str) -> Result<(), Status> {
     Ok(())
 }
 
+fn requested_gpu_device(gpu: bool, gpu_device: &str) -> Option<&str> {
+    gpu.then_some(gpu_device)
+}
+
 #[allow(clippy::result_large_err)]
 fn validate_gpu_request(gpu: bool, gpu_device: &str, gpu_enabled: bool) -> Result<(), Status> {
     if gpu && !gpu_enabled {
@@ -4536,6 +4541,24 @@ mod tests {
             .expect_err("gpu_device without gpu should be rejected");
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("gpu_device requires gpu=true"));
+    }
+
+    #[test]
+    fn requested_gpu_device_returns_none_without_gpu_request() {
+        assert_eq!(requested_gpu_device(false, ""), None);
+    }
+
+    #[test]
+    fn requested_gpu_device_defaults_empty_request_to_inventory_choice() {
+        assert_eq!(requested_gpu_device(true, ""), Some(""));
+    }
+
+    #[test]
+    fn requested_gpu_device_returns_explicit_device_id() {
+        assert_eq!(
+            requested_gpu_device(true, "0000:2d:00.0"),
+            Some("0000:2d:00.0")
+        );
     }
 
     #[test]
