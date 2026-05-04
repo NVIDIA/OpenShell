@@ -922,10 +922,7 @@ mod tests {
 
         // Verify namespace exists
         let ns_path = format!("/var/run/netns/{name}");
-        assert!(
-            std::path::Path::new(&ns_path).exists(),
-            "Namespace file should exist"
-        );
+        assert!(Path::new(&ns_path).exists(), "Namespace file should exist");
 
         // Verify IPs are set correctly
         assert_eq!(
@@ -942,7 +939,7 @@ mod tests {
 
         // Verify namespace is gone
         assert!(
-            !std::path::Path::new(&ns_path).exists(),
+            !Path::new(&ns_path).exists(),
             "Namespace should be cleaned up"
         );
     }
