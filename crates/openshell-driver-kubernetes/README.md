@@ -62,9 +62,9 @@ the supervisor's network namespace mount setup on AppArmor-enabled nodes.
 ## GPU Support
 
 When a sandbox requests GPU support, the driver checks node allocatable capacity
-for `nvidia.com/gpu` and requests one GPU resource in the workload spec. The
-sandbox image must provide the user-space libraries needed by the agent
-workload.
+for `nvidia.com/gpu` and sets the workload's `nvidia.com/gpu` resource limit.
+Requests without an explicit count use one GPU. The sandbox image must provide
+the user-space libraries needed by the agent workload.
 
 ## Driver Config POC
 

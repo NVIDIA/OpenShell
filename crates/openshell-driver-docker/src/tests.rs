@@ -13,7 +13,7 @@ use openshell_core::progress::{
     PROGRESS_STEP_STARTING_SANDBOX,
 };
 use openshell_core::proto::compute::v1::{
-    DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+    DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate, GpuRequestSpec,
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -41,8 +41,7 @@ fn test_sandbox() -> DriverSandbox {
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
                 ..Default::default()
             }),
-            gpu: false,
-            gpu_device: String::new(),
+            gpu: None,
             sandbox_token: String::new(),
         }),
         status: None,
@@ -604,12 +603,31 @@ fn build_container_create_body_clears_inherited_cmd() {
 fn validate_sandbox_rejects_gpu_when_cdi_unavailable() {
     let config = runtime_config();
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().gpu = true;
+    sandbox.spec.as_mut().unwrap().gpu = Some(GpuRequestSpec {
+        device_id: vec![],
+        count: None,
+    });
 
     let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("Docker CDI"));
+}
+
+#[test]
+fn validate_sandbox_rejects_gpu_count() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().gpu = Some(GpuRequestSpec {
+        device_id: vec![],
+        count: Some(2),
+    });
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("does not support GPU count"));
 }
 
 #[test]
@@ -639,7 +657,10 @@ fn build_container_create_body_maps_gpu_to_all_cdi_device() {
     let mut config = runtime_config();
     config.supports_gpu = true;
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().gpu = true;
+    sandbox.spec.as_mut().unwrap().gpu = Some(GpuRequestSpec {
+        device_id: vec![],
+        count: None,
+    });
 
     let create_body = build_container_create_body(&sandbox, &config).unwrap();
     let request = create_body
@@ -657,13 +678,17 @@ fn build_container_create_body_maps_gpu_to_all_cdi_device() {
 }
 
 #[test]
-fn build_container_create_body_passes_explicit_cdi_device_id_through() {
+fn build_container_create_body_passes_explicit_cdi_device_ids_through() {
     let mut config = runtime_config();
     config.supports_gpu = true;
     let mut sandbox = test_sandbox();
-    let spec = sandbox.spec.as_mut().unwrap();
-    spec.gpu = true;
-    spec.gpu_device = "nvidia.com/gpu=0".to_string();
+    sandbox.spec.as_mut().unwrap().gpu = Some(GpuRequestSpec {
+        device_id: vec![
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=1".to_string(),
+        ],
+        count: None,
+    });
 
     let create_body = build_container_create_body(&sandbox, &config).unwrap();
     let request = create_body
@@ -676,7 +701,10 @@ fn build_container_create_body_passes_explicit_cdi_device_id_through() {
     assert_eq!(request.driver.as_deref(), Some("cdi"));
     assert_eq!(
         request.device_ids.as_ref().unwrap(),
-        &vec!["nvidia.com/gpu=0".to_string()]
+        &vec![
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=1".to_string()
+        ]
     );
 }
 

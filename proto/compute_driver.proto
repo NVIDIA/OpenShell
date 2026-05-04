@@ -77,18 +77,16 @@ message DriverSandbox {
 
 // Driver-owned provisioning inputs required to create a sandbox.
 message DriverSandboxSpec {
+  reserved 10;
+
   // Log level exposed to processes running inside the sandbox.
   string log_level = 1;
   // Environment variables injected into the sandbox runtime.
   map<string, string> environment = 5;
   // Runtime template consumed by the driver during provisioning.
   DriverSandboxTemplate template = 6;
-  // Request NVIDIA GPU resources for this sandbox.
-  bool gpu = 9;
-  // Optional PCI BDF address (e.g. "0000:2d:00.0") or device index
-  // (e.g. "0", "1"). When empty with gpu=true, the driver assigns the
-  // first available GPU.
-  string gpu_device = 10;
+  // Request GPU resources for this sandbox. Presence indicates a GPU request.
+  GpuRequestSpec gpu = 9;
   // Gateway-minted JWT identifying this sandbox to the gateway. Set by
   // the gateway on create; the driver materialises it via its native
   // secret mechanism (Docker/Podman/VM bind-mount a per-sandbox file;
@@ -96,6 +94,15 @@ message DriverSandboxSpec {
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
   string sandbox_token = 11;
+}
+
+// Driver-native GPU request details.
+message GpuRequestSpec {
+  // Optional number of GPUs requested. Mutually exclusive with device_id.
+  optional uint32 count = 1;
+  // Optional driver-native device identifiers. Mutually exclusive with count.
+  // Empty means the driver chooses its default GPU assignment behavior.
+  repeated string device_id = 2;
 }
 
 // Driver-owned runtime template consumed by the compute platform.

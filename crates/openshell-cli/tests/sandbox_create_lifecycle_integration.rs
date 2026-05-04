@@ -827,6 +827,7 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
         true,
         false,
         None,
+        None,
         Some("500m"),
         Some("2Gi"),
         None,
@@ -995,13 +996,60 @@ async fn sandbox_create_sends_gpu_device_request_without_gpu_flag() {
     .expect("sandbox create should succeed");
 
     let requests = create_requests(&server).await;
-    let spec = requests[0]
+    let gpu = requests[0]
         .spec
         .as_ref()
-        .expect("sandbox spec should be sent");
+        .and_then(|spec| spec.gpu.as_ref())
+        .expect("GPU request should be sent");
 
-    assert!(spec.gpu);
-    assert_eq!(spec.gpu_device, "nvidia.com/gpu=0");
+    assert_eq!(gpu.device_id, vec!["nvidia.com/gpu=0"]);
+    assert_eq!(gpu.count, None);
+}
+
+#[tokio::test]
+async fn sandbox_create_sends_gpu_count_request() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        Some("gpu-count"),
+        None,
+        "openshell",
+        None,
+        true,
+        false,
+        None,
+        Some(2),
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        "manual",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    let gpu = requests[0]
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.gpu.as_ref())
+        .expect("GPU request should be sent");
+
+    assert!(gpu.device_id.is_empty());
+    assert_eq!(gpu.count, Some(2));
 }
 
 #[tokio::test]

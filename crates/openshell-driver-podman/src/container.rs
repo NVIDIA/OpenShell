@@ -4,7 +4,7 @@
 //! Container spec construction for the Podman driver.
 
 use crate::config::PodmanComputeConfig;
-use openshell_core::gpu::cdi_gpu_device_ids;
+use openshell_core::gpu::{cdi_gpu_device_ids, driver_gpu_request};
 use openshell_core::proto::compute::v1::DriverSandbox;
 use serde::Serialize;
 use serde_json::Value;
@@ -379,8 +379,8 @@ fn podman_pids_limit(value: i64) -> Option<i64> {
 
 /// Build CDI GPU device list if GPU is requested.
 fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
-    let spec = sandbox.spec.as_ref()?;
-    cdi_gpu_device_ids(spec.gpu, &spec.gpu_device).map(|device_ids| {
+    let gpu = sandbox.spec.as_ref().and_then(driver_gpu_request);
+    cdi_gpu_device_ids(gpu).map(|device_ids| {
         device_ids
             .into_iter()
             .map(|path| LinuxDevice { path })
@@ -808,11 +808,14 @@ mod tests {
     #[test]
     fn container_spec_maps_empty_gpu_request_to_all_cdi_device() {
         use openshell_core::config::CDI_GPU_DEVICE_ALL;
-        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, GpuRequestSpec};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
+            gpu: Some(GpuRequestSpec {
+                device_id: vec![],
+                count: None,
+            }),
             ..Default::default()
         });
         let config = test_config();
@@ -826,12 +829,14 @@ mod tests {
 
     #[test]
     fn container_spec_passes_explicit_cdi_device_id_through() {
-        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, GpuRequestSpec};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
-            gpu_device: "nvidia.com/gpu=0".to_string(),
+            gpu: Some(GpuRequestSpec {
+                device_id: vec!["nvidia.com/gpu=0".to_string()],
+                count: None,
+            }),
             ..Default::default()
         });
         let config = test_config();

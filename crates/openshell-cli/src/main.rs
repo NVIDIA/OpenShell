@@ -1217,8 +1217,12 @@ enum SandboxCommands {
         /// (for example "nvidia.com/gpu=0"); VM uses a PCI BDF or index.
         /// Specifying --gpu-device also requests GPU resources.
         /// When omitted with --gpu, the driver uses its default GPU selection.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "gpu_count")]
         gpu_device: Option<String>,
+
+        /// Request a specific number of GPUs. Mutually exclusive with --gpu-device.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..), conflicts_with = "gpu_device")]
+        gpu_count: Option<u32>,
 
         /// CPU limit for the sandbox (for example: 500m, 1, 2.5).
         #[arg(long)]
@@ -2548,6 +2552,7 @@ async fn main() -> Result<()> {
                     editor,
                     gpu,
                     gpu_device,
+                    gpu_count,
                     cpu,
                     memory,
                     driver_config_json,
@@ -2629,6 +2634,7 @@ async fn main() -> Result<()> {
                         keep,
                         gpu,
                         gpu_device.as_deref(),
+                        gpu_count,
                         cpu.as_deref(),
                         memory.as_deref(),
                         driver_config_json.as_deref(),
@@ -4396,6 +4402,52 @@ mod tests {
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_parses_without_gpu_flag() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu-count", "2"])
+            .expect("sandbox create --gpu-count should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, gpu_count, .. }),
+                ..
+            }) => {
+                assert!(!gpu);
+                assert_eq!(gpu_count, Some(2));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_rejects_zero() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu-count", "0"]);
+
+        assert!(
+            result.is_err(),
+            "sandbox create --gpu-count 0 should be rejected"
+        );
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_conflicts_with_gpu_device() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--gpu",
+            "--gpu-device",
+            "nvidia.com/gpu=0",
+            "--gpu-count",
+            "2",
+        ]);
+
+        assert!(
+            result.is_err(),
+            "sandbox create should reject --gpu-count with --gpu-device"
+        );
     }
 
     #[test]

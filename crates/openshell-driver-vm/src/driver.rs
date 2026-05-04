@@ -24,6 +24,7 @@ use oci_client::manifest::{
 };
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
+use openshell_core::gpu::driver_gpu_request;
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -32,11 +33,11 @@ use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest,
-    ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
-    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse, GpuRequestSpec,
+    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
+    WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_vfio::SysfsRoot;
 use prost::Message;
@@ -618,7 +619,7 @@ impl VmDriver {
         let gpu_device = sandbox
             .spec
             .as_ref()
-            .and_then(|spec| requested_gpu_device(spec.gpu, &spec.gpu_device));
+            .and_then(|spec| requested_gpu_device(driver_gpu_request(spec)));
         let gpu_bdf = if let Some(gpu_device) = gpu_device {
             Some(self.assign_gpu_to_record(&sandbox.id, gpu_device).await?)
         } else {
@@ -2578,7 +2579,7 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox spec is required"))?;
 
-    validate_gpu_request(spec.gpu, &spec.gpu_device, gpu_enabled)?;
+    validate_gpu_request(driver_gpu_request(spec), gpu_enabled)?;
 
     if let Some(template) = spec.template.as_ref() {
         if !template.agent_socket_path.is_empty() {
@@ -2621,20 +2622,29 @@ fn validate_sandbox_id(sandbox_id: &str) -> Result<(), Status> {
     Ok(())
 }
 
-fn requested_gpu_device(gpu: bool, gpu_device: &str) -> Option<&str> {
-    gpu.then_some(gpu_device)
+fn requested_gpu_device(gpu: Option<&GpuRequestSpec>) -> Option<&str> {
+    let gpu = gpu?;
+    Some(gpu.device_id.first().map_or("", String::as_str))
 }
 
 #[allow(clippy::result_large_err)]
-fn validate_gpu_request(gpu: bool, gpu_device: &str, gpu_enabled: bool) -> Result<(), Status> {
-    if gpu && !gpu_enabled {
+fn validate_gpu_request(gpu: Option<&GpuRequestSpec>, gpu_enabled: bool) -> Result<(), Status> {
+    if gpu.is_some() && !gpu_enabled {
         return Err(Status::failed_precondition(
             "GPU support is not enabled on this driver; start with --gpu",
         ));
     }
 
-    if !gpu && !gpu_device.is_empty() {
-        return Err(Status::invalid_argument("gpu_device requires gpu=true"));
+    if gpu.is_some_and(|gpu| gpu.count.is_some_and(|count| count > 1)) {
+        return Err(Status::invalid_argument(
+            "vm compute driver supports at most one GPU",
+        ));
+    }
+
+    if gpu.is_some_and(|gpu| gpu.device_id.len() > 1) {
+        return Err(Status::invalid_argument(
+            "vm compute driver supports at most one GPU device ID",
+        ));
     }
     Ok(())
 }
@@ -4423,7 +4433,7 @@ mod tests {
         PROGRESS_COMPLETE_STEP_KEY,
     };
     use openshell_core::proto::compute::v1::{
-        DriverSandboxSpec as SandboxSpec, DriverSandboxTemplate as SandboxTemplate,
+        DriverSandboxSpec as SandboxSpec, DriverSandboxTemplate as SandboxTemplate, GpuRequestSpec,
     };
     use prost_types::{Struct, Value, value::Kind};
     use std::fs;
@@ -4502,7 +4512,10 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: true,
+                gpu: Some(GpuRequestSpec {
+                    device_id: vec![],
+                    count: None,
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -4518,7 +4531,10 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: true,
+                gpu: Some(GpuRequestSpec {
+                    device_id: vec![],
+                    count: None,
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -4527,38 +4543,82 @@ mod tests {
     }
 
     #[test]
-    fn validate_vm_sandbox_rejects_gpu_device_without_gpu() {
+    fn validate_vm_sandbox_accepts_gpu_count_one_when_enabled() {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: false,
-                gpu_device: "0000:2d:00.0".to_string(),
+                gpu: Some(GpuRequestSpec {
+                    device_id: vec![],
+                    count: Some(1),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_vm_sandbox(&sandbox, true).expect("gpu count one should be accepted");
+    }
+
+    #[test]
+    fn validate_vm_sandbox_rejects_gpu_count_greater_than_one() {
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                gpu: Some(GpuRequestSpec {
+                    device_id: vec![],
+                    count: Some(2),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err =
+            validate_vm_sandbox(&sandbox, true).expect_err("gpu count > 1 should be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("at most one GPU"));
+    }
+
+    #[test]
+    fn validate_vm_sandbox_rejects_multiple_gpu_device_ids() {
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                gpu: Some(GpuRequestSpec {
+                    device_id: vec!["0000:2d:00.0".to_string(), "0000:3d:00.0".to_string()],
+                    count: None,
+                }),
                 ..Default::default()
             }),
             ..Default::default()
         };
         let err = validate_vm_sandbox(&sandbox, true)
-            .expect_err("gpu_device without gpu should be rejected");
+            .expect_err("multiple GPU device IDs should be rejected");
         assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("gpu_device requires gpu=true"));
+        assert!(err.message().contains("at most one GPU device ID"));
     }
 
     #[test]
     fn requested_gpu_device_returns_none_without_gpu_request() {
-        assert_eq!(requested_gpu_device(false, ""), None);
+        assert_eq!(requested_gpu_device(None), None);
     }
 
     #[test]
     fn requested_gpu_device_defaults_empty_request_to_inventory_choice() {
-        assert_eq!(requested_gpu_device(true, ""), Some(""));
+        let gpu = GpuRequestSpec {
+            device_id: vec![],
+            count: None,
+        };
+
+        assert_eq!(requested_gpu_device(Some(&gpu)), Some(""));
     }
 
     #[test]
-    fn requested_gpu_device_returns_explicit_device_id() {
-        assert_eq!(
-            requested_gpu_device(true, "0000:2d:00.0"),
-            Some("0000:2d:00.0")
-        );
+    fn requested_gpu_device_returns_first_explicit_device_id() {
+        let gpu = GpuRequestSpec {
+            device_id: vec!["0000:2d:00.0".to_string()],
+            count: None,
+        };
+
+        assert_eq!(requested_gpu_device(Some(&gpu)), Some("0000:2d:00.0"));
     }
 
     #[test]
