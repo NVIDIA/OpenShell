@@ -4,9 +4,18 @@
 # Helm chart tasks
 
 ["helm:lint"]
-description = "Lint the openshell helm chart"
-run = "helm lint deploy/helm/openshell"
-hide = true
+description = "Lint the openshell Helm chart (defaults + all CI configuration variants)"
+run = """
+  set -e
+  echo "--- helm lint: defaults ---"
+  helm lint deploy/helm/openshell
+  for f in deploy/helm/openshell/ci/values-*.yaml; do
+    variant=$(basename "$f" .yaml | sed 's/values-//')
+    echo "--- helm lint: $variant ---"
+    helm lint deploy/helm/openshell -f "$f"
+  done
+  echo "All variants passed."
+"""
 
 ["helm:skaffold:dev"]
 description = "Run skaffold dev for deploy/helm/openshell (iterative deploy)"
@@ -59,3 +68,24 @@ hide = true
 ["helm:gateway:apply"]
 description = "Apply the Envoy GatewayClass manifest (run after helm:skaffold:run when gateway routing is enabled)"
 run = "kubectl apply -f deploy/kube/manifests/envoy-gateway-openshell.yaml"
+
+# Helm e2e — boots a k3d cluster via the Helm path and runs the Rust + Python suites
+
+["e2e:helm"]
+description = "Bootstrap Helm k3d cluster and run Rust + Python e2e suites"
+run = "tasks/scripts/helm-e2e.sh"
+
+["e2e:helm:rust"]
+description = "Bootstrap Helm k3d cluster and run Rust e2e only"
+env = { HELM_E2E_SUITE = "rust" }
+run = "tasks/scripts/helm-e2e.sh"
+
+["e2e:helm:python"]
+description = "Bootstrap Helm k3d cluster and run Python e2e only"
+env = { HELM_E2E_SUITE = "python" }
+run = "tasks/scripts/helm-e2e.sh"
+
+["e2e:helm:cert-manager"]
+description = "Bootstrap Helm k3d cluster with cert-manager PKI and run full e2e"
+env = { HELM_E2E_PKI = "cert-manager" }
+run = "tasks/scripts/helm-e2e.sh"

@@ -5,7 +5,7 @@
 #
 # Requires Envoy Gateway in the cluster (installed via skaffold.yaml).
 # Add this file to the openshell release valuesFiles to activate:
-#   uncomment values-gateway.yaml in deploy/helm/openshell/skaffold.yaml
+#   uncomment ci/values-gateway.yaml in deploy/helm/openshell/skaffold.yaml
 #
 # Envoy Gateway will create an Envoy proxy Deployment and a LoadBalancer
 # Service (named envoy-<namespace>-<gateway-name>-*) in the openshell namespace.
