@@ -75,69 +75,9 @@ jobs:
           path: runtime-artifacts/vm-runtime-*.tar.zst
           retention-days: 1
 
-  build-rootfs:
-    name: Build Rootfs (${{ matrix.arch }})
-    strategy:
-      matrix:
-        include:
-          - arch: arm64
-            runner: build-arm64
-            guest_arch: aarch64
-          - arch: amd64
-            runner: build-amd64
-            guest_arch: x86_64
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
-    env:
-      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      OPENSHELL_IMAGE_TAG: ${{ inputs['image-tag'] }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs['checkout-ref'] }}
-
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Install tools
-        run: mise install --locked
-
-      - name: Install zstd
-        run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
-
-      - name: Build base rootfs tarball
-        run: |
-          set -euo pipefail
-          crates/openshell-vm/scripts/build-rootfs.sh \
-            --base \
-            --arch ${{ matrix.guest_arch }} \
-            target/rootfs-build
-
-          mkdir -p target/vm-runtime-compressed
-          tar -C target/rootfs-build -cf - . \
-            | zstd -19 -T0 -o target/vm-runtime-compressed/rootfs.tar.zst
-
-      - name: Upload rootfs artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: driver-vm-rootfs-${{ matrix.arch }}
-          path: target/vm-runtime-compressed/rootfs.tar.zst
-          retention-days: 1
-
   build-driver-vm-linux:
     name: Build Driver VM (Linux ${{ matrix.arch }})
-    needs: [download-kernel-runtime, build-rootfs]
+    needs: [download-kernel-runtime]
     strategy:
       matrix:
         include:
@@ -145,10 +85,12 @@ jobs:
             runner: build-arm64
             target: aarch64-unknown-linux-gnu
             platform: linux-aarch64
+            guest_arch: aarch64
           - arch: amd64
             runner: build-amd64
             target: x86_64-unknown-linux-gnu
             platform: linux-x86_64
+            guest_arch: x86_64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     container:
@@ -192,12 +134,6 @@ jobs:
           name: driver-vm-kernel-runtime-tarballs
           path: runtime-download/
 
-      - name: Download rootfs tarball
-        uses: actions/download-artifact@v4
-        with:
-          name: driver-vm-rootfs-${{ matrix.arch }}
-          path: rootfs-download/
-
       - name: Stage compressed runtime for embedding
         run: |
           set -euo pipefail
@@ -208,6 +144,9 @@ jobs:
           zstd -d "runtime-download/vm-runtime-${{ matrix.platform }}.tar.zst" --stdout \
             | tar -xf - -C "$EXTRACT_DIR"
 
+          echo "Extracted runtime files:"
+          ls -lah "$EXTRACT_DIR"
+
           for file in "$EXTRACT_DIR"/*; do
             [ -f "$file" ] || continue
             name=$(basename "$file")
@@ -215,8 +154,21 @@ jobs:
             zstd -19 -f -q -T0 -o "${COMPRESSED_DIR}/${name}.zst" "$file"
           done
 
-          cp rootfs-download/rootfs.tar.zst "${COMPRESSED_DIR}/rootfs.tar.zst"
+          echo "Staged compressed runtime artifacts:"
           ls -lah "$COMPRESSED_DIR"
+
+      - name: Build bundled supervisor
+        run: |
+          set -euo pipefail
+          OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${PWD}/target/vm-runtime-compressed" \
+            tasks/scripts/vm/build-supervisor-bundle.sh --arch "${{ matrix.guest_arch }}"
+
+      - name: Verify embedded driver inputs
+        run: |
+          set -euo pipefail
+          for file in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst openshell-sandbox.zst; do
+            test -s "target/vm-runtime-compressed/${file}"
+          done
 
       - name: Scope workspace to driver-vm crates
         run: |

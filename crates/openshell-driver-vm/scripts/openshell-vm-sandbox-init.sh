@@ -9,8 +9,9 @@
 
 set -euo pipefail
 
-# Source QEMU-injected environment variables if present
+# Source QEMU-injected environment variables if present.
 if [ -f /srv/openshell-env.sh ]; then
+    # shellcheck source=/dev/null
     source /srv/openshell-env.sh
 fi
 
@@ -31,20 +32,10 @@ GVPROXY_GATEWAY_IP="192.168.127.1"
 GVPROXY_HOST_LOOPBACK_IP="192.168.127.254"
 GATEWAY_IP="$GVPROXY_GATEWAY_IP"
 
-# Parse kernel cmdline for GPU and TAP networking parameters
 GPU_ENABLED="${GPU_ENABLED:-false}"
 VM_NET_IP="${VM_NET_IP:-}"
 VM_NET_GW="${VM_NET_GW:-}"
 VM_NET_DNS="${VM_NET_DNS:-}"
-
-for param in $(cat /proc/cmdline 2>/dev/null || true); do
-    case "$param" in
-        GPU_ENABLED=*)  GPU_ENABLED="${param#GPU_ENABLED=}" ;;
-        VM_NET_IP=*)    VM_NET_IP="${param#VM_NET_IP=}" ;;
-        VM_NET_GW=*)    VM_NET_GW="${param#VM_NET_GW=}" ;;
-        VM_NET_DNS=*)   VM_NET_DNS="${param#VM_NET_DNS=}" ;;
-    esac
-done
 
 ts() {
     local now
@@ -102,9 +93,9 @@ tcp_probe() {
     local port="$2"
 
     if command -v timeout >/dev/null 2>&1; then
-        timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${port}" >/dev/null 2>&1
+        timeout 2 bash -c "exec 3<>/dev/tcp/\$1/\$2" _ "$host" "$port" >/dev/null 2>&1
     else
-        bash -c "exec 3<>/dev/tcp/${host}/${port}" >/dev/null 2>&1
+        bash -c "exec 3<>/dev/tcp/\$1/\$2" _ "$host" "$port" >/dev/null 2>&1
     fi
 }
 
@@ -312,12 +303,22 @@ if [ -n "${VM_NET_IP}" ] && [ -n "${VM_NET_GW}" ]; then
     TAP_NIC=""
     NIC_WAIT=0
     while [ -z "$TAP_NIC" ] && [ "$NIC_WAIT" -lt 10 ]; do
-        for candidate in eth0 ens3 enp0s2 $(ls /sys/class/net/ 2>/dev/null | grep -v '^lo$'); do
+        for candidate in eth0 ens3 enp0s2; do
             if ip link show "$candidate" >/dev/null 2>&1 && [ "$candidate" != "lo" ]; then
                 TAP_NIC="$candidate"
                 break
             fi
         done
+        if [ -z "$TAP_NIC" ]; then
+            for sys_nic in /sys/class/net/*; do
+                [ -e "$sys_nic" ] || continue
+                candidate="${sys_nic##*/}"
+                if ip link show "$candidate" >/dev/null 2>&1 && [ "$candidate" != "lo" ]; then
+                    TAP_NIC="$candidate"
+                    break
+                fi
+            done
+        fi
         if [ -z "$TAP_NIC" ]; then
             sleep 1
             NIC_WAIT=$((NIC_WAIT + 1))
@@ -348,7 +349,7 @@ elif ip link show eth0 >/dev/null 2>&1; then
     if command -v udhcpc >/dev/null 2>&1; then
         UDHCPC_SCRIPT="/usr/share/udhcpc/default.script"
         if [ ! -f "$UDHCPC_SCRIPT" ]; then
-            mkdir -p /usr/share/udhcpc
+            UDHCPC_SCRIPT="/run/openshell-udhcpc.script"
             cat > "$UDHCPC_SCRIPT" <<'DHCP_SCRIPT'
 #!/bin/sh
 case "$1" in

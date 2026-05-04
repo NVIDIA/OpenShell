@@ -110,7 +110,8 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     check_kvm_access()?;
 
-    write_guest_env_file(&config.rootfs, &config.env)?;
+    let guest_env = qemu_guest_env_vars(config, host_dns_server());
+    write_guest_env_file(&config.rootfs, &guest_env)?;
 
     let rootfs_str = config.rootfs.to_str().ok_or("rootfs path not UTF-8")?;
     let sandbox_dir = config.rootfs.parent().unwrap_or(&config.rootfs);
@@ -296,6 +297,27 @@ fn write_guest_env_file(rootfs: &Path, env_vars: &[String]) -> Result<(), String
     Ok(())
 }
 
+fn qemu_guest_env_vars(config: &VmLaunchConfig, dns_server: Option<String>) -> Vec<String> {
+    let mut env_vars = config.env.clone();
+
+    if let Some(ip) = &config.guest_ip
+        && let Some(host_ip) = &config.host_ip
+    {
+        env_vars.push(format!("VM_NET_IP={ip}"));
+        env_vars.push(format!("VM_NET_GW={host_ip}"));
+    }
+
+    if let Some(dns) = dns_server {
+        env_vars.push(format!("VM_NET_DNS={dns}"));
+    }
+
+    if config.gpu_bdf.is_some() {
+        env_vars.push("GPU_ENABLED=true".to_string());
+    }
+
+    env_vars
+}
+
 /// Escape a string for use inside bash double quotes.
 fn shell_escape(s: &str) -> String {
     s.replace('\\', "\\\\")
@@ -320,16 +342,9 @@ fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
         && let Some(host_ip) = &config.host_ip
     {
         parts.push(format!("ip={ip}::{host_ip}:255.255.255.252:sandbox::off"));
-        parts.push(format!("VM_NET_IP={ip}"));
-        parts.push(format!("VM_NET_GW={host_ip}"));
-    }
-
-    if let Some(dns) = host_dns_server() {
-        parts.push(format!("VM_NET_DNS={dns}"));
     }
 
     if config.gpu_bdf.is_some() {
-        parts.push("GPU_ENABLED=true".to_string());
         parts.push("firmware_class.path=/lib/firmware".to_string());
     }
 
@@ -1308,6 +1323,56 @@ fn path_to_cstring(path: &Path) -> Result<CString, String> {
         .to_str()
         .ok_or_else(|| format!("path is not valid UTF-8: {}", path.display()))?;
     CString::new(path).map_err(|e| format!("invalid path string {path}: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn qemu_config() -> VmLaunchConfig {
+        VmLaunchConfig {
+            rootfs: PathBuf::from("/rootfs"),
+            vcpus: 2,
+            mem_mib: 2048,
+            exec_path: "/srv/openshell-vm-sandbox-init.sh".to_string(),
+            args: Vec::new(),
+            env: vec!["OPENSHELL_ENDPOINT=http://10.0.128.1:8080".to_string()],
+            workdir: "/".to_string(),
+            log_level: 0,
+            console_output: PathBuf::from("/console.log"),
+            backend: VmBackend::Qemu,
+            gpu_bdf: Some("0000:01:00.0".to_string()),
+            tap_device: Some("vmtap-test".to_string()),
+            guest_ip: Some("10.0.128.2".to_string()),
+            host_ip: Some("10.0.128.1".to_string()),
+            vsock_cid: Some(4),
+            guest_mac: Some("02:00:00:00:00:01".to_string()),
+            gateway_port: Some(8080),
+        }
+    }
+
+    #[test]
+    fn qemu_guest_env_vars_include_driver_runtime_metadata() {
+        let env = qemu_guest_env_vars(&qemu_config(), Some("1.1.1.1".to_string()));
+
+        assert!(env.contains(&"OPENSHELL_ENDPOINT=http://10.0.128.1:8080".to_string()));
+        assert!(env.contains(&"VM_NET_IP=10.0.128.2".to_string()));
+        assert!(env.contains(&"VM_NET_GW=10.0.128.1".to_string()));
+        assert!(env.contains(&"VM_NET_DNS=1.1.1.1".to_string()));
+        assert!(env.contains(&"GPU_ENABLED=true".to_string()));
+    }
+
+    #[test]
+    fn kernel_cmdline_keeps_guest_init_metadata_out_of_proc_cmdline() {
+        let cmdline = build_kernel_cmdline(&qemu_config());
+
+        assert!(cmdline.contains("ip=10.0.128.2::10.0.128.1:255.255.255.252:sandbox::off"));
+        assert!(cmdline.contains("firmware_class.path=/lib/firmware"));
+        assert!(!cmdline.contains("VM_NET_IP="));
+        assert!(!cmdline.contains("VM_NET_GW="));
+        assert!(!cmdline.contains("VM_NET_DNS="));
+        assert!(!cmdline.contains("GPU_ENABLED="));
+    }
 }
 
 #[cfg(target_os = "linux")]
