@@ -289,15 +289,11 @@ mount -t tmpfs tmpfs /run 2>/dev/null &
 mount -t devtmpfs devtmpfs /dev 2>/dev/null &
 wait
 
-mkdir -p /dev/pts /dev/shm /sys/fs/cgroup /sandbox
+mkdir -p /dev/pts /dev/shm /sys/fs/cgroup
 mount -t devpts devpts /dev/pts 2>/dev/null &
 mount -t tmpfs tmpfs /dev/shm 2>/dev/null &
 mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null &
 wait
-
-mount -t tmpfs tmpfs /sandbox 2>/dev/null || true
-mkdir -p /sandbox
-chown sandbox:sandbox /sandbox 2>/dev/null || true
 
 hostname openshell-sandbox-vm 2>/dev/null || true
 ip link set lo up 2>/dev/null || true

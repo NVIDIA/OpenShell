@@ -20,8 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN groupadd -g 1000660000 sandbox && \
     useradd -m -u 1000660000 -g sandbox sandbox
 
+RUN install -d -o sandbox -g sandbox /sandbox
 WORKDIR /sandbox
-COPY app.py .
+COPY --chown=sandbox:sandbox app.py .
 
 EXPOSE 8080
 

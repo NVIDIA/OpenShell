@@ -174,8 +174,6 @@ fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
     fs::write(opt_dir.join(".rootfs-type"), "sandbox\n")
         .map_err(|e| format!("write sandbox rootfs marker: {e}"))?;
     ensure_sandbox_guest_user(rootfs)?;
-    fs::create_dir_all(rootfs.join("sandbox"))
-        .map_err(|e| format!("create sandbox workdir: {e}"))?;
 
     Ok(())
 }
@@ -365,7 +363,7 @@ mod tests {
         assert!(!rootfs.join("opt/openshell/charts").exists());
         assert!(!rootfs.join("opt/openshell/manifests").exists());
         assert!(rootfs.join("srv/openshell-vm-sandbox-init.sh").is_file());
-        assert!(rootfs.join("sandbox").is_dir());
+        assert!(!rootfs.join("sandbox").exists());
         assert!(
             fs::read_to_string(rootfs.join("etc/passwd"))
                 .expect("read passwd")
@@ -379,6 +377,30 @@ mod tests {
         assert_eq!(
             fs::read_to_string(rootfs.join("etc/hosts")).expect("read hosts"),
             "127.0.0.1 localhost\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_sandbox_rootfs_preserves_image_workdir_contents() {
+        let dir = unique_temp_dir();
+        let rootfs = dir.join("rootfs");
+
+        fs::create_dir_all(rootfs.join("opt/openshell/bin")).expect("create openshell bin");
+        fs::write(
+            rootfs.join("opt/openshell/bin/openshell-sandbox"),
+            b"sandbox",
+        )
+        .expect("write openshell-sandbox");
+        fs::create_dir_all(rootfs.join("sandbox")).expect("create sandbox workdir");
+        fs::write(rootfs.join("sandbox/app.py"), "print('hello')\n").expect("write app");
+
+        prepare_sandbox_rootfs(&rootfs).expect("prepare sandbox rootfs");
+
+        assert_eq!(
+            fs::read_to_string(rootfs.join("sandbox/app.py")).expect("read app"),
+            "print('hello')\n"
         );
 
         let _ = fs::remove_dir_all(&dir);
