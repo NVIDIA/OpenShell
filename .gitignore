@@ -159,7 +159,6 @@ Desktop.ini
 .env
 .env.*
 !.env.example
-!.env.sample
 
 # Logs
 *.log
