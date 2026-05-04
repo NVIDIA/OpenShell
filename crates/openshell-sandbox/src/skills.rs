@@ -58,6 +58,6 @@ mod tests {
         let content = std::fs::read_to_string(expected).unwrap();
         assert!(content.contains("# OpenShell Policy Advisor"));
         assert!(content.contains("policy.local"));
-        assert!(content.contains("PolicyMergeOperation"));
+        assert!(content.contains("addRule"));
     }
 }

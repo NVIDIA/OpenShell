@@ -6,10 +6,11 @@
 use miette::{IntoDiagnostic, Result};
 use openshell_core::proto::{
     L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
-    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
+    SandboxPolicy as ProtoSandboxPolicy,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
@@ -17,12 +18,20 @@ use tokio::sync::RwLock;
 pub const POLICY_LOCAL_HOST: &str = "policy.local";
 
 const MAX_POLICY_LOCAL_BODY_BYTES: usize = 64 * 1024;
+const DEFAULT_DENIALS_LIMIT: usize = 10;
+const MAX_DENIALS_LIMIT: usize = 100;
+/// OCSF rolling appender keeps three files (daily rotation); read the most
+/// recent two so a request just past midnight still has yesterday's denials.
+const DENIAL_LOG_FILES_TO_SCAN: usize = 2;
+const OCSF_LOG_DIR: &str = "/var/log";
+const OCSF_LOG_PREFIX: &str = "openshell-ocsf";
 
 #[derive(Debug)]
 pub struct PolicyLocalContext {
     current_policy: Arc<RwLock<Option<ProtoSandboxPolicy>>>,
     gateway_endpoint: Option<String>,
     sandbox_name: Option<String>,
+    ocsf_log_dir: PathBuf,
 }
 
 impl PolicyLocalContext {
@@ -31,10 +40,25 @@ impl PolicyLocalContext {
         gateway_endpoint: Option<String>,
         sandbox_name: Option<String>,
     ) -> Self {
+        Self::with_log_dir(
+            current_policy,
+            gateway_endpoint,
+            sandbox_name,
+            PathBuf::from(OCSF_LOG_DIR),
+        )
+    }
+
+    fn with_log_dir(
+        current_policy: Option<ProtoSandboxPolicy>,
+        gateway_endpoint: Option<String>,
+        sandbox_name: Option<String>,
+        ocsf_log_dir: PathBuf,
+    ) -> Self {
         Self {
             current_policy: Arc::new(RwLock::new(current_policy)),
             gateway_endpoint,
             sandbox_name,
+            ocsf_log_dir,
         }
     }
 
@@ -64,16 +88,10 @@ async fn route_request(
     path: &str,
     body: &[u8],
 ) -> (u16, serde_json::Value) {
-    let route = path.split_once('?').map_or(path, |(route, _)| route);
+    let (route, query) = path.split_once('?').map_or((path, ""), |(r, q)| (r, q));
     match (method, route) {
         ("GET", "/v1/policy/current") => current_policy_response(ctx).await,
-        ("GET", "/v1/denials") => (
-            200,
-            serde_json::json!({
-                "denials": [],
-                "note": "recent-denial listing is not wired in this MVP slice; use the structured 403 body and /var/log/openshell*.log for now"
-            }),
-        ),
+        ("GET", "/v1/denials") => recent_denials_response(ctx, query).await,
         ("POST", "/v1/proposals") => submit_proposal(ctx, body).await,
         _ => (
             404,
@@ -112,6 +130,159 @@ async fn current_policy_response(ctx: &PolicyLocalContext) -> (u16, serde_json::
             }),
         ),
     }
+}
+
+async fn recent_denials_response(
+    ctx: &PolicyLocalContext,
+    query: &str,
+) -> (u16, serde_json::Value) {
+    let limit = parse_last_query(query).unwrap_or(DEFAULT_DENIALS_LIMIT);
+    let log_dir = ctx.ocsf_log_dir.clone();
+
+    let denials = tokio::task::spawn_blocking(move || read_recent_denials(&log_dir, limit))
+        .await
+        .unwrap_or_else(|_| Vec::new());
+
+    (200, serde_json::json!({ "denials": denials }))
+}
+
+fn parse_last_query(query: &str) -> Option<usize> {
+    if query.is_empty() {
+        return None;
+    }
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if key == "last" {
+            return value
+                .parse::<usize>()
+                .ok()
+                .map(|n| n.clamp(1, MAX_DENIALS_LIMIT));
+        }
+    }
+    None
+}
+
+/// Walk the OCSF JSONL log files (most-recent first) and return up to `limit`
+/// summarized denial events in newest-first order.
+///
+/// Reads files synchronously and is intended to run inside `spawn_blocking`.
+fn read_recent_denials(log_dir: &Path, limit: usize) -> Vec<serde_json::Value> {
+    let Ok(files) = collect_ocsf_log_files(log_dir, DENIAL_LOG_FILES_TO_SCAN) else {
+        return Vec::new();
+    };
+
+    let mut summaries: Vec<serde_json::Value> = Vec::with_capacity(limit);
+    for path in files {
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // Walk lines newest-first. Within a single file, last line written is
+        // the freshest event.
+        for line in contents.lines().rev() {
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(summary) = denial_summary_from_event(&value) else {
+                continue;
+            };
+            summaries.push(summary);
+            if summaries.len() >= limit {
+                return summaries;
+            }
+        }
+    }
+    summaries
+}
+
+fn collect_ocsf_log_files(log_dir: &Path, max_files: usize) -> std::io::Result<Vec<PathBuf>> {
+    let mut entries: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(log_dir)?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(OCSF_LOG_PREFIX) {
+                return None;
+            }
+            let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
+            Some((modified, path))
+        })
+        .collect();
+
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    Ok(entries.into_iter().take(max_files).map(|(_, p)| p).collect())
+}
+
+/// Convert an OCSF event into a compact denial summary, or `None` if the event
+/// is not a network/HTTP denial we want to surface to the agent.
+fn denial_summary_from_event(value: &serde_json::Value) -> Option<serde_json::Value> {
+    // OCSF action_id 2 = Denied. Filter aggressively to avoid leaking unrelated
+    // events (allowed connections, app lifecycle, etc.) into the agent's view.
+    if value.get("action_id").and_then(serde_json::Value::as_u64) != Some(2) {
+        return None;
+    }
+
+    let class_uid = value.get("class_uid").and_then(serde_json::Value::as_u64)?;
+    let layer = match class_uid {
+        4001 => "l4",
+        4002 => "l7",
+        _ => return None,
+    };
+
+    let mut summary = serde_json::Map::new();
+    summary.insert("layer".to_string(), serde_json::json!(layer));
+
+    if let Some(time) = value.get("time").and_then(serde_json::Value::as_i64) {
+        summary.insert("time_ms".to_string(), serde_json::json!(time));
+    }
+    if let Some(message) = value.get("message").and_then(serde_json::Value::as_str) {
+        summary.insert("message".to_string(), serde_json::json!(message));
+    }
+    if let Some(dst) = value.get("dst_endpoint") {
+        if let Some(host) = dst
+            .get("hostname")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| dst.get("ip").and_then(serde_json::Value::as_str))
+        {
+            summary.insert("host".to_string(), serde_json::json!(host));
+        }
+        if let Some(port) = dst.get("port").and_then(serde_json::Value::as_u64) {
+            summary.insert("port".to_string(), serde_json::json!(port));
+        }
+    }
+    if let Some(req) = value.get("http_request") {
+        if let Some(method) = req.get("http_method").and_then(serde_json::Value::as_str) {
+            summary.insert("method".to_string(), serde_json::json!(method));
+        }
+        if let Some(url) = req.get("url")
+            && let Some(path) = url.get("path").and_then(serde_json::Value::as_str)
+        {
+            summary.insert("path".to_string(), serde_json::json!(path));
+        }
+    }
+    if let Some(binary) = value
+        .get("actor")
+        .and_then(|a| a.get("process"))
+        .and_then(|p| p.get("file"))
+        .and_then(|f| f.get("path"))
+        .and_then(serde_json::Value::as_str)
+    {
+        summary.insert("binary".to_string(), serde_json::json!(binary));
+    }
+    if let Some(rule) = value
+        .get("firewall_rule")
+        .and_then(|r| r.get("name"))
+        .and_then(serde_json::Value::as_str)
+    {
+        summary.insert("policy".to_string(), serde_json::json!(rule));
+    }
+
+    Some(serde_json::Value::Object(summary))
 }
 
 async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_json::Value) {
@@ -157,17 +328,11 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
         }
     };
 
-    let mut raw_client = client.raw_client();
-    let response = match raw_client
-        .submit_policy_analysis(SubmitPolicyAnalysisRequest {
-            summaries: vec![],
-            proposed_chunks: chunks,
-            analysis_mode: "agent".to_string(),
-            name: sandbox_name.to_string(),
-        })
+    let response = match client
+        .submit_policy_analysis(sandbox_name, vec![], chunks, "agent_authored")
         .await
     {
-        Ok(response) => response.into_inner(),
+        Ok(response) => response,
         Err(error) => {
             return (
                 502,
@@ -186,7 +351,6 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
             "accepted_chunks": response.accepted_chunks,
             "rejected_chunks": response.rejected_chunks,
             "rejection_reasons": response.rejection_reasons,
-            "note": "the gateway assigns proposal ids; review pending proposals in the developer inbox"
         }),
     )
 }
@@ -199,13 +363,9 @@ fn proposal_chunks_from_body(body: &[u8]) -> std::result::Result<Vec<PolicyChunk
 
     let mut chunks = Vec::new();
     for operation in request.operations {
-        let Some(add_rule) = operation
-            .get("addRule")
-            .or_else(|| operation.get("add_rule"))
-            .cloned()
-        else {
+        let Some(add_rule) = operation.get("addRule").cloned() else {
             return Err(
-                "this MVP accepts addRule operations; submit a full narrow NetworkPolicyRule"
+                "this MVP accepts `addRule` operations; submit a full narrow NetworkPolicyRule"
                     .to_string(),
             );
         };
@@ -463,7 +623,7 @@ struct ProposalRequest {
 
 #[derive(Debug, Deserialize)]
 struct AddNetworkRuleJson {
-    #[serde(default, rename = "ruleName", alias = "rule_name")]
+    #[serde(default, rename = "ruleName")]
     rule_name: Option<String>,
     rule: NetworkPolicyRuleJson,
 }
@@ -623,6 +783,110 @@ mod tests {
         let error = proposal_chunks_from_body(body).unwrap_err();
         assert!(error.contains("query strings"));
         assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn parse_last_query_clamps_to_max() {
+        assert_eq!(parse_last_query("last=5"), Some(5));
+        assert_eq!(parse_last_query("foo=bar&last=20"), Some(20));
+        assert_eq!(parse_last_query("last=999"), Some(MAX_DENIALS_LIMIT));
+        assert_eq!(parse_last_query("last=0"), Some(1));
+        assert_eq!(parse_last_query(""), None);
+        assert_eq!(parse_last_query("other=1"), None);
+    }
+
+    #[test]
+    fn denial_summary_filters_to_l4_l7_denied_only() {
+        let allowed = serde_json::json!({
+            "class_uid": 4001,
+            "action_id": 1,
+            "dst_endpoint": {"hostname": "api.github.com", "port": 443}
+        });
+        assert!(denial_summary_from_event(&allowed).is_none());
+
+        let unrelated = serde_json::json!({
+            "class_uid": 6002,
+            "action_id": 2,
+            "message": "supervisor lifecycle"
+        });
+        assert!(denial_summary_from_event(&unrelated).is_none());
+
+        let l4_denied = serde_json::json!({
+            "class_uid": 4001,
+            "action_id": 2,
+            "time": 1_742_054_400_000_i64,
+            "message": "CONNECT denied api.github.com:443",
+            "dst_endpoint": {"hostname": "api.github.com", "port": 443},
+            "actor": {"process": {"file": {"path": "/usr/bin/curl"}}},
+            "firewall_rule": {"name": "github-readonly"}
+        });
+        let summary = denial_summary_from_event(&l4_denied).unwrap();
+        assert_eq!(summary["layer"], "l4");
+        assert_eq!(summary["host"], "api.github.com");
+        assert_eq!(summary["port"], 443);
+        assert_eq!(summary["binary"], "/usr/bin/curl");
+        assert_eq!(summary["policy"], "github-readonly");
+        assert_eq!(summary["time_ms"], 1_742_054_400_000_i64);
+
+        let l7_denied = serde_json::json!({
+            "class_uid": 4002,
+            "action_id": 2,
+            "message": "FORWARD denied PUT /repos/foo/bar/contents/x",
+            "dst_endpoint": {"hostname": "api.github.com", "port": 443},
+            "http_request": {
+                "http_method": "PUT",
+                "url": {"path": "/repos/foo/bar/contents/x"}
+            }
+        });
+        let summary = denial_summary_from_event(&l7_denied).unwrap();
+        assert_eq!(summary["layer"], "l7");
+        assert_eq!(summary["method"], "PUT");
+        assert_eq!(summary["path"], "/repos/foo/bar/contents/x");
+    }
+
+    #[tokio::test]
+    async fn recent_denials_returns_newest_first_from_jsonl_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("openshell-ocsf.2026-05-04.log");
+        let lines = [
+            serde_json::json!({
+                "class_uid": 4001,
+                "action_id": 2,
+                "time": 1,
+                "message": "first",
+                "dst_endpoint": {"hostname": "first.example", "port": 443}
+            }),
+            // An allowed event mixed in — must be filtered out.
+            serde_json::json!({
+                "class_uid": 4001,
+                "action_id": 1,
+                "time": 2,
+                "dst_endpoint": {"hostname": "ok.example", "port": 443}
+            }),
+            serde_json::json!({
+                "class_uid": 4002,
+                "action_id": 2,
+                "time": 3,
+                "message": "second",
+                "dst_endpoint": {"hostname": "second.example", "port": 443},
+                "http_request": {"http_method": "PUT", "url": {"path": "/x"}}
+            }),
+        ];
+        let body: String = lines
+            .iter()
+            .map(|v| format!("{v}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        std::fs::write(&log_path, body).unwrap();
+
+        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf());
+        let (status, payload) = recent_denials_response(&ctx, "last=10").await;
+        assert_eq!(status, 200);
+        let denials = payload["denials"].as_array().unwrap();
+        assert_eq!(denials.len(), 2);
+        // Newest first.
+        assert_eq!(denials[0]["message"], "second");
+        assert_eq!(denials[1]["message"], "first");
     }
 
     #[tokio::test]
