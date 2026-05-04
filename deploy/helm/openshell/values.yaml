@@ -181,6 +181,27 @@ pkiInitJob:
   serverIpAddresses:
     - 127.0.0.1
 
+# cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
+# Uses namespaced Issuers only (no ClusterIssuer). Does not install cert-manager itself.
+certManager:
+  enabled: false
+  # Secret created for the intermediate CA (Certificate with isCA: true).
+  caSecretName: openshell-ca-tls
+  # Mount gateway client CA from the server TLS secret's ca.crt (populated by
+  # cert-manager for certs issued by a CA Issuer). Avoids a separate
+  # openshell-server-client-ca Secret.
+  clientCaFromServerTlsSecret: true
+  certificateDuration: 8760h
+  certificateRenewBefore: 720h
+  serverDnsNames:
+    - openshell
+    - openshell.openshell.svc
+    - openshell.openshell.svc.cluster.local
+    - localhost
+    - host.docker.internal
+  serverIpAddresses:
+    - 127.0.0.1
+
 # Kubernetes Gateway API — HTTPRoute and Gateway resources.
 # Requires a Gateway API controller in the cluster. Install Envoy Gateway via
 # the skaffold.yaml releases or independently:

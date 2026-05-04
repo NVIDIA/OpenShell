@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+{{- if and .Values.pkiInitJob.enabled .Values.certManager.enabled }}
+{{- fail "pkiInitJob.enabled and certManager.enabled cannot both be true; disable one to avoid conflicting PKI sources." }}
+{{- end }}
 {{- if .Values.pkiInitJob.enabled }}
 {{- $hookName := printf "%s-pki-hook" (include "openshell.fullname" .) }}
 {{- $ns := .Release.Namespace }}
