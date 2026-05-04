@@ -243,6 +243,17 @@ create_gpu_device_nodes_mknod() {
 setup_gpu() {
     ts "GPU_ENABLED=true — initializing GPU passthrough"
 
+    # Kernel modules are built for a specific guest kernel version.
+    # If the running kernel doesn't match, depmod/modprobe will silently fail.
+    local expected_kver="6.12.76"
+    local actual_kver
+    actual_kver="$(uname -r)"
+    if [ "${actual_kver}" != "${expected_kver}" ]; then
+        ts "WARNING: kernel version mismatch: expected ${expected_kver}, got ${actual_kver}"
+        ts "         GPU modules are installed under lib/modules/${expected_kver}/"
+        ts "         modprobe may fail to find them"
+    fi
+
     if ! command -v modprobe >/dev/null 2>&1; then
         ts "FATAL: modprobe not found; cannot load nvidia kernel modules"
         return 1
@@ -256,6 +267,11 @@ setup_gpu() {
         if [ -e /sys/module/firmware_class/parameters/path ]; then
             echo /run/firmware > /sys/module/firmware_class/parameters/path
         fi
+    fi
+
+    ts "generating module dependency index"
+    if ! depmod -a "$(uname -r)" 2>/dev/null; then
+        ts "WARNING: depmod failed; modprobe may not find modules"
     fi
 
     ts "loading nvidia kernel modules"

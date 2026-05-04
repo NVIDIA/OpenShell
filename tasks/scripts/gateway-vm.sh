@@ -32,6 +32,8 @@
 
 set -euo pipefail
 
+MISE="${__MISE_EXE:-$(command -v mise 2>/dev/null || echo mise)}"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PORT="${OPENSHELL_SERVER_PORT:-18081}"
 GATEWAY_NAME="${OPENSHELL_VM_GATEWAY_NAME:-vm-dev}"
@@ -274,13 +276,13 @@ if [ ! -d "${COMPRESSED_DIR}" ] \
     || ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q . \
     || [ ! -f "${COMPRESSED_DIR}/gvproxy.zst" ]; then
   echo "==> Preparing embedded VM runtime (mise run vm:setup)"
-  mise run vm:setup
+  "$MISE" run vm:setup
 fi
 
 if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ]; then
   check_supervisor_cross_toolchain
   echo "==> Building bundled VM supervisor (mise run vm:supervisor)"
-  mise run vm:supervisor
+  "$MISE" run vm:supervisor
 fi
 
 export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${COMPRESSED_DIR}"
@@ -291,8 +293,17 @@ if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
 fi
 
 echo "==> Building openshell-gateway and openshell-driver-vm"
-cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-server -p openshell-driver-vm
+CARGO_CMD=(cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
+  -p openshell-server -p openshell-driver-vm)
+if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+  chown -R "${SUDO_USER}" "${ROOT}/target" 2>/dev/null || true
+  sudo -u "${SUDO_USER}" env \
+    "PATH=${PATH}" \
+    "OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR}" \
+    "${CARGO_CMD[@]}"
+else
+  "${CARGO_CMD[@]}"
+fi
 
 if [ "$(uname -s)" = "Darwin" ]; then
   echo "==> Codesigning openshell-driver-vm (Hypervisor entitlement)"

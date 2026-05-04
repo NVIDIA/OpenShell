@@ -45,6 +45,10 @@ run = "tasks/scripts/vm/build-supervisor-bundle.sh"
 description = "Build the VM rootfs tarball (use -- --base for lightweight)"
 run = "tasks/scripts/vm/build-rootfs-tarball.sh"
 
+["vm:nvidia-modules"]
+description = "Build NVIDIA kernel modules for the guest VM kernel"
+run = "tasks/scripts/vm/build-nvidia-modules.sh"
+
 ["vm:clean"]
 description = "Remove all VM cached artifacts (runtime, rootfs, builds)"
 run = "tasks/scripts/vm/vm-clean.sh"
