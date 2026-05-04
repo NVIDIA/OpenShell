@@ -57,6 +57,12 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
+    supervisor_image: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")]
+    supervisor_image_pull_policy: Option<String>,
 }
 
 #[tokio::main]
@@ -72,6 +78,10 @@ async fn main() -> Result<()> {
         namespace: args.sandbox_namespace,
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
+        supervisor_image: args.supervisor_image.unwrap_or_else(|| {
+            openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string()
+        }),
+        supervisor_image_pull_policy: args.supervisor_image_pull_policy.unwrap_or_default(),
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         ssh_socket_path: args.sandbox_ssh_socket_path,
         ssh_handshake_secret: args.ssh_handshake_secret,

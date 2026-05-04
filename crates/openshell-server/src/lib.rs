@@ -469,32 +469,45 @@ async fn build_compute_runtime(
     info!(driver = %driver, "Using compute driver");
 
     match driver {
-        ComputeDriverKind::Kubernetes => ComputeRuntime::new_kubernetes(
-            KubernetesComputeConfig {
-                namespace: config.sandbox_namespace.clone(),
-                default_image: config.sandbox_image.clone(),
-                image_pull_policy: config.sandbox_image_pull_policy.clone(),
-                grpc_endpoint: config.grpc_endpoint.clone(),
-                // Filesystem path to the supervisor's Unix-socket SSH daemon.
-                // The path lives in a root-only directory so only the
-                // supervisor can connect; the gateway reaches it through the
-                // RelayStream bridge, not directly. Override via
-                // `sandbox_ssh_socket_path` in the config for deployments
-                // where multiple supervisors share a filesystem.
-                ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
-                ssh_handshake_secret: config.ssh_handshake_secret.clone(),
-                ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
-                client_tls_secret_name: config.client_tls_secret_name.clone(),
-                host_gateway_ip: config.host_gateway_ip.clone(),
-            },
-            store,
-            sandbox_index,
-            sandbox_watch_bus,
-            tracing_log_bus,
-            supervisor_sessions.clone(),
-        )
-        .await
-        .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
+        ComputeDriverKind::Kubernetes => {
+            let supervisor_image = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string());
+            let supervisor_image_pull_policy =
+                std::env::var("OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default();
+            ComputeRuntime::new_kubernetes(
+                KubernetesComputeConfig {
+                    namespace: config.sandbox_namespace.clone(),
+                    default_image: config.sandbox_image.clone(),
+                    image_pull_policy: config.sandbox_image_pull_policy.clone(),
+                    supervisor_image,
+                    supervisor_image_pull_policy,
+                    grpc_endpoint: config.grpc_endpoint.clone(),
+                    // Filesystem path to the supervisor's Unix-socket SSH daemon.
+                    // The path lives in a root-only directory so only the
+                    // supervisor can connect; the gateway reaches it through the
+                    // RelayStream bridge, not directly. Override via
+                    // `sandbox_ssh_socket_path` in the config for deployments
+                    // where multiple supervisors share a filesystem.
+                    ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
+                    ssh_handshake_secret: config.ssh_handshake_secret.clone(),
+                    ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
+                    client_tls_secret_name: config.client_tls_secret_name.clone(),
+                    host_gateway_ip: config.host_gateway_ip.clone(),
+                },
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions.clone(),
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
         ComputeDriverKind::Docker => ComputeRuntime::new_docker(
             config.clone(),
             docker_config.clone(),
