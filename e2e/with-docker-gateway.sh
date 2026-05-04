@@ -32,21 +32,27 @@ github_actions_host_docker_tmpdir() {
 
   # Container jobs talk to the host Docker daemon. Bind mount source paths must
   # exist on the host, but the gateway also validates those same paths inside
-  # the job container before handing them to Docker.
-  if [ ! -e /home/runner/_work ] && [ ! -L /home/runner/_work ]; then
-    mkdir -p /home/runner 2>/dev/null || return 1
-    ln -s /__w /home/runner/_work 2>/dev/null || return 1
-  fi
-
+  # the job container before handing them to Docker. This must be a real mount
+  # rather than a symlink because the Docker driver canonicalizes file paths.
   if [ -d /home/runner/_work/_temp ]; then
     printf '%s\n' /home/runner/_work/_temp
     return 0
   fi
 
-  return 1
+  echo "ERROR: GitHub Actions Docker e2e requires /home/runner/_work mounted inside the job container." >&2
+  echo "       Mount /home/runner/_work:/home/runner/_work so Docker bind paths resolve on both sides." >&2
+  return 2
 }
 
-WORKDIR_PARENT="$(github_actions_host_docker_tmpdir || printf '%s\n' "${TMPDIR:-/tmp}")"
+if WORKDIR_PARENT="$(github_actions_host_docker_tmpdir)"; then
+  :
+else
+  status=$?
+  if [ "${status}" -eq 2 ]; then
+    exit 2
+  fi
+  WORKDIR_PARENT="${TMPDIR:-/tmp}"
+fi
 WORKDIR_PARENT="${WORKDIR_PARENT%/}"
 WORKDIR="$(mktemp -d "${WORKDIR_PARENT}/openshell-e2e-gateway.XXXXXX")"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
