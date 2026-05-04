@@ -61,6 +61,48 @@ chart. The `pkiInitJob` hook runs on first install to generate mTLS secrets. Env
 
 The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or `kubectl port-forward`.
 
+### TLS behaviour
+
+`values-skaffold.yaml` sets `server.disableTls: true`, so Skaffold-based deploys run
+plaintext by default. To test with TLS enabled, comment out that line and redeploy.
+
+| Mode | `server.disableTls` | Gateway scheme |
+|------|---------------------|----------------|
+| Skaffold dev (default) | `true` | `http://` |
+| TLS enabled | `false` (or omitted) | `https://` |
+
+### Connecting via port-forward
+
+```bash
+KUBECONFIG=kubeconfig kubectl port-forward -n openshell svc/openshell 8080:8080
+```
+
+**Plaintext (default Skaffold deploy):**
+
+```bash
+openshell sandbox list --gateway-endpoint http://localhost:8080
+```
+
+**With mTLS enabled** — extract the client cert the PKI hook wrote to the cluster,
+then place it where the CLI expects it. Run once after each fresh install:
+
+```bash
+mkdir -p ~/.config/openshell/gateways/openshell/mtls
+KUBECONFIG=kubeconfig kubectl get secret openshell-client-tls -n openshell \
+  -o jsonpath='{.data.ca\.crt}'  | base64 -d > ~/.config/openshell/gateways/openshell/mtls/ca.crt
+KUBECONFIG=kubeconfig kubectl get secret openshell-client-tls -n openshell \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d > ~/.config/openshell/gateways/openshell/mtls/tls.crt
+KUBECONFIG=kubeconfig kubectl get secret openshell-client-tls -n openshell \
+  -o jsonpath='{.data.tls\.key}' | base64 -d > ~/.config/openshell/gateways/openshell/mtls/tls.key
+```
+
+The server cert SANs include `localhost` and `127.0.0.1`, so hostname verification
+passes over a port-forward without any extra flags:
+
+```bash
+openshell sandbox list --gateway-endpoint https://localhost:8080
+```
+
 ---
 
 ## Teardown
