@@ -3,34 +3,32 @@
 
 # Agent-Driven Policy Management Demo
 
-Run the first policy-advisor MVP loop from one host-side script:
+Run the first policy-advisor MVP loop with a real agent:
 
 1. Use the active OpenShell gateway.
 2. Create a GitHub provider from a host token.
-3. Start a sandbox with read-only L7 GitHub API access.
-4. Attempt a GitHub contents write from inside the sandbox and capture the
-   structured `policy_denied` response.
-5. Submit a narrow policy proposal through `http://policy.local/v1/proposals`.
+3. Start a sandbox with your agent command and an uploaded task file.
+4. Let the agent hit an OpenShell `policy_denied` response.
+5. Let the agent read `/etc/openshell/skills/policy_advisor.md` and submit a
+   narrow proposal through `http://policy.local/v1/proposals`.
 6. Approve the draft rule from outside the sandbox.
-7. Retry the same write and confirm it succeeds.
+7. Let the agent retry and confirm the GitHub write succeeds.
 
-`demo.sh` is deterministic. It does not launch a real coding agent; it uses the
-same sandbox-local interfaces that the agent will use.
-
-`dogfood.sh` runs the next loop: Codex starts inside the sandbox, observes the
-structured denial, reads `/etc/openshell/skills/policy_advisor.md`, drafts and
-submits a narrow proposal through `policy.local`, then retries after the host
-developer approves.
+The shell script is agent-agnostic. It does not know how to sign in to a
+specific coding agent. Pass the provider names and sandbox command for the
+agent you want to run.
 
 ## Prerequisites
 
 - An active OpenShell gateway that includes the current sandbox supervisor
   build.
-- `curl`, `jq`, and `ssh` on the host machine.
+- `curl` and `jq` on the host machine.
 - The GitHub CLI (`gh`) if you want to create the scratch repo with the command
   below.
 - A disposable or demo-safe GitHub repository.
 - A GitHub token with contents write permission for that repository.
+- An agent provider and policy that let your chosen agent run inside the
+  sandbox.
 
 ## Create A Scratch Repo
 
@@ -50,40 +48,23 @@ file. Each default run writes a new timestamped file under
 
 ## Quick Start
 
+The included `policy.template.yaml` only defines the GitHub API target for the
+policy-management loop. Use `DEMO_POLICY_FILE` to point at a policy that also
+allows your chosen agent to reach its model/provider endpoints.
+
 ```bash
 export DEMO_GITHUB_OWNER=<owner>
 export DEMO_GITHUB_REPO=<repo>
 export DEMO_GITHUB_TOKEN=<token-with-contents-write>
+export DEMO_POLICY_FILE=/path/to/policy-that-allows-your-agent.yaml
+export DEMO_AGENT_PROVIDERS="my-agent-provider"
+export DEMO_AGENT_COMMAND='<agent command that reads /sandbox/payload/agent-task.md>'
 
 bash examples/agent-driven-policy-management/demo.sh
-```
-
-If you use the GitHub CLI, this also works:
-
-```bash
-export DEMO_GITHUB_OWNER=<owner>
-export DEMO_GITHUB_REPO=<repo>
-export DEMO_GITHUB_TOKEN="$(gh auth token)"
-
-bash examples/agent-driven-policy-management/demo.sh
-```
-
-## Codex Dogfood
-
-Sign in to Codex locally, then run:
-
-```bash
-codex login
-
-export DEMO_GITHUB_OWNER=<owner>
-export DEMO_GITHUB_REPO=<repo>
-export DEMO_GITHUB_TOKEN="$(gh auth token)"
-
-bash examples/agent-driven-policy-management/dogfood.sh
 ```
 
 The host script only orchestrates sandbox lifecycle and developer approval. The
-policy proposal is authored by Codex inside the sandbox from the installed
+policy proposal is authored by the agent inside the sandbox from the installed
 skill, structured denial response, and `policy.local` API.
 
 The demo writes one markdown file under:
@@ -92,14 +73,11 @@ The demo writes one markdown file under:
 openshell-policy-advisor-demo/<run-id>.md
 ```
 
-The dogfood run writes under:
-
-```text
-openshell-policy-advisor-dogfood/<run-id>.md
-```
-
 Use a scratch repository or a demo branch if you do not want this file in a
 production repository.
+
+The deterministic non-model validation flow lives in
+`e2e/agent-driven-policy-management/validation.sh`.
 
 ## Options
 
@@ -109,5 +87,6 @@ export DEMO_BRANCH=main
 export DEMO_RUN_ID="$(date +%Y%m%d-%H%M%S)"
 export DEMO_FILE_DIR=openshell-policy-advisor-demo
 export DEMO_KEEP_SANDBOX=0
-export DEMO_APPROVAL_TIMEOUT_SECS=180
+export DEMO_APPROVAL_TIMEOUT_SECS=240
+export DEMO_AGENT_PROVIDERS="agent-provider-a agent-provider-b"
 ```
