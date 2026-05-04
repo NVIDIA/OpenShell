@@ -59,6 +59,17 @@ build:
 deploy:
   helm:
     releases:
+      # cert-manager — comment this in and add values-cert-manager.yaml below
+      # when you want cert-manager to manage the PKI instead of pkiInitJob.
+      # Requires cert-manager CRDs to be installed in the cluster first.
+      #- name: cert-manager
+      #  repo: https://charts.jetstack.io
+      #  remoteChart: cert-manager
+      #  version: v1.20.2
+      #  namespace: cert-manager
+      #  createNamespace: true
+      #  setValues:
+      #    crds.enabled: true
       # Envoy Gateway — Kubernetes Gateway API implementation.
       # Installs the Gateway API CRDs and the "eg" GatewayClass.
       # Required when grpcRoute.enabled is true in the openshell release.
@@ -77,6 +88,9 @@ deploy:
         valuesFiles:
           - values.yaml
           - values-skaffold.yaml
+          # Add values-cert-manager.yaml here (and uncomment the cert-manager
+          # release above) to switch from pkiInitJob to cert-manager for PKI.
+          #- values-cert-manager.yaml
           # To enable OIDC with a local Keycloak instance, run the one-time
           # setup task first, then uncomment the line below:
           #   mise run keycloak:k8s:setup

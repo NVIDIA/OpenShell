@@ -57,7 +57,7 @@ mise run helm:skaffold:run
 ```
 
 Both commands build the `gateway` and `supervisor` images and deploy the OpenShell Helm
-chart. The `pkiInitJob` hook runs on first install to generate mTLS secrets. Envoy Gateway is opt-in; see the Optional Add-ons section below.
+chart. The `pkiInitJob` hook runs on first install to generate mTLS secrets. Envoy Gateway  opt-in; see the Optional Add-ons section below.
 
 The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or `kubectl port-forward`.
 
@@ -189,6 +189,7 @@ mise run helm:k3s:status
 | `deploy/helm/openshell/skaffold.yaml` | Skaffold config — images, Helm releases, values overlays |
 | `deploy/helm/openshell/values.yaml` | Default Helm values |
 | `deploy/helm/openshell/values-skaffold.yaml` | Dev overrides (image pull policy, local image names) |
+| `deploy/helm/openshell/values-cert-manager.yaml` | cert-manager TLS overlay (opt-in; disables pkiInitJob) |
 | `deploy/helm/openshell/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/values-keycloak.yaml` | Keycloak OIDC overlay |
 | `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass for Envoy Gateway (`mise run helm:gateway:apply`) |
