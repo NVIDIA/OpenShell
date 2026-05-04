@@ -77,7 +77,7 @@ Use a scratch repository or a demo branch if you do not want this file in a
 production repository.
 
 The deterministic non-model validation flow lives in
-`e2e/agent-driven-policy-management/validation.sh`.
+`examples/agent-driven-policy-management/validation/validation.sh`.
 
 ## Options
 
