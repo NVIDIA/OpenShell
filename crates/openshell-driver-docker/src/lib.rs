@@ -18,17 +18,16 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use openshell_core::config::{
-    CDI_GPU_DEVICE_ALL, DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_STOP_TIMEOUT_SECS,
-};
+use openshell_core::config::{DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_STOP_TIMEOUT_SECS};
+use openshell_core::gpu::cdi_gpu_device_ids;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
-    WatchSandboxesEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
-    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    GpuRequestSpec, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
+    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
+    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesRequest,
+    WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::{Config, Error, Result as CoreResult};
 use std::collections::HashMap;
@@ -306,11 +305,7 @@ impl DockerComputeDriver {
                 "docker sandboxes require a template image",
             ));
         }
-        if spec.gpu && !config.supports_gpu {
-            return Err(Status::failed_precondition(
-                "docker GPU sandboxes require Docker CDI support. Enable CDI on the Docker daemon, then restart the OpenShell gateway/server so GPU capability is detected.",
-            ));
-        }
+        Self::validate_gpu_request(spec.gpu.as_ref(), config.supports_gpu)?;
         if !template.agent_socket_path.trim().is_empty() {
             return Err(Status::failed_precondition(
                 "docker compute driver does not support template.agent_socket_path",
@@ -327,6 +322,18 @@ impl DockerComputeDriver {
         }
 
         let _ = docker_resource_limits(template)?;
+        Ok(())
+    }
+
+    fn validate_gpu_request(
+        gpu: Option<&GpuRequestSpec>,
+        supports_gpu: bool,
+    ) -> Result<(), Status> {
+        if gpu.is_some() && !supports_gpu {
+            return Err(Status::failed_precondition(
+                "docker GPU sandboxes require Docker CDI support. Enable CDI on the Docker daemon, then restart the OpenShell gateway/server so GPU capability is detected.",
+            ));
+        }
         Ok(())
     }
 
@@ -932,11 +939,11 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         .collect()
 }
 
-fn docker_gpu_device_requests(gpu: bool) -> Option<Vec<DeviceRequest>> {
-    gpu.then(|| {
+fn docker_gpu_device_requests(gpu: Option<&GpuRequestSpec>) -> Option<Vec<DeviceRequest>> {
+    cdi_gpu_device_ids(gpu).map(|device_ids| {
         vec![DeviceRequest {
             driver: Some("cdi".to_string()),
-            device_ids: Some(vec![CDI_GPU_DEVICE_ALL.to_string()]),
+            device_ids: Some(device_ids),
             ..Default::default()
         }]
     })
@@ -983,7 +990,7 @@ fn build_container_create_body(
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
-            device_requests: docker_gpu_device_requests(spec.gpu),
+            device_requests: docker_gpu_device_requests(spec.gpu.as_ref()),
             mounts: Some(build_mounts(config)),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),

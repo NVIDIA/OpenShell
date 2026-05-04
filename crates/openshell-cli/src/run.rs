@@ -27,11 +27,12 @@ use openshell_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
     ExecSandboxRequest, GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource, PolicyStatus, Provider,
-    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
-    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GpuRequestSpec, HealthRequest,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource,
+    PolicyStatus, Provider, RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy,
+    SandboxSpec, SandboxTemplate, SetClusterInferenceRequest, SettingScope, SettingValue,
+    UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
+    setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -2324,8 +2325,7 @@ pub async fn sandbox_create(
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
-            gpu: requested_gpu,
-            gpu_device: gpu_device.unwrap_or_default().to_string(),
+            gpu: gpu_request_from_cli(requested_gpu, gpu_device),
             policy,
             providers: configured_providers,
             template,
@@ -2755,6 +2755,15 @@ pub async fn sandbox_create(
             "sandbox provisioning stream ended before reaching terminal phase"
         )),
     }
+}
+
+fn gpu_request_from_cli(requested_gpu: bool, gpu_device: Option<&str>) -> Option<GpuRequestSpec> {
+    requested_gpu.then(|| GpuRequestSpec {
+        device_id: gpu_device
+            .filter(|device_id| !device_id.is_empty())
+            .map(|device_id| vec![device_id.to_string()])
+            .unwrap_or_default(),
+    })
 }
 
 /// Resolved source for the `--from` flag on `sandbox create`.
@@ -5794,8 +5803,8 @@ mod tests {
     use super::{
         GatewayControlTarget, TlsOptions, dockerfile_sources_supported_for_gateway,
         format_gateway_select_header, format_gateway_select_items, gateway_add, gateway_auth_label,
-        gateway_select_with, gateway_type_label, git_sync_files, http_health_check,
-        image_requests_gpu, inferred_provider_type, parse_cli_setting_value,
+        gateway_select_with, gateway_type_label, git_sync_files, gpu_request_from_cli,
+        http_health_check, image_requests_gpu, inferred_provider_type, parse_cli_setting_value,
         parse_credential_pairs, plaintext_gateway_is_remote, provisioning_timeout_message,
         ready_false_condition_message, resolve_from, resolve_gateway_control_target_from,
         sandbox_should_persist, shell_escape, source_requests_gpu, validate_gateway_name,
@@ -6043,6 +6052,26 @@ mod tests {
     fn source_requests_gpu_detects_known_community_gpu_name() {
         assert!(source_requests_gpu("nvidia-gpu"));
         assert!(!source_requests_gpu("base"));
+    }
+
+    #[test]
+    fn gpu_request_from_cli_uses_presence_with_empty_device_ids_for_default_gpu() {
+        let request = gpu_request_from_cli(true, None).expect("gpu request should be present");
+
+        assert!(request.device_id.is_empty());
+    }
+
+    #[test]
+    fn gpu_request_from_cli_maps_gpu_device_to_one_device_id() {
+        let request = gpu_request_from_cli(true, Some("0000:2d:00.0"))
+            .expect("gpu request should be present");
+
+        assert_eq!(request.device_id, vec!["0000:2d:00.0"]);
+    }
+
+    #[test]
+    fn gpu_request_from_cli_omits_gpu_request_when_not_requested() {
+        assert!(gpu_request_from_cli(false, Some("0")).is_none());
     }
 
     #[test]

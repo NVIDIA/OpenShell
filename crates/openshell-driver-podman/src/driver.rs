@@ -10,7 +10,7 @@ use crate::watcher::{
     self, WatchStream, driver_sandbox_from_inspect, driver_sandbox_from_list_entry,
 };
 use openshell_core::ComputeDriverError;
-use openshell_core::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
+use openshell_core::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse, GpuRequestSpec};
 use tracing::{info, warn};
 
 impl From<PodmanApiError> for ComputeDriverError {
@@ -184,8 +184,12 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
-        let gpu_requested = sandbox.spec.as_ref().is_some_and(|s| s.gpu);
-        if gpu_requested && !Self::has_gpu_capacity() {
+        let gpu = sandbox.spec.as_ref().and_then(|s| s.gpu.as_ref());
+        Self::validate_gpu_request(gpu)
+    }
+
+    fn validate_gpu_request(gpu: Option<&GpuRequestSpec>) -> Result<(), ComputeDriverError> {
+        if gpu.is_some() && !Self::has_gpu_capacity() {
             return Err(ComputeDriverError::Precondition(
                 "GPU sandbox requested, but no NVIDIA GPU devices are available.".to_string(),
             ));

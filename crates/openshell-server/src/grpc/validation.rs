@@ -642,7 +642,7 @@ pub(super) fn level_matches(log_level: &str, min_level: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::SandboxSpec;
+    use openshell_core::proto::{GpuRequestSpec, SandboxSpec};
     use std::collections::HashMap;
     use tonic::Code;
 
@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_gpu_flag() {
         let spec = SandboxSpec {
-            gpu: true,
+            gpu: Some(GpuRequestSpec { device_id: vec![] }),
             ..Default::default()
         };
         assert!(validate_sandbox_spec("gpu-sandbox", &spec).is_ok());

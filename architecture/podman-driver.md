@@ -43,7 +43,7 @@ graph TB
 | Supervisor delivery | hostPath volume (read-only) | Embedded in rootfs tarball | OCI image volume (read-only) |
 | Network model | Supervisor creates netns inside pod | gvproxy virtio-net (192.168.127.0/24) | Supervisor creates netns inside container |
 | Credential injection | Plaintext env var + K8s Secret volume (0400) | Rootfs file copy (0600) + env vars | Podman `secret_env` API + env vars |
-| GPU support | Yes (nvidia.com/gpu resource) | No | Yes (CDI device) |
+| GPU support | Yes (nvidia.com/gpu resource) | Yes (single passthrough GPU) | Yes (CDI device IDs via shared resolver) |
 | `stop_sandbox` | Unimplemented | Unimplemented | Implemented (graceful stop) |
 | State storage | Kubernetes API (CRD) | In-memory HashMap + filesystem | Podman daemon (container state) |
 | Endpoint resolution | Pod IP / cluster DNS | 127.0.0.1 + allocated port | 127.0.0.1 + ephemeral port |
