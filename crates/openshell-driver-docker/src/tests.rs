@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use openshell_core::config::DEFAULT_SERVER_PORT;
+use openshell_core::config::{CDI_GPU_DEVICE_ALL, DEFAULT_SERVER_PORT};
 use openshell_core::proto::compute::v1::{
-    DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+    DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate, GpuRequestSpec,
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -31,8 +31,7 @@ fn test_sandbox() -> DriverSandbox {
                 resources: None,
                 platform_config: None,
             }),
-            gpu: false,
-            gpu_device: String::new(),
+            gpu: None,
         }),
         status: None,
     }
@@ -348,7 +347,7 @@ fn build_container_create_body_clears_inherited_cmd() {
 fn validate_sandbox_rejects_gpu_when_cdi_unavailable() {
     let config = runtime_config();
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().gpu = true;
+    sandbox.spec.as_mut().unwrap().gpu = Some(GpuRequestSpec { device_id: vec![] });
 
     let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
 
@@ -361,7 +360,7 @@ fn build_container_create_body_maps_gpu_to_all_cdi_device() {
     let mut config = runtime_config();
     config.supports_gpu = true;
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().gpu = true;
+    sandbox.spec.as_mut().unwrap().gpu = Some(GpuRequestSpec { device_id: vec![] });
 
     let create_body = build_container_create_body(&sandbox, &config).unwrap();
     let request = create_body
@@ -375,6 +374,36 @@ fn build_container_create_body_maps_gpu_to_all_cdi_device() {
     assert_eq!(
         request.device_ids.as_ref().unwrap(),
         &vec![CDI_GPU_DEVICE_ALL.to_string()]
+    );
+}
+
+#[test]
+fn build_container_create_body_passes_explicit_cdi_device_ids_through() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().gpu = Some(GpuRequestSpec {
+        device_id: vec![
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=1".to_string(),
+        ],
+    });
+
+    let create_body = build_container_create_body(&sandbox, &config).unwrap();
+    let request = create_body
+        .host_config
+        .as_ref()
+        .and_then(|host_config| host_config.device_requests.as_ref())
+        .and_then(|requests| requests.first())
+        .expect("GPU request should add a Docker device request");
+
+    assert_eq!(request.driver.as_deref(), Some("cdi"));
+    assert_eq!(
+        request.device_ids.as_ref().unwrap(),
+        &vec![
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=1".to_string()
+        ]
     );
 }
 

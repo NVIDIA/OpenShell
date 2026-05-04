@@ -15,7 +15,7 @@ use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
     DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
-    GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    GetCapabilitiesResponse, GpuRequestSpec, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use std::collections::BTreeMap;
@@ -60,6 +60,10 @@ const SANDBOX_MANAGED_LABEL: &str = "openshell.ai/managed-by";
 const SANDBOX_MANAGED_VALUE: &str = "openshell";
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const GPU_RESOURCE_QUANTITY: &str = "1";
+
+fn gpu_has_explicit_device_ids(gpu: Option<&GpuRequestSpec>) -> bool {
+    gpu.is_some_and(|gpu| !gpu.device_id.is_empty())
+}
 
 // ---------------------------------------------------------------------------
 // Default workspace persistence (temporary — will be replaced by snapshotting)
@@ -194,12 +198,20 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
-        let gpu_requested = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu);
-        self.validate_gpu_request(gpu_requested).await
+        let gpu = sandbox.spec.as_ref().and_then(|spec| spec.gpu.as_ref());
+        self.validate_gpu_request(gpu).await
     }
 
-    async fn validate_gpu_request(&self, gpu_requested: bool) -> Result<(), tonic::Status> {
-        if gpu_requested
+    async fn validate_gpu_request(
+        &self,
+        gpu: Option<&GpuRequestSpec>,
+    ) -> Result<(), tonic::Status> {
+        if gpu_has_explicit_device_ids(gpu) {
+            return Err(tonic::Status::invalid_argument(
+                "kubernetes compute driver does not support explicit GPU device IDs",
+            ));
+        }
+        if gpu.is_some()
             && !self.has_gpu_capacity().await.map_err(|err| {
                 tonic::Status::internal(format!("check GPU node capacity failed: {err}"))
             })?
@@ -295,6 +307,12 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
+        if gpu_has_explicit_device_ids(sandbox.spec.as_ref().and_then(|spec| spec.gpu.as_ref())) {
+            return Err(KubernetesDriverError::Precondition(
+                "kubernetes compute driver does not support explicit GPU device IDs".to_string(),
+            ));
+        }
+
         let name = sandbox.name.as_str();
         info!(
             sandbox_id = %sandbox.id,
@@ -922,7 +940,7 @@ fn sandbox_to_k8s_spec(
                 "podTemplate".to_string(),
                 sandbox_template_to_k8s(
                     template,
-                    spec.gpu,
+                    spec.gpu.is_some(),
                     default_image,
                     image_pull_policy,
                     sandbox_id,
@@ -968,7 +986,7 @@ fn sandbox_to_k8s_spec(
             "podTemplate".to_string(),
             sandbox_template_to_k8s(
                 &SandboxTemplate::default(),
-                spec.as_ref().is_some_and(|s| s.gpu),
+                spec.as_ref().is_some_and(|s| s.gpu.is_some()),
                 default_image,
                 image_pull_policy,
                 sandbox_id,
@@ -1596,6 +1614,19 @@ mod tests {
             pod_template["spec"]["containers"][0]["resources"]["limits"][GPU_RESOURCE_NAME],
             serde_json::json!(GPU_RESOURCE_QUANTITY)
         );
+    }
+
+    #[test]
+    fn gpu_has_explicit_device_ids_only_when_ids_are_present() {
+        use openshell_core::proto::compute::v1::GpuRequestSpec;
+
+        assert!(!gpu_has_explicit_device_ids(None));
+        assert!(!gpu_has_explicit_device_ids(Some(&GpuRequestSpec {
+            device_id: vec![],
+        })));
+        assert!(gpu_has_explicit_device_ids(Some(&GpuRequestSpec {
+            device_id: vec!["nvidia.com/gpu=0".to_string()],
+        })));
     }
 
     #[test]

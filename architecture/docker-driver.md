@@ -60,7 +60,7 @@ enforced by the supervisor in that nested namespace.
 | `cap_add` | `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYSLOG` | Required for supervisor isolation setup and process inspection |
 | `security_opt` | `apparmor=unconfined` | Docker's default AppArmor profile blocks mount operations required by network namespace setup |
 | `restart_policy` | `unless-stopped` | Resume managed sandboxes after Docker or gateway restarts |
-| `device_requests` | CDI all-GPU request when `spec.gpu` is true | Enables Docker CDI GPU sandboxes when daemon support is detected |
+| `device_requests` | CDI GPU request when `spec.gpu` is present | Uses the shared CDI GPU resolver: empty `device_id` defaults to `nvidia.com/gpu=all`, explicit IDs pass through |
 
 ## Gateway Callback
 
