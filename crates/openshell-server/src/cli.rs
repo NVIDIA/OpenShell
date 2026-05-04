@@ -291,7 +291,7 @@ pub async fn run_cli() -> Result<()> {
 
     let args = Args::from_arg_matches(&command().get_matches()).expect("clap validated args");
 
-    run_from_args(args).await
+    Box::pin(run_from_args(args)).await
 }
 
 async fn run_from_args(args: Args) -> Result<()> {

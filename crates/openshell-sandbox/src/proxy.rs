@@ -1202,7 +1202,7 @@ fn evaluate_opa_tcp(
 #[cfg(not(target_os = "linux"))]
 fn evaluate_opa_tcp(
     _peer_addr: SocketAddr,
-    _engine: &OpaEngine,
+    engine: &OpaEngine,
     _identity_cache: &BinaryIdentityCache,
     _entrypoint_pid: &AtomicU32,
     _host: &str,
@@ -1212,7 +1212,7 @@ fn evaluate_opa_tcp(
         action: NetworkAction::Deny {
             reason: "identity binding unavailable on this platform".into(),
         },
-        generation: _engine.current_generation(),
+        generation: engine.current_generation(),
         binary: None,
         binary_pid: None,
         ancestors: vec![],
