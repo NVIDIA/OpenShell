@@ -31,6 +31,9 @@ pub const DEFAULT_SSH_HANDSHAKE_SKEW_SECS: u64 = 300;
 /// Default Podman bridge network name.
 pub const DEFAULT_NETWORK_NAME: &str = "openshell";
 
+/// Default Docker bridge network name for local sandboxes.
+pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
+
 /// Default OCI image for the openshell-sandbox supervisor binary.
 pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
 
@@ -515,7 +518,7 @@ impl Config {
 }
 
 fn default_bind_address() -> SocketAddr {
-    "0.0.0.0:8080".parse().expect("valid default address")
+    "127.0.0.1:8080".parse().expect("valid default address")
 }
 
 fn default_log_level() -> String {
@@ -587,6 +590,12 @@ mod tests {
     fn compute_driver_kind_rejects_unknown_values() {
         let err = "firecracker".parse::<ComputeDriverKind>().unwrap_err();
         assert!(err.contains("unsupported compute driver 'firecracker'"));
+    }
+
+    #[test]
+    fn config_defaults_to_loopback_bind_address() {
+        let expected: SocketAddr = "127.0.0.1:8080".parse().expect("valid address");
+        assert_eq!(Config::new(None).bind_address, expected);
     }
 
     #[test]

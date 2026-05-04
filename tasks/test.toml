@@ -33,7 +33,9 @@ depends = ["cluster"]
 run = [
   "cargo build -p openshell-cli --features openshell-core/dev-settings",
   # gateway_resume and Docker GPU tests run in dedicated jobs with their own clusters.
-  "cargo test --manifest-path e2e/rust/Cargo.toml --features e2e -- --skip gateway_resume_scenarios --skip docker_gpu_sandbox_runs_nvidia_smi",
+  # Dockerfile sources build into the host Docker daemon, so the custom image
+  # test belongs with Docker-backed gateway coverage rather than the k3s suite.
+  "cargo test --manifest-path e2e/rust/Cargo.toml --features e2e -- --skip gateway_resume_scenarios --skip docker_gpu_sandbox_runs_nvidia_smi --skip sandbox_from_custom_dockerfile",
 ]
 
 ["e2e:python"]

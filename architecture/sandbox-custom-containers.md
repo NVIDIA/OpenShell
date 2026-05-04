@@ -9,7 +9,7 @@ The `--from` flag accepts four kinds of input:
 | Input | Example | Behavior |
 |-------|---------|----------|
 | **Community sandbox name** | `--from openclaw` | Resolves to `ghcr.io/nvidia/openshell-community/sandboxes/openclaw:latest` |
-| **Dockerfile path** | `--from ./Dockerfile` | Builds the image, pushes it into the cluster, then creates the sandbox |
+| **Dockerfile path** | `--from ./Dockerfile` | Builds the image into the host Docker daemon, then creates the sandbox |
 | **Directory with Dockerfile** | `--from ./my-sandbox/` | Uses the directory as the build context |
 | **Full image reference** | `--from myregistry.com/img:tag` | Uses the image directly |
 
@@ -33,8 +33,7 @@ The community registry prefix defaults to `ghcr.io/nvidia/openshell-community/sa
 When `--from` points to a Dockerfile or directory, the CLI:
 
 1. Builds the image locally via the Docker daemon (respecting `.dockerignore`).
-2. Pushes it into the cluster's containerd runtime using `docker save` / `ctr import`.
-3. Creates the sandbox with the resulting image tag.
+2. Creates the sandbox with the resulting local image tag.
 
 ## How It Works
 
@@ -107,18 +106,18 @@ The `openshell-sandbox` supervisor adapts to arbitrary environments:
 |----------|-----------|
 | Unified `--from` flag | Single entry point for community names, Dockerfiles, directories, and image refs — removes the need to know registry paths |
 | Community name resolution | Bare names like `openclaw` expand to the GHCR community registry, making the common case simple |
-| Auto build+push for Dockerfiles | Eliminates the two-step `image push` + `create` workflow for local development |
+| Auto build for Dockerfiles | Eliminates the two-step `docker build` + `create` workflow for local Docker-backed development |
 | `OPENSHELL_COMMUNITY_REGISTRY` env var | Allows organizations to host their own community sandbox registry |
 | hostPath side-load | Supervisor binary lives on the node filesystem — no init container, no emptyDir, no extra image pull. Faster pod startup. |
 | Read-only mount in agent | The supervisor binary is mounted read-only, and the startup seccomp prelude blocks the remount syscalls that would otherwise reopen it for writes once privileged bootstrap has completed. |
 | Command override | Ensures `openshell-sandbox` is the entrypoint regardless of the image's default CMD |
 | Clear `run_as_user/group` for custom images | Prevents startup failure when the image lacks the default `sandbox` user |
 | Non-fatal log file init | `/var/log/openshell.log` may be unwritable in arbitrary images; falls back to stdout |
-| `docker save` / `ctr import` for push | Avoids requiring a registry for local dev; images land directly in the k3s containerd store |
+| Host Docker image store | Dockerfile sources build into the host Docker daemon and are referenced by local image tag. |
 | Optional `iptables` for bypass detection | Core network isolation works via routing alone (`iproute2`); `iptables` only adds fast-fail (`ECONNREFUSED`) and diagnostic LOG entries. Making it optional avoids hard failures in minimal images that lack `iptables` while giving better UX when it is available. |
 
 ## Limitations
 
 - Distroless / `FROM scratch` images are not supported (the supervisor needs glibc and `/proc`)
 - Missing `iproute2` (or required capabilities) blocks startup in proxy mode because namespace isolation is mandatory
-- The supervisor binary must be present on the k3s node at `/opt/openshell/bin/openshell-sandbox` (embedded in the cluster image at build time)
+- Kubernetes gateways require images to be available to the cluster runtime. Dockerfile sources build into the host Docker daemon only; use a registry image reference when the selected gateway cannot access the host Docker image store.

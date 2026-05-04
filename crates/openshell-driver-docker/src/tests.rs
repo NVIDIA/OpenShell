@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use openshell_core::config::DEFAULT_SERVER_PORT;
 use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
 };
 use std::fs;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tempfile::TempDir;
 
 const TLS_MOUNT_DIR: &str = "/etc/openshell/tls/client";
@@ -42,6 +44,14 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         image_pull_policy: String::new(),
         sandbox_namespace: "default".to_string(),
         grpc_endpoint: "https://localhost:8443".to_string(),
+        network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
+        gateway_route: DockerGatewayRoute::Bridge {
+            bind_address: SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+                DEFAULT_SERVER_PORT,
+            ),
+            host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+        },
         ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
         stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
         log_level: "info".to_string(),
@@ -57,16 +67,129 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
 }
 
 #[test]
-fn build_environment_preserves_loopback_endpoint_for_host_network() {
-    let mut config = runtime_config();
-    config.grpc_endpoint = "http://127.0.0.1:8080".to_string();
+fn container_visible_endpoint_rewrites_loopback_hosts() {
+    assert_eq!(
+        docker_container_openshell_endpoint(
+            "https://localhost:8443",
+            HOST_OPENSHELL_INTERNAL,
+            DEFAULT_SERVER_PORT,
+        ),
+        "https://host.openshell.internal:8080/"
+    );
+    assert_eq!(
+        docker_container_openshell_endpoint(
+            "http://127.0.0.1:8080",
+            HOST_OPENSHELL_INTERNAL,
+            DEFAULT_SERVER_PORT,
+        ),
+        "http://host.openshell.internal:8080/"
+    );
+    assert_eq!(
+        docker_container_openshell_endpoint(
+            "https://gateway.internal:8443",
+            HOST_OPENSHELL_INTERNAL,
+            DEFAULT_SERVER_PORT,
+        ),
+        "https://host.openshell.internal:8080/"
+    );
+}
 
-    let env = build_environment(&test_sandbox(), &config);
-    assert!(env.contains(&"OPENSHELL_ENDPOINT=http://127.0.0.1:8080".to_string()));
+#[test]
+fn docker_bridge_gateway_ip_requires_ipv4_gateway() {
+    let network = bollard::models::NetworkInspect {
+        driver: Some(DOCKER_NETWORK_DRIVER.to_string()),
+        ipam: Some(bollard::models::Ipam {
+            config: Some(vec![
+                bollard::models::IpamConfig {
+                    gateway: Some("fd00::1".to_string()),
+                    ..Default::default()
+                },
+                bollard::models::IpamConfig {
+                    gateway: Some("172.18.0.1".to_string()),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
 
-    config.grpc_endpoint = "https://localhost:8443".to_string();
-    let env = build_environment(&test_sandbox(), &config);
-    assert!(env.contains(&"OPENSHELL_ENDPOINT=https://localhost:8443".to_string()));
+    assert_eq!(
+        docker_bridge_gateway_ip(DEFAULT_DOCKER_NETWORK_NAME, &network).unwrap(),
+        IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1))
+    );
+
+    let ipv6_only_network = bollard::models::NetworkInspect {
+        driver: Some(DOCKER_NETWORK_DRIVER.to_string()),
+        ipam: Some(bollard::models::Ipam {
+            config: Some(vec![bollard::models::IpamConfig {
+                gateway: Some("fd00::1".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    assert!(
+        docker_bridge_gateway_ip(DEFAULT_DOCKER_NETWORK_NAME, &ipv6_only_network)
+            .unwrap_err()
+            .to_string()
+            .contains("IPv4 IPAM gateway")
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
+    let info = SystemInfo {
+        operating_system: Some("Docker Desktop".to_string()),
+        labels: Some(vec![
+            "com.docker.desktop.address=unix:///tmp/docker.sock".to_string(),
+        ]),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+        ),
+        DockerGatewayRoute::HostGateway
+    );
+    assert_eq!(
+        docker_extra_hosts(&DockerGatewayRoute::HostGateway),
+        vec!["host.openshell.internal:host-gateway".to_string()]
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
+    let info = SystemInfo {
+        operating_system: Some("Ubuntu 24.04 LTS".to_string()),
+        ..Default::default()
+    };
+
+    let route = docker_gateway_route(
+        &info,
+        IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+        DEFAULT_SERVER_PORT,
+    );
+
+    assert_eq!(
+        route,
+        DockerGatewayRoute::Bridge {
+            bind_address: "172.18.0.1:8080".parse().unwrap(),
+            host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+        }
+    );
+    assert_eq!(
+        docker_extra_hosts(&route),
+        vec![
+            "host.docker.internal:172.18.0.1".to_string(),
+            "host.openshell.internal:172.18.0.1".to_string()
+        ]
+    );
 }
 
 #[test]
@@ -124,6 +247,29 @@ fn build_environment_sets_docker_tls_paths() {
 }
 
 #[test]
+fn build_environment_keeps_path_driver_controlled() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.environment
+        .insert("PATH".to_string(), "/malicious/spec/bin".to_string());
+    spec.template
+        .as_mut()
+        .unwrap()
+        .environment
+        .insert("PATH".to_string(), "/malicious/template/bin".to_string());
+
+    let env = build_environment(&sandbox, &runtime_config());
+    let path_entries = env
+        .iter()
+        .filter(|entry| entry.starts_with("PATH="))
+        .collect::<Vec<_>>();
+
+    let expected_path = format!("PATH={SUPERVISOR_PATH}");
+    assert_eq!(path_entries.len(), 1);
+    assert_eq!(path_entries[0], &expected_path);
+}
+
+#[test]
 fn build_mounts_uses_docker_tls_directory() {
     let mounts = build_mounts(&runtime_config());
     let targets = mounts
@@ -168,13 +314,33 @@ fn build_container_create_body_clears_inherited_cmd() {
             .and_then(|labels| labels.get(SANDBOX_NAMESPACE_LABEL_KEY)),
         Some(&"default".to_string())
     );
+    let host_config = create_body.host_config.as_ref().unwrap();
     assert!(
-        create_body
-            .host_config
-            .as_ref()
-            .and_then(|host_config| host_config.device_requests.as_ref())
-            .is_none(),
+        host_config.device_requests.as_ref().is_none(),
         "non-GPU containers should not request Docker devices"
+    );
+    assert_eq!(
+        host_config.security_opt.as_ref(),
+        Some(&vec!["apparmor=unconfined".to_string()])
+    );
+    assert_eq!(
+        host_config.network_mode.as_deref(),
+        Some(DEFAULT_DOCKER_NETWORK_NAME)
+    );
+    assert_eq!(
+        host_config.extra_hosts.as_ref(),
+        Some(&vec![
+            "host.docker.internal:172.18.0.1".to_string(),
+            "host.openshell.internal:172.18.0.1".to_string()
+        ])
+    );
+    assert_eq!(
+        create_body
+            .networking_config
+            .as_ref()
+            .and_then(|config| config.endpoints_config.as_ref())
+            .and_then(|endpoints| endpoints.get(DEFAULT_DOCKER_NETWORK_NAME)),
+        Some(&EndpointSettings::default())
     );
 }
 
@@ -229,19 +395,22 @@ fn require_sandbox_identifier_rejects_when_id_and_name_are_empty() {
 }
 
 #[test]
-fn build_container_create_body_uses_host_network() {
+fn build_container_create_body_uses_bridge_network() {
     let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
     let host_config = create_body.host_config.expect("host_config is populated");
 
     assert_eq!(
         host_config.network_mode,
-        Some("host".to_string()),
-        "sandbox must use host networking so 127.0.0.1 reaches the host gateway"
+        Some(DEFAULT_DOCKER_NETWORK_NAME.to_string()),
+        "sandbox should join the driver-managed bridge network"
     );
     assert_eq!(
         host_config.extra_hosts,
-        Some(vec!["host.openshell.internal:127.0.0.1".to_string()]),
-        "sandbox should expose a stable host alias without host /etc/hosts edits"
+        Some(vec![
+            "host.docker.internal:172.18.0.1".to_string(),
+            "host.openshell.internal:172.18.0.1".to_string()
+        ]),
+        "sandbox should expose stable host aliases for gateway callbacks"
     );
 }
 
