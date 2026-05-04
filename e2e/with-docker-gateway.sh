@@ -23,6 +23,19 @@ fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+cargo_target_dir() {
+  if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    case "${CARGO_TARGET_DIR}" in
+      /*) printf '%s\n' "${CARGO_TARGET_DIR}" ;;
+      *) printf '%s\n' "${ROOT}/${CARGO_TARGET_DIR}" ;;
+    esac
+    return 0
+  fi
+
+  cargo metadata --format-version=1 --no-deps \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+}
+
 github_actions_host_docker_tmpdir() {
   if [ "${GITHUB_ACTIONS:-}" != "true" ] \
      || [ ! -S /var/run/docker.sock ] \
@@ -55,8 +68,8 @@ else
 fi
 WORKDIR_PARENT="${WORKDIR_PARENT%/}"
 WORKDIR="$(mktemp -d "${WORKDIR_PARENT}/openshell-e2e-gateway.XXXXXX")"
-GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
-CLI_BIN="${ROOT}/target/debug/openshell"
+GATEWAY_BIN=""
+CLI_BIN=""
 GATEWAY_PID=""
 GATEWAY_LOG="${WORKDIR}/gateway.log"
 GATEWAY_CONFIG_DIR=""
@@ -333,10 +346,28 @@ if [ -n "${CARGO_BUILD_JOBS:-}" ]; then
   CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
 fi
 
-echo "Building openshell-gateway and openshell-cli..."
+TARGET_DIR="$(cargo_target_dir)"
+GATEWAY_BIN="${TARGET_DIR}/debug/openshell-gateway"
+CLI_BIN="${TARGET_DIR}/debug/openshell"
+
+echo "Building openshell-gateway..."
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
   -p openshell-server --bin openshell-gateway \
-  -p openshell-cli --features openshell-core/dev-settings
+  --features openshell-core/dev-settings
+
+echo "Building openshell-cli..."
+cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
+  -p openshell-cli --bin openshell \
+  --features openshell-core/dev-settings
+
+if [ ! -x "${GATEWAY_BIN}" ]; then
+  echo "ERROR: expected openshell-gateway binary at ${GATEWAY_BIN}" >&2
+  exit 1
+fi
+if [ ! -x "${CLI_BIN}" ]; then
+  echo "ERROR: expected openshell CLI binary at ${CLI_BIN}" >&2
+  exit 1
+fi
 
 echo "Building openshell-sandbox for ${SUPERVISOR_TARGET}..."
 mkdir -p "${SUPERVISOR_OUT_DIR}"
@@ -344,7 +375,7 @@ if [ "${HOST_OS}" = "Linux" ] && [ "${HOST_ARCH}" = "${DAEMON_ARCH}" ]; then
   rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
   cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
     --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
-  cp "${ROOT}/target/${SUPERVISOR_TARGET}/release/openshell-sandbox" "${SUPERVISOR_BIN}"
+  cp "${TARGET_DIR}/${SUPERVISOR_TARGET}/release/openshell-sandbox" "${SUPERVISOR_BIN}"
 else
   CONTAINER_ENGINE=docker \
   DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
