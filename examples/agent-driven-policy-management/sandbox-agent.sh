@@ -66,8 +66,17 @@ cd "$WORK"
 # OpenShell sandbox container without extra capabilities. The "danger" framing
 # is from Codex's perspective on a developer host; here the OpenShell network
 # policy and filesystem constraints are doing the actual containment.
+#
+# Cap Codex's reasoning effort at the lower end. The demo task is mechanical
+# (one HTTP request, parse a structured 403, post a JSON proposal, retry); the
+# default high-effort reasoning roughly doubles the demo's wall time without
+# improving outcomes. Override with DEMO_CODEX_REASONING if you want to
+# compare runs.
+DEMO_CODEX_REASONING="${DEMO_CODEX_REASONING:-low}"
+
 exec codex exec \
     --skip-git-repo-check \
     --sandbox danger-full-access \
     --ephemeral \
+    -c "model_reasoning_effort=\"${DEMO_CODEX_REASONING}\"" \
     "$(cat /sandbox/payload/agent-task.md)"
