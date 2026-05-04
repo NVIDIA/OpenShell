@@ -32,6 +32,7 @@ async fn run_without_docker(args: &[&str]) -> (String, i32, std::time::Duration)
         .env("HOME", tmpdir.path())
         .env("DOCKER_HOST", "unix:///tmp/openshell-e2e-nonexistent.sock")
         .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -249,6 +250,7 @@ async fn doctor_check_passes_with_docker() {
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
         .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

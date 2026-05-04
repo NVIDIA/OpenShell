@@ -35,30 +35,8 @@ jobs:
       component: gateway
       platform: linux/arm64
 
-  build-cluster:
-    needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: cluster
-      platform: linux/arm64
-
-  build-supervisor:
-    needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: supervisor
-      platform: linux/arm64
-
   e2e:
-    needs: [pr_metadata, build-gateway, build-cluster, build-supervisor]
+    needs: [pr_metadata, build-gateway]
     if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:
       contents: read

@@ -21,6 +21,7 @@ async fn run_isolated(args: &[&str]) -> (String, i32) {
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
         .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

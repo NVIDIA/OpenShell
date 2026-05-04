@@ -4,7 +4,7 @@
 
 ```bash
 mise run test          # Rust + Python unit tests
-mise run e2e           # End-to-end tests (requires a running cluster)
+mise run e2e           # End-to-end tests (starts a Docker-backed gateway)
 mise run ci            # Everything: lint, compile checks, and tests
 ```
 
@@ -72,8 +72,17 @@ mise run test:python   # uv run pytest python/
 
 ## E2E Tests
 
-E2E tests run against a live cluster. `mise run e2e` deploys changed components
-before running the suite.
+E2E tests run against a live gateway. By default, `mise run e2e` starts an
+ephemeral standalone gateway with the Docker compute driver, runs the suite,
+and cleans it up afterward. To run the suite against an existing plaintext
+gateway, set `OPENSHELL_GATEWAY_ENDPOINT`:
+
+```bash
+OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:18080 mise run e2e
+```
+
+Raw endpoint mode is HTTP-only. Use a named gateway config when a gateway
+requires mTLS.
 
 ### Python E2E (`e2e/python/`)
 
@@ -125,7 +134,7 @@ def test_multiply(sandbox):
 
 | Fixture | Scope | Purpose |
 |---|---|---|
-| `sandbox_client` | session | gRPC client connected to the active cluster |
+| `sandbox_client` | session | gRPC client connected to the active gateway |
 | `sandbox` | function | Factory returning a `Sandbox` context manager |
 | `inference_client` | session | Client for managing inference routes |
 | `mock_inference_route` | session | Creates a mock OpenAI-protocol route for tests |
@@ -168,3 +177,4 @@ The harness (`e2e/rust/src/harness/`) provides:
 | Variable | Purpose |
 |---|---|
 | `OPENSHELL_GATEWAY` | Override active gateway name for E2E tests |
+| `OPENSHELL_GATEWAY_ENDPOINT` | Run E2E tests against an existing plaintext HTTP gateway endpoint |

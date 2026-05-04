@@ -21,6 +21,7 @@ async fn run_isolated(args: &[&str]) -> (String, i32) {
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
         .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
         // Suppress browser popup during auth flow.
         .env("OPENSHELL_NO_BROWSER", "1")
         // Use a closed stdin so auth prompts don't hang the test.
@@ -44,6 +45,7 @@ async fn run_with_config(tmpdir: &std::path::Path, args: &[&str]) -> (String, i3
         .env("XDG_CONFIG_HOME", tmpdir)
         .env("HOME", tmpdir)
         .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
         // Suppress browser popup during auth flow.
         .env("OPENSHELL_NO_BROWSER", "1")
         // Use a closed stdin so auth prompts don't hang the test.
@@ -416,4 +418,3 @@ async fn gateway_add_ssh_url_requires_port() {
         "error should mention port:\n{clean}"
     );
 }
-

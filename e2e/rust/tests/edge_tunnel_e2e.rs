@@ -3,20 +3,20 @@
 
 #![cfg(feature = "e2e")]
 
-//! E2E tests for edge tunnel auth flow against a running cluster.
+//! E2E tests for edge tunnel auth flow against a running gateway.
 //!
 //! Prerequisites:
-//! - A running openshell gateway deployed with `--plaintext`
-//! - The gateway's HTTP endpoint accessible (no TLS)
+//! - A running openshell gateway
+//! - For WS tunnel coverage, the gateway's HTTP endpoint is accessible (no TLS)
 //! - The `openshell` binary (built automatically from the workspace)
 //!
 //! These tests exercise the full CLI → WS tunnel → gRPC flow.
 //!
 //! Environment variables:
 //! - `OPENSHELL_GATEWAY`: Name of the active gateway (standard e2e var)
+//! - `OPENSHELL_GATEWAY_ENDPOINT`: Optional direct plaintext endpoint.
 //!
-//! The cluster must have been deployed with `openshell gateway start --plaintext`
-//! so that the server accepts plaintext HTTP connections.
+//! The edge-tunnel path requires a gateway endpoint that accepts plaintext HTTP.
 
 use std::process::Stdio;
 
@@ -39,13 +39,14 @@ async fn run_cli(args: &[&str]) -> (String, i32) {
 }
 
 /// Run `openshell <args>` with a custom config directory so the CLI reads
-/// our seeded cluster metadata and edge token instead of the real config.
+/// our seeded gateway metadata and edge token instead of the real config.
 async fn run_cli_with_config(config_dir: &std::path::Path, args: &[&str]) -> (String, i32) {
     let mut cmd = openshell_cmd();
     cmd.args(args)
         .env("XDG_CONFIG_HOME", config_dir)
         .env("HOME", config_dir)
         .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -57,63 +58,61 @@ async fn run_cli_with_config(config_dir: &std::path::Path, args: &[&str]) -> (St
     (combined, code)
 }
 
-/// Seed a temporary config directory with cluster metadata that has
-/// `auth_mode: "cloudflare_jwt"`, a stored edge token, and an active cluster
+/// Seed a temporary config directory with gateway metadata that has
+/// `auth_mode: "cloudflare_jwt"`, a stored edge token, and an active gateway
 /// pointing at the given endpoint.
-fn seed_edge_cluster_config(
+fn seed_edge_gateway_config(
     config_dir: &std::path::Path,
-    cluster_name: &str,
+    gateway_name: &str,
     gateway_endpoint: &str,
     edge_token: &str,
 ) {
     let openshell_dir = config_dir.join("openshell");
-    let clusters_dir = openshell_dir.join("clusters");
+    let gateways_dir = openshell_dir.join("gateways");
 
-    // Write active_cluster file.
     std::fs::create_dir_all(&openshell_dir).expect("create openshell config dir");
-    std::fs::write(openshell_dir.join("active_cluster"), cluster_name)
-        .expect("write active_cluster");
+    std::fs::write(openshell_dir.join("active_gateway"), gateway_name)
+        .expect("write active_gateway");
 
-    // Write cluster metadata JSON.
-    std::fs::create_dir_all(&clusters_dir).expect("create clusters dir");
+    // Write gateway metadata JSON.
+    let gateway_dir = gateways_dir.join(gateway_name);
+    std::fs::create_dir_all(&gateway_dir).expect("create gateway dir");
     let metadata = serde_json::json!({
-        "name": cluster_name,
+        "name": gateway_name,
         "gateway_endpoint": gateway_endpoint,
         "is_remote": false,
         "gateway_port": 0,
         "auth_mode": "cloudflare_jwt"
     });
     std::fs::write(
-        clusters_dir.join(format!("{cluster_name}_metadata.json")),
+        gateway_dir.join("metadata.json"),
         serde_json::to_string_pretty(&metadata).unwrap(),
     )
-    .expect("write cluster metadata");
+    .expect("write gateway metadata");
 
     // Write edge token file.
-    let token_dir = clusters_dir.join(cluster_name);
-    std::fs::create_dir_all(&token_dir).expect("create token dir");
-    std::fs::write(token_dir.join("edge_token"), edge_token).expect("write edge_token");
+    std::fs::write(gateway_dir.join("edge_token"), edge_token).expect("write edge_token");
 }
 
 // -------------------------------------------------------------------
-// Test 12: gRPC health check against a plaintext cluster
+// Test 12: gRPC health check against a gateway
 // -------------------------------------------------------------------
 
 /// `openshell status` should report a healthy gateway when connected to a
-/// plaintext cluster (deployed with `--plaintext`/`--disable-tls`).
+/// configured gateway.
 ///
-/// This test verifies the entire plaintext path:
-/// - CLI resolves cluster metadata with `http://` scheme
-/// - gRPC client connects over plaintext
+/// This test verifies the normal gateway path:
+/// - CLI resolves gateway metadata
+/// - gRPC client connects
 /// - Server responds to health check
 #[tokio::test]
-async fn plaintext_cluster_status_reports_healthy() {
+async fn gateway_status_reports_healthy() {
     let (output, code) = run_cli(&["status"]).await;
     let clean = strip_ansi(&output);
 
     assert_eq!(
         code, 0,
-        "openshell status should exit 0 against plaintext cluster:\n{clean}"
+        "openshell status should exit 0 against gateway:\n{clean}"
     );
 
     // The status output should show the gateway as healthy/connected.
@@ -130,7 +129,7 @@ async fn plaintext_cluster_status_reports_healthy() {
 // Test 13: gRPC through the WS tunnel proxy (edge token path)
 // -------------------------------------------------------------------
 
-/// When a cluster's metadata has `auth_mode == "cloudflare_jwt"` and a
+/// When a gateway's metadata has `auth_mode == "cloudflare_jwt"` and a
 /// stored edge token, the CLI routes gRPC through the WebSocket tunnel proxy.
 /// This test verifies the full tunnel path:
 ///
@@ -141,24 +140,23 @@ async fn plaintext_cluster_status_reports_healthy() {
 /// gateway.
 ///
 /// Note: The dummy token won't be validated (no edge auth middleware on
-/// the plaintext cluster), but it triggers the CLI's tunnel proxy codepath.
+/// the plaintext gateway), but it triggers the CLI's tunnel proxy codepath.
 #[tokio::test]
 async fn ws_tunnel_status_through_edge_proxy() {
-    // Read the current cluster name to restore it later.
     let (original_status, _) = run_cli(&["status"]).await;
     let clean_status = strip_ansi(&original_status);
 
-    // Only run this test if we have a healthy cluster to test against.
+    // Only run this test if we have a healthy gateway to test against.
     if !clean_status.to_lowercase().contains("healthy")
         && !clean_status.to_lowercase().contains("running")
         && !clean_status.to_lowercase().contains("connected")
         && !clean_status.contains("✓")
     {
-        eprintln!("Skipping ws_tunnel test: no healthy cluster available");
+        eprintln!("Skipping ws_tunnel test: no healthy gateway available");
         return;
     }
 
-    // Get the gateway endpoint from the cluster metadata.
+    // Get the gateway endpoint from the gateway metadata.
     let (info_output, info_code) = run_cli(&["gateway", "info"]).await;
     assert_eq!(info_code, 0, "gateway info should succeed:\n{info_output}");
 
@@ -182,13 +180,15 @@ async fn ws_tunnel_status_through_edge_proxy() {
         });
 
     let Some(endpoint) = endpoint else {
-        eprintln!("Skipping ws_tunnel test: could not extract gateway endpoint from:\n{info_clean}");
+        eprintln!(
+            "Skipping ws_tunnel test: could not extract gateway endpoint from:\n{info_clean}"
+        );
         return;
     };
 
     // For the WS tunnel test, we need the endpoint to be HTTP (plaintext).
     // If it's HTTPS, the WS tunnel test requires TLS negotiation which
-    // complicates things. Skip if the cluster isn't plaintext.
+    // complicates things. Skip if the gateway isn't plaintext.
     if !endpoint.starts_with("http://") {
         eprintln!(
             "Skipping ws_tunnel test: gateway endpoint is not plaintext HTTP: {endpoint}\n\
@@ -201,10 +201,15 @@ async fn ws_tunnel_status_through_edge_proxy() {
     // the live gateway. The dummy token triggers the WS tunnel codepath
     // without requiring real edge auth middleware.
     let tmpdir = tempfile::tempdir().expect("create temp config dir");
-    seed_edge_cluster_config(tmpdir.path(), "edge-tunnel-test", &endpoint, "dummy-test-jwt");
+    seed_edge_gateway_config(
+        tmpdir.path(),
+        "edge-tunnel-test",
+        &endpoint,
+        "dummy-test-jwt",
+    );
 
     let (output, code) = run_cli_with_config(tmpdir.path(), &[
-        "--cluster",
+        "--gateway",
         "edge-tunnel-test",
         "status",
     ])

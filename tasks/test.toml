@@ -28,21 +28,17 @@ run = "uv run pytest python/"
 hide = true
 
 ["e2e:rust"]
-description = "Run Rust CLI e2e tests (requires a running cluster)"
-depends = ["cluster"]
+description = "Run Rust CLI e2e tests against a Docker-backed gateway"
 run = [
   "cargo build -p openshell-cli --features openshell-core/dev-settings",
-  # gateway_resume and Docker GPU tests run in dedicated jobs with their own clusters.
-  # Dockerfile sources build into the host Docker daemon, so the custom image
-  # test belongs with Docker-backed gateway coverage rather than the k3s suite.
-  "cargo test --manifest-path e2e/rust/Cargo.toml --features e2e -- --skip gateway_resume_scenarios --skip docker_gpu_sandbox_runs_nvidia_smi --skip sandbox_from_custom_dockerfile",
+  "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e -- --skip docker_gpu_sandbox_runs_nvidia_smi",
 ]
 
 ["e2e:python"]
-description = "Run Python e2e tests (E2E_PARALLEL=N or 'auto'; default 5)"
-depends = ["python:proto", "cluster"]
+description = "Run Python e2e tests against a Docker-backed gateway (E2E_PARALLEL=N or 'auto'; default 5)"
+depends = ["python:proto"]
 env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
-run = "uv run pytest -o python_files='test_*.py' -m 'not gpu' -n ${E2E_PARALLEL:-5} e2e/python"
+run = "e2e/with-docker-gateway.sh uv run pytest -o python_files='test_*.py' -m 'not gpu' -n ${E2E_PARALLEL:-5} e2e/python"
 
 ["e2e:python:gpu"]
 description = "Run Python GPU e2e tests"
