@@ -2577,15 +2577,7 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox spec is required"))?;
 
-    if spec.gpu && !gpu_enabled {
-        return Err(Status::failed_precondition(
-            "GPU support is not enabled on this driver; start with --gpu",
-        ));
-    }
-
-    if !spec.gpu && !spec.gpu_device.is_empty() {
-        return Err(Status::invalid_argument("gpu_device requires gpu=true"));
-    }
+    validate_gpu_request(spec.gpu, &spec.gpu_device, gpu_enabled)?;
 
     if let Some(template) = spec.template.as_ref() {
         if !template.agent_socket_path.is_empty() {
@@ -2624,6 +2616,20 @@ fn validate_sandbox_id(sandbox_id: &str) -> Result<(), Status> {
         return Err(Status::invalid_argument(
             "sandbox id must match [A-Za-z0-9._-]{1,128}",
         ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_gpu_request(gpu: bool, gpu_device: &str, gpu_enabled: bool) -> Result<(), Status> {
+    if gpu && !gpu_enabled {
+        return Err(Status::failed_precondition(
+            "GPU support is not enabled on this driver; start with --gpu",
+        ));
+    }
+
+    if !gpu && !gpu_device.is_empty() {
+        return Err(Status::invalid_argument("gpu_device requires gpu=true"));
     }
     Ok(())
 }
