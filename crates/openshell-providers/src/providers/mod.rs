@@ -8,6 +8,7 @@ pub mod copilot;
 pub mod generic;
 pub mod github;
 pub mod gitlab;
+pub mod microsoft_agent_s2s;
 pub mod nvidia;
 pub mod openai;
 pub mod opencode;

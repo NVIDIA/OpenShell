@@ -94,6 +94,7 @@ pub trait ProviderPlugin: Send + Sync {
 | `nvidia.rs` | `NVIDIA_API_KEY` | *(none)* |
 | `gitlab.rs` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | `~/.config/glab-cli/config.yml` |
 | `github.rs` | `GITHUB_TOKEN`, `GH_TOKEN` | `~/.config/gh/hosts.yml` |
+| `microsoft_agent_s2s.rs` | `AZURE_TENANT_ID`, `A365_BLUEPRINT_CLIENT_ID`, `A365_BLUEPRINT_CLIENT_SECRET`, `A365_RUNTIME_AGENT_ID`, `A365_ALLOWED_AUDIENCES`, `A365_OBSERVABILITY_RESOURCE`, `A365_REQUIRED_ROLES` | *(none)* |
 | `outlook.rs` | *(none)* | *(none)* |
 
 `generic` and `outlook` are stubs — `discover_existing()` always returns `None`.

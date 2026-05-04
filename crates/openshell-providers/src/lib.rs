@@ -79,6 +79,7 @@ impl ProviderRegistry {
         registry.register(providers::codex::CodexProvider);
         registry.register(providers::copilot::CopilotProvider);
         registry.register(providers::opencode::OpencodeProvider);
+        registry.register(providers::microsoft_agent_s2s::MicrosoftAgentS2sProvider);
         registry.register(providers::generic::GenericProvider);
         registry.register(providers::openai::OpenaiProvider);
         registry.register(providers::anthropic::AnthropicProvider);
@@ -131,6 +132,9 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
         "codex" => Some("codex"),
         "copilot" => Some("copilot"),
         "opencode" => Some("opencode"),
+        "microsoft-agent-s2s" | "agent-s2s" | "agent-id-s2s" | "a365-s2s" => {
+            Some("microsoft-agent-s2s")
+        }
         "generic" => Some("generic"),
         "openai" => Some("openai"),
         "anthropic" => Some("anthropic"),
@@ -162,6 +166,18 @@ mod tests {
         assert_eq!(normalize_provider_type("glab"), Some("gitlab"));
         assert_eq!(normalize_provider_type("gh"), Some("github"));
         assert_eq!(normalize_provider_type("CLAUDE"), Some("claude"));
+        assert_eq!(
+            normalize_provider_type("agent-s2s"),
+            Some("microsoft-agent-s2s")
+        );
+        assert_eq!(
+            normalize_provider_type("agent-id-s2s"),
+            Some("microsoft-agent-s2s")
+        );
+        assert_eq!(
+            normalize_provider_type("a365-s2s"),
+            Some("microsoft-agent-s2s")
+        );
         assert_eq!(normalize_provider_type("generic"), Some("generic"));
         assert_eq!(normalize_provider_type("openai"), Some("openai"));
         assert_eq!(normalize_provider_type("anthropic"), Some("anthropic"));

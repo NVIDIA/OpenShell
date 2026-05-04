@@ -600,6 +600,72 @@ async fn explicit_provider_name_auto_creates_when_valid_type() {
     );
 }
 
+/// When `--provider microsoft-agent-s2s` is passed, no provider named
+/// "microsoft-agent-s2s" exists, and it is a valid provider type, the CLI
+/// should auto-create a provider using discovered Agent ID S2S credentials.
+#[tokio::test]
+async fn explicit_microsoft_agent_s2s_provider_name_auto_creates_when_valid_type() {
+    let ts = run_server().await;
+    let _guard = EnvVarGuard::set(&[
+        ("AZURE_TENANT_ID", "tenant-id"),
+        ("A365_BLUEPRINT_CLIENT_ID", "blueprint-client-id"),
+        ("A365_BLUEPRINT_CLIENT_SECRET", "blueprint-secret"),
+        ("A365_RUNTIME_AGENT_ID", "runtime-agent-id"),
+        ("A365_ALLOWED_AUDIENCES", "api://aud-a,api://aud-b"),
+        ("A365_OBSERVABILITY_RESOURCE", "observability-resource"),
+        ("A365_REQUIRED_ROLES", "Agent365.Observability.OtelWrite"),
+    ]);
+
+    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+        .await
+        .expect("grpc client");
+
+    let result = run::ensure_required_providers(
+        &mut client,
+        &["microsoft-agent-s2s".to_string()],
+        &[],
+        Some(true),
+    )
+    .await
+    .expect("should auto-create the provider");
+
+    assert_eq!(result, vec!["microsoft-agent-s2s".to_string()]);
+
+    let providers = ts.openshell.state.providers.lock().await;
+    let provider = providers
+        .get("microsoft-agent-s2s")
+        .expect("microsoft-agent-s2s provider should exist");
+    assert_eq!(provider.r#type, "microsoft-agent-s2s");
+    assert_eq!(
+        provider.credentials.get("AZURE_TENANT_ID"),
+        Some(&"tenant-id".to_string())
+    );
+    assert_eq!(
+        provider.credentials.get("A365_BLUEPRINT_CLIENT_ID"),
+        Some(&"blueprint-client-id".to_string())
+    );
+    assert_eq!(
+        provider.credentials.get("A365_BLUEPRINT_CLIENT_SECRET"),
+        Some(&"blueprint-secret".to_string())
+    );
+    assert_eq!(
+        provider.credentials.get("A365_RUNTIME_AGENT_ID"),
+        Some(&"runtime-agent-id".to_string())
+    );
+    assert_eq!(
+        provider.credentials.get("A365_ALLOWED_AUDIENCES"),
+        Some(&"api://aud-a,api://aud-b".to_string())
+    );
+    assert_eq!(
+        provider.credentials.get("A365_OBSERVABILITY_RESOURCE"),
+        Some(&"observability-resource".to_string())
+    );
+    assert_eq!(
+        provider.credentials.get("A365_REQUIRED_ROLES"),
+        Some(&"Agent365.Observability.OtelWrite".to_string())
+    );
+}
+
 /// When `--provider my-custom-thing` is passed and "my-custom-thing" is not a
 /// known provider type, the CLI should return an error.
 #[tokio::test]

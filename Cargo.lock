@@ -3149,6 +3149,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-provider-auth"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "openshell-providers"
 version = "0.0.0"
 dependencies = [

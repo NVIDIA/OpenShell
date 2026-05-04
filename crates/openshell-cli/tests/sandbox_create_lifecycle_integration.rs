@@ -718,6 +718,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
     let _env = test_env(&fake_ssh_dir, &xdg_dir);
     let tls = test_tls(&server);
     install_fake_ssh(&fake_ssh_dir);
+    let forward_port = unused_local_port();
 
     run::sandbox_create(
         &server.endpoint,
@@ -732,7 +733,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         None,
         &[],
         None,
-        Some(openshell_core::forward::ForwardSpec::new(8080)),
+        Some(openshell_core::forward::ForwardSpec::new(forward_port)),
         &["echo".to_string(), "OK".to_string()],
         Some(false),
         Some(false),
@@ -743,4 +744,9 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
     .expect("sandbox create with forward should succeed");
 
     assert!(deleted_names(&server).await.is_empty());
+}
+
+fn unused_local_port() -> u16 {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.local_addr().unwrap().port()
 }

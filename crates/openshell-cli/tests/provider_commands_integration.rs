@@ -28,32 +28,48 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
 use tonic::{Response, Status};
 
-struct EnvVarGuard {
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct SavedVar {
     key: &'static str,
     original: Option<String>,
 }
 
+struct EnvVarGuard {
+    vars: Vec<SavedVar>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
 #[allow(unsafe_code)]
 impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let original = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value);
+    fn set(pairs: &[(&'static str, &str)]) -> Self {
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut vars = Vec::with_capacity(pairs.len());
+        for &(key, value) in pairs {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            vars.push(SavedVar { key, original });
         }
-        Self { key, original }
+        Self { vars, _lock: lock }
     }
 }
 
 #[allow(unsafe_code)]
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
-        if let Some(value) = &self.original {
-            unsafe {
-                std::env::set_var(self.key, value);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(self.key);
+        for var in &self.vars {
+            if let Some(value) = &var.original {
+                unsafe {
+                    std::env::set_var(var.key, value);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(var.key);
+                }
             }
         }
     }
@@ -545,7 +561,7 @@ async fn provider_create_rejects_key_only_credentials_without_local_env_value() 
 #[tokio::test]
 async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set("NAV_GENERIC_TEST_KEY", "generic-value");
+    let _guard = EnvVarGuard::set(&[("NAV_GENERIC_TEST_KEY", "generic-value")]);
 
     run::provider_create(
         &ts.endpoint,
@@ -578,6 +594,73 @@ async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
 }
 
 #[tokio::test]
+async fn provider_create_from_existing_supports_microsoft_agent_s2s_type() {
+    let ts = run_server().await;
+    let _guard = EnvVarGuard::set(&[
+        ("AZURE_TENANT_ID", "tenant-id"),
+        ("A365_BLUEPRINT_CLIENT_ID", "blueprint-client-id"),
+        ("A365_BLUEPRINT_CLIENT_SECRET", "blueprint-secret"),
+        ("A365_RUNTIME_AGENT_ID", "runtime-agent-id"),
+        ("A365_ALLOWED_AUDIENCES", "api://aud-a,api://aud-b"),
+        ("A365_OBSERVABILITY_RESOURCE", "observability-resource"),
+        ("A365_REQUIRED_ROLES", "Agent365.Observability.OtelWrite"),
+    ]);
+
+    run::provider_create(
+        &ts.endpoint,
+        "my-microsoft-agent-s2s",
+        "microsoft-agent-s2s",
+        true,
+        &[],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+        .await
+        .expect("grpc client should connect");
+    let response = client
+        .get_provider(GetProviderRequest {
+            name: "my-microsoft-agent-s2s".to_string(),
+        })
+        .await
+        .expect("get provider should succeed")
+        .into_inner();
+    let provider = response.provider.expect("provider should exist");
+    assert_eq!(provider.r#type, "microsoft-agent-s2s");
+    assert_eq!(
+        provider.credentials.get("AZURE_TENANT_ID"),
+        Some(&"tenant-id".to_string())
+    );
+    assert_eq!(
+        provider.credentials.get("A365_BLUEPRINT_CLIENT_ID"),
+        Some(&"blueprint-client-id".to_string())
+    );
+    assert_eq!(
+        provider.credentials.get("A365_BLUEPRINT_CLIENT_SECRET"),
+        Some(&"blueprint-secret".to_string())
+    );
+    assert_eq!(
+        provider.credentials.get("A365_RUNTIME_AGENT_ID"),
+        Some(&"runtime-agent-id".to_string())
+    );
+    assert_eq!(
+        provider.credentials.get("A365_ALLOWED_AUDIENCES"),
+        Some(&"api://aud-a,api://aud-b".to_string())
+    );
+    assert_eq!(
+        provider.credentials.get("A365_OBSERVABILITY_RESOURCE"),
+        Some(&"observability-resource".to_string())
+    );
+    assert_eq!(
+        provider.credentials.get("A365_REQUIRED_ROLES"),
+        Some(&"Agent365.Observability.OtelWrite".to_string())
+    );
+}
+
+#[tokio::test]
 async fn provider_create_rejects_combined_from_existing_and_credentials() {
     let ts = run_server().await;
 
@@ -603,7 +686,7 @@ async fn provider_create_rejects_combined_from_existing_and_credentials() {
 #[tokio::test]
 async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set("NAV_EMPTY_ENV_KEY", "");
+    let _guard = EnvVarGuard::set(&[("NAV_EMPTY_ENV_KEY", "")]);
 
     let err = run::provider_create(
         &ts.endpoint,
@@ -627,7 +710,7 @@ async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
 #[tokio::test]
 async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set("NVIDIA_API_KEY", "nvapi-live-test");
+    let _guard = EnvVarGuard::set(&[("NVIDIA_API_KEY", "nvapi-live-test")]);
 
     run::provider_create(
         &ts.endpoint,
