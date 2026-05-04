@@ -16,6 +16,37 @@ process:
   run_as_group: sandbox
 
 network_policies:
+  codex:
+    name: codex
+    endpoints:
+      - { host: api.openai.com, port: 443, protocol: rest, enforcement: enforce, access: full }
+      - { host: auth.openai.com, port: 443, protocol: rest, enforcement: enforce, access: full }
+      - { host: chatgpt.com, port: 443, protocol: rest, enforcement: enforce, access: full }
+      - { host: ab.chatgpt.com, port: 443, protocol: rest, enforcement: enforce, access: full }
+    binaries:
+      - { path: /usr/bin/codex }
+      - { path: /usr/bin/node }
+      - { path: "/usr/lib/node_modules/@openai/**" }
+
+  codex_plugins:
+    name: codex-plugins
+    endpoints:
+      - host: github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/openai/plugins.git/info/refs*"
+          - allow:
+              method: POST
+              path: "/openai/plugins.git/git-upload-pack"
+    binaries:
+      - { path: /usr/bin/git }
+      - { path: /usr/lib/git-core/git-remote-http }
+      - { path: "/usr/lib/node_modules/@openai/**" }
+
   github_api_readonly:
     name: github-api-readonly
     endpoints:
