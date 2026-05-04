@@ -17,6 +17,21 @@ use tokio::sync::RwLock;
 
 pub const POLICY_LOCAL_HOST: &str = "policy.local";
 
+/// Filesystem path of the static agent guidance bundle inside the sandbox.
+/// Single source of truth: the skill installer writes here, the L7 deny body
+/// references this path in `next_steps`, and the skill's own documentation
+/// renders the same path. Changing the location is a one-line update here.
+pub const SKILL_PATH: &str = "/etc/openshell/skills/policy_advisor.md";
+
+/// Routes served by the in-sandbox policy advisor API. Held in one place so
+/// the L7 deny `next_steps` array, the route dispatcher, the skill content,
+/// and tests all stay in sync — change the wire path here and every caller
+/// follows. See `agent_next_steps()` for the consumer that surfaces these
+/// to the agent on a 403.
+pub const ROUTE_POLICY_CURRENT: &str = "/v1/policy/current";
+pub const ROUTE_DENIALS: &str = "/v1/denials";
+pub const ROUTE_PROPOSALS: &str = "/v1/proposals";
+
 const MAX_POLICY_LOCAL_BODY_BYTES: usize = 64 * 1024;
 /// Hard ceiling on how long a single request body read can stall. Bounds a
 /// slowloris-style upload from an in-sandbox process; the proxy listener only
@@ -95,9 +110,9 @@ async fn route_request(
 ) -> (u16, serde_json::Value) {
     let (route, query) = path.split_once('?').map_or((path, ""), |(r, q)| (r, q));
     match (method, route) {
-        ("GET", "/v1/policy/current") => current_policy_response(ctx).await,
-        ("GET", "/v1/denials") => recent_denials_response(ctx, query).await,
-        ("POST", "/v1/proposals") => submit_proposal(ctx, body).await,
+        ("GET", ROUTE_POLICY_CURRENT) => current_policy_response(ctx).await,
+        ("GET", ROUTE_DENIALS) => recent_denials_response(ctx, query).await,
+        ("POST", ROUTE_PROPOSALS) => submit_proposal(ctx, body).await,
         _ => (
             404,
             serde_json::json!({
@@ -106,6 +121,37 @@ async fn route_request(
             }),
         ),
     }
+}
+
+/// Build the `next_steps` array embedded in the L7 deny body so the agent has
+/// machine-readable pointers to this API. Centralizes the shape here to keep
+/// the deny body and the actual route table from drifting — adding or
+/// renaming a route only requires touching the route constants above.
+#[must_use]
+pub fn agent_next_steps() -> serde_json::Value {
+    let host = POLICY_LOCAL_HOST;
+    serde_json::json!([
+        {
+            "action": "read_skill",
+            "path": SKILL_PATH,
+        },
+        {
+            "action": "inspect_policy",
+            "method": "GET",
+            "url": format!("http://{host}{ROUTE_POLICY_CURRENT}"),
+        },
+        {
+            "action": "inspect_recent_denials",
+            "method": "GET",
+            "url": format!("http://{host}{ROUTE_DENIALS}?last=5"),
+        },
+        {
+            "action": "submit_proposal",
+            "method": "POST",
+            "url": format!("http://{host}{ROUTE_PROPOSALS}"),
+            "body_type": "PolicyMergeOperation",
+        },
+    ])
 }
 
 async fn current_policy_response(ctx: &PolicyLocalContext) -> (u16, serde_json::Value) {
