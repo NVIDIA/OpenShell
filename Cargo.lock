@@ -3206,6 +3206,7 @@ dependencies = [
  "openshell-core",
  "openshell-ocsf",
  "openshell-policy",
+ "openshell-provider-auth",
  "openshell-router",
  "rand_core 0.6.4",
  "rcgen",
@@ -3228,6 +3229,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "url",
  "uuid",
  "webpki-roots 1.0.6",
 ]

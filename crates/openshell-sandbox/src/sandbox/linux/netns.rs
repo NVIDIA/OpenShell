@@ -235,10 +235,11 @@ impl NetworkNamespace {
     /// Install iptables rules for bypass detection inside the namespace.
     ///
     /// Sets up OUTPUT chain rules that:
-    /// 1. ACCEPT traffic destined for the proxy (host_ip:proxy_port)
-    /// 2. ACCEPT loopback traffic
-    /// 3. ACCEPT established/related connections (response packets)
-    /// 4. LOG + REJECT all other TCP/UDP traffic (bypass attempts)
+    /// 1. ACCEPT traffic destined for the proxy (`host_ip:proxy_port`)
+    /// 2. ACCEPT traffic destined for supervisor-owned host services
+    /// 3. ACCEPT loopback traffic
+    /// 4. ACCEPT established/related connections (response packets)
+    /// 5. LOG + REJECT all other TCP/UDP traffic (bypass attempts)
     ///
     /// This provides two benefits:
     /// - **Fast-fail UX**: applications get immediate ECONNREFUSED instead of
@@ -249,7 +250,11 @@ impl NetworkNamespace {
     /// Degrades gracefully if `iptables` is not available — the namespace
     /// still provides isolation via routing, just without fast-fail and
     /// diagnostic logging.
-    pub fn install_bypass_rules(&self, proxy_port: u16) -> Result<()> {
+    pub fn install_bypass_rules(
+        &self,
+        proxy_port: u16,
+        additional_host_ports: &[u16],
+    ) -> Result<()> {
         // Check if iptables is available before attempting to install rules.
         let iptables_path = match find_iptables() {
             Some(path) => path,
@@ -281,6 +286,7 @@ impl NetworkNamespace {
             &iptables_path,
             &host_ip_str,
             &proxy_port_str,
+            additional_host_ports,
             &log_prefix,
         ) {
             openshell_ocsf::ocsf_emit!(
@@ -336,25 +342,18 @@ impl NetworkNamespace {
         iptables_cmd: &str,
         host_ip: &str,
         proxy_port: &str,
+        additional_host_ports: &[u16],
         log_prefix: &str,
     ) -> Result<()> {
         // Rule 1: ACCEPT traffic to the proxy
-        run_iptables_netns(
-            &self.name,
-            iptables_cmd,
-            &[
-                "-A",
-                "OUTPUT",
-                "-d",
-                &format!("{host_ip}/32"),
-                "-p",
-                "tcp",
-                "--dport",
-                proxy_port,
-                "-j",
-                "ACCEPT",
-            ],
-        )?;
+        self.install_host_tcp_accept_rule(iptables_cmd, host_ip, proxy_port)?;
+
+        for port in additional_host_ports {
+            let port = port.to_string();
+            if port != proxy_port {
+                self.install_host_tcp_accept_rule(iptables_cmd, host_ip, &port)?;
+            }
+        }
 
         // Rule 2: ACCEPT loopback traffic
         run_iptables_netns(
@@ -484,6 +483,30 @@ impl NetworkNamespace {
         )?;
 
         Ok(())
+    }
+
+    fn install_host_tcp_accept_rule(
+        &self,
+        iptables_cmd: &str,
+        host_ip: &str,
+        port: &str,
+    ) -> Result<()> {
+        run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-d",
+                &format!("{host_ip}/32"),
+                "-p",
+                "tcp",
+                "--dport",
+                port,
+                "-j",
+                "ACCEPT",
+            ],
+        )
     }
 
     /// Install IPv6 bypass detection rules.

@@ -242,15 +242,24 @@ variables (injected into the pod spec by the gateway's Kubernetes sandbox creati
 
 In `run_sandbox()` (`crates/openshell-sandbox/src/lib.rs`):
 
-1. loads the sandbox policy via gRPC (`GetSandboxSettings`),
+1. loads the sandbox policy via gRPC (`GetSandboxConfig`),
 2. fetches provider credentials via gRPC (`GetSandboxProviderEnvironment`),
-3. if the fetch fails, continues with an empty map (graceful degradation with a warning).
+3. if the fetch fails, continues with an empty map (graceful degradation with a warning),
+4. starts any provider-specific runtime resolvers, such as `microsoft-agent-s2s`.
 
-The returned `provider_env` `HashMap<String, String>` is immediately transformed into:
+Most returned provider credentials are transformed into:
 
 - a child-visible env map with placeholder values such as
   `openshell:resolve:env:ANTHROPIC_API_KEY`, and
 - a supervisor-only in-memory registry mapping each placeholder back to its real secret.
+
+`microsoft-agent-s2s` is handled differently. Its blueprint secret and broker inputs are
+removed from the child env path, used only by the sandbox supervisor to start a local
+token resolver, and replaced with non-secret resolver metadata:
+
+- `OPENSHELL_MICROSOFT_AGENT_S2S_TOKEN_URL`
+- `OPENSHELL_MICROSOFT_AGENT_S2S_DEFAULT_AUDIENCE` when one default audience is known
+- `A365_TOKEN_PROVIDER_URL` as a compatibility alias for runtimes that expect A365 naming
 
 The placeholder env map is threaded to the entrypoint process spawner and SSH server.
 The registry is threaded to the proxy so it can rewrite outbound headers.

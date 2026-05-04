@@ -17,6 +17,7 @@ pub mod opa;
 mod policy;
 mod process;
 pub mod procfs;
+mod provider_tokens;
 pub mod proxy;
 mod sandbox;
 mod secrets;
@@ -267,7 +268,7 @@ pub async fn run_sandbox(
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
-    let provider_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+    let mut provider_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
         match grpc_client::fetch_provider_environment(endpoint, id).await {
             Ok(env) => {
                 ocsf_emit!(
@@ -300,9 +301,8 @@ pub async fn run_sandbox(
     } else {
         std::collections::HashMap::new()
     };
-
-    let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
-    let secret_resolver = secret_resolver.map(Arc::new);
+    let provider_token_resolver_port =
+        provider_tokens::microsoft_agent_s2s_resolver_port(&provider_env);
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
@@ -387,7 +387,11 @@ pub async fn run_sandbox(
                     .as_ref()
                     .and_then(|p| p.http_addr)
                     .map_or(3128, |addr| addr.port());
-                if let Err(e) = ns.install_bypass_rules(proxy_port) {
+                let provider_token_ports = provider_token_resolver_port
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
+                if let Err(e) = ns.install_bypass_rules(proxy_port, &provider_token_ports) {
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Medium)
@@ -422,6 +426,40 @@ pub async fn run_sandbox(
     // (network namespace setup, iptables probes) complete, but before the SSH
     // listener and workload process are exposed.
     apply_supervisor_startup_hardening()?;
+
+    #[cfg(target_os = "linux")]
+    let provider_token_resolver_bind_addr = {
+        let ip = netns.as_ref().map_or(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            NetworkNamespace::host_ip,
+        );
+        SocketAddr::new(ip, provider_token_resolver_port.unwrap_or(0))
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let provider_token_resolver_bind_addr =
+        SocketAddr::from(([127, 0, 0, 1], provider_token_resolver_port.unwrap_or(0)));
+
+    let prepared_provider_tokens = provider_tokens::prepare_microsoft_agent_s2s(
+        &mut provider_env,
+        provider_token_resolver_bind_addr,
+    )
+    .await?;
+    if !prepared_provider_tokens.environment.is_empty() {
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "enabled")
+                .message("Started microsoft-agent-s2s provider token resolver")
+                .build()
+        );
+    }
+    let provider_token_environment = prepared_provider_tokens.environment;
+    let _provider_token_resolver = prepared_provider_tokens.handle;
+    let (mut provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
+    provider_env.extend(provider_token_environment);
+    let secret_resolver = secret_resolver.map(Arc::new);
 
     // Shared PID: set after process spawn so the proxy can look up
     // the entrypoint process's /proc/net/tcp for identity binding.
