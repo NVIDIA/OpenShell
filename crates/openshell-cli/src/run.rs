@@ -3980,7 +3980,7 @@ pub async fn provider_list(
     Ok(())
 }
 
-pub async fn provider_list_types(server: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn provider_list_profiles(server: &str, tls: &TlsOptions) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_provider_profiles(ListProviderProfilesRequest {
@@ -3997,11 +3997,11 @@ pub async fn provider_list_types(server: &str, tls: &TlsOptions) -> Result<()> {
     });
 
     if profiles.is_empty() {
-        println!("No provider types found.");
+        println!("No provider profiles found.");
         return Ok(());
     }
 
-    println!("{}", "Available Provider Types:".cyan().bold());
+    println!("{}", "Available Provider Profiles:".cyan().bold());
     let mut current_category = i32::MIN;
     for profile in profiles {
         if profile.category != current_category {

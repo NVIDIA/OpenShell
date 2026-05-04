@@ -551,12 +551,12 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
 }
 
 #[tokio::test]
-async fn provider_list_types_cli_uses_profile_browsing_rpc() {
+async fn provider_list_profiles_cli_uses_profile_browsing_rpc() {
     let ts = run_server().await;
 
-    run::provider_list_types(&ts.endpoint, &ts.tls)
+    run::provider_list_profiles(&ts.endpoint, &ts.tls)
         .await
-        .expect("provider list-types");
+        .expect("provider list-profiles");
 }
 
 #[tokio::test]

@@ -48,13 +48,13 @@ pub struct RegisteredSetting {
 ///    settable via `settings set`. The server validates that only registered
 ///    keys are accepted.
 /// 5. Add a unit test in this module's `tests` section to cover the new key.
-pub const USE_PROVIDERS_V2_KEY: &str = "use_providers_v2";
+pub const PROVIDERS_V2_ENABLED_KEY: &str = "providers_v2_enabled";
 
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     // Gateway-level opt-in for provider profile policy composition. Defaults
     // to false when unset.
     RegisteredSetting {
-        key: USE_PROVIDERS_V2_KEY,
+        key: PROVIDERS_V2_ENABLED_KEY,
         kind: SettingValueKind::Bool,
     },
     // When true the sandbox writes OCSF v1.7.0 JSONL records to
@@ -107,7 +107,7 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, USE_PROVIDERS_V2_KEY,
+        PROVIDERS_V2_ENABLED_KEY, REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind,
         parse_bool_like, registered_keys_csv, setting_for_key,
     };
 
@@ -132,9 +132,9 @@ mod tests {
     }
 
     #[test]
-    fn setting_for_key_returns_use_providers_v2() {
-        let setting =
-            setting_for_key(USE_PROVIDERS_V2_KEY).expect("use_providers_v2 should be registered");
+    fn setting_for_key_returns_providers_v2_enabled() {
+        let setting = setting_for_key(PROVIDERS_V2_ENABLED_KEY)
+            .expect("providers_v2_enabled should be registered");
         assert_eq!(setting.kind, SettingValueKind::Bool);
     }
 

@@ -64,10 +64,10 @@ inference-capable when their tool talks to an inference API.
 Profiles are additive to provider records. A provider record with only `type`,
 `credentials`, and `config` can be matched to built-in profile metadata by
 `provider.type`. Profile-generated policy is still opt-in: the gateway composes provider
-profile rules only when the gateway-global `use_providers_v2` setting is true.
+profile rules only when the gateway-global `providers_v2_enabled` setting is true.
 
 This keeps the compatibility boundary at the gateway. A gateway without
-`use_providers_v2=true` keeps the existing credential-only provider behavior, while a
+`providers_v2_enabled=true` keeps the existing credential-only provider behavior, while a
 gateway with the flag enabled routes all attached known provider types through the
 profile-backed policy path.
 
@@ -92,7 +92,7 @@ host/port endpoints across policy and provider rules are valid; OPA evaluates al
 rules, so allow decisions are the union of matching allows and deny rules continue to
 win globally.
 
-Gateway-global policy still overrides sandbox-authored policy. When `use_providers_v2`
+Gateway-global policy still overrides sandbox-authored policy. When `providers_v2_enabled`
 is true, provider layers compose JIT onto the effective policy source, whether that
 source is sandbox-scoped or global. The composed payload is derived data and is not
 persisted as a policy revision.
@@ -228,7 +228,7 @@ Also supported:
 
 - `openshell provider get <name>`
 - `openshell provider list`
-- `openshell provider list-types`
+- `openshell provider list-profiles`
 - `openshell provider update <name> ...`
 - `openshell provider delete <name> [<name>...]`
 

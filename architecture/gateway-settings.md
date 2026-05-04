@@ -30,7 +30,7 @@ The `REGISTERED_SETTINGS` static array defines the allowed setting keys and thei
 
 ```rust
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
-    RegisteredSetting { key: "use_providers_v2", kind: SettingValueKind::Bool },
+    RegisteredSetting { key: "providers_v2_enabled", kind: SettingValueKind::Bool },
     RegisteredSetting { key: "ocsf_json_enabled", kind: SettingValueKind::Bool },
 ];
 ```
@@ -375,11 +375,11 @@ Set a single setting key at sandbox or global scope.
 openshell settings set my-sandbox --key ocsf_json_enabled --value true
 
 # Global (requires confirmation)
-openshell settings set --global --key use_providers_v2 --value true
+openshell settings set --global --key providers_v2_enabled --value true
 openshell settings set --global --key ocsf_json_enabled --value true
 
 # Skip confirmation
-openshell settings set --global --key use_providers_v2 --value true --yes
+openshell settings set --global --key providers_v2_enabled --value true --yes
 ```
 
 Value parsing is type-aware: bool keys accept `true/false/yes/no/1/0/on/off` via `parse_bool_like()`. Int keys parse as base-10 `i64`. String keys accept any value.
@@ -390,7 +390,7 @@ Delete a setting key from the specified scope.
 
 ```bash
 # Global delete (unlocks sandbox control)
-openshell settings delete --global --key use_providers_v2 --yes
+openshell settings delete --global --key providers_v2_enabled --yes
 ```
 
 ### `policy set --global --policy FILE [--yes]`
@@ -500,17 +500,17 @@ Settings are refreshed on each 2-second polling tick alongside the sandbox list 
 
 ## Data Flow: Setting a Global Key
 
-End-to-end trace for `openshell settings set --global --key use_providers_v2 --value true --yes`:
+End-to-end trace for `openshell settings set --global --key providers_v2_enabled --value true --yes`:
 
 1. **CLI** (`crates/openshell-cli/src/run.rs` -- `gateway_setting_set()`):
-   - `parse_cli_setting_value("use_providers_v2", "true")` -- looks up `SettingValueKind::Bool` in the registry, wraps as `SettingValue { bool_value: true }`
+   - `parse_cli_setting_value("providers_v2_enabled", "true")` -- looks up `SettingValueKind::Bool` in the registry, wraps as `SettingValue { bool_value: true }`
    - `confirm_global_setting_takeover()` -- skipped because `--yes`
-   - Sends `UpdateSettingsRequest { setting_key: "use_providers_v2", setting_value: Some(...), global: true }`
+   - Sends `UpdateSettingsRequest { setting_key: "providers_v2_enabled", setting_value: Some(...), global: true }`
 
 2. **Gateway** (`crates/openshell-server/src/grpc.rs` -- `update_settings()`):
    - Acquires `settings_mutex` for the duration of the operation
    - Detects `global=true`, `has_setting=true`
-   - `validate_registered_setting_key("use_providers_v2")` -- passes (key is in registry)
+   - `validate_registered_setting_key("providers_v2_enabled")` -- passes (key is in registry)
    - `load_global_settings()` -- reads `gateway_settings` record from store
    - `proto_setting_to_stored()` -- converts proto value to `StoredSettingValue::Bool(true)`
    - `upsert_setting_value()` -- inserts into `BTreeMap`, returns `true` (changed)
@@ -519,7 +519,7 @@ End-to-end trace for `openshell settings set --global --key use_providers_v2 --v
 
 3. **Sandbox** (next poll tick in `run_policy_poll_loop()`):
    - `poll_settings(sandbox_id)` returns new `config_revision`
-   - `log_setting_changes()` logs: `Setting changed key="use_providers_v2" old="<unset>" new="true"`
+   - `log_setting_changes()` logs: `Setting changed key="providers_v2_enabled" old="<unset>" new="true"`
    - `policy_hash` unchanged -- no OPA reload
    - Updates tracked `current_config_revision` and `current_settings`
 

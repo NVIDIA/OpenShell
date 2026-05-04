@@ -436,7 +436,8 @@ pub(super) async fn handle_get_sandbox_config(
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let sandbox_settings =
         load_sandbox_settings(state.store.as_ref(), sandbox.object_name()).await?;
-    let use_providers_v2 = bool_setting_enabled(&global_settings, settings::USE_PROVIDERS_V2_KEY)?;
+    let providers_v2_enabled =
+        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
 
     let mut global_policy_version: u32 = 0;
 
@@ -456,7 +457,7 @@ pub(super) async fn handle_get_sandbox_config(
         }
     }
 
-    if use_providers_v2
+    if providers_v2_enabled
         && !matches!(policy_source, PolicySource::Global)
         && let Some(source_policy) = policy.as_ref()
     {
@@ -2828,7 +2829,7 @@ mod tests {
         let global_settings = StoredSettings {
             revision: 1,
             settings: std::iter::once((
-                settings::USE_PROVIDERS_V2_KEY.to_string(),
+                settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
                 StoredSettingValue::Bool(true),
             ))
             .collect(),
@@ -2892,22 +2893,25 @@ mod tests {
     }
 
     #[test]
-    fn use_providers_v2_defaults_false_when_unset() {
+    fn providers_v2_enabled_defaults_false_when_unset() {
         assert!(
-            !bool_setting_enabled(&StoredSettings::default(), settings::USE_PROVIDERS_V2_KEY)
-                .unwrap()
+            !bool_setting_enabled(
+                &StoredSettings::default(),
+                settings::PROVIDERS_V2_ENABLED_KEY
+            )
+            .unwrap()
         );
     }
 
     #[test]
-    fn use_providers_v2_reads_global_bool_setting() {
+    fn providers_v2_enabled_reads_global_bool_setting() {
         let mut settings = StoredSettings::default();
         settings.settings.insert(
-            settings::USE_PROVIDERS_V2_KEY.to_string(),
+            settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
             StoredSettingValue::Bool(true),
         );
 
-        assert!(bool_setting_enabled(&settings, settings::USE_PROVIDERS_V2_KEY).unwrap());
+        assert!(bool_setting_enabled(&settings, settings::PROVIDERS_V2_ENABLED_KEY).unwrap());
     }
 
     #[tokio::test]
@@ -3226,7 +3230,7 @@ mod tests {
             revision: 1,
             settings: [
                 (
-                    settings::USE_PROVIDERS_V2_KEY.to_string(),
+                    settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
                     StoredSettingValue::Bool(true),
                 ),
                 (
