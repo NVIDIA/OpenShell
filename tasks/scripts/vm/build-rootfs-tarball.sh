@@ -33,7 +33,9 @@ ROOTFS_BUILD_DIR="${ROOT}/target/rootfs-build"
 OUTPUT_DIR="${ROOT}/target/vm-runtime-compressed"
 OUTPUT="${OUTPUT_DIR}/rootfs.tar.zst"
 
-KERNEL_VERSION="6.12.76"
+# shellcheck source=../../crates/openshell-vm/pins.env
+source "${ROOT}/crates/openshell-vm/pins.env"
+KERNEL_VERSION="${GUEST_KERNEL_VERSION}"
 NVIDIA_MODULES_DIR="${ROOT}/target/libkrun-build/nvidia-modules"
 NVIDIA_USERSPACE_DIR="${ROOT}/target/libkrun-build/nvidia-userspace"
 

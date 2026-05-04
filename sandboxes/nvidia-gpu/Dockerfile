@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Architecture: GPU sandbox images are currently x86_64-only (both host and
+# guest). The .run installer and lib paths target Linux-x86_64 exclusively.
+# ARM/aarch64 GPU passthrough is not yet supported.
+#
 # GPU-enabled sandbox image for OpenShell VM driver.
 #
 # Provides userspace GPU tooling (nvidia-smi, NVML, CUDA driver libs, kmod)
@@ -9,23 +13,22 @@
 # injected at rootfs preparation time by the VM driver).
 #
 # Usage:
+#   ./build.sh                         # recommended — sources versions.env
+#   ./build.sh -t my-registry/gpu:v1   # custom tag
 #   openshell sandbox create --gpu --from ./sandboxes/nvidia-gpu/Dockerfile
-#   openshell sandbox create --gpu --from nvidia-gpu   # once published
 #
 # Build-time args:
-#   CUDA_VERSION          - CUDA toolkit version (default: 12.8.1)
-#   UBUNTU_VERSION        - Ubuntu release (default: 22.04)
-#   NVIDIA_DRIVER_VERSION - Must match the kernel modules built by
-#                           `mise run vm:nvidia-modules` (default: 580.159.03)
+#   NVIDIA_DRIVER_VERSION - **Required** (no default). Must match the kernel
+#                           modules built by `mise run vm:nvidia-modules`.
+#                           Use ./build.sh which sources versions.env, or pass
+#                           --build-arg NVIDIA_DRIVER_VERSION=<ver> manually.
 
-ARG CUDA_VERSION=12.8.1
-ARG UBUNTU_VERSION=22.04
+FROM ubuntu:latest
 
-FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
-
-# Must match NVIDIA_DRIVER_VERSION in sandboxes/nvidia-gpu/versions.env
-# and NVIDIA_OPEN_VERSION in tasks/scripts/vm/build-nvidia-modules.sh
-ARG NVIDIA_DRIVER_VERSION=580.159.03
+# Must match NVIDIA_DRIVER_VERSION in sandboxes/nvidia-gpu/versions.env.
+# The module build script also uses this version for the open-gpu-kernel-modules tag.
+# No default — use ./build.sh or pass --build-arg explicitly.
+ARG NVIDIA_DRIVER_VERSION
 
 # ── System packages required by the sandbox init script ──────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -42,14 +45,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN mkdir -p /usr/share/udhcpc && ln -sf /bin/busybox /sbin/udhcpc
 
 # ── NVIDIA driver userspace ──────────────────────────────────────────
-# The nvidia/cuda base image does NOT include the driver (nvidia-smi,
-# libcuda.so, libnvidia-ml.so). It relies on the NVIDIA Container
-# Runtime to mount them from the host. In a VM there is no container
-# runtime, so we install the driver userspace via the .run installer
-# with --no-kernel-module (kernel modules are injected separately).
+# We install the full driver userspace via the official .run installer
+# with --no-kernel-module (kernel modules are injected separately by
+# the VM driver at rootfs preparation time).
 # TODO(gpu): Pin SHA-256 checksum for reproducible builds. Compute with:
 #   curl -fsSL <url> | sha256sum
-RUN curl -fsSL \
+RUN test -n "${NVIDIA_DRIVER_VERSION}" || \
+      { echo "ERROR: NVIDIA_DRIVER_VERSION not set. Use ./build.sh or pass --build-arg NVIDIA_DRIVER_VERSION=<ver>"; exit 1; } \
+    && curl -fsSL \
         "https://us.download.nvidia.com/XFree86/Linux-x86_64/${NVIDIA_DRIVER_VERSION}/NVIDIA-Linux-x86_64-${NVIDIA_DRIVER_VERSION}.run" \
         -o /tmp/nvidia.run \
     && chmod +x /tmp/nvidia.run \
@@ -63,11 +66,11 @@ RUN curl -fsSL \
         --no-distro-scripts \
     && rm -f /tmp/nvidia.run
 
-# Ensure library paths are indexed for dlopen.
-RUN mkdir -p /etc/ld.so.conf.d \
-    && echo "/usr/local/cuda/lib64" > /etc/ld.so.conf.d/cuda.conf \
-    && echo "/usr/lib/x86_64-linux-gnu" >> /etc/ld.so.conf.d/cuda.conf \
-    && ldconfig 2>/dev/null || true
+RUN echo "${NVIDIA_DRIVER_VERSION}" > /etc/openshell-gpu-driver-version
+
+# The .run installer places libs in standard paths (/usr/lib/x86_64-linux-gnu).
+# Run ldconfig to update the linker cache for dlopen resolution.
+RUN ldconfig 2>/dev/null || true
 
 # ── Kernel modules ───────────────────────────────────────────────────
 # NVIDIA kernel modules (.ko) must match the guest VM kernel (libkrunfw).

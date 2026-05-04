@@ -2220,6 +2220,10 @@ fn build_guest_environment(
             "OPENSHELL_SSH_HANDSHAKE_SECRET".to_string(),
             config.ssh_handshake_secret.clone(),
         ),
+        (
+            "GUEST_KERNEL_VERSION".to_string(),
+            env!("GUEST_KERNEL_VERSION").to_string(),
+        ),
     ]);
     if config.requires_tls_materials() {
         environment.extend(HashMap::from([

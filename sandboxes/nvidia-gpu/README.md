@@ -3,6 +3,11 @@
 
 # GPU Sandbox Image
 
+> **Architecture:** GPU sandbox images are currently **x86_64-only** (both
+> host and guest). The Dockerfile downloads the `NVIDIA-Linux-x86_64`
+> installer, and the VM driver uses `qemu-system-x86_64` for GPU
+> passthrough. ARM/aarch64 GPU passthrough is not yet supported.
+
 GPU-enabled sandbox image for the OpenShell VM driver. Provides NVIDIA
 userspace tooling (nvidia-smi, NVML, CUDA driver libraries) on top of a
 minimal Ubuntu base. Kernel modules are injected separately by the VM
@@ -16,7 +21,7 @@ VM driver:
 | Layer | Source | Contents |
 |-------|--------|----------|
 | **Userspace** | This Dockerfile | nvidia-smi, libcuda.so, libnvidia-ml.so, kmod, iproute2 |
-| **Kernel modules** | VM driver injection | nvidia.ko, nvidia_uvm.ko, nvidia_modeset.ko (built for guest kernel 6.12.76) |
+| **Kernel modules** | VM driver injection | nvidia.ko, nvidia_uvm.ko, nvidia_modeset.ko (built for the pinned guest kernel version in `crates/openshell-vm/pins.env`) |
 | **GSP firmware** | `.run` installer in image OR host fallback | gsp_ga10x.bin, gsp_tu10x.bin |
 
 The kernel modules must be compiled against the exact guest kernel version
@@ -51,36 +56,25 @@ openshell sandbox create --gpu --from nvidia-gpu:latest
 
 ## Version Coupling
 
-The NVIDIA driver version must match across three components:
+All components use a single version variable — `NVIDIA_DRIVER_VERSION` —
+pinned in `sandboxes/nvidia-gpu/versions.env`:
 
-| Component | Variable | Default |
-|-----------|----------|---------|
-| Dockerfile (userspace) | `NVIDIA_DRIVER_VERSION` | `580.159.03` |
-| Module build script | `NVIDIA_OPEN_VERSION` | `580.159.03` |
-| Shared reference | `sandboxes/nvidia-gpu/versions.env` | `580.159.03` |
+| Component | Where `NVIDIA_DRIVER_VERSION` is consumed |
+|-----------|-------------------------------------------|
+| Dockerfile (userspace) | `ARG NVIDIA_DRIVER_VERSION` — `.run` installer URL |
+| Module build script | `build-nvidia-modules.sh` — open-gpu-kernel-modules tag |
+| Shared pin | `versions.env` — single source of truth |
 
-A mismatch causes `modprobe` "version magic" errors or nvidia-smi ABI
-failures at sandbox boot time.
+A mismatch between kernel modules and userspace causes `modprobe`
+"version magic" errors or nvidia-smi ABI failures at sandbox boot time.
 
 ## Customization
 
-### Changing the CUDA version
-
-```shell
-docker build \
-  --build-arg CUDA_VERSION=12.6.0 \
-  --build-arg UBUNTU_VERSION=22.04 \
-  -t my-gpu-sandbox:latest \
-  ./sandboxes/nvidia-gpu/
-```
-
 ### Changing the NVIDIA driver version
 
-Update all three locations:
-
-1. `sandboxes/nvidia-gpu/versions.env`
-2. `sandboxes/nvidia-gpu/Dockerfile` ARG `NVIDIA_DRIVER_VERSION`
-3. Rebuild kernel modules: `NVIDIA_OPEN_VERSION=<version> mise run vm:nvidia-modules`
+1. Update `NVIDIA_DRIVER_VERSION` in `sandboxes/nvidia-gpu/versions.env`
+2. Rebuild kernel modules: `mise run vm:nvidia-modules`
+3. Rebuild the sandbox image: `./sandboxes/nvidia-gpu/build.sh`
 
 ### Adding packages
 

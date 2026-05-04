@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 fn main() {
+    emit_guest_kernel_version();
+
     println!("cargo:rerun-if-env-changed=OPENSHELL_VM_RUNTIME_COMPRESSED_DIR");
 
     if let Ok(dir) = env::var("OPENSHELL_VM_RUNTIME_COMPRESSED_DIR") {
@@ -142,4 +144,58 @@ fn generate_stub_resources(out_dir: &Path, names: &[&str]) {
                 .unwrap_or_else(|e| panic!("Failed to write stub {}: {}", path.display(), e));
         }
     }
+}
+
+/// Parse `GUEST_KERNEL_VERSION` from `pins.env` and emit it as a compile-time
+/// environment variable so `rootfs.rs` can use `env!("GUEST_KERNEL_VERSION")`.
+fn emit_guest_kernel_version() {
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let pins_path = manifest_dir.join("../../crates/openshell-vm/pins.env");
+
+    println!("cargo:rerun-if-changed={}", pins_path.display());
+    println!("cargo:rerun-if-env-changed=GUEST_KERNEL_VERSION");
+
+    let version = if let Ok(v) = env::var("GUEST_KERNEL_VERSION") {
+        v
+    } else if let Ok(contents) = fs::read_to_string(&pins_path) {
+        parse_guest_kernel_version(&contents).unwrap_or_else(|| {
+            panic!(
+                "GUEST_KERNEL_VERSION not found in {}",
+                pins_path.display()
+            )
+        })
+    } else {
+        panic!(
+            "Cannot read {} and GUEST_KERNEL_VERSION env var not set",
+            pins_path.display()
+        );
+    };
+
+    println!("cargo:rustc-env=GUEST_KERNEL_VERSION={version}");
+}
+
+/// Extract the default value from a `GUEST_KERNEL_VERSION="${GUEST_KERNEL_VERSION:-<default>}"`
+/// line in pins.env.
+fn parse_guest_kernel_version(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || !trimmed.starts_with("GUEST_KERNEL_VERSION=") {
+            continue;
+        }
+        // Pattern: GUEST_KERNEL_VERSION="${GUEST_KERNEL_VERSION:-6.12.76}"
+        if let Some(start) = trimmed.find(":-") {
+            let after = &trimmed[start + 2..];
+            if let Some(end) = after.find('}') {
+                let value = after[..end].trim_end_matches('"');
+                return Some(value.to_string());
+            }
+        }
+        // Fallback: simple assignment like GUEST_KERNEL_VERSION="6.12.76"
+        if let Some((_key, value)) = trimmed.split_once('=') {
+            let v = value.trim_matches('"').trim_matches('\'');
+            return Some(v.to_string());
+        }
+    }
+    None
 }

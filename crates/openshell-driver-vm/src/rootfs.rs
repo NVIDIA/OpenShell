@@ -35,7 +35,7 @@ pub fn prepare_sandbox_rootfs_from_image_root(
 /// ensures the guest always runs the init script and supervisor that match
 /// the running driver binary.
 pub fn refresh_runtime_artifacts(rootfs: &Path) -> Result<(), String> {
-    let init_path = rootfs.join("srv/openshell-vm-sandbox-init.sh");
+    let init_path = rootfs.join(SANDBOX_GUEST_INIT_PATH.trim_start_matches('/'));
     if let Some(parent) = init_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
@@ -176,7 +176,7 @@ fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
         remove_rootfs_path(rootfs, relative)?;
     }
 
-    let init_path = rootfs.join("srv/openshell-vm-sandbox-init.sh");
+    let init_path = rootfs.join(SANDBOX_GUEST_INIT_PATH.trim_start_matches('/'));
     if let Some(parent) = init_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
@@ -206,7 +206,7 @@ fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
 
 pub fn validate_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
     require_rootfs_path(rootfs, SANDBOX_GUEST_INIT_PATH)?;
-    require_rootfs_path(rootfs, "/opt/openshell/bin/openshell-sandbox")?;
+    require_rootfs_path(rootfs, SANDBOX_SUPERVISOR_PATH)?;
     require_any_rootfs_path(rootfs, &["/bin/bash"])?;
     require_any_rootfs_path(rootfs, &["/bin/mount", "/usr/bin/mount"])?;
     require_any_rootfs_path(
@@ -220,10 +220,9 @@ pub fn validate_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
 /// Kernel version of the libkrunfw guest. Modules must be compiled against
 /// this exact version; a mismatch causes `modprobe` failures at boot.
 ///
-/// Keep in sync with:
-///   - `tasks/scripts/vm/build-nvidia-modules.sh` (`KERNEL_TREE` path)
-///   - `openshell-vm-sandbox-init.sh` `setup_gpu()` expected version
-const GUEST_KERNEL_VERSION: &str = "6.12.76";
+/// Single source of truth: `crates/openshell-vm/pins.env`. The build script
+/// parses the pin and emits it as a compile-time env var.
+const GUEST_KERNEL_VERSION: &str = env!("GUEST_KERNEL_VERSION");
 
 /// Inject NVIDIA kernel modules, firmware, and `kmod` tooling into a prepared
 /// sandbox rootfs. Called by the driver when a sandbox requests GPU support.
@@ -282,10 +281,55 @@ pub fn inject_gpu_modules(rootfs: &Path, state_dir: &Path) -> Result<(), String>
     }
 
     inject_gpu_firmware(rootfs, &modules_dir);
+    check_gpu_version_match(rootfs, &modules_dir);
     ensure_kmod_symlinks(rootfs);
     warn_missing_gpu_userspace(rootfs);
 
     Ok(())
+}
+
+/// Compare the driver version baked into the sandbox image against the
+/// firmware version directory. A mismatch means the image userspace and the
+/// injected kernel modules / firmware were built from different driver
+/// releases, which usually causes GPU initialisation failures.
+///
+/// Emits `tracing::warn!` (not an error) because operators may intentionally
+/// run minor-revision mismatches during rolling upgrades.
+fn check_gpu_version_match(rootfs: &Path, modules_dir: &Path) {
+    let stamp = rootfs.join("etc/openshell-gpu-driver-version");
+    let Ok(image_ver) = fs::read_to_string(&stamp) else {
+        return;
+    };
+    let image_ver = image_ver.trim();
+    if image_ver.is_empty() {
+        return;
+    }
+
+    let fw_dir = modules_dir.parent().map(|p| p.join("nvidia-firmware"));
+    let Some(ref fw) = fw_dir else { return };
+    let Ok(entries) = fs::read_dir(fw) else {
+        return;
+    };
+
+    let version_dirs: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+
+    if version_dirs.is_empty() {
+        return;
+    }
+
+    if !version_dirs.iter().any(|v| v == image_ver) {
+        tracing::warn!(
+            image_version = image_ver,
+            firmware_versions = ?version_dirs,
+            "GPU driver version mismatch: image userspace ({}) does not match \
+             any firmware version ({:?}). Sandbox GPU may fail to initialise.",
+            image_ver, version_dirs,
+        );
+    }
 }
 
 /// Check whether the rootfs contains essential GPU userspace binaries.
@@ -295,6 +339,7 @@ pub fn inject_gpu_modules(rootfs: &Path, state_dir: &Path) -> Result<(), String>
 fn warn_missing_gpu_userspace(rootfs: &Path) {
     let nvidia_smi_candidates = [
         "usr/bin/nvidia-smi",
+        "usr/sbin/nvidia-smi",
         "usr/local/bin/nvidia-smi",
         "bin/nvidia-smi",
     ];
@@ -860,7 +905,7 @@ mod tests {
 
         result.expect("inject_gpu_modules should succeed");
 
-        let dest = rootfs.join("lib/modules/6.12.76/kernel/drivers/nvidia");
+        let dest = rootfs.join(format!("lib/modules/{GUEST_KERNEL_VERSION}/kernel/drivers/nvidia"));
         assert!(dest.join("nvidia.ko").is_file());
         assert!(dest.join("nvidia-uvm.ko").is_file());
 

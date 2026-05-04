@@ -25,9 +25,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 BUILD_DIR="${ROOT}/target/libkrun-build"
 OUTPUT_DIR="${BUILD_DIR}/nvidia-modules"
 
-# Guest kernel version — keep in sync with GUEST_KERNEL_VERSION in
-# crates/openshell-driver-vm/src/rootfs.rs and the init script.
-KERNEL_TREE="${BUILD_DIR}/libkrunfw/linux-6.12.76"
+# shellcheck source=../../crates/openshell-vm/pins.env
+source "${ROOT}/crates/openshell-vm/pins.env"
+KERNEL_TREE="${BUILD_DIR}/libkrunfw/linux-${GUEST_KERNEL_VERSION}"
 if [ ! -d "${KERNEL_TREE}" ]; then
     echo "ERROR: Guest kernel tree not found at ${KERNEL_TREE}" >&2
     echo "       Run: mise run vm:setup" >&2
@@ -57,20 +57,19 @@ if [ -z "${HOST_DRIVER_VERSION}" ]; then
     HOST_DRIVER_VERSION="$(modinfo -F version /lib/modules/$(uname -r)/updates/dkms/nvidia.ko 2>/dev/null || true)"
 fi
 
-# Use the open-gpu-kernel-modules release matching the host driver major
-# version. The open modules support newer kernels better than the
-# proprietary DKMS source shipped in /usr/src/.
-# Must match NVIDIA_DRIVER_VERSION in sandboxes/nvidia-gpu/versions.env
-# and sandboxes/nvidia-gpu/Dockerfile ARG NVIDIA_DRIVER_VERSION
-NVIDIA_OPEN_VERSION="${NVIDIA_OPEN_VERSION:-580.159.03}"
-NVIDIA_SRC_DIR="${BUILD_DIR}/open-gpu-kernel-modules-${NVIDIA_OPEN_VERSION}"
+# Use the open-gpu-kernel-modules release matching the driver version.
+# The open modules support newer kernels better than the proprietary
+# DKMS source shipped in /usr/src/.
+# shellcheck source=sandboxes/nvidia-gpu/versions.env
+source "${ROOT}/sandboxes/nvidia-gpu/versions.env"
+NVIDIA_SRC_DIR="${BUILD_DIR}/open-gpu-kernel-modules-${NVIDIA_DRIVER_VERSION}"
 
 if [ ! -d "${NVIDIA_SRC_DIR}/kernel-open" ]; then
-    echo "==> Downloading NVIDIA open kernel modules ${NVIDIA_OPEN_VERSION}"
-    TARBALL="${BUILD_DIR}/nvidia-open-${NVIDIA_OPEN_VERSION}.tar.gz"
+    echo "==> Downloading NVIDIA open kernel modules ${NVIDIA_DRIVER_VERSION}"
+    TARBALL="${BUILD_DIR}/nvidia-open-${NVIDIA_DRIVER_VERSION}.tar.gz"
     if [ ! -f "${TARBALL}" ]; then
         curl -fSL \
-            "https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/${NVIDIA_OPEN_VERSION}.tar.gz" \
+            "https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/${NVIDIA_DRIVER_VERSION}.tar.gz" \
             -o "${TARBALL}"
         # TODO(gpu): Add SHA-256 verification for supply chain integrity.
         # echo "<expected-hash>  ${TARBALL}" | sha256sum -c -
@@ -90,7 +89,7 @@ if [ -f "${NV_PAT}" ] && grep -q '__flush_tlb()' "${NV_PAT}"; then
     sed -i 's/__flush_tlb()/__flush_tlb_all()/g' "${NV_PAT}"
 fi
 
-echo "==> Building NVIDIA ${NVIDIA_OPEN_VERSION} open kernel modules for guest kernel 6.12.76"
+echo "==> Building NVIDIA ${NVIDIA_DRIVER_VERSION} open kernel modules for guest kernel ${GUEST_KERNEL_VERSION}"
 echo "    NVIDIA source: ${NVIDIA_SRC}"
 echo "    Kernel tree:   ${KERNEL_TREE}"
 echo "    Output:        ${OUTPUT_DIR}"
@@ -143,7 +142,7 @@ echo "==> Collecting firmware"
 
 # GSP firmware is included in the open-gpu-kernel-modules source tree.
 FW_SRC="${NVIDIA_SRC}/src/nvidia/firmware"
-FW_OUTPUT="${BUILD_DIR}/nvidia-firmware/${NVIDIA_OPEN_VERSION}"
+FW_OUTPUT="${BUILD_DIR}/nvidia-firmware/${NVIDIA_DRIVER_VERSION}"
 if [ -d "${FW_SRC}" ] && ls "${FW_SRC}"/*.bin >/dev/null 2>&1; then
     mkdir -p "${FW_OUTPUT}"
     cp "${FW_SRC}"/*.bin "${FW_OUTPUT}/"
@@ -169,7 +168,7 @@ else
 fi
 
 echo ""
-echo "==> Done! ${KO_COUNT} kernel modules built for guest kernel 6.12.76."
+echo "==> Done! ${KO_COUNT} kernel modules built for guest kernel ${GUEST_KERNEL_VERSION}."
 echo "    The VM driver will auto-discover them at:"
 echo "    ${OUTPUT_DIR}"
 echo ""

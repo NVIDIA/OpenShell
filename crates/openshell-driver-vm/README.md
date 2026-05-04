@@ -47,6 +47,11 @@ By default `mise run gateway:vm`:
 
 For GPU passthrough (VFIO), pass `-- --gpu` and run with root privileges:
 
+> **Note:** GPU passthrough requires an **x86_64 host and guest**. The QEMU
+> backend uses `qemu-system-x86_64`, and the NVIDIA driver installer /
+> kernel module build scripts target x86_64 exclusively. ARM/aarch64 GPU
+> passthrough is not yet supported.
+
 ```shell
 sudo -E env "PATH=$PATH" mise run gateway:vm -- --gpu
 ```

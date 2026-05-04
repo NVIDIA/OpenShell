@@ -315,6 +315,11 @@ fn qemu_guest_env_vars(config: &VmLaunchConfig, dns_server: Option<String>) -> V
         env_vars.push("GPU_ENABLED=true".to_string());
     }
 
+    env_vars.push(format!(
+        "GUEST_KERNEL_VERSION={}",
+        env!("GUEST_KERNEL_VERSION")
+    ));
+
     env_vars
 }
 

@@ -236,10 +236,12 @@ setup_gpu() {
 
     # Kernel modules are built for a specific guest kernel version.
     # If the running kernel doesn't match, depmod/modprobe will silently fail.
-    local expected_kver="6.12.76"
+    local expected_kver="${GUEST_KERNEL_VERSION:-}"
     local actual_kver
     actual_kver="$(uname -r)"
-    if [ "${actual_kver}" != "${expected_kver}" ]; then
+    if [ -z "${expected_kver}" ]; then
+        ts "GUEST_KERNEL_VERSION not set; skipping kernel version check"
+    elif [ "${actual_kver}" != "${expected_kver}" ]; then
         ts "WARNING: kernel version mismatch: expected ${expected_kver}, got ${actual_kver}"
         ts "         GPU modules are installed under lib/modules/${expected_kver}/"
         ts "         modprobe may fail to find them"
