@@ -60,11 +60,23 @@ AGENT_PID=""
 step() { printf "\n${BOLD}${CYAN}==> %s${RESET}\n\n" "$1"; }
 info() { printf "  %b\n" "$*"; }
 
+# Redact host-side credentials from the agent log tail before printing on
+# failure. Codex shouldn't echo the token, but a misbehaving tool call (e.g.,
+# `curl -v`) could leak it; sanitize before showing the log.
+redact_log() {
+    local replacement='[redacted]'
+    sed \
+        -e "s|${DEMO_GITHUB_TOKEN:-__no_github_token__}|${replacement}|g" \
+        -e "s|${CODEX_AUTH_ACCESS_TOKEN:-__no_codex_access__}|${replacement}|g" \
+        -e "s|${CODEX_AUTH_REFRESH_TOKEN:-__no_codex_refresh__}|${replacement}|g" \
+        -e "s|${CODEX_AUTH_ACCOUNT_ID:-__no_codex_account__}|${replacement}|g"
+}
+
 fail() {
     printf "\n${RED}error:${RESET} %s\n" "$*" >&2
     if [[ -f "$AGENT_LOG" ]]; then
         printf "\n${YELLOW}Agent log tail:${RESET}\n" >&2
-        tail -n 80 "$AGENT_LOG" | sed 's/^/  /' >&2 || true
+        tail -n 80 "$AGENT_LOG" | redact_log | sed 's/^/  /' >&2 || true
     fi
     exit 1
 }
@@ -139,6 +151,10 @@ validate_env() {
     [[ "$DEMO_GITHUB_REPO" =~ ^[A-Za-z0-9_.-]+$ ]] || fail "DEMO_GITHUB_REPO contains unsupported characters"
     [[ "$DEMO_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || fail "DEMO_BRANCH contains unsupported characters"
     [[ "$DEMO_RUN_ID" =~ ^[A-Za-z0-9_.-]+$ ]] || fail "DEMO_RUN_ID contains unsupported characters"
+    # DEMO_FILE_DIR is interpolated through `sed` with `|` as the delimiter
+    # when rendering the agent task; reject any character that would break
+    # the substitution or escape into a shell context.
+    [[ "$DEMO_FILE_DIR" =~ ^[A-Za-z0-9._/-]+$ ]] || fail "DEMO_FILE_DIR contains unsupported characters"
 
     resolve_github_owner
     [[ "$DEMO_GITHUB_OWNER" =~ ^[A-Za-z0-9_.-]+$ ]] || fail "DEMO_GITHUB_OWNER contains unsupported characters"
