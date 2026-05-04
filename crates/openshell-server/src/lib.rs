@@ -36,6 +36,7 @@ mod tls;
 pub mod tracing_bus;
 mod ws_tunnel;
 
+use metrics::{Unit, describe_counter, describe_gauge, describe_histogram, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
 use std::collections::HashMap;
@@ -262,6 +263,38 @@ pub async fn run_server(
         let prometheus_handle = PrometheusBuilder::new()
             .install_recorder()
             .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+        // Record server start time so /metrics is non-empty from the first scrape.
+        // Without this, metrics-exporter-prometheus returns an empty body until the first
+        // request flows through MultiplexedService, causing Prometheus gaps on restart.
+        describe_gauge!(
+            "openshell_server_start_time_seconds",
+            Unit::Seconds,
+            "Unix timestamp of when the gateway server started"
+        );
+        gauge!("openshell_server_start_time_seconds").set(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64(),
+        );
+        describe_counter!(
+            "openshell_server_grpc_requests_total",
+            "Total number of gRPC requests handled"
+        );
+        describe_histogram!(
+            "openshell_server_grpc_request_duration_seconds",
+            Unit::Seconds,
+            "gRPC request duration in seconds"
+        );
+        describe_counter!(
+            "openshell_server_http_requests_total",
+            "Total number of HTTP requests handled"
+        );
+        describe_histogram!(
+            "openshell_server_http_request_duration_seconds",
+            Unit::Seconds,
+            "HTTP request duration in seconds"
+        );
         let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
             Error::transport(format!(
                 "failed to bind metrics port {metrics_bind_address}: {e}",
