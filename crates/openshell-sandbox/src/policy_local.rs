@@ -215,7 +215,11 @@ fn collect_ocsf_log_files(log_dir: &Path, max_files: usize) -> std::io::Result<V
         .collect();
 
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    Ok(entries.into_iter().take(max_files).map(|(_, p)| p).collect())
+    Ok(entries
+        .into_iter()
+        .take(max_files)
+        .map(|(_, p)| p)
+        .collect())
 }
 
 /// Convert an OCSF event into a compact denial summary, or `None` if the event
