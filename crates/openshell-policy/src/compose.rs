@@ -94,6 +94,7 @@ mod tests {
                 ports: Vec::new(),
                 deny_rules: Vec::new(),
                 allow_encoded_slash: false,
+                ..Default::default()
             }],
             binaries: Vec::new(),
         }

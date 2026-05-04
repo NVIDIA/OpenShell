@@ -193,6 +193,7 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         ports: Vec::new(),
         deny_rules: Vec::new(),
         allow_encoded_slash: false,
+        ..Default::default()
     }
 }
 
