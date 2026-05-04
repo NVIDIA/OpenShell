@@ -190,6 +190,9 @@ deploy/docker/.build/
 # SBOM generated output (JSON, CSV) — release artifacts, not committed
 deploy/sbom/output/
 
+# Debian package build output (default OPENSHELL_OUTPUT_DIR for tasks/scripts/package-deb.sh)
+artifacts/
+
 # Local mise settings
 mise.local.toml
 

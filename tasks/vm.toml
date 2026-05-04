@@ -5,20 +5,19 @@
 #
 # Workflow:
 #   mise run vm:setup          # one-time: download pre-built runtime (~30s)
+#   mise run vm:supervisor     # build the bundled sandbox supervisor
 #   mise run gateway:vm        # start openshell-gateway with the VM driver
+#                              # (defined in tasks/gateway.toml)
 #   mise run vm                # build + run the standalone openshell-vm microVM
 #   mise run vm:clean          # wipe everything and start over
 #
-# See crates/openshell-driver-vm/README.md for the `gateway:vm` flow and
+# See tasks/gateway.toml for `gateway:vm`,
+# crates/openshell-driver-vm/README.md for the VM driver workflow, and
 # crates/openshell-vm/README.md for the standalone microVM path.
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Commands
 # ═══════════════════════════════════════════════════════════════════════════
-
-["gateway:vm"]
-description = "Build openshell-gateway + openshell-driver-vm and start the gateway with the VM driver (pass -- --gpu for GPU support)"
-run = "crates/openshell-driver-vm/start.sh"
 
 [vm]
 description = "Build and run the standalone openshell-vm microVM"
@@ -37,6 +36,10 @@ run = [
 ["vm:setup"]
 description = "One-time setup: download (or build) the VM runtime"
 run = "tasks/scripts/vm/vm-setup.sh"
+
+["vm:supervisor"]
+description = "Build the bundled openshell-sandbox supervisor for openshell-driver-vm"
+run = "tasks/scripts/vm/build-supervisor-bundle.sh"
 
 ["vm:rootfs"]
 description = "Build the VM rootfs tarball (use -- --base for lightweight)"

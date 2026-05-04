@@ -1,0 +1,16 @@
+Package: openshell
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: NVIDIA OpenShell Maintainers <openshell@nvidia.com>
+Section: utils
+Priority: optional
+Pre-Depends: init-system-helpers (>= 1.54~)
+Homepage: https://github.com/NVIDIA/OpenShell
+Description: Safe, sandboxed runtimes for autonomous AI agents
+ OpenShell provides host-side command-line and gateway components for
+ launching and managing policy-enforced AI agent sandboxes. The package
+ installs the openshell CLI, openshell-gateway daemon, and the VM compute
+ driver helper, plus a per-user systemd unit for running the gateway.
+ .
+ The systemd unit is user-scope (under /usr/lib/systemd/user/). To start
+ it, run `systemctl --user enable --now openshell-gateway`.

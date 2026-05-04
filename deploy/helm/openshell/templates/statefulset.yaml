@@ -47,6 +47,8 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
+            - --bind-address
+            - "0.0.0.0"
             - --port
             - {{ .Values.service.port | quote }}
             - --health-port

@@ -1237,14 +1237,31 @@ const PROXY_BASELINE_READ_WRITE: &[&str] = &["/sandbox", "/tmp"];
 /// socket at init time.  If the directory exists but Landlock denies traversal
 /// (EACCES vs ECONNREFUSED), NVML returns `NVML_ERROR_INSUFFICIENT_PERMISSIONS`
 /// even though the daemon is optional.  Only read/traversal access is needed.
-const GPU_BASELINE_READ_ONLY: &[&str] = &["/run/nvidia-persistenced"];
+///
+/// `/usr/lib/wsl`: On WSL2, CDI bind-mounts GPU libraries (libdxcore.so,
+/// libcuda.so.1.1, etc.) into paths under `/usr/lib/wsl/`.  Although `/usr`
+/// is already in `PROXY_BASELINE_READ_ONLY`, individual file bind-mounts may
+/// not be covered by the parent-directory Landlock rule when the mount crosses
+/// a filesystem boundary.  Listing `/usr/lib/wsl` explicitly ensures traversal
+/// is permitted regardless of Landlock's cross-mount behaviour.
+const GPU_BASELINE_READ_ONLY: &[&str] = &[
+    "/run/nvidia-persistenced",
+    "/usr/lib/wsl", // WSL2: CDI-injected GPU library directory
+];
 
 /// GPU read-write paths (static).
 ///
 /// `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`,
-/// `/dev/nvidia-modeset`: control and UVM devices injected by CDI.
-/// Landlock restricts `open(2)` on device files even when DAC allows it;
-/// these need read-write because NVML/CUDA opens them with `O_RDWR`.
+/// `/dev/nvidia-modeset`: control and UVM devices injected by CDI on native
+/// Linux.  Landlock restricts `open(2)` on device files even when DAC allows
+/// it; these need read-write because NVML/CUDA opens them with `O_RDWR`.
+/// These devices do not exist on WSL2 and will be skipped by the existence
+/// check in `enrich_proto_baseline_paths()`.
+///
+/// `/dev/dxg`: On WSL2, NVIDIA GPUs are exposed through the DXG kernel driver
+/// (DirectX Graphics) rather than the native nvidia* devices.  CDI injects
+/// `/dev/dxg` as the sole GPU device node; it does not exist on native Linux
+/// and will be skipped there by the existence check.
 ///
 /// `/proc`: CUDA writes to `/proc/<pid>/task/<tid>/comm` during `cuInit()`
 /// to set thread names.  Without write access, `cuInit()` returns error 304.
@@ -1258,12 +1275,17 @@ const GPU_BASELINE_READ_WRITE: &[&str] = &[
     "/dev/nvidia-uvm",
     "/dev/nvidia-uvm-tools",
     "/dev/nvidia-modeset",
+    "/dev/dxg", // WSL2: DXG device (GPU via DirectX kernel driver, injected by CDI)
     "/proc",
 ];
 
 /// Returns true if GPU devices are present in the container.
+///
+/// Checks both the native Linux NVIDIA control device (`/dev/nvidiactl`) and
+/// the WSL2 DXG device (`/dev/dxg`).  CDI injects exactly one of these
+/// depending on the host kernel; the other will not exist.
 fn has_gpu_devices() -> bool {
-    std::path::Path::new("/dev/nvidiactl").exists()
+    std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/dxg").exists()
 }
 
 /// Enumerate per-GPU device nodes (`/dev/nvidia0`, `/dev/nvidia1`, …).
@@ -1543,6 +1565,17 @@ mod baseline_tests {
     }
 
     #[test]
+    fn gpu_baseline_read_write_contains_dxg() {
+        // /dev/dxg must be present so WSL2 sandboxes get the Landlock
+        // read-write rule for the CDI-injected DXG device.  The existence
+        // check in enrich_proto_baseline_paths() skips it on native Linux.
+        assert!(
+            GPU_BASELINE_READ_WRITE.contains(&"/dev/dxg"),
+            "/dev/dxg must be in GPU_BASELINE_READ_WRITE for WSL2 support"
+        );
+    }
+
+    #[test]
     fn local_enrichment_preserves_explicit_read_only_for_baseline_read_write_paths() {
         let mut policy = SandboxPolicy {
             version: 1,
@@ -1574,6 +1607,29 @@ mod baseline_tests {
                 .read_write
                 .contains(&std::path::PathBuf::from("/tmp")),
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
+        );
+    }
+
+    #[test]
+    fn gpu_baseline_read_only_contains_usr_lib_wsl() {
+        // /usr/lib/wsl must be present so CDI-injected WSL2 GPU library
+        // bind-mounts are accessible under Landlock.  Skipped on native Linux.
+        assert!(
+            GPU_BASELINE_READ_ONLY.contains(&"/usr/lib/wsl"),
+            "/usr/lib/wsl must be in GPU_BASELINE_READ_ONLY for WSL2 CDI library paths"
+        );
+    }
+
+    #[test]
+    fn has_gpu_devices_reflects_dxg_or_nvidiactl() {
+        // Verify the OR logic: result must match the manual disjunction of
+        // the two path checks.  Passes in all environments.
+        let nvidiactl = std::path::Path::new("/dev/nvidiactl").exists();
+        let dxg = std::path::Path::new("/dev/dxg").exists();
+        assert_eq!(
+            has_gpu_devices(),
+            nvidiactl || dxg,
+            "has_gpu_devices() should be true iff /dev/nvidiactl or /dev/dxg exists"
         );
     }
 }

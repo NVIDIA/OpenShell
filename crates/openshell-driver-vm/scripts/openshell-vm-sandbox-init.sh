@@ -9,29 +9,33 @@
 
 set -euo pipefail
 
-# Source QEMU-injected environment variables if present
+# Source QEMU-injected environment variables if present.
 if [ -f /srv/openshell-env.sh ]; then
+    # shellcheck source=/dev/null
     source /srv/openshell-env.sh
 fi
 
 BOOT_START=$(date +%s%3N 2>/dev/null || date +%s)
+# gvisor-tap-vsock subnet layout:
+#   192.168.127.1   — gateway: gvproxy's DNS / DHCP / HTTP API. Does NOT
+#                     proxy arbitrary host ports.
+#   192.168.127.254 — host-loopback: NAT-rewritten to host's 127.0.0.1 by
+#                     gvproxy's TCP/UDP/ICMP forwarder. Use this address
+#                     (or any of the host.* hostnames below) to reach a
+#                     service the host is listening on.
+# The host.containers.internal / host.docker.internal DNS records served
+# by gvproxy's embedded resolver point at 192.168.127.254. We mirror that
+# in /etc/hosts so the supervisor can reach the gateway even when
+# gvproxy's DNS is not in resolv.conf (e.g. DHCP failed and we fell
+# back to 8.8.8.8).
 GVPROXY_GATEWAY_IP="192.168.127.1"
+GVPROXY_HOST_LOOPBACK_IP="192.168.127.254"
 GATEWAY_IP="$GVPROXY_GATEWAY_IP"
 
-# Parse kernel cmdline for GPU and TAP networking parameters
 GPU_ENABLED="${GPU_ENABLED:-false}"
 VM_NET_IP="${VM_NET_IP:-}"
 VM_NET_GW="${VM_NET_GW:-}"
 VM_NET_DNS="${VM_NET_DNS:-}"
-
-for param in $(cat /proc/cmdline 2>/dev/null || true); do
-    case "$param" in
-        GPU_ENABLED=*)  GPU_ENABLED="${param#GPU_ENABLED=}" ;;
-        VM_NET_IP=*)    VM_NET_IP="${param#VM_NET_IP=}" ;;
-        VM_NET_GW=*)    VM_NET_GW="${param#VM_NET_GW=}" ;;
-        VM_NET_DNS=*)   VM_NET_DNS="${param#VM_NET_DNS=}" ;;
-    esac
-done
 
 ts() {
     local now
@@ -89,22 +93,46 @@ tcp_probe() {
     local port="$2"
 
     if command -v timeout >/dev/null 2>&1; then
-        timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${port}" >/dev/null 2>&1
+        timeout 2 bash -c "exec 3<>/dev/tcp/\$1/\$2" _ "$host" "$port" >/dev/null 2>&1
     else
-        bash -c "exec 3<>/dev/tcp/${host}/${port}" >/dev/null 2>&1
+        bash -c "exec 3<>/dev/tcp/\$1/\$2" _ "$host" "$port" >/dev/null 2>&1
     fi
 }
 
 ensure_host_gateway_aliases() {
+    # Seed /etc/hosts with the well-known gvproxy hostnames so the supervisor
+    # can reach the OpenShell server even when gvproxy's built-in DNS is not
+    # in resolv.conf (e.g. when DHCP fails and we fall back to 8.8.8.8).
+    #
+    # Critical distinction: host.* aliases point at the gvproxy *host-loopback*
+    # IP (192.168.127.254), not the gateway IP (192.168.127.1). Only the
+    # host-loopback IP carries NAT rewriting to the host's 127.0.0.1 — the
+    # gateway IP only listens on gvproxy's own service ports (DNS:53, DHCP,
+    # HTTP API:80). Pinning host.containers.internal to the gateway IP
+    # silently breaks guest→host port reachability for arbitrary ports.
     local hosts_tmp="/tmp/openshell-hosts.$$"
+    local host_aliases="host.openshell.internal host.containers.internal host.docker.internal"
+    local gateway_aliases="gateway.containers.internal"
+    local filter='(^|[[:space:]])(host\.openshell\.internal|host\.containers\.internal|host\.docker\.internal|gateway\.containers\.internal)([[:space:]]|$)'
 
     if [ -f /etc/hosts ]; then
-        grep -vE '(^|[[:space:]])host\.openshell\.internal([[:space:]]|$)' /etc/hosts > "$hosts_tmp" || true
+        grep -vE "$filter" /etc/hosts > "$hosts_tmp" || true
     else
         : > "$hosts_tmp"
     fi
 
-    printf '%s host.openshell.internal\n' "$GATEWAY_IP" >> "$hosts_tmp"
+    # In TAP/GPU mode, GATEWAY_IP is overridden to VM_NET_GW (the host-side
+    # of the TAP), and the gateway is reachable directly there. In gvproxy
+    # mode, host.openshell.internal etc. need GVPROXY_HOST_LOOPBACK_IP
+    # (192.168.127.254) which is gvproxy's host-NAT entry, while
+    # gateway.containers.internal points at the gvproxy gateway itself.
+    if [ "${GATEWAY_IP}" = "${GVPROXY_GATEWAY_IP}" ]; then
+        printf '%s %s\n' "$GVPROXY_HOST_LOOPBACK_IP" "$host_aliases" >> "$hosts_tmp"
+        printf '%s %s\n' "$GVPROXY_GATEWAY_IP" "$gateway_aliases" >> "$hosts_tmp"
+    else
+        # TAP networking: gateway and host are both reachable at GATEWAY_IP.
+        printf '%s %s %s\n' "$GATEWAY_IP" "$host_aliases" "$gateway_aliases" >> "$hosts_tmp"
+    fi
     cat "$hosts_tmp" > /etc/hosts
     rm -f "$hosts_tmp"
 }
@@ -129,7 +157,15 @@ rewrite_openshell_endpoint_if_needed() {
         return 0
     fi
 
-    for candidate in host.openshell.internal host.containers.internal host.docker.internal "$GATEWAY_IP"; do
+    # Probe candidates in preference order. Hostnames first for informative
+    # log output, then a bare IP as a final safety net. In gvproxy mode the
+    # bare IP is the host-loopback (192.168.127.254). In TAP/GPU mode it's
+    # the TAP host gateway.
+    local fallback_ip="$GVPROXY_HOST_LOOPBACK_IP"
+    if [ "${GATEWAY_IP}" != "${GVPROXY_GATEWAY_IP}" ]; then
+        fallback_ip="$GATEWAY_IP"
+    fi
+    for candidate in host.openshell.internal host.containers.internal host.docker.internal "$fallback_ip"; do
         if [ "$candidate" = "$host" ]; then
             continue
         fi
@@ -244,15 +280,11 @@ mount -t tmpfs tmpfs /run 2>/dev/null &
 mount -t devtmpfs devtmpfs /dev 2>/dev/null &
 wait
 
-mkdir -p /dev/pts /dev/shm /sys/fs/cgroup /sandbox
+mkdir -p /dev/pts /dev/shm /sys/fs/cgroup
 mount -t devpts devpts /dev/pts 2>/dev/null &
 mount -t tmpfs tmpfs /dev/shm 2>/dev/null &
 mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null &
 wait
-
-mount -t tmpfs tmpfs /sandbox 2>/dev/null || true
-mkdir -p /sandbox
-chown sandbox:sandbox /sandbox 2>/dev/null || true
 
 hostname openshell-sandbox-vm 2>/dev/null || true
 ip link set lo up 2>/dev/null || true
@@ -271,12 +303,22 @@ if [ -n "${VM_NET_IP}" ] && [ -n "${VM_NET_GW}" ]; then
     TAP_NIC=""
     NIC_WAIT=0
     while [ -z "$TAP_NIC" ] && [ "$NIC_WAIT" -lt 10 ]; do
-        for candidate in eth0 ens3 enp0s2 $(ls /sys/class/net/ 2>/dev/null | grep -v '^lo$'); do
+        for candidate in eth0 ens3 enp0s2; do
             if ip link show "$candidate" >/dev/null 2>&1 && [ "$candidate" != "lo" ]; then
                 TAP_NIC="$candidate"
                 break
             fi
         done
+        if [ -z "$TAP_NIC" ]; then
+            for sys_nic in /sys/class/net/*; do
+                [ -e "$sys_nic" ] || continue
+                candidate="${sys_nic##*/}"
+                if ip link show "$candidate" >/dev/null 2>&1 && [ "$candidate" != "lo" ]; then
+                    TAP_NIC="$candidate"
+                    break
+                fi
+            done
+        fi
         if [ -z "$TAP_NIC" ]; then
             sleep 1
             NIC_WAIT=$((NIC_WAIT + 1))
@@ -307,7 +349,7 @@ elif ip link show eth0 >/dev/null 2>&1; then
     if command -v udhcpc >/dev/null 2>&1; then
         UDHCPC_SCRIPT="/usr/share/udhcpc/default.script"
         if [ ! -f "$UDHCPC_SCRIPT" ]; then
-            mkdir -p /usr/share/udhcpc
+            UDHCPC_SCRIPT="/run/openshell-udhcpc.script"
             cat > "$UDHCPC_SCRIPT" <<'DHCP_SCRIPT'
 #!/bin/sh
 case "$1" in

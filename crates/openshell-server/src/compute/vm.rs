@@ -63,6 +63,9 @@ pub struct VmComputeConfig {
     /// falls back to its conventional install paths and sibling binary.
     pub driver_dir: Option<PathBuf>,
 
+    /// Default sandbox image the driver should use when a request omits one.
+    pub default_image: String,
+
     /// libkrun log level used by the VM driver helper.
     pub krun_log_level: u32,
 
@@ -113,6 +116,7 @@ impl VmComputeConfig {
         if let Some(home) = home {
             dirs.push(home.join(".local").join("libexec").join("openshell"));
         }
+        push_unique_path(&mut dirs, PathBuf::from("/usr/libexec/openshell"));
         push_unique_path(&mut dirs, PathBuf::from("/usr/local/libexec/openshell"));
         push_unique_path(&mut dirs, PathBuf::from("/usr/local/libexec"));
         dirs
@@ -124,6 +128,7 @@ impl Default for VmComputeConfig {
         Self {
             state_dir: Self::default_state_dir(),
             driver_dir: None,
+            default_image: String::new(),
             krun_log_level: Self::default_krun_log_level(),
             vcpus: Self::default_vcpus(),
             mem_mib: Self::default_mem_mib(),
@@ -148,8 +153,8 @@ pub struct VmGuestTlsPaths {
 /// 1. `{driver_dir}/openshell-driver-vm`, where `driver_dir` comes from
 ///    `--driver-dir` / `OPENSHELL_DRIVER_DIR`.
 /// 2. Conventional install directories:
-///    `~/.local/libexec/openshell`, `/usr/local/libexec/openshell`,
-///    `/usr/local/libexec`.
+///    `~/.local/libexec/openshell`, `/usr/libexec/openshell`,
+///    `/usr/local/libexec/openshell`, `/usr/local/libexec`.
 /// 3. Sibling of the gateway's own executable (last-resort fallback so
 ///    local development builds still work out of the box).
 pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf> {
@@ -186,7 +191,7 @@ pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf
         .collect::<Vec<_>>()
         .join(", ");
     Err(Error::config(format!(
-        "vm compute driver binary not found (searched {searched_display}); install it under --driver-dir / OPENSHELL_DRIVER_DIR, a conventional libexec path such as ~/.local/libexec/openshell or /usr/local/libexec{{,/openshell}}, or place it next to the gateway binary"
+        "vm compute driver binary not found (searched {searched_display}); install it under --driver-dir / OPENSHELL_DRIVER_DIR, a conventional libexec path such as ~/.local/libexec/openshell, /usr/libexec/openshell, or /usr/local/libexec{{,/openshell}}, or place it next to the gateway binary"
     )))
 }
 
@@ -303,9 +308,17 @@ pub async fn spawn(
         .arg("--openshell-endpoint")
         .arg(&config.grpc_endpoint);
     command.arg("--state-dir").arg(&vm_config.state_dir);
-    command
-        .arg("--ssh-handshake-secret")
-        .arg(&config.ssh_handshake_secret);
+    if !vm_config.default_image.trim().is_empty() {
+        command.arg("--default-image").arg(&vm_config.default_image);
+    }
+    // Only forward the handshake secret when one is configured. The VM
+    // driver does not consume it, but accepts it for parity with the
+    // Kubernetes/Podman drivers; passing an empty value is noise.
+    if !config.ssh_handshake_secret.is_empty() {
+        command
+            .arg("--ssh-handshake-secret")
+            .arg(&config.ssh_handshake_secret);
+    }
     command
         .arg("--ssh-handshake-skew-secs")
         .arg(config.ssh_handshake_skew_secs.to_string());
@@ -441,12 +454,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_driver_search_dirs_include_usr_local_libexec_fallbacks() {
+    fn resolve_driver_search_dirs_include_libexec_fallbacks() {
         let dirs = resolve_driver_search_dirs(&VmComputeConfig {
             driver_dir: None,
             ..Default::default()
         });
 
+        assert!(dirs.contains(&PathBuf::from("/usr/libexec/openshell")));
         assert!(dirs.contains(&PathBuf::from("/usr/local/libexec/openshell")));
         assert!(dirs.contains(&PathBuf::from("/usr/local/libexec")));
     }

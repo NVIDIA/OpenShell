@@ -31,6 +31,9 @@ pub const DEFAULT_SSH_HANDSHAKE_SKEW_SECS: u64 = 300;
 /// Default Podman bridge network name.
 pub const DEFAULT_NETWORK_NAME: &str = "openshell";
 
+/// Default Docker bridge network name for local sandboxes.
+pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
+
 /// Default OCI image for the openshell-sandbox supervisor binary.
 pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
 
@@ -139,6 +142,15 @@ pub struct Config {
     /// When `None`, the dedicated metrics listener is disabled.
     #[serde(default)]
     pub metrics_bind_address: Option<SocketAddr>,
+
+    /// Additional bind addresses that serve the same multiplexed gRPC/HTTP
+    /// surface as `bind_address`.
+    ///
+    /// Compute drivers may register extra listeners during startup so that
+    /// sandbox workloads can call back into the gateway over an interface
+    /// that the operator-supplied `bind_address` does not expose.
+    #[serde(default)]
+    pub extra_bind_addresses: Vec<SocketAddr>,
 
     /// Log level (trace, debug, info, warn, error).
     #[serde(default = "default_log_level")]
@@ -327,6 +339,7 @@ impl Config {
             bind_address: default_bind_address(),
             health_bind_address: None,
             metrics_bind_address: None,
+            extra_bind_addresses: Vec::new(),
             log_level: default_log_level(),
             tls,
             oidc: None,
@@ -365,6 +378,19 @@ impl Config {
     #[must_use]
     pub const fn with_metrics_bind_address(mut self, addr: SocketAddr) -> Self {
         self.metrics_bind_address = Some(addr);
+        self
+    }
+
+    /// Append an extra listener address to the multiplex service.
+    ///
+    /// Duplicate entries (matching `bind_address` or any existing entry) are
+    /// silently dropped so callers can naively push driver-derived addresses
+    /// without checking for collisions.
+    #[must_use]
+    pub fn with_extra_bind_address(mut self, addr: SocketAddr) -> Self {
+        if addr != self.bind_address && !self.extra_bind_addresses.contains(&addr) {
+            self.extra_bind_addresses.push(addr);
+        }
         self
     }
 
@@ -492,7 +518,7 @@ impl Config {
 }
 
 fn default_bind_address() -> SocketAddr {
-    "0.0.0.0:8080".parse().expect("valid default address")
+    "127.0.0.1:8080".parse().expect("valid default address")
 }
 
 fn default_log_level() -> String {
@@ -564,6 +590,12 @@ mod tests {
     fn compute_driver_kind_rejects_unknown_values() {
         let err = "firecracker".parse::<ComputeDriverKind>().unwrap_err();
         assert!(err.contains("unsupported compute driver 'firecracker'"));
+    }
+
+    #[test]
+    fn config_defaults_to_loopback_bind_address() {
+        let expected: SocketAddr = "127.0.0.1:8080".parse().expect("valid address");
+        assert_eq!(Config::new(None).bind_address, expected);
     }
 
     #[test]

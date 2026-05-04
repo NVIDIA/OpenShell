@@ -8,40 +8,50 @@ permissions:
   issues: write
 
 jobs:
-  check-agent-diagnostic:
+  label-non-maintainer-issues:
     runs-on: ubuntu-latest
-    # Only run on bug reports (title starts with "bug:")
-    if: startsWith(github.event.issue.title, 'bug:')
+    if: github.repository_owner == 'NVIDIA'
     steps:
-      - name: Check for agent diagnostic section
+      - name: Check contributor permissions
+        id: contributor
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const author = context.payload.issue.user.login;
+            const maintainerPermissions = ['admin', 'maintain', 'write'];
+
+            try {
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: author,
+              });
+
+              if (maintainerPermissions.includes(data.permission)) {
+                console.log(`${author} has maintainer permissions: ${data.permission}.`);
+                return 'false';
+              }
+
+              console.log(`${author} is not a maintainer; permission is ${data.permission}.`);
+              return 'true';
+            } catch (e) {
+              if (e.status === 404) {
+                console.log(`${author} is not a repository collaborator; labeling for triage.`);
+                return 'true';
+              }
+
+              throw e;
+            }
+
+      - name: Add triage label
+        if: steps.contributor.outputs.result == 'true'
         uses: actions/github-script@v7
         with:
           script: |
-            const body = context.payload.issue.body || '';
-
-            // Check if the Agent Diagnostic section has substantive content.
-            // GitHub issue forms render textarea labels as h3 headings, but
-            // issues created through gh or API clients often use h2 headings.
-            const diagnosticMatch = body.match(
-              /^#{2,4}\s+Agent Diagnostic[s]?\s*\n([\s\S]*?)(?=\n#{2,4}\s+|$)/im
-            );
-
-            const diagnosticText = diagnosticMatch?.[1].trim() || '';
-            const hasSubstantiveDiagnostic = diagnosticText.length > 0
-              && !diagnosticText.toLowerCase().startsWith('example:')
-              && !['n/a', 'none', 'no', 'not applicable'].includes(diagnosticText.toLowerCase());
-
-            if (hasSubstantiveDiagnostic) {
-              console.log('Agent diagnostic section found with content. Passing.');
-              return;
-            }
-
-            console.log('Agent diagnostic section missing or placeholder. Flagging.');
-
-            // Add state:triage-needed label
             await github.rest.issues.addLabels({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              labels: ['state:triage-needed']
+              labels: ['state:triage-needed'],
             });

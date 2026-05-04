@@ -1,0 +1,28 @@
+[Unit]
+Description=OpenShell Gateway
+Documentation=https://github.com/NVIDIA/OpenShell
+After=default.target
+
+[Service]
+Type=simple
+StateDirectory=openshell/gateway
+# %S resolves to $XDG_STATE_HOME for user services.
+Environment=OPENSHELL_BIND_ADDRESS=127.0.0.1
+Environment=OPENSHELL_SERVER_PORT=17670
+Environment=OPENSHELL_DISABLE_TLS=true
+Environment=OPENSHELL_DISABLE_GATEWAY_AUTH=true
+Environment=OPENSHELL_DB_URL=sqlite:%S/openshell/gateway/openshell.db
+Environment=OPENSHELL_DRIVERS=vm
+Environment=OPENSHELL_GRPC_ENDPOINT=http://127.0.0.1:17670
+Environment=OPENSHELL_SSH_GATEWAY_HOST=127.0.0.1
+Environment=OPENSHELL_SSH_GATEWAY_PORT=17670
+Environment=OPENSHELL_VM_DRIVER_STATE_DIR=%S/openshell/vm-driver
+EnvironmentFile=-%h/.config/openshell/gateway.env
+ExecStart=/usr/bin/openshell-gateway
+Restart=on-failure
+RestartSec=5s
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=default.target

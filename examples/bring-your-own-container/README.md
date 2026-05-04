@@ -62,6 +62,8 @@ key requirements are:
 - **Create a `sandbox` user** (uid/gid 1000660000) for non-root execution.
   Use a high UID (1000000000+) to avoid conflicts with host users when running
   without user namespace remapping.
+- **Make your application workdir writable by `sandbox`**. This example creates
+  `/sandbox` with `sandbox:sandbox` ownership before copying `app.py`.
 - **Install `iproute2`** for full network namespace isolation.
 - **Use a standard Linux base image** — distroless and `FROM scratch`
   images are not supported.

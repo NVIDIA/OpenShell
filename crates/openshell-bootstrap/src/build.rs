@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build and push container images into a k3s gateway.
+//! Build container images for gateway runtimes.
 //!
 //! This module wraps bollard's `build_image()` API to build a container image
-//! from a Dockerfile and build context, then reuses the existing push pipeline
-//! to import the image into the gateway's containerd runtime.
+//! from a Dockerfile and build context. Kubernetes deployments reuse the
+//! existing push pipeline to import the image into the gateway's containerd
+//! runtime. VM deployments keep the built image in the local Docker daemon and
+//! pass an internal local-image reference to the VM driver.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -31,9 +33,54 @@ use crate::push::push_local_images;
 /// build needs more time, or shorter for CI tightening.
 const DEFAULT_BUILD_NO_PROGRESS_TIMEOUT_SECS: u64 = 1800;
 
+/// Build a container image from a Dockerfile using the local Docker daemon.
+///
+/// This is used by `openshell sandbox create --from <Dockerfile>` for both the
+/// Kubernetes and VM backends. The image remains available in the local Docker
+/// daemon so the caller can either hand the resulting tag directly to the VM
+/// backend or import it into a local gateway containerd runtime.
+#[allow(clippy::implicit_hasher)]
+pub async fn build_local_image(
+    dockerfile_path: &Path,
+    tag: &str,
+    context_dir: &Path,
+    build_args: &HashMap<String, String>,
+    on_log: &mut impl FnMut(String),
+) -> Result<()> {
+    on_log(format!(
+        "Building image {tag} from {}",
+        dockerfile_path.display()
+    ));
+    build_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
+    on_log(format!("Built image {tag}"));
+    Ok(())
+}
+
+/// Push a locally-built image into the gateway's containerd runtime.
+#[allow(clippy::implicit_hasher)]
+pub async fn push_image_into_gateway(
+    tag: &str,
+    gateway_name: &str,
+    on_log: &mut impl FnMut(String),
+) -> Result<()> {
+    on_log(format!(
+        "Pushing image {tag} into gateway \"{gateway_name}\""
+    ));
+    let local_docker = crate::docker::connect_local_for_large_transfers()
+        .into_diagnostic()
+        .wrap_err("failed to connect to local Docker daemon")?;
+    let container = container_name(gateway_name);
+    let images: Vec<&str> = vec![tag];
+    push_local_images(&local_docker, &local_docker, &container, &images, on_log).await?;
+
+    on_log(format!("Image {tag} is available in the gateway."));
+    Ok(())
+}
+
 /// Build a container image from a Dockerfile and push it into the gateway.
 ///
-/// This is used by `openshell sandbox create --from <Dockerfile>`. It:
+/// This is used by `openshell sandbox create --from <Dockerfile>` when the
+/// active gateway is the local Kubernetes deployment. It:
 /// 1. Creates a tar archive of the build context directory.
 /// 2. Sends it to the local Docker daemon via `build_image()`.
 /// 3. Pushes the resulting image into the gateway's containerd via the
@@ -47,29 +94,8 @@ pub async fn build_and_push_image(
     build_args: &HashMap<String, String>,
     on_log: &mut impl FnMut(String),
 ) -> Result<()> {
-    // 1. Build the image locally.
-    on_log(format!(
-        "Building image {tag} from {}",
-        dockerfile_path.display()
-    ));
-    build_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
-    on_log(format!("Built image {tag}"));
-
-    // 2. Push into the gateway.
-    on_log(format!(
-        "Pushing image {tag} into gateway \"{gateway_name}\""
-    ));
-    // Use the long-timeout Docker client so `docker save` of multi-GB images
-    // doesn't trip the 120s bollard default mid-stream. Override with
-    // OPENSHELL_DOCKER_TIMEOUT_SECS=<secs>.
-    let local_docker = crate::docker::connect_local_for_large_transfers()
-        .into_diagnostic()
-        .wrap_err("failed to connect to local Docker daemon")?;
-    let container = container_name(gateway_name);
-    let images: Vec<&str> = vec![tag];
-    push_local_images(&local_docker, &local_docker, &container, &images, on_log).await?;
-
-    on_log(format!("Image {tag} is available in the gateway."));
+    build_local_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
+    push_image_into_gateway(tag, gateway_name, on_log).await?;
     Ok(())
 }
 

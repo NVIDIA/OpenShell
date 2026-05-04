@@ -1,0 +1,92 @@
+name: Debian Package
+
+on:
+  workflow_call:
+    inputs:
+      deb-version:
+        required: true
+        type: string
+      checkout-ref:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-deb-linux:
+    name: Build Debian Package (Linux ${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: build-amd64
+            deb_arch: amd64
+            cli_target: x86_64-unknown-linux-musl
+            gnu_target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runner: build-arm64
+            deb_arch: arm64
+            cli_target: aarch64-unknown-linux-musl
+            gnu_target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs['checkout-ref'] }}
+
+      - name: Download CLI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-linux-${{ matrix.arch }}
+          path: package-input/
+
+      - name: Download gateway artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gateway-binary-linux-${{ matrix.arch }}
+          path: package-input/
+
+      - name: Download VM driver artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: driver-vm-linux-${{ matrix.arch }}
+          path: package-input/
+
+      - name: Extract package inputs
+        run: |
+          set -euo pipefail
+          mkdir -p package-binaries
+          tar -xzf "package-input/openshell-${{ matrix.cli_target }}.tar.gz" -C package-binaries
+          tar -xzf "package-input/openshell-gateway-${{ matrix.gnu_target }}.tar.gz" -C package-binaries
+          tar -xzf "package-input/openshell-driver-vm-${{ matrix.gnu_target }}.tar.gz" -C package-binaries
+          ls -lah package-binaries
+
+      - name: Build Debian package
+        run: |
+          set -euo pipefail
+          OPENSHELL_CLI_BINARY="${PWD}/package-binaries/openshell" \
+          OPENSHELL_GATEWAY_BINARY="${PWD}/package-binaries/openshell-gateway" \
+          OPENSHELL_DRIVER_VM_BINARY="${PWD}/package-binaries/openshell-driver-vm" \
+          OPENSHELL_DEB_VERSION="${{ inputs['deb-version'] }}" \
+          OPENSHELL_DEB_ARCH="${{ matrix.deb_arch }}" \
+          OPENSHELL_OUTPUT_DIR=artifacts \
+            tasks/scripts/package-deb.sh
+
+      - name: Upload Debian package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-linux-${{ matrix.arch }}
+          path: artifacts/*.deb
+          retention-days: 5
