@@ -22,7 +22,33 @@ if [ "$#" -eq 0 ]; then
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORKDIR="$(mktemp -d "/tmp/openshell-e2e-gateway.XXXXXX")"
+
+github_actions_host_docker_tmpdir() {
+  if [ "${GITHUB_ACTIONS:-}" != "true" ] \
+     || [ ! -S /var/run/docker.sock ] \
+     || [ ! -d /__w/_temp ]; then
+    return 1
+  fi
+
+  # Container jobs talk to the host Docker daemon. Bind mount source paths must
+  # exist on the host, but the gateway also validates those same paths inside
+  # the job container before handing them to Docker.
+  if [ ! -e /home/runner/_work ] && [ ! -L /home/runner/_work ]; then
+    mkdir -p /home/runner 2>/dev/null || return 1
+    ln -s /__w /home/runner/_work 2>/dev/null || return 1
+  fi
+
+  if [ -d /home/runner/_work/_temp ]; then
+    printf '%s\n' /home/runner/_work/_temp
+    return 0
+  fi
+
+  return 1
+}
+
+WORKDIR_PARENT="$(github_actions_host_docker_tmpdir || printf '%s\n' "${TMPDIR:-/tmp}")"
+WORKDIR_PARENT="${WORKDIR_PARENT%/}"
+WORKDIR="$(mktemp -d "${WORKDIR_PARENT}/openshell-e2e-gateway.XXXXXX")"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 CLI_BIN="${ROOT}/target/debug/openshell"
 GATEWAY_PID=""
