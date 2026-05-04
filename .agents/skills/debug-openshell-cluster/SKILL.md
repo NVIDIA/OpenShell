@@ -26,7 +26,7 @@ For local evaluation only, TLS may be disabled and the gateway can be reached th
 - The `openshell` CLI must be available for endpoint checks.
 - Know the active gateway name and endpoint, or be able to inspect local gateway metadata.
 - Know the compute platform: Docker, Podman, Kubernetes, or VM.
-- For Kubernetes: `kubectl` must target the cluster that hosts OpenShell and Helm 3 must be available.
+- For Kubernetes: `kubectl` must target the cluster that hosts OpenShell and Helm version 3 or later must be available.
 - For Docker or Podman: the runtime socket must be reachable from the gateway host.
 
 ## Workflow
