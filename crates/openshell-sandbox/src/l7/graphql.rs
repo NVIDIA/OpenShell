@@ -796,12 +796,12 @@ network_policies:
             graphql: Some(info),
         };
 
-        let (allowed, reason) = crate::l7::relay::evaluate_l7_request(
-            &std::sync::Mutex::new(engine.clone_engine_for_tunnel().unwrap()),
-            &ctx,
-            &request_info,
-        )
-        .expect("evaluation should complete");
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .expect("tunnel engine should clone");
+        let (allowed, reason) =
+            crate::l7::relay::evaluate_l7_request(&tunnel_engine, &ctx, &request_info)
+                .expect("evaluation should complete");
 
         assert!(allowed, "expected query to be allowed, got {reason}");
     }
