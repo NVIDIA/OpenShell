@@ -22,7 +22,14 @@ The CLI loads gateway metadata from disk to determine the endpoint URL and authe
 
 ## Authentication Modes
 
-The CLI uses one of three connection modes depending on the gateway's authentication configuration.
+The CLI uses one of four connection modes depending on the gateway's authentication configuration.
+
+| `auth_mode` | Transport | Identity | Token storage |
+|---|---|---|---|
+| `mtls` | mTLS client cert | Cert CN | None |
+| `plaintext` | HTTP (no TLS) | None | None |
+| `cloudflare_jwt` | Edge TLS (Cloudflare Tunnel) | Cloudflare Access JWT | `edge_token` |
+| `oidc` | mTLS or plaintext | OIDC JWT | `oidc_token.json` |
 
 ### mTLS (local and remote gateways)
 
@@ -80,6 +87,73 @@ openshell gateway add http://127.0.0.1:8080 --local
 
 This stores the gateway with `auth_mode = plaintext`, skips mTLS certificate extraction, and does not open the browser login flow.
 
+### OIDC
+
+OIDC authentication validates a JSON Web Token bearer on every gRPC request against an external OpenID Connect provider. Use OIDC when you want centralized identity, role-based access control, or fine-grained scope enforcement on a shared gateway. The transport stays the same as the gateway's TLS configuration, so OIDC layers on top of mTLS, plaintext, or an edge-terminated TLS deployment.
+
+Register an OIDC gateway by passing the issuer URL:
+
+```shell
+openshell gateway add http://gateway.example.com:8080 \
+  --oidc-issuer https://keycloak.example.com/realms/openshell
+```
+
+The CLI fetches `/auth/oidc-config` on the gateway to discover the audience and remaining OIDC parameters, then stores `auth_mode = oidc` in metadata. Pass `--oidc-client-id` and `--oidc-audience` when the audience differs from the client ID, which is common with Microsoft Entra ID:
+
+```shell
+openshell gateway add http://gateway.example.com:8080 \
+  --oidc-issuer https://login.microsoftonline.com/{tenant-id}/v2.0 \
+  --oidc-client-id {client-id} \
+  --oidc-audience api://openshell
+```
+
+Authenticate interactively with the browser flow:
+
+```shell
+openshell gateway login
+```
+
+The CLI runs Authorization Code with PKCE against the issuer, stores the resulting access and refresh tokens in `oidc_token.json` with `0600` permissions, and silently refreshes the access token on subsequent commands. If a refresh fails, run `openshell gateway login` again to re-authenticate.
+
+For CI and other non-interactive environments, set `OPENSHELL_OIDC_CLIENT_SECRET` before running `openshell gateway login`. The CLI uses the Client Credentials grant instead of opening a browser.
+
+#### Server-side validation
+
+`openshell gateway start` exposes the matching server-side flags. The default values target Keycloak realms with `realm_access.roles`:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--oidc-issuer` | (none) | OIDC issuer URL. Setting this enables JWT validation. |
+| `--oidc-audience` | `openshell-cli` | Expected `aud` claim. |
+| `--oidc-client-id` | `openshell-cli` | Client ID stored in gateway metadata for CLI login. |
+| `--oidc-roles-claim` | `realm_access.roles` | Dot-separated path to the roles claim in the JWT. |
+| `--oidc-admin-role` | `openshell-admin` | Role required for admin operations like provider mutation and global policy updates. |
+| `--oidc-user-role` | `openshell-user` | Role required for sandbox and read operations. |
+| `--oidc-scopes-claim` | (none) | Claim path for scopes. Setting this enables fine-grained scope enforcement on top of roles. |
+| `--oidc-scopes` | (none) | Scopes the CLI requests during login. Stored in gateway metadata. |
+
+Setting both `--oidc-admin-role` and `--oidc-user-role` to empty strings switches the gateway into authentication-only mode. Any token the issuer signs for the configured audience is accepted, regardless of role claims. This mode supports providers that do not emit roles in their JWTs (such as GitHub Actions OIDC). Combine it with `--oidc-scopes-claim` and a narrow audience to reduce the blast radius of a leaked token.
+
+#### Method classification
+
+The gateway classifies every gRPC method into one of three groups:
+
+- **Unauthenticated** — health probes and gRPC reflection accept requests without auth.
+- **Sandbox-secret** — the sandbox supervisor uses the SSH handshake secret to fetch its policy, push logs, and resolve inference routes. The supervisor never holds an OIDC token.
+- **Bearer or dual-auth** — CLI calls present `authorization: Bearer <jwt>`. The server validates the signature against the cached JWKS, checks `iss`, `aud`, and `exp`, then enforces the configured roles and scopes.
+
+For full method-to-role mapping, scope definitions, JWKS caching, and provider-specific examples, refer to `architecture/oidc-auth.md` in the repository.
+
+#### Logout
+
+To remove the stored OIDC tokens for the active gateway, run:
+
+```shell
+openshell gateway logout
+```
+
+This deletes `oidc_token.json` but keeps the gateway registration. The next `openshell` command prompts for re-authentication.
+
 ## File Layout
 
 All gateway credentials and metadata are stored under `~/.config/openshell/`:
@@ -95,5 +169,6 @@ openshell/
         tls.crt                     # Client certificate
         tls.key                     # Client private key
       edge_token                    # Edge auth JWT (cloud gateways)
+      oidc_token.json               # OIDC access and refresh tokens (oidc gateways)
       last_sandbox                  # Last-used sandbox for this gateway
 ```

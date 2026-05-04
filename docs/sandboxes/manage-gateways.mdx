@@ -163,8 +163,17 @@ openshell gateway info --name my-remote-cluster
 | `--gpu` | Enable NVIDIA GPU passthrough. Requires NVIDIA drivers and the Container Toolkit on the host. OpenShell auto-selects CDI when enabled on the daemon and falls back to Docker's NVIDIA GPU request path (`--gpus all`) otherwise. |
 | `--plaintext` | Listen on HTTP instead of mTLS. Use behind a TLS-terminating reverse proxy. |
 | `--disable-gateway-auth` | Skip mTLS client certificate checks. Use when a reverse proxy cannot forward client certs. |
+| `--drivers` | Compute driver to use for sandboxes. Accepts `kubernetes`, `podman`, `docker`, or `vm`. When unset, the gateway auto-detects in priority order: Kubernetes (when `KUBERNETES_SERVICE_HOST` is set), Podman, then Docker. The VM driver is never auto-detected and must be selected explicitly. |
 | `--registry-username` | Username for registry authentication. Defaults to `__token__` when `--registry-token` is set. Only needed for private registries. Also configurable with `OPENSHELL_REGISTRY_USERNAME`. |
 | `--registry-token` | Authentication token for pulling container images. For GHCR, a GitHub PAT with `read:packages` scope. Only needed for private registries. Also configurable with `OPENSHELL_REGISTRY_TOKEN`. |
+| `--oidc-issuer` | OIDC issuer URL. Setting this enables JWT validation on the gateway. |
+| `--oidc-audience` | Expected `aud` claim in validated JWTs. Defaults to `openshell-cli`. |
+| `--oidc-roles-claim` | Dot-separated JWT claim path that holds the user's roles. Defaults to `realm_access.roles`. |
+| `--oidc-admin-role` | Role required for admin operations such as provider mutation and global policy updates. Defaults to `openshell-admin`. |
+| `--oidc-user-role` | Role required for sandbox and read operations. Defaults to `openshell-user`. |
+| `--oidc-scopes-claim` | JWT claim path for scopes. Setting this layers fine-grained scope enforcement on top of roles. |
+
+For the full OIDC configuration reference and provider-specific examples, refer to [Gateway Authentication](/reference/gateway-auth#oidc).
 
 ## Stop and Destroy
 

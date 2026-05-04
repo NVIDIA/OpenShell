@@ -31,6 +31,16 @@ OpenShell publishes standalone `openshell-gateway` release assets for manual dow
 
 These artifacts are attached to GitHub releases. `openshell gateway start` continues to use the published cluster and gateway container images.
 
+## Debian Packages
+
+OpenShell publishes Debian packages for Linux amd64 and arm64. Tagged releases attach `openshell_*.deb` artifacts to the GitHub release alongside the standalone binaries. The `dev` rolling tag carries the latest development build, which you can install with the `install-dev.sh` helper:
+
+```shell
+curl -fLsS https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-dev.sh | sh
+```
+
+The package installs the CLI, gateway binary, and a `systemd` unit that runs the gateway as a service. Debian packaging is currently limited to Linux amd64 and arm64.
+
 ## Software Prerequisites
 
 The following software must be installed on the host before using the OpenShell CLI:
