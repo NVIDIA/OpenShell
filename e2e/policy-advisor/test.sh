@@ -6,9 +6,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 POLICY_TEMPLATE="${SCRIPT_DIR}/policy.template.yaml"
-RUNNER_SOURCE="${SCRIPT_DIR}/runner.sh"
+RUNNER_SOURCE="${SCRIPT_DIR}/sandbox-runner.sh"
 
 if [[ -z "${OPENSHELL_BIN:-}" ]]; then
     if [[ -x "${REPO_ROOT}/target/debug/openshell" ]]; then

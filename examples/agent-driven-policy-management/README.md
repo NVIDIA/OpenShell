@@ -3,90 +3,85 @@
 
 # Agent-Driven Policy Management Demo
 
-Run the first policy-advisor MVP loop with a real agent:
+Run the full agent-driven policy loop end-to-end:
 
-1. Use the active OpenShell gateway.
-2. Create a GitHub provider from a host token.
-3. Start a sandbox with your agent command and an uploaded task file.
-4. Let the agent hit an OpenShell `policy_denied` response.
-5. Let the agent read `/etc/openshell/skills/policy_advisor.md` and submit a
-   narrow proposal through `http://policy.local/v1/proposals`.
-6. Approve the draft rule from outside the sandbox.
-7. Let the agent retry and confirm the GitHub write succeeds.
+1. A Codex agent inside an OpenShell sandbox tries to write a markdown file to
+   GitHub via the Contents API.
+2. OpenShell denies the request with a structured `policy_denied` 403 because
+   the initial policy only allows read-only access to `api.github.com`.
+3. The agent reads `/etc/openshell/skills/policy_advisor.md`, drafts the
+   narrowest rule needed, and submits it to `http://policy.local/v1/proposals`.
+4. You approve the proposal from the host with one keystroke.
+5. The sandbox hot-reloads the merged policy and the agent's retry succeeds.
 
-The shell script is agent-agnostic. It does not know how to sign in to a
-specific coding agent. Pass the provider names and sandbox command for the
-agent you want to run.
+The whole loop usually finishes in under two minutes.
 
 ## Prerequisites
 
-- An active OpenShell gateway that includes the current sandbox supervisor
-  build.
-- `curl` and `jq` on the host machine.
-- The GitHub CLI (`gh`) if you want to create the scratch repo with the command
-  below.
-- A disposable or demo-safe GitHub repository.
-- A GitHub token with contents write permission for that repository.
-- An agent provider and policy that let your chosen agent run inside the
-  sandbox.
+- An active OpenShell gateway (`openshell gateway start`).
+- `gh auth login` (or a `GITHUB_TOKEN` env var with contents-write on a
+  scratch repo).
+- `codex login` on the host.
+- A scratch GitHub repository with at least one commit on the default branch.
+  If you don't have one yet:
 
-## Create A Scratch Repo
+  ```shell
+  gh repo create "$(gh api user --jq .login)/openshell-policy-demo" \
+      --private --add-readme \
+      --description "OpenShell policy advisor demo scratch repo"
+  ```
 
-Use a private scratch repository with an initial README. The README matters
-because GitHub does not create the default branch until the first commit exists.
+## Run it
 
-```bash
-gh repo create zredlined/openshell-policy-demo \
-  --private \
-  --add-readme \
-  --description "OpenShell policy advisor demo scratch repo"
-```
-
-The demo never creates repositories and refuses to overwrite an existing demo
-file. Each default run writes a new timestamped file under
-`openshell-policy-advisor-demo/`.
-
-## Quick Start
-
-The included `policy.template.yaml` only defines the GitHub API target for the
-policy-management loop. Use `DEMO_POLICY_FILE` to point at a policy that also
-allows your chosen agent to reach its model/provider endpoints.
-
-```bash
-cp examples/agent-driven-policy-management/.env.example .env
-$EDITOR .env
-
-set -a
-source .env
-set +a
-
+```shell
 bash examples/agent-driven-policy-management/demo.sh
 ```
 
-The host script only orchestrates sandbox lifecycle and developer approval. The
-policy proposal is authored by the agent inside the sandbox from the installed
-skill, structured denial response, and `policy.local` API.
+That's the whole thing. The demo resolves your GitHub handle from `gh`, picks
+`openshell-policy-demo` as the repo, and writes one timestamped markdown file
+under `openshell-policy-advisor-demo/` per run.
 
-The demo writes one markdown file under:
+## Overrides (all optional)
 
-```text
-openshell-policy-advisor-demo/<run-id>.md
-```
+| Env var | Default |
+|---|---|
+| `DEMO_GITHUB_OWNER` | `gh api user --jq .login` |
+| `DEMO_GITHUB_REPO` | `openshell-policy-demo` |
+| `DEMO_BRANCH` | `main` |
+| `DEMO_RUN_ID` | timestamp |
+| `DEMO_GITHUB_TOKEN` | falls back to `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token` |
+| `DEMO_KEEP_SANDBOX` | `0` (set `1` to inspect the sandbox after the demo) |
+| `DEMO_APPROVAL_TIMEOUT_SECS` | `240` |
+| `OPENSHELL_BIN` | `target/debug/openshell` if present, else `openshell` on `PATH` |
 
-Use a scratch repository or a demo branch if you do not want this file in a
-production repository.
+## What the agent sees
 
-The deterministic non-model validation flow lives in
-`examples/agent-driven-policy-management/validation/validation.sh`.
+`policy.template.yaml` is the initial restrictive policy: a read-only L7 REST
+rule for `api.github.com` plus the binary set Codex needs. The agent has to
+ask for the additional `PUT /repos/.../contents/...` write itself — that's the
+proposal you approve.
 
-## Options
+## What gets approved (trust model)
 
-```bash
-export OPENSHELL_BIN=/path/to/openshell
-export DEMO_BRANCH=main
-export DEMO_RUN_ID="$(date +%Y%m%d-%H%M%S)"
-export DEMO_FILE_DIR=openshell-policy-advisor-demo
-export DEMO_KEEP_SANDBOX=0
-export DEMO_APPROVAL_TIMEOUT_SECS=240
-export DEMO_AGENT_PROVIDERS="agent-provider-a agent-provider-b"
-```
+Every proposal lands in the gateway as a `PolicyChunk` — a structured object
+with three parts, each with a different trust level:
+
+| Field | Source | Trust |
+|---|---|---|
+| `proposed_rule` (host, port, method, path, binary) | agent, schema-validated by the gateway | structured contract — *this* is what you're approving |
+| `rationale` (free-form prose) | agent | hint only — a compromised agent can lie here |
+| `validation_result` (prover output) | gateway-side prover | trust signal — but this surface is in progress (see [RFC 0001](../../rfc/0001-agent-driven-policy-management.md)) |
+
+The MVP today shows the structured rule plus the agent's rationale in
+`openshell rule get` and the TUI inbox panel. The demo's `openshell rule
+approve-all` auto-approves to keep the loop short — in a real session a
+developer reviews the structured grant before pressing `a`. Prover-backed
+validation badges, computed reachability deltas, and a richer "this is what
+the rule actually permits" summary are the next phase. For now, **always
+approve based on the structured rule, not the agent's rationale.**
+
+## Going further
+
+`e2e/policy-advisor/test.sh` runs the same loop deterministically without an
+LLM (curl + the `policy.local` API directly). Use it to validate the proxy and
+proposal pipeline when iterating on the sandbox or gateway code.
