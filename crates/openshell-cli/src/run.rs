@@ -2877,11 +2877,10 @@ async fn build_from_dockerfile(
         eprintln!("  {msg}");
     };
 
-    openshell_bootstrap::build::build_and_push_image(
+    openshell_bootstrap::build::build_local_image(
         dockerfile,
         &tag,
         context,
-        gateway_name,
         &HashMap::new(),
         &mut on_log,
     )
@@ -2889,7 +2888,7 @@ async fn build_from_dockerfile(
 
     eprintln!();
     eprintln!(
-        "{} Image {} is available in the gateway.",
+        "{} Image {} is available in the local Docker daemon.",
         "✓".green().bold(),
         tag.cyan(),
     );

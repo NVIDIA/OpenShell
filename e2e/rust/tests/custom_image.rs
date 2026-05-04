@@ -6,7 +6,7 @@
 //! E2E test: build a custom container image and run a sandbox with it.
 //!
 //! Prerequisites:
-//! - A running openshell gateway (`openshell gateway start`)
+//! - A running Docker-backed openshell gateway (`mise run gateway:docker`)
 //! - Docker daemon running (for image build)
 //! - The `openshell` binary (built automatically from the workspace)
 

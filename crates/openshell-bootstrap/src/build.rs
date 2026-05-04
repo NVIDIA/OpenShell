@@ -1,11 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build and push container images into a k3s gateway.
+//! Build container images from Dockerfiles.
 //!
 //! This module wraps bollard's `build_image()` API to build a container image
-//! from a Dockerfile and build context, then reuses the existing push pipeline
-//! to import the image into the gateway's containerd runtime.
+//! from a Dockerfile and build context into the local Docker daemon.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,48 +14,21 @@ use bollard::query_parameters::BuildImageOptionsBuilder;
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
 
-use crate::constants::container_name;
-use crate::push::push_local_images;
-
-/// Build a container image from a Dockerfile and push it into the gateway.
-///
-/// This is used by `openshell sandbox create --from <Dockerfile>`. It:
-/// 1. Creates a tar archive of the build context directory.
-/// 2. Sends it to the local Docker daemon via `build_image()`.
-/// 3. Pushes the resulting image into the gateway's containerd via the
-///    existing `push_local_images()` pipeline.
+/// Build a container image from a Dockerfile into the local Docker daemon.
 #[allow(clippy::implicit_hasher)]
-pub async fn build_and_push_image(
+pub async fn build_local_image(
     dockerfile_path: &Path,
     tag: &str,
     context_dir: &Path,
-    gateway_name: &str,
     build_args: &HashMap<String, String>,
     on_log: &mut impl FnMut(String),
 ) -> Result<()> {
-    // 1. Build the image locally.
     on_log(format!(
         "Building image {tag} from {}",
         dockerfile_path.display()
     ));
     build_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
     on_log(format!("Built image {tag}"));
-
-    // 2. Push into the gateway.
-    on_log(format!(
-        "Pushing image {tag} into gateway \"{gateway_name}\""
-    ));
-    // Use the long-timeout Docker client so `docker save` of multi-GB images
-    // doesn't trip the 120s bollard default mid-stream. Override with
-    // OPENSHELL_DOCKER_TIMEOUT_SECS=<secs>.
-    let local_docker = crate::docker::connect_local_for_large_transfers()
-        .into_diagnostic()
-        .wrap_err("failed to connect to local Docker daemon")?;
-    let container = container_name(gateway_name);
-    let images: Vec<&str> = vec![tag];
-    push_local_images(&local_docker, &local_docker, &container, &images, on_log).await?;
-
-    on_log(format!("Image {tag} is available in the gateway."));
     Ok(())
 }
 
