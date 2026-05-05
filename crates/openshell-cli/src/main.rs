@@ -1031,6 +1031,13 @@ enum GatewayCommands {
         #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
         name: Option<String>,
     },
+
+    /// List registered gateways.
+    ///
+    /// Prints a table of all registered gateways with their endpoint, type,
+    /// and authentication mode. The active gateway is marked with `*`.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List,
 }
 
 // -----------------------------------------------------------------------
@@ -1955,6 +1962,9 @@ async fn main() -> Result<()> {
                     .or_else(|| resolve_gateway_name(&cli.gateway))
                     .unwrap_or_else(|| "openshell".to_string());
                 run::gateway_admin_info(&name)?;
+            }
+            GatewayCommands::List => {
+                run::gateway_list(&cli.gateway)?;
             }
         },
 
