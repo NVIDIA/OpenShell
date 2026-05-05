@@ -55,6 +55,10 @@ jobs:
       - name: Docker preflight
         run: docker version
 
+      - name: Prepare bundled VM supervisor
+        if: matrix.name == 'linux-amd64-rtxpro6000-kvm'
+        run: mise run --no-deps --skip-deps vm:supervisor
+
       - name: Run VM e2e smoke
         run: mise run --no-deps --skip-deps e2e:vm
 
