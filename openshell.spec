@@ -9,7 +9,7 @@
 
 Name:           openshell
 Version:        0.0.37
-Release:        1.20260501160805739969.rpm.73.ge7c4151d%{?dist}
+Release:        1.20260504172601460222.rpm.90.g7cde9c40%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
@@ -147,7 +147,6 @@ ExecStartPre=%{_libexecdir}/openshell/init-pki.sh %%S/openshell/tls
 # reference) on first start if not present.
 # %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
 ExecStartPre=%{_libexecdir}/openshell/init-gateway-env.sh %%E/openshell/gateway.env
-EnvironmentFile=-%%E/openshell/gateway.env
 Environment=OPENSHELL_BIND_ADDRESS=0.0.0.0
 Environment=OPENSHELL_DRIVERS=podman
 Environment=OPENSHELL_DB_URL=sqlite://%%S/openshell/gateway.db
@@ -161,6 +160,9 @@ Environment=OPENSHELL_TLS_CLIENT_CA=%%S/openshell/tls/ca.crt
 Environment=OPENSHELL_PODMAN_TLS_CA=%%S/openshell/tls/ca.crt
 Environment=OPENSHELL_PODMAN_TLS_CERT=%%S/openshell/tls/client/tls.crt
 Environment=OPENSHELL_PODMAN_TLS_KEY=%%S/openshell/tls/client/tls.key
+# User overrides from gateway.env. Placed after Environment= directives
+# so that user values take precedence (systemd: last assignment wins).
+EnvironmentFile=-%%E/openshell/gateway.env
 ExecStart=/usr/bin/openshell-gateway
 StateDirectory=openshell
 Restart=on-failure
