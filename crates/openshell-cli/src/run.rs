@@ -22,16 +22,18 @@ use openshell_bootstrap::{
     get_gateway_metadata, list_gateways, load_active_gateway, remove_gateway_metadata,
     resolve_ssh_hostname, save_active_gateway, save_last_sandbox, store_gateway_metadata,
 };
+use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
     ExecSandboxRequest, GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource, PolicyStatus, Provider,
-    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
-    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProviderProfilesRequest,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource,
+    PolicyStatus, Provider, ProviderProfile, RejectDraftChunkRequest, Sandbox, SandboxPhase,
+    SandboxPolicy, SandboxSpec, SandboxTemplate, SetClusterInferenceRequest, SettingScope,
+    SettingValue, UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest,
+    exec_sandbox_event, setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -3851,7 +3853,7 @@ pub async fn provider_create(
                     created_at_ms: 0,
                     labels: HashMap::new(),
                 }),
-                r#type: provider_type,
+                r#type: provider_type.clone(),
                 credentials: credential_map,
                 config: config_map,
             }),
@@ -3976,6 +3978,68 @@ pub async fn provider_list(
     }
 
     Ok(())
+}
+
+pub async fn provider_list_profiles(server: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .list_provider_profiles(ListProviderProfilesRequest {
+            limit: 100,
+            offset: 0,
+        })
+        .await
+        .into_diagnostic()?;
+    let mut profiles = response.into_inner().profiles;
+    profiles.sort_by(|left, right| {
+        left.category
+            .cmp(&right.category)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    if profiles.is_empty() {
+        println!("No provider profiles found.");
+        return Ok(());
+    }
+
+    println!("{}", "Available Provider Profiles:".cyan().bold());
+    let mut current_category = i32::MIN;
+    for profile in profiles {
+        if profile.category != current_category {
+            current_category = profile.category;
+            println!();
+            println!("  {}", display_provider_category(current_category).bold());
+        }
+        print_provider_type_row(&profile);
+    }
+
+    Ok(())
+}
+
+fn display_provider_category(category: i32) -> &'static str {
+    match ProviderProfileCategory::try_from(category).unwrap_or(ProviderProfileCategory::Other) {
+        ProviderProfileCategory::Inference => "INFERENCE",
+        ProviderProfileCategory::Agent => "AGENT",
+        ProviderProfileCategory::SourceControl => "SOURCE CONTROL",
+        ProviderProfileCategory::Messaging => "MESSAGING",
+        ProviderProfileCategory::Data => "DATA",
+        ProviderProfileCategory::Knowledge => "KNOWLEDGE",
+        ProviderProfileCategory::Other | ProviderProfileCategory::Unspecified => "OTHER",
+    }
+}
+
+fn print_provider_type_row(profile: &ProviderProfile) {
+    let inference = if profile.inference_capable {
+        " inference"
+    } else {
+        ""
+    };
+    println!(
+        "    {:<12} {:<42} endpoints: {:<2}{}",
+        profile.id,
+        profile.display_name,
+        profile.endpoints.len(),
+        inference
+    );
 }
 
 pub async fn provider_update(

@@ -31,9 +31,9 @@ The CLI uses one of four connection modes depending on the gateway's authenticat
 | `cloudflare_jwt` | Edge TLS (Cloudflare Tunnel) | Cloudflare Access JWT | `edge_token` |
 | `oidc` | mTLS or plaintext | OIDC JWT | `oidc_token.json` |
 
-### mTLS (local and remote gateways)
+### mTLS
 
-The default mode for self-deployed gateways. When you run `gateway start` or `gateway add https://... --local` / `gateway add https://... --remote`, the CLI extracts mTLS certificates from the running container and stores them locally. Every subsequent request presents a client certificate to prove identity.
+The default mode for self-managed gateways. Every CLI request presents a client certificate to prove identity. Kubernetes Helm deployments provide the server certificate, client CA, and client certificate bundle through Kubernetes secrets. Standalone Docker, Podman, and MicroVM-backed gateways provide equivalent certificate files through their runtime configuration.
 
 The CLI loads three PEM files from `~/.config/openshell/gateways/<name>/mtls/`:
 
@@ -50,6 +50,24 @@ The connection flow:
 3. Performs a TLS handshake, presenting the client certificate.
 4. The gateway verifies the client certificate against its CA.
 5. An HTTP/2 channel is established. All CLI commands use this channel.
+
+For Helm deployments, create these Kubernetes secrets before installing the chart:
+
+```shell
+kubectl -n openshell create secret tls openshell-server-tls \
+  --cert server.crt \
+  --key server.key
+
+kubectl -n openshell create secret generic openshell-server-client-ca \
+  --from-file=ca.crt=ca.crt
+
+kubectl -n openshell create secret generic openshell-client-tls \
+  --from-file=ca.crt=ca.crt \
+  --from-file=tls.crt=client.crt \
+  --from-file=tls.key=client.key
+```
+
+The same `ca.crt`, `client.crt`, and `client.key` files must be placed in the CLI mTLS directory as `ca.crt`, `tls.crt`, and `tls.key`.
 
 ### Edge JWT (cloud gateways)
 
@@ -77,7 +95,7 @@ This is transparent to the user. All CLI commands work the same regardless of wh
 
 ### Plaintext
 
-When a gateway is deployed with `--plaintext`, TLS is disabled entirely. The CLI connects over plain HTTP/2. This mode is intended for gateways behind a trusted reverse proxy or tunnel that handles TLS termination externally.
+When a gateway is deployed with `server.disableTls=true`, TLS is disabled entirely. The CLI connects over plain HTTP/2. This mode is intended for local port-forwarding or gateways behind a trusted reverse proxy or tunnel that handles TLS termination externally.
 
 Register a plaintext gateway with an explicit `http://` endpoint:
 

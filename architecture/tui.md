@@ -1,10 +1,10 @@
 # OpenShell TUI
 
-The OpenShell TUI is a terminal user interface for OpenShell, inspired by [k9s](https://k9scli.io/). Instead of typing individual CLI commands to check cluster health, list sandboxes, and manage resources, the TUI gives you a real-time, keyboard-driven dashboard — everything updates automatically and you navigate with a few keystrokes.
+The OpenShell TUI is a terminal user interface for OpenShell, inspired by [k9s](https://k9scli.io/). Instead of typing individual CLI commands to check gateway health, list sandboxes, and manage resources, the TUI gives you a real-time, keyboard-driven dashboard — everything updates automatically and you navigate with a few keystrokes.
 
 ## Launching the TUI
 
-The TUI is a subcommand of the OpenShell CLI, so it inherits all your existing configuration — cluster selection, TLS settings, and verbosity flags all work the same way.
+The TUI is a subcommand of the OpenShell CLI, so it inherits all your existing configuration — gateway selection, TLS settings, and verbosity flags all work the same way.
 
 ```bash
 openshell term                   # launch against the active gateway
@@ -27,7 +27,7 @@ The TUI divides the terminal into four horizontal regions:
 
 ```text
 ┌─────────────────────────────────────────────────────────────────┐
-│  OpenShell ─ my-cluster ─ Dashboard  ● Healthy                   │  ← title bar
+│  OpenShell ─ my-gateway ─ Dashboard  ● Healthy                   │  ← title bar
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  (view content — Dashboard or Sandboxes)                        │  ← main area
@@ -39,7 +39,7 @@ The TUI divides the terminal into four horizontal regions:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-- **Title bar** — shows the OpenShell logo, cluster name, current view, and live cluster health status.
+- **Title bar** — shows the OpenShell logo, gateway name, current view, and live gateway health status.
 - **Main area** — the active view (Dashboard or Sandboxes).
 - **Navigation bar** — lists available views with their shortcut keys, plus Help and Quit.
 - **Command bar** — appears when you press `:` to type a command (like vim).
@@ -48,20 +48,20 @@ The TUI divides the terminal into four horizontal regions:
 
 ### Dashboard (press `1`)
 
-The Dashboard is the home screen. It shows your cluster at a glance.
+The Dashboard is the home screen. It shows your gateway at a glance.
 
 The dashboard is divided into a top info pane and a middle pane with two tabs:
 
-- **Top pane**: Cluster name, gateway endpoint, health status, sandbox count.
+- **Top pane**: Gateway name, gateway endpoint, health status, sandbox count.
 - **Middle pane**: Tabbed view toggled with `Tab`:
-  - **Providers** — provider configurations attached to the cluster.
+  - **Providers** — provider configurations attached to the gateway.
   - **Global Settings** — gateway-global runtime settings (fetched via `GetGatewaySettings`).
 
 **Health status** indicators:
 
 - `●` **Healthy** (green) — everything is running normally.
-- `◐` **Degraded** (yellow) — the cluster is up but something needs attention.
-- `○` **Unhealthy** (red) — the cluster is not operating correctly.
+- `◐` **Degraded** (yellow) — the gateway is up but something needs attention.
+- `○` **Unhealthy** (red) — the gateway is not operating correctly.
 - `…` — still connecting or status unknown.
 
 **Global policy indicator**: When a global policy is active, the gateway row shows `Global Policy Active (vN)` in yellow (the `status_warn` style). The TUI detects this by polling `ListSandboxPolicies` with `global: true, limit: 1` on each tick and checking if the latest revision has `PolicyStatus::Loaded`. See `crates/openshell-tui/src/ui/dashboard.rs`.
@@ -81,7 +81,7 @@ Both edit and delete operations display a confirmation modal before applying. Ch
 
 ### Sandboxes (press `2`)
 
-The Sandboxes view shows a table of all sandboxes in the cluster:
+The Sandboxes view shows a table of all sandboxes in the gateway:
 
 | Column | Description |
 |--------|-------------|
@@ -150,7 +150,7 @@ Press `Esc` to cancel and return to Normal mode. `Backspace` deletes characters 
 
 ## Data Refresh
 
-The TUI automatically polls the cluster every **2 seconds**. Cluster health, the sandbox list, and global settings all update on each tick, so the display stays current without manual refreshing. This uses the same gRPC calls as the CLI — no additional server-side setup is required.
+The TUI automatically polls the gateway every **2 seconds**. Gateway health, the sandbox list, and global settings all update on each tick, so the display stays current without manual refreshing. This uses the same gRPC calls as the CLI — no additional server-side setup is required.
 
 When viewing a sandbox, the policy pane auto-refreshes when a new policy version is detected. The sandbox list response includes `current_policy_version` for each sandbox; on every tick the TUI compares this against the currently displayed policy version and re-fetches the full policy only when they differ. This avoids extra RPCs during normal operation while ensuring policy updates appear within the polling interval. The user's scroll position is preserved across auto-refreshes.
 

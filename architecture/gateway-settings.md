@@ -30,9 +30,8 @@ The `REGISTERED_SETTINGS` static array defines the allowed setting keys and thei
 
 ```rust
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
-    RegisteredSetting { key: "log_level", kind: SettingValueKind::String },
-    RegisteredSetting { key: "dummy_int", kind: SettingValueKind::Int },
-    RegisteredSetting { key: "dummy_bool", kind: SettingValueKind::Bool },
+    RegisteredSetting { key: "providers_v2_enabled", kind: SettingValueKind::Bool },
+    RegisteredSetting { key: "ocsf_json_enabled", kind: SettingValueKind::Bool },
 ];
 ```
 
@@ -373,15 +372,14 @@ Set a single setting key at sandbox or global scope.
 
 ```bash
 # Sandbox-scoped
-openshell settings set my-sandbox --key log_level --value debug
+openshell settings set my-sandbox --key ocsf_json_enabled --value true
 
 # Global (requires confirmation)
-openshell settings set --global --key log_level --value warn
-openshell settings set --global --key dummy_bool --value yes
-openshell settings set --global --key dummy_int --value 42
+openshell settings set --global --key providers_v2_enabled --value true
+openshell settings set --global --key ocsf_json_enabled --value true
 
 # Skip confirmation
-openshell settings set --global --key log_level --value info --yes
+openshell settings set --global --key providers_v2_enabled --value true --yes
 ```
 
 Value parsing is type-aware: bool keys accept `true/false/yes/no/1/0/on/off` via `parse_bool_like()`. Int keys parse as base-10 `i64`. String keys accept any value.
@@ -392,7 +390,7 @@ Delete a setting key from the specified scope.
 
 ```bash
 # Global delete (unlocks sandbox control)
-openshell settings delete --global --key log_level --yes
+openshell settings delete --global --key providers_v2_enabled --yes
 ```
 
 ### `policy set --global --policy FILE [--yes]`
@@ -502,26 +500,26 @@ Settings are refreshed on each 2-second polling tick alongside the sandbox list 
 
 ## Data Flow: Setting a Global Key
 
-End-to-end trace for `openshell settings set --global --key log_level --value debug --yes`:
+End-to-end trace for `openshell settings set --global --key providers_v2_enabled --value true --yes`:
 
 1. **CLI** (`crates/openshell-cli/src/run.rs` -- `gateway_setting_set()`):
-   - `parse_cli_setting_value("log_level", "debug")` -- looks up `SettingValueKind::String` in the registry, wraps as `SettingValue { string_value: "debug" }`
+   - `parse_cli_setting_value("providers_v2_enabled", "true")` -- looks up `SettingValueKind::Bool` in the registry, wraps as `SettingValue { bool_value: true }`
    - `confirm_global_setting_takeover()` -- skipped because `--yes`
-   - Sends `UpdateSettingsRequest { setting_key: "log_level", setting_value: Some(...), global: true }`
+   - Sends `UpdateSettingsRequest { setting_key: "providers_v2_enabled", setting_value: Some(...), global: true }`
 
 2. **Gateway** (`crates/openshell-server/src/grpc.rs` -- `update_settings()`):
    - Acquires `settings_mutex` for the duration of the operation
    - Detects `global=true`, `has_setting=true`
-   - `validate_registered_setting_key("log_level")` -- passes (key is in registry)
+   - `validate_registered_setting_key("providers_v2_enabled")` -- passes (key is in registry)
    - `load_global_settings()` -- reads `gateway_settings` record from store
-   - `proto_setting_to_stored()` -- converts proto value to `StoredSettingValue::String("debug")`
+   - `proto_setting_to_stored()` -- converts proto value to `StoredSettingValue::Bool(true)`
    - `upsert_setting_value()` -- inserts into `BTreeMap`, returns `true` (changed)
    - Increments `revision`, calls `save_global_settings()`
    - Returns `UpdateSettingsResponse { settings_revision: N }`
 
 3. **Sandbox** (next poll tick in `run_policy_poll_loop()`):
    - `poll_settings(sandbox_id)` returns new `config_revision`
-   - `log_setting_changes()` logs: `Setting changed key="log_level" old="<unset>" new="debug"`
+   - `log_setting_changes()` logs: `Setting changed key="providers_v2_enabled" old="<unset>" new="true"`
    - `policy_hash` unchanged -- no OPA reload
    - Updates tracked `current_config_revision` and `current_settings`
 

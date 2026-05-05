@@ -34,7 +34,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-sandbox/` | Sandbox runtime | Container supervision, policy-enforced egress routing |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
 | `crates/openshell-router/` | Privacy router | Privacy-aware LLM routing |
-| `crates/openshell-bootstrap/` | Cluster bootstrap | K3s cluster setup, image loading, mTLS PKI |
+| `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, mTLS bundle storage, legacy bootstrap helpers |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.7.0 event types, builders, shorthand/JSONL formatters, tracing layers |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
 | `crates/openshell-providers/` | Provider management | Credential provider backends |
@@ -154,7 +154,7 @@ ocsf_emit!(event);
 
 ## Sandbox Infra Changes
 
-- If you change sandbox infrastructure, ensure `mise run sandbox` succeeds.
+- If you change sandbox infrastructure, ensure the relevant sandbox e2e path succeeds.
 
 ## Commits
 
@@ -172,7 +172,7 @@ ocsf_emit!(event);
 
 - `mise run pre-commit` — Lint, format, license headers. Run before every commit.
 - `mise run test` — Unit test suite. Run after code changes.
-- `mise run e2e` — End-to-end tests against a running cluster. Run for infrastructure, sandbox, or policy changes.
+- `mise run e2e` — End-to-end tests against a running gateway. Run for infrastructure, sandbox, or policy changes.
 - `mise run ci` — Full local CI (lint + compile/type checks + tests). Run before opening a PR.
 
 ## Python
@@ -185,7 +185,7 @@ ocsf_emit!(event);
 
 ## Cluster Infrastructure Changes
 
-- If you change cluster bootstrap infrastructure (e.g., `openshell-bootstrap` crate, `deploy/docker/Dockerfile.images`, `cluster-entrypoint.sh`, `cluster-healthcheck.sh`, deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `.agents/skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
+- If you change gateway deployment infrastructure (e.g., Helm values/templates, gateway image packaging, or deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `.agents/skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
 
 ## Documentation
 

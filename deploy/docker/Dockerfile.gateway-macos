@@ -80,6 +80,7 @@ RUN --mount=type=cache,id=cargo-registry-gateway-macos,sharing=locked,target=/ro
     cargo build --release --target aarch64-apple-darwin -p openshell-server 2>/dev/null || true
 
 COPY crates/ crates/
+COPY providers/ providers/
 
 RUN touch crates/openshell-core/src/lib.rs \
     crates/openshell-driver-kubernetes/src/lib.rs \

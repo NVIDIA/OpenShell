@@ -9,6 +9,7 @@
 //! policy schema. Both parsing (YAML→proto) and serialization (proto→YAML) use
 //! these types, ensuring round-trip fidelity.
 
+mod compose;
 mod merge;
 
 use std::collections::{BTreeMap, HashMap};
@@ -23,6 +24,7 @@ use openshell_core::proto::{
 };
 use serde::{Deserialize, Serialize};
 
+pub use compose::{ProviderPolicyLayer, compose_effective_policy, provider_rule_name};
 pub use merge::{
     PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning, generated_rule_name,
     merge_policy,

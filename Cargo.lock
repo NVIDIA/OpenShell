@@ -3539,6 +3539,8 @@ name = "openshell-providers"
 version = "0.0.0"
 dependencies = [
  "openshell-core",
+ "serde",
+ "serde_yml",
  "thiserror 2.0.18",
 ]
 
@@ -3637,6 +3639,7 @@ dependencies = [
  "openshell-driver-podman",
  "openshell-ocsf",
  "openshell-policy",
+ "openshell-providers",
  "openshell-router",
  "petname",
  "pin-project-lite",
@@ -6202,6 +6205,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

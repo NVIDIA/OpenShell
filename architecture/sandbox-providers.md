@@ -41,13 +41,67 @@ The gRPC surface is defined in `proto/openshell.proto`:
 - `CreateProvider`
 - `GetProvider`
 - `ListProviders`
+- `ListProviderProfiles`
+- `GetProviderProfile`
 - `UpdateProvider`
 - `DeleteProvider`
+
+## Provider Type Profiles
+
+Provider type profiles are declarative metadata for provider types. Built-in profiles
+live as one YAML document per provider under the top-level `providers/` directory
+and are exposed through
+`ListProviderProfiles` and `GetProviderProfile`. The profile loader validates the
+YAML catalog and materializes the same proto-backed shape that future API imports
+will accept. Profiles describe credential names and environment variables, known
+network endpoints, expected binaries, category, and whether the provider is
+inference-capable. Categories are a proto enum so clients can group and filter
+provider types without parsing display strings. Current values are `other`,
+`inference`, `agent`, `source_control`, `messaging`, `data`, and `knowledge`.
+Agent profiles such as `claude`, `codex`, and `opencode` can still be
+inference-capable when their tool talks to an inference API.
+
+Profiles are additive to provider records. A provider record with only `type`,
+`credentials`, and `config` can be matched to built-in profile metadata by
+`provider.type`. Profile-generated policy is still opt-in: the gateway composes provider
+profile rules only when the gateway-global `providers_v2_enabled` setting is true.
+
+This keeps the compatibility boundary at the gateway. A gateway without
+`providers_v2_enabled=true` keeps the existing credential-only provider behavior, while a
+gateway with the flag enabled routes all attached known provider types through the
+profile-backed policy path.
+
+### Provider Policy Composition
+
+Sandbox policy fetch uses just-in-time composition:
+
+```text
+effective policy = base/static policy + provider profile rules + user rules
+```
+
+The composed policy is derived data. The sandbox still receives one normal
+`SandboxPolicy`, but provider-generated entries are not persisted as user-authored
+policy revisions. Full policy replacement and incremental policy updates continue to
+mutate the user-authored policy layer. Provider-generated rules are re-added during
+composition for each attached provider whose type has a built-in profile.
+
+Provider-generated network rules use reserved `_provider_*` names derived from the
+provider record name. If a user or global policy already has the same key, composition
+keeps the policy entry and adds a numeric suffix to the provider entry. Duplicate
+host/port endpoints across policy and provider rules are valid; OPA evaluates all
+rules, so allow decisions are the union of matching allows and deny rules continue to
+win globally.
+
+Gateway-global policy still overrides sandbox-authored policy. When `providers_v2_enabled`
+is true, provider layers compose JIT onto the effective policy source, whether that
+source is sandbox-scoped or global. The composed payload is derived data and is not
+persisted as a policy revision.
 
 ## Components
 
 - `crates/openshell-providers`
   - canonical provider type normalization and command detection,
+  - YAML-backed built-in provider profiles,
   - provider registry and per-provider discovery plugins,
   - shared discovery engine and context abstraction for testability.
 - `crates/openshell-cli`
@@ -174,6 +228,7 @@ Also supported:
 
 - `openshell provider get <name>`
 - `openshell provider list`
+- `openshell provider list-profiles`
 - `openshell provider update <name> ...`
 - `openshell provider delete <name> [<name>...]`
 
@@ -232,6 +287,8 @@ Key behaviors:
 - Only `credentials` are injected, not `config`.
 - Invalid env var keys (containing `.`, `-`, spaces, etc.) are skipped.
 - Credentials are never persisted in the sandbox spec's environment map.
+- Provider profiles do not change credential injection in the first iteration.
+  Injection still uses the existing placeholder environment path.
 
 ### Sandbox Supervisor: Fetching Credentials
 

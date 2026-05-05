@@ -212,8 +212,8 @@ backend = "core:python"
 precompiled_flavor = "install_only_stripped"
 
 [tools.python."platforms.linux-arm64"]
-checksum = "sha256:0556f1260a9a1fc83210dcecf9d4cbacf17eb4a684541c84798ffc8b4d618c35"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
+checksum = "sha256:7fda891fac489ae1380fdf7050acf5ed4d3cb1ce0a84d6a4a6f51f6b5aee2d6d"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260504/cpython-3.13.13+20260504-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.linux-arm64-musl"]
@@ -222,8 +222,8 @@ url = "https://github.com/astral-sh/python-build-standalone/releases/download/20
 provenance = "github-attestations"
 
 [tools.python."platforms.linux-x64"]
-checksum = "sha256:13d3b6d15f4c3c1dd1955a3c81e06bdc5aef4cb5cb65076878374948be3b0412"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+checksum = "sha256:701c00bb8cc5b172b9c8a31eb6be57b6bc72cfe0addbff8e013db79a28981642"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260504/cpython-3.13.13+20260504-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.linux-x64-musl"]
@@ -232,8 +232,8 @@ url = "https://github.com/astral-sh/python-build-standalone/releases/download/20
 provenance = "github-attestations"
 
 [tools.python."platforms.macos-arm64"]
-checksum = "sha256:874f9931ad40dcce38caf6f408aa7e10ec3d0dfce2184ba7af62a965a66b9cd9"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-aarch64-apple-darwin-install_only_stripped.tar.gz"
+checksum = "sha256:001872dfdea7fdb5b985cbe03a5b15d1ba7d8a5df6056615d433423e2adb27c5"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260504/cpython-3.13.13+20260504-aarch64-apple-darwin-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.macos-x64"]

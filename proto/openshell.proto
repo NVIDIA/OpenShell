@@ -51,6 +51,14 @@ service OpenShell {
   // List providers.
   rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
 
+  // List available provider type profiles.
+  rpc ListProviderProfiles(ListProviderProfilesRequest)
+      returns (ListProviderProfilesResponse);
+
+  // Fetch one provider type profile by id.
+  rpc GetProviderProfile(GetProviderProfileRequest)
+      returns (ProviderProfileResponse);
+
   // Update an existing provider by name.
   rpc UpdateProvider(UpdateProviderRequest) returns (ProviderResponse);
 
@@ -560,6 +568,62 @@ message ProviderResponse {
 // List providers response.
 message ListProvidersResponse {
   repeated openshell.datamodel.v1.Provider providers = 1;
+}
+
+// List provider type profiles request.
+message ListProviderProfilesRequest {
+  uint32 limit = 1;
+  uint32 offset = 2;
+}
+
+// Fetch provider type profile request.
+message GetProviderProfileRequest {
+  string id = 1;
+}
+
+// Provider credential declaration.
+message ProviderProfileCredential {
+  string name = 1;
+  string description = 2;
+  repeated string env_vars = 3;
+  bool required = 4;
+  string auth_style = 5;
+  string header_name = 6;
+  string query_param = 7;
+}
+
+// Stable provider profile categories used by clients for grouping and filtering.
+enum ProviderProfileCategory {
+  PROVIDER_PROFILE_CATEGORY_UNSPECIFIED = 0;
+  PROVIDER_PROFILE_CATEGORY_OTHER = 1;
+  PROVIDER_PROFILE_CATEGORY_INFERENCE = 2;
+  PROVIDER_PROFILE_CATEGORY_AGENT = 3;
+  PROVIDER_PROFILE_CATEGORY_SOURCE_CONTROL = 4;
+  PROVIDER_PROFILE_CATEGORY_MESSAGING = 5;
+  PROVIDER_PROFILE_CATEGORY_DATA = 6;
+  PROVIDER_PROFILE_CATEGORY_KNOWLEDGE = 7;
+}
+
+// Provider type profile metadata exposed to clients.
+message ProviderProfile {
+  string id = 1;
+  string display_name = 2;
+  string description = 3;
+  ProviderProfileCategory category = 4;
+  repeated ProviderProfileCredential credentials = 5;
+  repeated openshell.sandbox.v1.NetworkEndpoint endpoints = 6;
+  repeated openshell.sandbox.v1.NetworkBinary binaries = 7;
+  bool inference_capable = 8;
+}
+
+// Provider profile response.
+message ProviderProfileResponse {
+  ProviderProfile profile = 1;
+}
+
+// List provider profiles response.
+message ListProviderProfilesResponse {
+  repeated ProviderProfile profiles = 1;
 }
 
 // Delete provider response.

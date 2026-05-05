@@ -110,7 +110,7 @@ Based on the sub-agent's analysis, also attempt to validate the report directly:
 
 - For bug reports: check the relevant code paths, look for the described failure mode
 - For feature requests: assess feasibility against the existing architecture
-- For cluster/infrastructure issues: reference the `debug-openshell-cluster` skill's known failure patterns
+- For gateway deployment or infrastructure issues: reference the `debug-openshell-cluster` skill's known failure patterns
 - For inference and provider-topology issues: reference the `debug-inference` skill's known failure patterns
 - For CLI/usage issues: reference the `openshell-cli` skill's command reference
 

@@ -135,6 +135,20 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    async fn list_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn update_provider(
         &self,
         _request: tonic::Request<UpdateProviderRequest>,
@@ -342,4 +356,77 @@ async fn serves_grpc_and_http_on_same_port() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     server.abort();
+}
+
+/// Verify tonic metadata ↔ HTTP header roundtrip for `x-request-id`.
+///
+/// This intentionally constructs its own request-ID layers from
+/// `tower-http`'s public API rather than reusing the production macro
+/// (which is crate-private). Production middleware composition and
+/// layer ordering are covered by the unit tests in `multiplex::tests`.
+#[tokio::test]
+async fn grpc_response_propagates_request_id() {
+    use tower::ServiceBuilder;
+    use tower_http::request_id::{
+        MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
+    };
+
+    #[derive(Clone)]
+    struct TestUuidRequestId;
+
+    impl MakeRequestId for TestUuidRequestId {
+        fn make_request_id<B>(&mut self, _req: &Request<B>) -> Option<RequestId> {
+            let id = uuid::Uuid::new_v4().to_string();
+            Some(RequestId::new(http::HeaderValue::from_str(&id).unwrap()))
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let x_request_id = http::HeaderName::from_static("x-request-id");
+    let grpc_service = ServiceBuilder::new()
+        .layer(SetRequestIdLayer::new(
+            x_request_id.clone(),
+            TestUuidRequestId,
+        ))
+        .layer(PropagateRequestIdLayer::new(x_request_id))
+        .service(OpenShellServer::new(TestOpenShell));
+    let http_service = health_router();
+    let service = MultiplexedService::new(grpc_service, http_service);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let svc = service.clone();
+            tokio::spawn(async move {
+                let _ = Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+
+    let mut client = OpenShellClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+
+    // Server generates a UUID when client omits x-request-id.
+    let response = client.health(HealthRequest {}).await.unwrap();
+    let generated = response
+        .metadata()
+        .get("x-request-id")
+        .expect("gRPC response should include server-generated x-request-id");
+    uuid::Uuid::parse_str(generated.to_str().unwrap()).expect("should be a valid UUID");
+
+    // Server preserves a client-supplied x-request-id.
+    let mut request = tonic::Request::new(HealthRequest {});
+    request
+        .metadata_mut()
+        .insert("x-request-id", "grpc-corr-id".parse().unwrap());
+    let response = client.health(request).await.unwrap();
+    let echoed = response.metadata().get("x-request-id").unwrap();
+    assert_eq!(echoed.to_str().unwrap(), "grpc-corr-id");
 }

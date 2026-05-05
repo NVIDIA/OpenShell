@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: copilot
+display_name: GitHub Copilot
+description: GitHub Copilot tooling
+category: agent
+credentials:
+  - name: github_token
+    description: GitHub token used by Copilot tooling
+    env_vars: [COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: api.github.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: github.com
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+binaries: [/usr/bin/copilot, /usr/local/bin/copilot]

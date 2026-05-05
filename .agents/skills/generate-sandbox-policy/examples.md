@@ -858,7 +858,7 @@ network_policies:
       - { path: /usr/local/bin/claude }
 ```
 
-The agent notes that `filesystem_policy`, `landlock`, and `process` are sensible defaults that may need adjustment, and that cluster inference is configured separately via `openshell cluster inference set/get` rather than an `inference` policy block.
+The agent notes that `filesystem_policy`, `landlock`, and `process` are sensible defaults that may need adjustment, and that gateway inference is configured separately via `openshell inference set/get` rather than an `inference` policy block.
 
 ---
 

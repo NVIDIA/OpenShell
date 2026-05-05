@@ -201,6 +201,27 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(ListProvidersResponse { providers }))
     }
 
+    async fn list_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ListProviderProfilesResponse {
+                profiles: openshell_providers::default_profiles()
+                    .iter()
+                    .map(openshell_providers::ProviderTypeProfile::to_proto)
+                    .collect(),
+            },
+        ))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn update_provider(
         &self,
         request: tonic::Request<UpdateProviderRequest>,
@@ -527,6 +548,15 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     run::provider_delete(&ts.endpoint, &["my-claude".to_string()], &ts.tls)
         .await
         .expect("provider delete");
+}
+
+#[tokio::test]
+async fn provider_list_profiles_cli_uses_profile_browsing_rpc() {
+    let ts = run_server().await;
+
+    run::provider_list_profiles(&ts.endpoint, &ts.tls)
+        .await
+        .expect("provider list-profiles");
 }
 
 #[tokio::test]

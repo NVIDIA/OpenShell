@@ -8,7 +8,7 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Security, Archit
 position: 2
 ---
 
-OpenShell runs inside a Docker container. Each sandbox is an isolated environment managed through the gateway. Three components work together to keep agents secure.
+OpenShell runs sandboxes through a gateway that uses one of four compute platforms: Kubernetes, Docker, Podman, or the experimental MicroVM runtime. Each sandbox is an isolated environment managed through the gateway. Three components work together to keep agents secure.
 
 ![OpenShell architecture diagram](/assets/images/architecture.svg)
 
@@ -16,10 +16,10 @@ OpenShell runs inside a Docker container. Each sandbox is an isolated environmen
 
 The following table describes each component and its role in the system:
 
-| Component | Role |
-|---|---|
-| **Gateway** | Control-plane API that coordinates sandbox lifecycle and state, and acts as the auth boundary between clients and sandboxes. |
-| **Sandbox** | Isolated runtime that includes container supervision and policy-enforced egress routing. |
+| Component         | Role                                                                                                                                                                                                         |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Gateway**       | Control-plane API that coordinates sandbox lifecycle and state, and acts as the auth boundary between clients and sandboxes.                                                                                 |
+| **Sandbox**       | Isolated runtime that includes container supervision and policy-enforced egress routing.                                                                                                                     |
 | **Policy Engine** | Policy definition and enforcement layer for filesystem, network, process, and inference constraints. Defense in depth enforces policies from the application layer down to infrastructure and kernel layers. |
 
 ## How a Request Flows
@@ -32,17 +32,17 @@ Every outbound connection from agent code passes through the same decision path:
 4. For every other destination, the proxy queries the policy engine with the destination, port, and calling binary.
 5. The policy engine returns one of the following decisions. Explicit deny takes precedence over allow, and allow takes precedence over implicit deny.
 
-   | Decision | When it applies | Outcome |
-   |---|---|---|
-   | **Explicit Deny** | A deny rule, or a hardening rule such as server-side request forgery (SSRF) protection, a blocked control-plane port, or a Layer 7 (L7) deny, rejects the request even when an allow rule would otherwise permit it. | The connection is blocked and logged. |
-   | **Allow** | The destination and binary match a policy block, and no deny rule applies. | Traffic flows directly to the external service. |
-   | **Implicit Deny** | No policy block matched. | The connection is blocked and logged. |
+   | Decision          | When it applies                                                                                                                                                                                                      | Outcome                                         |
+   | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+   | **Explicit Deny** | A deny rule, or a hardening rule such as server-side request forgery (SSRF) protection, a blocked control-plane port, or a Layer 7 (L7) deny, rejects the request even when an allow rule would otherwise permit it. | The connection is blocked and logged.           |
+   | **Allow**         | The destination and binary match a policy block, and no deny rule applies.                                                                                                                                           | Traffic flows directly to the external service. |
+   | **Implicit Deny** | No policy block matched.                                                                                                                                                                                             | The connection is blocked and logged.           |
 
 For REST endpoints, the proxy auto-detects Transport Layer Security (TLS) by peeking the first bytes of each tunnel. When TLS is detected, the proxy terminates it transparently using a per-sandbox ephemeral certificate authority (CA) so each HTTP request can be checked against per-method, per-path rules before forwarding. To trust a corporate or internal CA for upstream traffic, add the PEM-encoded certificate to the sandbox container's trust store at image build time.
 
 ## Gateway Lifecycle
 
-OpenShell preserves sandbox state across gateway restarts. After `openshell gateway stop` and `openshell gateway start`, running sandboxes resume from their saved state. Existing SSH sessions reconnect without re-authenticating.
+OpenShell preserves gateway state in the configured gateway database. Kubernetes deployments commonly use the Helm chart's persistent volume, while standalone gateway deployments can use local storage or Postgres. Sandbox state depends on the selected compute driver and the storage configured for sandbox workloads.
 
 ## Observability
 
@@ -50,13 +50,14 @@ The sandbox emits operational decisions as Open Cybersecurity Schema Framework (
 
 ## Deployment Modes
 
-OpenShell can run locally, on a remote host, or behind a cloud proxy. The architecture is identical in all cases. Only the Docker container location and authentication mode change.
+OpenShell supports four deployment modes: Kubernetes, Docker, Podman, and MicroVM. Each mode runs or exposes a gateway, then registers that endpoint with the CLI. The gateway's compute driver determines where sandboxes run.
 
-| Mode | Description | Command |
-|---|---|---|
-| **Local** | The gateway runs inside Docker on your workstation. The CLI provisions it automatically on first use. | `openshell gateway start` |
-| **Remote** | The gateway runs on a remote host via SSH. Only Docker is required on the remote machine. | `openshell gateway start --remote user@host` |
-| **Cloud** | A gateway already running behind a reverse proxy (e.g. Cloudflare Access). Register and authenticate via browser. | `openshell gateway add https://gateway.example.com` |
+| Mode           | Description                                                                      |
+| -------------- | -------------------------------------------------------------------------------- |
+| **Docker**     | The gateway uses Docker to create local sandbox containers.                      |
+| **Podman**     | The gateway uses a Podman-compatible container runtime, commonly rootless.       |
+| **Kubernetes** | The Helm chart deploys the gateway and configures the Kubernetes compute driver. |
+| **MicroVM**    | The gateway uses the experimental VM compute driver.                             |
 
 You can register multiple gateways and switch between them with `openshell gateway select`. For the full deployment and management workflow, refer to the [Gateways](/sandboxes/manage-gateways) section.
 

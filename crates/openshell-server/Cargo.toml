@@ -21,6 +21,7 @@ openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
 openshell-driver-podman = { path = "../openshell-driver-podman" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
+openshell-providers = { path = "../openshell-providers" }
 openshell-router = { path = "../openshell-router" }
 
 # Async runtime
