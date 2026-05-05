@@ -8,7 +8,7 @@
 #
 # Then layer this file on top of values.yaml when deploying:
 #   helm upgrade --install openshell . \
-#     -f values.yaml -f values-skaffold.yaml -f values-keycloak.yaml
+#     -f values.yaml -f ci/values-skaffold.yaml -f ci/values-keycloak.yaml
 #
 # Or add this file to skaffold.yaml valuesFiles for iterative dev.
 #

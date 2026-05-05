@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Merge after values.yaml when cert-manager CRDs are installed, e.g.:
-#   helm install ... -f values.yaml -f values-cert-manager.yaml
+#   helm install ... -f values.yaml -f ci/values-cert-manager.yaml
 # Or add this file to skaffold manifests.helm.releases[].valuesFiles.
 server:
   disableTls: false
