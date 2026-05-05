@@ -129,7 +129,19 @@ merge_kubeconfig() {
     old_server=$(kubectl --kubeconfig="${KUBECONFIG_TARGET}" config view --raw \
       -o "jsonpath={.clusters[?(@.name=='${context}')].cluster.server}")
     if [[ "${old_server}" == https://0.0.0.0:* ]]; then
-      host_addr=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+      # Read the default-route gateway from /proc/net/route directly to avoid
+      # depending on the `ip` command, which is not in the CI image. The
+      # gateway field is a little-endian 32-bit hex value, so we read pairs
+      # of hex digits in reverse and format as dotted decimal.
+      host_addr=$(awk '$2=="00000000" {
+        gw = $3
+        printf "%d.%d.%d.%d",
+          strtonum("0x" substr(gw,7,2)),
+          strtonum("0x" substr(gw,5,2)),
+          strtonum("0x" substr(gw,3,2)),
+          strtonum("0x" substr(gw,1,2))
+        exit
+      }' /proc/net/route 2>/dev/null) || host_addr=""
       if [[ -n "${host_addr}" ]]; then
         new_server="${old_server//0.0.0.0/${host_addr}}"
         echo "Inside container; rewriting kubeconfig server ${old_server} -> ${new_server} (insecure-skip-tls-verify)."
