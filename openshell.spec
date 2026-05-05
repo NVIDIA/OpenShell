@@ -9,7 +9,7 @@
 
 Name:           openshell
 Version:        0.0.37
-Release:        1.20260501160805739969.rpm.73.ge7c4151d%{?dist}
+Release:        1.20260505111703438211.rpm.100.gec0e2ce3%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
@@ -207,7 +207,7 @@ install -d %{buildroot}%{python3_sitelib}/%{name}-%{version}.dist-info
 cat > %{buildroot}%{python3_sitelib}/%{name}-%{version}.dist-info/METADATA << EOF
 Metadata-Version: 2.1
 Name: %{name}
-Version: %{version}
+Version: 0.0.37
 Summary: OpenShell Python SDK for agent execution and management
 License: Apache-2.0
 Requires-Python: >=3.12
