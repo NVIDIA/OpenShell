@@ -102,6 +102,7 @@ RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.
 # Stage 2: real build
 # ---------------------------------------------------------------------------
 COPY crates/ crates/
+COPY providers/ providers/
 
 # Touch source files to ensure they're rebuilt (not the cached dummy).
 RUN touch crates/openshell-cli/src/main.rs \

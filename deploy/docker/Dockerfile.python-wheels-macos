@@ -91,6 +91,7 @@ RUN --mount=type=cache,id=cargo-registry-python-wheels-macos-${TARGETARCH},shari
 
 # Copy actual source code and Python packaging files.
 COPY crates/ crates/
+COPY providers/ providers/
 COPY pyproject.toml README.md ./
 COPY python/ python/
 
