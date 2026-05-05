@@ -73,6 +73,11 @@ impl PodmanComputeDriver {
             }
         }
 
+        // Validate TLS configuration before connecting.  Partial configs
+        // (e.g. CA set but cert/key missing) are rejected early so operators
+        // get a clear error instead of a silent fallback to plaintext HTTP.
+        config.validate_tls_config()?;
+
         let client = PodmanClient::new(config.socket_path.clone());
 
         // Verify connectivity.
@@ -602,19 +607,26 @@ mod tests {
     }
 
     #[test]
-    fn grpc_endpoint_partial_tls_falls_back_to_http() {
-        let mut cfg = PodmanComputeConfig {
+    fn partial_tls_config_returns_error() {
+        let cfg = PodmanComputeConfig {
             gateway_port: 8080,
             guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
             // guest_tls_cert and guest_tls_key not set — incomplete TLS config.
             ..PodmanComputeConfig::default()
         };
         assert!(!cfg.tls_enabled());
-        if cfg.grpc_endpoint.is_empty() {
-            let scheme = if cfg.tls_enabled() { "https" } else { "http" };
-            cfg.grpc_endpoint = format!("{scheme}://host.containers.internal:{}", cfg.gateway_port);
-        }
-        assert_eq!(cfg.grpc_endpoint, "http://host.containers.internal:8080");
+        let err = cfg
+            .validate_tls_config()
+            .expect_err("partial TLS config should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("OPENSHELL_PODMAN_TLS_CERT"),
+            "error should name the missing cert: {msg}"
+        );
+        assert!(
+            msg.contains("OPENSHELL_PODMAN_TLS_KEY"),
+            "error should name the missing key: {msg}"
+        );
     }
 
     #[test]

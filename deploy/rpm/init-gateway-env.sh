@@ -83,8 +83,10 @@ OPENSHELL_SSH_HANDSHAKE_SECRET=${SECRET}
 #
 # To use externally-managed certs, uncomment and edit the paths below.
 # To rotate certs, delete ~/.local/state/openshell/tls/ and restart.
-# To disable TLS (NOT RECOMMENDED), uncomment the next line and
-# comment out all OPENSHELL_TLS_* and OPENSHELL_PODMAN_TLS_* variables.
+# WARNING: Disabling TLS with the default bind address (0.0.0.0) exposes
+# the gateway API to the entire network with NO authentication. Only
+# disable TLS when behind a TLS-terminating reverse proxy, or restrict
+# OPENSHELL_BIND_ADDRESS to 127.0.0.1.
 #OPENSHELL_DISABLE_TLS=true
 
 # Server TLS (gateway listens with these certs).

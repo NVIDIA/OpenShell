@@ -76,8 +76,11 @@ gRPC and HTTP, secured by mutual TLS (mTLS) by default.
     Environment: **OPENSHELL_TLS_CLIENT_CA**.
 
 **--disable-tls**
-:   Disable TLS entirely and listen on plaintext HTTP. Use when the
-    gateway sits behind a TLS-terminating reverse proxy.
+:   Disable TLS entirely and listen on plaintext HTTP. When the bind
+    address is **0.0.0.0** (the RPM default), disabling TLS exposes the
+    API to the entire network without authentication. Only use when the
+    gateway sits behind a TLS-terminating reverse proxy, or restrict
+    **--bind-address** to **127.0.0.1**.
     Environment: **OPENSHELL_DISABLE_TLS**.
 
 **--disable-gateway-auth**

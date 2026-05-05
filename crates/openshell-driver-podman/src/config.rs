@@ -120,6 +120,40 @@ impl PodmanComputeConfig {
         self.guest_tls_ca.is_some() && self.guest_tls_cert.is_some() && self.guest_tls_key.is_some()
     }
 
+    /// Validate TLS configuration consistency.
+    ///
+    /// Returns `Ok(())` when either all three TLS paths are set (full mTLS)
+    /// or none are set (plaintext).  Returns an error naming the missing
+    /// fields when only a subset is provided — this prevents silent
+    /// fallback to plaintext when an operator partially configures mTLS.
+    pub fn validate_tls_config(&self) -> Result<(), crate::client::PodmanApiError> {
+        let has_ca = self.guest_tls_ca.is_some();
+        let has_cert = self.guest_tls_cert.is_some();
+        let has_key = self.guest_tls_key.is_some();
+
+        // All set or none set — both are valid.
+        if (has_ca && has_cert && has_key) || (!has_ca && !has_cert && !has_key) {
+            return Ok(());
+        }
+
+        let mut missing = Vec::new();
+        if !has_ca {
+            missing.push("--podman-tls-ca / OPENSHELL_PODMAN_TLS_CA");
+        }
+        if !has_cert {
+            missing.push("--podman-tls-cert / OPENSHELL_PODMAN_TLS_CERT");
+        }
+        if !has_key {
+            missing.push("--podman-tls-key / OPENSHELL_PODMAN_TLS_KEY");
+        }
+
+        Err(crate::client::PodmanApiError::InvalidInput(format!(
+            "Partial TLS configuration: all three TLS paths must be provided together. \
+             Missing: {}",
+            missing.join(", ")
+        )))
+    }
+
     /// Resolve the default socket path from the environment.
     ///
     /// - **macOS**: `$HOME/.local/share/containers/podman/machine/podman.sock`
@@ -241,5 +275,117 @@ mod tests {
                 PathBuf::from("/Users/testuser/.local/share/containers/podman/machine/podman.sock")
             );
         });
+    }
+
+    // ── TLS config validation ─────────────────────────────────────────
+
+    #[test]
+    fn validate_tls_config_all_none_is_ok() {
+        let cfg = PodmanComputeConfig::default();
+        assert!(cfg.validate_tls_config().is_ok());
+    }
+
+    #[test]
+    fn validate_tls_config_all_set_is_ok() {
+        let cfg = PodmanComputeConfig {
+            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
+            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
+            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_tls_config().is_ok());
+    }
+
+    #[test]
+    fn validate_tls_config_only_ca_is_error() {
+        let cfg = PodmanComputeConfig {
+            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg
+            .validate_tls_config()
+            .expect_err("only CA should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
+        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
+        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
+    }
+
+    #[test]
+    fn validate_tls_config_only_cert_is_error() {
+        let cfg = PodmanComputeConfig {
+            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg
+            .validate_tls_config()
+            .expect_err("only cert should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
+        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
+        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
+    }
+
+    #[test]
+    fn validate_tls_config_only_key_is_error() {
+        let cfg = PodmanComputeConfig {
+            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg
+            .validate_tls_config()
+            .expect_err("only key should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
+        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
+        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
+    }
+
+    #[test]
+    fn validate_tls_config_ca_and_cert_missing_key_is_error() {
+        let cfg = PodmanComputeConfig {
+            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
+            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg
+            .validate_tls_config()
+            .expect_err("missing key should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
+        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
+        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
+    }
+
+    #[test]
+    fn validate_tls_config_ca_and_key_missing_cert_is_error() {
+        let cfg = PodmanComputeConfig {
+            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
+            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg
+            .validate_tls_config()
+            .expect_err("missing cert should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
+        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
+        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
+    }
+
+    #[test]
+    fn validate_tls_config_cert_and_key_missing_ca_is_error() {
+        let cfg = PodmanComputeConfig {
+            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
+            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg
+            .validate_tls_config()
+            .expect_err("missing CA should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
+        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
+        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
     }
 }

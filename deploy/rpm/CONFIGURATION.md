@@ -92,6 +92,15 @@ The gateway regenerates the PKI on next start.
 
 ### Disabling TLS
 
+> **WARNING:** The RPM gateway binds to all interfaces (`0.0.0.0`) by
+> default. With TLS disabled, the gateway API is exposed to the entire
+> network with **no authentication**. Any host that can reach the
+> gateway port has full access, including the ability to create
+> sandboxes, execute arbitrary code, and access configured credentials.
+> Only disable TLS when the gateway is behind a TLS-terminating reverse
+> proxy that enforces its own authentication. When disabling TLS without
+> a reverse proxy, restrict `OPENSHELL_BIND_ADDRESS` to `127.0.0.1`.
+
 To disable TLS (not recommended for production):
 
 1. Edit `~/.config/openshell/gateway.env`:
@@ -104,9 +113,6 @@ To disable TLS (not recommended for production):
    variables if they are set.
 
 1. Restart the gateway.
-
-With TLS disabled, the gateway has no authentication. Any host that can
-reach the gateway port has full access to the API.
 
 ## Sandbox TLS
 
@@ -147,7 +153,7 @@ across package upgrades.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENSHELL_BIND_ADDRESS` | `0.0.0.0` | IP address to bind all listeners to |
+| `OPENSHELL_BIND_ADDRESS` | `0.0.0.0` | IP address to bind all listeners to. The default exposes the gateway on all interfaces; mTLS must remain enabled to prevent unauthenticated access. Set to `127.0.0.1` for local-only access. |
 | `OPENSHELL_SERVER_PORT` | `8080` | Port for the gRPC/HTTP API |
 | `OPENSHELL_HEALTH_PORT` | `0` (disabled) | Port for unauthenticated health endpoints (`/healthz`, `/readyz`). Set to a non-zero value to enable. |
 | `OPENSHELL_METRICS_PORT` | `0` (disabled) | Port for Prometheus metrics (`/metrics`). Set to a non-zero value to enable. |

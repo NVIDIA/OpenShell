@@ -66,6 +66,12 @@ On first start, the gateway automatically generates:
 - An SSH handshake secret for sandbox authentication
 - A commented configuration file at `~/.config/openshell/gateway.env`
 
+> **Note:** The gateway binds to all interfaces (`0.0.0.0`) by default.
+> Mutual TLS (mTLS) is enabled automatically on first start, requiring a
+> valid client certificate for every connection. Do not disable TLS
+> without restricting the bind address to `127.0.0.1`. See
+> CONFIGURATION.md for details.
+
 Verify the service is running:
 
 ```shell

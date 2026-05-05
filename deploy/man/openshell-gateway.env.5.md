@@ -48,7 +48,10 @@ the SSH handshake secret).
 ## Gateway
 
 **OPENSHELL_BIND_ADDRESS** (default: 0.0.0.0)
-:   IP address to bind all listeners to.
+:   IP address to bind all listeners to. The RPM default of **0.0.0.0**
+    exposes the gateway on all network interfaces; mTLS must remain
+    enabled to prevent unauthenticated access. Set to **127.0.0.1** for
+    local-only access.
 
 **OPENSHELL_SERVER_PORT** (default: 8080)
 :   Port for the multiplexed gRPC/HTTP API.
@@ -87,7 +90,11 @@ the SSH handshake secret).
 
 **OPENSHELL_DISABLE_TLS** (default: unset)
 :   Set to **true** to disable TLS entirely and listen on plaintext
-    HTTP. Not recommended for production.
+    HTTP. Not recommended for production. When the bind address is
+    **0.0.0.0** (the RPM default), disabling TLS exposes the API to the
+    entire network without authentication. Restrict
+    **OPENSHELL_BIND_ADDRESS** to **127.0.0.1** or place the gateway
+    behind a TLS-terminating reverse proxy.
 
 **OPENSHELL_PODMAN_TLS_CA** (default: auto-generated path)
 :   CA certificate bind-mounted into sandbox containers.
