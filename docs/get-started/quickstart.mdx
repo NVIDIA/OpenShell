@@ -39,68 +39,6 @@ After installing the CLI, run `openshell --help` in your terminal to see the ful
 You can also clone the [NVIDIA OpenShell GitHub repository](https://github.com/NVIDIA/OpenShell) and use the `/openshell-cli` skill to load the CLI reference into your agent.
 </Tip>
 
-## Connect to a Gateway
-
-OpenShell sandboxes run through a gateway. The gateway can use different compute platforms:
-
-| Platform | Typical use |
-|---|---|
-| Kubernetes | Shared clusters and Helm-managed deployments. |
-| Docker | Local development and single-machine gateway testing. |
-| Podman | Rootless local or workstation deployments. |
-| MicroVM | Stronger isolation experiments using the VM driver. |
-
-For a local source checkout, you can start a Docker-backed gateway for evaluation:
-
-```shell
-git clone https://github.com/NVIDIA/OpenShell.git
-cd OpenShell
-mise trust
-mise run gateway:docker
-```
-
-In another terminal, register the gateway:
-
-```shell
-openshell gateway add http://127.0.0.1:18080 --local --name local
-openshell status
-```
-
-For Kubernetes deployments, install the Helm chart into a cluster you manage:
-
-```shell
-kubectl create namespace openshell --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n openshell create secret generic openshell-ssh-handshake \
-  --from-literal=secret="$(openssl rand -hex 32)" \
-  --dry-run=client -o yaml | kubectl apply -f -
-```
-
-```shell
-helm upgrade --install openshell ./deploy/helm/openshell \
-  --namespace openshell \
-  --set service.type=ClusterIP \
-  --set server.disableTls=true \
-  --set server.grpcEndpoint=http://openshell.openshell.svc.cluster.local:8080
-```
-
-Then wait for the gateway and start a local port-forward:
-
-```shell
-kubectl -n openshell rollout status statefulset/openshell
-kubectl -n openshell port-forward svc/openshell 8080:8080
-```
-
-In another terminal, register the gateway:
-
-```shell
-openshell gateway add http://127.0.0.1:8080 --local --name local
-openshell status
-```
-
-<Note>
-Plaintext examples are for trusted local evaluation. For shared deployments, keep TLS enabled or expose the gateway through a trusted access proxy. See [Gateway Authentication](/reference/gateway-auth).
-</Note>
-
 ## Create Your First OpenShell Sandbox
 
 Create a sandbox and launch an agent inside it.
