@@ -15,15 +15,25 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: GitHub Release tag to update
+        required: false
+        default: vm-dev
+        type: string
 
 permissions:
   contents: write
   packages: read
 
-# Serialize with release-vm-kernel.yml — both update the vm-dev release.
+# Serialize with release-vm-kernel.yml when both workflows update the same
+# release tag.
 concurrency:
-  group: vm-dev-release
+  group: vm-release-${{ inputs.release_tag || 'vm-dev' }}
   cancel-in-progress: false
+
+env:
+  VM_RELEASE_TAG: ${{ inputs.release_tag || 'vm-dev' }}
 
 defaults:
   run:
@@ -62,7 +72,7 @@ jobs:
           echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # Download kernel runtime tarballs from the vm-dev release
+  # Download kernel runtime tarballs from the configured VM release
   # ---------------------------------------------------------------------------
   download-kernel-runtime:
     name: Download Kernel Runtime
@@ -85,7 +95,7 @@ jobs:
 
           for platform in linux-aarch64 linux-x86_64 darwin-aarch64; do
             echo "Downloading vm-runtime-${platform}.tar.zst..."
-            gh release download vm-dev \
+            gh release download "${VM_RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
               --pattern "vm-runtime-${platform}.tar.zst" \
               --dir runtime-artifacts \
@@ -103,9 +113,9 @@ jobs:
             if [ ! -f "$file" ]; then
               echo "ERROR: Missing ${file}" >&2
               echo "" >&2
-              echo "The vm-dev release does not have kernel runtime artifacts." >&2
+              echo "The ${VM_RELEASE_TAG} release does not have kernel runtime artifacts." >&2
               echo "Run the 'Release VM Kernel' workflow first:" >&2
-              echo "  gh workflow run release-vm-kernel.yml" >&2
+              echo "  gh workflow run release-vm-kernel.yml -f release_tag=${VM_RELEASE_TAG}" >&2
               exit 1
             fi
             echo "OK: ${file} ($(du -sh "$file" | cut -f1))"
@@ -660,7 +670,7 @@ jobs:
           retention-days: 5
 
   # ---------------------------------------------------------------------------
-  # Upload all VM binaries to the vm-dev rolling release
+  # Upload all VM binaries to the configured VM release
   # ---------------------------------------------------------------------------
   release-vm-dev:
     name: Release VM Dev
@@ -711,24 +721,25 @@ jobs:
             > vm-binary-checksums-sha256.txt
           cat vm-binary-checksums-sha256.txt
 
-      - name: Ensure vm-dev tag exists
+      - name: Ensure VM release tag exists
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -fa vm-dev -m "VM Development Build" "${GITHUB_SHA}"
-          git push --force origin vm-dev
+          git tag -fa "${VM_RELEASE_TAG}" -m "VM Development Build" "${GITHUB_SHA}"
+          git push --force origin "refs/tags/${VM_RELEASE_TAG}"
 
-      - name: Prune stale VM binary assets from vm-dev release
+      - name: Prune stale VM binary assets from VM release
         uses: actions/github-script@v7
         with:
           script: |
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            const tag = process.env.VM_RELEASE_TAG;
             let release;
             try {
-              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: 'vm-dev' });
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
             } catch (err) {
               if (err.status === 404) {
-                core.info('No existing vm-dev release; will create fresh.');
+                core.info(`No existing ${tag} release; will create fresh.`);
                 return;
               }
               throw err;
@@ -745,12 +756,12 @@ jobs:
               }
             }
 
-      - name: Upload to vm-dev GitHub Release
+      - name: Upload to VM GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: OpenShell VM Development Build
           prerelease: true
-          tag_name: vm-dev
+          tag_name: ${{ env.VM_RELEASE_TAG }}
           target_commitish: ${{ github.sha }}
           body: |
             Rolling development build of **openshell-vm** — the MicroVM runtime for OpenShell.

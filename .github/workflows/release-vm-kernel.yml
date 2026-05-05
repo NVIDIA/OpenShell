@@ -19,15 +19,25 @@ name: Release VM Kernel
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: GitHub Release tag to update
+        required: false
+        default: vm-dev
+        type: string
 
 permissions:
   contents: write
   packages: read
 
-# Serialize with release-vm-dev.yml — both update the vm-dev release.
+# Serialize with release-vm-dev.yml when both workflows update the same
+# release tag.
 concurrency:
-  group: vm-dev-release
+  group: vm-release-${{ inputs.release_tag || 'vm-dev' }}
   cancel-in-progress: false
+
+env:
+  VM_RELEASE_TAG: ${{ inputs.release_tag || 'vm-dev' }}
 
 defaults:
   run:
@@ -166,7 +176,7 @@ jobs:
           retention-days: 5
 
   # ---------------------------------------------------------------------------
-  # Upload all runtime tarballs to the vm-dev rolling release
+  # Upload all runtime tarballs to the configured VM release
   # ---------------------------------------------------------------------------
   release-kernel:
     name: Release Kernel Runtime
@@ -190,24 +200,25 @@ jobs:
           sha256sum vm-runtime-*.tar.zst > vm-runtime-checksums-sha256.txt
           cat vm-runtime-checksums-sha256.txt
 
-      - name: Ensure vm-dev tag exists
+      - name: Ensure VM release tag exists
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -fa vm-dev -m "VM Development Build" "${GITHUB_SHA}"
-          git push --force origin vm-dev
+          git tag -fa "${VM_RELEASE_TAG}" -m "VM Development Build" "${GITHUB_SHA}"
+          git push --force origin "refs/tags/${VM_RELEASE_TAG}"
 
-      - name: Prune stale runtime assets from vm-dev release
+      - name: Prune stale runtime assets from VM release
         uses: actions/github-script@v7
         with:
           script: |
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            const tag = process.env.VM_RELEASE_TAG;
             let release;
             try {
-              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: 'vm-dev' });
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
             } catch (err) {
               if (err.status === 404) {
-                core.info('No existing vm-dev release; will create fresh.');
+                core.info(`No existing ${tag} release; will create fresh.`);
                 return;
               }
               throw err;
@@ -220,12 +231,12 @@ jobs:
               }
             }
 
-      - name: Create / update vm-dev GitHub Release
+      - name: Create / update VM GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: OpenShell VM Development Build
           prerelease: true
-          tag_name: vm-dev
+          tag_name: ${{ env.VM_RELEASE_TAG }}
           target_commitish: ${{ github.sha }}
           body: |
             Rolling development build of **openshell-vm** — the MicroVM runtime for OpenShell.
