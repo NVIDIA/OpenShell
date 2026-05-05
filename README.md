@@ -35,21 +35,6 @@ uv tool install -U openshell
 
 Both methods install the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION` (binary) or pin the version with `uv tool install openshell==<version>`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
 
-For local development from a source checkout, start a Docker-backed gateway:
-
-```bash
-git clone https://github.com/NVIDIA/OpenShell.git
-cd OpenShell
-mise trust
-mise run gateway:docker
-```
-
-In another terminal, register the endpoint:
-
-```bash
-openshell gateway add http://127.0.0.1:18080 --local --name local
-openshell status
-```
 
 ### Create a sandbox
 
@@ -114,7 +99,7 @@ OpenShell isolates each sandbox in its own container with policy-enforced egress
 | **Policy Engine**  | Enforces filesystem, network, and process constraints from application layer down to kernel. |
 | **Privacy Router** | Privacy-aware LLM routing that keeps sensitive context on sandbox compute.                   |
 
-Under the hood, OpenShell runs a gateway control plane that manages sandbox lifecycle through a configured compute driver. Supported compute platforms include Docker, Podman, MicroVM, and Kubernetes through the Helm chart in `deploy/helm/openshell`.
+OpenShell runs a gateway control plane that manages sandbox lifecycle through a configured compute driver. Supported compute platforms include Docker, Podman, MicroVM, and Kubernetes.
 
 ## Protection Layers
 
