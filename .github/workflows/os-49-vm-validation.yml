@@ -1,0 +1,134 @@
+name: OS-49 VM Validation
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  vm-boot:
+    name: "VM boot (${{ matrix.name }})"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64-cpu8
+            runner: linux-amd64-cpu8
+          - name: linux-arm64-cpu8
+            runner: linux-arm64-cpu8
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Host virtualization preflight
+        run: |
+          set -euo pipefail
+          uname -a
+          id
+          ls -l /dev/kvm
+          test -r /dev/kvm
+
+      - name: Docker preflight
+        run: docker version
+
+      - name: Run VM e2e smoke
+        run: mise run --no-deps --skip-deps e2e:vm
+
+  gpu-vfio-probe:
+    name: "GPU VFIO probe (${{ matrix.name }})"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64-rtxpro6000
+            runner: linux-amd64-gpu-rtxpro6000-latest-1
+          - name: linux-arm64-l4
+            runner: linux-arm64-gpu-l4-latest-1
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    steps:
+      - name: Probe host GPU, KVM, and VFIO capability
+        run: |
+          set -u
+
+          show_status() {
+            label="$1"
+            shift
+            if "$@"; then
+              echo "OK: ${label}"
+            else
+              echo "NO: ${label}"
+            fi
+          }
+
+          echo "== Host =="
+          uname -a
+          id
+
+          echo
+          echo "== KVM =="
+          ls -l /dev/kvm 2>/dev/null || true
+          show_status "/dev/kvm readable" test -r /dev/kvm
+          show_status "/dev/kvm writable" test -w /dev/kvm
+
+          echo
+          echo "== GPU =="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L || true
+          else
+            echo "nvidia-smi not found"
+          fi
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -Dnnd 10de: || true
+          else
+            find /sys/bus/pci/devices -maxdepth 1 -type l -print 2>/dev/null \
+              | while read -r device; do
+                  vendor="$(cat "${device}/vendor" 2>/dev/null || true)"
+                  if [ "${vendor}" = "0x10de" ]; then
+                    echo "${device##*/} vendor=${vendor} device=$(cat "${device}/device" 2>/dev/null || true)"
+                  fi
+                done
+          fi
+
+          echo
+          echo "== IOMMU =="
+          show_status "IOMMU group directory present" test -d /sys/kernel/iommu_groups
+          find /sys/kernel/iommu_groups -maxdepth 2 -type l -print 2>/dev/null | head -50 || true
+
+          echo
+          echo "== VFIO =="
+          if [ -r /proc/modules ]; then
+            grep -E '(^vfio|^kvm)' /proc/modules || true
+          fi
+          show_status "vfio-pci driver path present" test -d /sys/bus/pci/drivers/vfio-pci
+          show_status "vfio-pci new_id writable" test -w /sys/bus/pci/drivers/vfio-pci/new_id
+          show_status "vfio-pci remove_id writable" test -w /sys/bus/pci/drivers/vfio-pci/remove_id
+
+          echo
+          echo "Probe complete. This job is read-only and does not bind or unbind GPUs."
