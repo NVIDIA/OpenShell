@@ -66,7 +66,7 @@ install_deps() {
   
   if command -v apt-get &>/dev/null; then
     # Debian/Ubuntu
-    DEPS="build-essential git python3 python3-pip python3-pyelftools flex bison libelf-dev libssl-dev bc curl libclang-dev cpio zstd jq"
+    DEPS="build-essential git python3 python3-pip python3-pyelftools flex bison libelf-dev libssl-dev libcap-ng-dev bc curl libclang-dev cpio zstd jq"
     MISSING=""
     for dep in $DEPS; do
       if ! dpkg -s "$dep" &>/dev/null; then
@@ -83,14 +83,14 @@ install_deps() {
     
   elif command -v dnf &>/dev/null; then
     # Fedora/RHEL
-    DEPS="make git python3 python3-pyelftools gcc flex bison elfutils-libelf-devel openssl-devel bc glibc-static curl clang-devel cpio zstd jq"
+    DEPS="make git python3 python3-pyelftools gcc flex bison elfutils-libelf-devel openssl-devel libcap-ng-devel bc glibc-static curl clang-devel cpio zstd jq"
     echo "    Installing dependencies via dnf..."
     $SUDO dnf install -y $DEPS
     
   else
     echo "Warning: Unknown package manager. Please install manually:" >&2
     echo "  build-essential git python3 python3-pyelftools flex bison" >&2
-    echo "  libelf-dev libssl-dev bc curl cpio" >&2
+    echo "  libelf-dev libssl-dev libcap-ng-dev bc curl cpio" >&2
   fi
 
 }
