@@ -58,8 +58,21 @@ jobs:
       image-tag: shadow-branch-e2e-${{ github.sha }}
     secrets: inherit
 
+  build-supervisor:
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: supervisor
+      platform: linux/arm64
+      image-tag: shadow-branch-e2e-${{ github.sha }}
+    secrets: inherit
+
   e2e:
-    needs: [pr_metadata, build-gateway, build-cluster]
+    needs: [pr_metadata, build-gateway, build-cluster, build-supervisor]
     if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:
       contents: read
