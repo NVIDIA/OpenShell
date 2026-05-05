@@ -187,8 +187,11 @@ Component images (server, sandbox) can reach kubelet via two paths:
 Gateway and cluster image builds consume Rust binaries staged at `deploy/docker/.build/prebuilt-binaries/<arch>/`. In CI these come from the reusable Rust native build workflow; locally `tasks/scripts/docker-build-image.sh` runs `tasks/scripts/stage-prebuilt-binaries.sh` before invoking Docker unless `PREBUILT_AUTO_STAGE=0` is set.
 
 ```bash
-# Verify image refs currently used by openshell deployment
-openshell doctor exec -- kubectl -n openshell get statefulset openshell -o jsonpath="{.spec.template.spec.containers[*].image}"
+# Verify image refs currently used by openshell deployment.
+# The gateway image and server.supervisorImage should use the same build tag
+# in branch/E2E deploys; a stale supervisor image can make sandbox behavior
+# lag behind gateway policy/proto changes.
+openshell doctor exec -- kubectl -n openshell get statefulset openshell -o jsonpath="{.spec.template.spec.containers[*].image}{\"\n\"}{.spec.template.spec.containers[*].env[?(@.name==\"OPENSHELL_SUPERVISOR_IMAGE\")].value}{\"\n\"}"
 
 # Verify registry mirror/auth endpoint configuration
 openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml

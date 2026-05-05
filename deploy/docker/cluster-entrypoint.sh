@@ -455,10 +455,12 @@ if [ -n "${PUSH_IMAGE_REFS:-}" ] && [ -f "$HELMCHART" ]; then
 fi
 
 if [ -n "${IMAGE_TAG:-}" ] && [ -f "$HELMCHART" ]; then
-    echo "Overriding gateway image tag to: ${IMAGE_TAG}"
+    echo "Overriding gateway and supervisor image tags to: ${IMAGE_TAG}"
     # server image tag (standalone value field)
     # Handle both quoted and unquoted defaults: tag: "latest" / tag: latest
     sed -i -E "s|tag:[[:space:]]*\"?latest\"?|tag: \"${IMAGE_TAG}\"|" "$HELMCHART"
+    # supervisor image is a full image ref under server.supervisorImage
+    sed -i -E "s|(supervisorImage:[[:space:]]*\"?[^\"]*:)[^\"[:space:]]+(\"?)|\\1${IMAGE_TAG}\\2|" "$HELMCHART"
 fi
 
 if [ -f "$HELMCHART" ]; then
