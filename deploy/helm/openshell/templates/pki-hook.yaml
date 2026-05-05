@@ -118,13 +118,23 @@ spec:
               K8S_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
               API=https://kubernetes.default.svc
 
-              # Idempotency: skip if server TLS secret already exists
-              HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+              # Idempotency: skip only when both TLS secrets already exist.
+              # Checking one is insufficient — a partial cleanup can leave one half
+              # of the pair behind, which would cause mTLS to fail at runtime.
+              HTTP_SERVER=$(curl -s -o /dev/null -w "%{http_code}" \
                 -H "Authorization: Bearer $TOKEN" --cacert "$K8S_CA" \
                 "$API/api/v1/namespaces/$NAMESPACE/secrets/$SERVER_SECRET")
-              if [ "$HTTP" = "200" ]; then
+              HTTP_CLIENT=$(curl -s -o /dev/null -w "%{http_code}" \
+                -H "Authorization: Bearer $TOKEN" --cacert "$K8S_CA" \
+                "$API/api/v1/namespaces/$NAMESPACE/secrets/$CLIENT_SECRET")
+              if [ "$HTTP_SERVER" = "200" ] && [ "$HTTP_CLIENT" = "200" ]; then
                 echo "PKI secrets already exist, skipping."
                 exit 0
+              fi
+              if [ "$HTTP_SERVER" = "200" ] || [ "$HTTP_CLIENT" = "200" ]; then
+                echo "ERROR: partial PKI state — one secret exists but not both." >&2
+                echo "To recover: kubectl delete secret -n $NAMESPACE $SERVER_SECRET $CLIENT_SECRET" >&2
+                exit 1
               fi
 
               cd /tmp

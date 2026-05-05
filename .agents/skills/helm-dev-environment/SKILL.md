@@ -73,14 +73,17 @@ plaintext by default. To test with TLS enabled, comment out that line and redepl
 
 ### Connecting via port-forward
 
+Port `8080` is already bound by the k3d load balancer when Envoy Gateway is active, so
+the port-forward uses local port `8090` to avoid a collision:
+
 ```bash
-KUBECONFIG=kubeconfig kubectl port-forward -n openshell svc/openshell 8080:8080
+KUBECONFIG=kubeconfig kubectl port-forward -n openshell svc/openshell 8090:8080
 ```
 
 **Plaintext (default Skaffold deploy):**
 
 ```bash
-openshell sandbox list --gateway-endpoint http://localhost:8080
+openshell sandbox list --gateway-endpoint http://localhost:8090
 ```
 
 **With mTLS enabled** — extract the client cert the PKI hook wrote to the cluster,
@@ -100,7 +103,7 @@ The server cert SANs include `localhost` and `127.0.0.1`, so hostname verificati
 passes over a port-forward without any extra flags:
 
 ```bash
-openshell sandbox list --gateway-endpoint https://localhost:8080
+openshell sandbox list --gateway-endpoint https://localhost:8090
 ```
 
 ---
