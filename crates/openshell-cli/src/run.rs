@@ -25,20 +25,24 @@ use openshell_bootstrap::{
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
-    CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
-    ExecSandboxRequest, GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProviderProfilesRequest,
-    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource,
-    PolicyStatus, Provider, ProviderProfile, RejectDraftChunkRequest, Sandbox, SandboxPhase,
-    SandboxPolicy, SandboxSpec, SandboxTemplate, SetClusterInferenceRequest, SettingScope,
-    SettingValue, UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest,
+    CreateProviderRequest, CreateSandboxRequest, DeleteProviderProfileRequest,
+    DeleteProviderRequest, DeleteSandboxRequest, ExecSandboxRequest, GetClusterInferenceRequest,
+    GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
+    GetProviderProfileRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ImportProviderProfilesRequest,
+    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
+    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource, PolicyStatus, Provider,
+    ProviderProfile, ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, SetClusterInferenceRequest,
+    SettingScope, SettingValue, UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest,
     exec_sandbox_event, setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
 use openshell_providers::{
-    ProviderRegistry, detect_provider_from_command, normalize_provider_type,
+    ProviderRegistry, ProviderTypeProfile, detect_provider_from_command, normalize_provider_type,
+    parse_profile_json, parse_profile_yaml, profile_to_json, profile_to_yaml, profiles_to_json,
+    profiles_to_yaml,
 };
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -4085,7 +4089,7 @@ pub async fn provider_list(
     Ok(())
 }
 
-pub async fn provider_list_profiles(server: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn provider_list_profiles(server: &str, output: &str, tls: &TlsOptions) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_provider_profiles(ListProviderProfilesRequest {
@@ -4100,6 +4104,23 @@ pub async fn provider_list_profiles(server: &str, tls: &TlsOptions) -> Result<()
             .cmp(&right.category)
             .then_with(|| left.id.cmp(&right.id))
     });
+    let dto_profiles = profiles
+        .iter()
+        .map(ProviderTypeProfile::from_proto)
+        .collect::<Vec<_>>();
+
+    match output {
+        "yaml" => {
+            print!("{}", profiles_to_yaml(&dto_profiles).into_diagnostic()?);
+            return Ok(());
+        }
+        "json" => {
+            println!("{}", profiles_to_json(&dto_profiles).into_diagnostic()?);
+            return Ok(());
+        }
+        "table" => {}
+        _ => return Err(miette!("unsupported output format: {output}")),
+    }
 
     if profiles.is_empty() {
         println!("No provider profiles found.");
@@ -4118,6 +4139,241 @@ pub async fn provider_list_profiles(server: &str, tls: &TlsOptions) -> Result<()
     }
 
     Ok(())
+}
+
+pub async fn provider_profile_export(
+    server: &str,
+    id: &str,
+    output: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_provider_profile(GetProviderProfileRequest { id: id.to_string() })
+        .await
+        .into_diagnostic()?;
+    let profile = response
+        .into_inner()
+        .profile
+        .ok_or_else(|| miette!("provider profile '{id}' not found"))?;
+    let profile = ProviderTypeProfile::from_proto(&profile);
+
+    match output {
+        "yaml" => print!("{}", profile_to_yaml(&profile).into_diagnostic()?),
+        "json" => println!("{}", profile_to_json(&profile).into_diagnostic()?),
+        "table" => {
+            return Err(miette!(
+                "profile export supports '-o yaml' and '-o json'; table output is not supported"
+            ));
+        }
+        _ => return Err(miette!("unsupported output format: {output}")),
+    }
+    Ok(())
+}
+
+pub async fn provider_profile_import(
+    server: &str,
+    file: Option<&Path>,
+    from: Option<&Path>,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let (items, mut diagnostics) = load_profile_import_items(file, from)?;
+    if items.is_empty() && diagnostics.is_empty() {
+        return Err(miette!("no provider profile files found"));
+    }
+    if profile_diagnostics_have_errors(&diagnostics) {
+        print_profile_diagnostics(&diagnostics);
+        return Err(miette!("provider profile import failed"));
+    }
+
+    let mut client = grpc_client(server, tls).await?;
+    if !items.is_empty() {
+        let response = client
+            .import_provider_profiles(ImportProviderProfilesRequest { profiles: items })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        diagnostics.extend(response.diagnostics);
+        if response.imported {
+            println!(
+                "Imported {} provider profile{}.",
+                response.profiles.len(),
+                if response.profiles.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+            return Ok(());
+        }
+    }
+
+    print_profile_diagnostics(&diagnostics);
+    Err(miette!("provider profile import failed"))
+}
+
+pub async fn provider_profile_lint(
+    server: &str,
+    file: Option<&Path>,
+    from: Option<&Path>,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let (items, mut diagnostics) = load_profile_import_items(file, from)?;
+    if items.is_empty() && diagnostics.is_empty() {
+        return Err(miette!("no provider profile files found"));
+    }
+
+    if !items.is_empty() {
+        let mut client = grpc_client(server, tls).await?;
+        let response = client
+            .lint_provider_profiles(LintProviderProfilesRequest { profiles: items })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        diagnostics.extend(response.diagnostics);
+    }
+
+    if profile_diagnostics_have_errors(&diagnostics) {
+        print_profile_diagnostics(&diagnostics);
+        return Err(miette!("provider profile lint failed"));
+    }
+
+    println!("Provider profile lint passed.");
+    Ok(())
+}
+
+pub async fn provider_profile_delete(server: &str, id: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .delete_provider_profile(DeleteProviderProfileRequest { id: id.to_string() })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+    if response.deleted {
+        println!("Deleted provider profile '{id}'.");
+    } else {
+        println!("Provider profile '{id}' was not deleted.");
+    }
+    Ok(())
+}
+
+fn load_profile_import_items(
+    file: Option<&Path>,
+    from: Option<&Path>,
+) -> Result<(
+    Vec<ProviderProfileImportItem>,
+    Vec<ProviderProfileDiagnostic>,
+)> {
+    let paths = profile_source_paths(file, from)?;
+    let mut items = Vec::new();
+    let mut diagnostics = Vec::new();
+    for path in paths {
+        match load_profile_import_item(&path) {
+            Ok(item) => items.push(item),
+            Err(diagnostic) => diagnostics.push(diagnostic),
+        }
+    }
+    Ok((items, diagnostics))
+}
+
+fn profile_source_paths(file: Option<&Path>, from: Option<&Path>) -> Result<Vec<PathBuf>> {
+    if let Some(file) = file {
+        return Ok(vec![file.to_path_buf()]);
+    }
+    let Some(from) = from else {
+        return Ok(Vec::new());
+    };
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(from)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read profile directory {}", from.display()))?
+    {
+        let entry = entry.into_diagnostic()?;
+        let path = entry.path();
+        if path.is_file() && profile_extension_supported(&path) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn profile_extension_supported(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("yaml" | "yml" | "json")
+    )
+}
+
+fn load_profile_import_item(
+    path: &Path,
+) -> Result<ProviderProfileImportItem, ProviderProfileDiagnostic> {
+    let source = path.display().to_string();
+    let input = std::fs::read_to_string(path).map_err(|err| {
+        profile_file_diagnostic(
+            &source,
+            format!("failed to read provider profile file: {err}"),
+        )
+    })?;
+    let profile = match path.extension().and_then(|ext| ext.to_str()) {
+        Some("yaml" | "yml") => parse_profile_yaml(&input),
+        Some("json") => parse_profile_json(&input),
+        _ => {
+            return Err(profile_file_diagnostic(
+                &source,
+                "unsupported provider profile file format".to_string(),
+            ));
+        }
+    }
+    .map_err(|err| profile_file_diagnostic(&source, err.to_string()))?;
+
+    Ok(ProviderProfileImportItem {
+        profile: Some(profile.to_proto()),
+        source,
+    })
+}
+
+fn profile_file_diagnostic(source: &str, message: String) -> ProviderProfileDiagnostic {
+    ProviderProfileDiagnostic {
+        source: source.to_string(),
+        profile_id: String::new(),
+        field: "file".to_string(),
+        message,
+        severity: "error".to_string(),
+    }
+}
+
+fn print_profile_diagnostics(diagnostics: &[ProviderProfileDiagnostic]) {
+    if diagnostics.is_empty() {
+        return;
+    }
+    eprintln!("{}", "Provider profile diagnostics:".red().bold());
+    for diagnostic in diagnostics {
+        let source = if diagnostic.source.is_empty() {
+            "<input>"
+        } else {
+            &diagnostic.source
+        };
+        let profile = if diagnostic.profile_id.is_empty() {
+            "-".to_string()
+        } else {
+            diagnostic.profile_id.clone()
+        };
+        eprintln!(
+            "  {} {} profile={} field={} {}",
+            diagnostic.severity.as_str().red(),
+            source,
+            profile,
+            diagnostic.field,
+            diagnostic.message
+        );
+    }
+}
+
+fn profile_diagnostics_have_errors(diagnostics: &[ProviderProfileDiagnostic]) -> bool {
+    diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == "error")
 }
 
 fn display_provider_category(category: i32) -> &'static str {

@@ -9,6 +9,7 @@ use clap_complete::env::CompleteEnv;
 use miette::Result;
 use owo_colors::OwoColorize;
 use std::io::Write;
+use std::path::PathBuf;
 
 use openshell_bootstrap::{
     edge_token::load_edge_token, get_gateway_metadata, list_gateways, load_active_gateway,
@@ -633,6 +634,23 @@ fn normalize_completion_script(output: Vec<u8>, executable: &std::path::Path) ->
 }
 
 #[derive(Clone, Debug, ValueEnum)]
+enum ProviderProfileOutput {
+    Table,
+    Yaml,
+    Json,
+}
+
+impl ProviderProfileOutput {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Yaml => "yaml",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Clone, Debug, ValueEnum)]
 enum CliProviderType {
     Claude,
     Opencode,
@@ -736,7 +754,15 @@ enum ProviderCommands {
 
     /// List available provider profiles.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    ListProfiles,
+    ListProfiles {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = ProviderProfileOutput::Table)]
+        output: ProviderProfileOutput,
+    },
+
+    /// Manage provider profiles.
+    #[command(subcommand, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Profile(ProviderProfileCommands),
 
     /// Update an existing provider's credentials or config.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -768,6 +794,51 @@ enum ProviderCommands {
         /// Provider names.
         #[arg(required = true, num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_provider_names))]
         names: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProviderProfileCommands {
+    /// Export a provider profile.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Export {
+        /// Provider profile id.
+        id: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = ProviderProfileOutput::Yaml)]
+        output: ProviderProfileOutput,
+    },
+
+    /// Import provider profiles from a file or directory.
+    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Import {
+        /// Profile file to import.
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: Option<PathBuf>,
+
+        /// Directory containing profile files to import.
+        #[arg(long = "from", value_hint = ValueHint::DirPath)]
+        from: Option<PathBuf>,
+    },
+
+    /// Validate provider profile files without registering them.
+    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Lint {
+        /// Profile file to lint.
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: Option<PathBuf>,
+
+        /// Directory containing profile files to lint.
+        #[arg(long = "from", value_hint = ValueHint::DirPath)]
+        from: Option<PathBuf>,
+    },
+
+    /// Delete a custom provider profile.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Provider profile id.
+        id: String,
     },
 }
 
@@ -2777,9 +2848,35 @@ async fn main() -> Result<()> {
                 } => {
                     run::provider_list(endpoint, limit, offset, names, &tls).await?;
                 }
-                ProviderCommands::ListProfiles => {
-                    run::provider_list_profiles(endpoint, &tls).await?;
+                ProviderCommands::ListProfiles { output } => {
+                    run::provider_list_profiles(endpoint, output.as_str(), &tls).await?;
                 }
+                ProviderCommands::Profile(command) => match command {
+                    ProviderProfileCommands::Export { id, output } => {
+                        run::provider_profile_export(endpoint, &id, output.as_str(), &tls).await?;
+                    }
+                    ProviderProfileCommands::Import { file, from } => {
+                        run::provider_profile_import(
+                            endpoint,
+                            file.as_deref(),
+                            from.as_deref(),
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ProviderProfileCommands::Lint { file, from } => {
+                        run::provider_profile_lint(
+                            endpoint,
+                            file.as_deref(),
+                            from.as_deref(),
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ProviderProfileCommands::Delete { id } => {
+                        run::provider_profile_delete(endpoint, &id, &tls).await?;
+                    }
+                },
                 ProviderCommands::Update {
                     name,
                     from_existing,
@@ -3479,8 +3576,79 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Provider {
-                command: Some(ProviderCommands::ListProfiles)
+                command: Some(ProviderCommands::ListProfiles {
+                    output: ProviderProfileOutput::Table
+                })
             })
+        ));
+    }
+
+    #[test]
+    fn provider_list_profiles_accepts_output_format() {
+        let cli = Cli::try_parse_from(["openshell", "provider", "list-profiles", "-o", "json"])
+            .expect("provider list-profiles -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::ListProfiles {
+                    output: ProviderProfileOutput::Json
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_profile_commands_parse() {
+        let export = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "profile",
+            "export",
+            "custom-api",
+            "-o",
+            "yaml",
+        ])
+        .expect("provider profile export should parse");
+        assert!(matches!(
+            export.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Profile(ProviderProfileCommands::Export {
+                    id,
+                    output: ProviderProfileOutput::Yaml
+                }))
+            }) if id == "custom-api"
+        ));
+
+        let import = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "profile",
+            "import",
+            "--from",
+            "./profiles",
+        ])
+        .expect("provider profile import should parse");
+        assert!(matches!(
+            import.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Profile(ProviderProfileCommands::Import {
+                    from: Some(_),
+                    ..
+                }))
+            })
+        ));
+
+        let delete =
+            Cli::try_parse_from(["openshell", "provider", "profile", "delete", "custom-api"])
+                .expect("provider profile delete should parse");
+        assert!(matches!(
+            delete.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Profile(ProviderProfileCommands::Delete {
+                    id
+                }))
+            }) if id == "custom-api"
         ));
     }
 

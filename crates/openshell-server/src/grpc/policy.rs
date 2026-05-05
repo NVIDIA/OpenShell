@@ -46,7 +46,6 @@ use openshell_ocsf::{
 use openshell_policy::{
     PolicyMergeOp, ProviderPolicyLayer, compose_effective_policy, merge_policy,
 };
-use openshell_providers::get_default_profile;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -498,11 +497,13 @@ async fn profile_provider_policy_layers(
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
 
         let provider_type = provider.r#type.trim();
-        let Some(profile) = get_default_profile(provider_type) else {
+        let Some(profile) =
+            super::provider::get_provider_type_profile(store, provider_type).await?
+        else {
             warn!(
                 provider_name = %name,
                 provider_type,
-                "provider type has no default profile; skipping provider policy layer"
+                "provider type has no profile; skipping provider policy layer"
             );
             continue;
         };
@@ -2866,6 +2867,51 @@ mod tests {
             .unwrap();
 
         assert!(layers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_policy_layers_include_custom_provider_profiles() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        store
+            .put_message(&test_provider("work-custom", "custom-api"))
+            .await
+            .unwrap();
+        store
+            .put_message(&openshell_core::proto::StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-custom-api".to_string(),
+                    name: "custom-api".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                }),
+                profile: Some(openshell_core::proto::ProviderProfile {
+                    id: "custom-api".to_string(),
+                    display_name: "Custom API".to_string(),
+                    description: String::new(),
+                    category: openshell_core::proto::ProviderProfileCategory::Other as i32,
+                    credentials: Vec::new(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.custom.example".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/custom".to_string(),
+                        ..Default::default()
+                    }],
+                    inference_capable: false,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let layers = profile_provider_policy_layers(&store, &["work-custom".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].rule_name, "_provider_work_custom");
+        assert_eq!(layers[0].rule.endpoints[0].host, "api.custom.example");
     }
 
     #[tokio::test]

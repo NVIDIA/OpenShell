@@ -187,6 +187,27 @@ impl OpenShell for RelayGateway {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn import_provider_profiles(
+        &self,
+        _: tonic::Request<openshell_core::proto::ImportProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ImportProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn lint_provider_profiles(
+        &self,
+        _: tonic::Request<openshell_core::proto::LintProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::LintProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_provider_profile(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn delete_provider(
         &self,
         _: tonic::Request<openshell_core::proto::DeleteProviderRequest>,

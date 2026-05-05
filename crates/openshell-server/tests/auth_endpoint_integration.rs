@@ -524,6 +524,30 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
         Err(tonic::Status::unimplemented("test"))
     }
 
+    async fn import_provider_profiles(
+        &self,
+        _: tonic::Request<openshell_core::proto::ImportProviderProfilesRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::ImportProviderProfilesResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("test"))
+    }
+
+    async fn lint_provider_profiles(
+        &self,
+        _: tonic::Request<openshell_core::proto::LintProviderProfilesRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::LintProviderProfilesResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("test"))
+    }
+
+    async fn delete_provider_profile(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteProviderProfileRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::DeleteProviderProfileResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("test"))
+    }
+
     async fn update_provider(
         &self,
         _: tonic::Request<openshell_core::proto::UpdateProviderRequest>,

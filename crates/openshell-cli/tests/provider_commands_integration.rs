@@ -12,8 +12,8 @@ use openshell_core::proto::{
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
-    Provider, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
+    Provider, ProviderProfile, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    SandboxResponse, SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
     WatchSandboxRequest,
 };
 use openshell_core::{ObjectId, ObjectName};
@@ -63,6 +63,7 @@ impl Drop for EnvVarGuard {
 #[derive(Clone, Default)]
 struct ProviderState {
     providers: Arc<Mutex<HashMap<String, Provider>>>,
+    profiles: Arc<Mutex<HashMap<String, ProviderProfile>>>,
 }
 
 #[derive(Clone, Default)]
@@ -205,21 +206,72 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        let mut profiles = openshell_providers::default_profiles()
+            .iter()
+            .map(openshell_providers::ProviderTypeProfile::to_proto)
+            .collect::<Vec<_>>();
+        profiles.extend(self.state.profiles.lock().await.values().cloned());
         Ok(Response::new(
-            openshell_core::proto::ListProviderProfilesResponse {
-                profiles: openshell_providers::default_profiles()
-                    .iter()
-                    .map(openshell_providers::ProviderTypeProfile::to_proto)
-                    .collect(),
-            },
+            openshell_core::proto::ListProviderProfilesResponse { profiles },
         ))
     }
 
     async fn get_provider_profile(
         &self,
-        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+        request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
     ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
+        let id = request.into_inner().id;
+        let profile = if let Some(profile) = openshell_providers::get_default_profile(&id) {
+            profile.to_proto()
+        } else {
+            self.state
+                .profiles
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| Status::not_found("provider profile not found"))?
+        };
+        Ok(Response::new(
+            openshell_core::proto::ProviderProfileResponse {
+                profile: Some(profile),
+            },
+        ))
+    }
+
+    async fn import_provider_profiles(
+        &self,
+        request: tonic::Request<openshell_core::proto::ImportProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ImportProviderProfilesResponse>, Status> {
+        let mut profiles = self.state.profiles.lock().await;
+        let imported = request
+            .into_inner()
+            .profiles
+            .into_iter()
+            .filter_map(|item| item.profile)
+            .inspect(|profile| {
+                profiles.insert(profile.id.clone(), profile.clone());
+            })
+            .collect::<Vec<_>>();
+        Ok(Response::new(
+            openshell_core::proto::ImportProviderProfilesResponse {
+                diagnostics: Vec::new(),
+                profiles: imported,
+                imported: true,
+            },
+        ))
+    }
+
+    async fn lint_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::LintProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::LintProviderProfilesResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::LintProviderProfilesResponse {
+                diagnostics: Vec::new(),
+                valid: true,
+            },
+        ))
     }
 
     async fn update_provider(
@@ -279,6 +331,17 @@ impl OpenShell for TestOpenShell {
         let name = request.into_inner().name;
         let deleted = self.state.providers.lock().await.remove(&name).is_some();
         Ok(Response::new(DeleteProviderResponse { deleted }))
+    }
+
+    async fn delete_provider_profile(
+        &self,
+        request: tonic::Request<openshell_core::proto::DeleteProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
+        let id = request.into_inner().id;
+        let deleted = self.state.profiles.lock().await.remove(&id).is_some();
+        Ok(Response::new(
+            openshell_core::proto::DeleteProviderProfileResponse { deleted },
+        ))
     }
 
     type WatchSandboxStream =
@@ -554,9 +617,50 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
 async fn provider_list_profiles_cli_uses_profile_browsing_rpc() {
     let ts = run_server().await;
 
-    run::provider_list_profiles(&ts.endpoint, &ts.tls)
+    run::provider_list_profiles(&ts.endpoint, "table", &ts.tls)
         .await
         .expect("provider list-profiles");
+}
+
+#[tokio::test]
+async fn provider_profile_cli_run_functions_support_custom_profiles() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile_path = dir.path().join("custom-api.yaml");
+    std::fs::write(
+        &profile_path,
+        r"
+id: custom-api
+display_name: Custom API
+category: other
+credentials:
+  - name: api_key
+    env_vars: [CUSTOM_API_KEY]
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: api.custom.example
+    port: 443
+binaries: [/usr/bin/custom]
+",
+    )
+    .unwrap();
+
+    run::provider_profile_lint(&ts.endpoint, Some(&profile_path), None, &ts.tls)
+        .await
+        .expect("profile lint");
+    run::provider_profile_import(&ts.endpoint, Some(&profile_path), None, &ts.tls)
+        .await
+        .expect("profile import");
+    run::provider_profile_export(&ts.endpoint, "custom-api", "yaml", &ts.tls)
+        .await
+        .expect("profile export");
+    run::provider_list_profiles(&ts.endpoint, "json", &ts.tls)
+        .await
+        .expect("provider list-profiles json");
+    run::provider_profile_delete(&ts.endpoint, "custom-api", &ts.tls)
+        .await
+        .expect("profile delete");
 }
 
 #[tokio::test]

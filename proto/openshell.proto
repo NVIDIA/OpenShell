@@ -59,11 +59,23 @@ service OpenShell {
   rpc GetProviderProfile(GetProviderProfileRequest)
       returns (ProviderProfileResponse);
 
+  // Import custom provider type profiles.
+  rpc ImportProviderProfiles(ImportProviderProfilesRequest)
+      returns (ImportProviderProfilesResponse);
+
+  // Validate provider type profiles without registering them.
+  rpc LintProviderProfiles(LintProviderProfilesRequest)
+      returns (LintProviderProfilesResponse);
+
   // Update an existing provider by name.
   rpc UpdateProvider(UpdateProviderRequest) returns (ProviderResponse);
 
   // Delete a provider by name.
   rpc DeleteProvider(DeleteProviderRequest) returns (DeleteProviderResponse);
+
+  // Delete a custom provider type profile by id.
+  rpc DeleteProviderProfile(DeleteProviderProfileRequest)
+      returns (DeleteProviderProfileResponse);
 
   // Get sandbox settings by id (called by sandbox entrypoint and poll loop).
   rpc GetSandboxConfig(openshell.sandbox.v1.GetSandboxConfigRequest)
@@ -581,6 +593,21 @@ message GetProviderProfileRequest {
   string id = 1;
 }
 
+// Provider profile payload with optional source metadata for diagnostics.
+message ProviderProfileImportItem {
+  ProviderProfile profile = 1;
+  string source = 2;
+}
+
+// Provider profile validation diagnostic.
+message ProviderProfileDiagnostic {
+  string source = 1;
+  string profile_id = 2;
+  string field = 3;
+  string message = 4;
+  string severity = 5;
+}
+
 // Provider credential declaration.
 message ProviderProfileCredential {
   string name = 1;
@@ -616,6 +643,12 @@ message ProviderProfile {
   bool inference_capable = 8;
 }
 
+// Stored custom provider profile object.
+message StoredProviderProfile {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  ProviderProfile profile = 2;
+}
+
 // Provider profile response.
 message ProviderProfileResponse {
   ProviderProfile profile = 1;
@@ -626,8 +659,41 @@ message ListProviderProfilesResponse {
   repeated ProviderProfile profiles = 1;
 }
 
+// Import custom provider profiles request.
+message ImportProviderProfilesRequest {
+  repeated ProviderProfileImportItem profiles = 1;
+}
+
+// Import custom provider profiles response.
+message ImportProviderProfilesResponse {
+  repeated ProviderProfileDiagnostic diagnostics = 1;
+  repeated ProviderProfile profiles = 2;
+  bool imported = 3;
+}
+
+// Lint provider profiles request.
+message LintProviderProfilesRequest {
+  repeated ProviderProfileImportItem profiles = 1;
+}
+
+// Lint provider profiles response.
+message LintProviderProfilesResponse {
+  repeated ProviderProfileDiagnostic diagnostics = 1;
+  bool valid = 2;
+}
+
 // Delete provider response.
 message DeleteProviderResponse {
+  bool deleted = 1;
+}
+
+// Delete custom provider profile request.
+message DeleteProviderProfileRequest {
+  string id = 1;
+}
+
+// Delete custom provider profile response.
+message DeleteProviderProfileResponse {
   bool deleted = 1;
 }
 

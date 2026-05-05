@@ -3540,6 +3540,7 @@ version = "0.0.0"
 dependencies = [
  "openshell-core",
  "serde",
+ "serde_json",
  "serde_yml",
  "thiserror 2.0.18",
 ]

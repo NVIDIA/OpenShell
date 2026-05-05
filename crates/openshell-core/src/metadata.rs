@@ -5,7 +5,9 @@
 //!
 //! These traits provide uniform access to `ObjectMeta` fields across all resource types.
 
-use crate::proto::{InferenceRoute, ObjectForTest, Provider, Sandbox, SshSession};
+use crate::proto::{
+    InferenceRoute, ObjectForTest, Provider, Sandbox, SshSession, StoredProviderProfile,
+};
 use std::collections::HashMap;
 
 /// Provides access to the object's unique identifier.
@@ -56,6 +58,25 @@ impl ObjectName for Provider {
 }
 
 impl ObjectLabels for Provider {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+// Implementations for StoredProviderProfile
+impl ObjectId for StoredProviderProfile {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for StoredProviderProfile {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for StoredProviderProfile {
     fn object_labels(&self) -> Option<HashMap<String, String>> {
         self.metadata.as_ref().map(|m| m.labels.clone())
     }
