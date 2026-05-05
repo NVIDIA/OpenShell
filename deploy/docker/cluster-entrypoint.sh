@@ -431,15 +431,17 @@ fi
 
 # In push mode, use the exact image references that were imported into cluster
 # containerd so the Helm release cannot drift back to remote ":latest" tags.
-# Only the gateway image is pushed; sandbox images are pulled from the
-# community registry at runtime.
+# Gateway and supervisor images may be pushed; sandbox base images are pulled
+# from the community registry at runtime.
 if [ -n "${PUSH_IMAGE_REFS:-}" ] && [ -f "$HELMCHART" ]; then
     server_image=""
+    supervisor_image=""
     old_ifs="$IFS"
     IFS=','
     for ref in $PUSH_IMAGE_REFS; do
         case "$ref" in
             */gateway:*) server_image="$ref" ;;
+            */supervisor:*) supervisor_image="$ref" ;;
         esac
     done
     IFS="$old_ifs"
@@ -451,6 +453,11 @@ if [ -n "${PUSH_IMAGE_REFS:-}" ] && [ -f "$HELMCHART" ]; then
         echo "Setting server image tag: ${server_tag}"
         sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${server_repo}|" "$HELMCHART"
         sed -i -E "s|tag:[[:space:]]*\"?[^\"[:space:]]+\"?|tag: \"${server_tag}\"|" "$HELMCHART"
+    fi
+
+    if [ -n "$supervisor_image" ]; then
+        echo "Setting supervisor image: ${supervisor_image}"
+        sed -i -E "s|supervisorImage:[[:space:]]*\"?[^\"]+\"?|supervisorImage: ${supervisor_image}|" "$HELMCHART"
     fi
 fi
 
