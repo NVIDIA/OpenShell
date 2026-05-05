@@ -47,7 +47,7 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      HELM_E2E_CLUSTER_NAME: openshell-helm-e2e-${{ github.run_id }}-rust
+      HELM_E2E_CLUSTER_NAME: helm-e2e-${{ github.run_id }}-rust
     steps:
       - uses: actions/checkout@v6
 
@@ -79,7 +79,7 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      HELM_E2E_CLUSTER_NAME: openshell-helm-e2e-${{ github.run_id }}-python
+      HELM_E2E_CLUSTER_NAME: helm-e2e-${{ github.run_id }}-python
     steps:
       - uses: actions/checkout@v6
 

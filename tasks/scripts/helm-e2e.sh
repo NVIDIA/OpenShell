@@ -35,7 +35,7 @@ _branch_cluster_name() {
   local branch
   branch="$(git -C "${ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")"
   local suffix="${branch##*/}"
-  suffix="${suffix:0:24}"
+  suffix="${suffix:0:18}"
   echo "openshell-dev-${suffix}"
 }
 
