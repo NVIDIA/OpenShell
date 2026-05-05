@@ -114,6 +114,34 @@ merge_kubeconfig() {
   rm -f "${tmp}"
 
   kubectl --kubeconfig="${KUBECONFIG_TARGET}" config use-context "$(k3d_context_name)"
+
+  # When this script runs inside a container (e.g., a GitHub Actions
+  # `container:` job mounting /var/run/docker.sock), k3d publishes the API
+  # server on the host's `0.0.0.0:<port>` but `0.0.0.0` from inside the
+  # container is not the host. Rewrite the server URL to the default-route
+  # gateway, which routes to the docker host. The API server cert is signed
+  # for `0.0.0.0` / `127.0.0.1` and won't have the gateway IP as a SAN, so
+  # mark the cluster insecure-skip-tls-verify (CI-only path; local dev keeps
+  # the default secure setup).
+  if [[ -f /.dockerenv ]]; then
+    local context old_server new_server host_addr
+    context="$(k3d_context_name)"
+    old_server=$(kubectl --kubeconfig="${KUBECONFIG_TARGET}" config view --raw \
+      -o "jsonpath={.clusters[?(@.name=='${context}')].cluster.server}")
+    if [[ "${old_server}" == https://0.0.0.0:* ]]; then
+      host_addr=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+      if [[ -n "${host_addr}" ]]; then
+        new_server="${old_server//0.0.0.0/${host_addr}}"
+        echo "Inside container; rewriting kubeconfig server ${old_server} -> ${new_server} (insecure-skip-tls-verify)."
+        kubectl --kubeconfig="${KUBECONFIG_TARGET}" config unset \
+          "clusters.${context}.certificate-authority-data" >/dev/null 2>&1 || true
+        kubectl --kubeconfig="${KUBECONFIG_TARGET}" config set-cluster "${context}" \
+          --server="${new_server}" --insecure-skip-tls-verify=true >/dev/null
+      else
+        echo "warning: running inside a container but could not detect a default-route gateway; kubectl may fail to reach the API server." >&2
+      fi
+    fi
+  fi
 }
 
 apply_base_manifests() {
