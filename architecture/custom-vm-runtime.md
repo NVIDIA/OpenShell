@@ -299,8 +299,8 @@ versions change.
 
 | Platform | Runner | Build Method |
 |----------|--------|-------------|
-| Linux ARM64 | `build-arm64` (self-hosted) | Native `build-libkrun.sh` |
-| Linux x86_64 | `build-amd64` (self-hosted) | Native `build-libkrun.sh` |
+| Linux ARM64 | `linux-arm64-cpu8` (shared runner) | Native `build-libkrun.sh` |
+| Linux x86_64 | `linux-amd64-cpu8` (shared runner) | Native `build-libkrun.sh` |
 | macOS ARM64 | `macos-latest-xlarge` (GitHub-hosted) | `build-libkrun-macos.sh` |
 
 Artifacts: `vm-runtime-{platform}.tar.zst` containing libkrun, libkrunfw,
@@ -320,6 +320,9 @@ from the `vm-dev` release; the `build-openshell-driver-vm` jobs set
 run `cargo build --release -p openshell-driver-vm`. The macOS driver is
 cross-compiled via osxcross (no macOS runner needed for the binary build —
 only for the kernel build).
+
+These release workflows build and package VM artifacts. They do not validate
+VFIO GPU passthrough; passthrough requires a dedicated VFIO-capable host.
 
 macOS driver binaries produced via osxcross are not codesigned. Development
 builds are signed automatically by `tasks/scripts/gateway-vm.sh`
