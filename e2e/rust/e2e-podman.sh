@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Run the Rust e2e smoke test against a Podman-backed gateway.
+# Run Rust e2e tests against a Podman-backed gateway.
 #
 # Usage:
 #   mise run e2e:podman                     # start a gateway with Podman driver
+#   mise run e2e:podman:gpu                 # run the CDI GPU test binary
 #   mise run e2e:podman -- --port=9090      # use a specific port
 #
 # Options:
@@ -15,7 +16,7 @@
 #   1. Verifies Podman is available and the socket is reachable
 #   2. Starts openshell-gateway with --drivers podman --disable-tls
 #   3. Waits for the gateway to become healthy
-#   4. Runs the Rust smoke test
+#   4. Runs the selected Rust e2e test
 #   5. Cleans up the gateway process and any leftover sandbox containers
 #
 # Prerequisites:
@@ -28,6 +29,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 TIMEOUT=120
+E2E_TEST="${OPENSHELL_E2E_PODMAN_TEST:-smoke}"
+GPU_MODE="${OPENSHELL_E2E_PODMAN_GPU:-0}"
 
 # ── Parse arguments ──────────────────────────────────────────────────
 PORT=""
@@ -54,6 +57,11 @@ if ! podman info &>/dev/null; then
   echo "  systemctl --user start podman.socket"
   exit 1
 fi
+if [ "${GPU_MODE}" = "1" ] && [ ! -e /dev/nvidia0 ]; then
+  echo "ERROR: e2e:podman:gpu requires NVIDIA GPU devices and CDI support." >&2
+  echo "       Verify /dev/nvidia0 exists and Podman can resolve nvidia.com/gpu=0." >&2
+  exit 2
+fi
 
 if [ ! -f "${GATEWAY_BIN}" ]; then
   echo "Building openshell-gateway..."
@@ -63,7 +71,7 @@ fi
 # ── Resolve images ───────────────────────────────────────────────────
 # Use the same image defaults as the driver, allowing env overrides.
 SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE:-openshell/supervisor:dev}"
-SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-}"
+SANDBOX_IMAGE="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-}}"
 
 # Verify the supervisor image exists locally.
 if ! podman image exists "${SUPERVISOR_IMAGE}" 2>/dev/null; then
@@ -155,14 +163,14 @@ if [ "${healthy}" != "true" ]; then
 fi
 echo "Gateway is ready (${elapsed}s)."
 
-# ── Run the smoke test ───────────────────────────────────────────────
+# ── Run the selected test ────────────────────────────────────────────
 export OPENSHELL_GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 # Use a synthetic gateway name so the CLI does not require stored mTLS creds.
 export OPENSHELL_GATEWAY="e2e-podman"
 export OPENSHELL_PROVISION_TIMEOUT=300
 
-echo "Running e2e smoke test (gateway: ${OPENSHELL_GATEWAY}, endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})..."
+echo "Running e2e ${E2E_TEST} test (gateway: ${OPENSHELL_GATEWAY}, endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})..."
 cargo build -p openshell-cli --features openshell-core/dev-settings
-cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test smoke -- --nocapture
+cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test "${E2E_TEST}" -- --nocapture
 
-echo "Smoke test passed."
+echo "${E2E_TEST} test passed."
