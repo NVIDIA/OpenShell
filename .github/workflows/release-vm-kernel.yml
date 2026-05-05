@@ -92,6 +92,7 @@ jobs:
           path: |
             target/libkrun-build/kernel.c
             target/libkrun-build/ABI_VERSION
+          if-no-files-found: error
           retention-days: 1
 
   # ---------------------------------------------------------------------------
