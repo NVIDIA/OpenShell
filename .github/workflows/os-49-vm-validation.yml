@@ -27,6 +27,8 @@ jobs:
             runner: linux-amd64-cpu8
           - name: linux-arm64-cpu8
             runner: linux-arm64-cpu8
+          - name: linux-amd64-rtxpro6000-kvm
+            runner: linux-amd64-gpu-rtxpro6000-latest-1
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
