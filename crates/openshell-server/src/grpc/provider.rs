@@ -700,8 +700,9 @@ mod tests {
     use openshell_core::Config;
     use openshell_core::proto::{
         DeleteProviderProfileRequest, GetProviderProfileRequest, ImportProviderProfilesRequest,
-        LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkEndpoint, ProviderProfile,
-        ProviderProfileCategory, ProviderProfileImportItem, Sandbox, SandboxSpec,
+        L7Allow, L7Rule, LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkBinary,
+        NetworkEndpoint, ProviderProfile, ProviderProfileCategory, ProviderProfileImportItem,
+        Sandbox, SandboxSpec,
     };
     use openshell_core::{ObjectId, ObjectName};
     use std::collections::HashMap;
@@ -974,6 +975,79 @@ mod tests {
             .unwrap_err();
             assert_eq!(missing.code(), Code::NotFound);
         }
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn import_provider_profiles_preserves_advanced_proto_policy_fields() {
+        let state = test_server_state().await;
+        let response = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(ProviderProfile {
+                        id: "advanced-api".to_string(),
+                        display_name: "Advanced API".to_string(),
+                        description: String::new(),
+                        category: ProviderProfileCategory::Other as i32,
+                        credentials: Vec::new(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "api.advanced.example".to_string(),
+                            protocol: "rest".to_string(),
+                            ports: vec![443, 8443],
+                            allowed_ips: vec!["10.0.0.0/24".to_string()],
+                            rules: vec![L7Rule {
+                                allow: Some(L7Allow {
+                                    method: "GET".to_string(),
+                                    path: "/v1/**".to_string(),
+                                    ..Default::default()
+                                }),
+                            }],
+                            allow_encoded_slash: true,
+                            path: "/v1".to_string(),
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/advanced".to_string(),
+                            harness: true,
+                        }],
+                        inference_capable: false,
+                    }),
+                    source: "advanced-api.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(response.imported);
+
+        let fetched = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: "advanced-api".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profile
+        .expect("profile should exist");
+        let endpoint = fetched.endpoints.first().expect("endpoint should exist");
+        assert_eq!(endpoint.ports, vec![443, 8443]);
+        assert_eq!(endpoint.allowed_ips, vec!["10.0.0.0/24"]);
+        assert_eq!(endpoint.rules.len(), 1);
+        assert_eq!(
+            endpoint.rules[0]
+                .allow
+                .as_ref()
+                .map(|allow| allow.path.as_str()),
+            Some("/v1/**")
+        );
+        assert!(endpoint.allow_encoded_slash);
+        assert_eq!(endpoint.path, "/v1");
+        assert!(fetched.binaries[0].harness);
     }
 
     #[tokio::test]

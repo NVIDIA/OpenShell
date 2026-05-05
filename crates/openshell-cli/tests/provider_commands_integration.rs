@@ -709,6 +709,67 @@ binaries: [/usr/bin/yaml-client]
 }
 
 #[tokio::test]
+#[allow(deprecated)]
+async fn provider_profile_import_preserves_advanced_network_policy_fields() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile_path = dir.path().join("advanced-api.yaml");
+    std::fs::write(
+        &profile_path,
+        r"
+id: advanced-api
+display_name: Advanced API
+category: other
+endpoints:
+  - host: api.advanced.example
+    ports: [443, 8443]
+    protocol: rest
+    tls: terminate
+    enforcement: enforce
+    rules:
+      - allow:
+          method: GET
+          path: /v1/**
+    allowed_ips: [10.0.0.0/24]
+    deny_rules:
+      - method: POST
+        path: /admin/**
+    allow_encoded_slash: true
+    path: /v1
+binaries:
+  - path: /usr/bin/advanced
+    harness: true
+",
+    )
+    .unwrap();
+
+    run::provider_profile_import(&ts.endpoint, Some(&profile_path), None, &ts.tls)
+        .await
+        .expect("profile import");
+
+    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+        .await
+        .expect("grpc client should connect");
+    let profile = client
+        .get_provider_profile(openshell_core::proto::GetProviderProfileRequest {
+            id: "advanced-api".to_string(),
+        })
+        .await
+        .expect("get provider profile")
+        .into_inner()
+        .profile
+        .expect("profile should exist");
+    let endpoint = profile.endpoints.first().expect("endpoint should exist");
+    assert_eq!(endpoint.ports, vec![443, 8443]);
+    assert_eq!(endpoint.rules.len(), 1);
+    assert_eq!(endpoint.deny_rules.len(), 1);
+    assert_eq!(endpoint.allowed_ips, vec!["10.0.0.0/24"]);
+    assert!(endpoint.allow_encoded_slash);
+    assert_eq!(endpoint.path, "/v1");
+    assert!(profile.binaries[0].harness);
+}
+
+#[tokio::test]
 async fn provider_profile_import_from_directory_parse_error_prevents_partial_import() {
     let ts = run_server().await;
     let dir = tempfile::tempdir().unwrap();

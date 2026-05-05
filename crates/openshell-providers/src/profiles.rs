@@ -6,11 +6,12 @@
 #![allow(deprecated)] // NetworkBinary::harness remains in the public proto for compatibility.
 
 use openshell_core::proto::{
-    NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProviderProfile, ProviderProfileCategory,
-    ProviderProfileCredential,
+    GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, NetworkBinary, NetworkEndpoint,
+    NetworkPolicyRule, ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
 };
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
@@ -88,13 +89,100 @@ pub struct CredentialProfile {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EndpointProfile {
     pub host: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub port: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub protocol: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tls: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub access: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub enforcement: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<L7RuleProfile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_ips: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_rules: Vec<L7DenyRuleProfile>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_encoded_slash: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub persisted_queries: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub graphql_persisted_queries: HashMap<String, GraphqlOperationProfile>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub graphql_max_body_bytes: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct L7RuleProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<L7AllowProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct L7AllowProfile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub method: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub query: HashMap<String, L7QueryMatcherProfile>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct L7DenyRuleProfile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub method: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub query: HashMap<String, L7QueryMatcherProfile>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct L7QueryMatcherProfile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub glob: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub any: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GraphqlOperationProfile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryProfile {
+    pub path: String,
+    pub harness: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -114,7 +202,7 @@ pub struct ProviderTypeProfile {
     #[serde(default)]
     pub endpoints: Vec<EndpointProfile>,
     #[serde(default)]
-    pub binaries: Vec<String>,
+    pub binaries: Vec<BinaryProfile>,
     #[serde(default)]
     pub inference_capable: bool,
 }
@@ -142,11 +230,7 @@ impl ProviderTypeProfile {
                 })
                 .collect(),
             endpoints: profile.endpoints.iter().map(endpoint_from_proto).collect(),
-            binaries: profile
-                .binaries
-                .iter()
-                .map(|binary| binary.path.clone())
-                .collect(),
+            binaries: profile.binaries.iter().map(binary_from_proto).collect(),
             inference_capable: profile.inference_capable,
         }
     }
@@ -185,14 +269,7 @@ impl ProviderTypeProfile {
                 })
                 .collect(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
-            binaries: self
-                .binaries
-                .iter()
-                .map(|path| NetworkBinary {
-                    path: path.clone(),
-                    harness: false,
-                })
-                .collect(),
+            binaries: self.binaries.iter().map(binary_to_proto).collect(),
             inference_capable: self.inference_capable,
         }
     }
@@ -202,20 +279,70 @@ impl ProviderTypeProfile {
         NetworkPolicyRule {
             name: rule_name.to_string(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
-            binaries: self
-                .binaries
-                .iter()
-                .map(|path| NetworkBinary {
-                    path: path.clone(),
-                    harness: false,
-                })
-                .collect(),
+            binaries: self.binaries.iter().map(binary_to_proto).collect(),
+        }
+    }
+}
+
+impl Serialize for BinaryProfile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if !self.harness {
+            return serializer.serialize_str(&self.path);
+        }
+        let mut state = serializer.serialize_struct("BinaryProfile", 2)?;
+        state.serialize_field("path", &self.path)?;
+        state.serialize_field("harness", &self.harness)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for BinaryProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum BinaryProfileInput {
+            Path(String),
+            Object(BinaryProfileObject),
+        }
+
+        #[derive(Deserialize)]
+        struct BinaryProfileObject {
+            path: String,
+            #[serde(default)]
+            harness: bool,
+        }
+
+        match BinaryProfileInput::deserialize(deserializer)? {
+            BinaryProfileInput::Path(path) => Ok(Self {
+                path,
+                harness: false,
+            }),
+            BinaryProfileInput::Object(binary) => Ok(Self {
+                path: binary.path,
+                harness: binary.harness,
+            }),
         }
     }
 }
 
 fn default_category() -> ProviderProfileCategory {
     ProviderProfileCategory::Other
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 fn deserialize_category<'de, D>(deserializer: D) -> Result<ProviderProfileCategory, D::Error>
@@ -270,30 +397,170 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         host: endpoint.host.clone(),
         port: endpoint.port,
         protocol: endpoint.protocol.clone(),
-        tls: String::new(),
+        tls: endpoint.tls.clone(),
         enforcement: endpoint.enforcement.clone(),
         access: endpoint.access.clone(),
-        rules: Vec::new(),
-        allowed_ips: Vec::new(),
-        ports: Vec::new(),
-        deny_rules: Vec::new(),
-        allow_encoded_slash: false,
-        ..Default::default()
+        rules: endpoint.rules.iter().map(rule_to_proto).collect(),
+        allowed_ips: endpoint.allowed_ips.clone(),
+        ports: endpoint.ports.clone(),
+        deny_rules: endpoint.deny_rules.iter().map(deny_rule_to_proto).collect(),
+        allow_encoded_slash: endpoint.allow_encoded_slash,
+        persisted_queries: endpoint.persisted_queries.clone(),
+        graphql_persisted_queries: endpoint
+            .graphql_persisted_queries
+            .iter()
+            .map(|(name, operation)| (name.clone(), graphql_operation_to_proto(operation)))
+            .collect(),
+        graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
+        path: endpoint.path.clone(),
     }
 }
 
 fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
-    let port = if endpoint.port != 0 {
-        endpoint.port
-    } else {
-        endpoint.ports.first().copied().unwrap_or_default()
-    };
     EndpointProfile {
         host: endpoint.host.clone(),
-        port,
+        port: endpoint.port,
         protocol: endpoint.protocol.clone(),
+        tls: endpoint.tls.clone(),
         access: endpoint.access.clone(),
         enforcement: endpoint.enforcement.clone(),
+        rules: endpoint.rules.iter().map(rule_from_proto).collect(),
+        allowed_ips: endpoint.allowed_ips.clone(),
+        ports: endpoint.ports.clone(),
+        deny_rules: endpoint
+            .deny_rules
+            .iter()
+            .map(deny_rule_from_proto)
+            .collect(),
+        allow_encoded_slash: endpoint.allow_encoded_slash,
+        persisted_queries: endpoint.persisted_queries.clone(),
+        graphql_persisted_queries: endpoint
+            .graphql_persisted_queries
+            .iter()
+            .map(|(name, operation)| (name.clone(), graphql_operation_from_proto(operation)))
+            .collect(),
+        graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
+        path: endpoint.path.clone(),
+    }
+}
+
+fn binary_to_proto(binary: &BinaryProfile) -> NetworkBinary {
+    NetworkBinary {
+        path: binary.path.clone(),
+        harness: binary.harness,
+    }
+}
+
+fn binary_from_proto(binary: &NetworkBinary) -> BinaryProfile {
+    BinaryProfile {
+        path: binary.path.clone(),
+        harness: binary.harness,
+    }
+}
+
+fn rule_to_proto(rule: &L7RuleProfile) -> L7Rule {
+    L7Rule {
+        allow: rule.allow.as_ref().map(allow_to_proto),
+    }
+}
+
+fn rule_from_proto(rule: &L7Rule) -> L7RuleProfile {
+    L7RuleProfile {
+        allow: rule.allow.as_ref().map(allow_from_proto),
+    }
+}
+
+fn allow_to_proto(allow: &L7AllowProfile) -> L7Allow {
+    L7Allow {
+        method: allow.method.clone(),
+        path: allow.path.clone(),
+        command: allow.command.clone(),
+        query: allow
+            .query
+            .iter()
+            .map(|(name, matcher)| (name.clone(), query_matcher_to_proto(matcher)))
+            .collect(),
+        operation_type: allow.operation_type.clone(),
+        operation_name: allow.operation_name.clone(),
+        fields: allow.fields.clone(),
+    }
+}
+
+fn allow_from_proto(allow: &L7Allow) -> L7AllowProfile {
+    L7AllowProfile {
+        method: allow.method.clone(),
+        path: allow.path.clone(),
+        command: allow.command.clone(),
+        query: allow
+            .query
+            .iter()
+            .map(|(name, matcher)| (name.clone(), query_matcher_from_proto(matcher)))
+            .collect(),
+        operation_type: allow.operation_type.clone(),
+        operation_name: allow.operation_name.clone(),
+        fields: allow.fields.clone(),
+    }
+}
+
+fn deny_rule_to_proto(rule: &L7DenyRuleProfile) -> L7DenyRule {
+    L7DenyRule {
+        method: rule.method.clone(),
+        path: rule.path.clone(),
+        command: rule.command.clone(),
+        query: rule
+            .query
+            .iter()
+            .map(|(name, matcher)| (name.clone(), query_matcher_to_proto(matcher)))
+            .collect(),
+        operation_type: rule.operation_type.clone(),
+        operation_name: rule.operation_name.clone(),
+        fields: rule.fields.clone(),
+    }
+}
+
+fn deny_rule_from_proto(rule: &L7DenyRule) -> L7DenyRuleProfile {
+    L7DenyRuleProfile {
+        method: rule.method.clone(),
+        path: rule.path.clone(),
+        command: rule.command.clone(),
+        query: rule
+            .query
+            .iter()
+            .map(|(name, matcher)| (name.clone(), query_matcher_from_proto(matcher)))
+            .collect(),
+        operation_type: rule.operation_type.clone(),
+        operation_name: rule.operation_name.clone(),
+        fields: rule.fields.clone(),
+    }
+}
+
+fn query_matcher_to_proto(matcher: &L7QueryMatcherProfile) -> L7QueryMatcher {
+    L7QueryMatcher {
+        glob: matcher.glob.clone(),
+        any: matcher.any.clone(),
+    }
+}
+
+fn query_matcher_from_proto(matcher: &L7QueryMatcher) -> L7QueryMatcherProfile {
+    L7QueryMatcherProfile {
+        glob: matcher.glob.clone(),
+        any: matcher.any.clone(),
+    }
+}
+
+fn graphql_operation_to_proto(operation: &GraphqlOperationProfile) -> GraphqlOperation {
+    GraphqlOperation {
+        operation_type: operation.operation_type.clone(),
+        operation_name: operation.operation_name.clone(),
+        fields: operation.fields.clone(),
+    }
+}
+
+fn graphql_operation_from_proto(operation: &GraphqlOperation) -> GraphqlOperationProfile {
+    GraphqlOperationProfile {
+        operation_type: operation.operation_type.clone(),
+        operation_name: operation.operation_name.clone(),
+        fields: operation.fields.clone(),
     }
 }
 
@@ -365,9 +632,10 @@ fn validate_profiles(profiles: &[ProviderTypeProfile]) -> Result<(), ProfileErro
             && let Some(profile) = profiles
                 .iter()
                 .find(|profile| profile.id == diagnostic.profile_id)
-            && let Some(endpoint) = profile.endpoints.iter().find(|endpoint| {
-                endpoint.host.trim().is_empty() || endpoint.port == 0 || endpoint.port > 65_535
-            })
+            && let Some(endpoint) = profile
+                .endpoints
+                .iter()
+                .find(|endpoint| !endpoint_is_valid(endpoint))
         {
             return Err(ProfileError::InvalidEndpoint {
                 id: profile.id.clone(),
@@ -477,7 +745,7 @@ pub fn validate_profile_set(
         }
 
         for (index, endpoint) in profile.endpoints.iter().enumerate() {
-            if endpoint.host.trim().is_empty() || endpoint.port == 0 || endpoint.port > 65_535 {
+            if !endpoint_is_valid(endpoint) {
                 diagnostics.push(ProfileValidationDiagnostic::error(
                     source,
                     profile_id,
@@ -488,7 +756,7 @@ pub fn validate_profile_set(
         }
 
         for (index, binary) in profile.binaries.iter().enumerate() {
-            if binary.trim().is_empty() {
+            if binary.path.trim().is_empty() {
                 diagnostics.push(ProfileValidationDiagnostic::error(
                     source,
                     profile_id,
@@ -499,6 +767,19 @@ pub fn validate_profile_set(
         }
     }
     diagnostics
+}
+
+fn endpoint_is_valid(endpoint: &EndpointProfile) -> bool {
+    if endpoint.host.trim().is_empty() {
+        return false;
+    }
+    if !endpoint.ports.is_empty() {
+        return endpoint
+            .ports
+            .iter()
+            .all(|port| (1..=65_535).contains(port));
+    }
+    (1..=65_535).contains(&endpoint.port)
 }
 
 static DEFAULT_PROFILES: OnceLock<Vec<ProviderTypeProfile>> = OnceLock::new();
@@ -526,7 +807,8 @@ mod tests {
 
     use super::{
         ProfileError, default_profiles, get_default_profile, parse_profile_catalog_yamls,
-        parse_profile_json, parse_profile_yaml, profile_to_json, validate_profile_set,
+        parse_profile_json, parse_profile_yaml, profile_to_json, profile_to_yaml,
+        validate_profile_set,
     };
 
     #[test]
@@ -589,7 +871,90 @@ credentials:
 
         assert_eq!(parsed.id, "github");
         assert_eq!(parsed.category, ProviderProfileCategory::SourceControl);
-        assert_eq!(parsed.binaries[0], "/usr/bin/gh");
+        assert_eq!(parsed.binaries[0].path, "/usr/bin/gh");
+    }
+
+    #[test]
+    fn profile_yaml_round_trip_preserves_full_network_policy_fields() {
+        let profile = parse_profile_yaml(
+            r"
+id: advanced
+display_name: Advanced
+category: other
+endpoints:
+  - host: api.example.com
+    ports: [443, 8443]
+    protocol: rest
+    tls: terminate
+    enforcement: enforce
+    access: read-only
+    rules:
+      - allow:
+          method: GET
+          path: /v1/**
+          query:
+            state:
+              any: [open, closed]
+    allowed_ips: [10.0.0.0/24]
+    deny_rules:
+      - method: POST
+        path: /admin/**
+    allow_encoded_slash: true
+    persisted_queries: allow_registered
+    graphql_persisted_queries:
+      hash-a:
+        operation_type: query
+        operation_name: Viewer
+        fields: [viewer]
+    graphql_max_body_bytes: 131072
+    path: /graphql
+binaries:
+  - path: /usr/bin/custom
+    harness: true
+",
+        )
+        .expect("profile should parse");
+        let diagnostics = validate_profile_set(&[("advanced.yaml".to_string(), profile.clone())]);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+
+        let proto = profile.to_proto();
+        let endpoint = proto.endpoints.first().expect("endpoint should exist");
+        assert_eq!(endpoint.port, 0);
+        assert_eq!(endpoint.ports, vec![443, 8443]);
+        assert_eq!(endpoint.tls, "terminate");
+        assert_eq!(endpoint.allowed_ips, vec!["10.0.0.0/24"]);
+        assert!(endpoint.allow_encoded_slash);
+        assert_eq!(endpoint.persisted_queries, "allow_registered");
+        assert_eq!(endpoint.graphql_max_body_bytes, 131_072);
+        assert_eq!(endpoint.path, "/graphql");
+        assert_eq!(
+            endpoint
+                .rules
+                .first()
+                .and_then(|rule| rule.allow.as_ref())
+                .map(|allow| allow.method.as_str()),
+            Some("GET")
+        );
+        assert_eq!(endpoint.deny_rules[0].method, "POST");
+        assert_eq!(
+            endpoint
+                .graphql_persisted_queries
+                .get("hash-a")
+                .map(|operation| operation.operation_name.as_str()),
+            Some("Viewer")
+        );
+        assert!(proto.binaries[0].harness);
+
+        let reparsed = parse_profile_yaml(&profile_to_yaml(&profile).expect("serialize YAML"))
+            .expect("serialized profile should parse");
+        let reprotoo = reparsed.to_proto();
+        assert_eq!(reprotoo.endpoints[0].rules.len(), 1);
+        assert_eq!(reprotoo.endpoints[0].deny_rules.len(), 1);
+        assert_eq!(reprotoo.endpoints[0].ports, vec![443, 8443]);
+        assert!(reprotoo.binaries[0].harness);
     }
 
     #[test]

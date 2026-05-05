@@ -2870,6 +2870,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn provider_policy_layers_include_custom_provider_profiles() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         store
@@ -2892,12 +2893,23 @@ mod tests {
                     credentials: Vec::new(),
                     endpoints: vec![NetworkEndpoint {
                         host: "api.custom.example".to_string(),
-                        port: 443,
+                        protocol: "rest".to_string(),
+                        ports: vec![443, 8443],
+                        allowed_ips: vec!["10.0.0.0/24".to_string()],
+                        rules: vec![L7Rule {
+                            allow: Some(openshell_core::proto::L7Allow {
+                                method: "GET".to_string(),
+                                path: "/v1/**".to_string(),
+                                ..Default::default()
+                            }),
+                        }],
+                        allow_encoded_slash: true,
+                        path: "/v1".to_string(),
                         ..Default::default()
                     }],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/custom".to_string(),
-                        ..Default::default()
+                        harness: true,
                     }],
                     inference_capable: false,
                 }),
@@ -2912,6 +2924,12 @@ mod tests {
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].rule_name, "_provider_work_custom");
         assert_eq!(layers[0].rule.endpoints[0].host, "api.custom.example");
+        assert_eq!(layers[0].rule.endpoints[0].ports, vec![443, 8443]);
+        assert_eq!(layers[0].rule.endpoints[0].rules.len(), 1);
+        assert_eq!(layers[0].rule.endpoints[0].allowed_ips, vec!["10.0.0.0/24"]);
+        assert!(layers[0].rule.endpoints[0].allow_encoded_slash);
+        assert_eq!(layers[0].rule.endpoints[0].path, "/v1");
+        assert!(layers[0].rule.binaries[0].harness);
     }
 
     #[tokio::test]
