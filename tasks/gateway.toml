@@ -3,6 +3,10 @@
 
 # Standalone gateway tasks
 
+["gateway"]
+description = "Run a standalone gateway with the detected compute driver"
+run = "bash tasks/scripts/gateway.sh"
+
 ["gateway:docker"]
 description = "Run a standalone gateway with the bundled Docker compute driver"
 run = "bash tasks/scripts/gateway-docker.sh"

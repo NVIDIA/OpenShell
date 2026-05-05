@@ -152,8 +152,8 @@ cargo build -p openshell-prover --features bundled-z3
 # One-time trust
 mise trust
 
-# Run a standalone Docker-backed gateway for local development
-mise run gateway:docker
+# Run a standalone gateway for local development
+mise run gateway
 ```
 
 ## Building the `openshell` CLI
@@ -176,7 +176,7 @@ These are the primary `mise` tasks for day-to-day development:
 
 | Task               | Purpose                                                 |
 | ------------------ | ------------------------------------------------------- |
-| `mise run gateway:docker` | Run a standalone Docker-backed gateway for local development |
+| `mise run gateway` | Run a standalone gateway for local development          |
 | `mise run sandbox` | Create or reconnect to the dev sandbox                  |
 | `mise run test`    | Default test suite                                      |
 | `mise run e2e`     | Default end-to-end test lane                            |
