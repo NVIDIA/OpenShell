@@ -28,9 +28,31 @@ jobs:
         with:
           required_label: test:e2e-helm
 
+  build-gateway:
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: gateway
+      platform: linux/amd64
+
+  build-supervisor:
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: supervisor
+      platform: linux/amd64
+
   helm-e2e-rust:
     name: Helm E2E (rust)
-    needs: [pr_metadata]
+    needs: [pr_metadata, build-gateway, build-supervisor]
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
     timeout-minutes: 60
@@ -48,11 +70,15 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       HELM_E2E_CLUSTER_NAME: helm-e2e-${{ github.run_id }}-rust
+      HELM_E2E_IMAGE_TAG: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Install tools
         run: mise install --locked
@@ -62,7 +88,7 @@ jobs:
 
   helm-e2e-python:
     name: Helm E2E (python)
-    needs: [pr_metadata]
+    needs: [pr_metadata, build-gateway, build-supervisor]
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
     timeout-minutes: 60
@@ -80,11 +106,15 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       HELM_E2E_CLUSTER_NAME: helm-e2e-${{ github.run_id }}-python
+      HELM_E2E_IMAGE_TAG: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Install tools
         run: mise install --locked

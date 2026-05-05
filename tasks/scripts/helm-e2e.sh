@@ -20,6 +20,12 @@
 #   HELM_E2E_PKI            pki-init | cert-manager (default: pki-init)
 #   HELM_E2E_KEEP_CLUSTER   1 to skip cluster deletion on exit (default: 0)
 #   HELM_E2E_CLUSTER_NAME   override k3d cluster name (default: derived from branch)
+#   HELM_E2E_IMAGE_TAG      if set, pull gateway+supervisor images from
+#                           HELM_E2E_IMAGE_REGISTRY at this tag instead of
+#                           building them locally (used by CI to reuse the
+#                           images produced by docker-build.yml)
+#   HELM_E2E_IMAGE_REGISTRY registry to pull pre-built images from
+#                           (default: ghcr.io/nvidia/openshell)
 #   KUBECONFIG              path to kubeconfig (default: <repo-root>/kubeconfig)
 #   OPENSHELL_PROVISION_TIMEOUT  sandbox ready timeout in seconds (default: 300)
 
@@ -127,23 +133,34 @@ fi
 GATEWAY_IMAGE="openshell/gateway:helm-e2e"
 SUPERVISOR_IMAGE="openshell/supervisor:helm-e2e"
 
-echo "Building gateway image..."
-docker buildx build \
-  --build-arg BUILD_FROM_SOURCE=1 \
-  --target gateway \
-  --tag "${GATEWAY_IMAGE}" \
-  --load \
-  --file "${ROOT}/deploy/docker/Dockerfile.images" \
-  "${ROOT}" 2>&1
+if [ -n "${HELM_E2E_IMAGE_TAG:-}" ]; then
+  REGISTRY="${HELM_E2E_IMAGE_REGISTRY:-ghcr.io/nvidia/openshell}"
+  echo "Pulling pre-built gateway image (${REGISTRY}/gateway:${HELM_E2E_IMAGE_TAG})..."
+  docker pull "${REGISTRY}/gateway:${HELM_E2E_IMAGE_TAG}"
+  docker tag "${REGISTRY}/gateway:${HELM_E2E_IMAGE_TAG}" "${GATEWAY_IMAGE}"
 
-echo "Building supervisor image..."
-docker buildx build \
-  --build-arg BUILD_FROM_SOURCE=1 \
-  --target supervisor \
-  --tag "${SUPERVISOR_IMAGE}" \
-  --load \
-  --file "${ROOT}/deploy/docker/Dockerfile.images" \
-  "${ROOT}" 2>&1
+  echo "Pulling pre-built supervisor image (${REGISTRY}/supervisor:${HELM_E2E_IMAGE_TAG})..."
+  docker pull "${REGISTRY}/supervisor:${HELM_E2E_IMAGE_TAG}"
+  docker tag "${REGISTRY}/supervisor:${HELM_E2E_IMAGE_TAG}" "${SUPERVISOR_IMAGE}"
+else
+  echo "Building gateway image..."
+  docker buildx build \
+    --build-arg BUILD_FROM_SOURCE=1 \
+    --target gateway \
+    --tag "${GATEWAY_IMAGE}" \
+    --load \
+    --file "${ROOT}/deploy/docker/Dockerfile.images" \
+    "${ROOT}" 2>&1
+
+  echo "Building supervisor image..."
+  docker buildx build \
+    --build-arg BUILD_FROM_SOURCE=1 \
+    --target supervisor \
+    --tag "${SUPERVISOR_IMAGE}" \
+    --load \
+    --file "${ROOT}/deploy/docker/Dockerfile.images" \
+    "${ROOT}" 2>&1
+fi
 
 # Load images into the k3d cluster nodes.
 echo "Loading images into k3d cluster..."
