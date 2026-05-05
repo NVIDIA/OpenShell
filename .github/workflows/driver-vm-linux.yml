@@ -101,7 +101,6 @@ jobs:
       options: --privileged
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
       OPENSHELL_IMAGE_TAG: ${{ inputs['image-tag'] }}
     steps:
       - uses: actions/checkout@v4
