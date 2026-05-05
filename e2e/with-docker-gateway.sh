@@ -72,6 +72,8 @@ GATEWAY_BIN=""
 CLI_BIN=""
 GATEWAY_PID=""
 GATEWAY_LOG="${WORKDIR}/gateway.log"
+GATEWAY_PID_FILE="${WORKDIR}/gateway.pid"
+GATEWAY_ARGS_FILE="${WORKDIR}/gateway.args"
 GATEWAY_CONFIG_DIR=""
 E2E_NAMESPACE=""
 DOCKER_NETWORK_NAME=""
@@ -85,10 +87,14 @@ export XDG_CONFIG_HOME="${WORKDIR}/config"
 cleanup() {
   local exit_code=$?
 
-  if [ -n "${GATEWAY_PID}" ] && kill -0 "${GATEWAY_PID}" 2>/dev/null; then
-    echo "Stopping openshell-gateway (pid ${GATEWAY_PID})..."
-    kill "${GATEWAY_PID}" 2>/dev/null || true
-    wait "${GATEWAY_PID}" 2>/dev/null || true
+  local gateway_pid="${GATEWAY_PID}"
+  if [ -f "${GATEWAY_PID_FILE}" ]; then
+    gateway_pid="$(cat "${GATEWAY_PID_FILE}" 2>/dev/null || true)"
+  fi
+  if [ -n "${gateway_pid}" ] && kill -0 "${gateway_pid}" 2>/dev/null; then
+    echo "Stopping openshell-gateway (pid ${gateway_pid})..."
+    kill "${gateway_pid}" 2>/dev/null || true
+    wait "${gateway_pid}" 2>/dev/null || true
   fi
 
   if [ "${exit_code}" -ne 0 ] \
@@ -472,8 +478,19 @@ GATEWAY_ARGS=(
 if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
   GATEWAY_ARGS+=(--host-gateway-ip "${GATEWAY_HOST_ALIAS_IP}")
 fi
+
+: >"${GATEWAY_ARGS_FILE}"
+for arg in "${GATEWAY_ARGS[@]}"; do
+  printf '%s\0' "${arg}" >>"${GATEWAY_ARGS_FILE}"
+done
+export OPENSHELL_E2E_GATEWAY_BIN="${GATEWAY_BIN}"
+export OPENSHELL_E2E_GATEWAY_ARGS_FILE="${GATEWAY_ARGS_FILE}"
+export OPENSHELL_E2E_GATEWAY_LOG="${GATEWAY_LOG}"
+export OPENSHELL_E2E_GATEWAY_PID_FILE="${GATEWAY_PID_FILE}"
+
 "${GATEWAY_BIN}" "${GATEWAY_ARGS[@]}" >"${GATEWAY_LOG}" 2>&1 &
 GATEWAY_PID=$!
+printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"
 
 GATEWAY_NAME="openshell-e2e-docker-${HOST_PORT}"
 CLI_GATEWAY_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
