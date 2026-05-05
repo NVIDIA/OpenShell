@@ -17,8 +17,9 @@
 #   OPENSHELL_SANDBOX_NAMESPACE=my-ns mise run gateway:docker
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:docker
 #
-# This script writes ~/.config/openshell/active_gateway so the CLI targets
-# the Docker-backed gateway by default after startup.
+# After the gateway is running, point the CLI at it with either:
+#   openshell --gateway docker-dev <command>
+#   openshell gateway use docker-dev   # then plain `openshell <command>`
 
 set -euo pipefail
 
@@ -83,17 +84,6 @@ register_gateway_metadata() {
   "auth_mode": "plaintext"
 }
 EOF
-}
-
-save_active_gateway() {
-  local name=$1
-  local config_home active_gateway_path
-
-  config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
-  active_gateway_path="${config_home}/openshell/active_gateway"
-
-  mkdir -p "$(dirname "${active_gateway_path}")"
-  printf '%s' "${name}" >"${active_gateway_path}"
 }
 
 if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -169,7 +159,6 @@ mkdir -p "${STATE_DIR}"
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
-save_active_gateway "${GATEWAY_NAME}"
 
 echo "Starting standalone Docker gateway..."
 echo "  gateway:   ${GATEWAY_NAME}"
@@ -177,7 +166,9 @@ echo "  endpoint:  ${GATEWAY_ENDPOINT}"
 echo "  namespace: ${SANDBOX_NAMESPACE}"
 echo "  state dir: ${STATE_DIR}"
 echo
-echo "Active gateway set to '${GATEWAY_NAME}'. The CLI now targets this gateway by default."
+echo "Point the CLI at this gateway with one of:"
+echo "  openshell --gateway ${GATEWAY_NAME} status"
+echo "  openshell gateway select ${GATEWAY_NAME}"
 echo
 
 exec "${GATEWAY_BIN}" \

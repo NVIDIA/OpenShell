@@ -69,8 +69,16 @@ command_available() {
   command -v "$1" >/dev/null 2>&1
 }
 
-binary_detected() {
-  command_available "$1" && "$1" --version >/dev/null 2>&1
+require_mise() {
+  if ! command_available mise; then
+    echo "ERROR: mise is required to build local gateway artifacts" >&2
+    exit 1
+  fi
+}
+
+run_mise_task() {
+  require_mise
+  mise run "$@"
 }
 
 podman_available() {
@@ -168,8 +176,8 @@ ensure_podman_supervisor_image() {
   fi
 
   echo "Building Podman supervisor sideload image (${supervisor_image})..."
-  CONTAINER_ENGINE=podman IMAGE_TAG=dev \
-    bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output
+  require_mise
+  CONTAINER_ENGINE=podman IMAGE_TAG=dev mise run build:docker:supervisor-sideload
 
   if ! podman image exists "${supervisor_image}" >/dev/null 2>&1; then
     echo "ERROR: expected supervisor image '${supervisor_image}' after build" >&2
@@ -262,7 +270,12 @@ if port_is_in_use "${PORT}"; then
 fi
 
 echo "Building openshell-gateway..."
-cargo build -p openshell-server --bin openshell-gateway
+run_mise_task build:gateway
+
+if [[ ! -x "${GATEWAY_BIN}" ]]; then
+  echo "ERROR: expected gateway binary at ${GATEWAY_BIN}" >&2
+  exit 1
+fi
 
 mkdir -p "${STATE_DIR}"
 

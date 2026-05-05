@@ -3,6 +3,11 @@
 
 # Standalone gateway tasks
 
+["build:gateway"]
+description = "Build the standalone openshell-gateway binary"
+run = "cargo build -p openshell-server --bin openshell-gateway"
+hide = true
+
 ["gateway"]
 description = "Run a standalone gateway with the detected compute driver"
 run = "bash tasks/scripts/gateway.sh"
