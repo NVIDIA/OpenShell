@@ -6635,6 +6635,7 @@ mod tests {
 
     #[test]
     fn gateway_add_registers_plaintext_loopback_gateway_without_local_flag() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
@@ -6667,6 +6668,7 @@ mod tests {
 
     #[test]
     fn gateway_add_respects_local_flag_for_plaintext_registrations() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
