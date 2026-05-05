@@ -86,6 +86,11 @@ pub struct CredentialProfile {
     pub query_param: String,
 }
 
+// These YAML/JSON DTOs mirror the network policy protos intentionally. Keep
+// every lossless conversion below in sync with proto/sandbox.proto. If a field
+// is added to NetworkEndpoint, L7Rule, L7Allow, L7DenyRule, L7QueryMatcher,
+// GraphqlOperation, or NetworkBinary, add it here and in both conversion
+// directions unless the import/lint path explicitly rejects it.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EndpointProfile {
     pub host: String,
@@ -207,6 +212,10 @@ pub struct ProviderTypeProfile {
     pub inference_capable: bool,
 }
 
+// Provider profile import/export is expected to be lossless for the network
+// policy fields exposed by the protobuf API. Do not collapse these DTOs into a
+// narrower shape; direct gRPC imports and CLI YAML imports must preserve the
+// same policy intent through storage and JIT composition.
 impl ProviderTypeProfile {
     #[must_use]
     pub fn from_proto(profile: &ProviderProfile) -> Self {
