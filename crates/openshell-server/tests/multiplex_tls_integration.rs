@@ -21,10 +21,18 @@ use openshell_core::proto::{
     ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
     SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
     WatchSandboxRequest,
-    open_shell_client::OpenShellClient,
+    inference_server::InferenceServer,
     open_shell_server::{OpenShell, OpenShellServer},
 };
-use openshell_server::{MultiplexedService, TlsAcceptor, health_router};
+use openshell_server::{
+    GatewayGrpcRouter, GatewayStandardHealth, MultiplexedService, OPENSHELL_SERVICE_NAME,
+    TlsAcceptor, health_router,
+};
+use tonic_health::pb::{
+    HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
+};
+
+mod common;
 use rcgen::{CertificateParams, IsCa, KeyPair};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
@@ -398,7 +406,17 @@ async fn start_test_server(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let grpc_service = OpenShellServer::new(TestOpenShell);
+    let standard_health = GatewayStandardHealth::server(common::MAX_GRPC_DECODE);
+    let reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(openshell_core::proto::FILE_DESCRIPTOR_SET)
+        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .unwrap();
+    let openshell =
+        OpenShellServer::new(TestOpenShell).max_decoding_message_size(common::MAX_GRPC_DECODE);
+    let inference = InferenceServer::new(common::TestInference)
+        .max_decoding_message_size(common::MAX_GRPC_DECODE);
+    let grpc_service = GatewayGrpcRouter::new(standard_health, reflection, openshell, inference);
     let http_service = health_router();
     let service = MultiplexedService::new(grpc_service, http_service);
 
@@ -423,13 +441,13 @@ async fn start_test_server(
     (addr, handle)
 }
 
-/// Build a gRPC client with mTLS (CA + client cert).
-async fn grpc_client_mtls(
+/// Build a gRPC channel with mTLS (CA + client cert).
+async fn grpc_channel_mtls(
     addr: std::net::SocketAddr,
     ca_pem: Vec<u8>,
     client_cert_pem: Vec<u8>,
     client_key_pem: Vec<u8>,
-) -> OpenShellClient<Channel> {
+) -> Channel {
     let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
     let identity = tonic::transport::Identity::from_pem(client_cert_pem, client_key_pem);
     let tls = ClientTlsConfig::new()
@@ -440,8 +458,7 @@ async fn grpc_client_mtls(
         .expect("invalid endpoint")
         .tls_config(tls)
         .expect("failed to set tls");
-    let channel = endpoint.connect().await.expect("failed to connect");
-    OpenShellClient::new(channel)
+    endpoint.connect().await.expect("failed to connect")
 }
 
 fn build_tls_root(cert_pem: &[u8]) -> RootCertStore {
@@ -505,16 +522,23 @@ async fn serves_grpc_and_http_over_tls_on_same_port() {
 
     let (addr, server) = start_test_server(tls_acceptor).await;
 
-    // gRPC with mTLS
-    let mut grpc = grpc_client_mtls(
+    // gRPC with mTLS (standard health)
+    let channel = grpc_channel_mtls(
         addr,
         pki.ca_cert_pem.clone(),
         pki.client_cert_pem.clone(),
         pki.client_key_pem.clone(),
     )
     .await;
-    let response = grpc.health(HealthRequest {}).await.unwrap();
-    assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+    let mut health = HealthClient::new(channel);
+    let response = health
+        .check(HealthCheckRequest {
+            service: OPENSHELL_SERVICE_NAME.to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.status, ServingStatus::Serving as i32);
 
     // HTTP with mTLS
     let client = https_client_mtls(&pki);
@@ -544,15 +568,22 @@ async fn mtls_valid_client_cert_accepted() {
 
     let (addr, server) = start_test_server(tls_acceptor).await;
 
-    let mut grpc = grpc_client_mtls(
+    let channel = grpc_channel_mtls(
         addr,
         pki.ca_cert_pem.clone(),
         pki.client_cert_pem.clone(),
         pki.client_key_pem.clone(),
     )
     .await;
-    let response = grpc.health(HealthRequest {}).await.unwrap();
-    assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+    let mut health = HealthClient::new(channel);
+    let response = health
+        .check(HealthCheckRequest {
+            service: OPENSHELL_SERVICE_NAME.to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.status, ServingStatus::Serving as i32);
 
     server.abort();
 }
@@ -586,8 +617,12 @@ async fn mtls_no_client_cert_rejected() {
     // Connection should fail at the TLS handshake level or shortly after.
     // The exact error depends on timing -- it may fail on connect or on first RPC.
     if let Ok(channel) = result {
-        let mut client = OpenShellClient::new(channel);
-        let rpc_result = client.health(HealthRequest {}).await;
+        let mut health = HealthClient::new(channel);
+        let rpc_result = health
+            .check(HealthCheckRequest {
+                service: OPENSHELL_SERVICE_NAME.to_string(),
+            })
+            .await;
         assert!(
             rpc_result.is_err(),
             "expected RPC to fail without client cert"
@@ -651,8 +686,12 @@ async fn mtls_wrong_ca_client_cert_rejected() {
 
     let result = endpoint.connect().await;
     if let Ok(channel) = result {
-        let mut client = OpenShellClient::new(channel);
-        let rpc_result = client.health(HealthRequest {}).await;
+        let mut health = HealthClient::new(channel);
+        let rpc_result = health
+            .check(HealthCheckRequest {
+                service: OPENSHELL_SERVICE_NAME.to_string(),
+            })
+            .await;
         assert!(
             rpc_result.is_err(),
             "expected RPC to fail with rogue client cert"

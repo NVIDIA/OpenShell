@@ -19,7 +19,12 @@ import "sandbox.proto";
 //   resource messages before persisting or returning them to clients.
 service OpenShell {
   // Check the health of the service.
-  rpc Health(HealthRequest) returns (HealthResponse);
+  //
+  // Deprecated: prefer the standard `grpc.health.v1.Health/Check` RPC for interoperability
+  // (e.g. `grpcurl`, Kubernetes gRPC probes). This RPC remains for backward compatibility.
+  rpc Health(HealthRequest) returns (HealthResponse) {
+    option deprecated = true;
+  }
 
   // Create a new sandbox.
   rpc CreateSandbox(CreateSandboxRequest) returns (SandboxResponse);
@@ -166,10 +171,18 @@ service OpenShell {
 }
 
 // Health check request.
-message HealthRequest {}
+//
+// Deprecated: use standard gRPC health (`grpc.health.v1.Health/Check`) instead.
+message HealthRequest {
+  option deprecated = true;
+}
 
 // Health check response.
+//
+// Deprecated: use standard gRPC health (`grpc.health.v1.Health/Check`) instead.
 message HealthResponse {
+  option deprecated = true;
+
   // Service status.
   ServiceStatus status = 1;
 

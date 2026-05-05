@@ -29,6 +29,8 @@ tokio = { workspace = true }
 
 # gRPC
 tonic = { workspace = true, features = ["channel", "tls"] }
+tonic-health = { workspace = true }
+tonic-reflection = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 

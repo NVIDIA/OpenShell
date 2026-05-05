@@ -84,6 +84,8 @@ bundled-z3 = ["openshell-prover/bundled-z3"]
 dev-settings = ["openshell-core/dev-settings"]
 
 [dev-dependencies]
+openshell-server = { path = "../openshell-server" }
+tonic-health = { workspace = true }
 futures = { workspace = true }
 rcgen = { version = "0.13", features = ["crypto", "pem"] }
 reqwest = { workspace = true }

@@ -48,6 +48,10 @@ fn build_tls_config(ca: Vec<u8>, cert: Vec<u8>, key: Vec<u8>) -> ClientTlsConfig
 ///
 /// Returns `Ok(())` if the health check succeeds (service reports healthy),
 /// or an error describing why the check failed.
+///
+/// Uses legacy `openshell.v1.OpenShell/Health` until this crate switches to
+/// `grpc.health.v1.Health/Check`.
+#[allow(deprecated)]
 async fn grpc_health_check(gateway_port: u16, gateway_name: &str) -> Result<(), String> {
     // Load mTLS materials
     let (ca, cert, key) = load_mtls_materials(gateway_name)?;

@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(deprecated)]
+// Transport-focused tests still call legacy `openshell.v1.OpenShell/Health` over the tunnel.
+
 //! Integration tests for the WebSocket tunnel (`/_ws_tunnel`).
 //!
 //! These tests verify that gRPC traffic can be tunneled through a WebSocket

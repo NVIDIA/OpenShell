@@ -5,6 +5,10 @@
 //!
 //! This module re-exports the generated protobuf types and service definitions.
 
+mod descriptor_set;
+
+pub use descriptor_set::FILE_DESCRIPTOR_SET;
+
 #[allow(
     clippy::all,
     clippy::pedantic,

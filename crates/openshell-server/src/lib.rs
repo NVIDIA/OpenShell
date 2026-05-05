@@ -49,8 +49,11 @@ use tracing::{debug, error, info, warn};
 
 use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
 pub use grpc::OpenShellService;
+pub use grpc::gateway_health::{GatewayStandardHealth, OPENSHELL_SERVICE_NAME};
 pub use http::{health_router, http_router, metrics_router};
-pub use multiplex::{MultiplexService, MultiplexedService};
+pub use multiplex::{
+    GatewayGrpcRouter, MAX_GRPC_DECODE_SIZE, MultiplexService, MultiplexedService,
+};
 use openshell_driver_kubernetes::KubernetesComputeConfig;
 use persistence::Store;
 use sandbox_index::SandboxIndex;

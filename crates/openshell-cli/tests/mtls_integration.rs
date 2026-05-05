@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_cli::tls::{TlsOptions, grpc_client};
+use openshell_cli::tls::{TlsOptions, build_channel};
 use openshell_core::proto::{
     CreateProviderRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, ExecSandboxEvent, ExecSandboxRequest,
@@ -10,6 +10,7 @@ use openshell_core::proto::{
     UpdateProviderRequest,
     open_shell_server::{OpenShell, OpenShellServer},
 };
+use openshell_server::{GatewayStandardHealth, MAX_GRPC_DECODE_SIZE, OPENSHELL_SERVICE_NAME};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
 };
@@ -20,6 +21,9 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{
     Response, Status,
     transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig},
+};
+use tonic_health::pb::{
+    HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
 };
 
 struct EnvVarGuard {
@@ -407,7 +411,10 @@ async fn run_server(
         Server::builder()
             .tls_config(tls)
             .unwrap()
-            .add_service(OpenShellServer::new(TestOpenShell))
+            .add_service(GatewayStandardHealth::server(MAX_GRPC_DECODE_SIZE))
+            .add_service(
+                OpenShellServer::new(TestOpenShell).max_decoding_message_size(MAX_GRPC_DECODE_SIZE),
+            )
             .serve_with_incoming(incoming)
             .await
             .unwrap();
@@ -437,9 +444,16 @@ async fn cli_connects_with_client_cert() {
 
     let tls = TlsOptions::new(Some(ca_path), Some(cert_path), Some(key_path));
     let endpoint = format!("https://localhost:{}", addr.port());
-    let mut client = grpc_client(&endpoint, &tls).await.unwrap();
-    let response = client.health(HealthRequest {}).await.unwrap();
-    assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+    let channel = build_channel(&endpoint, &tls).await.unwrap();
+    let mut health = HealthClient::new(channel);
+    let response = health
+        .check(HealthCheckRequest {
+            service: OPENSHELL_SERVICE_NAME.to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.status, ServingStatus::Serving as i32);
 }
 
 #[tokio::test]
@@ -461,6 +475,6 @@ async fn cli_requires_client_cert_for_https() {
 
     let tls = TlsOptions::new(Some(ca_path), None, None);
     let endpoint = format!("https://localhost:{}", addr.port());
-    let result = grpc_client(&endpoint, &tls).await;
+    let result = build_channel(&endpoint, &tls).await;
     assert!(result.is_err());
 }

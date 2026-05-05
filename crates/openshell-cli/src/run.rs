@@ -696,7 +696,10 @@ fn is_progress_status(status: &str) -> bool {
 }
 
 /// Show gateway status.
-#[allow(clippy::branches_sharing_code)]
+///
+/// Still calls legacy `OpenShell/Health` for version text; migrate to
+/// `grpc.health.v1.Health/Check` when a generated client is wired here.
+#[allow(clippy::branches_sharing_code, deprecated)]
 pub async fn gateway_status(gateway_name: &str, server: &str, tls: &TlsOptions) -> Result<()> {
     println!("{}", "Server Status".cyan().bold());
     println!();

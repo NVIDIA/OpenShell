@@ -31,10 +31,7 @@ pub const INTERNAL_AUTH_SOURCE_HEADER: &str = "x-openshell-auth-source";
 pub const AUTH_SOURCE_SANDBOX_SECRET: &str = "sandbox-secret";
 
 /// Truly unauthenticated methods — health probes and infrastructure.
-const UNAUTHENTICATED_METHODS: &[&str] = &[
-    "/openshell.v1.OpenShell/Health",
-    "/openshell.inference.v1.Inference/Health",
-];
+const UNAUTHENTICATED_METHODS: &[&str] = &["/openshell.v1.OpenShell/Health"];
 
 /// Path prefixes that bypass OIDC validation (gRPC reflection, health probes).
 const UNAUTHENTICATED_PREFIXES: &[&str] = &["/grpc.reflection.", "/grpc.health."];

@@ -3,6 +3,7 @@
 
 //! gRPC service implementation.
 
+pub mod gateway_health;
 pub mod policy;
 mod provider;
 mod sandbox;
@@ -159,8 +160,13 @@ impl OpenShell for OpenShellService {
         &self,
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
+        let status = if gateway_health::gateway_process_accepting_rpc() {
+            ServiceStatus::Healthy
+        } else {
+            ServiceStatus::Unhealthy
+        };
         Ok(Response::new(HealthResponse {
-            status: ServiceStatus::Healthy.into(),
+            status: status.into(),
             version: openshell_core::VERSION.to_string(),
         }))
     }

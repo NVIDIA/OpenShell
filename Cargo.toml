@@ -19,6 +19,8 @@ tokio = { version = "1.43", features = ["full"] }
 # gRPC/Protobuf
 tonic = "0.12"
 tonic-build = "0.12"
+tonic-health = "0.12"
+tonic-reflection = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 
