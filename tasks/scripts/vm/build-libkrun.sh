@@ -239,6 +239,32 @@ make -j"$(nproc)"
 cp libkrunfw.so* "$OUTPUT_DIR/"
 echo "    Built: $(ls "$OUTPUT_DIR"/libkrunfw.so* | xargs -n1 basename | tr '\n' ' ')"
 
+# Export the generated kernel bundle for the macOS job.  The generated file is
+# produced by libkrunfw and may move if upstream adjusts its build layout, so
+# prefer the expected path and fail loudly if it is absent.
+KERNEL_C_SOURCE="kernel.c"
+if [ ! -f "$KERNEL_C_SOURCE" ]; then
+  KERNEL_C_SOURCE="$(find . -maxdepth 3 -name kernel.c -print -quit)"
+fi
+if [ -z "$KERNEL_C_SOURCE" ] || [ ! -f "$KERNEL_C_SOURCE" ]; then
+  echo "ERROR: libkrunfw build did not produce kernel.c" >&2
+  exit 1
+fi
+cp "$KERNEL_C_SOURCE" "$OUTPUT_DIR/kernel.c"
+
+if [ -f ABI_VERSION ]; then
+  cp ABI_VERSION "$OUTPUT_DIR/ABI_VERSION"
+else
+  LIBKRUNFW_VERSIONED="$(ls "$OUTPUT_DIR"/libkrunfw.so.* 2>/dev/null | sort -V | tail -n1 || true)"
+  ABI_VERSION="$(basename "$LIBKRUNFW_VERSIONED" | sed -n 's/^libkrunfw\.so\.\([0-9][0-9]*\).*/\1/p')"
+  if [ -z "$ABI_VERSION" ]; then
+    echo "ERROR: libkrunfw build did not produce ABI_VERSION and ABI could not be inferred" >&2
+    exit 1
+  fi
+  printf '%s\n' "$ABI_VERSION" > "$OUTPUT_DIR/ABI_VERSION"
+fi
+echo "    Exported: kernel.c ABI_VERSION=$(cat "$OUTPUT_DIR/ABI_VERSION")"
+
 cd "$BUILD_DIR"
 
 # ── Build libkrun (VMM) ─────────────────────────────────────────────────
