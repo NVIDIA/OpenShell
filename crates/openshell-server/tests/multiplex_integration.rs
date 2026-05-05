@@ -18,16 +18,11 @@ use openshell_core::proto::{
     ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
     ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
     SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
-    WatchSandboxRequest,
-    inference_server::InferenceServer,
-    open_shell_client::OpenShellClient,
-    open_shell_server::{OpenShell, OpenShellServer},
+    WatchSandboxRequest, open_shell_client::OpenShellClient, open_shell_server::OpenShell,
 };
-use openshell_server::{
-    GatewayGrpcRouter, GatewayStandardHealth, MultiplexedService, OPENSHELL_SERVICE_NAME,
-    health_router,
-};
+use openshell_server::{MultiplexedService, OPENSHELL_SERVICE_NAME, health_router};
 
+#[macro_use]
 mod common;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -328,17 +323,7 @@ async fn serves_grpc_and_http_on_same_port() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let standard_health = GatewayStandardHealth::server(common::MAX_GRPC_DECODE);
-    let reflection = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(openshell_core::proto::FILE_DESCRIPTOR_SET)
-        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
-        .build_v1()
-        .unwrap();
-    let openshell =
-        OpenShellServer::new(TestOpenShell).max_decoding_message_size(common::MAX_GRPC_DECODE);
-    let inference = InferenceServer::new(common::TestInference)
-        .max_decoding_message_size(common::MAX_GRPC_DECODE);
-    let grpc_router = GatewayGrpcRouter::new(standard_health, reflection, openshell, inference);
+    let grpc_router = gateway_test_grpc_router!(common::openshell_max_decode_server(TestOpenShell));
     let http_service = health_router();
     let service = MultiplexedService::new(grpc_router, http_service);
 
@@ -418,17 +403,7 @@ async fn grpc_response_propagates_request_id() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let standard_health = GatewayStandardHealth::server(common::MAX_GRPC_DECODE);
-    let reflection = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(openshell_core::proto::FILE_DESCRIPTOR_SET)
-        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
-        .build_v1()
-        .unwrap();
-    let openshell =
-        OpenShellServer::new(TestOpenShell).max_decoding_message_size(common::MAX_GRPC_DECODE);
-    let inference = InferenceServer::new(common::TestInference)
-        .max_decoding_message_size(common::MAX_GRPC_DECODE);
-    let grpc_router = GatewayGrpcRouter::new(standard_health, reflection, openshell, inference);
+    let grpc_router = gateway_test_grpc_router!(common::openshell_max_decode_server(TestOpenShell));
 
     let x_request_id = http::HeaderName::from_static("x-request-id");
     let grpc_service = ServiceBuilder::new()
@@ -484,17 +459,7 @@ async fn standard_grpc_health_reflection_multiplexed() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let standard_health = GatewayStandardHealth::server(common::MAX_GRPC_DECODE);
-    let reflection = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(openshell_core::proto::FILE_DESCRIPTOR_SET)
-        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
-        .build_v1()
-        .unwrap();
-    let openshell =
-        OpenShellServer::new(TestOpenShell).max_decoding_message_size(common::MAX_GRPC_DECODE);
-    let inference = InferenceServer::new(common::TestInference)
-        .max_decoding_message_size(common::MAX_GRPC_DECODE);
-    let grpc_router = GatewayGrpcRouter::new(standard_health, reflection, openshell, inference);
+    let grpc_router = gateway_test_grpc_router!(common::openshell_max_decode_server(TestOpenShell));
     let http_service = health_router();
     let service = MultiplexedService::new(grpc_router, http_service);
 

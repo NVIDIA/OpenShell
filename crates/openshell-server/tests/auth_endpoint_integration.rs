@@ -26,6 +26,7 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
+#[macro_use]
 mod common;
 
 // ---------------------------------------------------------------------------
@@ -712,13 +713,7 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
 /// Uses `serve_connection_with_upgrades` to also support WebSocket upgrades.
 #[tokio::test]
 async fn plaintext_server_accepts_grpc_and_http() {
-    use openshell_core::proto::{
-        inference_server::InferenceServer, open_shell_server::OpenShellServer,
-    };
-    use openshell_server::{
-        GatewayGrpcRouter, GatewayStandardHealth, MultiplexedService, OPENSHELL_SERVICE_NAME,
-        health_router,
-    };
+    use openshell_server::{MultiplexedService, OPENSHELL_SERVICE_NAME, health_router};
     use tonic_health::pb::{
         HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
     };
@@ -726,17 +721,8 @@ async fn plaintext_server_accepts_grpc_and_http() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let standard_health = GatewayStandardHealth::server(common::MAX_GRPC_DECODE);
-    let reflection = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(openshell_core::proto::FILE_DESCRIPTOR_SET)
-        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
-        .build_v1()
-        .unwrap();
-    let openshell =
-        OpenShellServer::new(TestOpenShell).max_decoding_message_size(common::MAX_GRPC_DECODE);
-    let inference = InferenceServer::new(common::TestInference)
-        .max_decoding_message_size(common::MAX_GRPC_DECODE);
-    let grpc_service = GatewayGrpcRouter::new(standard_health, reflection, openshell, inference);
+    let grpc_service =
+        gateway_test_grpc_router!(common::openshell_max_decode_server(TestOpenShell));
     let http_service = health_router();
     let service = MultiplexedService::new(grpc_service, http_service);
 
