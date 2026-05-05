@@ -19,7 +19,15 @@
 #   HELM_E2E_SUITE          rust | python | all (default: all)
 #   HELM_E2E_PKI            pki-init | cert-manager (default: pki-init)
 #   HELM_E2E_KEEP_CLUSTER   1 to skip cluster deletion on exit (default: 0)
-#   HELM_E2E_CLUSTER_NAME   override k3d cluster name (default: derived from branch)
+#   HELM_E2E_CLUSTER_NAME   override cluster name (default: derived from branch)
+#   HELM_E2E_SKIP_CLUSTER   1 if the caller has already provisioned the cluster
+#                           (and KUBECONFIG points at it). The script will not
+#                           create or delete the cluster. Used by CI, where
+#                           helm/kind-action provisions a kind cluster before
+#                           this script runs.
+#   HELM_E2E_IMAGE_LOADER   k3d | kind | none — which loader to use to import
+#                           the gateway and supervisor images into the cluster
+#                           (default: k3d for local dev; CI sets kind)
 #   HELM_E2E_IMAGE_TAG      if set, pull gateway+supervisor images from
 #                           HELM_E2E_IMAGE_REGISTRY at this tag instead of
 #                           building them locally (used by CI to reuse the
@@ -35,6 +43,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SUITE="${HELM_E2E_SUITE:-all}"
 PKI_MODE="${HELM_E2E_PKI:-pki-init}"
 KEEP_CLUSTER="${HELM_E2E_KEEP_CLUSTER:-0}"
+SKIP_CLUSTER="${HELM_E2E_SKIP_CLUSTER:-0}"
+IMAGE_LOADER="${HELM_E2E_IMAGE_LOADER:-k3d}"
 
 # Derive cluster name the same way helm-k3s-local.sh does (last path component of branch).
 _branch_cluster_name() {
@@ -92,11 +102,26 @@ require_cmd() {
   fi
 }
 
-require_cmd k3d
 require_cmd helm
 require_cmd kubectl
 require_cmd docker
 require_cmd openssl
+
+# k3d is only needed when this script manages the cluster lifecycle. CI hands
+# us a pre-existing kind cluster via HELM_E2E_SKIP_CLUSTER=1.
+if [ "${SKIP_CLUSTER}" != "1" ]; then
+  require_cmd k3d
+fi
+case "${IMAGE_LOADER}" in
+  k3d|kind|none) ;;
+  *)
+    echo "ERROR: unknown HELM_E2E_IMAGE_LOADER '${IMAGE_LOADER}' (must be k3d, kind, or none)" >&2
+    exit 2
+    ;;
+esac
+if [ "${IMAGE_LOADER}" = "kind" ]; then
+  require_cmd kind
+fi
 
 if ! docker info >/dev/null 2>&1; then
   echo "ERROR: docker daemon is not reachable" >&2
@@ -106,7 +131,9 @@ fi
 echo "=== helm-e2e: suite=${SUITE} pki=${PKI_MODE} cluster=${CLUSTER_NAME} ==="
 
 # ── Cluster ──────────────────────────────────────────────────────────────────
-if k3d cluster get "${CLUSTER_NAME}" >/dev/null 2>&1; then
+if [ "${SKIP_CLUSTER}" = "1" ]; then
+  echo "Using pre-existing cluster '${CLUSTER_NAME}' (HELM_E2E_SKIP_CLUSTER=1)."
+elif k3d cluster get "${CLUSTER_NAME}" >/dev/null 2>&1; then
   echo "Reusing existing k3d cluster '${CLUSTER_NAME}'."
   # Refresh kubeconfig in case it's stale.
   k3d kubeconfig write "${CLUSTER_NAME}" --output "${KUBECONFIG}" >/dev/null
@@ -162,9 +189,20 @@ else
     "${ROOT}" 2>&1
 fi
 
-# Load images into the k3d cluster nodes.
-echo "Loading images into k3d cluster..."
-k3d image import "${GATEWAY_IMAGE}" "${SUPERVISOR_IMAGE}" -c "${CLUSTER_NAME}" 2>&1
+# Load images into the cluster nodes.
+case "${IMAGE_LOADER}" in
+  k3d)
+    echo "Loading images into k3d cluster '${CLUSTER_NAME}'..."
+    k3d image import "${GATEWAY_IMAGE}" "${SUPERVISOR_IMAGE}" -c "${CLUSTER_NAME}" 2>&1
+    ;;
+  kind)
+    echo "Loading images into kind cluster '${CLUSTER_NAME}'..."
+    kind load docker-image "${GATEWAY_IMAGE}" "${SUPERVISOR_IMAGE}" --name "${CLUSTER_NAME}" 2>&1
+    ;;
+  none)
+    echo "Skipping image load (HELM_E2E_IMAGE_LOADER=none); the cluster must already have ${GATEWAY_IMAGE} and ${SUPERVISOR_IMAGE}."
+    ;;
+esac
 
 # ── Deploy via Helm ───────────────────────────────────────────────────────────
 HELM_VALUES_FLAGS=(

@@ -59,29 +59,32 @@ jobs:
     permissions:
       contents: read
       packages: read
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       HELM_E2E_CLUSTER_NAME: helm-e2e-${{ github.run_id }}-rust
       HELM_E2E_IMAGE_TAG: ${{ github.sha }}
+      HELM_E2E_SKIP_CLUSTER: "1"
+      HELM_E2E_IMAGE_LOADER: kind
     steps:
       - uses: actions/checkout@v6
-
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      - name: Install mise
+        run: |
+          curl https://mise.run | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+
       - name: Install tools
         run: mise install --locked
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ${{ env.HELM_E2E_CLUSTER_NAME }}
+          wait: 120s
 
       - name: Run Helm E2E (Rust)
         run: mise run e2e:helm:rust
@@ -95,32 +98,35 @@ jobs:
     permissions:
       contents: read
       packages: read
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       HELM_E2E_CLUSTER_NAME: helm-e2e-${{ github.run_id }}-python
       HELM_E2E_IMAGE_TAG: ${{ github.sha }}
+      HELM_E2E_SKIP_CLUSTER: "1"
+      HELM_E2E_IMAGE_LOADER: kind
     steps:
       - uses: actions/checkout@v6
 
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Install mise
+        run: |
+          curl https://mise.run | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
 
       - name: Install tools
         run: mise install --locked
 
       - name: Install Python dependencies
         run: uv sync --frozen && mise run --no-deps python:proto
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ${{ env.HELM_E2E_CLUSTER_NAME }}
+          wait: 120s
 
       - name: Run Helm E2E (Python)
         run: mise run e2e:helm:python
