@@ -35,7 +35,6 @@ uv tool install -U openshell
 
 Both methods install the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION` (binary) or pin the version with `uv tool install openshell==<version>`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
 
-
 ### Create a sandbox
 
 ```bash
