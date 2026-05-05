@@ -228,7 +228,10 @@ network_policies:
       - host: host.openshell.internal
         port: {port}
         allowed_ips:
+          - "10.0.0.0/8"
           - "172.0.0.0/8"
+          - "192.168.0.0/16"
+          - "fc00::/7"
     binaries:
       - path: /usr/bin/curl
 "#
@@ -299,7 +302,7 @@ async fn sandbox_inference_local_routes_to_host_openshell_internal() {
         delete_provider(INFERENCE_PROVIDER_NAME).await;
     }
 
-    let create_output = create_openai_provider(
+    create_openai_provider(
         INFERENCE_PROVIDER_NAME,
         &format!("http://host.openshell.internal:{}/v1", server.port),
     )
@@ -313,17 +316,14 @@ async fn sandbox_inference_local_routes_to_host_openshell_internal() {
         INFERENCE_PROVIDER_NAME,
         "--model",
         "host-echo-model",
+        "--no-verify",
     ])
     .await
     .expect("point inference.local at host-backed provider");
 
     assert!(
-        inference_output.contains("Validated Endpoints:"),
-        "expected verification details in output:\n{inference_output}"
-    );
-    assert!(
-        inference_output.contains("/v1/chat/completions (openai_chat_completions)"),
-        "expected validated endpoint in output:\n{inference_output}"
+        !inference_output.contains("Validated Endpoints:"),
+        "did not expect local CLI verification for host-only alias:\n{inference_output}"
     );
 
     let guard = SandboxGuard::create(&[
@@ -352,8 +352,6 @@ async fn sandbox_inference_local_routes_to_host_openshell_internal() {
         "expected sandbox to receive echoed inference content:\n{}",
         guard.create_output
     );
-
-    let _ = create_output;
 }
 
 #[tokio::test]

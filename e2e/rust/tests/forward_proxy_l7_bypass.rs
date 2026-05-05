@@ -18,8 +18,10 @@ use tempfile::NamedTempFile;
 use tokio::time::{interval, timeout};
 
 const TEST_SERVER_IMAGE: &str = "public.ecr.aws/docker/library/python:3.13-alpine";
+const TEST_SERVER_ALIAS: &str = "rest-l7.openshell.test";
 
 struct DockerServer {
+    host: String,
     port: u16,
     container_id: String,
 }
@@ -44,18 +46,26 @@ class Handler(BaseHTTPRequestHandler):
 HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
 "#;
 
+        let e2e_network = std::env::var("OPENSHELL_E2E_DOCKER_NETWORK_NAME")
+            .ok()
+            .filter(|network| !network.trim().is_empty());
+        let host = e2e_network.as_ref().map_or_else(
+            || "host.openshell.internal".to_string(),
+            |_| TEST_SERVER_ALIAS.to_string(),
+        );
+        let port = if e2e_network.is_some() { 8000 } else { port };
+
+        let mut args = vec!["run", "--detach", "--rm"];
+        let published_port = format!("{port}:8000");
+        if let Some(network) = e2e_network.as_deref() {
+            args.extend(["--network", network, "--network-alias", TEST_SERVER_ALIAS]);
+        } else {
+            args.extend(["-p", &published_port]);
+        }
+        args.extend([TEST_SERVER_IMAGE, "python3", "-c", script]);
+
         let output = Command::new("docker")
-            .args([
-                "run",
-                "--detach",
-                "--rm",
-                "-p",
-                &format!("{port}:8000"),
-                TEST_SERVER_IMAGE,
-                "python3",
-                "-c",
-                script,
-            ])
+            .args(args)
             .output()
             .map_err(|e| format!("start docker test server: {e}"))?;
 
@@ -70,6 +80,7 @@ HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
         }
 
         let server = Self {
+            host,
             port,
             container_id: stdout,
         };
@@ -111,7 +122,7 @@ impl Drop for DockerServer {
     }
 }
 
-fn write_policy_with_l7_rules(port: u16) -> Result<NamedTempFile, String> {
+fn write_policy_with_l7_rules(host: &str, port: u16) -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|e| format!("create temp policy file: {e}"))?;
     let policy = format!(
         r#"version: 1
@@ -142,12 +153,15 @@ network_policies:
   test_l7:
     name: test_l7
     endpoints:
-      - host: host.openshell.internal
+      - host: {host}
         port: {port}
         protocol: rest
         enforcement: enforce
         allowed_ips:
+          - "10.0.0.0/8"
           - "172.0.0.0/8"
+          - "192.168.0.0/16"
+          - "fc00::/7"
         rules:
           - allow:
               method: GET
@@ -173,8 +187,7 @@ async fn forward_proxy_allows_l7_permitted_request() {
         .await
         .expect("start docker test server");
     let policy =
-        write_policy_with_l7_rules(server.port)
-            .expect("write custom policy");
+        write_policy_with_l7_rules(&server.host, server.port).expect("write custom policy");
     let policy_path = policy
         .path()
         .to_str()
@@ -184,7 +197,7 @@ async fn forward_proxy_allows_l7_permitted_request() {
     let script = format!(
         r#"
 import urllib.request, urllib.error, json, sys
-url = "http://host.openshell.internal:{port}/allowed"
+url = "http://{host}:{port}/allowed"
 try:
     resp = urllib.request.urlopen(url, timeout=15)
     print(json.dumps({{"status": resp.status, "error": None}}))
@@ -193,19 +206,13 @@ except urllib.error.HTTPError as e:
 except Exception as e:
     print(json.dumps({{"status": -1, "error": str(e)}}))
 "#,
+        host = server.host,
         port = server.port,
     );
 
-    let guard = SandboxGuard::create(&[
-        "--policy",
-        &policy_path,
-        "--",
-        "python3",
-        "-c",
-        &script,
-    ])
-    .await
-    .expect("sandbox create");
+    let guard = SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", &script])
+        .await
+        .expect("sandbox create");
 
     // L7 policy allows GET /allowed — should succeed.
     assert!(
@@ -222,8 +229,7 @@ async fn forward_proxy_denies_l7_blocked_request() {
         .await
         .expect("start docker test server");
     let policy =
-        write_policy_with_l7_rules(server.port)
-            .expect("write custom policy");
+        write_policy_with_l7_rules(&server.host, server.port).expect("write custom policy");
     let policy_path = policy
         .path()
         .to_str()
@@ -233,7 +239,7 @@ async fn forward_proxy_denies_l7_blocked_request() {
     let script = format!(
         r#"
 import urllib.request, urllib.error, json, sys
-url = "http://host.openshell.internal:{port}/allowed"
+url = "http://{host}:{port}/allowed"
 req = urllib.request.Request(url, data=b"test", method="POST")
 try:
     resp = urllib.request.urlopen(req, timeout=15)
@@ -243,19 +249,13 @@ except urllib.error.HTTPError as e:
 except Exception as e:
     print(json.dumps({{"status": -1, "error": str(e)}}))
 "#,
+        host = server.host,
         port = server.port,
     );
 
-    let guard = SandboxGuard::create(&[
-        "--policy",
-        &policy_path,
-        "--",
-        "python3",
-        "-c",
-        &script,
-    ])
-    .await
-    .expect("sandbox create");
+    let guard = SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", &script])
+        .await
+        .expect("sandbox create");
 
     // L7 policy denies POST — should return 403.
     assert!(

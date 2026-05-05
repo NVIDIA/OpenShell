@@ -443,6 +443,7 @@ DOCKER_NETWORK_NAME="${E2E_NAMESPACE}"
 GATEWAY_HOST_ALIAS_IP=""
 
 ensure_e2e_docker_network "${DOCKER_NETWORK_NAME}"
+export OPENSHELL_E2E_DOCKER_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 if connect_current_container_to_docker_network "${DOCKER_NETWORK_NAME}"; then
   echo "Connected CI job container to Docker network ${DOCKER_NETWORK_NAME} (${GATEWAY_HOST_ALIAS_IP})."
 else

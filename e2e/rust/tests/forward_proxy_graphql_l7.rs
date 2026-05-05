@@ -20,8 +20,10 @@ use tempfile::NamedTempFile;
 use tokio::time::{interval, timeout};
 
 const TEST_SERVER_IMAGE: &str = "public.ecr.aws/docker/library/python:3.13-alpine";
+const TEST_SERVER_ALIAS: &str = "graphql-l7.openshell.test";
 
 struct DockerServer {
+    host: String,
     port: u16,
     container_id: String,
 }
@@ -66,18 +68,26 @@ class Handler(BaseHTTPRequestHandler):
 HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
 "#;
 
+        let e2e_network = std::env::var("OPENSHELL_E2E_DOCKER_NETWORK_NAME")
+            .ok()
+            .filter(|network| !network.trim().is_empty());
+        let host = e2e_network.as_ref().map_or_else(
+            || "host.openshell.internal".to_string(),
+            |_| TEST_SERVER_ALIAS.to_string(),
+        );
+        let port = if e2e_network.is_some() { 8000 } else { port };
+
+        let mut args = vec!["run", "--detach", "--rm"];
+        let published_port = format!("{port}:8000");
+        if let Some(network) = e2e_network.as_deref() {
+            args.extend(["--network", network, "--network-alias", TEST_SERVER_ALIAS]);
+        } else {
+            args.extend(["-p", &published_port]);
+        }
+        args.extend([TEST_SERVER_IMAGE, "python3", "-c", script]);
+
         let output = Command::new("docker")
-            .args([
-                "run",
-                "--detach",
-                "--rm",
-                "-p",
-                &format!("{port}:8000"),
-                TEST_SERVER_IMAGE,
-                "python3",
-                "-c",
-                script,
-            ])
+            .args(args)
             .output()
             .map_err(|e| format!("start docker test server: {e}"))?;
 
@@ -92,6 +102,7 @@ HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
         }
 
         let server = Self {
+            host,
             port,
             container_id: stdout,
         };
@@ -133,7 +144,7 @@ impl Drop for DockerServer {
     }
 }
 
-fn write_graphql_policy(port: u16) -> Result<NamedTempFile, String> {
+fn write_graphql_policy(host: &str, port: u16) -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|e| format!("create temp policy file: {e}"))?;
     let policy = format!(
         r#"version: 1
@@ -164,7 +175,7 @@ network_policies:
   test_graphql_l7:
     name: test_graphql_l7
     endpoints:
-      - host: host.openshell.internal
+      - host: {host}
         port: {port}
         protocol: graphql
         enforcement: enforce
@@ -208,7 +219,7 @@ async fn graphql_l7_enforces_allow_and_deny_rules_on_forward_and_connect_paths()
     let server = DockerServer::start()
         .await
         .expect("start docker test server");
-    let policy = write_graphql_policy(server.port).expect("write custom policy");
+    let policy = write_graphql_policy(&server.host, server.port).expect("write custom policy");
     let policy_path = policy
         .path()
         .to_str()
@@ -225,7 +236,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-HOST = "host.openshell.internal"
+HOST = {host:?}
 PORT = {port}
 DETAILS = {{}}
 
@@ -477,19 +488,13 @@ results = {{
 results.update(DETAILS)
 print(json.dumps(results, sort_keys=True))
 "#,
+        host = server.host,
         port = server.port,
     );
 
-    let guard = SandboxGuard::create(&[
-        "--policy",
-        &policy_path,
-        "--",
-        "python3",
-        "-c",
-        &script,
-    ])
-    .await
-    .expect("sandbox create");
+    let guard = SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", &script])
+        .await
+        .expect("sandbox create");
 
     for (key, expected) in [
         ("forward_query_allowed", 200),
