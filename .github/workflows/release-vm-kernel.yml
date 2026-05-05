@@ -13,6 +13,9 @@ name: Release VM Kernel
 # This workflow runs on-demand (or when kernel config / pins change).  It is
 # intentionally decoupled from the per-commit VM binary build because the
 # kernel rarely changes and takes 15-45 minutes to compile.
+#
+# OS-49: this workflow uses shared runners for VM runtime build/package jobs.
+# It does not validate VFIO GPU passthrough.
 
 on:
   workflow_dispatch:
@@ -36,7 +39,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-runtime-linux-arm64:
     name: Build Runtime (Linux ARM64)
-    runs-on: build-arm64
+    runs-on: linux-arm64-cpu8
     timeout-minutes: 60
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -86,7 +89,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-runtime-linux-amd64:
     name: Build Runtime (Linux AMD64)
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 60
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -168,7 +171,7 @@ jobs:
   release-kernel:
     name: Release Kernel Runtime
     needs: [build-runtime-linux-arm64, build-runtime-linux-amd64, build-runtime-macos-arm64]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6

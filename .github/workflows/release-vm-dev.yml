@@ -7,6 +7,9 @@ name: Release VM Dev
 #
 # Prerequisites: the vm-dev release must already contain kernel runtime
 # tarballs.  Run the "Release VM Kernel" workflow first if they are missing.
+#
+# OS-49: this workflow uses shared runners for VM build/package jobs. It does
+# not validate VFIO GPU passthrough; that requires a dedicated VFIO-capable host.
 
 on:
   push:
@@ -32,7 +35,7 @@ jobs:
   # ---------------------------------------------------------------------------
   compute-versions:
     name: Compute Versions
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 5
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -63,7 +66,7 @@ jobs:
   # ---------------------------------------------------------------------------
   download-kernel-runtime:
     name: Download Kernel Runtime
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -125,10 +128,10 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             guest_arch: aarch64
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             guest_arch: x86_64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -189,12 +192,12 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-gnu
             platform: linux-aarch64
             guest_arch: aarch64
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-gnu
             platform: linux-x86_64
             guest_arch: x86_64
@@ -208,7 +211,6 @@ jobs:
       options: --privileged
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
       OPENSHELL_IMAGE_TAG: dev
     steps:
       - uses: actions/checkout@v6
@@ -315,7 +317,7 @@ jobs:
   build-vm-macos:
     name: Build VM (macOS)
     needs: [compute-versions, download-kernel-runtime, build-rootfs]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 60
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -327,7 +329,6 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -344,6 +345,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
+        with:
+          driver: local
 
       - name: Install zstd
         run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
@@ -426,12 +429,12 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-gnu
             platform: linux-aarch64
             guest_arch: aarch64
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-gnu
             platform: linux-x86_64
             guest_arch: x86_64
@@ -445,7 +448,6 @@ jobs:
       options: --privileged
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
       OPENSHELL_IMAGE_TAG: dev
     steps:
       - uses: actions/checkout@v6
@@ -549,7 +551,7 @@ jobs:
   build-driver-vm-macos:
     name: Build Driver VM (macOS)
     needs: [compute-versions, download-kernel-runtime]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 60
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -561,7 +563,6 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -578,6 +579,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
+        with:
+          driver: local
 
       - name: Install zstd
         run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
@@ -666,7 +669,7 @@ jobs:
       - build-vm-macos
       - build-driver-vm-linux
       - build-driver-vm-macos
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
