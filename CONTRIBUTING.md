@@ -34,7 +34,7 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 
 Issues labeled [`good-first-issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3Agood-first-issue) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
-All open issues are actionable — if it's in the issue tracker, it's ready to be worked on.
+Open issues are not all the same: bugs and implementation issues may be ready to work, while feature proposal issues are product discussions until maintainers accept the feature request.
 
 ## Before You Open an Issue
 
@@ -48,7 +48,7 @@ This project ships with [agent skills](#agent-skills-for-contributors) that can 
 ### When to Open an Issue
 
 - A real bug that your agent confirmed and could not fix.
-- A feature proposal with a design — not a "please build this" request.
+- A concrete feature idea that needs product discussion. Open a GitHub issue first; for substantial product changes, create a feature request under `feature-requests/` and link it from the issue.
 - An infrastructure problem that the gateway deployment troubleshooting skill could not resolve.
 - An inference setup problem that the `debug-inference` skill could not resolve.
 - Security vulnerabilities must follow [SECURITY.md](SECURITY.md) — **not** GitHub issues.
@@ -196,12 +196,25 @@ These are the primary `mise` tasks for day-to-day development:
 | `docs/`         | Published Fern docs source, navigation, and content assets |
 | `fern/`         | Fern site config, components, and theme assets |
 | `architecture/` | Architecture docs and plans                   |
+| `feature-requests/` | Product requirements and feature proposal templates |
 | `rfc/`          | Request for Comments proposals                |
 | `.agents/`      | Agent skills and persona definitions          |
 
-## RFCs
+## Feature Requests and RFCs
 
-For cross-cutting architectural decisions, API contract changes, or process proposals that need broad consensus, use the RFC process. RFCs live in `rfc/` — copy the template, fill it in, and open a PR for discussion. See [rfc/README.md](rfc/README.md) for the full lifecycle and guidelines on when to write an RFC versus a spike issue or architecture doc.
+Feature requests are product proposals. Use them when you want maintainers to decide whether a capability belongs in OpenShell, who it serves, what user outcome it should provide, and where users should expect it to be available. Feature requests live in `feature-requests/`; copy `feature-requests/0000-template`, fill it in, and link the GitHub issue where the feature is discussed.
+
+RFCs are technical design proposals. Use them after a feature request has been discussed and approved by core maintainers, or for non-feature technical decisions such as architecture, API contracts, process changes, or test design. RFCs live in `rfc/`; copy the template, fill it in, and link the approved feature request when applicable.
+
+Typical flow for new product capabilities:
+
+1. Open a GitHub issue to discuss the feature.
+2. Create a feature request under `feature-requests/` and link the issue.
+3. Get core maintainer approval on the product direction.
+4. Create an RFC only if detailed technical design is needed.
+5. Break accepted work into implementation issues or PRs.
+
+See [feature-requests/README.md](feature-requests/README.md) and [rfc/README.md](rfc/README.md) for the full processes.
 
 ## Documentation
 
