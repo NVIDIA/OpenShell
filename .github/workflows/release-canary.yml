@@ -33,9 +33,9 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     container:
@@ -81,10 +81,10 @@ jobs:
           - two-step
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-musl
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30

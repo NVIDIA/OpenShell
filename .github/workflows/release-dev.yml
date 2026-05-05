@@ -19,7 +19,7 @@ jobs:
   # ---------------------------------------------------------------------------
   compute-versions:
     name: Compute Versions
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 5
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -75,12 +75,12 @@ jobs:
     uses: ./.github/workflows/e2e-test.yml
     with:
       image-tag: ${{ github.sha }}
-      runner: build-arm64
+      runner: linux-arm64-cpu8
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
     needs: [build-gateway, build-supervisor, build-cluster]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     steps:
       - name: Log in to GHCR
@@ -105,12 +105,12 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             artifact: linux-amd64
             task: python:build:linux:amd64
             output_path: target/wheels/linux-amd64/*.whl
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             artifact: linux-arm64
             task: python:build:linux:arm64
             output_path: target/wheels/linux-arm64/*.whl
@@ -160,7 +160,7 @@ jobs:
   build-python-wheel-macos:
     name: Build Python Wheel (macOS)
     needs: [compute-versions]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 120
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -217,11 +217,11 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-musl
             zig_target: x86_64-linux-musl
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-musl
             zig_target: aarch64-linux-musl
     runs-on: ${{ matrix.runner }}
@@ -325,7 +325,7 @@ jobs:
   build-cli-macos:
     name: Build CLI (macOS)
     needs: [compute-versions]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 60
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -392,10 +392,10 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-gnu
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -472,7 +472,7 @@ jobs:
   build-gateway-binary-macos:
     name: Build Gateway Binary (macOS)
     needs: [compute-versions]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 60
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -543,10 +543,10 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-gnu
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -642,7 +642,7 @@ jobs:
   release-dev:
     name: Release Dev
     needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, build-deb]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     outputs:
       wheel_filenames: ${{ steps.wheel_filenames.outputs.wheel_filenames }}

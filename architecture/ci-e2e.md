@@ -32,6 +32,8 @@ OS-49 Phase 5 added non-required shadow workflows for the non-release workflows 
 
 `branch-checks.yml` uses `pr-gate` without a required label. That still verifies the mirror SHA matches the source PR head SHA, but does not require a new GitHub label for ordinary required checks. `branch-e2e.yml` keeps the existing `test:e2e` gate because it publishes temporary images and runs the expensive E2E suite. `ci-image.yml` now builds amd64 and arm64 CI images natively on shared CPU runners and merges the multi-arch manifest after both per-arch images are pushed.
 
+OS-49 Phase 7 moves the release-facing CPU jobs in `release-canary.yml`, `release-dev.yml`, and `release-tag.yml` to the same shared CPU labels. The release workflows also call `driver-vm-linux.yml` and `deb-package.yml`, so those reusable workers use the same labels to avoid retaining a hidden ARC dependency in the release path. `release-vm-dev.yml` and `release-vm-kernel.yml` remain on the old labels until the VM runtime decision is recorded for OS-131.
+
 ## Trigger taxonomy
 
 Five GitHub Actions trigger types appear in this flow. Each one was chosen for a specific reason - they are not interchangeable.
@@ -169,6 +171,8 @@ Only one workflow holds an "interesting" token: `rerun-on-completion` in `e2e-ga
 ## Release flow
 
 `release-tag.yml` and `release-dev.yml` call `e2e-test.yml` directly on `main` / tag pushes. Tags and `main` are inherently trusted refs, so they bypass copy-pr-bot. E2E still blocks the release jobs (`tag-ghcr-release: needs: [..., e2e]`).
+
+The release CPU jobs run on `linux-amd64-cpu8` and `linux-arm64-cpu8`. GitHub-hosted docs publishing and the external wheel-publish bridge keep their existing runners. VM development release workflows are tracked separately because the managed platform capability decision is still open.
 
 Permissions on the release workflows are not yet scoped per-job. Tracked separately.
 

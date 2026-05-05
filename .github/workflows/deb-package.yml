@@ -25,12 +25,12 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             deb_arch: amd64
             cli_target: x86_64-unknown-linux-musl
             gnu_target: x86_64-unknown-linux-gnu
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             deb_arch: arm64
             cli_target: aarch64-unknown-linux-musl
             gnu_target: aarch64-unknown-linux-gnu

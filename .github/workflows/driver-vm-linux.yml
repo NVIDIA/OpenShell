@@ -24,7 +24,7 @@ defaults:
 jobs:
   download-kernel-runtime:
     name: Download Kernel Runtime
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -82,12 +82,12 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-gnu
             platform: linux-aarch64
             guest_arch: aarch64
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-gnu
             platform: linux-x86_64
             guest_arch: x86_64

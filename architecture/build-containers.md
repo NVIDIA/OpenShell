@@ -47,6 +47,7 @@ OpenShell also publishes Python wheels for `linux/amd64`, `linux/arm64`, and mac
 - There is no local Linux multiarch wheel build task. Release workflows own the per-arch Linux wheel production.
 - The macOS ARM64 wheel is cross-compiled with `deploy/docker/Dockerfile.python-wheels-macos` via `build:python:wheel:macos`.
 - Release workflows mirror the CLI layout: a Linux matrix job for amd64/arm64, a separate macOS job, and release jobs that download the per-platform wheel artifacts directly before publishing.
+- Release CPU jobs run on `linux-amd64-cpu8` and `linux-arm64-cpu8`; the macOS wheel is still cross-compiled in Docker from the amd64 Linux runner.
 
 ## Sandbox Images
 
