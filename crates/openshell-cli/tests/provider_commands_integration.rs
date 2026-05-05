@@ -664,6 +664,113 @@ binaries: [/usr/bin/custom]
 }
 
 #[tokio::test]
+async fn provider_profile_import_from_directory_imports_supported_profile_files() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("custom-yaml.yaml"),
+        r"
+id: custom-yaml
+display_name: Custom YAML
+category: other
+endpoints:
+  - host: api.yaml.example
+    port: 443
+binaries: [/usr/bin/yaml-client]
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("custom-json.json"),
+        r#"{
+  "id": "custom-json",
+  "display_name": "Custom JSON",
+  "description": "",
+  "category": "other",
+  "credentials": [],
+  "endpoints": [{"host": "api.json.example", "port": 443}],
+  "binaries": ["/usr/bin/json-client"],
+  "inference_capable": false
+}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "ignored").unwrap();
+
+    run::provider_profile_import(&ts.endpoint, None, Some(dir.path()), &ts.tls)
+        .await
+        .expect("profile import --from");
+
+    run::provider_profile_export(&ts.endpoint, "custom-yaml", "yaml", &ts.tls)
+        .await
+        .expect("custom-yaml should be imported");
+    run::provider_profile_export(&ts.endpoint, "custom-json", "json", &ts.tls)
+        .await
+        .expect("custom-json should be imported");
+}
+
+#[tokio::test]
+async fn provider_profile_import_from_directory_parse_error_prevents_partial_import() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("custom-good.yaml"),
+        r"
+id: custom-good
+display_name: Custom Good
+category: other
+endpoints:
+  - host: api.good.example
+    port: 443
+",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("broken.yaml"), "id: [\n").unwrap();
+
+    let err = run::provider_profile_import(&ts.endpoint, None, Some(dir.path()), &ts.tls)
+        .await
+        .expect_err("profile import --from should fail on parse errors");
+    assert!(
+        err.to_string().contains("provider profile import failed"),
+        "unexpected error: {err}"
+    );
+
+    run::provider_profile_export(&ts.endpoint, "custom-good", "yaml", &ts.tls)
+        .await
+        .expect_err("valid profiles should not be partially imported after local parse errors");
+}
+
+#[tokio::test]
+async fn provider_profile_lint_from_directory_reports_parse_errors_without_importing() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("custom-good.yaml"),
+        r"
+id: custom-good
+display_name: Custom Good
+category: other
+endpoints:
+  - host: api.good.example
+    port: 443
+",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("broken.yaml"), "id: [\n").unwrap();
+
+    let err = run::provider_profile_lint(&ts.endpoint, None, Some(dir.path()), &ts.tls)
+        .await
+        .expect_err("profile lint --from should fail on parse errors");
+    assert!(
+        err.to_string().contains("provider profile lint failed"),
+        "unexpected error: {err}"
+    );
+
+    run::provider_profile_export(&ts.endpoint, "custom-good", "yaml", &ts.tls)
+        .await
+        .expect_err("lint should not import valid profiles");
+}
+
+#[tokio::test]
 async fn provider_create_rejects_key_only_credentials_without_local_env_value() {
     let ts = run_server().await;
 

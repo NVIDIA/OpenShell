@@ -700,8 +700,8 @@ mod tests {
     use openshell_core::Config;
     use openshell_core::proto::{
         DeleteProviderProfileRequest, GetProviderProfileRequest, ImportProviderProfilesRequest,
-        ListProviderProfilesRequest, ProviderProfile, ProviderProfileCategory,
-        ProviderProfileImportItem, Sandbox, SandboxSpec,
+        LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkEndpoint, ProviderProfile,
+        ProviderProfileCategory, ProviderProfileImportItem, Sandbox, SandboxSpec,
     };
     use openshell_core::{ObjectId, ObjectName};
     use std::collections::HashMap;
@@ -760,6 +760,16 @@ mod tests {
             binaries: Vec::new(),
             inference_capable: false,
         }
+    }
+
+    fn custom_profile_with_invalid_endpoint(id: &str) -> ProviderProfile {
+        let mut profile = custom_profile(id);
+        profile.endpoints.push(NetworkEndpoint {
+            host: String::new(),
+            port: 0,
+            ..Default::default()
+        });
+        profile
     }
 
     async fn test_server_state() -> Arc<ServerState> {
@@ -919,6 +929,95 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("built-in"))
         );
+    }
+
+    #[tokio::test]
+    async fn import_provider_profiles_rejects_mixed_batch_without_partial_import() {
+        let state = test_server_state().await;
+        let response = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile("bulk-one")),
+                        source: "bulk-one.yaml".to_string(),
+                    },
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile_with_invalid_endpoint("bulk-bad")),
+                        source: "bulk-bad.yaml".to_string(),
+                    },
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile("bulk-two")),
+                        source: "bulk-two.yaml".to_string(),
+                    },
+                ],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.imported);
+        assert!(response.profiles.is_empty());
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.profile_id == "bulk-bad"
+                && diagnostic.field == "endpoints[0]"
+                && diagnostic.message.contains("invalid endpoint")
+        }));
+
+        for id in ["bulk-one", "bulk-two"] {
+            let missing = handle_get_provider_profile(
+                &state,
+                Request::new(GetProviderProfileRequest { id: id.to_string() }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(missing.code(), Code::NotFound);
+        }
+    }
+
+    #[tokio::test]
+    async fn lint_provider_profiles_reports_mixed_batch_diagnostics() {
+        let state = test_server_state().await;
+        let response = handle_lint_provider_profiles(
+            &state,
+            Request::new(LintProviderProfilesRequest {
+                profiles: vec![
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile("lint-one")),
+                        source: "lint-one.yaml".to_string(),
+                    },
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile_with_invalid_endpoint("lint-bad")),
+                        source: "lint-bad.yaml".to_string(),
+                    },
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile("lint-two")),
+                        source: "lint-two.yaml".to_string(),
+                    },
+                ],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.valid);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.profile_id == "lint-bad"
+                && diagnostic.field == "endpoints[0]"
+                && diagnostic.message.contains("invalid endpoint")
+        }));
+
+        for id in ["lint-one", "lint-two"] {
+            let missing = handle_get_provider_profile(
+                &state,
+                Request::new(GetProviderProfileRequest { id: id.to_string() }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(missing.code(), Code::NotFound);
+        }
     }
 
     #[tokio::test]
