@@ -4,7 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
   workflow_run:
-    workflows: ["Branch E2E Checks", "GPU Test"]
+    workflows: ["Branch E2E Checks", "GPU Test", "Branch Helm E2E"]
     types: [completed]
 
 permissions: {}
@@ -35,6 +35,18 @@ jobs:
     with:
       required_label: test:e2e-gpu
       workflow_file: test-gpu.yml
+
+  helm-e2e:
+    name: Helm E2E
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    uses: ./.github/workflows/e2e-gate-check.yml
+    with:
+      required_label: test:e2e-helm
+      workflow_file: branch-helm-e2e.yml
 
   # When the guarded workflow finishes, GitHub fires `workflow_run` in the
   # default-branch context — any check posted from here would land on `main`,
