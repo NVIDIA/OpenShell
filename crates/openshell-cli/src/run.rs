@@ -5,7 +5,8 @@
 
 use crate::policy_update::build_policy_update_plan;
 use crate::tls::{
-    TlsOptions, build_rustls_config, grpc_client, grpc_inference_client, require_tls_materials,
+    TlsOptions, build_insecure_rustls_config, build_rustls_config, grpc_client,
+    grpc_inference_client, require_tls_materials,
 };
 use bytes::Bytes;
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
@@ -1509,7 +1510,14 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
     let uri: hyper::Uri = format!("{base}/healthz").parse().into_diagnostic()?;
 
     let scheme = uri.scheme_str().unwrap_or("https");
-    let https = if scheme.eq_ignore_ascii_case("http") || tls.is_bearer_auth() {
+    let https = if tls.gateway_insecure && scheme.eq_ignore_ascii_case("https") {
+        let insecure_config = build_insecure_rustls_config()?;
+        HttpsConnectorBuilder::new()
+            .with_tls_config(insecure_config)
+            .https_or_http()
+            .enable_http1()
+            .build()
+    } else if scheme.eq_ignore_ascii_case("http") || tls.is_bearer_auth() {
         HttpsConnectorBuilder::new()
             .with_native_roots()
             .into_diagnostic()?

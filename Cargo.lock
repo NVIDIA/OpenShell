@@ -3384,6 +3384,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "tonic",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
  "url",
