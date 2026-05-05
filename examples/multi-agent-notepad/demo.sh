@@ -100,7 +100,9 @@ validate_env() {
     [[ "$DEMO_GITHUB_OWNER" =~ ^[A-Za-z0-9_.-]+$ ]] || fail "DEMO_GITHUB_OWNER contains unsupported characters"
     [[ "$DEMO_GITHUB_REPO" =~ ^[A-Za-z0-9_.-]+$ ]] || fail "DEMO_GITHUB_REPO contains unsupported characters"
     [[ "$DEMO_BRANCH" =~ ^[A-Za-z0-9._-]+$ ]] || fail "DEMO_BRANCH may contain only letters, numbers, '.', '_', and '-'"
+    info "GitHub repo ${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO}@${DEMO_BRANCH} and token present"
 
+    info "checking OpenShell gateway is reachable..."
     "$OPENSHELL_BIN" status >/dev/null 2>&1 || fail "OpenShell gateway is not reachable; run: openshell gateway start"
 
     export CODEX_AUTH_ACCESS_TOKEN
@@ -113,6 +115,7 @@ validate_env() {
     [[ -n "$CODEX_AUTH_ACCESS_TOKEN" ]] || fail "local Codex sign-in is missing an access token; run: codex login"
     [[ -n "$CODEX_AUTH_REFRESH_TOKEN" ]] || fail "local Codex sign-in is missing a refresh token; run: codex login"
     [[ -n "$CODEX_AUTH_ACCOUNT_ID" ]] || fail "local Codex sign-in is missing an account id; run: codex login"
+    info "local Codex OAuth tokens loaded from ~/.codex/auth.json"
 }
 
 render_policy() {
@@ -221,6 +224,7 @@ print_results() {
 }
 
 main() {
+    step "Validating Codex and GitHub credentials"
     validate_env
     render_policy
     write_runner

@@ -13,7 +13,7 @@ reports, decision logs — need somewhere durable to write them. The store has
 to survive individual sandbox death, accept many concurrent writers safely,
 and stay inspectable after the fact. GitHub provides all three for free:
 
-- **Durable across sandbox death.** A sandbox can crash mid-run; the
+- **Durable across sandbox restarts.** A sandbox can crash mid-run; the
   committed artifact persists.
 - **Concurrency control built in.** Every PUT must include the current file
   SHA, and the branch ref serializes commits. Racing writers see HTTP 409
