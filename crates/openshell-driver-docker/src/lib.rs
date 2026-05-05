@@ -799,11 +799,21 @@ impl ComputeDriver for DockerComputeDriver {
         let request = request.into_inner();
         require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
 
-        Ok(Response::new(DeleteSandboxResponse {
-            deleted: self
-                .delete_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
-                .await?,
-        }))
+        let event_sandbox_id = request.sandbox_id.clone();
+        let deleted = self
+            .delete_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
+            .await?;
+        if deleted && !event_sandbox_id.is_empty() {
+            let _ = self.events.send(WatchSandboxesEvent {
+                payload: Some(watch_sandboxes_event::Payload::Deleted(
+                    WatchSandboxesDeletedEvent {
+                        sandbox_id: event_sandbox_id,
+                    },
+                )),
+            });
+        }
+
+        Ok(Response::new(DeleteSandboxResponse { deleted }))
     }
 
     async fn watch_sandboxes(
