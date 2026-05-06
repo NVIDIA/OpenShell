@@ -32,6 +32,8 @@ OS-49 Phase 5 added non-required shadow workflows for the non-release workflows 
 
 `branch-checks.yml` uses `pr-gate` without a required label. That still verifies the mirror SHA matches the source PR head SHA, but does not require a new GitHub label for ordinary required checks. `branch-e2e.yml` keeps the existing `test:e2e` gate because it publishes temporary images and runs the expensive E2E suite. `ci-image.yml` now builds amd64 and arm64 CI images natively on shared CPU runners and merges the multi-arch manifest after both per-arch images are pushed.
 
+The `mise-lockfile` job regenerates `mise.lock` with the CI image's pinned mise version and compares the result against the checked-in file. The comparison ignores only mise's generated comment header, because mise has changed that documentation URL without changing lockfile semantics; all tool entries, URLs, checksums, and platform records remain enforced.
+
 OS-49 Phase 7 moves the release-facing CPU jobs in `release-canary.yml`, `release-dev.yml`, and `release-tag.yml` to the same shared CPU labels. The release workflows also call `driver-vm-linux.yml` and `deb-package.yml`, so those reusable workers use the same labels to avoid retaining a hidden ARC dependency in the release path. `release-vm-dev.yml` and `release-vm-kernel.yml` remain on the old labels until the VM runtime decision is recorded for OS-131.
 
 ## Trigger taxonomy
