@@ -42,17 +42,10 @@ Both methods install the latest stable release by default. To install a specific
 Deploy the OpenShell gateway into a Kubernetes cluster from the OCI chart published to GHCR:
 
 ```bash
-# Tagged release — pin to a specific version
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version>
-
-# Floating dev tag — tracks the latest commit on main
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version 0.0.0-dev
-
-# Pinned dev — exact commit on main (full SHA)
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version 0.0.0-dev.<commit-sha>
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart
 ```
 
-See [`deploy/helm/openshell/values.yaml`](deploy/helm/openshell/values.yaml) for configurable values.
+See [`deploy/helm/openshell/README.md`](deploy/helm/openshell/README.md) for available versions, dev tag conventions, and configuration.
 
 ### Create a sandbox
 
