@@ -185,7 +185,7 @@ gh issue comment <id> --body "$(cat <<'EOF'
 - <risk or unknown that may need human input>
 
 ### Documentation Impact
-- <which architecture/ docs will need updating, or "None expected">
+- <docs expected per AGENTS.md, or "None expected">
 
 ---
 *Revision 1 — initial plan*
@@ -431,18 +431,9 @@ Do not proceed to PR creation if E2E verification is not green.
 
 ### Step 11: Update Documentation
 
-Use the `arch-doc-writer` sub-agent to update architecture documentation. Use the Task tool:
-
-```
-Task tool with subagent_type="arch-doc-writer"
-```
-
-In the prompt, provide:
-- Which files were changed and why (from the plan + any deviations)
-- The issue context (what was built/fixed)
-- Which architecture docs in `architecture/` are likely affected
-
-Launch one `arch-doc-writer` instance per documentation file that needs updating. If no documentation changes are needed, the `arch-doc-writer` will make that determination.
+Review the documentation requirements in `AGENTS.md` and update any affected
+docs as part of the implementation. Keep documentation changes scoped to the
+behavior or subsystem that changed.
 
 ### Step 12: Commit and Push
 
@@ -502,10 +493,9 @@ Closes #<issue-id>
 ## Checklist
 - [x] Follows Conventional Commits
 - [x] Commits are signed off (DCO)
-- [x] Architecture docs updated (if applicable)
 
 **Documentation updated:**
-- `<architecture/doc.md>`: <what was updated>
+- `<doc path>`: <what was updated, or "None needed">
 EOF
 )"
 ```
@@ -537,7 +527,7 @@ PR: [#<pr-number>](https://github.com/OWNER/REPO/pull/<pr-number>)
 - E2E: <count or N/A>
 
 ### Docs updated
-- <list of updated architecture docs, or "None needed">
+- <list of updated docs, or "None needed">
 
 The issue will auto-close when the PR is merged.
 EOF
@@ -691,7 +681,6 @@ User says: "Build issue #42"
 7. Add unit tests for pagination logic, integration tests for both endpoints
 8. `mise run pre-commit` passes on first attempt
 9. E2E tests skipped (no changes under `e2e/`)
-10. `arch-doc-writer` updates `architecture/gateway.md` with pagination details
 10. Commit, push, create PR with `Closes #42`
 11. Post summary comment on issue with PR link
 12. Update labels: remove `state:in-progress` + `state:review-ready`, add `state:pr-opened`
