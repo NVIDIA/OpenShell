@@ -38,7 +38,7 @@ Environment:
   OPENSHELL_SERVER_PORT   Gateway port. Defaults to 8080 for Kubernetes,
                           18080 for Podman/Docker, and 18081 for VM.
   OPENSHELL_SUPERVISOR_IMAGE
-                          Podman supervisor sideload image. Defaults to
+                          Podman supervisor image. Defaults to
                           openshell/supervisor:dev and is built on demand.
 
 Docker and VM runs delegate to gateway:docker and gateway:vm setup scripts.
@@ -175,9 +175,9 @@ ensure_podman_supervisor_image() {
     exit 1
   fi
 
-  echo "Building Podman supervisor sideload image (${supervisor_image})..."
+  echo "Building Podman supervisor image (${supervisor_image})..."
   require_mise
-  CONTAINER_ENGINE=podman IMAGE_TAG=dev mise run build:docker:supervisor-sideload
+  CONTAINER_ENGINE=podman IMAGE_TAG=dev mise run build:container:supervisor
 
   if ! podman image exists "${supervisor_image}" >/dev/null 2>&1; then
     echo "ERROR: expected supervisor image '${supervisor_image}' after build" >&2

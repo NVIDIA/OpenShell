@@ -30,7 +30,7 @@ The chart remains the supported deployment artifact for Kubernetes.
 
 `deploy/docker/Dockerfile.images` no longer compiles Rust. CI calls `.github/workflows/shadow-rust-native-build.yml` through `workflow_call` to build `openshell-gateway` or `openshell-sandbox` natively on the target architecture. `.github/workflows/docker-build.yml` downloads the resulting artifact, stages it at `deploy/docker/.build/prebuilt-binaries/<arch>/`, builds the per-arch image with the local Buildx driver, and merges multi-arch pushes with `docker buildx imagetools create`. Callers normally publish the GitHub SHA tag, but can pass `image-tag` to publish isolated temporary tags for validation.
 
-Local image builds use `tasks/scripts/stage-prebuilt-binaries.sh` through `tasks/scripts/docker-build-image.sh` before invoking Docker, so clean checkouts do not need to create the staging directory manually.
+Local image builds use `tasks/scripts/stage-prebuilt-binaries.sh` through `tasks/scripts/container-build-image.sh` before invoking Docker, so clean checkouts do not need to create the staging directory manually.
 
 ## Supervisor Delivery
 

@@ -280,7 +280,7 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | `tls handshake eof` from `openshell status` | Server not running or mTLS credentials missing/mismatched | Check StatefulSet replicas (Step 3) and mTLS files (Step 6) |
 | StatefulSet `0/0` replicas | StatefulSet scaled to zero (failed deploy, manual scale-down, or Helm misconfiguration) | `openshell doctor exec -- kubectl -n openshell scale statefulset openshell --replicas=1` |
 | Local mTLS files missing | Deploy was interrupted before credentials were persisted | Extract from cluster secret `openshell-client-tls` (Step 6) |
-| Container not found | Image not built | `mise run docker:build:cluster` (local) or re-deploy (remote) |
+| Container not found | Image not built | `mise run build:container:cluster` (local) or re-deploy (remote) |
 | Container exited, OOMKilled | Insufficient memory | Increase host memory or reduce workload |
 | Container exited, non-zero exit | k3s crash, port conflict, privilege issue | Check `openshell doctor logs` for details |
 | `/readyz` fails | k3s still starting or crashed | Wait longer or check container logs for k3s errors |

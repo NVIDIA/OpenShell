@@ -4,23 +4,29 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Build multi-arch gateway + cluster images and push to a container registry.
-# Requires DOCKER_REGISTRY to be set (e.g. ghcr.io/myorg).
+# Requires CONTAINER_REGISTRY (or DOCKER_REGISTRY) to be set (e.g. ghcr.io/myorg).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/container-engine.sh"
 
-REGISTRY=${DOCKER_REGISTRY:?Set DOCKER_REGISTRY to push multi-arch images (e.g. ghcr.io/myorg)}
+# Backwards-compatible env var fallbacks: accept CONTAINER_* or DOCKER_*
+CONTAINER_REGISTRY="${CONTAINER_REGISTRY:-${DOCKER_REGISTRY:-}}"
+CONTAINER_PLATFORMS="${CONTAINER_PLATFORMS:-${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}}"
+CONTAINER_BUILDER="${CONTAINER_BUILDER:-${DOCKER_BUILDER:-}}"
+CONTAINER_PUSH="${CONTAINER_PUSH:-${DOCKER_PUSH:-}}"
+EXTRA_CONTAINER_TAGS="${EXTRA_CONTAINER_TAGS:-${EXTRA_DOCKER_TAGS:-}}"
+
+REGISTRY=${CONTAINER_REGISTRY:?Set CONTAINER_REGISTRY (or DOCKER_REGISTRY) to push multi-arch images (e.g. ghcr.io/myorg)}
 IMAGE_TAG=${IMAGE_TAG:-dev}
-PLATFORMS=${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}
+PLATFORMS=${CONTAINER_PLATFORMS}
 TAG_LATEST=${TAG_LATEST:-false}
-EXTRA_DOCKER_TAGS_RAW=${EXTRA_DOCKER_TAGS:-}
 EXTRA_TAGS=()
 
-if [[ -n "${EXTRA_DOCKER_TAGS_RAW}" ]]; then
-  EXTRA_DOCKER_TAGS_RAW=${EXTRA_DOCKER_TAGS_RAW//,/ }
-  for tag in ${EXTRA_DOCKER_TAGS_RAW}; do
+if [[ -n "${EXTRA_CONTAINER_TAGS}" ]]; then
+  EXTRA_TAGS_RAW=${EXTRA_CONTAINER_TAGS//,/ }
+  for tag in ${EXTRA_TAGS_RAW}; do
     [[ -n "${tag}" ]] && EXTRA_TAGS+=("${tag}")
   done
 fi
@@ -29,7 +35,7 @@ fi
 # Docker path: use buildx builders + imagetools for multi-arch
 # ---------------------------------------------------------------------------
 _publish_multiarch_docker() {
-  BUILDER_NAME=${DOCKER_BUILDER:-multiarch}
+  BUILDER_NAME=${CONTAINER_BUILDER:-multiarch}
   if ce buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
     echo "Using existing buildx builder: ${BUILDER_NAME}"
     ce buildx use "${BUILDER_NAME}"
@@ -38,17 +44,17 @@ _publish_multiarch_docker() {
     ce buildx create --name "${BUILDER_NAME}" --use --bootstrap
   fi
 
-  export DOCKER_BUILDER="${BUILDER_NAME}"
-  export DOCKER_PLATFORM="${PLATFORMS}"
-  export DOCKER_PUSH=1
+  export CONTAINER_BUILDER="${BUILDER_NAME}"
+  export CONTAINER_PLATFORM="${PLATFORMS}"
+  export CONTAINER_PUSH=1
   export IMAGE_REGISTRY="${REGISTRY}"
 
   echo "Building multi-arch gateway image..."
-  tasks/scripts/docker-build-image.sh gateway
+  tasks/scripts/container-build-image.sh gateway
 
   echo
   echo "Building multi-arch cluster image..."
-  tasks/scripts/docker-build-image.sh cluster
+  tasks/scripts/container-build-image.sh cluster
 
   TAGS_TO_APPLY=("${EXTRA_TAGS[@]}")
   if [[ "${TAG_LATEST}" == "true" ]]; then
@@ -91,12 +97,12 @@ _publish_multiarch_podman() {
     for platform in "${PLATFORM_LIST[@]}"; do
       echo "  Building ${component} for ${platform}..."
       # Build for each platform and add to the manifest list.
-      # docker-build-image.sh sources container-engine.sh itself,
+      # container-build-image.sh sources container-engine.sh itself,
       # so ce_build is used internally.
-      DOCKER_PLATFORM="${platform}" \
-      DOCKER_PUSH="" \
+      CONTAINER_PLATFORM="${platform}" \
+      CONTAINER_PUSH="" \
       IMAGE_TAG="${IMAGE_TAG}" \
-        tasks/scripts/docker-build-image.sh "${component}"
+        tasks/scripts/container-build-image.sh "${component}"
 
       # Tag with a platform-specific suffix for manifest assembly.
       local platform_tag="${IMAGE_TAG}-${platform//\//-}"

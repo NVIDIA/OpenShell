@@ -1,20 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Docker image build tasks
+# Backwards-compatible aliases: build:docker:* → build:container:*
+# These exist so CI workflows and muscle memory keep working.
 
 ["build:docker"]
-description = "Build all Docker images"
-depends = [
-  "build:docker:gateway",
-  "build:docker:cluster",
-  "build:docker:supervisor",
-]
+description = "Alias → build:container (all container images)"
+depends = ["build:container"]
 hide = true
 
 ["build:docker:ci"]
-description = "Build the CI Docker image"
-run = "tasks/scripts/docker-build-ci.sh"
+description = "Alias → build:container:ci"
+depends = ["build:container:ci"]
 hide = true
 
 ["build:docker:prebuilt"]
@@ -23,49 +20,49 @@ run = "tasks/scripts/stage-prebuilt-binaries.sh all"
 hide = true
 
 ["build:docker:gateway"]
-description = "Build the gateway Docker image"
-run = "tasks/scripts/docker-build-image.sh gateway"
+description = "Alias → build:container:gateway"
+depends = ["build:container:gateway"]
 hide = true
 
 ["build:docker:supervisor"]
-description = "Build the supervisor image (FROM scratch, binary only)"
-run = "tasks/scripts/docker-build-image.sh supervisor"
+description = "Alias → build:container:supervisor"
+depends = ["build:container:supervisor"]
 hide = true
 
 ["build:docker:cluster"]
-description = "Build the k3s cluster image (component images pulled at runtime from registry)"
-run = "tasks/scripts/docker-build-image.sh cluster"
-hide = true
-
-["docker:build:gateway"]
-description = "Alias for build:docker:gateway"
-depends = ["build:docker:gateway"]
-hide = true
-
-["docker:build:supervisor"]
-description = "Alias for build:docker:supervisor"
-depends = ["build:docker:supervisor"]
-hide = true
-
-["docker:build:cluster"]
-description = "Alias for build:docker:cluster"
-depends = ["build:docker:cluster"]
+description = "Alias → build:container:cluster"
+depends = ["build:container:cluster"]
 hide = true
 
 ["build:docker:cluster:multiarch"]
-description = "Build multi-arch cluster image and push to a registry"
-run = "tasks/scripts/docker-publish-multiarch.sh"
+description = "Alias → build:container:cluster:multiarch"
+depends = ["build:container:cluster:multiarch"]
+hide = true
+
+["docker:build:gateway"]
+description = "Alias → build:container:gateway"
+depends = ["build:container:gateway"]
+hide = true
+
+["docker:build:supervisor"]
+description = "Alias → build:container:supervisor"
+depends = ["build:container:supervisor"]
+hide = true
+
+["docker:build:cluster"]
+description = "Alias → build:container:cluster"
+depends = ["build:container:cluster"]
 hide = true
 
 ["docker:build:cluster:multiarch"]
-description = "Alias for build:docker:cluster:multiarch"
-depends = ["build:docker:cluster:multiarch"]
+description = "Alias → build:container:cluster:multiarch"
+depends = ["build:container:cluster:multiarch"]
 hide = true
 
 ["docker:cleanup"]
-description = "Remove stale images, volumes, and build cache not used by the current cluster"
-run = "scripts/docker-cleanup.sh --force"
+description = "Alias → container:cleanup"
+depends = ["container:cleanup"]
 
 ["docker:cleanup:dry-run"]
-description = "Preview what docker:cleanup would remove without deleting anything"
-run = "scripts/docker-cleanup.sh --dry-run"
+description = "Alias → container:cleanup:dry-run"
+depends = ["container:cleanup:dry-run"]

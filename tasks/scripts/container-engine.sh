@@ -270,7 +270,7 @@ ce_imagetools_create() {
   # Podman fallback: parse -t <tag> and the trailing source image, then
   # use skopeo or podman tag.  This is a best-effort shim for simple
   # re-tagging; full multi-arch manifest manipulation should use the
-  # podman-native code path in docker-publish-multiarch.sh.
+  # podman-native code path in container-publish-multiarch.sh.
   #
   # Argument parsing uses a sentinel ("__next__") to capture the value
   # that follows a two-token -t / --tag flag.  --prefer-index is accepted
@@ -302,6 +302,32 @@ ce_imagetools_create() {
       "${_CE_BIN}" tag "${source_image}" "${new_tag}"
       "${_CE_BIN}" push "${new_tag}"
     fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# ce_resolve_containerfile — find the container build file for a given target.
+#
+# Probes for Containerfile.{suffix} first (Podman/OCI convention), then
+# Dockerfile.{suffix} (Docker convention).  Returns the first match.
+#
+# Usage: ce_resolve_containerfile <dir> <suffix>
+#   dir    — directory containing the build file (e.g. deploy/docker)
+#   suffix — file suffix (e.g. images, ci, python-wheels-macos)
+#
+# Prints the resolved path on stdout.  Returns 1 if neither file exists.
+# ---------------------------------------------------------------------------
+ce_resolve_containerfile() {
+  local dir="${1:?Usage: ce_resolve_containerfile <dir> <suffix>}"
+  local suffix="${2:?Usage: ce_resolve_containerfile <dir> <suffix>}"
+
+  if [[ -f "${dir}/Containerfile.${suffix}" ]]; then
+    echo "${dir}/Containerfile.${suffix}"
+  elif [[ -f "${dir}/Dockerfile.${suffix}" ]]; then
+    echo "${dir}/Dockerfile.${suffix}"
+  else
+    echo "Error: no Containerfile.${suffix} or Dockerfile.${suffix} found in ${dir}" >&2
+    return 1
   fi
 }
 
