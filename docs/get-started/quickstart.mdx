@@ -33,6 +33,17 @@ If you prefer [uv](https://docs.astral.sh/uv/):
 uv tool install -U openshell
 ```
 
+Tagged releases also publish a temporary Homebrew formula for Apple Silicon
+macOS local gateways:
+
+```shell
+VERSION=v0.0.10 # replace with the release tag you want
+curl -fsSLo /tmp/openshell.rb "https://github.com/NVIDIA/OpenShell/releases/download/${VERSION}/openshell.rb"
+brew install /tmp/openshell.rb
+brew services restart openshell
+openshell gateway add http://127.0.0.1:17670 --local --name local
+```
+
 After installing the CLI, run `openshell --help` in your terminal to see the full CLI reference.
 
 <Tip>

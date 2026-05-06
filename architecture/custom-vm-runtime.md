@@ -326,8 +326,9 @@ only for the kernel build).
 macOS driver binaries produced via osxcross are not codesigned. Development
 builds are signed automatically by `tasks/scripts/gateway-vm.sh`
 (registered as `mise run gateway:vm`) and by `install-dev.sh` when it installs
-the Apple Silicon development tarballs from the selected release. A packaged
-release needs signing in CI.
+the Apple Silicon development tarballs from the selected release. Tagged
+releases also publish a generated Homebrew formula that ad-hoc signs the
+installed driver in `post_install`. A packaged release needs signing in CI.
 
 ## Rollout Strategy
 

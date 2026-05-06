@@ -789,6 +789,15 @@ jobs:
             openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz > openshell-sandbox-checksums-sha256.txt
           cat openshell-sandbox-checksums-sha256.txt
 
+      - name: Generate Homebrew formula
+        run: |
+          set -euo pipefail
+          python3 tasks/scripts/release.py generate-homebrew-formula \
+            --release-tag "${RELEASE_TAG}" \
+            --release-dir release \
+            --output release/openshell.rb
+          cat release/openshell.rb
+
       - name: Attest VM driver artifacts
         uses: actions/attest@v4
         with:
@@ -835,6 +844,15 @@ jobs:
             curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_VERSION=${{ env.RELEASE_TAG }} sh
             ```
 
+            ### Apple Silicon macOS local gateway via Homebrew
+
+            ```bash
+            curl -fsSLo /tmp/openshell.rb https://github.com/NVIDIA/OpenShell/releases/download/${{ env.RELEASE_TAG }}/openshell.rb
+            brew install /tmp/openshell.rb
+            brew services restart openshell
+            openshell gateway add http://127.0.0.1:17670 --local --name local
+            ```
+
           files: |
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz
@@ -850,6 +868,7 @@ jobs:
             release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
             release/*.whl
+            release/openshell.rb
             release/openshell-checksums-sha256.txt
             release/openshell-gateway-checksums-sha256.txt
             release/openshell-sandbox-checksums-sha256.txt
