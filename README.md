@@ -33,22 +33,7 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 uv tool install -U openshell
 ```
 
-**Apple Silicon macOS local gateway via Homebrew formula:**
-
-```bash
-VERSION=v0.0.10 # replace with the release tag you want
-curl -fsSLo /tmp/openshell.rb "https://github.com/NVIDIA/OpenShell/releases/download/${VERSION}/openshell.rb"
-brew install /tmp/openshell.rb
-brew services restart openshell
-openshell gateway add http://127.0.0.1:17670 --local --name local
-```
-
-The binary and PyPI methods install the latest stable release by default. To
-install a specific version, set `OPENSHELL_VERSION` (binary), pin the version
-with `uv tool install openshell==<version>`, or download the matching
-`openshell.rb` formula from a tagged release. A
-[`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also
-available that tracks the latest commit on `main`.
+Both methods install the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION` (binary) or pin the version with `uv tool install openshell==<version>`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
 
 ### Create a sandbox
 

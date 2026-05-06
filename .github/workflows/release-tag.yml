@@ -844,15 +844,6 @@ jobs:
             curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_VERSION=${{ env.RELEASE_TAG }} sh
             ```
 
-            ### Apple Silicon macOS local gateway via Homebrew
-
-            ```bash
-            curl -fsSLo /tmp/openshell.rb https://github.com/NVIDIA/OpenShell/releases/download/${{ env.RELEASE_TAG }}/openshell.rb
-            brew install /tmp/openshell.rb
-            brew services restart openshell
-            openshell gateway add http://127.0.0.1:17670 --local --name local
-            ```
-
           files: |
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz

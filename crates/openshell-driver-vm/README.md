@@ -182,14 +182,11 @@ On Linux amd64 and arm64, `install-dev.sh` installs the Debian package from the
 selected `OPENSHELL_VERSION` release tag. That package includes
 `openshell-gateway` and `openshell-driver-vm`.
 
-On Apple Silicon macOS, `install-dev.sh` installs `openshell`,
-`openshell-gateway`, and `openshell-driver-vm` from the selected release
-tarballs. It ad-hoc signs `openshell-driver-vm` with the Hypervisor entitlement
-before registering the local LaunchAgent gateway.
-
-Tagged releases also publish an `openshell.rb` release asset. Installing that
-formula by path lets Homebrew own the binary layout and `brew services` gateway
-lifecycle without requiring a tap or cask yet.
+On Apple Silicon macOS, `install-dev.sh` installs the generated `openshell.rb`
+formula from the selected release. Homebrew installs `openshell`,
+`openshell-gateway`, and `openshell-driver-vm`, ad-hoc signs the driver with
+the Hypervisor entitlement in `post_install`, and owns the `brew services`
+gateway lifecycle.
 
 ## Relationship to `openshell-vm`
 
@@ -198,4 +195,4 @@ lifecycle without requiring a tap or cask yet.
 ## TODOs
 
 - The gateway still configures the driver via CLI args; this will move to a gRPC bootstrap call so the driver interface is uniform across backends. See the `TODO(driver-abstraction)` notes in `crates/openshell-server/src/lib.rs` and `crates/openshell-server/src/compute/vm.rs`.
-- macOS local builds are codesigned by `tasks/scripts/gateway-vm.sh`; `install-dev.sh` and the tagged-release Homebrew formula sign the release tarball driver for local installs.
+- macOS local builds are codesigned by `tasks/scripts/gateway-vm.sh`; the generated Homebrew formula signs the release tarball driver for local installs.
