@@ -1189,7 +1189,9 @@ async fn wait_for_namespace(
 ) -> Result<()> {
     use miette::WrapErr;
 
-    let attempts = 60;
+    // Shared CPU runners can take several minutes to cold-start k3s, apply
+    // bundled manifests, and let the k3s Helm controller create the namespace.
+    let attempts = 150;
     let max_backoff = std::time::Duration::from_secs(2);
     let mut backoff = std::time::Duration::from_millis(200);
 

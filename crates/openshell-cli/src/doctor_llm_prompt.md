@@ -225,7 +225,7 @@ openshell doctor exec -- kubectl -n openshell get secret openshell-client-tls -o
 
 Common mTLS issues:
 
-- **Secrets missing**: The `openshell` namespace may not have been created yet (Helm controller race). Bootstrap waits up to 2 minutes for the namespace.
+- **Secrets missing**: The `openshell` namespace may not have been created yet (Helm controller race). Bootstrap waits up to about 5 minutes for the namespace.
 - **mTLS mismatch after manual secret deletion**: Delete all three secrets and redeploy — bootstrap will regenerate and restart the workload.
 - **CLI can't connect after redeploy**: Check that `~/.config/openshell/gateways/<name>/mtls/` contains `ca.crt`, `tls.crt`, `tls.key` and that they were updated at deploy time.
 - **Local mTLS files missing**: The gateway was deployed but CLI credentials weren't persisted (e.g., interrupted deploy). Extract from the cluster secret as shown above.

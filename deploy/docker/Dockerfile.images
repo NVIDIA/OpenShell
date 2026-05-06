@@ -201,7 +201,13 @@ COPY deploy/docker/cluster-healthcheck.sh /usr/local/bin/cluster-healthcheck.sh
 RUN chmod +x /usr/local/bin/cluster-healthcheck.sh
 
 COPY deploy/docker/.build/charts/*.tgz /opt/openshell/charts/
-COPY deploy/kube/manifests/*.yaml /opt/openshell/manifests/
+# Only the core k3s auto-deploy manifests belong in the cluster image.
+# Gateway API routing is optional and requires Envoy Gateway CRDs, so
+# deploy/kube/manifests/envoy-gateway-openshell.yaml stays repo-local and is
+# applied manually by `mise run helm:gateway:apply` when grpcRoute is enabled.
+COPY deploy/kube/manifests/openshell-helmchart.yaml \
+     deploy/kube/manifests/agent-sandbox.yaml \
+     /opt/openshell/manifests/
 COPY deploy/kube/gpu-manifests/*.yaml /opt/openshell/gpu-manifests/
 
 ENTRYPOINT ["/usr/local/bin/cluster-entrypoint.sh"]
