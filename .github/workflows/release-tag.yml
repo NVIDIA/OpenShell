@@ -158,7 +158,7 @@ jobs:
         run: uv sync
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: python-wheel-linux-${{ matrix.arch }}
           cache-directories: .cache/sccache
@@ -273,7 +273,7 @@ jobs:
         run: mise install --locked
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: cli-musl-${{ matrix.arch }}
           cache-directories: .cache/sccache
@@ -447,7 +447,7 @@ jobs:
         run: mise install --locked
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: gateway-binary-gnu-${{ matrix.arch }}
           cache-directories: .cache/sccache
@@ -531,7 +531,7 @@ jobs:
         run: mise install --locked
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: supervisor-binary-gnu-${{ matrix.arch }}
           cache-directories: .cache/sccache
