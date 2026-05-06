@@ -22,6 +22,7 @@ class Versions:
     cargo: str
     docker: str
     deb: str
+    snap: str
     rpm_version: str
     rpm_release: str
     git_tag: str
@@ -108,6 +109,11 @@ def _versions_from_parts(
     # Docker tags can't contain '+'.
     docker_version = cargo_version.replace("+", "-")
 
+    # Snap versions cannot contain '+' and are limited to 32 characters.
+    snap_version = re.sub(r"\.d\d{8}$", "", docker_version)
+    if len(snap_version) > 32:
+        raise ValueError(f"snap version must be at most 32 characters: {snap_version}")
+
     # Debian versions use '~' so prereleases sort before the eventual release.
     deb_version = cargo_version
     deb_version = deb_version[1:] if deb_version.startswith("v") else deb_version
@@ -119,6 +125,7 @@ def _versions_from_parts(
         cargo=cargo_version,
         docker=docker_version,
         deb=deb_version,
+        snap=snap_version,
         rpm_version=rpm_version,
         rpm_release=rpm_release,
         git_tag=git_tag,
@@ -149,6 +156,7 @@ def _print_env(versions: Versions) -> None:
     print(f"VERSION_CARGO={versions.cargo}")
     print(f"VERSION_DOCKER={versions.docker}")
     print(f"VERSION_DEB={versions.deb}")
+    print(f"VERSION_SNAP={versions.snap}")
     print(f"VERSION_RPM={versions.rpm_version}")
     print(f"VERSION_RPM_RELEASE={versions.rpm_release}")
     print(f"GIT_TAG={versions.git_tag}")
@@ -166,6 +174,8 @@ def get_version(format: str) -> None:
         print(versions.docker)
     elif format == "deb":
         print(versions.deb)
+    elif format == "snap":
+        print(versions.snap)
     elif format == "rpm-version":
         print(versions.rpm_version)
     elif format == "rpm-release":
@@ -369,6 +379,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--deb", action="store_true", help="Print Debian package version only."
     )
     get_version_parser.add_argument(
+        "--snap", action="store_true", help="Print Snap package version only."
+    )
+    get_version_parser.add_argument(
         "--rpm-version", action="store_true", help="Print RPM Version only."
     )
     get_version_parser.add_argument(
@@ -416,6 +429,8 @@ def main() -> None:
             get_version("docker")
         elif args.deb:
             get_version("deb")
+        elif args.snap:
+            get_version("snap")
         elif args.rpm_version:
             get_version("rpm-version")
         elif args.rpm_release:
