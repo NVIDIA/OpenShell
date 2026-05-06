@@ -45,9 +45,6 @@ The gRPC surface is defined in `proto/openshell.proto`:
 - `GetProviderProfile`
 - `UpdateProvider`
 - `DeleteProvider`
-- `ImportProviderProfiles`
-- `LintProviderProfiles`
-- `DeleteProviderProfile`
 
 ## Provider Type Profiles
 
@@ -74,26 +71,6 @@ This keeps the compatibility boundary at the gateway. A gateway without
 gateway with the flag enabled routes all attached known provider types through the
 profile-backed policy path.
 
-### Custom Provider Profiles
-
-Custom provider profiles use the same DTO shape as built-in YAML profiles. The CLI can
-lint, import, export, and delete profiles as YAML or JSON, and the gRPC API carries the
-same proto-backed profile payloads.
-
-Custom profiles are persisted in the existing object store with
-`object_type = "provider_profile"`. No dedicated provider profile table is used. Built-in
-profiles remain file-backed and read-only; attempts to import over a built-in id or
-delete a built-in profile fail. `ListProviderProfiles` and `GetProviderProfile` merge the
-built-in YAML catalog with custom profiles from the object store, with built-ins taking
-precedence for reserved ids. Custom profile ids also cannot reuse legacy provider type
-ids or aliases such as `generic`, `github`, or `gh`; those ids remain reserved for
-provider records even when no built-in profile exists for that type.
-
-Deletion is limited to custom profiles that are not in use. Because sandbox specs attach
-provider names, the gateway checks every sandbox's attached providers, resolves each
-provider record, and blocks deletion when any provider's `type` matches the target
-profile id. Deleting a profile never cascades to provider records or sandboxes.
-
 ### Provider Policy Composition
 
 Sandbox policy fetch uses just-in-time composition:
@@ -106,9 +83,7 @@ The composed policy is derived data. The sandbox still receives one normal
 `SandboxPolicy`, but provider-generated entries are not persisted as user-authored
 policy revisions. Full policy replacement and incremental policy updates continue to
 mutate the user-authored policy layer. Provider-generated rules are re-added during
-composition for each attached provider whose type has a built-in or custom profile.
-Known legacy provider types without built-in profiles, such as `generic`, are skipped
-rather than resolving to a custom profile with the same id.
+composition for each attached provider whose type has a built-in profile.
 
 Provider-generated network rules use reserved `_provider_*` names derived from the
 provider record name. If a user or global policy already has the same key, composition
@@ -116,10 +91,6 @@ keeps the policy entry and adds a numeric suffix to the provider entry. Duplicat
 host/port endpoints across policy and provider rules are valid; OPA evaluates all
 rules, so allow decisions are the union of matching allows and deny rules continue to
 win globally.
-
-When a provider is detached from a sandbox, the next JIT composition naturally omits that
-provider's profile-generated layer because composition reads current sandbox provider
-attachments from the database each time.
 
 Gateway-global policy still overrides sandbox-authored policy. When `providers_v2_enabled`
 is true, provider layers compose JIT onto the effective policy source, whether that
@@ -138,9 +109,8 @@ persisted as a policy revision.
   - sandbox provider requirement resolution in `sandbox create`.
 - `crates/openshell-server` (gateway)
   - provider CRUD gRPC handlers,
-  - provider profile registry handlers,
   - `GetSandboxProviderEnvironment` handler resolves credentials at runtime,
-  - persistence using `object_type = "provider"` and `object_type = "provider_profile"`.
+  - persistence using `object_type = "provider"`.
 - `crates/openshell-sandbox`
   - sandbox supervisor fetches provider credentials via gRPC at startup,
   - injects placeholder env vars into entrypoint and SSH child processes,
@@ -259,13 +229,6 @@ Also supported:
 - `openshell provider get <name>`
 - `openshell provider list`
 - `openshell provider list-profiles`
-- `openshell provider list-profiles -o yaml|json`
-- `openshell provider profile export <id> -o yaml|json`
-- `openshell provider profile import -f <file>`
-- `openshell provider profile import --from <directory>`
-- `openshell provider profile lint -f <file>`
-- `openshell provider profile lint --from <directory>`
-- `openshell provider profile delete <id>`
 - `openshell provider update <name> ...`
 - `openshell provider delete <name> [<name>...]`
 
