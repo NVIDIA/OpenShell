@@ -1,6 +1,7 @@
 # openshell-router
 
-`openshell-router` is the inference routing and upstream execution engine used by `openshell-server`.
+`openshell-router` is the inference routing and upstream execution engine used
+by the sandbox proxy and gateway inference validation paths.
 
 ## Responsibilities
 
@@ -16,16 +17,20 @@
 - Persistence of routes/entities.
 - Loading sandbox or policy objects.
 
-These are owned by `openshell-server`.
+These are owned by `openshell-server` and `openshell-sandbox`.
 
-## Integration contract with openshell-server
+## Integration Contract
 
 Current split:
 
 - `openshell-server`:
-  - authenticates request origin
-  - resolves cluster-managed inference route candidates from providers
-  - loads enabled route candidates from the entity store
+  - authenticates user-facing inference configuration changes
+  - resolves managed route candidates from provider records
+  - validates backend endpoints
+- `openshell-sandbox`:
+  - intercepts `https://inference.local`
+  - detects the source inference protocol
+  - passes sanitized requests and resolved route candidates to the router
 - `openshell-router`:
   - picks a route from candidates (`proxy_with_candidates`)
   - forwards the HTTP request upstream and returns the raw response

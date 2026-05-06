@@ -196,6 +196,17 @@ ocsf_emit!(event);
 - Fern PR previews run through `.github/workflows/branch-docs.yml`, and production publish runs through the `publish-fern-docs` job in `.github/workflows/release-tag.yml`.
 - Use the `update-docs` skill to scan recent commits and draft doc updates.
 
+### Architecture Docs
+
+- Architecture docs are short canonical subsystem overviews, not exhaustive implementation notes.
+- Update one of the existing top-level architecture docs before adding a new file.
+- Put useful crate-specific details in the relevant crate `README.md`.
+- Add a new top-level architecture doc only when explicitly requested or when an RFC-level design needs a stable home.
+- Keep architecture docs focused on stable boundaries, data/control flow, invariants, and operational constraints.
+- Remove stale detail instead of preserving it by default.
+- Do not include testing transcripts, historical debugging notes, long source-file inventories, or field-by-field schema references.
+- Put user-facing instructions in `docs/`, broad design proposals in `rfc/`, and temporary plans in ignored `architecture/plans/`.
+
 ## Security
 
 - Never commit secrets, API keys, or credentials. If a file looks like it contains secrets (`.env`, `credentials.json`, etc.), do not stage it.

@@ -51,7 +51,9 @@ For GPU passthrough (VFIO), pass `-- --gpu` and run with root privileges:
 sudo -E env "PATH=$PATH" mise run gateway:vm -- --gpu
 ```
 
-See [`architecture/vm-gpu-sandbox-guide.md`](../../architecture/vm-gpu-sandbox-guide.md) for full GPU prerequisites and usage.
+GPU passthrough uses VFIO and requires host support for IOMMU, root privileges
+for bind/unbind operations, and a compatible sandbox image. The public GPU
+overview lives in the repository `README.md`.
 
 Point the CLI at the gateway with one of:
 

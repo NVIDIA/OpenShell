@@ -155,11 +155,11 @@ You may need to go back and forth a few times. Keep the loop tight:
 Read the full policy schema reference:
 
 ```
-Read architecture/security-policy.md
+Read docs/reference/policy-schema.mdx
 ```
 
 Key sections to reference:
-- **Full YAML Policy Schema** — top-level structure
+- **Policy Schema Reference** — top-level structure
 - **`network_policies`** — rule structure
 - **`NetworkEndpoint`** fields — host, port, protocol, tls, enforcement, access, rules, allowed_ips
 - **`L7Rule` / `L7Allow`** — method + path matching
@@ -167,7 +167,7 @@ Key sections to reference:
 - **Private IP Access via `allowed_ips`** — CIDR allowlist for private IP space
 - **Validation Rules** — what combinations are valid/invalid
 
-Also read the example policy for real-world patterns. The default policy is baked into the community base image (`ghcr.io/nvidia/openshell-community/sandboxes/base:latest`). For reference, consult the policy schema documentation:
+Also read the architecture overview for enforcement context. The default policy is baked into the community base image (`ghcr.io/nvidia/openshell-community/sandboxes/base:latest`). For reference, consult:
 
 ```
 Read architecture/security-policy.md
@@ -567,7 +567,8 @@ private_services:
 
 ## Additional Resources
 
-- Full policy schema: [architecture/security-policy.md](../../../architecture/security-policy.md)
+- Full policy schema: [docs/reference/policy-schema.mdx](../../../docs/reference/policy-schema.mdx)
+- Enforcement overview: [architecture/security-policy.md](../../../architecture/security-policy.md)
 - Default policy: baked into the community base image (`ghcr.io/nvidia/openshell-community/sandboxes/base:latest`)
 - Rego evaluation rules: [sandbox-policy.rego](../../../crates/openshell-sandbox/data/sandbox-policy.rego)
 - For translation examples from real API docs, see [examples.md](examples.md)
