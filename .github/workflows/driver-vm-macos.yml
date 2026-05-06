@@ -66,9 +66,62 @@ jobs:
           path: runtime-artifacts/vm-runtime-darwin-aarch64.tar.zst
           retention-days: 1
 
+  build-supervisor-arm64:
+    name: Build Supervisor Bundle (arm64)
+    runs-on: linux-arm64-cpu8
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OPENSHELL_IMAGE_TAG: ${{ inputs['image-tag'] }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs['checkout-ref'] }}
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: driver-vm-supervisor-arm64
+          cache-directories: .cache/sccache
+          cache-targets: "true"
+
+      - name: Install zstd
+        run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
+
+      - name: Build bundled supervisor
+        run: |
+          set -euo pipefail
+          tasks/scripts/vm/build-supervisor-bundle.sh --arch aarch64
+
+      - name: sccache stats
+        if: always()
+        run: mise x -- sccache --show-stats
+
+      - name: Upload supervisor bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: driver-vm-supervisor-arm64
+          path: target/vm-runtime-compressed/openshell-sandbox.zst
+          retention-days: 1
+
   build-driver-vm-macos:
     name: Build Driver VM (macOS)
-    needs: [download-kernel-runtime]
+    needs: [download-kernel-runtime, build-supervisor-arm64]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 60
     container:
@@ -81,7 +134,6 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -99,6 +151,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
+        with:
+          driver: local
 
       - name: Install zstd
         run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
@@ -132,20 +186,17 @@ jobs:
           echo "Staged macOS compressed runtime artifacts:"
           ls -lah "$COMPRESSED_DIR"
 
-      - name: Build bundled supervisor
+      - name: Download bundled supervisor
+        uses: actions/download-artifact@v4
+        with:
+          name: driver-vm-supervisor-arm64
+          path: target/vm-runtime-compressed-macos/
+
+      - name: Verify bundled supervisor
         run: |
           set -euo pipefail
-          docker buildx build \
-            --file deploy/docker/Dockerfile.images \
-            --platform linux/arm64 \
-            --build-arg OPENSHELL_CARGO_VERSION="${{ inputs['cargo-version'] }}" \
-            --build-arg OPENSHELL_IMAGE_TAG="${{ inputs['image-tag'] }}" \
-            --target supervisor-output \
-            --output type=local,dest=supervisor-out/ \
-            .
-
-          zstd -19 -T0 -f supervisor-out/openshell-sandbox \
-            -o "${PWD}/target/vm-runtime-compressed-macos/openshell-sandbox.zst"
+          test -f target/vm-runtime-compressed-macos/openshell-sandbox.zst
+          ls -lh target/vm-runtime-compressed-macos/openshell-sandbox.zst
 
       - name: Verify embedded driver inputs
         run: |
