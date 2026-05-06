@@ -768,6 +768,9 @@ jobs:
             openshell-x86_64-unknown-linux-musl.tar.gz \
             openshell-aarch64-unknown-linux-musl.tar.gz \
             openshell-aarch64-apple-darwin.tar.gz \
+            openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz \
+            openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz \
+            openshell-driver-vm-aarch64-apple-darwin.tar.gz \
             *.deb \
             openshell-*.rpm \
             *.whl > openshell-checksums-sha256.txt
