@@ -58,6 +58,72 @@ pub use openshell_core::forward::{
     find_forward_by_port, list_forwards, stop_forward, stop_forwards_for_sandbox,
 };
 
+/// Compute resource arguments for sandbox creation.
+#[derive(Debug, Default)]
+pub struct ResourceArgs {
+    pub cpu_request: Option<String>,
+    pub cpu_limit: Option<String>,
+    pub memory_request: Option<String>,
+    pub memory_limit: Option<String>,
+}
+
+impl ResourceArgs {
+    /// Build a `prost_types::Struct` matching the Kubernetes resources shape
+    /// expected by `extract_typed_resources` in the gateway server.
+    ///
+    /// Returns `None` when no CPU or memory fields are set (GPU is handled
+    /// separately via `SandboxSpec.gpu`).
+    pub fn to_resources_struct(&self) -> Option<prost_types::Struct> {
+        use prost_types::{Struct, Value, value::Kind};
+
+        let mut requests = std::collections::BTreeMap::new();
+        let mut limits = std::collections::BTreeMap::new();
+
+        if let Some(ref v) = self.cpu_request {
+            requests.insert(
+                "cpu".to_string(),
+                Value { kind: Some(Kind::StringValue(v.clone())) },
+            );
+        }
+        if let Some(ref v) = self.memory_request {
+            requests.insert(
+                "memory".to_string(),
+                Value { kind: Some(Kind::StringValue(v.clone())) },
+            );
+        }
+        if let Some(ref v) = self.cpu_limit {
+            limits.insert(
+                "cpu".to_string(),
+                Value { kind: Some(Kind::StringValue(v.clone())) },
+            );
+        }
+        if let Some(ref v) = self.memory_limit {
+            limits.insert(
+                "memory".to_string(),
+                Value { kind: Some(Kind::StringValue(v.clone())) },
+            );
+        }
+        if requests.is_empty() && limits.is_empty() {
+            return None;
+        }
+
+        let mut fields = std::collections::BTreeMap::new();
+        if !requests.is_empty() {
+            fields.insert(
+                "requests".to_string(),
+                Value { kind: Some(Kind::StructValue(Struct { fields: requests })) },
+            );
+        }
+        if !limits.is_empty() {
+            fields.insert(
+                "limits".to_string(),
+                Value { kind: Some(Kind::StructValue(Struct { fields: limits })) },
+            );
+        }
+        Some(Struct { fields })
+    }
+}
+
 /// Convert a sandbox phase integer to a human-readable string.
 fn phase_name(phase: i32) -> &'static str {
     match SandboxPhase::try_from(phase) {
@@ -2228,6 +2294,7 @@ pub async fn sandbox_create_with_bootstrap(
     keep: bool,
     gpu: bool,
     gpu_device: Option<&str>,
+    resource_args: &ResourceArgs,
     editor: Option<Editor>,
     remote: Option<&str>,
     ssh_key: Option<&str>,
@@ -2264,6 +2331,7 @@ pub async fn sandbox_create_with_bootstrap(
         keep,
         gpu,
         gpu_device,
+        resource_args,
         editor,
         remote,
         ssh_key,
@@ -2321,6 +2389,7 @@ pub async fn sandbox_create(
     keep: bool,
     gpu: bool,
     gpu_device: Option<&str>,
+    resource_args: &ResourceArgs,
     editor: Option<Editor>,
     remote: Option<&str>,
     ssh_key: Option<&str>,
@@ -2424,10 +2493,19 @@ pub async fn sandbox_create(
 
     let policy = load_sandbox_policy(policy)?;
 
-    let template = image.map(|img| SandboxTemplate {
-        image: img,
-        ..SandboxTemplate::default()
-    });
+    let resources_struct = resource_args.to_resources_struct();
+    let template = match (image, &resources_struct) {
+        (Some(img), _) => Some(SandboxTemplate {
+            image: img,
+            resources: resources_struct,
+            ..SandboxTemplate::default()
+        }),
+        (None, Some(_)) => Some(SandboxTemplate {
+            resources: resources_struct,
+            ..SandboxTemplate::default()
+        }),
+        (None, None) => None,
+    };
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
@@ -6778,5 +6856,62 @@ mod tests {
             ssh_escaped.ends_with('\''),
             "should end with single-quote: {ssh_escaped}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ResourceArgs tests
+    // ------------------------------------------------------------------
+
+    use super::ResourceArgs;
+    use prost_types::value::Kind;
+
+    #[test]
+    fn resource_args_empty_returns_none() {
+        let args = ResourceArgs::default();
+        assert!(args.to_resources_struct().is_none());
+    }
+
+    #[test]
+    fn resource_args_cpu_only_request() {
+        let args = ResourceArgs {
+            cpu_request: Some("500m".to_string()),
+            ..ResourceArgs::default()
+        };
+        let s = args.to_resources_struct().expect("should return Some");
+        let requests = &s.fields["requests"];
+        let Kind::StructValue(inner) = requests.kind.as_ref().unwrap() else {
+            panic!("expected StructValue");
+        };
+        let Kind::StringValue(cpu) = inner.fields["cpu"].kind.as_ref().unwrap() else {
+            panic!("expected StringValue");
+        };
+        assert_eq!(cpu, "500m");
+        assert!(!s.fields.contains_key("limits"));
+    }
+
+    #[test]
+    fn resource_args_all_four_fields() {
+        let args = ResourceArgs {
+            cpu_request: Some("500m".to_string()),
+            cpu_limit: Some("4".to_string()),
+            memory_request: Some("256Mi".to_string()),
+            memory_limit: Some("8Gi".to_string()),
+        };
+        let s = args.to_resources_struct().expect("should return Some");
+
+        let get = |section: &str, key: &str| -> String {
+            let Kind::StructValue(sec) = s.fields[section].kind.as_ref().unwrap() else {
+                panic!("expected StructValue for {section}");
+            };
+            let Kind::StringValue(val) = sec.fields[key].kind.as_ref().unwrap() else {
+                panic!("expected StringValue for {section}.{key}");
+            };
+            val.clone()
+        };
+
+        assert_eq!(get("requests", "cpu"), "500m");
+        assert_eq!(get("requests", "memory"), "256Mi");
+        assert_eq!(get("limits", "cpu"), "4");
+        assert_eq!(get("limits", "memory"), "8Gi");
     }
 }
