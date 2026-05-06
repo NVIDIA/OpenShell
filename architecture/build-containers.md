@@ -38,7 +38,7 @@ The `openshell-sandbox` supervisor is delivered by the selected compute driver:
 
 | Driver | Supervisor delivery |
 |---|---|
-| Kubernetes | Sandbox pod image or Kubernetes driver pod template configuration. |
+| Kubernetes | Init container copies the supervisor binary from the supervisor image into an `emptyDir` volume shared with the sandbox container. Configured via `supervisor_image` / `supervisor_image_pull_policy` in `KubernetesComputeConfig`. |
 | Docker | Local supervisor binary or supervisor image extraction configured by the gateway. |
 | Podman | Read-only OCI image volume from the `supervisor-output` image. |
 | VM | Embedded in the VM runtime rootfs. |

@@ -84,7 +84,7 @@ All capabilities are only available to the supervisor process. Sandbox child pro
 
 ## Supervisor Sideloading
 
-The supervisor binary is delivered to sandbox containers via Podman's OCI image volume mechanism, distinct from both the Kubernetes hostPath approach and the VM's embedded rootfs.
+The supervisor binary is delivered to sandbox containers via Podman's OCI image volume mechanism, distinct from the Kubernetes init-container approach (which copies the binary into an `emptyDir` volume) and the VM's embedded rootfs.
 
 ```mermaid
 sequenceDiagram
