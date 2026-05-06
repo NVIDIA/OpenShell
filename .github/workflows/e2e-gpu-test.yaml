@@ -79,4 +79,4 @@ jobs:
         run: mise run --no-deps --skip-deps cluster
 
       - name: Run tests
-        run: mise run --no-deps --skip-deps e2e:python:gpu
+        run: mise run --no-deps --skip-deps e2e:k3s:gpu

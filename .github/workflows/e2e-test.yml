@@ -27,9 +27,9 @@ jobs:
       matrix:
         include:
           - suite: python
-            cmd: "mise run --no-deps --skip-deps e2e:python"
+            cmd: "mise run --no-deps --skip-deps e2e:docker:python"
           - suite: rust
-            cmd: "mise run --no-deps --skip-deps e2e:rust"
+            cmd: "mise run --no-deps --skip-deps e2e:docker:rust"
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:

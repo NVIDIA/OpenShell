@@ -300,6 +300,7 @@ url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-a
 url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-amd64"
 
 [tools.skaffold."platforms.macos-arm64"]
+checksum = "blake3:0e91ba4f1d53adfdf70868424b3678de1b4e194488652ba5ed1805eb7142f929"
 url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-darwin-arm64"
 
 [tools.skaffold."platforms.macos-x64"]

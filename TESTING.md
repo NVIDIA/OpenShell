@@ -4,7 +4,9 @@
 
 ```bash
 mise run test          # Rust + Python unit tests
-mise run e2e           # End-to-end tests (starts a Docker-backed gateway)
+mise run e2e           # Docker-backed end-to-end tests
+mise run e2e:docker    # Same as e2e, explicit Docker-backed suite
+mise run e2e:k3s:gpu   # GPU E2E against the OpenShell k3s-cluster gateway
 mise run ci            # Everything: lint, compile checks, and tests
 ```
 
@@ -96,6 +98,12 @@ def test_exec_returns_stdout(sandbox):
         assert "hello" in result.stdout
 ```
 
+Run Docker-backed Python e2e tests:
+
+```bash
+mise run e2e:docker:python
+```
+
 #### `Sandbox.exec_python`
 
 `exec_python` serializes a Python callable with `cloudpickle`, sends it to the
@@ -154,13 +162,32 @@ Tests:
 Run all CLI e2e tests:
 
 ```bash
-mise run e2e:rust
+mise run e2e:docker:rust
 ```
 
 Run a single test directly with cargo:
 
 ```bash
 cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test sync
+```
+
+Run a single Rust e2e test target with the Docker-backed gateway wrapper:
+
+```bash
+OPENSHELL_E2E_RUST_TEST=smoke mise run e2e:docker:rust
+OPENSHELL_E2E_RUST_TEST=sync mise run e2e:docker:rust
+```
+
+Run only the Docker-backed smoke test:
+
+```bash
+mise run e2e:docker:smoke
+```
+
+Run GPU E2E against the OpenShell k3s-cluster gateway:
+
+```bash
+mise run e2e:k3s:gpu
 ```
 
 The harness (`e2e/rust/src/harness/`) provides:
@@ -178,3 +205,4 @@ The harness (`e2e/rust/src/harness/`) provides:
 |---|---|
 | `OPENSHELL_GATEWAY` | Override active gateway name for E2E tests |
 | `OPENSHELL_GATEWAY_ENDPOINT` | Run E2E tests against an existing plaintext HTTP gateway endpoint |
+| `OPENSHELL_E2E_RUST_TEST` | Run one Rust E2E integration test target, for example `smoke` or `sync` |

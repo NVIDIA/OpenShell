@@ -2,19 +2,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Run a Rust e2e test against a standalone gateway running the bundled Docker
-# compute driver. Set OPENSHELL_GATEWAY_ENDPOINT=http://host:port to reuse an
-# existing plaintext gateway instead of starting an ephemeral one.
+# Backward-compatible wrapper for the Docker Rust e2e smoke path.
+#
+# Prefer e2e-rust.sh with OPENSHELL_E2E_RUST_TEST for new task wiring.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-E2E_TEST="${OPENSHELL_E2E_DOCKER_TEST:-smoke}"
 
-cargo build -p openshell-cli --features openshell-core/dev-settings
+export OPENSHELL_E2E_RUST_TEST="${OPENSHELL_E2E_RUST_TEST:-${OPENSHELL_E2E_DOCKER_TEST:-smoke}}"
 
-exec "${ROOT}/e2e/with-docker-gateway.sh" \
-  cargo test --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \
-    --features e2e \
-    --test "${E2E_TEST}" \
-    -- --nocapture
+exec "${ROOT}/e2e/rust/e2e-rust.sh"
