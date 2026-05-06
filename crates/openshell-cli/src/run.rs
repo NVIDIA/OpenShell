@@ -3008,6 +3008,30 @@ fn dockerfile_sources_supported_for_gateway(metadata: Option<&GatewayMetadata>) 
     !metadata.is_some_and(|metadata| metadata.is_remote)
 }
 
+/// Load key=value pairs from a `versions.env` file in the given directory.
+/// Returns an empty map if the file doesn't exist or can't be read.
+fn load_versions_env(context: &Path) -> HashMap<String, String> {
+    let env_file = context.join("versions.env");
+    let Ok(contents) = std::fs::read_to_string(&env_file) else {
+        return HashMap::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
 /// Build a Dockerfile and make the resulting image available to the gateway.
 ///
 /// For local Kubernetes gateways running in Docker, this imports the built image
@@ -3042,6 +3066,14 @@ async fn build_from_dockerfile(
     eprintln!("  {} {}", "Gateway:".dimmed(), gateway_name);
     eprintln!();
 
+    let build_args = load_versions_env(context);
+    if !build_args.is_empty() {
+        for (k, v) in &build_args {
+            eprintln!("  Build arg (from versions.env): {k}={v}");
+        }
+        eprintln!();
+    }
+
     let mut on_log = |msg: String| {
         eprintln!("  {msg}");
     };
@@ -3050,7 +3082,7 @@ async fn build_from_dockerfile(
         dockerfile,
         &tag,
         context,
-        &HashMap::new(),
+        &build_args,
         &mut on_log,
     )
     .await?;

@@ -315,6 +315,11 @@ fn qemu_guest_env_vars(config: &VmLaunchConfig, dns_server: Option<String>) -> V
         env_vars.push("GPU_ENABLED=true".to_string());
     }
 
+    env_vars.push(format!(
+        "GUEST_KERNEL_VERSION={}",
+        env!("GUEST_KERNEL_VERSION")
+    ));
+
     env_vars
 }
 
@@ -346,6 +351,8 @@ fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
 
     if config.gpu_bdf.is_some() {
         parts.push("firmware_class.path=/lib/firmware".to_string());
+        parts.push("modprobe.blacklist=nouveau".to_string());
+        parts.push("nouveau.modeset=0".to_string());
     }
 
     parts.join(" ")
