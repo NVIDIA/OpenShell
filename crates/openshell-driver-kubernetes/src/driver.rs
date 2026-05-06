@@ -688,15 +688,15 @@ fn supervisor_volume_mount() -> serde_json::Value {
 
 /// Path of the supervisor binary inside the supervisor image.
 ///
-/// The supervisor image is built `FROM scratch` and contains a single binary
-/// at the filesystem root. We invoke it directly — there is no shell, `cp`,
-/// or PATH resolution available inside the image.
+/// The supervisor image places the binary at the filesystem root and ships
+/// nothing else. We invoke it directly — there is no shell, `cp`, or PATH
+/// resolution available inside the image.
 const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
 
 /// Build the init container that copies the supervisor binary into the emptyDir.
 ///
-/// The supervisor image is `FROM scratch` and contains only the supervisor
-/// binary at `/openshell-sandbox`. We invoke that binary with the `copy-self`
+/// The supervisor image contains only the supervisor binary at
+/// `/openshell-sandbox`. We invoke that binary with the `copy-self`
 /// subcommand so it copies itself into the shared emptyDir volume, where the
 /// agent container then executes it from a fixed, writable path. This pattern
 /// (binary self-copy) avoids requiring `sh`/`cp` in the supervisor image and
@@ -1559,7 +1559,7 @@ mod tests {
         assert_eq!(init_containers[0]["image"], "supervisor-image:latest");
         assert_eq!(init_containers[0]["imagePullPolicy"], "IfNotPresent");
 
-        // The supervisor image is `FROM scratch` and has no shell. The init
+        // The supervisor image ships only the binary (no shell). The init
         // container must invoke the binary directly with `copy-self <DEST>`.
         let init_command = init_containers[0]["command"]
             .as_array()
@@ -1573,7 +1573,7 @@ mod tests {
         );
         assert!(
             !init_command.iter().any(|v| v == "sh"),
-            "init container must not depend on a shell (image is FROM scratch)"
+            "init container must not depend on a shell (supervisor image ships only the binary)"
         );
 
         // Agent container command should be overridden to the emptyDir path

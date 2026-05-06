@@ -19,9 +19,9 @@ use openshell_sandbox::run_sandbox;
 
 /// Subcommand name used to self-copy the supervisor binary into a shared volume.
 ///
-/// The supervisor image is built `FROM scratch`, so init containers cannot rely
-/// on `sh`/`cp` to copy the binary out. Invoking the binary itself with this
-/// argument performs the copy in pure Rust.
+/// The supervisor image only ships the binary itself, so init containers
+/// cannot rely on `sh`/`cp` to copy the binary out. Invoking the binary itself
+/// with this argument performs the copy in pure Rust.
 const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 
 /// `OpenShell` Sandbox - process isolation and monitoring.
@@ -148,9 +148,9 @@ fn copy_self(dest: &str) -> Result<()> {
 
 fn main() -> Result<()> {
     // Handle `copy-self <DEST>` before clap so it works without any of the
-    // sandbox flags. The supervisor image is `FROM scratch`, and Kubernetes
-    // init containers invoke this path to seed an emptyDir volume that the
-    // agent container then executes from.
+    // sandbox flags. The supervisor image only ships the binary itself, and
+    // Kubernetes init containers invoke this path to seed an emptyDir volume
+    // that the agent container then executes from.
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.get(1).map(String::as_str) == Some(COPY_SELF_SUBCOMMAND) {
         let dest = raw_args.get(2).ok_or_else(|| {

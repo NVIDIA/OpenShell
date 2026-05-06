@@ -115,10 +115,19 @@ CMD ["--bind-address", "0.0.0.0", "--port", "8080"]
 # ---------------------------------------------------------------------------
 # Final supervisor image
 # ---------------------------------------------------------------------------
-# Minimal FROM scratch image containing only the supervisor binary.
-# Used by both the Docker driver (binary extraction) and the Podman driver
-# (OCI image volume mount at /opt/openshell/bin).
-FROM scratch AS supervisor
+# Supervisor image based on the same NVIDIA Ubuntu base used by the gateway.
+#
+# Used by:
+#   - Docker driver: binary is extracted from the image and run inside the
+#     agent container.
+#   - Podman driver: image is mounted as an OCI volume at /opt/openshell/bin.
+#   - Kubernetes driver: image runs as an init container that invokes the
+#     binary's `copy-self` subcommand to seed an emptyDir volume.
+#
+# An Ubuntu base provides glibc and the dynamic loader needed to exec the
+# dynamically linked binary. `FROM scratch` would be smaller but cannot run
+# the binary, breaking the Kubernetes init-container path.
+FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS supervisor
 COPY --from=supervisor-binary /build/out/openshell-sandbox /openshell-sandbox
 
 # ---------------------------------------------------------------------------
