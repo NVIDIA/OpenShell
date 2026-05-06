@@ -43,12 +43,14 @@ This project ships with [agent skills](#agent-skills-for-contributors) that can 
 1. Clone the repo and point your coding agent at it.
 2. Load the relevant skill - `debug-openshell-cluster` for gateway or deployment problems, `debug-inference` for inference setup problems, `openshell-cli` for usage questions, `generate-sandbox-policy` for policy help.
 3. Have your agent investigate. Let it run diagnostics, read the architecture docs, and attempt a fix.
-4. If the agent cannot resolve it, open an issue **with the agent's diagnostic output attached**. The issue template requires this.
+4. If the agent cannot resolve it, open an issue. For bug and troubleshooting
+   reports, attach the agent's diagnostic output; those issue templates require
+   it.
 
 ### When to Open an Issue
 
 - A real bug that your agent confirmed and could not fix.
-- A concrete feature idea that needs product discussion. Open a GitHub issue first; for substantial product changes, create a feature request under `feature-requests/` and link it from the issue.
+- A completed feature request document that needs product discussion. For substantial product changes, use `create-feature-request` to start a feature request draft, complete the draft, make it visible through a GitHub URL, and then create a GitHub issue that links to the doc or PR for discussion.
 - An infrastructure problem that the gateway deployment troubleshooting skill could not resolve.
 - An inference setup problem that the `debug-inference` skill could not resolve.
 - Security vulnerabilities must follow [SECURITY.md](SECURITY.md) — **not** GitHub issues.
@@ -70,6 +72,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Getting Started | `debug-inference`         | Diagnose `inference.local`, host-backed local inference, and direct external inference setup issues |
 | Contributing    | `create-spike`            | Investigate a problem, produce a structured GitHub issue                                            |
 | Contributing    | `build-from-issue`        | Plan and implement work from a GitHub issue (maintainer workflow)                                   |
+| Contributing    | `create-feature-request`  | Start and iteratively fill a numbered feature request draft                                         |
 | Contributing    | `create-github-issue`     | Create well-structured GitHub issues                                                                |
 | Contributing    | `create-github-pr`        | Create pull requests with proper conventions                                                        |
 | Reviewing       | `review-github-pr`        | Summarize PR diffs and key design decisions                                                         |
@@ -88,6 +91,7 @@ Skills connect into pipelines. Individual skill files don't describe these relat
 
 - **Community inflow:** `triage-issue` → `create-spike` → `build-from-issue`
 - **Internal development:** `create-spike` → `build-from-issue`
+- **Feature proposals:** `create-feature-request` → user completes proposal → feature request PR/doc link → linked GitHub issue → product review
 - **Security:** `review-security-issue` → `fix-security-issue`
 - **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
 
@@ -202,17 +206,18 @@ These are the primary `mise` tasks for day-to-day development:
 
 ## Feature Requests and RFCs
 
-Feature requests are product proposals. Use them when you want maintainers to decide whether a capability belongs in OpenShell, who it serves, what user outcome it should provide, and where users should expect it to be available. Feature requests live in `feature-requests/`; copy `feature-requests/0000-template`, fill it in, and link the GitHub issue where the feature is discussed.
+Feature requests are product proposals. Use them when you want maintainers to decide whether a capability belongs in OpenShell, who it serves, what user outcome it should provide, and where users should expect it to be available. For substantial proposals, use the `create-feature-request` skill to start a draft under `feature-requests/`, complete the draft, make it visible through a GitHub URL, and then create a GitHub issue that links to the completed feature request doc or PR.
 
 RFCs are technical design proposals. Use them after a feature request has been discussed and approved by core maintainers, or for non-feature technical decisions such as architecture, API contracts, process changes, or test design. RFCs live in `rfc/`; copy the template, fill it in, and link the approved feature request when applicable.
 
 Typical flow for new product capabilities:
 
-1. Open a GitHub issue to discuss the feature.
-2. Create a feature request under `feature-requests/` and link the issue.
-3. Get core maintainer approval on the product direction.
-4. Create an RFC only if detailed technical design is needed.
-5. Break accepted work into implementation issues or PRs.
+1. Use `create-feature-request` to start a numbered draft.
+2. Complete the feature request draft.
+3. Open a PR or push the doc so it has a GitHub URL.
+4. Create a GitHub issue that links to the completed feature request doc or PR.
+5. Review the feature request in the PR and linked issue, then get core maintainer approval on the product direction.
+6. Create an RFC only if detailed technical design is needed.
 
 See [feature-requests/README.md](feature-requests/README.md) and [rfc/README.md](rfc/README.md) for the full processes.
 

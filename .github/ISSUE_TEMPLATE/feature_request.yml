@@ -1,50 +1,43 @@
 name: Feature Request
-description: Propose a feature with a design. Not a "please build this" request.
+description: Discuss a completed feature request document or PR.
 type: Feature
 body:
   - type: markdown
     attributes:
       value: |
-        ## Design-First Feature Proposals
+        ## Feature request discussion
 
-        OpenShell feature requests must include a design proposal — describe the system behavior you want, not just the outcome. If your agent explored the codebase to assess feasibility (e.g., using the `create-spike` skill), include its findings.
+        Use this issue to discuss a completed feature request document. For substantial proposals, start with `create-feature-request`, complete the draft under `feature-requests/`, make it visible through a GitHub URL, then open this issue with the document or PR linked.
 
   - type: textarea
-    id: problem
+    id: feature-request-doc
     attributes:
-      label: Problem Statement
-      description: What problem does this solve? Why does it matter?
+      label: Feature request document or PR
+      description: Link the completed feature request document, or the PR containing it if the document is not merged yet.
     validations:
       required: true
 
   - type: textarea
-    id: design
+    id: summary
     attributes:
-      label: Proposed Design
-      description: |
-        How should this work? Describe the system behavior, components involved, and user-facing interface. This should be a design, not a wish list.
+      label: Summary
+      description: Briefly summarize the feature and user-visible outcome.
     validations:
       required: true
 
   - type: textarea
-    id: alternatives
+    id: review-focus
     attributes:
-      label: Alternatives Considered
-      description: What other approaches did you evaluate? Why is the proposed design better?
+      label: Review focus
+      description: What feedback do you want from maintainers?
     validations:
       required: true
 
   - type: textarea
-    id: agent-investigation
+    id: related-work
     attributes:
-      label: Agent Investigation
-      description: |
-        If your agent explored the codebase to assess feasibility (e.g., using the `create-spike` skill), paste its findings here. This is optional but strengthens the proposal.
-      placeholder: |
-        Example:
-        - Used `create-spike` to investigate existing provider infrastructure
-        - Found that `crates/openshell-providers/` already supports a plugin pattern
-        - Proposed design extends the existing trait rather than adding a new abstraction
+      label: Related work and prior art
+      description: Link related issues, discussions, docs, examples, or similar features in other projects.
     validations:
       required: false
 
@@ -53,7 +46,7 @@ body:
     attributes:
       label: Checklist
       options:
-        - label: I've reviewed existing issues and the architecture docs
+        - label: The linked feature request doc or PR is complete and ready for discussion
           required: true
-        - label: This is a design proposal, not a "please build this" request
+        - label: The linked feature request doc describes product requirements, not an implementation plan
           required: true

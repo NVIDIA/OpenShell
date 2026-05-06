@@ -3,12 +3,15 @@
 Feature requests are product proposals for OpenShell. They describe a user need,
 why the capability belongs in OpenShell, what the product should do, and how
 maintainers should evaluate success. They are intentionally lighter than RFCs:
-feature requests decide **whether** a capability should exist and where it
-belongs at the product level; RFCs decide **how** approved, technically involved
-capabilities should be designed.
+feature requests decide **whether** a capability should exist and where users
+should expect it to be available; RFCs decide **how** approved, technically
+involved capabilities should be designed.
 
 Use feature requests to create a durable record of product intent before
-implementation begins.
+implementation begins. For substantial proposals, start with the feature request
+document, complete it, make it visible through a GitHub URL, and then create a
+GitHub issue that links to the completed document or the PR containing it for
+discussion.
 
 ## Feature requests vs other artifacts
 
@@ -18,15 +21,15 @@ guide to pick the right one:
 | Artifact | Purpose | When to use |
 |----------|---------|-------------|
 | **GitHub Discussion** | Gauge interest in a rough idea | You have an early thought and want feedback before writing a proposal |
-| **GitHub issue** | Discuss a concrete feature request | You have a feature request draft or clear product ask and need a durable discussion record |
-| **Feature request** | Define product requirements and decide whether OpenShell should own a capability | You know the user problem and want maintainers to evaluate scope, priority, and product fit |
+| **Feature request** | Define product requirements and decide whether OpenShell should own a capability | You have a substantial product proposal that needs review |
+| **GitHub issue** | Discuss a feature request | You have a completed, GitHub-visible feature request document or PR and need a durable discussion thread |
 | **Spike issue** (`create-spike`) | Investigate implementation feasibility for scoped work | You need codebase research before an RFC or implementation issue |
 | **RFC** | Propose detailed technical design for an approved or likely feature | The change affects architecture, public contracts, multiple components, or requires broad technical consensus |
 | **Architecture doc** (`architecture/`) | Document how things work today | Living reference material updated as the system evolves |
 
-The key distinction: **feature requests are product requirements; RFCs are
-technical design proposals.** A feature request may lead to an RFC, a spike, a
-normal implementation issue, or rejection.
+The key distinction: **feature requests capture product requirements; GitHub
+issues host discussion; RFCs capture technical design.** A feature request may
+lead to an RFC, a spike, a normal implementation issue, or rejection.
 
 ## When to use a feature request
 
@@ -44,6 +47,9 @@ Use a feature request when you want to propose:
 Feature requests should be written from a user and product perspective. They
 should explain the problem, target users, use cases, product scope, non-goals,
 success criteria, and why OpenShell is the right layer for the capability.
+Use the `create-feature-request` skill to start a numbered draft. After the user
+completes the draft and makes it visible through a GitHub URL, create a linked
+GitHub issue for product discussion.
 
 ## When not to use a feature request
 
@@ -82,6 +88,7 @@ Avoid:
 - treating the feature request as a "please build this" ticket,
 - bundling several unrelated features into one proposal,
 - assuming every useful integration should be built in,
+- treating an agent-started draft as complete or approved,
 - skipping non-goals and tradeoffs.
 
 ## Availability and support expectations
@@ -126,7 +133,7 @@ A feature request can be in one of the following states:
 
 | State | Description |
 |-------|-------------|
-| `draft` | The proposal is being written and is not ready for review. |
+| `draft` | The proposal is being written, possibly from an agent-started draft, and is not ready for discussion or review. |
 | `review` | Under active discussion in a linked GitHub issue and pull request. |
 | `accepted` | Maintainers agree the feature belongs in OpenShell. |
 | `rejected` | The feature was reviewed and declined. |
@@ -139,23 +146,20 @@ spike, or smaller implementation issues.
 
 ## Lifecycle
 
-### 1. Start with discussion when the idea is rough
+### 1. Start a feature request draft
 
 If the problem or product fit is still uncertain, consider opening a GitHub
 Discussion first. Early discussion helps validate the need, surface tradeoffs,
 and find the right reviewers.
 
-When the feature is concrete enough for product review, open a GitHub issue.
-That issue is the durable discussion record for the feature request and should
-be linked from the feature request front matter.
+When the feature is concrete enough for product review, use the
+`create-feature-request` skill to start a numbered feature request document. The
+agent reserves the next available folder, copies the template, fills only what
+the user provided, and leaves explicit `TODO(<author>)` placeholders.
 
-### 2. Reserve a feature request number
+The generated draft is a starting point, not a completed proposal.
 
-Look at the existing folders in this directory and choose the next available
-number. If two authors choose the same number on separate branches, the later PR
-should pick the next available number during review.
-
-### 3. Create the feature request
+### 2. Complete the feature request
 
 Each feature request lives in its own folder:
 
@@ -168,20 +172,29 @@ feature-requests/NNNN-my-feature/
 Where `NNNN` is the feature request number, zero-padded to four digits, and
 `my-feature` is a short descriptive name.
 
-To start a new feature request, copy the template folder:
+The template folder is:
 
 ```shell
-cp -r feature-requests/0000-template feature-requests/NNNN-my-feature
+feature-requests/0000-template
 ```
 
-Fill in the metadata, include the linked GitHub issue, and keep the state as
-`draft` while you are iterating.
+The user owns completing the draft. Fill in the product requirements, scope,
+non-goals, success criteria, risks, alternatives, and contribution intent before
+asking for discussion or PR review.
 
-### 4. Open a pull request
+### 3. Open a pull request for review
 
-When the proposal is ready for review, update the state to `review` and open a
-pull request. Link the GitHub issue, pull request, and any related discussions,
-prior art, or RFCs in the front matter.
+When the completed proposal is ready for review, update the state to `review`
+and open a pull request. The PR gives reviewers a GitHub-visible link to the
+feature request document while the proposal is still unmerged.
+
+### 4. Create the linked GitHub issue
+
+After the feature request document is complete and available through a GitHub
+URL, create a GitHub issue that links to it or to the PR containing it. The
+issue is the durable discussion thread for the proposal. Link the GitHub issue,
+pull request, and any related discussions, prior art, or RFCs in the front
+matter.
 
 ### 5. Iterate and decide
 
