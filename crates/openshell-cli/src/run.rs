@@ -766,7 +766,21 @@ pub fn gateway_use(name: &str) -> Result<()> {
 
     save_active_gateway(name)?;
     eprintln!("{} Active gateway set to '{name}'", "✓".green().bold());
+    if let Some(warning) = gateway_env_override_warning(name) {
+        eprintln!("{} {warning}", "⚠".yellow().bold());
+    }
     Ok(())
+}
+
+fn gateway_env_override_warning(selected_name: &str) -> Option<String> {
+    let env_name = std::env::var("OPENSHELL_GATEWAY").ok()?;
+    if env_name.is_empty() || env_name == selected_name {
+        return None;
+    }
+
+    Some(format!(
+        "OPENSHELL_GATEWAY={env_name} is set and will override this selection.\n  Unset it or run: export OPENSHELL_GATEWAY={selected_name}"
+    ))
 }
 
 pub fn gateway_select(name: Option<&str>, gateway_flag: &Option<String>) -> Result<()> {
@@ -5971,8 +5985,8 @@ mod tests {
     use super::{
         GatewayControlTarget, TlsOptions, dockerfile_sources_supported_for_gateway,
         format_gateway_select_header, format_gateway_select_items, gateway_add, gateway_auth_label,
-        gateway_select_with, gateway_type_label, git_sync_files, http_health_check,
-        image_requests_gpu, inferred_provider_type, parse_cli_setting_value,
+        gateway_env_override_warning, gateway_select_with, gateway_type_label, git_sync_files,
+        http_health_check, image_requests_gpu, inferred_provider_type, parse_cli_setting_value,
         parse_credential_pairs, plaintext_gateway_is_remote, provisioning_timeout_message,
         ready_false_condition_message, resolve_from, resolve_gateway_control_target_from,
         sandbox_should_persist, shell_escape, source_requests_gpu, validate_gateway_name,
@@ -6512,6 +6526,35 @@ mod tests {
             assert_eq!(load_active_gateway().as_deref(), Some("alpha"));
             assert!(!prompted, "explicit gateway should skip prompting");
         });
+    }
+
+    #[test]
+    fn gateway_env_override_warning_mentions_masked_selection() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvVarGuard::set("OPENSHELL_GATEWAY", "openshell");
+
+        let warning = gateway_env_override_warning("docker-dev").expect("env override should warn");
+
+        assert!(
+            warning.contains("OPENSHELL_GATEWAY=openshell"),
+            "warning should name the overriding env var: {warning}"
+        );
+        assert!(
+            warning.contains("export OPENSHELL_GATEWAY=docker-dev"),
+            "warning should suggest updating the env var: {warning}"
+        );
+    }
+
+    #[test]
+    fn gateway_env_override_warning_skips_matching_gateway() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvVarGuard::set("OPENSHELL_GATEWAY", "docker-dev");
+
+        assert_eq!(gateway_env_override_warning("docker-dev"), None);
     }
 
     #[test]
