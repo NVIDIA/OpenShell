@@ -47,6 +47,10 @@ actions:
     # dist-info stays at the RPM Version; dev build identity is carried by
     # Release so Fedora's Python RPM post-processing can normalize metadata.
     - 'bash -c "if [ -n \"${OPENSHELL_CARGO_VERSION:-}\" ]; then sed -i -r \"s/^%global openshell_cargo_version .*/%global openshell_cargo_version ${OPENSHELL_CARGO_VERSION}/\" openshell.spec; fi"'
+    # Override image_tag to 'latest' for tagged stable releases.
+    # For PR and commit-to-main builds the spec default ('dev') is kept,
+    # matching the :dev images pushed by release-dev.yml.
+    - 'bash -c "if git describe --exact-match --tags HEAD 2>/dev/null | grep -qE ''^v[0-9]+\.[0-9]+\.[0-9]+$''; then sed -i ''s/^%global image_tag.*/%global image_tag latest/'' openshell.spec; fi"'
 
 jobs:
   # Build on every pull request targeting main for CI validation

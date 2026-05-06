@@ -11,9 +11,15 @@
 # in the format redhat-rpm-config expects (especially on EPEL).
 %global debug_package %{nil}
 
+# Default container image tag for supervisor and sandbox images.
+# Overridden to 'latest' by Packit's fix-spec-file action for tagged stable
+# releases (via git describe --exact-match). PR and commit-to-main builds
+# keep the default 'dev' so they track the development image stream.
+%global image_tag dev
+
 Name:           openshell
 Version:        0.0.37
-Release:        1.20260505111703438211.rpm.100.gec0e2ce3%{?dist}
+Release:        1.20260505163856492034.rpm.108.g82598241%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
@@ -100,7 +106,7 @@ grep -q 'version = "%{openshell_cargo_version}"' Cargo.toml || (echo "ERROR: Car
 export CARGO_BUILD_JOBS=%{_smp_build_ncpus}
 # Set the default container image tag so compiled-in image refs point at
 # real tags in the ghcr.io/nvidia/openshell registry.
-export OPENSHELL_IMAGE_TAG=latest
+export OPENSHELL_IMAGE_TAG=%{image_tag}
 cargo build --release --bin openshell --bin openshell-gateway
 
 # Generate vendored crate manifest and license metadata.
@@ -155,8 +161,8 @@ EnvironmentFile=-%%E/openshell/gateway.env
 Environment=OPENSHELL_BIND_ADDRESS=0.0.0.0
 Environment=OPENSHELL_DRIVERS=podman
 Environment=OPENSHELL_DB_URL=sqlite://%%S/openshell/gateway.db
-Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
-Environment=OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:%{image_tag}
+Environment=OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:%{image_tag}
 # mTLS: auto-generated certs in the state directory.
 Environment=OPENSHELL_TLS_CERT=%%S/openshell/tls/server/tls.crt
 Environment=OPENSHELL_TLS_KEY=%%S/openshell/tls/server/tls.key
@@ -184,6 +190,10 @@ EOF
 install -d %{buildroot}%{_libexecdir}/%{name}
 install -pm 0755 deploy/rpm/init-pki.sh %{buildroot}%{_libexecdir}/%{name}/init-pki.sh
 install -pm 0755 deploy/rpm/init-gateway-env.sh %{buildroot}%{_libexecdir}/%{name}/init-gateway-env.sh
+# Patch commented image defaults to match the build type (dev or latest).
+# The source file uses :latest as a generic reference; the installed copy
+# reflects what this RPM actually expects from the registry.
+sed -i 's/:latest/:%{image_tag}/g' %{buildroot}%{_libexecdir}/%{name}/init-gateway-env.sh
 
 # --- Gateway documentation ---
 install -d %{buildroot}%{_docdir}/%{name}-gateway
