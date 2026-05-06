@@ -165,10 +165,22 @@ find_deb_asset() {
   _arch="$2"
 
   awk -v arch="$_arch" '
-    $2 ~ "^\\*?openshell_.*_" arch "\\.deb$" {
-      sub("^\\*", "", $2)
-      print $2
+    {
+      name = $2
+      sub("^\\*", "", name)
+    }
+    name == "openshell-dev-" arch ".deb" {
+      print name
+      found = 1
       exit
+    }
+    legacy == "" && name ~ "^openshell_.*_" arch "\\.deb$" {
+      legacy = name
+    }
+    END {
+      if (!found && legacy != "") {
+        print legacy
+      }
     }
   ' "$_checksums"
 }
