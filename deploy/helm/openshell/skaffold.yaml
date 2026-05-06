@@ -28,15 +28,16 @@ build:
         buildCommand: |
           IMAGE_NAME="${IMAGE%:*}" \
           IMAGE_TAG="${IMAGE##*:}" \
-          tasks/scripts/docker-build-image.sh gateway
+          tasks/scripts/container-build-image.sh gateway
         dependencies:
           paths:
             - Cargo.toml
             - Cargo.lock
             - crates/**
             - proto/**
-            - deploy/docker/Dockerfile.gateway
-            - tasks/scripts/docker-build-image.sh
+            - deploy/container/Dockerfile.images
+            - crates/openshell-server/migrations/**
+            - tasks/scripts/container-build-image.sh
             - tasks/scripts/stage-prebuilt-binaries.sh
     - image: openshell/supervisor
       context: ../../..
@@ -44,15 +45,15 @@ build:
         buildCommand: |
           IMAGE_NAME="${IMAGE%:*}" \
           IMAGE_TAG="${IMAGE##*:}" \
-          tasks/scripts/docker-build-image.sh supervisor
+          tasks/scripts/container-build-image.sh supervisor
         dependencies:
           paths:
             - Cargo.toml
             - Cargo.lock
             - crates/**
             - proto/**
-            - deploy/docker/Dockerfile.supervisor
-            - tasks/scripts/docker-build-image.sh
+            - deploy/container/Dockerfile.images
+            - tasks/scripts/container-build-image.sh
             - tasks/scripts/stage-prebuilt-binaries.sh
 deploy:
   helm:

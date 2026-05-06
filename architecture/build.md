@@ -12,8 +12,8 @@ OpenShell builds these main artifacts:
 |---|---|
 | Gateway binary | `crates/openshell-server` |
 | CLI package and Python SDK | `python/openshell` plus Rust binaries where packaged |
-| Gateway container image | `deploy/docker/Dockerfile.gateway` |
-| Supervisor container image | `deploy/docker/Dockerfile.supervisor` |
+<<<<<<< HEAD
+| Gateway and supervisor container images | `deploy/container/Dockerfile.images` |
 | Helm chart | `deploy/helm/openshell` |
 | VM driver/runtime assets | `crates/openshell-driver-vm` |
 | Published docs site | `docs/` rendered by Fern config in `fern/` |
@@ -31,12 +31,10 @@ glibc 2.31 floor.
 
 ## Container Builds
 
-The Docker image pipeline is a two-step flow: build the Rust binary natively
-for the target architecture, then assemble the container image from the
-prebuilt binary. The gateway image is built from `deploy/docker/Dockerfile.gateway`
-and the supervisor image from `deploy/docker/Dockerfile.supervisor`. Neither
-Dockerfile compiles Rust — both copy a staged binary out of
-`deploy/docker/.build/prebuilt-binaries/<arch>/` into the final image.
+The container image pipeline stages prebuilt Rust binaries, then builds container
+images from `deploy/container/Dockerfile.images`. CI builds native artifacts on the
+target architecture, stages them under `deploy/container/.build/`, and then uses
+Buildx to publish per-architecture images and multi-architecture tags.
 
 Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Gateway
 binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.31, including
@@ -59,7 +57,6 @@ Runtime layout:
   Static linkage is required because the image is mounted/extracted into
   sandbox environments (Docker extraction, Podman image volumes, Kubernetes
   init-container copy-self) and cannot rely on a dynamic loader.
-
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.
 Package formulas also pin Docker supervisor extraction to the matching release

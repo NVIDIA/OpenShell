@@ -86,8 +86,8 @@ sequenceDiagram
     C->>C: entrypoint: /opt/openshell/bin/openshell-sandbox
 ```
 
-The supervisor image from `deploy/docker/Dockerfile.supervisor` copies the static
-`openshell-sandbox` binary to `/openshell-sandbox`.
+The `supervisor` target in `deploy/container/Dockerfile.images` copies the
+`openshell-sandbox` binary to `/openshell-sandbox` in the supervisor image.
 Mounting that image at `/opt/openshell/bin` makes the binary available as
 `/opt/openshell/bin/openshell-sandbox`.
 
@@ -346,4 +346,4 @@ matter compared to cluster or rootful runtimes:
   netns, proxy, and relay behavior shared by all drivers.
 - Container engine abstraction: `tasks/scripts/container-engine.sh` for
   build/deploy support across Docker and Podman.
-- Supervisor image build: `deploy/docker/Dockerfile.supervisor`.
+- Supervisor image build: `deploy/container/Dockerfile.images`.
