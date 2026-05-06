@@ -327,6 +327,17 @@ These complement the unit tests inside `supervisor_session.rs` (registry-only be
 
 ## gRPC Services
 
+### Standard health and reflection (infrastructure)
+
+The gateway multiplexes these alongside application services on the same TLS port (`crates/openshell-server/src/multiplex.rs`):
+
+| Service | Path prefix | Notes |
+|---------|-------------|--------|
+| `grpc.health.v1.Health` | `/grpc.health.v1.Health/` | `Check` reports **process liveness** only (same semantics as legacy `OpenShell/Health` today—not database, driver, or inference readiness). Registered names include `openshell.v1.OpenShell`, `openshell.inference.v1.Inference`, and aggregate probe `service: ""`. `Watch` returns `UNIMPLEMENTED`. |
+| `grpc.reflection.v1.ServerReflection` | `/grpc.reflection.v1.ServerReflection/` | Reflection aggregates multiple encoded `FileDescriptorSet`s: OpenShell protos from `openshell-core` (`crates/openshell-core/build.rs`), `grpc.health.v1` from `tonic_health::pb::FILE_DESCRIPTOR_SET`, and `grpc.reflection.v1` from the set `tonic_reflection::server::Builder::build_v1()` registers by default ([reflection proto](https://github.com/grpc/grpc/blob/master/src/proto/grpc/reflection/v1/reflection.proto)). When OIDC is enabled, `/grpc.reflection.*` remains **unauthenticated** by design (see `UNAUTHENTICATED_PREFIXES` in `crates/openshell-server/src/auth/oidc.rs`). |
+
+Prefer **`grpc.health.v1.Health/Check`** for probes and tooling; `openshell.v1.OpenShell/Health` is **deprecated** in `proto/openshell.proto` but retained for backward compatibility.
+
 ### OpenShell Service
 
 Defined in `proto/openshell.proto`, implemented in `crates/openshell-server/src/grpc/mod.rs` as `OpenShellService`. Per-concern handlers live in `crates/openshell-server/src/grpc/` submodules.
@@ -335,7 +346,7 @@ Defined in `proto/openshell.proto`, implemented in `crates/openshell-server/src/
 
 | RPC | Description | Key behavior |
 |-----|-------------|--------------|
-| `Health` | Returns service status and version | Always returns `HEALTHY` with `CARGO_PKG_VERSION` |
+| `Health` | Returns service status and version | **Deprecated** — use `grpc.health.v1.Health/Check`. When called, reflects process liveness (`HEALTHY` / `UNHEALTHY`) and `CARGO_PKG_VERSION` (or git-derived version). |
 | `CreateSandbox` | Create a new sandbox | Validates spec and policy, validates provider names exist (fail-fast), persists to store, creates the compute-driver sandbox. On driver failure, rolls back the store record and index entry. |
 | `GetSandbox` | Fetch sandbox by name | Looks up by name via `store.get_message_by_name()` |
 | `ListSandboxes` | List sandboxes | Paginated (default limit 100), decodes protobuf payloads from store records |

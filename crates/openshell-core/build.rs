@@ -40,10 +40,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     collect_proto_files(&proto_root, &mut proto_files)?;
     proto_files.sort();
 
+    // Serialized FileDescriptorSet for gRPC server reflection on the gateway.
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+    let descriptor_path = out_dir.join("openshell_file_descriptor_set.bin");
+
     // Configure tonic-build
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
+        .file_descriptor_set_path(&descriptor_path)
         .compile_protos(&proto_files, &[proto_root.as_path()])?;
 
     Ok(())

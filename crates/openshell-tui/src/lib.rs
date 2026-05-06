@@ -2156,6 +2156,8 @@ fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
     });
 }
 
+/// Polls legacy `OpenShell/Health` until the TUI moves to `grpc.health.v1.Health/Check`.
+#[allow(deprecated)]
 async fn refresh_health(app: &mut App) {
     let req = openshell_core::proto::HealthRequest {};
     let result = tokio::time::timeout(Duration::from_secs(5), app.client.health(req)).await;

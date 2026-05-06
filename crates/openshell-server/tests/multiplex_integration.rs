@@ -18,15 +18,24 @@ use openshell_core::proto::{
     ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
     ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
     SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
-    WatchSandboxRequest,
-    open_shell_client::OpenShellClient,
-    open_shell_server::{OpenShell, OpenShellServer},
+    WatchSandboxRequest, open_shell_client::OpenShellClient, open_shell_server::OpenShell,
 };
-use openshell_server::{MultiplexedService, health_router};
+use openshell_server::{MultiplexedService, OPENSHELL_SERVICE_NAME, health_router};
+
+#[macro_use]
+mod common;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tonic::Code;
 use tonic::{Response, Status};
+use tonic_health::pb::{
+    HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
+};
+use tonic_reflection::pb::v1::{
+    ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
+    server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+};
 
 #[derive(Clone, Default)]
 struct TestOpenShell;
@@ -314,9 +323,9 @@ async fn serves_grpc_and_http_on_same_port() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let grpc_service = OpenShellServer::new(TestOpenShell);
+    let grpc_router = gateway_test_grpc_router!(common::openshell_max_decode_server(TestOpenShell));
     let http_service = health_router();
-    let service = MultiplexedService::new(grpc_service, http_service);
+    let service = MultiplexedService::new(grpc_router, http_service);
 
     let server = tokio::spawn(async move {
         loop {
@@ -332,11 +341,20 @@ async fn serves_grpc_and_http_on_same_port() {
         }
     });
 
-    let mut client = OpenShellClient::connect(format!("http://{addr}"))
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
         .await
         .unwrap();
-    let response = client.health(HealthRequest {}).await.unwrap();
-    assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+    let mut health = HealthClient::new(channel);
+    let response = health
+        .check(HealthCheckRequest {
+            service: OPENSHELL_SERVICE_NAME.to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.status, ServingStatus::Serving as i32);
 
     let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -365,6 +383,7 @@ async fn serves_grpc_and_http_on_same_port() {
 /// (which is crate-private). Production middleware composition and
 /// layer ordering are covered by the unit tests in `multiplex::tests`.
 #[tokio::test]
+#[allow(deprecated)] // Legacy `OpenShell/Health` still used here to exercise response metadata paths.
 async fn grpc_response_propagates_request_id() {
     use tower::ServiceBuilder;
     use tower_http::request_id::{
@@ -384,6 +403,8 @@ async fn grpc_response_propagates_request_id() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
+    let grpc_router = gateway_test_grpc_router!(common::openshell_max_decode_server(TestOpenShell));
+
     let x_request_id = http::HeaderName::from_static("x-request-id");
     let grpc_service = ServiceBuilder::new()
         .layer(SetRequestIdLayer::new(
@@ -391,11 +412,11 @@ async fn grpc_response_propagates_request_id() {
             TestUuidRequestId,
         ))
         .layer(PropagateRequestIdLayer::new(x_request_id))
-        .service(OpenShellServer::new(TestOpenShell));
+        .service(grpc_router);
     let http_service = health_router();
     let service = MultiplexedService::new(grpc_service, http_service);
 
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
@@ -429,4 +450,105 @@ async fn grpc_response_propagates_request_id() {
     let response = client.health(request).await.unwrap();
     let echoed = response.metadata().get("x-request-id").unwrap();
     assert_eq!(echoed.to_str().unwrap(), "grpc-corr-id");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn standard_grpc_health_reflection_multiplexed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let grpc_router = gateway_test_grpc_router!(common::openshell_max_decode_server(TestOpenShell));
+    let http_service = health_router();
+    let service = MultiplexedService::new(grpc_router, http_service);
+
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let svc = service.clone();
+            tokio::spawn(async move {
+                let _ = Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+
+    let endpoint = format!("http://{addr}");
+    let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut health = HealthClient::new(channel);
+
+    let check = health
+        .check(HealthCheckRequest {
+            service: OPENSHELL_SERVICE_NAME.to_string(),
+        })
+        .await
+        .expect("health check")
+        .into_inner();
+    assert_eq!(check.status, ServingStatus::Serving as i32);
+
+    let check_agg = health
+        .check(HealthCheckRequest {
+            service: String::new(),
+        })
+        .await
+        .expect("aggregate health check")
+        .into_inner();
+    assert_eq!(check_agg.status, ServingStatus::Serving as i32);
+
+    let watch_res = health
+        .watch(HealthCheckRequest {
+            service: OPENSHELL_SERVICE_NAME.to_string(),
+        })
+        .await;
+    let Err(watch_err) = watch_res else {
+        panic!("watch should fail with UNIMPLEMENTED");
+    };
+    assert_eq!(watch_err.code(), Code::Unimplemented);
+
+    let channel2 = tonic::transport::Endpoint::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut refl = ServerReflectionClient::new(channel2);
+
+    let req = tonic::Request::new(tokio_stream::once(ServerReflectionRequest {
+        host: String::new(),
+        message_request: Some(MessageRequest::ListServices(String::new())),
+    }));
+    let mut inbound = refl
+        .server_reflection_info(req)
+        .await
+        .expect("reflection")
+        .into_inner();
+    let msg = inbound
+        .next()
+        .await
+        .expect("stream item")
+        .expect("reflection response");
+    let response = msg.message_response.expect("message_response");
+    match response {
+        MessageResponse::ListServicesResponse(list) => {
+            let names: Vec<&str> = list.service.iter().map(|s| s.name.as_str()).collect();
+            assert!(
+                names.contains(&"openshell.v1.OpenShell"),
+                "expected openshell.v1.OpenShell in reflection list, got {names:?}"
+            );
+            assert!(
+                names.contains(&"grpc.health.v1.Health"),
+                "expected grpc.health.v1.Health in reflection list, got {names:?}"
+            );
+        }
+        other => panic!("unexpected reflection response: {other:?}"),
+    }
+
+    server.abort();
 }

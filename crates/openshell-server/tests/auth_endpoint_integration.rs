@@ -26,6 +26,9 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
+#[macro_use]
+mod common;
+
 // ---------------------------------------------------------------------------
 // Test auth handler (mirrors auth.rs but no ServerState)
 // ---------------------------------------------------------------------------
@@ -710,16 +713,16 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
 /// Uses `serve_connection_with_upgrades` to also support WebSocket upgrades.
 #[tokio::test]
 async fn plaintext_server_accepts_grpc_and_http() {
-    use openshell_core::proto::{
-        HealthRequest, ServiceStatus, open_shell_client::OpenShellClient,
-        open_shell_server::OpenShellServer,
+    use openshell_server::{MultiplexedService, OPENSHELL_SERVICE_NAME, health_router};
+    use tonic_health::pb::{
+        HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
     };
-    use openshell_server::{MultiplexedService, health_router};
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let grpc_service = OpenShellServer::new(TestOpenShell);
+    let grpc_service =
+        gateway_test_grpc_router!(common::openshell_max_decode_server(TestOpenShell));
     let http_service = health_router();
     let service = MultiplexedService::new(grpc_service, http_service);
 
@@ -739,17 +742,23 @@ async fn plaintext_server_accepts_grpc_and_http() {
         }
     });
 
-    // gRPC over plaintext HTTP
-    let mut client = OpenShellClient::connect(format!("http://{addr}"))
+    // gRPC over plaintext HTTP (standard health)
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
         .await
         .expect("plaintext gRPC connect failed");
-    let resp = client
-        .health(HealthRequest {})
+    let mut health = HealthClient::new(channel);
+    let resp = health
+        .check(HealthCheckRequest {
+            service: OPENSHELL_SERVICE_NAME.to_string(),
+        })
         .await
-        .expect("plaintext health RPC failed");
+        .expect("plaintext health RPC failed")
+        .into_inner();
     assert_eq!(
-        resp.get_ref().status,
-        ServiceStatus::Healthy as i32,
+        resp.status,
+        ServingStatus::Serving as i32,
         "gRPC health check should succeed over plaintext"
     );
 

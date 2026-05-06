@@ -30,8 +30,8 @@ use tower_http::request_id::{MakeRequestId, RequestId};
 use tracing::Span;
 
 use crate::{
-    OpenShellService, ServerState, auth::authz::AuthzPolicy, auth::oidc, http_router,
-    inference::InferenceService,
+    OpenShellService, ServerState, auth::authz::AuthzPolicy, auth::oidc, grpc::gateway_health,
+    http_router, inference::InferenceService,
 };
 
 /// Request-ID generator that produces a UUID v4 for each inbound request.
@@ -110,7 +110,7 @@ macro_rules! request_id_middleware {
 /// Replaces tonic's implicit 4 MB default with a conservative limit to
 /// bound memory allocation from a single request. Sandbox creation is
 /// the largest payload and well within this cap under normal use.
-const MAX_GRPC_DECODE_SIZE: usize = 1_048_576;
+pub const MAX_GRPC_DECODE_SIZE: usize = 1_048_576;
 
 /// Multiplexed gRPC/HTTP service.
 #[derive(Clone)]
@@ -131,6 +131,21 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let standard_health = gateway_health::GatewayStandardHealth::server(MAX_GRPC_DECODE_SIZE);
+
+        // gRPC server reflection: OIDC treats `/grpc.reflection.*` as unauthenticated by design.
+        // A future hardening pass could require authentication here and/or register a reduced
+        // file descriptor set so only a subset of services is discoverable.
+        //
+        // Descriptor sets (see crates `tonic-health`, `tonic-reflection`): `build_v1()` registers
+        // `grpc.reflection.v1` by default; we add OpenShell protos from `openshell-core` and
+        // `grpc.health.v1` via `tonic_health::pb::FILE_DESCRIPTOR_SET`.
+        let reflection = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(openshell_core::proto::FILE_DESCRIPTOR_SET)
+            .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+            .build_v1()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
         let openshell = OpenShellServer::new(OpenShellService::new(self.state.clone()))
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
         let inference = InferenceServer::new(InferenceService::new(self.state.clone()))
@@ -141,7 +156,7 @@ impl MultiplexService {
             scopes_enabled: !oidc.scopes_claim.is_empty(),
         });
         let grpc_service = AuthGrpcRouter::new(
-            GrpcRouter::new(openshell, inference),
+            GatewayGrpcRouter::new(standard_health, reflection, openshell, inference),
             self.state.oidc_cache.clone(),
             authz_policy,
             self.state.config.ssh_handshake_secret.clone(),
@@ -171,40 +186,57 @@ impl MultiplexService {
     }
 }
 
-/// Combined gRPC service that routes between `OpenShell` and Inference services
-/// based on the request path prefix.
+/// Combined gRPC service: standard health, reflection, `Inference`, then `OpenShell` (default).
 #[derive(Clone)]
-pub struct GrpcRouter<N, I> {
-    openshell: N,
+pub struct GatewayGrpcRouter<H, R, O, I> {
+    health: H,
+    reflection: R,
+    openshell: O,
     inference: I,
 }
 
-impl<N, I> GrpcRouter<N, I> {
-    fn new(openshell: N, inference: I) -> Self {
+impl<H, R, O, I> GatewayGrpcRouter<H, R, O, I> {
+    /// Combine standard health, reflection, `OpenShell`, and `Inference` gRPC services.
+    #[must_use]
+    pub fn new(health: H, reflection: R, openshell: O, inference: I) -> Self {
         Self {
+            health,
+            reflection,
             openshell,
             inference,
         }
     }
 }
 
+const GRPC_HEALTH_V1_PREFIX: &str = "/grpc.health.v1.Health/";
+const GRPC_REFLECTION_V1_PREFIX: &str = "/grpc.reflection.v1.ServerReflection/";
 const INFERENCE_PATH_PREFIX: &str = "/openshell.inference.v1.Inference/";
 
-impl<N, I, B> tower::Service<Request<B>> for GrpcRouter<N, I>
+impl<H, R, O, I, B> tower::Service<Request<B>> for GatewayGrpcRouter<H, R, O, I>
 where
-    N: tower::Service<Request<B>> + Clone + Send + 'static,
-    N::Response: Send,
-    N::Future: Send,
-    N::Error: Send,
-    I: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+    H: tower::Service<Request<B>> + Clone + Send + 'static,
+    H::Response: Send,
+    H::Future: Send,
+    H::Error: Send,
+    R: tower::Service<Request<B>, Response = H::Response, Error = H::Error>
+        + Clone
+        + Send
+        + 'static,
+    R::Future: Send,
+    O: tower::Service<Request<B>, Response = H::Response, Error = H::Error>
+        + Clone
+        + Send
+        + 'static,
+    O::Future: Send,
+    I: tower::Service<Request<B>, Response = H::Response, Error = H::Error>
         + Clone
         + Send
         + 'static,
     I::Future: Send,
     B: Send + 'static,
 {
-    type Response = N::Response;
-    type Error = N::Error;
+    type Response = H::Response;
+    type Error = H::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -212,9 +244,14 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let is_inference = req.uri().path().starts_with(INFERENCE_PATH_PREFIX);
-
-        if is_inference {
+        let path = req.uri().path();
+        if path.starts_with(GRPC_HEALTH_V1_PREFIX) {
+            let mut svc = self.health.clone();
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        } else if path.starts_with(GRPC_REFLECTION_V1_PREFIX) {
+            let mut svc = self.reflection.clone();
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        } else if path.starts_with(INFERENCE_PATH_PREFIX) {
             let mut svc = self.inference.clone();
             Box::pin(async move { svc.ready().await?.call(req).await })
         } else {
@@ -706,6 +743,22 @@ mod tests {
         assert_eq!(
             grpc_method_from_path("/openshell.inference.v1.Inference/GetInferenceBundle"),
             "GetInferenceBundle"
+        );
+    }
+
+    #[test]
+    fn grpc_method_extracts_standard_health_check() {
+        assert_eq!(
+            grpc_method_from_path("/grpc.health.v1.Health/Check"),
+            "Check"
+        );
+    }
+
+    #[test]
+    fn grpc_method_extracts_reflection_info() {
+        assert_eq!(
+            grpc_method_from_path("/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"),
+            "ServerReflectionInfo"
         );
     }
 

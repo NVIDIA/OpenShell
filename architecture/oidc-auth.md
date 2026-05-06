@@ -158,10 +158,11 @@ These methods require no authentication at all — health probes and infrastruct
 
 | Method / Prefix | Reason |
 |---|---|
-| `OpenShell/Health` | Kubernetes liveness/readiness probes |
-| `Inference/Health` | Inference service health probes |
+| `OpenShell/Health` | Deprecated custom health RPC on `OpenShell` for legacy clients/tooling. Kubernetes **gRPC probes** call `grpc.health.v1.Health/Check` (see `/grpc.health.*` below), not this method |
 | `/grpc.reflection.*` | gRPC server reflection (debugging tools) |
-| `/grpc.health.*` | gRPC health check protocol |
+| `/grpc.health.*` | Standard gRPC health check protocol (covers logical services by name, e.g. `openshell.inference.v1.Inference`; there is no separate `Inference/Health` RPC on `Inference`) |
+
+Note: The `Inference` service in `proto/inference.proto` never defined a `Health` method — only bundle/cluster inference RPCs. Any historical OIDC allowlist entry for `Inference/Health` pointed at a non-existent method.
 
 ### Sandbox-Secret Authenticated
 
