@@ -13,7 +13,7 @@ Use `openshell` first to identify the active endpoint. Then use the platform too
 
 The target deployment flow is:
 
-1. Operator starts or deploys the gateway.
+1. Operator starts or deploys the gateway with system packages, systemd, Helm, or a development task. The CLI does not start, stop, or destroy gateway services.
 2. Operator configures the compute driver.
 3. Operator provides TLS and SSH relay material for the deployment mode.
 4. The CLI registers a reachable gateway endpoint with `openshell gateway add`.

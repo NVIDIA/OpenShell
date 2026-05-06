@@ -26,29 +26,32 @@ openshell inference set|get|update
 openshell settings get|set
 openshell forward start|stop|list
 openshell term
-openshell gateway add|select|info
-openshell gateway destroy     (removes CLI registration only)
+openshell gateway add|select|info|list|remove
 ```
 
-### Commands that do not apply
+### Gateway lifecycle
 
-These commands manage Docker container lifecycle and are not applicable
-to the RPM/systemd deployment. Use the systemd equivalents instead.
+Gateway service lifecycle is owned by systemd for RPM deployments. Use
+systemd commands directly:
 
-| CLI command | RPM alternative |
-|-------------|-----------------|
-| `openshell gateway start` | `systemctl --user start openshell-gateway` |
-| `openshell gateway stop` | `systemctl --user stop openshell-gateway` |
-| `openshell doctor check` | `systemctl --user status openshell-gateway` |
-| `openshell doctor logs` | `journalctl --user -u openshell-gateway` |
-| `openshell doctor logs --tail` | `journalctl --user -u openshell-gateway -f` |
-| `openshell doctor exec` | Not applicable (no K3s container) |
+| Task | Command |
+|------|---------|
+| Start gateway | `systemctl --user start openshell-gateway` |
+| Stop gateway | `systemctl --user stop openshell-gateway` |
+| Restart gateway | `systemctl --user restart openshell-gateway` |
+| Check status | `systemctl --user status openshell-gateway` |
+| View logs | `journalctl --user -u openshell-gateway` |
+| Follow logs | `journalctl --user -u openshell-gateway -f` |
+| Remove CLI registration | `openshell gateway remove [name]` |
+
+`openshell doctor exec` is not applicable to the RPM gateway because
+there is no K3s container to exec into.
 
 ### Building from local Dockerfiles
 
-`openshell sandbox create --from ./Dockerfile` builds via Docker and
-pushes into K3s containerd. With the Podman driver, build the image
-with Podman and reference it directly:
+`openshell sandbox create --from ./Dockerfile` builds via the local
+Docker daemon. With the RPM Podman driver, build the image with Podman
+and reference it directly:
 
 ```shell
 podman build -t my-sandbox ./my-dir

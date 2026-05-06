@@ -9,7 +9,7 @@ Guide agents through using the `openshell` CLI for sandbox and platform manageme
 
 ## Overview
 
-The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes, providers, policies, inference routes, and gateways. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
+The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes, providers, policies, inference routes, and gateway registrations. Gateway service lifecycle is handled outside the CLI by packages, systemd, Helm, or development tasks. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
 
 **Companion skill**: For creating or modifying sandbox policy YAML content (network rules, L7 inspection, access presets), use the `generate-sandbox-policy` skill. This skill covers the CLI *commands* for the policy lifecycle; `generate-sandbox-policy` covers policy *content authoring*.
 
@@ -486,7 +486,7 @@ openshell status                    # Verify connectivity
 ```bash
 openshell gateway add http://127.0.0.1:8080 --local --name local
 openshell gateway add https://gateway.example.com --name production
-openshell gateway destroy --name local                  # Remove local registration
+openshell gateway remove local                         # Remove local registration
 ```
 
 ### Platform-specific deployment inspection
@@ -549,7 +549,7 @@ $ openshell sandbox upload --help
 | Configure gateway inference | `openshell inference set --provider P --model M` |
 | View gateway inference | `openshell inference get` |
 | Delete sandbox | `openshell sandbox delete <name>` |
-| Remove gateway registration | `openshell gateway destroy --name <name>` |
+| Remove gateway registration | `openshell gateway remove <name>` |
 | Self-teach any command | `openshell <group> <cmd> --help` |
 
 ## Companion Skills

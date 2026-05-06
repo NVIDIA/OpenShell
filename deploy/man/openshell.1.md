@@ -8,7 +8,7 @@ date: 2025
 
 # NAME
 
-openshell - CLI for managing OpenShell sandboxes, gateways, and providers
+openshell - CLI for managing OpenShell sandboxes, gateway registrations, and providers
 
 # SYNOPSIS
 
@@ -18,40 +18,38 @@ openshell - CLI for managing OpenShell sandboxes, gateways, and providers
 
 **openshell** is the command-line interface for OpenShell, a platform
 providing safe, sandboxed runtimes for autonomous AI agents. It manages
-the gateway control plane, sandbox lifecycle, credential providers,
+gateway registrations, sandbox lifecycle, credential providers,
 network policies, and inference routing.
 
 The CLI communicates with a gateway server over gRPC. The gateway can
-run as a systemd user service (RPM deployment with Podman driver), a
-Docker container with embedded K3s, or behind a cloud reverse proxy.
+run as a package-managed systemd user service, a Helm deployment, a
+development task, or behind a cloud reverse proxy.
 
 # COMMANDS
 
 ## Gateway Management
 
-**gateway start**
-:   Deploy a new gateway using Docker (not applicable to RPM deployments;
-    use **systemctl --user start openshell-gateway** instead).
-
-**gateway stop**
-:   Stop a Docker-managed gateway (use **systemctl --user stop
-    openshell-gateway** for RPM deployments).
-
-**gateway destroy** \[**--name** *NAME*\]
-:   Destroy a gateway. For RPM deployments, this removes the CLI
-    registration only.
-
 **gateway add** *ENDPOINT* \[**--local**\] \[**--name** *NAME*\] \[**--remote** *USER@HOST*\]
 :   Register an existing gateway with the CLI.
+
+**gateway remove** \[*NAME*\]
+:   Remove a local CLI registration and stored auth tokens. This does not
+    stop or destroy the gateway service.
 
 **gateway select** \[*NAME*\]
 :   List registered gateways or switch the active gateway.
 
 **gateway info** \[**--name** *NAME*\]
-:   Show deployment details for a gateway.
+:   Show registration details for a gateway.
+
+**gateway list**
+:   List registered gateways.
 
 **gateway login**
 :   Re-authenticate with a cloud gateway.
+
+**gateway logout**
+:   Clear stored authentication credentials for a gateway.
 
 **status**
 :   Check the health of the active gateway.
@@ -59,8 +57,7 @@ Docker container with embedded K3s, or behind a cloud reverse proxy.
 ## Sandbox Management
 
 **sandbox create** \[**--from** *IMAGE*\] \[**--policy** *FILE*\] \[**--provider** *NAME*\] \[**--gpu**\] \[**--upload** *SRC:DST*\] \[**--forward** *PORT*\] \[**--** *COMMAND*\]
-:   Create a new sandbox. If no gateway exists, auto-bootstraps one
-    (Docker mode only).
+:   Create a new sandbox on the active gateway.
 
 **sandbox list** \[**--selector** *LABEL*\]
 :   List all sandboxes on the active gateway.
@@ -145,9 +142,9 @@ Docker container with embedded K3s, or behind a cloud reverse proxy.
 **term**
 :   Open the real-time TUI dashboard.
 
-**doctor check** \| **logs** \| **exec** \| **llm.txt**
-:   Diagnostic tools (Docker/K3s mode only; see **TROUBLESHOOTING**
-    section for RPM alternatives).
+**doctor check** \| **logs** \| **exec**
+:   Diagnostic tools for local Docker-backed gateways. For package-managed
+    gateways, prefer systemd, journalctl, kubectl, or Helm diagnostics.
 
 **completions** *SHELL*
 :   Generate shell completions (bash, zsh, fish).

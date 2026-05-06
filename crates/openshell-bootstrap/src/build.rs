@@ -1,13 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build container images for gateway runtimes.
+//! Build container images for sandbox runtimes.
 //!
 //! This module wraps bollard's `build_image()` API to build a container image
-//! from a Dockerfile and build context. Kubernetes deployments reuse the
-//! existing push pipeline to import the image into the gateway's containerd
-//! runtime. VM deployments keep the built image in the local Docker daemon and
-//! pass an internal local-image reference to the VM driver.
+//! from a Dockerfile and build context. Package-managed local gateways use the
+//! host Docker daemon, so the resulting tag is passed to the gateway directly.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,9 +16,6 @@ use bollard::query_parameters::BuildImageOptionsBuilder;
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use tokio::time::timeout;
-
-use crate::constants::container_name;
-use crate::push::push_local_images;
 
 /// Maximum gap between Docker build stream events before a build is treated
 /// as stuck.
@@ -35,10 +30,9 @@ const DEFAULT_BUILD_NO_PROGRESS_TIMEOUT_SECS: u64 = 1800;
 
 /// Build a container image from a Dockerfile using the local Docker daemon.
 ///
-/// This is used by `openshell sandbox create --from <Dockerfile>` for both the
-/// Kubernetes and VM backends. The image remains available in the local Docker
-/// daemon so the caller can either hand the resulting tag directly to the VM
-/// backend or import it into a local gateway containerd runtime.
+/// This is used by `openshell sandbox create --from <Dockerfile>`. The image
+/// remains available in the local Docker daemon so the gateway's active local
+/// compute driver can resolve the tag.
 #[allow(clippy::implicit_hasher)]
 pub async fn build_local_image(
     dockerfile_path: &Path,
@@ -53,49 +47,6 @@ pub async fn build_local_image(
     ));
     build_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
     on_log(format!("Built image {tag}"));
-    Ok(())
-}
-
-/// Push a locally-built image into the gateway's containerd runtime.
-#[allow(clippy::implicit_hasher)]
-pub async fn push_image_into_gateway(
-    tag: &str,
-    gateway_name: &str,
-    on_log: &mut impl FnMut(String),
-) -> Result<()> {
-    on_log(format!(
-        "Pushing image {tag} into gateway \"{gateway_name}\""
-    ));
-    let local_docker = crate::docker::connect_local_for_large_transfers()
-        .into_diagnostic()
-        .wrap_err("failed to connect to local Docker daemon")?;
-    let container = container_name(gateway_name);
-    let images: Vec<&str> = vec![tag];
-    push_local_images(&local_docker, &local_docker, &container, &images, on_log).await?;
-
-    on_log(format!("Image {tag} is available in the gateway."));
-    Ok(())
-}
-
-/// Build a container image from a Dockerfile and push it into the gateway.
-///
-/// This is used by `openshell sandbox create --from <Dockerfile>` when the
-/// active gateway is the local Kubernetes deployment. It:
-/// 1. Creates a tar archive of the build context directory.
-/// 2. Sends it to the local Docker daemon via `build_image()`.
-/// 3. Pushes the resulting image into the gateway's containerd via the
-///    existing `push_local_images()` pipeline.
-#[allow(clippy::implicit_hasher)]
-pub async fn build_and_push_image(
-    dockerfile_path: &Path,
-    tag: &str,
-    context_dir: &Path,
-    gateway_name: &str,
-    build_args: &HashMap<String, String>,
-    on_log: &mut impl FnMut(String),
-) -> Result<()> {
-    build_local_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
-    push_image_into_gateway(tag, gateway_name, on_log).await?;
     Ok(())
 }
 
