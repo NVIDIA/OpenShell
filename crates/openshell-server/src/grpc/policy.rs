@@ -2987,6 +2987,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_policy_layers_normalize_custom_provider_type_ids() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        store
+            .put_message(&test_provider("work-custom", " Custom-API "))
+            .await
+            .unwrap();
+        store
+            .put_message(&openshell_core::proto::StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-custom-api".to_string(),
+                    name: "custom-api".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                }),
+                profile: Some(openshell_core::proto::ProviderProfile {
+                    id: "custom-api".to_string(),
+                    display_name: "Custom API".to_string(),
+                    description: String::new(),
+                    category: openshell_core::proto::ProviderProfileCategory::Other as i32,
+                    credentials: Vec::new(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.custom.example".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: Vec::new(),
+                    inference_capable: false,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let layers = profile_provider_policy_layers(&store, &["work-custom".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].rule.endpoints[0].host, "api.custom.example");
+    }
+
+    #[tokio::test]
     async fn provider_policy_layers_include_known_provider_profiles() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         store

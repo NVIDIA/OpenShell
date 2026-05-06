@@ -19,8 +19,8 @@ pub use context::{DiscoveryContext, RealDiscoveryContext};
 pub use discovery::discover_with_spec;
 pub use profiles::{
     ProfileError, ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles,
-    get_default_profile, parse_profile_json, parse_profile_yaml, profile_to_json, profile_to_yaml,
-    profiles_to_json, profiles_to_yaml, validate_profile_set,
+    get_default_profile, normalize_profile_id, parse_profile_json, parse_profile_yaml,
+    profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml, validate_profile_set,
 };
 
 #[derive(Debug, thiserror::Error)]

@@ -283,7 +283,7 @@ use openshell_core::proto::{
 };
 use openshell_providers::{
     ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles, get_default_profile,
-    normalize_provider_type, validate_profile_set,
+    normalize_profile_id, normalize_provider_type, validate_profile_set,
 };
 use std::sync::Arc;
 use tonic::{Request, Response};
@@ -356,10 +356,8 @@ pub(super) async fn handle_get_provider_profile(
     request: Request<GetProviderProfileRequest>,
 ) -> Result<Response<ProviderProfileResponse>, Status> {
     let id = request.into_inner().id;
-    if id.trim().is_empty() {
-        return Err(Status::invalid_argument("id is required"));
-    }
-    let profile = get_provider_type_profile(state.store.as_ref(), id.trim())
+    let id = normalize_profile_id_request(&id)?;
+    let profile = get_provider_type_profile(state.store.as_ref(), &id)
         .await?
         .ok_or_else(|| Status::not_found("provider profile not found"))?
         .to_proto();
@@ -427,11 +425,8 @@ pub(super) async fn handle_delete_provider_profile(
     request: Request<DeleteProviderProfileRequest>,
 ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
     let id = request.into_inner().id;
-    let id = id.trim();
-    if id.is_empty() {
-        return Err(Status::invalid_argument("id is required"));
-    }
-    if get_default_profile(id).is_some() {
+    let id = normalize_profile_id_request(&id)?;
+    if get_default_profile(&id).is_some() {
         return Err(Status::failed_precondition(
             "built-in provider profiles cannot be deleted",
         ));
@@ -439,14 +434,14 @@ pub(super) async fn handle_delete_provider_profile(
 
     let existing = state
         .store
-        .get_message_by_name::<StoredProviderProfile>(id)
+        .get_message_by_name::<StoredProviderProfile>(&id)
         .await
         .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?;
     if existing.is_none() {
         return Err(Status::not_found("provider profile not found"));
     }
 
-    let blocking_sandboxes = sandboxes_using_profile(state.store.as_ref(), id).await?;
+    let blocking_sandboxes = sandboxes_using_profile(state.store.as_ref(), &id).await?;
     if !blocking_sandboxes.is_empty() {
         return Err(Status::failed_precondition(format!(
             "provider profile '{id}' is in use by sandboxes: {}",
@@ -456,7 +451,7 @@ pub(super) async fn handle_delete_provider_profile(
 
     let deleted = state
         .store
-        .delete_by_name(StoredProviderProfile::object_type(), id)
+        .delete_by_name(StoredProviderProfile::object_type(), &id)
         .await
         .map_err(|e| Status::internal(format!("delete provider profile failed: {e}")))?;
 
@@ -467,11 +462,14 @@ pub(super) async fn get_provider_type_profile(
     store: &Store,
     id: &str,
 ) -> Result<Option<ProviderTypeProfile>, Status> {
-    if let Some(profile) = get_default_profile(id) {
+    let Some(id) = normalize_profile_id(id) else {
+        return Ok(None);
+    };
+    if let Some(profile) = get_default_profile(&id) {
         return Ok(Some(profile.clone()));
     }
     let profile = store
-        .get_message_by_name::<StoredProviderProfile>(id)
+        .get_message_by_name::<StoredProviderProfile>(&id)
         .await
         .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
         .and_then(|stored| stored.profile)
@@ -504,6 +502,15 @@ async fn custom_provider_profiles(store: &Store) -> Result<Vec<StoredProviderPro
         profiles.push(profile);
     }
     Ok(profiles)
+}
+
+fn normalize_profile_id_request(id: &str) -> Result<String, Status> {
+    if id.trim().is_empty() {
+        return Err(Status::invalid_argument("id is required"));
+    }
+    normalize_profile_id(id).ok_or_else(|| {
+        Status::invalid_argument("id must be lowercase kebab-case using only a-z, 0-9, and '-'")
+    })
 }
 
 fn profiles_from_import_items(
@@ -552,24 +559,23 @@ async fn profile_conflict_diagnostics(
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
     let mut diagnostics = Vec::new();
     for (source, profile) in profiles {
-        let id = profile.id.trim();
-        if id.is_empty() {
+        let Some(id) = normalize_profile_id(&profile.id) else {
             continue;
-        }
-        if get_default_profile(id).is_some() {
+        };
+        if get_default_profile(&id).is_some() {
             diagnostics.push(ProfileValidationDiagnostic {
                 source: source.clone(),
-                profile_id: id.to_string(),
+                profile_id: id.clone(),
                 field: "id".to_string(),
                 message: format!("provider profile '{id}' is built-in and cannot be overwritten"),
                 severity: "error".to_string(),
             });
             continue;
         }
-        if let Some(provider_type) = normalize_provider_type(id) {
+        if let Some(provider_type) = normalize_provider_type(&id) {
             diagnostics.push(ProfileValidationDiagnostic {
                 source: source.clone(),
-                profile_id: id.to_string(),
+                profile_id: id.clone(),
                 field: "id".to_string(),
                 message: format!(
                     "provider profile id '{id}' is reserved for legacy provider type '{provider_type}'"
@@ -579,14 +585,14 @@ async fn profile_conflict_diagnostics(
             continue;
         }
         if store
-            .get_message_by_name::<StoredProviderProfile>(id)
+            .get_message_by_name::<StoredProviderProfile>(&id)
             .await
             .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
             .is_some()
         {
             diagnostics.push(ProfileValidationDiagnostic {
                 source: source.clone(),
-                profile_id: id.to_string(),
+                profile_id: id.clone(),
                 field: "id".to_string(),
                 message: format!("custom provider profile '{id}' already exists"),
                 severity: "error".to_string(),
@@ -658,7 +664,7 @@ async fn sandboxes_using_profile(store: &Store, profile_id: &str) -> Result<Vec<
                 else {
                     continue;
                 };
-                if provider.r#type.trim().eq_ignore_ascii_case(profile_id) {
+                if normalize_profile_id(&provider.r#type).as_deref() == Some(profile_id) {
                     blocking.push(sandbox.object_name().to_string());
                     break;
                 }
@@ -977,6 +983,83 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(missing.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_rejects_noncanonical_ids() {
+        let state = test_server_state().await;
+        let response = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile(" alex-api ")),
+                        source: "space.yaml".to_string(),
+                    },
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile("alex_api")),
+                        source: "underscore.yaml".to_string(),
+                    },
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile("Alex-API")),
+                        source: "case.yaml".to_string(),
+                    },
+                ],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.imported);
+        assert_eq!(
+            response
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("lowercase kebab-case"))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_profile_get_and_delete_normalize_request_ids() {
+        let state = test_server_state().await;
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("alex-api")),
+                    source: "alex-api.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let fetched = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: " Alex-API ".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profile
+        .unwrap();
+        assert_eq!(fetched.id, "alex-api");
+
+        let deleted = handle_delete_provider_profile(
+            &state,
+            Request::new(DeleteProviderProfileRequest {
+                id: " Alex-API ".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(deleted.deleted);
     }
 
     #[tokio::test]

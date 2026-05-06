@@ -658,19 +658,49 @@ fn validate_profiles(profiles: &[ProviderTypeProfile]) -> Result<(), ProfileErro
 }
 
 #[must_use]
+pub fn normalize_profile_id(input: &str) -> Option<String> {
+    let id = input.trim().to_ascii_lowercase();
+    if is_valid_profile_id(&id) {
+        Some(id)
+    } else {
+        None
+    }
+}
+
+fn is_valid_profile_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+        && id.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+}
+
+#[must_use]
 pub fn validate_profile_set(
     profiles: &[(String, ProviderTypeProfile)],
 ) -> Vec<ProfileValidationDiagnostic> {
     let mut diagnostics = Vec::new();
     let mut ids = HashSet::new();
     for (source, profile) in profiles {
-        let profile_id = profile.id.trim();
+        let raw_profile_id = profile.id.as_str();
+        let profile_id = raw_profile_id.trim();
         if profile_id.is_empty() {
             diagnostics.push(ProfileValidationDiagnostic::error(
                 source,
                 "",
                 "id",
                 "provider profile id is required",
+            ));
+        } else if normalize_profile_id(raw_profile_id).as_deref() != Some(raw_profile_id) {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                "id",
+                "provider profile id must be lowercase kebab-case using only a-z, 0-9, and '-'",
             ));
         } else if !ids.insert(profile_id.to_string()) {
             diagnostics.push(ProfileValidationDiagnostic::error(
@@ -815,9 +845,9 @@ mod tests {
     use openshell_core::proto::ProviderProfileCategory;
 
     use super::{
-        ProfileError, default_profiles, get_default_profile, parse_profile_catalog_yamls,
-        parse_profile_json, parse_profile_yaml, profile_to_json, profile_to_yaml,
-        validate_profile_set,
+        ProfileError, ProviderTypeProfile, default_profiles, get_default_profile,
+        normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
+        profile_to_json, profile_to_yaml, validate_profile_set,
     };
 
     #[test]
@@ -1004,6 +1034,75 @@ binaries: ["", /usr/bin/broken]
                 .any(|message| message.starts_with("invalid endpoint"))
         );
         assert!(messages.contains(&"binary path must not be empty"));
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_noncanonical_profile_ids() {
+        let profiles = [
+            (
+                "space.yaml".to_string(),
+                ProviderTypeProfile {
+                    id: " alex-api ".to_string(),
+                    display_name: "Space".to_string(),
+                    description: String::new(),
+                    category: ProviderProfileCategory::Other,
+                    credentials: Vec::new(),
+                    endpoints: Vec::new(),
+                    binaries: Vec::new(),
+                    inference_capable: false,
+                },
+            ),
+            (
+                "underscore.yaml".to_string(),
+                ProviderTypeProfile {
+                    id: "alex_api".to_string(),
+                    display_name: "Underscore".to_string(),
+                    description: String::new(),
+                    category: ProviderProfileCategory::Other,
+                    credentials: Vec::new(),
+                    endpoints: Vec::new(),
+                    binaries: Vec::new(),
+                    inference_capable: false,
+                },
+            ),
+            (
+                "case.yaml".to_string(),
+                ProviderTypeProfile {
+                    id: "Alex-API".to_string(),
+                    display_name: "Case".to_string(),
+                    description: String::new(),
+                    category: ProviderProfileCategory::Other,
+                    credentials: Vec::new(),
+                    endpoints: Vec::new(),
+                    binaries: Vec::new(),
+                    inference_capable: false,
+                },
+            ),
+        ];
+
+        let diagnostics = validate_profile_set(&profiles);
+        let id_errors = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.field == "id")
+            .collect::<Vec<_>>();
+
+        assert_eq!(id_errors.len(), 3);
+        assert!(
+            id_errors
+                .iter()
+                .all(|diagnostic| diagnostic.message.contains("lowercase kebab-case"))
+        );
+    }
+
+    #[test]
+    fn normalize_profile_id_trims_and_lowercases_valid_ids() {
+        assert_eq!(
+            normalize_profile_id(" Alex-API "),
+            Some("alex-api".to_string())
+        );
+        assert_eq!(normalize_profile_id("alex_api"), None);
+        assert_eq!(normalize_profile_id("-alex"), None);
+        assert_eq!(normalize_profile_id("alex--api"), None);
     }
 
     #[test]
