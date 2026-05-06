@@ -7,7 +7,7 @@
 //! command inside it, and tear it down.
 //!
 //! This test is cluster-agnostic — it works against any running gateway
-//! (Docker-based cluster or openshell-vm microVM).  The `e2e:vm` mise
+//! (Docker-based cluster or openshell-driver-vm microVM).  The `e2e:vm` mise
 //! task uses it to validate the VM gateway after boot.
 
 use std::process::Stdio;

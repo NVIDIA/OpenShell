@@ -3703,33 +3703,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-vm"
-version = "0.0.0"
-dependencies = [
- "base64 0.22.1",
- "clap",
- "indicatif",
- "libc",
- "libloading",
- "miette",
- "nix",
- "openshell-bootstrap",
- "openshell-core",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "tar",
- "thiserror 2.0.18",
- "tokio",
- "tokio-rustls",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "zstd",
-]
-
-[[package]]
 name = "openssh"
 version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

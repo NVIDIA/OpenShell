@@ -34,7 +34,7 @@ OS-49 Phase 5 added non-required shadow workflows for the non-release workflows 
 
 The `mise-lockfile` job regenerates `mise.lock` with the CI image's pinned mise version and requires the checked-in file to match exactly. This intentionally includes generated metadata so contributors catch toolchain-version drift instead of letting different mise versions churn the lockfile.
 
-OS-49 Phase 7 moves the release-facing CPU jobs in `release-canary.yml`, `release-dev.yml`, and `release-tag.yml` to the same shared CPU labels. The release workflows also call `driver-vm-linux.yml` and `deb-package.yml`, so those reusable workers use the same labels to avoid retaining a hidden ARC dependency in the release path. `release-vm-dev.yml` and `release-vm-kernel.yml` remain on the old labels until the VM runtime decision is recorded for OS-131.
+OS-49 Phase 7 moves the release-facing CPU jobs in `release-canary.yml`, `release-dev.yml`, and `release-tag.yml` to the same shared CPU labels. The release workflows also call `driver-vm-linux.yml`, `driver-vm-macos.yml`, and `deb-package.yml`, so those reusable workers use the same labels to avoid retaining a hidden ARC dependency in the release path. `release-vm-kernel.yml` uses the shared CPU labels for its Linux runtime and release jobs; the macOS runtime job stays on `macos-latest-xlarge` because it builds native macOS dylibs.
 
 ## Trigger taxonomy
 

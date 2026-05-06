@@ -140,9 +140,9 @@ still replace-the-rootfs semantics, so VM images must remain base-compatible
 with the sandbox guest init path. Distroless or `scratch` images are not
 expected to work.
 
-The separate `openshell-vm` binary still uses `vm:rootfs` to build a standalone
-embedded guest filesystem, but `openshell-driver-vm` no longer consumes that
-artifact.
+The legacy `openshell-vm` crate remains in the repository for later
+deprecation, but it is excluded from the normal workspace and release paths.
+`openshell-driver-vm` owns active VM runtime build inputs.
 
 ## Network Plane
 
@@ -203,7 +203,7 @@ specific runtime artifact.
 
 ```mermaid
 graph LR
-    subgraph Source["crates/openshell-vm/runtime/"]
+    subgraph Source["crates/openshell-driver-vm/runtime/"]
         KCONF["kernel/openshell.kconfig<br/>Kernel config fragment"]
     end
 
@@ -254,7 +254,7 @@ stock libkrunfw kernel:
 | Landlock | `CONFIG_SECURITY_LANDLOCK` | Sandbox supervisor filesystem sandboxing |
 | Seccomp filter | `CONFIG_SECCOMP_FILTER` | Sandbox supervisor syscall filtering |
 
-See `crates/openshell-vm/runtime/kernel/openshell.kconfig` for the full
+See `crates/openshell-driver-vm/runtime/kernel/openshell.kconfig` for the full
 fragment with inline comments explaining why each option is needed.
 
 ## Verification
@@ -278,8 +278,8 @@ mise run gateway:vm
 # With custom kernel (optional, adds ~20 min)
 FROM_SOURCE=1 mise run vm:setup
 
-# Wipe everything and start over
-mise run vm:clean
+# Remove the staged compressed runtime when you need a clean rebuild
+rm -rf target/vm-runtime-compressed
 ```
 
 See `crates/openshell-driver-vm/README.md` for the full driver workflow,
@@ -288,43 +288,45 @@ examples.
 
 ## CI/CD
 
-Two GitHub Actions workflows back the driver's release artifacts, both
-publishing to a rolling `vm-dev` GitHub Release:
+The driver release path is split between on-demand runtime builds and normal
+OpenShell releases:
 
 ### Kernel Runtime (`release-vm-kernel.yml`)
 
 Builds the custom libkrunfw (kernel firmware), libkrun (VMM), and gvproxy for
-all supported platforms. Runs on-demand or when the kernel config / pinned
+all supported platforms. Run it on demand when the kernel config or pinned
 versions change.
 
 | Platform | Runner | Build Method |
 |----------|--------|-------------|
-| Linux ARM64 | `build-arm64` (self-hosted) | Native `build-libkrun.sh` |
-| Linux x86_64 | `build-amd64` (self-hosted) | Native `build-libkrun.sh` |
+| Linux ARM64 | `linux-arm64-cpu8` | Native `build-libkrun.sh` |
+| Linux x86_64 | `linux-amd64-cpu8` | Native `build-libkrun.sh` |
 | macOS ARM64 | `macos-latest-xlarge` (GitHub-hosted) | `build-libkrun-macos.sh` |
 
 Artifacts: `vm-runtime-{platform}.tar.zst` containing libkrun, libkrunfw,
 gvproxy, and provenance metadata. Each platform builds its own libkrunfw and
 libkrun natively; the kernel inside libkrunfw is always Linux regardless of
-host platform.
+host platform. The workflow publishes GitHub artifact attestations for each
+runtime tarball instead of a separate runtime checksum file.
 
-### Driver Binary (`release-vm-dev.yml`)
+### Driver Binary (`release-dev.yml` / `release-tag.yml`)
 
 Builds the self-contained `openshell-driver-vm` binary for every platform,
-with the kernel runtime + bundled sandbox supervisor embedded. Runs on every
-push to `main` that touches VM-related crates.
+with the kernel runtime + bundled sandbox supervisor embedded. Development
+driver binaries are published to the rolling `dev` release; tagged driver
+binaries are published to the corresponding `v*` release.
 
-The `download-kernel-runtime` job pulls the current `vm-runtime-<platform>.tar.zst`
-from the `vm-dev` release; the `build-openshell-driver-vm` jobs set
+The reusable driver workflows pull the current `vm-runtime-<platform>.tar.zst`
+from the `vm-runtime` release; their build jobs set
 `OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed` and
 run `cargo build --release -p openshell-driver-vm`. The macOS driver is
 cross-compiled via osxcross (no macOS runner needed for the binary build —
 only for the kernel build).
 
-macOS driver binaries produced via osxcross are not codesigned. Development
-builds are signed automatically by `tasks/scripts/gateway-vm.sh`
-(registered as `mise run gateway:vm`); a packaged release needs signing in
-CI.
+macOS driver binaries produced via osxcross are not codesigned. Local
+development builds are signed automatically by `tasks/scripts/gateway-vm.sh`
+(registered as `mise run gateway:vm`). Release tarball users on macOS must
+ad-hoc sign `openshell-driver-vm` before running VM sandboxes.
 
 ## Rollout Strategy
 
@@ -335,5 +337,6 @@ CI.
    fast if missing.
 3. For development, override with `OPENSHELL_VM_RUNTIME_DIR` to use a local
    directory instead of the extracted cache.
-4. In CI, the kernel runtime is pre-built and cached in the `vm-dev` release.
-   The driver build downloads it via `download-kernel-runtime.sh`.
+4. In CI, the kernel runtime is pre-built and cached in the `vm-runtime` release.
+   Dev and tagged release builds download that runtime, embed it into
+   `openshell-driver-vm`, and publish the driver next to `openshell-gateway`.

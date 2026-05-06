@@ -626,6 +626,16 @@ jobs:
       checkout-ref: ${{ github.sha }}
     secrets: inherit
 
+  build-driver-vm-macos:
+    name: Build Driver VM macOS
+    needs: [compute-versions]
+    uses: ./.github/workflows/driver-vm-macos.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      image-tag: dev
+      checkout-ref: ${{ github.sha }}
+    secrets: inherit
+
   build-deb:
     name: Build Debian Packages
     needs: [compute-versions, build-cli-linux, build-gateway-binary-linux, build-driver-vm-linux]
@@ -644,13 +654,18 @@ jobs:
     secrets: inherit
 
   # ---------------------------------------------------------------------------
-  # Create / update the dev GitHub Release with CLI binaries and wheels
+  # Create / update the dev GitHub Release with CLI, gateway, driver, and wheels
   # ---------------------------------------------------------------------------
   release-dev:
     name: Release Dev
-    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, build-deb, build-rpm]
+    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, build-driver-vm-linux, build-driver-vm-macos, build-deb, build-rpm]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     outputs:
       wheel_filenames: ${{ steps.wheel_filenames.outputs.wheel_filenames }}
     steps:
@@ -674,6 +689,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: supervisor-binary-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download VM driver artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: driver-vm-*
           path: release/
           merge-multiple: true
 
@@ -728,6 +750,14 @@ jobs:
             openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz > openshell-sandbox-checksums-sha256.txt
           cat openshell-sandbox-checksums-sha256.txt
 
+      - name: Attest VM driver artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
+
       - name: Prune stale wheel, deb, and rpm assets from dev release
         uses: actions/github-script@v7
         env:
@@ -760,8 +790,8 @@ jobs:
               core.info(`  ${String(a.id).padStart(12)}  ${a.name}`);
             }
 
-            // Delete stale wheels, debs, and rpms
-            let kept = 0, deleted = 0, debDeleted = 0, rpmDeleted = 0;
+            // Delete stale wheels, debs, rpms, and removed VM checksum assets.
+            let kept = 0, deleted = 0, debDeleted = 0, rpmDeleted = 0, removedVmChecksums = 0;
             for (const asset of assets) {
               if (asset.name.endsWith('.deb')) {
                 core.info(`Deleting stale deb package: ${asset.name} (id=${asset.id})`);
@@ -771,6 +801,10 @@ jobs:
                 core.info(`Deleting stale rpm package: ${asset.name} (id=${asset.id})`);
                 await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
                 rpmDeleted++;
+              } else if (asset.name === 'openshell-driver-vm-checksums-sha256.txt') {
+                core.info(`Deleting removed VM checksum asset: ${asset.name} (id=${asset.id})`);
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
+                removedVmChecksums++;
               } else if (asset.name.endsWith('.whl') && asset.name.startsWith(currentPrefix)) {
                 core.info(`Keeping current wheel: ${asset.name}`);
                 kept++;
@@ -780,7 +814,7 @@ jobs:
                 deleted++;
               }
             }
-            core.info(`Summary: kept_wheels=${kept}, deleted_wheels=${deleted}, deleted_debs=${debDeleted}, deleted_rpms=${rpmDeleted}`);
+            core.info(`Summary: kept_wheels=${kept}, deleted_wheels=${deleted}, deleted_debs=${debDeleted}, deleted_rpms=${rpmDeleted}, deleted_removed_vm_checksums=${removedVmChecksums}`);
 
       - name: Move dev tag
         run: |
@@ -818,6 +852,9 @@ jobs:
             release/openshell-gateway-aarch64-apple-darwin.tar.gz
             release/openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
             release/*.whl
             release/openshell-checksums-sha256.txt
             release/openshell-gateway-checksums-sha256.txt

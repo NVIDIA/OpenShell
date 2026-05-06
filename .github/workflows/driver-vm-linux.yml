@@ -32,7 +32,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs['checkout-ref'] }}
 
@@ -46,17 +46,14 @@ jobs:
           for platform in linux-aarch64 linux-x86_64; do
             asset="vm-runtime-${platform}.tar.zst"
             echo "Downloading ${asset}..."
-            asset_url=$(curl -fsSL \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/vm-dev" \
-              | jq -r --arg asset "$asset" '.assets[] | select(.name == $asset) | .browser_download_url' \
-              | head -n1)
-            if [ -z "$asset_url" ]; then
-              echo "::error::No ${asset} asset found on vm-dev release"
+            if ! gh release download vm-runtime \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${asset}" \
+              --dir runtime-artifacts \
+              --clobber; then
+              echo "::error::No ${asset} asset found on vm-runtime release"
               exit 1
             fi
-            curl -fL -o "runtime-artifacts/${asset}" "$asset_url"
           done
 
           ls -lah runtime-artifacts/
@@ -71,7 +68,7 @@ jobs:
       - name: Upload runtime artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: driver-vm-kernel-runtime-tarballs
+          name: vm-driver-kernel-runtime-tarballs
           path: runtime-artifacts/vm-runtime-*.tar.zst
           retention-days: 1
 
@@ -103,7 +100,7 @@ jobs:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OPENSHELL_IMAGE_TAG: ${{ inputs['image-tag'] }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs['checkout-ref'] }}
           fetch-depth: 0
@@ -130,7 +127,7 @@ jobs:
       - name: Download kernel runtime tarball
         uses: actions/download-artifact@v4
         with:
-          name: driver-vm-kernel-runtime-tarballs
+          name: vm-driver-kernel-runtime-tarballs
           path: runtime-download/
 
       - name: Stage compressed runtime for embedding
@@ -185,6 +182,13 @@ jobs:
           set -euo pipefail
           OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${PWD}/target/vm-runtime-compressed" \
             mise x -- cargo build --release -p openshell-driver-vm
+
+      - name: Verify packaged binary
+        run: |
+          set -euo pipefail
+          OUTPUT="$(target/release/openshell-driver-vm --version)"
+          echo "$OUTPUT"
+          grep -q '^openshell-driver-vm ' <<<"$OUTPUT"
 
       - name: sccache stats
         if: always()

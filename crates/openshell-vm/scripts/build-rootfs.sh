@@ -43,10 +43,10 @@ else
 fi
 
 # Source pinned dependency versions (digests, checksums, commit SHAs).
-# Environment variables override pins — see pins.env for details.
-PINS_FILE="${SCRIPT_DIR}/../pins.env"
+# Environment variables override pins.
+PINS_FILE="${SCRIPT_DIR}/../../openshell-driver-vm/runtime/pins.env"
 if [ -f "$PINS_FILE" ]; then
-    # shellcheck source=../pins.env
+    # shellcheck source=../../openshell-driver-vm/runtime/pins.env
     source "$PINS_FILE"
 fi
 

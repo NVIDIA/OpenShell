@@ -2,17 +2,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Install the OpenShell development build from the rolling GitHub `dev` release.
+# Install an OpenShell Debian package from a GitHub release.
 #
-# This script is intended as a convenient installer for development builds. It
-# currently supports Debian packages on Linux amd64 and arm64 only.
+# This script defaults to the rolling `dev` release and supports Debian
+# packages on Linux amd64 and arm64 only. The package installs the CLI,
+# gateway, and VM compute driver.
 #
 set -e
 
 APP_NAME="openshell"
 REPO="NVIDIA/OpenShell"
 GITHUB_URL="https://github.com/${REPO}"
-RELEASE_TAG="dev"
+RELEASE_TAG="${OPENSHELL_VERSION:-dev}"
 CHECKSUMS_NAME="openshell-checksums-sha256.txt"
 
 info() {
@@ -26,7 +27,7 @@ error() {
 
 usage() {
   cat <<EOF
-install-dev.sh - Install the OpenShell development Debian package
+install-dev.sh - Install the OpenShell Debian package
 
 USAGE:
     curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-dev.sh -o install-dev.sh
@@ -37,11 +38,15 @@ USAGE:
 OPTIONS:
     --help       Print this help message
 
+ENVIRONMENT VARIABLES:
+    OPENSHELL_VERSION   Release tag to install (default: dev).
+
 NOTES:
-    This installs the rolling development release from:
+    This installs the selected release from:
     ${GITHUB_URL}/releases/tag/${RELEASE_TAG}
 
-    Only Linux amd64 and arm64 Debian packages are supported right now.
+    Only Linux amd64 and arm64 Debian packages are supported right now. The
+    Debian package includes openshell, openshell-gateway, and openshell-driver-vm.
 EOF
 }
 
@@ -318,7 +323,7 @@ main() {
 
   info "installing ${_deb_file}..."
   install_deb_package "$_deb_path"
-  info "installed ${APP_NAME} development package"
+  info "installed ${APP_NAME} package from ${RELEASE_TAG}"
   start_user_gateway
 }
 

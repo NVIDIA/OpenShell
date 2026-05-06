@@ -17,7 +17,7 @@ depends = ["e2e:python:gpu"]
 
 ["test:rust"]
 description = "Run Rust tests"
-run = "cargo test --workspace --exclude openshell-vm"
+run = "cargo test --workspace"
 hide = true
 
 ["test:python"]

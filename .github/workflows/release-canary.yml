@@ -67,6 +67,79 @@ jobs:
             echo "Version check passed: found $EXPECTED in output"
           fi
 
+  install-dev:
+    name: Install Debian package (${{ matrix.arch }})
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: build-amd64
+          - arch: arm64
+            runner: build-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Determine release tag
+        id: release
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            WORKFLOW_NAME="${{ github.event.workflow_run.name }}"
+            if [ "$WORKFLOW_NAME" = "Release Dev" ]; then
+              echo "tag=dev" >> "$GITHUB_OUTPUT"
+            elif [ "$WORKFLOW_NAME" = "Release Tag" ]; then
+              TAG="${{ github.event.workflow_run.head_branch }}"
+              if [ -z "$TAG" ]; then
+                echo "::error::Could not determine release tag from workflow_run"
+                exit 1
+              fi
+              echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::Unexpected triggering workflow: ${WORKFLOW_NAME}"
+              exit 1
+            fi
+          fi
+
+      - name: Install Debian package
+        run: |
+          set -euo pipefail
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-dev.sh \
+            | OPENSHELL_VERSION=${{ steps.release.outputs.tag }} sh
+
+      - name: Verify gateway and VM driver versions
+        run: |
+          set -euo pipefail
+          command -v openshell-gateway
+          test -x /usr/libexec/openshell/openshell-driver-vm
+
+          GATEWAY_ACTUAL="$(openshell-gateway --version)"
+          DRIVER_ACTUAL="$(/usr/libexec/openshell/openshell-driver-vm --version)"
+          echo "Gateway: ${GATEWAY_ACTUAL}"
+          echo "Driver:  ${DRIVER_ACTUAL}"
+
+          TAG="${{ steps.release.outputs.tag }}"
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            EXPECTED="${TAG#v}"
+            for actual in "$GATEWAY_ACTUAL" "$DRIVER_ACTUAL"; do
+              if [[ "$actual" != *"$EXPECTED"* ]]; then
+                echo "::error::Version mismatch: expected '$EXPECTED' in '$actual'"
+                exit 1
+              fi
+            done
+            echo "Version check passed: found $EXPECTED in both binaries"
+          else
+            echo "Non-release tag ($TAG), skipping version check"
+          fi
+
   canary:
     name: Canary ${{ matrix.mode }} (${{ matrix.arch }})
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}

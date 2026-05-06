@@ -1,16 +1,16 @@
 name: Release VM Kernel
 
 # Build custom libkrunfw (kernel firmware) + libkrun (VMM) + gvproxy for all
-# supported openshell-vm platforms.  Artifacts are uploaded to the rolling
-# "vm-dev" GitHub Release and consumed by release-vm-dev.yml when building the
-# openshell-vm binary.
+# supported openshell-driver-vm platforms. Artifacts are uploaded to the
+# rolling "vm-runtime" GitHub Release and consumed by normal dev/tag release
+# workflows when building the openshell-driver-vm binary.
 #
 # The Linux kernel is compiled once on aarch64 Linux.  The resulting kernel.c
 # (a C source file containing the kernel as a byte array) is shared with the
 # macOS job, which only needs to compile it into a .dylib — no krunvm, no
 # Fedora VM, no kernel rebuild.  This cuts macOS CI from ~45 min to ~5 min.
 #
-# This workflow runs on-demand (or when kernel config / pins change).  It is
+# This workflow runs on demand when kernel config or pins change. It is
 # intentionally decoupled from the per-commit VM binary build because the
 # kernel rarely changes and takes 15-45 minutes to compile.
 
@@ -21,9 +21,9 @@ permissions:
   contents: write
   packages: read
 
-# Serialize with release-vm-dev.yml — both update the vm-dev release.
+# Serialize runtime release updates.
 concurrency:
-  group: vm-dev-release
+  group: vm-runtime-release
   cancel-in-progress: false
 
 defaults:
@@ -36,7 +36,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-runtime-linux-arm64:
     name: Build Runtime (Linux ARM64)
-    runs-on: build-arm64
+    runs-on: linux-arm64-cpu8
     timeout-minutes: 60
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -86,7 +86,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-runtime-linux-amd64:
     name: Build Runtime (Linux AMD64)
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 60
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -163,13 +163,18 @@ jobs:
           retention-days: 5
 
   # ---------------------------------------------------------------------------
-  # Upload all runtime tarballs to the vm-dev rolling release
+  # Upload all runtime tarballs to the vm-runtime rolling release
   # ---------------------------------------------------------------------------
   release-kernel:
     name: Release Kernel Runtime
     needs: [build-runtime-linux-arm64, build-runtime-linux-amd64, build-runtime-macos-arm64]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@v6
 
@@ -180,36 +185,37 @@ jobs:
           path: release/
           merge-multiple: true
 
-      - name: Generate checksums
-        run: |
-          set -euo pipefail
-          cd release
-          sha256sum vm-runtime-*.tar.zst > vm-runtime-checksums-sha256.txt
-          cat vm-runtime-checksums-sha256.txt
+      - name: Attest VM runtime artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            release/vm-runtime-linux-aarch64.tar.zst
+            release/vm-runtime-linux-x86_64.tar.zst
+            release/vm-runtime-darwin-aarch64.tar.zst
 
-      - name: Ensure vm-dev tag exists
+      - name: Ensure vm-runtime tag exists
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -fa vm-dev -m "VM Development Build" "${GITHUB_SHA}"
-          git push --force origin vm-dev
+          git tag -fa vm-runtime -m "VM Runtime Development Build" "${GITHUB_SHA}"
+          git push --force origin vm-runtime
 
-      - name: Prune stale runtime assets from vm-dev release
+      - name: Prune stale runtime assets from vm-runtime release
         uses: actions/github-script@v7
         with:
           script: |
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
             let release;
             try {
-              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: 'vm-dev' });
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: 'vm-runtime' });
             } catch (err) {
               if (err.status === 404) {
-                core.info('No existing vm-dev release; will create fresh.');
+                core.info('No existing vm-runtime release; will create fresh.');
                 return;
               }
               throw err;
             }
-            // Delete old runtime tarballs and checksums (keep vm binary assets)
+            // Delete old runtime assets, including removed checksum files.
             for (const asset of release.data.assets) {
               if (asset.name.startsWith('vm-runtime-')) {
                 core.info(`Deleting stale asset: ${asset.name}`);
@@ -217,15 +223,15 @@ jobs:
               }
             }
 
-      - name: Create / update vm-dev GitHub Release
+      - name: Create / update vm-runtime GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: OpenShell VM Development Build
+          name: OpenShell VM Runtime Development Build
           prerelease: true
-          tag_name: vm-dev
+          tag_name: vm-runtime
           target_commitish: ${{ github.sha }}
           body: |
-            Rolling development build of **openshell-vm** — the MicroVM runtime for OpenShell.
+            Rolling development build of the OpenShell VM runtime artifacts used by `openshell-driver-vm`.
 
             > **NOTE**: This is a development build, not a tagged release, and may be unstable.
             > The VM implementation itself is also experimental and may change or break without
@@ -234,8 +240,8 @@ jobs:
             ### Kernel Runtime Artifacts
 
             Pre-built kernel runtime (libkrunfw + libkrun + gvproxy) for embedding into
-            the openshell-vm binary. These are rebuilt when the kernel config or pinned
-            dependency versions change.
+            the `openshell-driver-vm` binary. These are rebuilt on demand when the kernel
+            config or pinned dependency versions change.
 
             | Platform | Artifact |
             |----------|----------|
@@ -243,27 +249,16 @@ jobs:
             | Linux x86_64 | `vm-runtime-linux-x86_64.tar.zst` |
             | macOS ARM64 | `vm-runtime-darwin-aarch64.tar.zst` |
 
-            ### VM Binaries
+            VM driver binaries are published from the normal `dev` and `v*` releases.
 
-            Self-extracting openshell-vm binaries with embedded kernel runtime and base
-            rootfs. These are rebuilt on every push to main.
+            ### Verify
 
-            | Platform | Artifact |
-            |----------|----------|
-            | Linux ARM64 | `openshell-vm-aarch64-unknown-linux-gnu.tar.gz` |
-            | Linux x86_64 | `openshell-vm-x86_64-unknown-linux-gnu.tar.gz` |
-            | macOS ARM64 | `openshell-vm-aarch64-apple-darwin.tar.gz` |
-
-            ### Quick install
-
+            ```bash
+            gh release download vm-runtime -R NVIDIA/OpenShell -p vm-runtime-linux-x86_64.tar.zst
+            gh attestation verify vm-runtime-linux-x86_64.tar.zst -R NVIDIA/OpenShell
             ```
-            curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-vm.sh | sh
-            ```
-
-            Auto-detects your platform, verifies checksums, and codesigns on macOS.
 
           files: |
             release/vm-runtime-linux-aarch64.tar.zst
             release/vm-runtime-linux-x86_64.tar.zst
             release/vm-runtime-darwin-aarch64.tar.zst
-            release/vm-runtime-checksums-sha256.txt

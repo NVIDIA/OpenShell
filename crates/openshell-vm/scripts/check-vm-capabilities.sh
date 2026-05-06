@@ -224,7 +224,7 @@ else
         echo ""
         echo "FAIL: $FAIL required capabilities missing."
         echo "The VM kernel needs to be rebuilt with the missing features."
-        echo "See: crates/openshell-vm/runtime/kernel/README.md"
+        echo "See: crates/openshell-driver-vm/runtime/README.md"
         exit 1
     else
         echo ""

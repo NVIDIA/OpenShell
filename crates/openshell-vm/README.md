@@ -1,18 +1,16 @@
 # openshell-vm
 
-> Status: Experimental and work in progress (WIP). VM support is under active development and may change.
+> Status: Legacy. This crate remains in the repository for later deprecation or
+> removal, but it is excluded from normal workspace builds, CI, and release
+> paths. Active VM sandbox work lives in `crates/openshell-driver-vm`.
 
 MicroVM runtime for OpenShell, powered by [libkrun](https://github.com/containers/libkrun). Boots a lightweight ARM64 Linux VM on macOS (Apple Hypervisor.framework) or Linux (KVM) running a single-node k3s cluster with the OpenShell control plane.
 
-## Quick Start
+## Current Path
 
-```bash
-# One-time setup: download pre-built runtime (~30s)
-mise run vm:setup
-
-# Build and run the VM
-mise run vm
-```
+Use `mise run gateway:vm` for the supported per-sandbox VM driver workflow. The
+standalone `openshell-vm` tasks and wrappers are intentionally not part of the
+normal task surface.
 
 ## Prerequisites
 
@@ -27,7 +25,8 @@ mise run vm
 
 ### macOS-Specific
 
-The binary must be codesigned with the Hypervisor.framework entitlement. The `mise run vm` flow handles this automatically. To codesign manually:
+The binary must be codesigned with the Hypervisor.framework entitlement. To
+codesign manually:
 
 ```bash
 codesign --entitlements crates/openshell-vm/entitlements.plist --force -s - target/debug/openshell-vm
@@ -37,7 +36,8 @@ codesign --entitlements crates/openshell-vm/entitlements.plist --force -s - targ
 
 ### Download Pre-Built Runtime (Default)
 
-Downloads libkrun, libkrunfw, and gvproxy from the `vm-dev` GitHub Release:
+Downloads libkrun, libkrunfw, and gvproxy from the `vm-runtime` GitHub Release for
+the active VM driver runtime:
 
 ```bash
 mise run vm:setup
@@ -55,25 +55,14 @@ On macOS this builds a custom libkrunfw (kernel firmware with bridge/netfilter s
 
 ## Build
 
-Build the openshell-vm binary with embedded runtime:
-
-```bash
-mise run vm:build
-```
-
-This compresses runtime artifacts, compiles the Rust binary with `include_bytes!()` embedding, codesigns it (macOS), and stages the sidecar runtime bundle.
+There is no first-class `mise` build task for the standalone binary. This crate
+is no longer part of normal CI or release builds.
 
 ## Rootfs
 
-The rootfs is an Ubuntu filesystem containing k3s, pre-loaded container images, and the OpenShell binaries. Build it with:
-
-```bash
-# Base rootfs (~200-300MB, cold starts in ~30-60s)
-mise run vm:rootfs -- --base
-
-# Full rootfs (~2GB+, pre-initialized, boots in ~3-5s)
-mise run vm:rootfs
-```
+The legacy rootfs scripts are kept with this crate for historical reference.
+They are not used by `openshell-driver-vm`, which derives each sandbox guest
+rootfs from a container image at create time.
 
 ## Run
 
@@ -81,11 +70,7 @@ mise run vm:rootfs
 
 Boots the full OpenShell gateway -- k3s + openshell-server + openshell-sandbox:
 
-```bash
-mise run vm
-```
-
-Or run the binary directly:
+Run the binary directly after manually building and signing it:
 
 ```bash
 ./target/debug/openshell-vm
@@ -143,39 +128,11 @@ Subcommands:
   exec                     Execute a command inside a running VM
 ```
 
-## mise Tasks Reference
+## Tasks
 
-| Task | Description |
-|------|-------------|
-| `vm` | Build and run the VM |
-| `vm:build` | Build openshell-vm binary with embedded runtime |
-| `vm:setup` | One-time setup: download (or build) the VM runtime |
-| `vm:rootfs` | Build the VM rootfs tarball (`-- --base` for lightweight) |
-| `vm:clean` | Remove all VM cached artifacts |
-| `e2e:vm` | Boot VM and run smoke e2e tests |
-
-### Common Workflows
-
-```bash
-# First time setup
-mise run vm:setup              # download pre-built runtime (~30s)
-mise run vm                    # build + run
-
-# Day-to-day iteration
-mise run vm                    # incremental build + run
-
-# Need fresh rootfs
-mise run vm:rootfs -- --base   # rebuild base rootfs
-mise run vm:build              # rebuild binary with new rootfs
-
-# Something broken, start over
-mise run vm:clean              # wipe everything
-mise run vm:setup              # re-download runtime
-mise run vm                    # full rebuild + run
-
-# Custom kernel work (rare)
-FROM_SOURCE=1 mise run vm:setup
-```
+Standalone `openshell-vm` tasks have been removed from the normal task surface.
+The remaining VM tasks (`vm:setup`, `vm:supervisor`, `gateway:vm`, `e2e:vm`,
+and `vm:smoke:orphan-cleanup`) support `openshell-driver-vm`.
 
 ## Architecture
 

@@ -1,0 +1,186 @@
+name: Driver VM macOS
+
+on:
+  workflow_call:
+    inputs:
+      cargo-version:
+        required: true
+        type: string
+      image-tag:
+        required: true
+        type: string
+      checkout-ref:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  download-kernel-runtime:
+    name: Download Kernel Runtime
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs['checkout-ref'] }}
+
+      - name: Download macOS runtime tarball
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p runtime-artifacts
+
+          asset="vm-runtime-darwin-aarch64.tar.zst"
+          echo "Downloading ${asset}..."
+          if ! gh release download vm-runtime \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "${asset}" \
+            --dir runtime-artifacts \
+            --clobber; then
+            echo "::error::No ${asset} asset found on vm-runtime release"
+            exit 1
+          fi
+
+          ls -lah runtime-artifacts/
+
+      - name: Verify download
+        run: test -f runtime-artifacts/vm-runtime-darwin-aarch64.tar.zst
+
+      - name: Upload runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-driver-macos-kernel-runtime-tarball
+          path: runtime-artifacts/vm-runtime-darwin-aarch64.tar.zst
+          retention-days: 1
+
+  build-driver-vm-macos:
+    name: Build Driver VM (macOS)
+    needs: [download-kernel-runtime]
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs['checkout-ref'] }}
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/setup-buildx
+
+      - name: Install zstd
+        run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
+
+      - name: Download kernel runtime tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: vm-driver-macos-kernel-runtime-tarball
+          path: runtime-download/
+
+      - name: Prepare compressed runtime directory
+        run: |
+          set -euo pipefail
+          COMPRESSED_DIR="${PWD}/target/vm-runtime-compressed-macos"
+          mkdir -p "$COMPRESSED_DIR"
+
+          EXTRACT_DIR=$(mktemp -d)
+          zstd -d "runtime-download/vm-runtime-darwin-aarch64.tar.zst" --stdout \
+            | tar -xf - -C "$EXTRACT_DIR"
+
+          echo "Extracted darwin runtime files:"
+          ls -lah "$EXTRACT_DIR"
+
+          for file in "$EXTRACT_DIR"/*; do
+            [ -f "$file" ] || continue
+            name=$(basename "$file")
+            [ "$name" = "provenance.json" ] && continue
+            zstd -19 -f -q -T0 -o "${COMPRESSED_DIR}/${name}.zst" "$file"
+          done
+
+          echo "Staged macOS compressed runtime artifacts:"
+          ls -lah "$COMPRESSED_DIR"
+
+      - name: Build bundled supervisor
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file deploy/docker/Dockerfile.images \
+            --platform linux/arm64 \
+            --build-arg OPENSHELL_CARGO_VERSION="${{ inputs['cargo-version'] }}" \
+            --build-arg OPENSHELL_IMAGE_TAG="${{ inputs['image-tag'] }}" \
+            --target supervisor-output \
+            --output type=local,dest=supervisor-out/ \
+            .
+
+          zstd -19 -T0 -f supervisor-out/openshell-sandbox \
+            -o "${PWD}/target/vm-runtime-compressed-macos/openshell-sandbox.zst"
+
+      - name: Verify embedded driver inputs
+        run: |
+          set -euo pipefail
+          for file in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst openshell-sandbox.zst; do
+            test -s "target/vm-runtime-compressed-macos/${file}"
+          done
+
+      - name: Build macOS binary via Docker
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file deploy/docker/Dockerfile.driver-vm-macos \
+            --build-arg OPENSHELL_CARGO_VERSION="${{ inputs['cargo-version'] }}" \
+            --build-arg OPENSHELL_IMAGE_TAG="${{ inputs['image-tag'] }}" \
+            --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
+            --build-context vm-runtime-compressed="${PWD}/target/vm-runtime-compressed-macos" \
+            --target binary \
+            --output type=local,dest=out/ \
+            .
+
+      - name: Verify packaged binary shape
+        run: test -x out/openshell-driver-vm
+
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          tar -czf artifacts/openshell-driver-vm-aarch64-apple-darwin.tar.gz \
+            -C out openshell-driver-vm
+          ls -lh artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: driver-vm-macos
+          path: artifacts/*.tar.gz
+          retention-days: 5
