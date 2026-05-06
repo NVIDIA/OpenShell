@@ -7,7 +7,7 @@
 #
 # Targets:
 #   gateway             Final gateway image
-#   supervisor          Final supervisor image (FROM scratch, binary only)
+#   supervisor          Final supervisor image (Ubuntu base, supervisor binary)
 #   cluster             Final cluster image
 #
 # Rust binaries are built natively before the image build and staged at:
