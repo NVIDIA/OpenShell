@@ -15,7 +15,10 @@ The sandbox-local policy API is reachable at `http://policy.local`:
 
 - `GET /v1/policy/current` — current effective policy as YAML.
 - `GET /v1/denials?last=10` — most recent network/L7 denials seen by this
-  sandbox (newest first).
+  sandbox (newest first), returned as raw shorthand log lines. Each line
+  carries the timestamp, class, severity, action, host/port, binary, policy
+  name, and (for denied events) a short reason. Read the lines directly; you
+  do not need to parse them into structured fields.
 - `POST /v1/proposals` — submit a proposal for developer approval.
 
 The proposal body takes an `intent_summary` and one or more `addRule`
@@ -91,7 +94,7 @@ Two local files complement the API and are useful when debugging policy
 behavior:
 
 - `/var/log/openshell.YYYY-MM-DD.log` — shorthand log of sandbox activity.
-- `/var/log/openshell-ocsf.YYYY-MM-DD.log` — OCSF JSONL events when enabled.
-
-The `/v1/denials` endpoint reads these structured events for you; the files
-are listed here only as a fallback for inspection.
+  This is what `/v1/denials` reads from.
+- `/var/log/openshell-ocsf.YYYY-MM-DD.log` — full OCSF JSON events, only
+  written when the `ocsf_json_enabled` setting is on. Not used by
+  `/v1/denials`; useful for SIEM ingestion.
