@@ -1,16 +1,20 @@
-name: Test Install Script
+name: Test Install Scripts
 
 on:
   pull_request:
     paths:
       - 'install.sh'
+      - 'install-dev.sh'
       - 'e2e/install/**'
+      - 'e2e/install-dev/**'
       - '.github/workflows/test-install.yml'
   push:
     branches: [main]
     paths:
       - 'install.sh'
+      - 'install-dev.sh'
       - 'e2e/install/**'
+      - 'e2e/install-dev/**'
       - '.github/workflows/test-install.yml'
   workflow_dispatch:
 
@@ -39,6 +43,9 @@ jobs:
             test: e2e/install/fish_test.fish
             run: fish e2e/install/fish_test.fish
             install: fish
+          - shell: install-dev-macos
+            test: e2e/install-dev/macos_homebrew_test.sh
+            run: sh e2e/install-dev/macos_homebrew_test.sh
 
     steps:
       - uses: actions/checkout@v6

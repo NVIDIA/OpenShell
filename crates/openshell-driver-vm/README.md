@@ -182,11 +182,11 @@ On Linux amd64 and arm64, `install-dev.sh` installs the Debian package from the
 selected `OPENSHELL_VERSION` release tag. That package includes
 `openshell-gateway` and `openshell-driver-vm`.
 
-On Apple Silicon macOS, `install-dev.sh` installs the generated `openshell.rb`
-formula from the selected release. Homebrew installs `openshell`,
-`openshell-gateway`, and `openshell-driver-vm`, ad-hoc signs the driver with
-the Hypervisor entitlement in `post_install`, and owns the `brew services`
-gateway lifecycle.
+On Apple Silicon macOS, `install-dev.sh` stages the generated `openshell.rb`
+formula from the selected release in a local `nvidia/openshell-dev` Homebrew
+tap. Homebrew installs `openshell`, `openshell-gateway`, and
+`openshell-driver-vm`, ad-hoc signs the driver with the Hypervisor entitlement
+in `post_install`, and owns the `brew services` gateway lifecycle.
 
 ## Relationship to `openshell-vm`
 
