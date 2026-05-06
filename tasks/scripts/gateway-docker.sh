@@ -146,7 +146,7 @@ else
   CONTAINER_ENGINE=docker \
   DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
   DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_OUT_DIR}" \
-    bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output
+    bash "${ROOT}/tasks/scripts/container-build-image.sh" supervisor-output
 fi
 
 if [[ ! -f "${SUPERVISOR_BIN}" ]]; then

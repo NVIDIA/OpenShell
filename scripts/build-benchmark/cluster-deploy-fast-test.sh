@@ -230,7 +230,7 @@ run_fast_deploy() {
       BUILDKIT_PROGRESS=plain \
       CLUSTER_NAME="${CLUSTER_NAME}" \
       DEPLOY_FAST_STATE_FILE="${state_file}" \
-      DOCKER_BUILD_CACHE_DIR="${CACHE_DIR}" \
+      CONTAINER_BUILD_CACHE_DIR="${CACHE_DIR}" \
       "$@" \
       mise run cluster
   ) >"${log_file}" 2>&1 || true
@@ -252,7 +252,7 @@ run_fast_deploy_args() {
       BUILDKIT_PROGRESS=plain \
       CLUSTER_NAME="${CLUSTER_NAME}" \
       DEPLOY_FAST_STATE_FILE="${state_file}" \
-      DOCKER_BUILD_CACHE_DIR="${CACHE_DIR}" \
+      CONTAINER_BUILD_CACHE_DIR="${CACHE_DIR}" \
       mise run cluster -- "$@"
   ) >"${log_file}" 2>&1 || true
   end=$(date +%s)

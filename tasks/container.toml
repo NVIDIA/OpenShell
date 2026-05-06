@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Container image build tasks (engine-neutral: Docker or Podman)
+
+["build:container"]
+description = "Build all container images"
+depends = [
+  "build:container:gateway",
+  "build:container:cluster",
+  "build:container:supervisor",
+]
+hide = true
+
+["build:container:ci"]
+description = "Build the CI container image"
+run = "tasks/scripts/container-build-ci.sh"
+hide = true
+
+["build:container:gateway"]
+description = "Build the gateway container image"
+run = "tasks/scripts/container-build-image.sh gateway"
+hide = true
+
+["build:container:supervisor"]
+description = "Build the standalone supervisor container image (Ubuntu-based, for K8s pods)"
+run = "tasks/scripts/container-build-image.sh supervisor"
+hide = true
+
+["build:container:cluster"]
+description = "Build the k3s cluster image (component images pulled at runtime from registry)"
+run = "tasks/scripts/container-build-image.sh cluster"
+hide = true
+
+["build:container:cluster:multiarch"]
+description = "Build multi-arch cluster image and push to a registry"
+run = "tasks/scripts/container-publish-multiarch.sh"
+hide = true
+
+["container:cleanup"]
+description = "Remove stale images, volumes, and build cache not used by the current cluster"
+run = "scripts/container-cleanup.sh --force"
+
+["container:cleanup:dry-run"]
+description = "Preview what container:cleanup would remove without deleting anything"
+run = "scripts/container-cleanup.sh --dry-run"

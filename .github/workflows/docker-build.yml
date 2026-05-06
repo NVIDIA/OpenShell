@@ -226,7 +226,7 @@ jobs:
           DOCKER_BUILDER: openshell
         run: |
           set -euo pipefail
-          mise exec -- tasks/scripts/docker-build-image.sh "${{ inputs.component }}" \
+          mise exec -- tasks/scripts/container-build-image.sh "${{ inputs.component }}" \
             --cache-from "type=gha,scope=${{ inputs.component }}-${{ matrix.arch }}" \
             --cache-to "type=gha,mode=max,scope=${{ inputs.component }}-${{ matrix.arch }}"
 

@@ -179,9 +179,9 @@ ocsf_emit!(event);
 
 - Always use `uv` for Python commands (e.g., `uv pip install`, `uv run`, `uv venv`)
 
-## Docker
+## Containers
 
-- Always prefer `mise` commands over direct docker builds (e.g., `mise run docker:build` instead of `docker build`)
+- Always prefer `mise` commands over direct container builds (e.g., `mise run build:container` instead of `docker build` or `podman build`)
 
 ## Cluster Infrastructure Changes
 

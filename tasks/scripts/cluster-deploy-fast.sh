@@ -152,7 +152,7 @@ matches_gateway() {
     Cargo.toml|Cargo.lock|proto/*|tasks/scripts/stage-prebuilt-binaries.sh)
       return 0
       ;;
-    deploy/docker/Dockerfile.images|tasks/scripts/docker-build-image.sh)
+    deploy/docker/Dockerfile.images|deploy/docker/Containerfile.images|tasks/scripts/container-build-image.sh)
       return 0
       ;;
     crates/openshell-core/*|crates/openshell-driver-kubernetes/*|crates/openshell-ocsf/*|crates/openshell-policy/*|crates/openshell-providers/*)
@@ -173,7 +173,7 @@ matches_supervisor() {
     Cargo.toml|Cargo.lock|proto/*|tasks/scripts/stage-prebuilt-binaries.sh)
       return 0
       ;;
-    deploy/docker/Dockerfile.images|tasks/scripts/docker-build-image.sh)
+    deploy/docker/Dockerfile.images|deploy/docker/Containerfile.images|tasks/scripts/container-build-image.sh)
       return 0
       ;;
     crates/openshell-core/*|crates/openshell-policy/*|crates/openshell-router/*)
@@ -210,13 +210,13 @@ compute_fingerprint() {
   # hashes.  This ensures that committed changes (e.g. after `git pull`
   # or amend) are detected even when there are no uncommitted edits.
   local committed_trees=""
-	case "${component}" in
-	    gateway)
-	      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh tasks/scripts/stage-prebuilt-binaries.sh crates/openshell-core/ crates/openshell-driver-kubernetes/ crates/openshell-ocsf/ crates/openshell-policy/ crates/openshell-providers/ crates/openshell-router/ crates/openshell-server/ 2>/dev/null || true)
-	      ;;
-	    supervisor)
-	      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh tasks/scripts/stage-prebuilt-binaries.sh crates/openshell-core/ crates/openshell-policy/ crates/openshell-router/ crates/openshell-sandbox/ 2>/dev/null || true)
-	      ;;
+  case "${component}" in
+    gateway)
+      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh deploy/docker/Dockerfile.images deploy/docker/Containerfile.images tasks/scripts/container-build-image.sh crates/openshell-core/ crates/openshell-driver-kubernetes/ crates/openshell-ocsf/ crates/openshell-policy/ crates/openshell-providers/ crates/openshell-router/ crates/openshell-server/ 2>/dev/null || true)
+      ;;
+    supervisor)
+      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh deploy/docker/Dockerfile.images deploy/docker/Containerfile.images tasks/scripts/container-build-image.sh crates/openshell-core/ crates/openshell-policy/ crates/openshell-router/ crates/openshell-sandbox/ 2>/dev/null || true)
+      ;;
     helm)
       committed_trees=$(git ls-tree HEAD deploy/helm/openshell/ 2>/dev/null || true)
       ;;
@@ -305,10 +305,10 @@ build_start=$(date +%s)
 declare -a built_components=()
 
 if [[ "${build_gateway}" == "1" ]]; then
-  tasks/scripts/docker-build-image.sh gateway
+  tasks/scripts/container-build-image.sh gateway
 fi
 
-# Build the supervisor binary and docker cp it into the running k3s cluster.
+# Build the supervisor binary and copy it into the running k3s cluster.
 # The binary lives at /opt/openshell/bin/openshell-sandbox on the node
 # filesystem and is mounted into sandbox pods via a hostPath volume.
 if [[ "${build_supervisor}" == "1" ]]; then
@@ -340,19 +340,20 @@ if [[ "${build_supervisor}" == "1" ]]; then
     _cargo_version=$(uv run python tasks/scripts/release.py get-version --cargo 2>/dev/null || true)
   fi
 
-	  # Only set DOCKER_PLATFORM when the cluster architecture differs from the
-	  # local container engine architecture. Omitting it for native builds lets
-	  # docker-build-image.sh pick the fast default builder.
+  # Only set CONTAINER_PLATFORM when actually cross-compiling.  Omitting it
+  # for native builds lets container-build-image.sh pick the fast "docker"
+  # driver (same as gateway), which shares BuildKit cache mounts (sccache,
+  # cargo registry/target) and avoids docker-container IPC overhead.
   _platform_env=()
   if [[ "${CLUSTER_ARCH}" != "${HOST_ARCH}" ]]; then
-    _platform_env=(DOCKER_PLATFORM="linux/${CLUSTER_ARCH}")
+    _platform_env=(CONTAINER_PLATFORM="linux/${CLUSTER_ARCH}")
   fi
 
   env \
   "${_platform_env[@]+"${_platform_env[@]}"}" \
-  DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_BUILD_DIR}" \
+  CONTAINER_OUTPUT="type=local,dest=${SUPERVISOR_BUILD_DIR}" \
   OPENSHELL_CARGO_VERSION="${_cargo_version}" \
-    tasks/scripts/docker-build-image.sh supervisor-output
+    tasks/scripts/container-build-image.sh supervisor-output
 
   # Copy the built binary into the running k3s container
   ce exec "${CONTAINER_NAME}" mkdir -p /opt/openshell/bin

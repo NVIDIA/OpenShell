@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Clean up stale Docker images, volumes, and build cache that are not in use
+# Clean up stale container images, volumes, and build cache that are not in use
 # by the currently deployed OpenShell cluster.
 #
 # Preserves:
@@ -13,7 +13,7 @@
 #   - Volumes attached to running containers
 #
 # Usage:
-#   ./scripts/docker-cleanup.sh [options]
+#   ./scripts/container-cleanup.sh [options]
 #
 # Options:
 #   --dry-run        Show what would be removed without deleting anything

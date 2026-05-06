@@ -81,13 +81,13 @@ fi
 
 case "$GUEST_ARCH" in
     aarch64)
-        DOCKER_PLATFORM="linux/arm64"
+        CONTAINER_PLATFORM="linux/arm64"
         K3S_BINARY_SUFFIX="-arm64"
         K3S_CHECKSUM_VAR="K3S_ARM64_SHA256"
         RUST_TARGET="aarch64-unknown-linux-gnu"
         ;;
     x86_64)
-        DOCKER_PLATFORM="linux/amd64"
+        CONTAINER_PLATFORM="linux/amd64"
         K3S_BINARY_SUFFIX=""    # x86_64 binary has no suffix
         K3S_CHECKSUM_VAR="K3S_AMD64_SHA256"
         RUST_TARGET="x86_64-unknown-linux-gnu"
@@ -294,7 +294,7 @@ fi
 ce rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 
 echo "==> Building base image..."
-ce build --platform "${DOCKER_PLATFORM}" -t "${BASE_IMAGE_TAG}" \
+ce build --platform "${CONTAINER_PLATFORM}" -t "${BASE_IMAGE_TAG}" \
     --build-arg "BASE_IMAGE=${VM_BASE_IMAGE}" -f - . <<'DOCKERFILE'
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
@@ -318,7 +318,7 @@ DOCKERFILE
 
 # Create a container and export the filesystem
 echo "==> Creating container..."
-ce create --platform "${DOCKER_PLATFORM}" --name "${CONTAINER_NAME}" "${BASE_IMAGE_TAG}" /bin/true
+ce create --platform "${CONTAINER_PLATFORM}" --name "${CONTAINER_NAME}" "${BASE_IMAGE_TAG}" /bin/true
 
 echo "==> Exporting filesystem..."
 # Previous builds may leave overlayfs work/ dirs with permissions that
@@ -513,7 +513,7 @@ pull_and_save() {
     # Try to pull; if the registry is unavailable, fall back to the
     # local Docker image cache (image may exist from a previous pull).
     echo "    pulling: ${image}..."
-    if ! ce pull --platform "${DOCKER_PLATFORM}" "${image}" --quiet 2>/dev/null; then
+    if ! ce pull --platform "${CONTAINER_PLATFORM}" "${image}" --quiet 2>/dev/null; then
         echo "    pull failed, checking local image cache..."
         if ! ce image inspect "${image}" >/dev/null 2>&1; then
             echo "ERROR: image ${image} not available locally or from registry"
