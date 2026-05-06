@@ -22,19 +22,8 @@ if [ "$#" -eq 0 ]; then
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-cargo_target_dir() {
-  if [ -n "${CARGO_TARGET_DIR:-}" ]; then
-    case "${CARGO_TARGET_DIR}" in
-      /*) printf '%s\n' "${CARGO_TARGET_DIR}" ;;
-      *) printf '%s\n' "${ROOT}/${CARGO_TARGET_DIR}" ;;
-    esac
-    return 0
-  fi
-
-  cargo metadata --format-version=1 --no-deps \
-    | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
-}
+# shellcheck source=e2e/support/gateway-common.sh
+source "${ROOT}/e2e/support/gateway-common.sh"
 
 github_actions_host_docker_tmpdir() {
   if [ "${GITHUB_ACTIONS:-}" != "true" ] \
@@ -74,28 +63,21 @@ GATEWAY_PID=""
 GATEWAY_LOG="${WORKDIR}/gateway.log"
 GATEWAY_PID_FILE="${WORKDIR}/gateway.pid"
 GATEWAY_ARGS_FILE="${WORKDIR}/gateway.args"
-GATEWAY_CONFIG_DIR=""
 E2E_NAMESPACE=""
 DOCKER_NETWORK_NAME=""
 DOCKER_NETWORK_CONNECTED_CONTAINER=""
 DOCKER_NETWORK_MANAGED=0
 GPU_MODE="${OPENSHELL_E2E_DOCKER_GPU:-0}"
+DOCKER_SUPERVISOR_ARGS=()
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
+export XDG_DATA_HOME="${WORKDIR}/data"
 
 cleanup() {
   local exit_code=$?
 
-  local gateway_pid="${GATEWAY_PID}"
-  if [ -f "${GATEWAY_PID_FILE}" ]; then
-    gateway_pid="$(cat "${GATEWAY_PID_FILE}" 2>/dev/null || true)"
-  fi
-  if [ -n "${gateway_pid}" ] && kill -0 "${gateway_pid}" 2>/dev/null; then
-    echo "Stopping openshell-gateway (pid ${gateway_pid})..."
-    kill "${gateway_pid}" 2>/dev/null || true
-    wait "${gateway_pid}" 2>/dev/null || true
-  fi
+  e2e_stop_gateway "${GATEWAY_PID}" "${GATEWAY_PID_FILE}"
 
   if [ "${exit_code}" -ne 0 ] \
      && [ -n "${E2E_NAMESPACE}" ] \
@@ -143,70 +125,11 @@ cleanup() {
     docker network rm "${DOCKER_NETWORK_NAME}" >/dev/null 2>&1 || true
   fi
 
-  if [ "${exit_code}" -ne 0 ] && [ -f "${GATEWAY_LOG}" ]; then
-    echo "=== gateway log (preserved for debugging) ==="
-    cat "${GATEWAY_LOG}"
-    echo "=== end gateway log ==="
-  fi
+  e2e_print_gateway_log_on_failure "${exit_code}" "${GATEWAY_LOG}"
 
   rm -rf "${WORKDIR}" 2>/dev/null || true
 }
 trap cleanup EXIT
-
-register_plaintext_gateway() {
-  local name=$1
-  local endpoint=$2
-  local port=$3
-
-  GATEWAY_CONFIG_DIR="${XDG_CONFIG_HOME}/openshell/gateways/${name}"
-  mkdir -p "${GATEWAY_CONFIG_DIR}"
-  cat >"${GATEWAY_CONFIG_DIR}/metadata.json" <<EOF
-{
-  "name": "${name}",
-  "gateway_endpoint": "${endpoint}",
-  "is_remote": false,
-  "gateway_port": ${port},
-  "auth_mode": "plaintext"
-}
-EOF
-  printf '%s' "${name}" >"${XDG_CONFIG_HOME}/openshell/active_gateway"
-}
-
-register_mtls_gateway() {
-  local name=$1
-  local endpoint=$2
-  local port=$3
-  local pki_dir=$4
-
-  GATEWAY_CONFIG_DIR="${XDG_CONFIG_HOME}/openshell/gateways/${name}"
-  mkdir -p "${GATEWAY_CONFIG_DIR}/mtls"
-  cp "${pki_dir}/ca.crt"     "${GATEWAY_CONFIG_DIR}/mtls/ca.crt"
-  cp "${pki_dir}/client.crt" "${GATEWAY_CONFIG_DIR}/mtls/tls.crt"
-  cp "${pki_dir}/client.key" "${GATEWAY_CONFIG_DIR}/mtls/tls.key"
-  cat >"${GATEWAY_CONFIG_DIR}/metadata.json" <<EOF
-{
-  "name": "${name}",
-  "gateway_endpoint": "${endpoint}",
-  "is_remote": false,
-  "gateway_port": ${port}
-}
-EOF
-  printf '%s' "${name}" >"${XDG_CONFIG_HOME}/openshell/active_gateway"
-}
-
-endpoint_port() {
-  python3 - "$1" <<'PY'
-import sys
-from urllib.parse import urlparse
-
-parsed = urlparse(sys.argv[1])
-print(parsed.port or (443 if parsed.scheme == "https" else 80))
-PY
-}
-
-pick_port() {
-  python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
-}
 
 ensure_e2e_docker_network() {
   local network=$1
@@ -287,9 +210,15 @@ if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
   esac
 
   GATEWAY_NAME="${OPENSHELL_GATEWAY:-openshell-e2e-endpoint}"
-  register_plaintext_gateway "${GATEWAY_NAME}" "${OPENSHELL_GATEWAY_ENDPOINT}" "$(endpoint_port "${OPENSHELL_GATEWAY_ENDPOINT}")"
+  e2e_register_plaintext_gateway \
+    "${XDG_CONFIG_HOME}" \
+    "${GATEWAY_NAME}" \
+    "${OPENSHELL_GATEWAY_ENDPOINT}" \
+    "$(e2e_endpoint_port "${OPENSHELL_GATEWAY_ENDPOINT}")"
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-180}"
+  export OPENSHELL_E2E_DRIVER="${OPENSHELL_E2E_DRIVER:-docker}"
+  export OPENSHELL_E2E_CONTAINER_ENGINE="${OPENSHELL_E2E_CONTAINER_ENGINE:-docker}"
 
   echo "Using existing e2e gateway endpoint: ${OPENSHELL_GATEWAY_ENDPOINT}"
   "$@"
@@ -340,6 +269,48 @@ linux_target_triple() {
   esac
 }
 
+resolve_docker_supervisor_image() {
+  if [ -n "${OPENSHELL_DOCKER_SUPERVISOR_IMAGE:-}" ]; then
+    printf '%s\n' "${OPENSHELL_DOCKER_SUPERVISOR_IMAGE}"
+    return 0
+  fi
+
+  if [ -n "${OPENSHELL_SUPERVISOR_IMAGE:-}" ]; then
+    printf '%s\n' "${OPENSHELL_SUPERVISOR_IMAGE}"
+    return 0
+  fi
+
+  if [ -n "${CI:-}" ]; then
+    if [ -z "${IMAGE_TAG:-}" ]; then
+      echo "ERROR: IMAGE_TAG must be set in CI when no Docker supervisor image override is provided." >&2
+      exit 2
+    fi
+
+    local registry="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+    printf '%s/supervisor:%s\n' "${registry%/}" "${IMAGE_TAG}"
+    return 0
+  fi
+
+  printf '%s\n' ""
+}
+
+ensure_docker_supervisor_image() {
+  local image=$1
+
+  if docker image inspect "${image}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "Pulling Docker supervisor image ${image}..."
+  if docker pull "${image}"; then
+    return 0
+  fi
+
+  echo "ERROR: supervisor image '${image}' is not available." >&2
+  echo "       Build it, push it, or set OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
+  exit 2
+}
+
 DAEMON_ARCH="$(normalize_arch "$(docker info --format '{{.Architecture}}' 2>/dev/null || true)")"
 SUPERVISOR_TARGET="$(linux_target_triple "${DAEMON_ARCH}")"
 HOST_OS="$(uname -s)"
@@ -352,48 +323,35 @@ if [ -n "${CARGO_BUILD_JOBS:-}" ]; then
   CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
 fi
 
-TARGET_DIR="$(cargo_target_dir)"
-GATEWAY_BIN="${TARGET_DIR}/debug/openshell-gateway"
-CLI_BIN="${TARGET_DIR}/debug/openshell"
+e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
 
-echo "Building openshell-gateway..."
-cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-server --bin openshell-gateway \
-  --features openshell-core/dev-settings
-
-echo "Building openshell-cli..."
-cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-cli --bin openshell \
-  --features openshell-core/dev-settings
-
-if [ ! -x "${GATEWAY_BIN}" ]; then
-  echo "ERROR: expected openshell-gateway binary at ${GATEWAY_BIN}" >&2
-  exit 1
-fi
-if [ ! -x "${CLI_BIN}" ]; then
-  echo "ERROR: expected openshell CLI binary at ${CLI_BIN}" >&2
-  exit 1
-fi
-
-echo "Building openshell-sandbox for ${SUPERVISOR_TARGET}..."
-mkdir -p "${SUPERVISOR_OUT_DIR}"
-if [ "${HOST_OS}" = "Linux" ] && [ "${HOST_ARCH}" = "${DAEMON_ARCH}" ]; then
-  rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
-  cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-    --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
-  cp "${TARGET_DIR}/${SUPERVISOR_TARGET}/release/openshell-sandbox" "${SUPERVISOR_BIN}"
+SUPERVISOR_IMAGE="$(resolve_docker_supervisor_image)"
+if [ -n "${SUPERVISOR_IMAGE}" ]; then
+  ensure_docker_supervisor_image "${SUPERVISOR_IMAGE}"
+  echo "Using Docker supervisor image: ${SUPERVISOR_IMAGE}"
+  DOCKER_SUPERVISOR_ARGS=(--docker-supervisor-image "${SUPERVISOR_IMAGE}")
 else
-  CONTAINER_ENGINE=docker \
-  DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
-  DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_OUT_DIR}" \
-    bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output
-fi
+  echo "Building openshell-sandbox for ${SUPERVISOR_TARGET}..."
+  mkdir -p "${SUPERVISOR_OUT_DIR}"
+  if [ "${HOST_OS}" = "Linux" ] && [ "${HOST_ARCH}" = "${DAEMON_ARCH}" ]; then
+    rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
+    cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
+      --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
+    cp "${TARGET_DIR}/${SUPERVISOR_TARGET}/release/openshell-sandbox" "${SUPERVISOR_BIN}"
+  else
+    CONTAINER_ENGINE=docker \
+    DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
+    DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_OUT_DIR}" \
+      bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output
+  fi
 
-if [ ! -f "${SUPERVISOR_BIN}" ]; then
-  echo "ERROR: expected supervisor binary at ${SUPERVISOR_BIN}" >&2
-  exit 1
+  if [ ! -f "${SUPERVISOR_BIN}" ]; then
+    echo "ERROR: expected supervisor binary at ${SUPERVISOR_BIN}" >&2
+    exit 1
+  fi
+  chmod +x "${SUPERVISOR_BIN}"
+  DOCKER_SUPERVISOR_ARGS=(--docker-supervisor-bin "${SUPERVISOR_BIN}")
 fi
-chmod +x "${SUPERVISOR_BIN}"
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
@@ -439,7 +397,7 @@ openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
 
 cd "${ROOT}"
 
-HOST_PORT=$(pick_port)
+HOST_PORT=$(e2e_pick_port)
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
 
@@ -450,6 +408,10 @@ GATEWAY_HOST_ALIAS_IP=""
 
 ensure_e2e_docker_network "${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_DOCKER_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
+export OPENSHELL_E2E_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
+export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
+export OPENSHELL_E2E_DRIVER="docker"
+export OPENSHELL_E2E_CONTAINER_ENGINE="docker"
 if connect_current_container_to_docker_network "${DOCKER_NETWORK_NAME}"; then
   echo "Connected CI job container to Docker network ${DOCKER_NETWORK_NAME} (${GATEWAY_HOST_ALIAS_IP})."
 else
@@ -468,7 +430,7 @@ GATEWAY_ARGS=(
   --tls-client-ca "${PKI_DIR}/ca.crt" \
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc" \
   --grpc-endpoint "${GATEWAY_ENDPOINT}" \
-  --docker-supervisor-bin "${SUPERVISOR_BIN}" \
+  "${DOCKER_SUPERVISOR_ARGS[@]}" \
   --docker-tls-ca "${PKI_DIR}/ca.crt" \
   --docker-tls-cert "${PKI_DIR}/client.crt" \
   --docker-tls-key "${PKI_DIR}/client.key" \
@@ -479,14 +441,12 @@ if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
   GATEWAY_ARGS+=(--host-gateway-ip "${GATEWAY_HOST_ALIAS_IP}")
 fi
 
-: >"${GATEWAY_ARGS_FILE}"
-for arg in "${GATEWAY_ARGS[@]}"; do
-  printf '%s\0' "${arg}" >>"${GATEWAY_ARGS_FILE}"
-done
-export OPENSHELL_E2E_GATEWAY_BIN="${GATEWAY_BIN}"
-export OPENSHELL_E2E_GATEWAY_ARGS_FILE="${GATEWAY_ARGS_FILE}"
-export OPENSHELL_E2E_GATEWAY_LOG="${GATEWAY_LOG}"
-export OPENSHELL_E2E_GATEWAY_PID_FILE="${GATEWAY_PID_FILE}"
+e2e_write_gateway_args_file "${GATEWAY_ARGS_FILE}" "${GATEWAY_ARGS[@]}"
+e2e_export_gateway_restart_metadata \
+  "${GATEWAY_BIN}" \
+  "${GATEWAY_ARGS_FILE}" \
+  "${GATEWAY_LOG}" \
+  "${GATEWAY_PID_FILE}"
 
 "${GATEWAY_BIN}" "${GATEWAY_ARGS[@]}" >"${GATEWAY_LOG}" 2>&1 &
 GATEWAY_PID=$!
@@ -494,7 +454,12 @@ printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"
 
 GATEWAY_NAME="openshell-e2e-docker-${HOST_PORT}"
 CLI_GATEWAY_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
-register_mtls_gateway "${GATEWAY_NAME}" "${CLI_GATEWAY_ENDPOINT}" "${HOST_PORT}" "${PKI_DIR}"
+e2e_register_mtls_gateway \
+  "${XDG_CONFIG_HOME}" \
+  "${GATEWAY_NAME}" \
+  "${CLI_GATEWAY_ENDPOINT}" \
+  "${HOST_PORT}" \
+  "${PKI_DIR}"
 
 export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
 export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-180}"

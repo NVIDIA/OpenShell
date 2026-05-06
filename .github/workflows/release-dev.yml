@@ -71,7 +71,7 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
   e2e:
-    needs: [build-gateway, build-cluster]
+    needs: [build-gateway, build-supervisor, build-cluster]
     uses: ./.github/workflows/e2e-test.yml
     with:
       image-tag: ${{ github.sha }}

@@ -17,6 +17,28 @@ publish = false
 
 [features]
 e2e = []
+e2e-docker = ["e2e"]
+e2e-docker-gpu = ["e2e-docker"]
+
+[[test]]
+name = "custom_image"
+path = "tests/custom_image.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
+name = "docker_gpu"
+path = "tests/docker_gpu.rs"
+required-features = ["e2e-docker-gpu"]
+
+[[test]]
+name = "docker_preflight"
+path = "tests/docker_preflight.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
+name = "gateway_resume"
+path = "tests/gateway_resume.rs"
+required-features = ["e2e-docker"]
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }

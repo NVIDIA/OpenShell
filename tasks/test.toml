@@ -31,7 +31,7 @@ hide = true
 description = "Run Rust CLI e2e tests against a Docker-backed gateway"
 run = [
   "cargo build -p openshell-cli --features openshell-core/dev-settings",
-  "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e -- --skip docker_gpu_sandbox_runs_nvidia_smi",
+  "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker",
 ]
 
 ["e2e:python"]
@@ -47,8 +47,7 @@ env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
 run = "uv run pytest -o python_files='test_*.py' -m gpu -n ${E2E_PARALLEL:-1} e2e/python"
 
 ["e2e:podman"]
-description = "Start a Podman-backed gateway and run smoke e2e (requires rootless Podman; pass -- --port=N to override)"
-depends = ["build:docker:supervisor"]
+description = "Run Rust CLI e2e tests against a Podman-backed gateway"
 run = "e2e/rust/e2e-podman.sh"
 
 ["e2e:vm"]
@@ -61,5 +60,5 @@ run = "e2e/rust/e2e-docker.sh"
 
 ["e2e:docker:gpu"]
 description = "Run GPU e2e against a standalone gateway with the Docker compute driver"
-env = { OPENSHELL_E2E_DOCKER_GPU = "1", OPENSHELL_E2E_DOCKER_TEST = "docker_gpu" }
+env = { OPENSHELL_E2E_DOCKER_GPU = "1", OPENSHELL_E2E_DOCKER_TEST = "docker_gpu", OPENSHELL_E2E_DOCKER_FEATURES = "e2e-docker-gpu" }
 run = "e2e/rust/e2e-docker.sh"

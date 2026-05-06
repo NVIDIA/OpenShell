@@ -9,27 +9,15 @@
 #![cfg(feature = "e2e")]
 
 use std::io::Write;
-use std::process::Command;
-use std::time::Duration;
 
-use openshell_e2e::harness::port::find_free_port;
+use openshell_e2e::harness::container::ContainerHttpServer;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
-use tokio::time::{interval, timeout};
 
-const TEST_SERVER_IMAGE: &str = "public.ecr.aws/docker/library/python:3.13-alpine";
 const TEST_SERVER_ALIAS: &str = "rest-l7.openshell.test";
 
-struct DockerServer {
-    host: String,
-    port: u16,
-    container_id: String,
-}
-
-impl DockerServer {
-    async fn start() -> Result<Self, String> {
-        let port = find_free_port();
-        let script = r#"from http.server import BaseHTTPRequestHandler, HTTPServer
+async fn start_test_server() -> Result<ContainerHttpServer, String> {
+    let script = r#"from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -46,80 +34,7 @@ class Handler(BaseHTTPRequestHandler):
 HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
 "#;
 
-        let e2e_network = std::env::var("OPENSHELL_E2E_DOCKER_NETWORK_NAME")
-            .ok()
-            .filter(|network| !network.trim().is_empty());
-        let host = e2e_network.as_ref().map_or_else(
-            || "host.openshell.internal".to_string(),
-            |_| TEST_SERVER_ALIAS.to_string(),
-        );
-        let port = if e2e_network.is_some() { 8000 } else { port };
-
-        let mut args = vec!["run", "--detach", "--rm"];
-        let published_port = format!("{port}:8000");
-        if let Some(network) = e2e_network.as_deref() {
-            args.extend(["--network", network, "--network-alias", TEST_SERVER_ALIAS]);
-        } else {
-            args.extend(["-p", &published_port]);
-        }
-        args.extend([TEST_SERVER_IMAGE, "python3", "-c", script]);
-
-        let output = Command::new("docker")
-            .args(args)
-            .output()
-            .map_err(|e| format!("start docker test server: {e}"))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        if !output.status.success() {
-            return Err(format!(
-                "docker run failed (exit {:?}):\n{stderr}",
-                output.status.code()
-            ));
-        }
-
-        let server = Self {
-            host,
-            port,
-            container_id: stdout,
-        };
-        server.wait_until_ready().await?;
-        Ok(server)
-    }
-
-    async fn wait_until_ready(&self) -> Result<(), String> {
-        let container_id = self.container_id.clone();
-        timeout(Duration::from_secs(60), async move {
-            let mut tick = interval(Duration::from_millis(500));
-            loop {
-                tick.tick().await;
-                let output = Command::new("docker")
-                    .args([
-                        "exec",
-                        &container_id,
-                        "python3",
-                        "-c",
-                        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000', timeout=1).read()",
-                    ])
-                    .output()
-                    .ok();
-                if output.is_some_and(|o| o.status.success()) {
-                    return;
-                }
-            }
-        })
-        .await
-        .map_err(|_| "docker test server did not become ready within 60s".to_string())
-    }
-}
-
-impl Drop for DockerServer {
-    fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &self.container_id])
-            .output();
-    }
+    ContainerHttpServer::start_python(TEST_SERVER_ALIAS, script).await
 }
 
 fn write_policy_with_l7_rules(host: &str, port: u16) -> Result<NamedTempFile, String> {
@@ -183,9 +98,7 @@ network_policies:
 /// GET /allowed should succeed — the L7 policy explicitly allows it.
 #[tokio::test]
 async fn forward_proxy_allows_l7_permitted_request() {
-    let server = DockerServer::start()
-        .await
-        .expect("start docker test server");
+    let server = start_test_server().await.expect("start test server");
     let policy =
         write_policy_with_l7_rules(&server.host, server.port).expect("write custom policy");
     let policy_path = policy
@@ -225,9 +138,7 @@ except Exception as e:
 /// POST /allowed should be denied — the L7 policy only allows GET.
 #[tokio::test]
 async fn forward_proxy_denies_l7_blocked_request() {
-    let server = DockerServer::start()
-        .await
-        .expect("start docker test server");
+    let server = start_test_server().await.expect("start test server");
     let policy =
         write_policy_with_l7_rules(&server.host, server.port).expect("write custom policy");
     let policy_path = policy
