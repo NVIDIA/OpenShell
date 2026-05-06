@@ -23,8 +23,10 @@ inputs:
   pin-sha:
     description: >
       Full commit SHA. When set on dev releases, a second chart is also pushed
-      as 0.0.0-dev.<short-sha> with appVersion set to this SHA, enabling exact
-      version pinning alongside the floating 0.0.0-dev tag.
+      as 0.0.0-dev.<sha> with appVersion set to the same SHA, enabling exact
+      version pinning alongside the floating 0.0.0-dev tag. Both chart version
+      and appVersion use the full SHA so the chart tag matches the image tag
+      pushed by docker-build.yml.
     required: false
     default: ""
 
@@ -92,10 +94,9 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        SHORT_SHA="${PIN_SHA:0:7}"
         SHA_CHART_DIR="${RUNNER_TEMP}/chart-build-sha"
         cp -a "${CHART_DIR}/." "${SHA_CHART_DIR}"
-        sed -i "s/^version:.*/version: 0.0.0-dev.${SHORT_SHA}/" "${SHA_CHART_DIR}/Chart.yaml"
+        sed -i "s/^version:.*/version: 0.0.0-dev.${PIN_SHA}/" "${SHA_CHART_DIR}/Chart.yaml"
         sed -i "s/^appVersion:.*/appVersion: \"${PIN_SHA}\"/" "${SHA_CHART_DIR}/Chart.yaml"
         helm package "${SHA_CHART_DIR}" --destination /tmp/sha-pin
         helm push /tmp/sha-pin/helm-chart-*.tgz oci://ghcr.io/nvidia/openshell
