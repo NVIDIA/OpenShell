@@ -3,6 +3,8 @@
 
 %global crate openshell
 %global openshell_cargo_version %{version}
+# Python dist-info metadata intentionally follows the RPM Version. Dev build
+# identity is represented by Release for RPM packages.
 %global openshell_python_version %{version}
 
 # Cargo/Rust builds with vendored deps do not produce debugsource listings

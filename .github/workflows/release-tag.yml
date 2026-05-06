@@ -685,7 +685,6 @@ jobs:
       rpm-version: ${{ needs.compute-versions.outputs.rpm_version }}
       rpm-release: ${{ needs.compute-versions.outputs.rpm_release }}
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-      python-version: ${{ needs.compute-versions.outputs.python_version }}
     secrets: inherit
 
   # ---------------------------------------------------------------------------

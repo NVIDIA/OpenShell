@@ -21,10 +21,6 @@ on:
         required: false
         type: string
         default: ""
-      python-version:
-        required: false
-        type: string
-        default: ""
 
 permissions:
   contents: read
@@ -73,7 +69,6 @@ jobs:
           OPENSHELL_RPM_VERSION: ${{ inputs['rpm-version'] }}
           OPENSHELL_RPM_RELEASE: ${{ inputs['rpm-release'] }}
           OPENSHELL_CARGO_VERSION: ${{ inputs['cargo-version'] }}
-          OPENSHELL_PYTHON_VERSION: ${{ inputs['python-version'] }}
         run: packit build locally
 
       - name: Collect RPM artifacts

@@ -43,9 +43,10 @@ actions:
     - 'bash -c "sed -i -r \"s/^Version:(\\s*)\\S+/Version:\\1${PACKIT_RPMSPEC_VERSION}/\" openshell.spec"'
     # Update Release
     - 'bash -c "RELEASE=${OPENSHELL_RPM_RELEASE:-${PACKIT_RPMSPEC_RELEASE}} && sed -i -r \"s/^Release:(\\s*)\\S+/Release:\\1${RELEASE}%{?dist}/\" openshell.spec"'
-    # Keep embedded binary / Python metadata aligned with the release workflow.
+    # Keep embedded binary metadata aligned with the release workflow. Python
+    # dist-info stays at the RPM Version; dev build identity is carried by
+    # Release so Fedora's Python RPM post-processing can normalize metadata.
     - 'bash -c "if [ -n \"${OPENSHELL_CARGO_VERSION:-}\" ]; then sed -i -r \"s/^%global openshell_cargo_version .*/%global openshell_cargo_version ${OPENSHELL_CARGO_VERSION}/\" openshell.spec; fi"'
-    - 'bash -c "if [ -n \"${OPENSHELL_PYTHON_VERSION:-}\" ]; then sed -i -r \"s/^%global openshell_python_version .*/%global openshell_python_version ${OPENSHELL_PYTHON_VERSION}/\" openshell.spec; fi"'
 
 jobs:
   # Build on every pull request targeting main for CI validation
