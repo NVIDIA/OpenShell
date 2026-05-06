@@ -75,9 +75,9 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     container:
