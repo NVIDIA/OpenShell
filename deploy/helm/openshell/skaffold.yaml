@@ -87,16 +87,16 @@ deploy:
         createNamespace: true
         valuesFiles:
           - values.yaml
-          - values-skaffold.yaml
-          # Add values-cert-manager.yaml here (and uncomment the cert-manager
+          - ci/values-skaffold.yaml
+          # Add ci/values-cert-manager.yaml here (and uncomment the cert-manager
           # release above) to switch from pkiInitJob to cert-manager for PKI.
-          #- values-cert-manager.yaml
+          #- ci/values-cert-manager.yaml
           # To enable OIDC with a local Keycloak instance, run the one-time
           # setup task first, then uncomment the line below:
           #   mise run keycloak:k8s:setup
-          #- values-keycloak.yaml
+          #- ci/values-keycloak.yaml
           # To enable the Gateway API HTTPRoute (requires Envoy Gateway above):
-          #- values-gateway.yaml
+          #- ci/values-gateway.yaml
         setValueTemplates:
           image.repository: '{{.IMAGE_REPO_openshell_gateway}}'
           image.tag: '{{.IMAGE_TAG_openshell_gateway}}'

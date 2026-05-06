@@ -63,7 +63,7 @@ The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or
 
 ### TLS behaviour
 
-`values-skaffold.yaml` sets `server.disableTls: true`, so Skaffold-based deploys run
+`ci/values-skaffold.yaml` sets `server.disableTls: true`, so Skaffold-based deploys run
 plaintext by default. To test with TLS enabled, comment out that line and redeploy.
 
 | Mode | `server.disableTls` | Gateway scheme |
@@ -160,7 +160,7 @@ imports the openshell realm from `scripts/keycloak-realm.json`, and prints a por
 command for acquiring tokens from the CLI.
 
 Then activate OIDC in the OpenShell Helm chart:
-1. Uncomment `#- values-keycloak.yaml` in `skaffold.yaml`
+1. Uncomment `#- ci/values-keycloak.yaml` in `skaffold.yaml`
 2. Redeploy: `mise run helm:skaffold:run`
 
 To remove Keycloak:
@@ -191,10 +191,11 @@ mise run helm:k3s:status
 |------|---------|
 | `deploy/helm/openshell/skaffold.yaml` | Skaffold config — images, Helm releases, values overlays |
 | `deploy/helm/openshell/values.yaml` | Default Helm values |
-| `deploy/helm/openshell/values-skaffold.yaml` | Dev overrides (image pull policy, local image names) |
-| `deploy/helm/openshell/values-cert-manager.yaml` | cert-manager TLS overlay (opt-in; disables pkiInitJob) |
-| `deploy/helm/openshell/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
-| `deploy/helm/openshell/values-keycloak.yaml` | Keycloak OIDC overlay |
+| `deploy/helm/openshell/ci/values-skaffold.yaml` | Dev overrides (image pull policy, TLS disabled for local Skaffold) |
+| `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
+| `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
+| `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
+| `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |
 | `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass for Envoy Gateway (`mise run helm:gateway:apply`) |
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |
 | `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy + realm import |

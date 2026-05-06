@@ -4,9 +4,20 @@
 # Helm chart tasks
 
 ["helm:lint"]
-description = "Lint the openshell helm chart"
-run = "helm lint deploy/helm/openshell"
-hide = true
+description = "Lint the openshell Helm chart (defaults + all CI configuration variants)"
+run = """
+  set -e
+  echo "--- helm lint: defaults ---"
+  echo "values files: deploy/helm/openshell/values.yaml"
+  helm lint deploy/helm/openshell
+  for f in deploy/helm/openshell/ci/values-*.yaml; do
+    variant=$(basename "$f" .yaml | sed 's/values-//')
+    echo "--- helm lint: $variant ---"
+    echo "values files: deploy/helm/openshell/values.yaml, $f"
+    helm lint deploy/helm/openshell -f "$f"
+  done
+  echo "All variants passed."
+"""
 
 ["helm:skaffold:dev"]
 description = "Run skaffold dev for deploy/helm/openshell (iterative deploy)"
