@@ -201,7 +201,7 @@ jobs:
           git push --force origin vm-runtime
 
       - name: Prune stale runtime assets from vm-runtime release
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');

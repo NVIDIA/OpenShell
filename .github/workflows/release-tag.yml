@@ -795,7 +795,7 @@ jobs:
             release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
 
       - name: Prune removed VM checksum asset
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
