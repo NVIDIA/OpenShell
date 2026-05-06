@@ -60,7 +60,7 @@ jobs:
         run: test -f runtime-artifacts/vm-runtime-darwin-aarch64.tar.zst
 
       - name: Upload runtime artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vm-driver-macos-kernel-runtime-tarball
           path: runtime-artifacts/vm-runtime-darwin-aarch64.tar.zst
@@ -113,7 +113,7 @@ jobs:
         run: mise x -- sccache --show-stats
 
       - name: Upload supervisor bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: driver-vm-supervisor-arm64
           path: target/vm-runtime-compressed/openshell-sandbox.zst
@@ -230,7 +230,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: driver-vm-macos
           path: artifacts/*.tar.gz

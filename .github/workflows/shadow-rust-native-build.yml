@@ -235,7 +235,7 @@ jobs:
           ls -lh "$STAGE/"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs['artifact-name'] != '' && inputs['artifact-name'] || format('rust-binary-{0}-linux-{1}', inputs.component, inputs.arch) }}
           path: prebuilt-binaries/${{ inputs.arch }}/${{ steps.target.outputs.binary }}

@@ -150,7 +150,7 @@ jobs:
           ls -la ${{ matrix.output_path }}
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-wheels-${{ matrix.artifact }}
           path: ${{ matrix.output_path }}
@@ -198,7 +198,7 @@ jobs:
           ls -la target/wheels/*.whl
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-wheels-macos
           path: target/wheels/*.whl
@@ -312,7 +312,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cli-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
@@ -376,7 +376,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cli-macos
           path: artifacts/*.tar.gz
@@ -459,7 +459,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gateway-binary-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
@@ -527,7 +527,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gateway-binary-macos
           path: artifacts/*.tar.gz
@@ -610,7 +610,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: supervisor-binary-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz

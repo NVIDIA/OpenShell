@@ -63,7 +63,7 @@ jobs:
             --output artifacts/vm-runtime-linux-aarch64.tar.zst
 
       - name: Upload runtime artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vm-runtime-linux-arm64
           path: artifacts/vm-runtime-linux-aarch64.tar.zst
@@ -73,7 +73,7 @@ jobs:
       # the aarch64 Linux kernel as a byte array — it is OS-agnostic and can
       # be compiled into a .dylib by Apple's cc without rebuilding the kernel.
       - name: Upload kernel.c for macOS build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kernel-c-arm64
           path: |
@@ -113,7 +113,7 @@ jobs:
             --output artifacts/vm-runtime-linux-x86_64.tar.zst
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vm-runtime-linux-amd64
           path: artifacts/vm-runtime-linux-x86_64.tar.zst
@@ -156,7 +156,7 @@ jobs:
             --output artifacts/vm-runtime-darwin-aarch64.tar.zst
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vm-runtime-macos-arm64
           path: artifacts/vm-runtime-darwin-aarch64.tar.zst

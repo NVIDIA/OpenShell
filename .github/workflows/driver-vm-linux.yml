@@ -66,7 +66,7 @@ jobs:
           done
 
       - name: Upload runtime artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vm-driver-kernel-runtime-tarballs
           path: runtime-artifacts/vm-runtime-*.tar.zst
@@ -202,7 +202,7 @@ jobs:
             -C target/release openshell-driver-vm
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: driver-vm-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
