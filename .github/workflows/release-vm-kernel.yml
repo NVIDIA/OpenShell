@@ -226,16 +226,14 @@ jobs:
       - name: Create / update vm-runtime GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: OpenShell VM Runtime Development Build
+          name: OpenShell VM Runtime
           prerelease: true
           tag_name: vm-runtime
           target_commitish: ${{ github.sha }}
           body: |
-            Rolling development build of the OpenShell VM runtime artifacts used by `openshell-driver-vm`.
+            Build of the OpenShell VM runtime artifacts used by `openshell-driver-vm`.
 
-            > **NOTE**: This is a development build, not a tagged release, and may be unstable.
-            > The VM implementation itself is also experimental and may change or break without
-            > notice.
+            > **NOTE**: This is a development build.
 
             ### Kernel Runtime Artifacts
 
@@ -248,8 +246,6 @@ jobs:
             | Linux ARM64 | `vm-runtime-linux-aarch64.tar.zst` |
             | Linux x86_64 | `vm-runtime-linux-x86_64.tar.zst` |
             | macOS ARM64 | `vm-runtime-darwin-aarch64.tar.zst` |
-
-            VM driver binaries are published from the normal `dev` and `v*` releases.
 
             ### Verify
 
