@@ -59,7 +59,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          find ~/rpmbuild/RPMS/ -name '*.rpm' -exec cp {} artifacts/ \;
+          for rpm_dir in "$HOME/rpmbuild/RPMS" "$PWD/${{ matrix.arch }}"; do
+            if [ -d "$rpm_dir" ]; then
+              find "$rpm_dir" -type f -name '*.rpm' -exec cp {} artifacts/ \;
+            fi
+          done
+          if ! compgen -G 'artifacts/*.rpm' > /dev/null; then
+            echo "::error::No RPM artifacts found"
+            find "$PWD" -maxdepth 3 -type f -name '*.rpm' -print
+            exit 1
+          fi
           echo "=== Built RPMs ==="
           ls -lah artifacts/
 
