@@ -26,9 +26,10 @@ actions:
     # reflects any patching that Packit may have done (e.g. version bumps).
     - 'bash -c "VERSION=${PACKIT_PROJECT_VERSION} && TMPDIR=$(mktemp -d) && DIR=openshell-${VERSION} && mkdir -p ${TMPDIR}/${DIR} && git ls-files -z | xargs -0 tar cf - | tar xf - -C ${TMPDIR}/${DIR}/ && tar -czf openshell-${VERSION}.tar.gz -C ${TMPDIR} ${DIR} && rm -rf ${TMPDIR}"'
     # Step 2: Create vendored Cargo dependencies tarball for offline RPM build.
-    - 'bash -c "VERSION=${PACKIT_PROJECT_VERSION} && cargo vendor --quiet && tar -cJf openshell-${VERSION}-vendor.tar.xz vendor/ && rm -rf vendor/"'
-    # Step 3: Return BOTH archive names. Packit maps each line to Source0, Source1, etc.
-    - 'bash -c "echo openshell-${PACKIT_PROJECT_VERSION}.tar.gz && echo openshell-${PACKIT_PROJECT_VERSION}-vendor.tar.xz"'
+    - 'bash -c "VERSION=${PACKIT_PROJECT_VERSION} && CARGO_HTTP_TIMEOUT=600 CARGO_NET_RETRY=5 cargo vendor --locked --quiet && tar -cJf openshell-${VERSION}-vendor.tar.xz vendor/ && rm -rf vendor/"'
+    # Step 3: Return the primary archive name. Packit expects create-archive
+    # to print one path for Source0; Source1 is patched explicitly below.
+    - 'bash -c "echo openshell-${PACKIT_PROJECT_VERSION}.tar.gz"'
 
   fix-spec-file:
     # Update Source0 to the generated tarball name
