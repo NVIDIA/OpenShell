@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 %global crate openshell
+%global openshell_cargo_version %{version}
+%global openshell_python_version %{version}
 
 # Cargo/Rust builds with vendored deps do not produce debugsource listings
 # in the format redhat-rpm-config expects (especially on EPEL).
@@ -87,9 +89,9 @@ management, agent execution, and inference routing via gRPC.
 tar xf %{SOURCE1}
 %cargo_prep -v vendor
 
-# Patch workspace version from placeholder to actual version
-sed -i 's/^version = "0.0.0"/version = "%{version}"/' Cargo.toml
-grep -q 'version = "%{version}"' Cargo.toml || (echo "ERROR: Cargo.toml version patch failed" && exit 1)
+# Patch workspace version from placeholder to actual build identity.
+sed -i 's/^version = "0.0.0"/version = "%{openshell_cargo_version}"/' Cargo.toml
+grep -q 'version = "%{openshell_cargo_version}"' Cargo.toml || (echo "ERROR: Cargo.toml version patch failed" && exit 1)
 
 %build
 # Build the CLI and gateway binaries
@@ -203,11 +205,11 @@ install -pm 0644 python/%{name}/_proto/__init__.py %{buildroot}%{python3_sitelib
 install -pm 0644 python/%{name}/_proto/*.py %{buildroot}%{python3_sitelib}/%{name}/_proto/
 
 # Create dist-info so importlib.metadata can resolve the package version
-install -d %{buildroot}%{python3_sitelib}/%{name}-%{version}.dist-info
-cat > %{buildroot}%{python3_sitelib}/%{name}-%{version}.dist-info/METADATA << EOF
+install -d %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-info
+cat > %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-info/METADATA << EOF
 Metadata-Version: 2.1
 Name: %{name}
-Version: 0.0.37
+Version: %{openshell_python_version}
 Summary: OpenShell Python SDK for agent execution and management
 License: Apache-2.0
 Requires-Python: >=3.12
@@ -217,10 +219,10 @@ Requires-Dist: protobuf>=4.25
 EOF
 
 # INSTALLER marker per PEP 376
-echo "rpm" > %{buildroot}%{python3_sitelib}/%{name}-%{version}.dist-info/INSTALLER
+echo "rpm" > %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-info/INSTALLER
 
 # RECORD can be empty for RPM-managed installs
-touch %{buildroot}%{python3_sitelib}/%{name}-%{version}.dist-info/RECORD
+touch %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-info/RECORD
 
 %check
 # Smoke-test the CLI binary
@@ -233,7 +235,7 @@ touch %{buildroot}%{python3_sitelib}/%{name}-%{version}.dist-info/RECORD
 # We query the dist-info directly rather than importing the package because
 # the full import pulls in grpcio and other runtime deps not present in the
 # build environment.
-PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata import version; v = version('openshell'); print(v); assert v == '%{version}', f'expected %{version}, got {v}'"
+PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata import version; v = version('openshell'); print(v); assert v == '%{openshell_python_version}', f'expected %{openshell_python_version}, got {v}'"
 
 %post gateway
 %systemd_user_post %{name}-gateway.service
@@ -269,7 +271,7 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata
 %files -n python3-%{name}
 %license LICENSE
 %{python3_sitelib}/%{name}/
-%{python3_sitelib}/%{name}-%{version}.dist-info/
+%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-info/
 
 %changelog
 %autochangelog

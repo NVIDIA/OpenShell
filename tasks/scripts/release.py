@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from setuptools_scm import get_version as scm_get_version
+SEMVER_TAG_GLOB = "v[0-9]*.[0-9]*.[0-9]*"
+SEMVER_TAG_RE = re.compile(r"^v?(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$")
 
 
 @dataclass(frozen=True)
@@ -20,8 +22,11 @@ class Versions:
     cargo: str
     docker: str
     deb: str
+    rpm_version: str
+    rpm_release: str
     git_tag: str
     git_sha: str
+    git_distance: int
 
 
 def _repo_root() -> Path:
@@ -38,16 +43,53 @@ def _git(cmd: list[str]) -> str:
     )
 
 
-def _compute_versions() -> Versions:
-    root = _repo_root()
-    python_version = scm_get_version(
-        # NOTE: Cargo doesn't support .post versions, so when we are releasing,
-        # but not on tag, we use a next version (bumps the patch).
-        # EXAMPLE: if the last tag was 0.1.0, then the next version will be 0.1.1-dev.0
-        version_scheme="guess-next-dev",
-        root=str(root),
-        fallback_version="0.0.0",
+def _parse_semver_tag(tag: str) -> tuple[int, int, int] | None:
+    match = SEMVER_TAG_RE.match(tag)
+    if match is None:
+        return None
+    return (
+        int(match.group("major")),
+        int(match.group("minor")),
+        int(match.group("patch")),
     )
+
+
+def _format_semver(version: tuple[int, int, int]) -> str:
+    return f"{version[0]}.{version[1]}.{version[2]}"
+
+
+def _next_patch(version: tuple[int, int, int]) -> tuple[int, int, int]:
+    return version[0], version[1], version[2] + 1
+
+
+def _latest_semver_tag() -> str | None:
+    try:
+        tag = _git(
+            ["describe", "--tags", "--match", SEMVER_TAG_GLOB, "--abbrev=0", "HEAD"]
+        )
+    except subprocess.CalledProcessError:
+        return None
+
+    if _parse_semver_tag(tag) is None:
+        raise RuntimeError(f"git describe returned non-semver release tag: {tag}")
+    return tag
+
+
+def _versions_from_parts(
+    base_version: tuple[int, int, int],
+    git_distance: int,
+    git_sha: str,
+    git_tag: str,
+) -> Versions:
+    if git_distance == 0:
+        python_version = _format_semver(base_version)
+        rpm_version = python_version
+        rpm_release = "1"
+    else:
+        next_version = _format_semver(_next_patch(base_version))
+        python_version = f"{next_version}.dev{git_distance}+g{git_sha}"
+        rpm_version = next_version
+        rpm_release = f"0.dev.{git_distance}.g{git_sha}"
 
     # Convert PEP 440 to a SemVer-ish string for Cargo:
     # 0.1.0.dev3+gabcdef -> 0.1.0-dev.3+gabcdef
@@ -62,17 +104,46 @@ def _compute_versions() -> Versions:
     deb_version = deb_version.replace("-dev.", "~dev.", 1)
     deb_version = f"{deb_version}-1"
 
-    git_tag = _git(["describe", "--tags", "--abbrev=0"])
-    git_sha = _git(["rev-parse", "--short", "HEAD"])
-
     return Versions(
         python=python_version,
         cargo=cargo_version,
         docker=docker_version,
         deb=deb_version,
+        rpm_version=rpm_version,
+        rpm_release=rpm_release,
         git_tag=git_tag,
         git_sha=git_sha,
+        git_distance=git_distance,
     )
+
+
+def _compute_versions() -> Versions:
+    git_tag = _latest_semver_tag()
+    git_sha = _git(["rev-parse", "--short=9", "HEAD"])
+
+    if git_tag is None:
+        base_version = (0, 0, 0)
+        git_distance = int(_git(["rev-list", "--count", "HEAD"]))
+        return _versions_from_parts(base_version, git_distance, git_sha, "")
+
+    parsed_tag = _parse_semver_tag(git_tag)
+    if parsed_tag is None:
+        raise RuntimeError(f"invalid semantic release tag: {git_tag}")
+
+    git_distance = int(_git(["rev-list", f"{git_tag}..HEAD", "--count"]))
+    return _versions_from_parts(parsed_tag, git_distance, git_sha, git_tag)
+
+
+def _print_env(versions: Versions) -> None:
+    print(f"VERSION_PY={versions.python}")
+    print(f"VERSION_CARGO={versions.cargo}")
+    print(f"VERSION_DOCKER={versions.docker}")
+    print(f"VERSION_DEB={versions.deb}")
+    print(f"VERSION_RPM={versions.rpm_version}")
+    print(f"VERSION_RPM_RELEASE={versions.rpm_release}")
+    print(f"GIT_TAG={versions.git_tag}")
+    print(f"GIT_SHA={versions.git_sha}")
+    print(f"GIT_DISTANCE={versions.git_distance}")
 
 
 def get_version(format: str) -> None:
@@ -85,13 +156,14 @@ def get_version(format: str) -> None:
         print(versions.docker)
     elif format == "deb":
         print(versions.deb)
+    elif format == "rpm-version":
+        print(versions.rpm_version)
+    elif format == "rpm-release":
+        print(versions.rpm_release)
+    elif format == "json":
+        print(json.dumps(asdict(versions), sort_keys=True))
     else:
-        print(f"VERSION_PY={versions.python}")
-        print(f"VERSION_CARGO={versions.cargo}")
-        print(f"VERSION_DOCKER={versions.docker}")
-        print(f"VERSION_DEB={versions.deb}")
-        print(f"GIT_TAG={versions.git_tag}")
-        print(f"GIT_SHA={versions.git_sha}")
+        _print_env(versions)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -111,6 +183,15 @@ def build_parser() -> argparse.ArgumentParser:
     get_version_parser.add_argument(
         "--deb", action="store_true", help="Print Debian package version only."
     )
+    get_version_parser.add_argument(
+        "--rpm-version", action="store_true", help="Print RPM Version only."
+    )
+    get_version_parser.add_argument(
+        "--rpm-release", action="store_true", help="Print RPM Release only."
+    )
+    get_version_parser.add_argument(
+        "--json", action="store_true", help="Print all versions as JSON."
+    )
 
     return parser
 
@@ -128,6 +209,12 @@ def main() -> None:
             get_version("docker")
         elif args.deb:
             get_version("deb")
+        elif args.rpm_version:
+            get_version("rpm-version")
+        elif args.rpm_release:
+            get_version("rpm-release")
+        elif args.json:
+            get_version("json")
         else:
             get_version("all")
 

@@ -17,10 +17,11 @@ srpm_build_deps:
 
 actions:
   get-current-version:
-    # Derive version from the latest SemVer upstream tag on the current branch.
-    # Avoid operational tags such as vm-dev; Packit normalizes that to m.dev,
-    # which is not a valid Cargo package version.
-    - 'bash -c "git describe --tags --match ''v[0-9]*.[0-9]*.[0-9]*'' --abbrev=0 HEAD | sed ''s/^v//''"'
+    # Release workflows pass OPENSHELL_RPM_VERSION so every artifact shares one
+    # precomputed identity. Local Packit runs fall back to the latest SemVer
+    # upstream tag, avoiding operational tags such as vm-dev; Packit normalizes
+    # those to invalid Cargo package versions such as m.dev.
+    - 'bash -c "if [ -n \"${OPENSHELL_RPM_VERSION:-}\" ]; then echo \"${OPENSHELL_RPM_VERSION}\"; else git describe --tags --match ''v[0-9]*.[0-9]*.[0-9]*'' --abbrev=0 HEAD | sed ''s/^v//''; fi"'
 
   create-archive:
     # Step 1: Create source tarball from git working tree.
@@ -41,7 +42,10 @@ actions:
     # Update Version
     - 'bash -c "sed -i -r \"s/^Version:(\\s*)\\S+/Version:\\1${PACKIT_RPMSPEC_VERSION}/\" openshell.spec"'
     # Update Release
-    - 'bash -c "sed -i -r \"s/^Release:(\\s*)\\S+/Release:\\1${PACKIT_RPMSPEC_RELEASE}%{?dist}/\" openshell.spec"'
+    - 'bash -c "RELEASE=${OPENSHELL_RPM_RELEASE:-${PACKIT_RPMSPEC_RELEASE}} && sed -i -r \"s/^Release:(\\s*)\\S+/Release:\\1${RELEASE}%{?dist}/\" openshell.spec"'
+    # Keep embedded binary / Python metadata aligned with the release workflow.
+    - 'bash -c "if [ -n \"${OPENSHELL_CARGO_VERSION:-}\" ]; then sed -i -r \"s/^%global openshell_cargo_version .*/%global openshell_cargo_version ${OPENSHELL_CARGO_VERSION}/\" openshell.spec; fi"'
+    - 'bash -c "if [ -n \"${OPENSHELL_PYTHON_VERSION:-}\" ]; then sed -i -r \"s/^%global openshell_python_version .*/%global openshell_python_version ${OPENSHELL_PYTHON_VERSION}/\" openshell.spec; fi"'
 
 jobs:
   # Build on every pull request targeting main for CI validation

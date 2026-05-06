@@ -41,6 +41,8 @@ jobs:
       python_version: ${{ steps.v.outputs.python }}
       cargo_version: ${{ steps.v.outputs.cargo }}
       deb_version: ${{ steps.v.outputs.deb }}
+      rpm_version: ${{ steps.v.outputs.rpm_version }}
+      rpm_release: ${{ steps.v.outputs.rpm_release }}
       # Semver without 'v' prefix (e.g. 0.6.0), used for image tags and release body
       semver: ${{ steps.v.outputs.semver }}
     steps:
@@ -62,6 +64,8 @@ jobs:
           echo "python=$(uv run python tasks/scripts/release.py get-version --python)" >> "$GITHUB_OUTPUT"
           echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
           echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)" >> "$GITHUB_OUTPUT"
+          echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --rpm-version)" >> "$GITHUB_OUTPUT"
+          echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --rpm-release)" >> "$GITHUB_OUTPUT"
           echo "semver=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
   build-gateway:
@@ -678,6 +682,10 @@ jobs:
     uses: ./.github/workflows/rpm-package.yml
     with:
       checkout-ref: ${{ inputs.tag || github.ref }}
+      rpm-version: ${{ needs.compute-versions.outputs.rpm_version }}
+      rpm-release: ${{ needs.compute-versions.outputs.rpm_release }}
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      python-version: ${{ needs.compute-versions.outputs.python_version }}
     secrets: inherit
 
   # ---------------------------------------------------------------------------
