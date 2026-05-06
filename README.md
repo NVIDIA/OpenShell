@@ -35,6 +35,25 @@ uv tool install -U openshell
 
 Both methods install the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION` (binary) or pin the version with `uv tool install openshell==<version>`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
 
+**Helm chart:**
+
+> **Experimental** — the Kubernetes deployment path is under active development. Expect rough edges and breaking changes.
+
+Deploy the OpenShell gateway into a Kubernetes cluster from the OCI chart published to GHCR:
+
+```bash
+# Tagged release — pin to a specific version
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version>
+
+# Floating dev tag — tracks the latest commit on main
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version 0.0.0-dev
+
+# Pinned dev — exact commit on main (full SHA)
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version 0.0.0-dev.<commit-sha>
+```
+
+See [`deploy/helm/openshell/values.yaml`](deploy/helm/openshell/values.yaml) for configurable values.
+
 ### Create a sandbox
 
 ```bash
