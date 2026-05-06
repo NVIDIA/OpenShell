@@ -85,7 +85,9 @@ Custom profiles are persisted in the existing object store with
 profiles remain file-backed and read-only; attempts to import over a built-in id or
 delete a built-in profile fail. `ListProviderProfiles` and `GetProviderProfile` merge the
 built-in YAML catalog with custom profiles from the object store, with built-ins taking
-precedence for reserved ids.
+precedence for reserved ids. Custom profile ids also cannot reuse legacy provider type
+ids or aliases such as `generic`, `github`, or `gh`; those ids remain reserved for
+provider records even when no built-in profile exists for that type.
 
 Deletion is limited to custom profiles that are not in use. Because sandbox specs attach
 provider names, the gateway checks every sandbox's attached providers, resolves each
@@ -104,7 +106,9 @@ The composed policy is derived data. The sandbox still receives one normal
 `SandboxPolicy`, but provider-generated entries are not persisted as user-authored
 policy revisions. Full policy replacement and incremental policy updates continue to
 mutate the user-authored policy layer. Provider-generated rules are re-added during
-composition for each attached provider whose type has a built-in profile.
+composition for each attached provider whose type has a built-in or custom profile.
+Known legacy provider types without built-in profiles, such as `generic`, are skipped
+rather than resolving to a custom profile with the same id.
 
 Provider-generated network rules use reserved `_provider_*` names derived from the
 provider record name. If a user or global policy already has the same key, composition

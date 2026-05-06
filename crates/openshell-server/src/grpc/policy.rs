@@ -46,6 +46,7 @@ use openshell_ocsf::{
 use openshell_policy::{
     PolicyMergeOp, ProviderPolicyLayer, compose_effective_policy, merge_policy,
 };
+use openshell_providers::{get_default_profile, normalize_provider_type};
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -497,15 +498,28 @@ async fn profile_provider_policy_layers(
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
 
         let provider_type = provider.r#type.trim();
-        let Some(profile) =
-            super::provider::get_provider_type_profile(store, provider_type).await?
-        else {
-            warn!(
-                provider_name = %name,
-                provider_type,
-                "provider type has no profile; skipping provider policy layer"
-            );
-            continue;
+        let profile = if let Some(canonical_type) = normalize_provider_type(provider_type) {
+            let Some(profile) = get_default_profile(canonical_type) else {
+                warn!(
+                    provider_name = %name,
+                    provider_type,
+                    "legacy provider type has no profile; skipping provider policy layer"
+                );
+                continue;
+            };
+            profile.clone()
+        } else {
+            let Some(profile) =
+                super::provider::get_provider_type_profile(store, provider_type).await?
+            else {
+                warn!(
+                    provider_name = %name,
+                    provider_type,
+                    "provider type has no profile; skipping provider policy layer"
+                );
+                continue;
+            };
+            profile
         };
 
         let rule_name = openshell_policy::provider_rule_name(provider.object_name());
@@ -2859,6 +2873,46 @@ mod tests {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         store
             .put_message(&test_provider("custom-provider", "custom"))
+            .await
+            .unwrap();
+
+        let layers = profile_provider_policy_layers(&store, &["custom-provider".to_string()])
+            .await
+            .unwrap();
+
+        assert!(layers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_policy_layers_skip_custom_profile_for_legacy_provider_type() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        store
+            .put_message(&test_provider("custom-provider", "generic"))
+            .await
+            .unwrap();
+        store
+            .put_message(&openshell_core::proto::StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-generic".to_string(),
+                    name: "generic".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                }),
+                profile: Some(openshell_core::proto::ProviderProfile {
+                    id: "generic".to_string(),
+                    display_name: "Generic Override".to_string(),
+                    description: String::new(),
+                    category: openshell_core::proto::ProviderProfileCategory::Other as i32,
+                    credentials: Vec::new(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "backdoor.example".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: Vec::new(),
+                    inference_capable: false,
+                }),
+            })
             .await
             .unwrap();
 

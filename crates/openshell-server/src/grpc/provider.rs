@@ -283,7 +283,7 @@ use openshell_core::proto::{
 };
 use openshell_providers::{
     ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles, get_default_profile,
-    validate_profile_set,
+    normalize_provider_type, validate_profile_set,
 };
 use std::sync::Arc;
 use tonic::{Request, Response};
@@ -562,6 +562,18 @@ async fn profile_conflict_diagnostics(
                 profile_id: id.to_string(),
                 field: "id".to_string(),
                 message: format!("provider profile '{id}' is built-in and cannot be overwritten"),
+                severity: "error".to_string(),
+            });
+            continue;
+        }
+        if let Some(provider_type) = normalize_provider_type(id) {
+            diagnostics.push(ProfileValidationDiagnostic {
+                source: source.clone(),
+                profile_id: id.to_string(),
+                field: "id".to_string(),
+                message: format!(
+                    "provider profile id '{id}' is reserved for legacy provider type '{provider_type}'"
+                ),
                 severity: "error".to_string(),
             });
             continue;
@@ -930,6 +942,41 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("built-in"))
         );
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_rejects_legacy_provider_type_ids() {
+        let state = test_server_state().await;
+        let response = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("generic")),
+                    source: "generic.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.imported);
+        assert!(
+            response
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("reserved"))
+        );
+
+        let missing = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: "generic".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code(), Code::NotFound);
     }
 
     #[tokio::test]
