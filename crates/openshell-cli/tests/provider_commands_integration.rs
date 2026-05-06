@@ -526,6 +526,7 @@ fn build_client_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
 struct TestServer {
     endpoint: String,
     tls: TlsOptions,
+    state: ProviderState,
     _dir: TempDir,
 }
 
@@ -546,11 +547,15 @@ async fn run_server() -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = TcpListenerStream::new(listener);
+    let state = ProviderState::default();
+    let service = TestOpenShell {
+        state: state.clone(),
+    };
     tokio::spawn(async move {
         Server::builder()
             .tls_config(tls_config)
             .unwrap()
-            .add_service(OpenShellServer::new(TestOpenShell::default()))
+            .add_service(OpenShellServer::new(service))
             .serve_with_incoming(incoming)
             .await
             .unwrap();
@@ -570,6 +575,7 @@ async fn run_server() -> TestServer {
     TestServer {
         endpoint,
         tls,
+        state,
         _dir: dir,
     }
 }
@@ -658,6 +664,31 @@ binaries: [/usr/bin/custom]
     run::provider_list_profiles(&ts.endpoint, "json", &ts.tls)
         .await
         .expect("provider list-profiles json");
+    run::provider_create(
+        &ts.endpoint,
+        "custom-provider",
+        "custom-api",
+        false,
+        &["CUSTOM_API_KEY=abc".to_string()],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("custom profile provider create");
+
+    let provider = ts
+        .state
+        .providers
+        .lock()
+        .await
+        .get("custom-provider")
+        .cloned()
+        .expect("custom provider should be stored");
+    assert_eq!(provider.r#type, "custom-api");
+
+    run::provider_delete(&ts.endpoint, &["custom-provider".to_string()], &ts.tls)
+        .await
+        .expect("custom provider delete");
     run::provider_profile_delete(&ts.endpoint, "custom-api", &ts.tls)
         .await
         .expect("profile delete");

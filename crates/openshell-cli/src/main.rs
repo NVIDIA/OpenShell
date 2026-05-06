@@ -651,21 +651,6 @@ impl ProviderProfileOutput {
 }
 
 #[derive(Clone, Debug, ValueEnum)]
-enum CliProviderType {
-    Claude,
-    Opencode,
-    Codex,
-    Copilot,
-    Generic,
-    Openai,
-    Anthropic,
-    Nvidia,
-    Gitlab,
-    Github,
-    Outlook,
-}
-
-#[derive(Clone, Debug, ValueEnum)]
 enum CliEditor {
     Vscode,
     Cursor,
@@ -680,24 +665,6 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
     }
 }
 
-impl CliProviderType {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Opencode => "opencode",
-            Self::Codex => "codex",
-            Self::Copilot => "copilot",
-            Self::Generic => "generic",
-            Self::Openai => "openai",
-            Self::Anthropic => "anthropic",
-            Self::Nvidia => "nvidia",
-            Self::Gitlab => "gitlab",
-            Self::Github => "github",
-            Self::Outlook => "outlook",
-        }
-    }
-}
-
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
@@ -708,8 +675,8 @@ enum ProviderCommands {
         name: String,
 
         /// Provider type.
-        #[arg(long = "type", value_enum)]
-        provider_type: CliProviderType,
+        #[arg(long = "type")]
+        provider_type: String,
 
         /// Load provider credentials/config from existing local state.
         #[arg(long, conflicts_with = "credentials")]
@@ -3653,6 +3620,39 @@ mod tests {
     }
 
     #[test]
+    fn provider_create_accepts_custom_profile_type_ids() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "work-github",
+            "--type",
+            "github-readonly",
+            "--credential",
+            "GITHUB_TOKEN=token",
+        ])
+        .expect("provider create should parse custom profile ids");
+
+        match cli.command {
+            Some(Commands::Provider {
+                command:
+                    Some(ProviderCommands::Create {
+                        name,
+                        provider_type,
+                        credentials,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(name, "work-github");
+                assert_eq!(provider_type, "github-readonly");
+                assert_eq!(credentials, vec!["GITHUB_TOKEN=token"]);
+            }
+            other => panic!("expected provider create command, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn settings_set_global_parses_yes_flag() {
         let cli = Cli::try_parse_from([
             "openshell",
@@ -3797,30 +3797,5 @@ mod tests {
                 panic!("expected SandboxCommands::Create");
             }
         }
-    }
-
-    /// Ensure every provider registered in `ProviderRegistry` has a
-    /// corresponding `CliProviderType` variant (and vice-versa).
-    /// This test would have caught the missing `Copilot` variant from #707.
-    #[test]
-    fn cli_provider_types_match_registry() {
-        let registry = openshell_providers::ProviderRegistry::new();
-        let registry_types: std::collections::BTreeSet<&str> =
-            registry.known_types().into_iter().collect();
-
-        let cli_types: std::collections::BTreeSet<&str> =
-            <CliProviderType as ValueEnum>::value_variants()
-                .iter()
-                .map(CliProviderType::as_str)
-                .collect();
-
-        assert_eq!(
-            cli_types,
-            registry_types,
-            "CliProviderType variants must match ProviderRegistry.known_types(). \
-             CLI-only: {:?}, Registry-only: {:?}",
-            cli_types.difference(&registry_types).collect::<Vec<_>>(),
-            registry_types.difference(&cli_types).collect::<Vec<_>>(),
-        );
     }
 }

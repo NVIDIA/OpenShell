@@ -3920,9 +3920,33 @@ pub async fn provider_create(
 
     let mut client = grpc_client(server, tls).await?;
 
-    let provider_type = normalize_provider_type(provider_type)
-        .ok_or_else(|| miette::miette!("unsupported provider type: {provider_type}"))?
-        .to_string();
+    let provider_type = if let Some(provider_type) = normalize_provider_type(provider_type) {
+        provider_type.to_string()
+    } else {
+        let profile_id = provider_type.trim();
+        if profile_id.is_empty() {
+            return Err(miette::miette!("provider type is required"));
+        }
+        let response = client
+            .get_provider_profile(GetProviderProfileRequest {
+                id: profile_id.to_string(),
+            })
+            .await;
+        match response {
+            Ok(response) => response
+                .into_inner()
+                .profile
+                .map(|profile| profile.id)
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| profile_id.to_string()),
+            Err(status) if status.code() == Code::NotFound => {
+                return Err(miette::miette!(
+                    "unsupported provider type or profile: {provider_type}"
+                ));
+            }
+            Err(status) => return Err(status).into_diagnostic(),
+        }
+    };
 
     let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
