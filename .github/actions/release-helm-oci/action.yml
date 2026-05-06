@@ -4,7 +4,7 @@
 name: Release Helm OCI
 description: >
   Patch chart version/appVersion, refuse duplicate OCI versions on public
-  releases, package the chart, push to GHCR OCI, and tag as latest (public only).
+  releases, package the chart, and push to GHCR OCI.
 
 inputs:
   chart-version:
@@ -18,7 +18,7 @@ inputs:
       (e.g. 0.6.0 for tag releases, dev for dev).
     required: true
   release-kind:
-    description: "dev or public — controls duplicate guard and latest tagging."
+    description: "dev or public — controls the duplicate-version guard."
     required: true
   pin-sha:
     description: >
@@ -83,21 +83,6 @@ runs:
       run: |
         set -euo pipefail
         helm push /tmp/helm-chart-*.tgz oci://ghcr.io/nvidia/openshell
-
-    - name: Install oras
-      if: inputs.release-kind == 'public'
-      uses: oras-project/setup-oras@v1
-
-    - name: Tag chart as latest
-      if: inputs.release-kind == 'public'
-      env:
-        CHART_VERSION: ${{ steps.prep.outputs.chart_version }}
-      shell: bash
-      run: |
-        set -euo pipefail
-        oras copy \
-          ghcr.io/nvidia/openshell/helm-chart:"${CHART_VERSION}" \
-          ghcr.io/nvidia/openshell/helm-chart:latest
 
     - name: Push SHA-pinned chart
       if: inputs.pin-sha != ''
