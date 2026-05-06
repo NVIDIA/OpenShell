@@ -40,18 +40,27 @@ const MAX_POLICY_LOCAL_BODY_BYTES: usize = 64 * 1024;
 const POLICY_LOCAL_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const DEFAULT_DENIALS_LIMIT: usize = 10;
 const MAX_DENIALS_LIMIT: usize = 100;
-/// OCSF rolling appender keeps three files (daily rotation); read the most
-/// recent two so a request just past midnight still has yesterday's denials.
+/// The shorthand rolling appender keeps three files (daily rotation); read the
+/// most recent two so a request just past midnight still has yesterday's
+/// denials.
 const DENIAL_LOG_FILES_TO_SCAN: usize = 2;
-const OCSF_LOG_DIR: &str = "/var/log";
-const OCSF_LOG_PREFIX: &str = "openshell-ocsf";
+const LOG_DIR: &str = "/var/log";
+/// Shorthand log filenames are `openshell.YYYY-MM-DD.log`. The trailing dot in
+/// the prefix is intentional: it disambiguates from the OCSF JSONL appender's
+/// `openshell-ocsf.YYYY-MM-DD.log`, which we never want to surface here (the
+/// JSONL is opt-in via `ocsf_json_enabled` and not the source of truth for
+/// `/v1/denials`).
+const SHORTHAND_LOG_PREFIX: &str = "openshell.";
+/// Defensive cap on per-line length returned to the agent so a pathological
+/// log entry (very long URL path, etc.) cannot blow up the response.
+const MAX_DENIAL_LINE_BYTES: usize = 4096;
 
 #[derive(Debug)]
 pub struct PolicyLocalContext {
     current_policy: Arc<RwLock<Option<ProtoSandboxPolicy>>>,
     gateway_endpoint: Option<String>,
     sandbox_name: Option<String>,
-    ocsf_log_dir: PathBuf,
+    shorthand_log_dir: PathBuf,
 }
 
 impl PolicyLocalContext {
@@ -64,7 +73,7 @@ impl PolicyLocalContext {
             current_policy,
             gateway_endpoint,
             sandbox_name,
-            PathBuf::from(OCSF_LOG_DIR),
+            PathBuf::from(LOG_DIR),
         )
     }
 
@@ -72,13 +81,13 @@ impl PolicyLocalContext {
         current_policy: Option<ProtoSandboxPolicy>,
         gateway_endpoint: Option<String>,
         sandbox_name: Option<String>,
-        ocsf_log_dir: PathBuf,
+        shorthand_log_dir: PathBuf,
     ) -> Self {
         Self {
             current_policy: Arc::new(RwLock::new(current_policy)),
             gateway_endpoint,
             sandbox_name,
-            ocsf_log_dir,
+            shorthand_log_dir,
         }
     }
 
@@ -188,19 +197,22 @@ async fn recent_denials_response(
     query: &str,
 ) -> (u16, serde_json::Value) {
     let limit = parse_last_query(query).unwrap_or(DEFAULT_DENIALS_LIMIT);
-    let log_dir = ctx.ocsf_log_dir.clone();
+    let log_dir = ctx.shorthand_log_dir.clone();
 
-    // Distinguish "OCSF JSONL is enabled and no denials happened" from "OCSF
-    // JSONL is disabled, so we have nothing to read." Without this flag the
-    // agent sees `[]` in both cases and cannot tell the difference.
+    // Distinguish "shorthand log exists and no denials happened" from "no log
+    // file yet, so we have nothing to read." Without this flag the agent sees
+    // `[]` in both cases and cannot tell the difference. The shorthand log is
+    // always-on (no setting gates it), so the only way `log_available=false`
+    // happens in practice is if the supervisor has not flushed any events to
+    // disk yet, or `/var/log` is not writable in this image.
     let log_available = matches!(
-        collect_ocsf_log_files(&log_dir, 1),
+        collect_shorthand_log_files(&log_dir, 1),
         Ok(files) if !files.is_empty()
     );
 
-    let denials = tokio::task::spawn_blocking(move || read_recent_denials(&log_dir, limit))
+    let denials = tokio::task::spawn_blocking(move || read_recent_denial_lines(&log_dir, limit))
         .await
-        .unwrap_or_else(|_| Vec::new());
+        .unwrap_or_default();
 
     let mut payload = serde_json::json!({
         "denials": denials,
@@ -208,7 +220,7 @@ async fn recent_denials_response(
     });
     if !log_available {
         payload["note"] = serde_json::json!(
-            "no OCSF JSONL log file is present; enable the `ocsf_json_enabled` sandbox setting to populate"
+            "no shorthand log file is present yet at /var/log/openshell.YYYY-MM-DD.log; the supervisor may not have emitted any events to disk yet"
         );
     }
 
@@ -233,49 +245,114 @@ fn parse_last_query(query: &str) -> Option<usize> {
     None
 }
 
-/// Walk the OCSF JSONL log files (most-recent first) and return up to `limit`
-/// summarized denial events in newest-first order.
+/// Walk the shorthand log files (most-recent first) and return up to `limit`
+/// raw denial lines in newest-first order. The agent receives the same
+/// human-readable text that `openshell logs` displays — no parsing back into
+/// structured form. Updating the shorthand format adds fields automatically;
+/// no schema rev required.
 ///
 /// Reads files synchronously and is intended to run inside `spawn_blocking`.
-fn read_recent_denials(log_dir: &Path, limit: usize) -> Vec<serde_json::Value> {
-    let Ok(files) = collect_ocsf_log_files(log_dir, DENIAL_LOG_FILES_TO_SCAN) else {
+fn read_recent_denial_lines(log_dir: &Path, limit: usize) -> Vec<String> {
+    let Ok(files) = collect_shorthand_log_files(log_dir, DENIAL_LOG_FILES_TO_SCAN) else {
         return Vec::new();
     };
 
-    let mut summaries: Vec<serde_json::Value> = Vec::with_capacity(limit);
+    let mut lines: Vec<String> = Vec::with_capacity(limit);
     for path in files {
         let Ok(contents) = std::fs::read_to_string(&path) else {
             continue;
         };
-        // Walk lines newest-first. Within a single file, last line written is
-        // the freshest event.
+        // Walk lines newest-first. Within a single file, the last line written
+        // is the freshest event.
         for line in contents.lines().rev() {
-            if line.is_empty() {
+            if !is_ocsf_denial_line(line) {
                 continue;
             }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            let Some(summary) = denial_summary_from_event(&value) else {
-                continue;
-            };
-            summaries.push(summary);
-            if summaries.len() >= limit {
-                return summaries;
+            // Defense-in-depth: redact query strings before truncation. The
+            // FORWARD deny path in `proxy.rs` populates the OCSF `message`
+            // and URL with the raw request path including `?query=...`, which
+            // the shorthand layer then renders verbatim. Stripping queries
+            // here means the agent never sees the secret even if an upstream
+            // emit site forgets to redact (TODO: harden the emit sites in
+            // proxy.rs FORWARD path so the on-disk shorthand log itself is
+            // clean — tracked separately). Redact first so truncation cannot
+            // slice mid-secret.
+            let redacted = redact_query_strings(line);
+            let surfaced = truncate_at_char_boundary(&redacted, MAX_DENIAL_LINE_BYTES);
+            lines.push(surfaced);
+            if lines.len() >= limit {
+                return lines;
             }
         }
     }
-    summaries
+    lines
 }
 
-fn collect_ocsf_log_files(log_dir: &Path, max_files: usize) -> std::io::Result<Vec<PathBuf>> {
+/// Replace any `?<query>` substring with `?[redacted]` to keep query-string
+/// secrets out of the agent's view. Walks per Unicode scalar value so multi-byte
+/// content is safe. A query is everything from `?` until the next whitespace or
+/// `]` (the shorthand format uses `[...]` for context tags).
+fn redact_query_strings(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '?' {
+            out.push('?');
+            out.push_str("[redacted]");
+            // Consume until whitespace or `]` (preserved as the next token's
+            // boundary by writing it back out).
+            for next in chars.by_ref() {
+                if next.is_whitespace() || next == ']' {
+                    out.push(next);
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Truncate `s` at the largest UTF-8 char boundary <= `max_bytes`, appending a
+/// `...[truncated]` suffix. Returning a `String` (not `&str`) avoids surprising
+/// callers about lifetime relationships with `s`.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + "...[truncated]".len());
+    out.push_str(&s[..end]);
+    out.push_str("...[truncated]");
+    out
+}
+
+/// True for OCSF denial events as rendered by the shorthand layer. The format
+/// is `<ISO ts> OCSF <CLASS:ACTIVITY> <[SEV]> <ACTION> ...`. The literal
+/// ` OCSF ` substring identifies an OCSF event (vs. a non-OCSF tracing line);
+/// ` DENIED ` is the OCSF action label uppercased and surrounded by spaces, so
+/// matching it is safe against substring collisions in URLs or hostnames.
+fn is_ocsf_denial_line(line: &str) -> bool {
+    line.contains(" OCSF ") && line.contains(" DENIED ")
+}
+
+fn collect_shorthand_log_files(
+    log_dir: &Path,
+    max_files: usize,
+) -> std::io::Result<Vec<PathBuf>> {
     let mut entries: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(log_dir)?
         .filter_map(std::result::Result::ok)
         .filter_map(|entry| {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if !name.starts_with(OCSF_LOG_PREFIX) {
+            // `openshell.YYYY-MM-DD.log` only — the trailing dot in the prefix
+            // disambiguates from `openshell-ocsf.YYYY-MM-DD.log`.
+            if !name.starts_with(SHORTHAND_LOG_PREFIX) || !name.ends_with(".log") {
                 return None;
             }
             let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
@@ -289,78 +366,6 @@ fn collect_ocsf_log_files(log_dir: &Path, max_files: usize) -> std::io::Result<V
         .take(max_files)
         .map(|(_, p)| p)
         .collect())
-}
-
-/// Convert an OCSF event into a compact denial summary, or `None` if the event
-/// is not a network/HTTP denial we want to surface to the agent.
-fn denial_summary_from_event(value: &serde_json::Value) -> Option<serde_json::Value> {
-    // OCSF action_id 2 = Denied. Filter aggressively to avoid leaking unrelated
-    // events (allowed connections, app lifecycle, etc.) into the agent's view.
-    if value.get("action_id").and_then(serde_json::Value::as_u64) != Some(2) {
-        return None;
-    }
-
-    let class_uid = value.get("class_uid").and_then(serde_json::Value::as_u64)?;
-    let layer = match class_uid {
-        4001 => "l4",
-        4002 => "l7",
-        _ => return None,
-    };
-
-    let mut summary = serde_json::Map::new();
-    summary.insert("layer".to_string(), serde_json::json!(layer));
-
-    if let Some(time) = value.get("time").and_then(serde_json::Value::as_i64) {
-        summary.insert("time_ms".to_string(), serde_json::json!(time));
-    }
-    // Deliberately do NOT echo `message` from the OCSF event. The proxy's
-    // shorthand denial messages can include the request path with query
-    // string (e.g., `?access_token=…`), which would expose secrets back to an
-    // in-sandbox agent that is by definition outside the trust boundary
-    // protecting that token. The structured fields below (host, port, method,
-    // path, binary, policy) carry everything the agent needs to draft a
-    // proposal, and `path` is sourced from `http_request.url.path` which
-    // already excludes the query string.
-    if let Some(dst) = value.get("dst_endpoint") {
-        if let Some(host) = dst
-            .get("hostname")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| dst.get("ip").and_then(serde_json::Value::as_str))
-        {
-            summary.insert("host".to_string(), serde_json::json!(host));
-        }
-        if let Some(port) = dst.get("port").and_then(serde_json::Value::as_u64) {
-            summary.insert("port".to_string(), serde_json::json!(port));
-        }
-    }
-    if let Some(req) = value.get("http_request") {
-        if let Some(method) = req.get("http_method").and_then(serde_json::Value::as_str) {
-            summary.insert("method".to_string(), serde_json::json!(method));
-        }
-        if let Some(url) = req.get("url")
-            && let Some(path) = url.get("path").and_then(serde_json::Value::as_str)
-        {
-            summary.insert("path".to_string(), serde_json::json!(path));
-        }
-    }
-    if let Some(binary) = value
-        .get("actor")
-        .and_then(|a| a.get("process"))
-        .and_then(|p| p.get("file"))
-        .and_then(|f| f.get("path"))
-        .and_then(serde_json::Value::as_str)
-    {
-        summary.insert("binary".to_string(), serde_json::json!(binary));
-    }
-    if let Some(rule) = value
-        .get("firewall_rule")
-        .and_then(|r| r.get("name"))
-        .and_then(serde_json::Value::as_str)
-    {
-        summary.insert("policy".to_string(), serde_json::json!(rule));
-    }
-
-    Some(serde_json::Value::Object(summary))
 }
 
 async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_json::Value) {
@@ -880,87 +885,42 @@ mod tests {
     }
 
     #[test]
-    fn denial_summary_filters_to_l4_l7_denied_only() {
-        let allowed = serde_json::json!({
-            "class_uid": 4001,
-            "action_id": 1,
-            "dst_endpoint": {"hostname": "api.github.com", "port": 443}
-        });
-        assert!(denial_summary_from_event(&allowed).is_none());
+    fn is_ocsf_denial_line_filters_correctly() {
+        // OCSF denial — match.
+        assert!(is_ocsf_denial_line(
+            "2026-05-06T17:02:00.000Z OCSF HTTP:PUT [MED] DENIED PUT http://api.github.com:443/x [policy:p engine:l7]"
+        ));
+        assert!(is_ocsf_denial_line(
+            "2026-05-06T17:02:00.000Z OCSF NET:OPEN [MED] DENIED curl(42) -> blocked.com:443 [policy:- engine:opa]"
+        ));
 
-        let unrelated = serde_json::json!({
-            "class_uid": 6002,
-            "action_id": 2,
-            "message": "supervisor lifecycle"
-        });
-        assert!(denial_summary_from_event(&unrelated).is_none());
+        // OCSF allowed — must not match.
+        assert!(!is_ocsf_denial_line(
+            "2026-05-06T17:02:00.000Z OCSF NET:OPEN [INFO] ALLOWED curl(42) -> api.example.com:443"
+        ));
 
-        let l4_denied = serde_json::json!({
-            "class_uid": 4001,
-            "action_id": 2,
-            "time": 1_742_054_400_000_i64,
-            "message": "CONNECT denied api.github.com:443",
-            "dst_endpoint": {"hostname": "api.github.com", "port": 443},
-            "actor": {"process": {"file": {"path": "/usr/bin/curl"}}},
-            "firewall_rule": {"name": "github-readonly"}
-        });
-        let summary = denial_summary_from_event(&l4_denied).unwrap();
-        assert_eq!(summary["layer"], "l4");
-        assert_eq!(summary["host"], "api.github.com");
-        assert_eq!(summary["port"], 443);
-        assert_eq!(summary["binary"], "/usr/bin/curl");
-        assert_eq!(summary["policy"], "github-readonly");
-        assert_eq!(summary["time_ms"], 1_742_054_400_000_i64);
+        // Non-OCSF tracing line — must not match even if it contains the word DENIED.
+        assert!(!is_ocsf_denial_line(
+            "2026-05-06T17:02:00.000Z INFO some::module: request DENIED in upstream"
+        ));
 
-        let l7_denied = serde_json::json!({
-            "class_uid": 4002,
-            "action_id": 2,
-            "message": "FORWARD denied PUT /repos/foo/bar/contents/x",
-            "dst_endpoint": {"hostname": "api.github.com", "port": 443},
-            "http_request": {
-                "http_method": "PUT",
-                "url": {"path": "/repos/foo/bar/contents/x"}
-            }
-        });
-        let summary = denial_summary_from_event(&l7_denied).unwrap();
-        assert_eq!(summary["layer"], "l7");
-        assert_eq!(summary["method"], "PUT");
-        assert_eq!(summary["path"], "/repos/foo/bar/contents/x");
+        // Empty line — must not match.
+        assert!(!is_ocsf_denial_line(""));
     }
 
     #[tokio::test]
-    async fn recent_denials_returns_newest_first_from_jsonl_files() {
+    async fn recent_denials_returns_newest_first_from_shorthand_lines() {
         let dir = tempfile::tempdir().unwrap();
-        let log_path = dir.path().join("openshell-ocsf.2026-05-04.log");
-        let lines = [
-            serde_json::json!({
-                "class_uid": 4001,
-                "action_id": 2,
-                "time": 1,
-                "message": "first",
-                "dst_endpoint": {"hostname": "first.example", "port": 443}
-            }),
-            // An allowed event mixed in — must be filtered out.
-            serde_json::json!({
-                "class_uid": 4001,
-                "action_id": 1,
-                "time": 2,
-                "dst_endpoint": {"hostname": "ok.example", "port": 443}
-            }),
-            serde_json::json!({
-                "class_uid": 4002,
-                "action_id": 2,
-                "time": 3,
-                "message": "second",
-                "dst_endpoint": {"hostname": "second.example", "port": 443},
-                "http_request": {"http_method": "PUT", "url": {"path": "/x"}}
-            }),
-        ];
-        let body: String = lines
-            .iter()
-            .map(|v| format!("{v}\n"))
-            .collect::<Vec<_>>()
-            .concat();
+        let log_path = dir.path().join("openshell.2026-05-06.log");
+        // Mixed file: allowed events, non-OCSF info lines, two denials.
+        // Lines are written in chronological order; reader walks newest-first.
+        let body = "\
+2026-05-06T17:02:00.000Z OCSF NET:OPEN [INFO] ALLOWED curl(10) -> api.example.com:443 [policy:default engine:opa]
+2026-05-06T17:02:01.000Z INFO some::module: routine status check
+2026-05-06T17:02:02.000Z OCSF HTTP:GET [MED] DENIED GET http://blocked.example/v1/data [policy:default-deny engine:l7]
+2026-05-06T17:02:03.000Z OCSF NET:OPEN [INFO] ALLOWED curl(11) -> api.example.com:443
+2026-05-06T17:02:04.000Z OCSF HTTP:PUT [MED] DENIED PUT http://api.github.com:443/repos/x/y/contents/z [policy:gh_readonly engine:l7]
+";
         std::fs::write(&log_path, body).unwrap();
 
         let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf());
@@ -970,12 +930,35 @@ mod tests {
         let denials = payload["denials"].as_array().unwrap();
         assert_eq!(denials.len(), 2);
         // Newest first.
-        assert_eq!(denials[0]["host"], "second.example");
-        assert_eq!(denials[1]["host"], "first.example");
+        assert!(denials[0].as_str().unwrap().contains("HTTP:PUT"));
         assert!(
-            denials[0].get("message").is_none(),
-            "denial summaries must not echo the OCSF `message` field; it can leak credentials in query strings"
+            denials[0]
+                .as_str()
+                .unwrap()
+                .contains("/repos/x/y/contents/z")
         );
+        assert!(denials[1].as_str().unwrap().contains("HTTP:GET"));
+        assert!(denials[1].as_str().unwrap().contains("blocked.example"));
+    }
+
+    #[tokio::test]
+    async fn recent_denials_skips_jsonl_log_files() {
+        // The shorthand reader must not surface `openshell-ocsf.*.log` content
+        // even if a deny-looking line is present, so the response stays
+        // independent of the JSONL appender's enabled state.
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("openshell-ocsf.2026-05-06.log");
+        std::fs::write(
+            &jsonl,
+            r#"{"class_uid":4002,"action_id":2,"message":"DENIED","time":1}"#,
+        )
+        .unwrap();
+
+        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf());
+        let (status, payload) = recent_denials_response(&ctx, "").await;
+        assert_eq!(status, 200);
+        assert_eq!(payload["log_available"], false);
+        assert_eq!(payload["denials"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -990,28 +973,67 @@ mod tests {
             payload["note"]
                 .as_str()
                 .unwrap()
-                .contains("ocsf_json_enabled")
+                .contains("/var/log/openshell.")
         );
     }
 
     #[test]
-    fn denial_summary_does_not_leak_message_field() {
-        // OCSF `message` strings can include the request path with query
-        // (e.g., `?access_token=…`); the summary must drop them.
-        let evt = serde_json::json!({
-            "class_uid": 4002,
-            "action_id": 2,
-            "message": "FORWARD denied PUT api.github.com:443/x?access_token=secret-token",
-            "dst_endpoint": {"hostname": "api.github.com", "port": 443},
-            "http_request": {"http_method": "PUT", "url": {"path": "/x"}}
-        });
-        let summary = denial_summary_from_event(&evt).unwrap();
-        assert_eq!(summary["path"], "/x");
-        assert!(summary.get("message").is_none());
-        assert!(
-            !summary.to_string().contains("secret-token"),
-            "summary must not include credentials from the source message"
+    fn redact_query_strings_removes_query_from_url_token() {
+        let line = "2026-05-06T17:02:00.000Z OCSF HTTP:PUT [MED] DENIED PUT http://api.github.com/x?access_token=secret-token-1234 [policy:p engine:l7]";
+        let redacted = redact_query_strings(line);
+        assert!(!redacted.contains("secret-token-1234"));
+        assert!(!redacted.contains("access_token"));
+        assert!(redacted.contains("?[redacted]"));
+        // Bracketed tag after the URL preserved.
+        assert!(redacted.contains("[policy:p engine:l7]"));
+    }
+
+    #[test]
+    fn redact_query_strings_removes_query_in_reason_tag() {
+        // The FORWARD deny path's `message` becomes `[reason:...]` and may
+        // include a path with query string lacking a `://` prefix.
+        let line = "2026-05-06T17:02:00.000Z OCSF HTTP:PUT [MED] DENIED PUT http://api.github.com/x [policy:p engine:opa] [reason:FORWARD denied PUT api.github.com:443/x?token=secret-456]";
+        let redacted = redact_query_strings(line);
+        assert!(!redacted.contains("secret-456"));
+        assert!(!redacted.contains("token=secret"));
+        assert!(redacted.contains("?[redacted]]"));
+    }
+
+    #[test]
+    fn redact_query_strings_handles_multibyte_chars() {
+        let line = "ÜLÅUTF8 ? secret-x [policy:p]";
+        // No `?<nonspace>` here, so no redaction — but must not panic.
+        let _ = redact_query_strings(line);
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_does_not_panic_on_multibyte() {
+        // 4-byte emoji sequence so byte-naive slicing would panic.
+        let s = "🚀".repeat(2000); // 8000 bytes
+        let truncated = truncate_at_char_boundary(&s, 4096);
+        assert!(truncated.len() <= 4096 + "...[truncated]".len());
+        assert!(truncated.ends_with("...[truncated]"));
+        // Result must be valid UTF-8 — implicit if we return without panic.
+    }
+
+    #[tokio::test]
+    async fn recent_denials_truncates_pathological_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("openshell.2026-05-06.log");
+        // A single OCSF denial line exceeding MAX_DENIAL_LINE_BYTES.
+        let huge_path = "/".to_string() + &"a".repeat(MAX_DENIAL_LINE_BYTES + 100);
+        let line = format!(
+            "2026-05-06T17:02:00.000Z OCSF HTTP:PUT [MED] DENIED PUT http://x{huge_path} [policy:p engine:l7]\n"
         );
+        std::fs::write(&log_path, line).unwrap();
+
+        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf());
+        let (_, payload) = recent_denials_response(&ctx, "last=1").await;
+        let denials = payload["denials"].as_array().unwrap();
+        assert_eq!(denials.len(), 1);
+        let surfaced = denials[0].as_str().unwrap();
+        assert!(surfaced.len() <= MAX_DENIAL_LINE_BYTES + "...[truncated]".len());
+        assert!(surfaced.ends_with("...[truncated]"));
     }
 
     #[tokio::test]
