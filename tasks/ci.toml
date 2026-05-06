@@ -5,7 +5,7 @@
 
 [build]
 description = "Build the whole project"
-depends = ["build:rust:workspace", "build:docker", "build:python:wheel"]
+depends = ["build:rust:workspace", "build:container", "build:python:wheel"]
 
 ["build:rust"]
 description = "Alias for build:rust:workspace"

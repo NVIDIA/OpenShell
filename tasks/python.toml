@@ -174,8 +174,10 @@ CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "$CACHE_SCOPE_INPUT" | sha256_16_stdin)
 
 mkdir -p target/wheels
 
+CONTAINERFILE=$(ce_resolve_containerfile deploy/docker python-wheels-macos)
+
 ce build \
-  -f deploy/docker/Dockerfile.python-wheels-macos \
+  -f "${CONTAINERFILE}" \
   --target wheels \
   --build-arg "OSXCROSS_IMAGE=${OSXCROSS_IMAGE_REF}" \
   --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}" \
