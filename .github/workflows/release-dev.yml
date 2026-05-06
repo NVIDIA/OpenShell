@@ -883,6 +883,23 @@ jobs:
             release/openshell-gateway-checksums-sha256.txt
             release/openshell-sandbox-checksums-sha256.txt
 
+  release-helm:
+    name: Release Helm Chart (OCI, dev)
+    needs: [tag-ghcr-dev]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/release-helm-oci
+        with:
+          chart-version: 0.0.0-dev
+          app-version: dev
+          release-kind: dev
+          pin-sha: ${{ github.sha }}
+
   trigger-wheel-publish:
     name: Trigger Wheel Publish
     needs: [compute-versions, release-dev]
