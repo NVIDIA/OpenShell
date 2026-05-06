@@ -21,7 +21,7 @@ Both are required to merge once the corresponding `E2E Gate` checks are marked r
 
 copy-pr-bot decides whether to mirror a PR automatically based on whether the author is trusted. For org members and collaborators, "trusted" means **all commits in the PR are cryptographically signed**. Unsigned commits, even from an org member, force the bot to wait for a maintainer's `/ok to test <SHA>`.
 
-DCO sign-off (`-s` / `Signed-off-by`) is a separate requirement and does not count as commit signing.
+DCO sign-off (`-s` / `Signed-off-by`) is a separate requirement and does not count as commit signing. Dependabot-authored dependency update PRs are allowlisted in DCO Assistant because the bot cannot sign commits.
 
 ### One-time setup with an SSH key
 
