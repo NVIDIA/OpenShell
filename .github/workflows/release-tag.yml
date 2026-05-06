@@ -385,7 +385,7 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx build \
-            --file deploy/docker/Dockerfile.cli-macos \
+            --file deploy/container/Dockerfile.cli-macos \
             --build-arg OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" \
             --build-arg OPENSHELL_IMAGE_TAG="${{ needs.compute-versions.outputs.semver }}" \
             --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
@@ -631,7 +631,7 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx build \
-            --file deploy/docker/Dockerfile.gateway-macos \
+            --file deploy/container/Dockerfile.gateway-macos \
             --build-arg OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" \
             --build-arg OPENSHELL_IMAGE_TAG="${{ needs.compute-versions.outputs.semver }}" \
             --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \

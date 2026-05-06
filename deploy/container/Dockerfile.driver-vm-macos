@@ -13,7 +13,7 @@
 # include_bytes!().
 #
 # Usage:
-#   docker buildx build -f deploy/docker/Dockerfile.driver-vm-macos \
+#   docker buildx build -f deploy/container/Dockerfile.driver-vm-macos \
 #     --build-arg OPENSHELL_CARGO_VERSION=0.6.0 \
 #     --build-context vm-runtime-compressed=/path/to/compressed-dir \
 #     --output type=local,dest=out/ .

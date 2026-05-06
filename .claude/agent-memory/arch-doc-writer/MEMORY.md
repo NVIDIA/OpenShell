@@ -62,7 +62,7 @@
 - Four runtime images: sandbox (5 stages), gateway (2 stages), cluster (k3s base), pki-job (Alpine)
 - Two build-only images: python-wheels (Linux multi-arch), python-wheels-macos (osxcross cross-compile)
 - CI image: Dockerfile.ci (Ubuntu 24.04, pre-installs docker/buildx/aws/kubectl/helm/mise/uv/sccache/socat)
-- Cross-compilation: `deploy/docker/cross-build.sh` shared by sandbox + gateway Dockerfiles
+- Cross-compilation: `deploy/container/cross-build.sh` shared by sandbox + gateway Dockerfiles
 - Sandbox image has coding-agents stage: Claude CLI (native installer), OpenCode, Codex (npm)
 - Helm chart deploys a StatefulSet (NOT Deployment), PVC 1Gi at /var/openshell
 - Cluster image does NOT bundle image tarballs -- components pulled at runtime from distribution registry

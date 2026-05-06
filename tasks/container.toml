@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Container image build tasks (engine-neutral: Docker or Podman)
+# build:docker:* and docker:* names are kept as aliases for backwards compatibility.
+
+["build:container"]
+description = "Build all container images"
+alias = "build:docker"
+depends = [
+  "build:container:gateway",
+  "build:container:supervisor",
+]
+hide = true
+
+["build:container:ci"]
+description = "Build the CI container image"
+alias = "build:docker:ci"
+run = "tasks/scripts/container-build-ci.sh"
+hide = true
+
+["build:container:gateway"]
+description = "Build the gateway container image"
+alias = ["build:docker:gateway", "docker:build:gateway"]
+run = "tasks/scripts/container-build-image.sh gateway"
+hide = true
+
+["build:container:supervisor"]
+description = "Build the standalone supervisor container image (Ubuntu-based, for K8s pods)"
+alias = ["build:docker:supervisor", "docker:build:supervisor"]
+run = "tasks/scripts/container-build-image.sh supervisor"
+hide = true
+
+["build:container:multiarch"]
+description = "Build multi-arch gateway and supervisor images and push to a registry"
+alias = ["build:docker:multiarch", "docker:build:multiarch"]
+run = "tasks/scripts/container-publish-multiarch.sh"
+hide = true
+
+["build:container:prebuilt"]
+description = "Build and stage Rust binaries consumed by container image builds"
+alias = "build:docker:prebuilt"
+run = "tasks/scripts/stage-prebuilt-binaries.sh all"
+hide = true
+
+["container:cleanup"]
+description = "Remove stale images, volumes, and build cache not used by the current deployments"
+alias = "docker:cleanup"
+run = "scripts/container-cleanup.sh --force"
+
+["container:cleanup:dry-run"]
+description = "Preview what container:cleanup would remove without deleting anything"
+alias = "docker:cleanup:dry-run"
+run = "scripts/container-cleanup.sh --dry-run"
