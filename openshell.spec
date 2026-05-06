@@ -19,7 +19,7 @@
 
 Name:           openshell
 Version:        0.0.37
-Release:        1.20260505163856492034.rpm.108.g82598241%{?dist}
+Release:        1.20260506170246815148.rpm.dev.106.g99e94469%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
@@ -162,7 +162,7 @@ Environment=OPENSHELL_BIND_ADDRESS=0.0.0.0
 Environment=OPENSHELL_DRIVERS=podman
 Environment=OPENSHELL_DB_URL=sqlite://%%S/openshell/gateway.db
 Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:%{image_tag}
-Environment=OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:%{image_tag}
+Environment=OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 # mTLS: auto-generated certs in the state directory.
 Environment=OPENSHELL_TLS_CERT=%%S/openshell/tls/server/tls.crt
 Environment=OPENSHELL_TLS_KEY=%%S/openshell/tls/server/tls.key
@@ -193,7 +193,7 @@ install -pm 0755 deploy/rpm/init-gateway-env.sh %{buildroot}%{_libexecdir}/%{nam
 # Patch commented image defaults to match the build type (dev or latest).
 # The source file uses :latest as a generic reference; the installed copy
 # reflects what this RPM actually expects from the registry.
-sed -i 's/:latest/:%{image_tag}/g' %{buildroot}%{_libexecdir}/%{name}/init-gateway-env.sh
+sed -i 's|supervisor:latest|supervisor:%{image_tag}|' %{buildroot}%{_libexecdir}/%{name}/init-gateway-env.sh
 
 # --- Gateway documentation ---
 install -d %{buildroot}%{_docdir}/%{name}-gateway
@@ -221,7 +221,7 @@ install -d %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.di
 cat > %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-info/METADATA << EOF
 Metadata-Version: 2.1
 Name: %{name}
-Version: %{openshell_python_version}
+Version: 0.0.37
 Summary: OpenShell Python SDK for agent execution and management
 License: Apache-2.0
 Requires-Python: >=3.12
