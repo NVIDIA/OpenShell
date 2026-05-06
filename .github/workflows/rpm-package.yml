@@ -33,6 +33,7 @@ jobs:
   build-rpm-linux:
     name: Build RPM Package (Linux ${{ matrix.arch }})
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x86_64
@@ -75,16 +76,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          for rpm_dir in "$HOME/rpmbuild/RPMS" "$PWD/${{ matrix.arch }}"; do
-            if [ -d "$rpm_dir" ]; then
-              find "$rpm_dir" -type f -name '*.rpm' -exec cp {} artifacts/ \;
-            fi
-          done
-          if ! compgen -G 'artifacts/*.rpm' > /dev/null; then
-            echo "::error::No RPM artifacts found"
-            find "$PWD" -maxdepth 3 -type f -name '*.rpm' -print
+          mapfile -t rpms < <(find "$GITHUB_WORKSPACE" -maxdepth 3 -type f -name '*.rpm' ! -name '*.src.rpm' | sort)
+          if [ "${#rpms[@]}" -eq 0 ]; then
+            echo "::error::No RPM artifacts found under $GITHUB_WORKSPACE"
+            find "$GITHUB_WORKSPACE" -maxdepth 3 -type f | sort
             exit 1
           fi
+          cp "${rpms[@]}" artifacts/
           echo "=== Built RPMs ==="
           ls -lah artifacts/
 
