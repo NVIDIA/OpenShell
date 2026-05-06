@@ -49,6 +49,35 @@ flowchart TB
 5. Agent network traffic goes through the sandbox proxy. The proxy allows, denies, inspects, or routes requests according to policy and inference configuration.
 6. Connect, exec, and file sync traffic use a gateway relay to the sandbox supervisor. The gateway does not require direct inbound access to sandbox workloads.
 
+## Driver Philosophy
+
+OpenShell should integrate with the compute ecosystem instead of replacing it.
+Drivers adapt Docker, Podman, Kubernetes, and VM runtimes to a common sandbox
+contract, while those runtimes keep ownership of scheduling, image management,
+storage primitives, GPU/device exposure, and platform lifecycle.
+
+Drivers should stay thin:
+
+- Translate OpenShell sandbox specs into native runtime objects.
+- Inject the supervisor, sandbox identity, callback configuration, and runtime
+  credentials needed by the supervisor.
+- Report lifecycle and platform events back through the shared driver contract.
+- Preserve native runtime behavior unless it conflicts with the sandbox security
+  contract.
+
+The supervisor is where OpenShell-specific enforcement belongs. Filesystem
+policy, process privilege reduction, network proxying, inference interception,
+credential injection, log emission, and gateway relay behavior should be
+consistent across runtimes. If a runtime needs special handling, keep that logic
+inside the driver or crate README rather than leaking it into the core sandbox
+model.
+
+When adding a new runtime, prefer native APIs and conventions over bespoke
+orchestration. The driver should make OpenShell feel like a well-behaved member
+of that ecosystem: observable through standard tools, compatible with existing
+image and device workflows, and clear about the small set of assumptions
+OpenShell requires.
+
 ## Architecture Docs
 
 Architecture docs are short subsystem overviews. User-facing how-to content
