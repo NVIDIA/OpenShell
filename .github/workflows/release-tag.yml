@@ -815,6 +815,24 @@ jobs:
         working-directory: ./fern
         run: fern generate --docs
 
+  release-helm:
+    name: Release Helm Chart (OCI)
+    needs: [compute-versions, tag-ghcr-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: ./.github/actions/release-helm-oci
+        with:
+          chart-version: ${{ needs.compute-versions.outputs.semver }}
+          app-version: ${{ needs.compute-versions.outputs.semver }}
+          release-kind: public
+
   trigger-wheel-publish:
     name: Trigger Wheel Publish
     needs: [compute-versions, release]
