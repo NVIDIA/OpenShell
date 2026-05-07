@@ -13,11 +13,13 @@ use crate::ServerState;
 use crate::persistence::{ObjectType, generate_name};
 use futures::future;
 use openshell_core::proto::{
-    CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteSandboxRequest,
-    DeleteSandboxResponse, ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest,
-    ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest, ListSandboxesRequest,
-    ListSandboxesResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
-    SandboxStreamEvent, WatchSandboxRequest,
+    AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateSandboxRequest,
+    CreateSshSessionRequest, CreateSshSessionResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent, ExecSandboxExit,
+    ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
+    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
+    ListSandboxesResponse, Provider, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    SandboxResponse, SandboxStreamEvent, WatchSandboxRequest,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use prost::Message;
@@ -31,12 +33,12 @@ use tracing::{info, warn};
 use russh::ChannelMsg;
 use russh::client::AuthResult;
 
-use super::provider::is_valid_env_key;
+use super::provider::{get_provider_record, is_valid_env_key};
 use super::validation::{
     level_matches, source_matches, validate_exec_request_fields, validate_policy_safety,
     validate_sandbox_spec,
 };
-use super::{MAX_PAGE_SIZE, clamp_limit, current_time_ms};
+use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, clamp_limit, current_time_ms};
 
 // ---------------------------------------------------------------------------
 // Sandbox lifecycle handlers
@@ -66,7 +68,7 @@ pub(super) async fn handle_create_sandbox(
     for name in &spec.providers {
         state
             .store
-            .get_message_by_name::<openshell_core::proto::Provider>(name)
+            .get_message_by_name::<Provider>(name)
             .await
             .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
@@ -192,6 +194,130 @@ pub(super) async fn handle_list_sandboxes(
     Ok(Response::new(ListSandboxesResponse { sandboxes }))
 }
 
+pub(super) async fn handle_list_sandbox_providers(
+    state: &Arc<ServerState>,
+    request: Request<ListSandboxProvidersRequest>,
+) -> Result<Response<ListSandboxProvidersResponse>, Status> {
+    let sandbox = sandbox_by_name(state, &request.into_inner().sandbox_name).await?;
+    let providers = providers_for_sandbox(state, &sandbox).await?;
+    Ok(Response::new(ListSandboxProvidersResponse { providers }))
+}
+
+pub(super) async fn handle_attach_sandbox_provider(
+    state: &Arc<ServerState>,
+    request: Request<AttachSandboxProviderRequest>,
+) -> Result<Response<AttachSandboxProviderResponse>, Status> {
+    let request = request.into_inner();
+    if request.provider_name.is_empty() {
+        return Err(Status::invalid_argument("provider_name is required"));
+    }
+
+    get_provider_record(state.store.as_ref(), &request.provider_name)
+        .await
+        .map_err(|err| {
+            if err.code() == tonic::Code::NotFound {
+                Status::failed_precondition(format!(
+                    "provider '{}' not found",
+                    request.provider_name
+                ))
+            } else {
+                err
+            }
+        })?;
+
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let mut sandbox = sandbox_by_name(state, &request.sandbox_name).await?;
+    let sandbox_name = sandbox
+        .metadata
+        .as_ref()
+        .map_or_else(String::new, |metadata| metadata.name.clone());
+    let spec = sandbox
+        .spec
+        .as_mut()
+        .ok_or_else(|| Status::failed_precondition("sandbox spec is missing"))?;
+
+    dedupe_provider_names(&mut spec.providers);
+    let attached = if spec
+        .providers
+        .iter()
+        .any(|name| name == &request.provider_name)
+    {
+        false
+    } else {
+        if spec.providers.len() >= MAX_PROVIDERS {
+            return Err(Status::invalid_argument(format!(
+                "providers list exceeds maximum ({MAX_PROVIDERS})"
+            )));
+        }
+        spec.providers.push(request.provider_name.clone());
+        true
+    };
+    validate_sandbox_spec(&sandbox_name, spec)?;
+
+    state
+        .store
+        .put_message(&sandbox)
+        .await
+        .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
+
+    info!(
+        sandbox_name = %request.sandbox_name,
+        provider_name = %request.provider_name,
+        attached,
+        "AttachSandboxProvider request completed successfully"
+    );
+
+    Ok(Response::new(AttachSandboxProviderResponse {
+        sandbox: Some(sandbox),
+        attached,
+    }))
+}
+
+pub(super) async fn handle_detach_sandbox_provider(
+    state: &Arc<ServerState>,
+    request: Request<DetachSandboxProviderRequest>,
+) -> Result<Response<DetachSandboxProviderResponse>, Status> {
+    let request = request.into_inner();
+    if request.provider_name.is_empty() {
+        return Err(Status::invalid_argument("provider_name is required"));
+    }
+
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let mut sandbox = sandbox_by_name(state, &request.sandbox_name).await?;
+    let sandbox_name = sandbox
+        .metadata
+        .as_ref()
+        .map_or_else(String::new, |metadata| metadata.name.clone());
+    let spec = sandbox
+        .spec
+        .as_mut()
+        .ok_or_else(|| Status::failed_precondition("sandbox spec is missing"))?;
+
+    let before_len = spec.providers.len();
+    spec.providers.retain(|name| name != &request.provider_name);
+    let detached = spec.providers.len() != before_len;
+    dedupe_provider_names(&mut spec.providers);
+    validate_sandbox_spec(&sandbox_name, spec)?;
+
+    state
+        .store
+        .put_message(&sandbox)
+        .await
+        .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
+
+    info!(
+        sandbox_name = %request.sandbox_name,
+        provider_name = %request.provider_name,
+        detached,
+        "DetachSandboxProvider request completed successfully"
+    );
+
+    Ok(Response::new(DetachSandboxProviderResponse {
+        sandbox: Some(sandbox),
+        detached,
+    }))
+}
+
 pub(super) async fn handle_delete_sandbox(
     state: &Arc<ServerState>,
     request: Request<DeleteSandboxRequest>,
@@ -204,6 +330,56 @@ pub(super) async fn handle_delete_sandbox(
     let deleted = state.compute.delete_sandbox(&name).await?;
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
     Ok(Response::new(DeleteSandboxResponse { deleted }))
+}
+
+async fn sandbox_by_name(state: &Arc<ServerState>, name: &str) -> Result<Sandbox, Status> {
+    if name.is_empty() {
+        return Err(Status::invalid_argument("sandbox_name is required"));
+    }
+
+    state
+        .store
+        .get_message_by_name::<Sandbox>(name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))
+}
+
+async fn providers_for_sandbox(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+) -> Result<Vec<Provider>, Status> {
+    let provider_names = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.as_slice())
+        .ok_or_else(|| Status::failed_precondition("sandbox spec is missing"))?;
+
+    let mut providers = Vec::with_capacity(provider_names.len());
+    for name in provider_names {
+        let provider = get_provider_record(state.store.as_ref(), name)
+            .await
+            .map_err(|err| {
+                if err.code() == tonic::Code::NotFound {
+                    Status::failed_precondition(format!("provider '{name}' not found"))
+                } else {
+                    err
+                }
+            })?;
+        providers.push(provider);
+    }
+    Ok(providers)
+}
+
+fn dedupe_provider_names(provider_names: &mut Vec<String>) {
+    let mut index = 0;
+    while index < provider_names.len() {
+        if provider_names[..index].contains(&provider_names[index]) {
+            provider_names.remove(index);
+        } else {
+            index += 1;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -938,6 +1114,15 @@ async fn run_exec_with_russh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compute::new_test_runtime;
+    use crate::persistence::Store;
+    use crate::sandbox_index::SandboxIndex;
+    use crate::sandbox_watch::SandboxWatchBus;
+    use crate::supervisor_session::SupervisorSessionRegistry;
+    use crate::tracing_bus::TracingLogBus;
+    use openshell_core::Config;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use std::collections::HashMap;
 
     // ---- shell_escape ----
 
@@ -1065,5 +1250,242 @@ mod tests {
                 "fallback name should be all lowercase: {name}"
             );
         }
+    }
+
+    async fn test_server_state() -> Arc<ServerState> {
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let compute = new_test_runtime(store.clone()).await;
+        Arc::new(ServerState::new(
+            Config::new(None)
+                .with_database_url("sqlite::memory:")
+                .with_ssh_handshake_secret("test-secret"),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        ))
+    }
+
+    fn test_provider(name: &str, provider_type: &str) -> Provider {
+        Provider {
+            metadata: Some(ObjectMeta {
+                id: format!("provider-{name}"),
+                name: name.to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+            }),
+            r#type: provider_type.to_string(),
+            credentials: std::iter::once(("TOKEN".to_string(), "secret".to_string())).collect(),
+            config: HashMap::new(),
+        }
+    }
+
+    fn test_sandbox(name: &str, providers: Vec<String>) -> Sandbox {
+        Sandbox {
+            metadata: Some(ObjectMeta {
+                id: format!("sandbox-{name}"),
+                name: name.to_string(),
+                created_at_ms: 1_000_000,
+                labels: std::iter::once(("team".to_string(), "agents".to_string())).collect(),
+            }),
+            spec: Some(openshell_core::proto::SandboxSpec {
+                log_level: "debug".to_string(),
+                policy: Some(openshell_core::proto::SandboxPolicy::default()),
+                providers,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            current_policy_version: 7,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_sandbox_provider_persists_current_provider_list() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+
+        let response = handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "work-github".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(response.attached);
+        let sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap();
+        let spec = sandbox.spec.unwrap();
+        assert_eq!(spec.providers, vec!["work-github"]);
+        assert_eq!(spec.log_level, "debug");
+        assert_eq!(sandbox.phase, SandboxPhase::Ready as i32);
+        assert_eq!(sandbox.current_policy_version, 7);
+    }
+
+    #[tokio::test]
+    async fn attach_sandbox_provider_is_idempotent_and_avoids_duplicates() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "work",
+                vec!["work-github".to_string(), "work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "work-github".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.attached);
+        let providers = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap()
+            .spec
+            .unwrap()
+            .providers;
+        assert_eq!(providers, vec!["work-github"]);
+    }
+
+    #[tokio::test]
+    async fn detach_sandbox_provider_is_idempotent_and_removes_all_matches() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "work",
+                vec![
+                    "work-github".to_string(),
+                    "other".to_string(),
+                    "work-github".to_string(),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_detach_sandbox_provider(
+            &state,
+            Request::new(DetachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "work-github".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(response.detached);
+        let providers = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap()
+            .spec
+            .unwrap()
+            .providers;
+        assert_eq!(providers, vec!["other"]);
+
+        let response = handle_detach_sandbox_provider(
+            &state,
+            Request::new(DetachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "work-github".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!response.detached);
+    }
+
+    #[tokio::test]
+    async fn list_sandbox_providers_returns_attached_provider_records() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", vec!["work-github".to_string()]))
+            .await
+            .unwrap();
+
+        let response = handle_list_sandbox_providers(
+            &state,
+            Request::new(ListSandboxProvidersRequest {
+                sandbox_name: "work".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.providers.len(), 1);
+        assert_eq!(response.providers[0].r#type, "github");
+        assert_eq!(
+            response.providers[0].credentials.get("TOKEN"),
+            Some(&"REDACTED".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_sandbox_provider_validates_provider_exists() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+
+        let err = handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "missing".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 }

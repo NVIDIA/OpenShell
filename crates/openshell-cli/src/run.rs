@@ -25,18 +25,19 @@ use openshell_bootstrap::{
 };
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
-    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
-    CreateProviderRequest, CreateSandboxRequest, DeleteProviderProfileRequest,
-    DeleteProviderRequest, DeleteSandboxRequest, ExecSandboxRequest, GetClusterInferenceRequest,
+    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
+    ClearDraftChunksRequest, CreateProviderRequest, CreateSandboxRequest,
+    DeleteProviderProfileRequest, DeleteProviderRequest, DeleteSandboxRequest,
+    DetachSandboxProviderRequest, ExecSandboxRequest, GetClusterInferenceRequest,
     GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
     GetProviderProfileRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
     GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ImportProviderProfilesRequest,
     LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource, PolicyStatus, Provider,
-    ProviderProfile, ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
-    Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, SetClusterInferenceRequest,
-    SettingScope, SettingValue, UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest,
-    exec_sandbox_event, setting_value,
+    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest, PolicySource,
+    PolicyStatus, Provider, ProviderProfile, ProviderProfileDiagnostic, ProviderProfileImportItem,
+    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
+    SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
+    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -2510,6 +2511,143 @@ pub async fn sandbox_list(
     }
 
     Ok(())
+}
+
+pub async fn sandbox_provider_list(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .list_sandbox_providers(ListSandboxProvidersRequest {
+            sandbox_name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    let providers = response.into_inner().providers;
+
+    if providers.is_empty() {
+        println!("No providers attached to sandbox {name}.");
+        return Ok(());
+    }
+
+    print_provider_attachment_table(&providers);
+    Ok(())
+}
+
+pub async fn sandbox_provider_attach(
+    server: &str,
+    name: &str,
+    provider: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .attach_sandbox_provider(AttachSandboxProviderRequest {
+            sandbox_name: name.to_string(),
+            provider_name: provider.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if response.attached {
+        println!(
+            "{} Attached provider {} to sandbox {}",
+            "✓".green().bold(),
+            provider,
+            name
+        );
+    } else {
+        println!("Provider {provider} is already attached to sandbox {name}.");
+    }
+    Ok(())
+}
+
+pub async fn sandbox_provider_detach(
+    server: &str,
+    name: &str,
+    provider: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .detach_sandbox_provider(DetachSandboxProviderRequest {
+            sandbox_name: name.to_string(),
+            provider_name: provider.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if response.detached {
+        println!(
+            "{} Detached provider {} from sandbox {}",
+            "✓".green().bold(),
+            provider,
+            name
+        );
+    } else {
+        println!("Provider {provider} was not attached to sandbox {name}.");
+    }
+    Ok(())
+}
+
+fn print_provider_attachment_table(providers: &[Provider]) {
+    print!("{}", format_provider_attachment_table(providers, true));
+}
+
+fn format_provider_attachment_table(providers: &[Provider], color: bool) -> String {
+    use std::fmt::Write as _;
+
+    let name_width = providers
+        .iter()
+        .map(|provider| provider.object_name().len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let type_width = providers
+        .iter()
+        .map(|provider| provider.r#type.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    let name_header = if color {
+        "NAME".bold().to_string()
+    } else {
+        "NAME".to_string()
+    };
+    let type_header = if color {
+        "TYPE".bold().to_string()
+    } else {
+        "TYPE".to_string()
+    };
+    let credential_keys_header = if color {
+        "CREDENTIAL_KEYS".bold().to_string()
+    } else {
+        "CREDENTIAL_KEYS".to_string()
+    };
+    let config_keys_header = if color {
+        "CONFIG_KEYS".bold().to_string()
+    } else {
+        "CONFIG_KEYS".to_string()
+    };
+
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "{name_header:<name_width$}  {type_header:<type_width$}  {credential_keys_header:<16}  {config_keys_header}",
+    );
+
+    for provider in providers {
+        let provider_name = provider.object_name();
+        let provider_type = &provider.r#type;
+        let credential_keys = provider.credentials.len();
+        let config_keys = provider.config.len();
+        let _ = writeln!(
+            output,
+            "{provider_name:<name_width$}  {provider_type:<type_width$}  {credential_keys:<16}  {config_keys}",
+        );
+    }
+    output
 }
 
 /// Delete a sandbox by name, or all sandboxes when `all` is true.
@@ -5251,11 +5389,12 @@ fn format_timestamp_ms(ms: i64) -> String {
 mod tests {
     use super::{
         TlsOptions, dockerfile_sources_supported_for_gateway, format_gateway_select_header,
-        format_gateway_select_items, gateway_add, gateway_auth_label, gateway_env_override_warning,
-        gateway_select_with, gateway_type_label, git_sync_files, http_health_check,
-        image_requests_gpu, inferred_provider_type, parse_cli_setting_value,
-        parse_credential_pairs, plaintext_gateway_is_remote, provisioning_timeout_message,
-        ready_false_condition_message, resolve_from, sandbox_should_persist,
+        format_gateway_select_items, format_provider_attachment_table, gateway_add,
+        gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
+        git_sync_files, http_health_check, image_requests_gpu, inferred_provider_type,
+        parse_cli_setting_value, parse_credential_pairs, plaintext_gateway_is_remote,
+        provisioning_timeout_message, ready_false_condition_message, resolve_from,
+        sandbox_should_persist,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -5268,7 +5407,9 @@ mod tests {
     use std::thread;
 
     use openshell_bootstrap::GatewayMetadata;
-    use openshell_core::proto::{SandboxCondition, SandboxStatus};
+    use openshell_core::proto::{
+        Provider, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+    };
 
     struct EnvVarGuard {
         key: &'static str,
@@ -5369,6 +5510,40 @@ mod tests {
         assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+    }
+
+    #[test]
+    fn provider_attachment_table_formats_provider_counts() {
+        let output = format_provider_attachment_table(
+            &[Provider {
+                metadata: Some(ObjectMeta {
+                    name: "work-custom".to_string(),
+                    ..Default::default()
+                }),
+                r#type: "custom-api".to_string(),
+                credentials: [
+                    ("CUSTOM_API_KEY".to_string(), "REDACTED".to_string()),
+                    ("CUSTOM_API_SECRET".to_string(), "REDACTED".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                config: std::iter::once((
+                    "BASE_URL".to_string(),
+                    "https://api.custom.example".to_string(),
+                ))
+                .collect(),
+            }],
+            false,
+        );
+
+        assert!(output.contains("NAME"));
+        assert!(output.contains("TYPE"));
+        assert!(output.contains("CREDENTIAL_KEYS"));
+        assert!(output.contains("CONFIG_KEYS"));
+        assert!(output.contains("work-custom"));
+        assert!(output.contains("custom-api"));
+        assert!(output.contains('2'));
+        assert!(output.contains('1'));
     }
 
     #[cfg(feature = "dev-settings")]

@@ -111,6 +111,24 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::ListSandboxesResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn list_sandbox_providers(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListSandboxProvidersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxProvidersResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn attach_sandbox_provider(
+        &self,
+        _: tonic::Request<openshell_core::proto::AttachSandboxProviderRequest>,
+    ) -> Result<Response<openshell_core::proto::AttachSandboxProviderResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn detach_sandbox_provider(
+        &self,
+        _: tonic::Request<openshell_core::proto::DetachSandboxProviderRequest>,
+    ) -> Result<Response<openshell_core::proto::DetachSandboxProviderResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
     async fn delete_sandbox(
         &self,
         _: tonic::Request<openshell_core::proto::DeleteSandboxRequest>,

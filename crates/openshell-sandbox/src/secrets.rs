@@ -70,8 +70,16 @@ pub struct SecretResolver {
 }
 
 impl SecretResolver {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_provider_env(
         provider_env: HashMap<String, String>,
+    ) -> (HashMap<String, String>, Option<Self>) {
+        Self::from_provider_env_for_revision(provider_env, 0)
+    }
+
+    pub(crate) fn from_provider_env_for_revision(
+        provider_env: HashMap<String, String>,
+        revision: u64,
     ) -> (HashMap<String, String>, Option<Self>) {
         if provider_env.is_empty() {
             return (HashMap::new(), None);
@@ -81,12 +89,24 @@ impl SecretResolver {
         let mut by_placeholder = HashMap::with_capacity(provider_env.len());
 
         for (key, value) in provider_env {
-            let placeholder = placeholder_for_env_key(&key);
+            let placeholder = placeholder_for_env_key_for_revision(&key, revision);
             child_env.insert(key, placeholder.clone());
             by_placeholder.insert(placeholder, value);
         }
 
         (child_env, Some(Self { by_placeholder }))
+    }
+
+    pub(crate) fn merge<'a>(resolvers: impl IntoIterator<Item = &'a Self>) -> Option<Self> {
+        let mut by_placeholder = HashMap::new();
+        for resolver in resolvers {
+            by_placeholder.extend(resolver.by_placeholder.clone());
+        }
+        if by_placeholder.is_empty() {
+            None
+        } else {
+            Some(Self { by_placeholder })
+        }
     }
 
     /// Resolve a placeholder string to the real secret value.
@@ -176,6 +196,14 @@ impl SecretResolver {
 
 pub fn placeholder_for_env_key(key: &str) -> String {
     format!("{PLACEHOLDER_PREFIX}{key}")
+}
+
+pub fn placeholder_for_env_key_for_revision(key: &str, revision: u64) -> String {
+    if revision == 0 {
+        placeholder_for_env_key(key)
+    } else {
+        format!("{PLACEHOLDER_PREFIX}v{revision}_{key}")
+    }
 }
 
 // ---------------------------------------------------------------------------

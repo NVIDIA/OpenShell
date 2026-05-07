@@ -275,6 +275,16 @@ impl ComputeRuntime {
         })
     }
 
+    /// Serializes sandbox object read-modify-write operations within this
+    /// gateway process.
+    ///
+    /// This is a temporary single-gateway guard for full-object sandbox writes.
+    /// It is not HA-safe; replace it with DB-backed CAS/resource-version writes
+    /// tracked by #1255 before enabling multiple gateway writers.
+    pub(crate) async fn sandbox_sync_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.sync_lock.clone().lock_owned().await
+    }
+
     pub async fn new_docker(
         config: openshell_core::Config,
         docker_config: DockerComputeConfig,

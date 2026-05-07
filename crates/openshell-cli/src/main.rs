@@ -1260,6 +1260,45 @@ enum SandboxCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
     },
+
+    /// Manage providers attached to a sandbox.
+    #[command(subcommand)]
+    Provider(SandboxProviderCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum SandboxProviderCommands {
+    /// List providers attached to a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Attach a provider to a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Attach {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+
+        /// Provider name to attach.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        provider: String,
+    },
+
+    /// Detach a provider from a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Detach {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+
+        /// Provider name to detach.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        provider: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2385,6 +2424,20 @@ async fn main() -> Result<()> {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
                             run::print_ssh_config(&ctx.name, &name);
                         }
+                        SandboxCommands::Provider(command) => match command {
+                            SandboxProviderCommands::List { name } => {
+                                let name = resolve_sandbox_name(name, &ctx.name)?;
+                                run::sandbox_provider_list(endpoint, &name, &tls).await?;
+                            }
+                            SandboxProviderCommands::Attach { name, provider } => {
+                                run::sandbox_provider_attach(endpoint, &name, &provider, &tls)
+                                    .await?;
+                            }
+                            SandboxProviderCommands::Detach { name, provider } => {
+                                run::sandbox_provider_detach(endpoint, &name, &provider, &tls)
+                                    .await?;
+                            }
+                        },
                     }
                 }
             }
@@ -2719,6 +2772,30 @@ mod tests {
             names.contains(&"completions".to_string()),
             "expected 'completions' in candidates, got: {names:?}"
         );
+    }
+
+    #[test]
+    fn sandbox_provider_subcommands_parse() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "provider",
+            "attach",
+            "work-sandbox",
+            "work-github",
+        ])
+        .expect("sandbox provider attach should parse");
+
+        let Some(Commands::Sandbox {
+            command:
+                Some(SandboxCommands::Provider(SandboxProviderCommands::Attach { name, provider })),
+        }) = cli.command
+        else {
+            panic!("expected sandbox provider attach command");
+        };
+
+        assert_eq!(name, "work-sandbox");
+        assert_eq!(provider, "work-github");
     }
 
     #[test]

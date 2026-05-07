@@ -5,16 +5,18 @@ use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
-    CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
-    ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
-    Provider, ProviderProfile, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    SandboxResponse, SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
-    WatchSandboxRequest,
+    AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
+    CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
+    DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
+    ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest, GetGatewayConfigResponse,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
+    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
+    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
+    ListSandboxesResponse, Provider, ProviderProfile, ProviderResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, ServiceStatus,
+    SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
 };
 use openshell_core::{ObjectId, ObjectName};
 use rcgen::{
@@ -64,6 +66,23 @@ impl Drop for EnvVarGuard {
 struct ProviderState {
     providers: Arc<Mutex<HashMap<String, Provider>>>,
     profiles: Arc<Mutex<HashMap<String, ProviderProfile>>>,
+    sandbox_providers: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    sandbox_provider_requests: Arc<Mutex<Vec<SandboxProviderRequestLog>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SandboxProviderRequestLog {
+    List {
+        sandbox_name: String,
+    },
+    Attach {
+        sandbox_name: String,
+        provider_name: String,
+    },
+    Detach {
+        sandbox_name: String,
+        provider_name: String,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -102,6 +121,120 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         Ok(Response::new(ListSandboxesResponse::default()))
+    }
+
+    async fn list_sandbox_providers(
+        &self,
+        request: tonic::Request<ListSandboxProvidersRequest>,
+    ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
+        let sandbox_name = request.into_inner().sandbox_name;
+        self.state
+            .sandbox_provider_requests
+            .lock()
+            .await
+            .push(SandboxProviderRequestLog::List {
+                sandbox_name: sandbox_name.clone(),
+            });
+        let provider_names = self
+            .state
+            .sandbox_providers
+            .lock()
+            .await
+            .get(&sandbox_name)
+            .cloned()
+            .unwrap_or_default();
+        let providers_by_name = self.state.providers.lock().await;
+        let providers = provider_names
+            .iter()
+            .filter_map(|name| providers_by_name.get(name).cloned())
+            .collect();
+        Ok(Response::new(ListSandboxProvidersResponse { providers }))
+    }
+
+    async fn attach_sandbox_provider(
+        &self,
+        request: tonic::Request<AttachSandboxProviderRequest>,
+    ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .sandbox_provider_requests
+            .lock()
+            .await
+            .push(SandboxProviderRequestLog::Attach {
+                sandbox_name: request.sandbox_name.clone(),
+                provider_name: request.provider_name.clone(),
+            });
+        if !self
+            .state
+            .providers
+            .lock()
+            .await
+            .contains_key(&request.provider_name)
+        {
+            return Err(Status::failed_precondition("provider not found"));
+        }
+        let mut sandbox_providers = self.state.sandbox_providers.lock().await;
+        let providers = sandbox_providers
+            .entry(request.sandbox_name.clone())
+            .or_default();
+        let attached = if providers.contains(&request.provider_name) {
+            false
+        } else {
+            providers.push(request.provider_name.clone());
+            true
+        };
+        let sandbox = openshell_core::proto::Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                name: request.sandbox_name,
+                ..Default::default()
+            }),
+            spec: Some(openshell_core::proto::SandboxSpec {
+                providers: providers.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok(Response::new(AttachSandboxProviderResponse {
+            sandbox: Some(sandbox),
+            attached,
+        }))
+    }
+
+    async fn detach_sandbox_provider(
+        &self,
+        request: tonic::Request<DetachSandboxProviderRequest>,
+    ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .sandbox_provider_requests
+            .lock()
+            .await
+            .push(SandboxProviderRequestLog::Detach {
+                sandbox_name: request.sandbox_name.clone(),
+                provider_name: request.provider_name.clone(),
+            });
+        let mut sandbox_providers = self.state.sandbox_providers.lock().await;
+        let providers = sandbox_providers
+            .entry(request.sandbox_name.clone())
+            .or_default();
+        let before_len = providers.len();
+        providers.retain(|name| name != &request.provider_name);
+        let detached = providers.len() != before_len;
+        let sandbox = openshell_core::proto::Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                name: request.sandbox_name,
+                ..Default::default()
+            }),
+            spec: Some(openshell_core::proto::SandboxSpec {
+                providers: providers.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok(Response::new(DetachSandboxProviderResponse {
+            sandbox: Some(sandbox),
+            detached,
+        }))
     }
 
     async fn delete_sandbox(
@@ -626,6 +759,90 @@ async fn provider_list_profiles_cli_uses_profile_browsing_rpc() {
     run::provider_list_profiles(&ts.endpoint, "table", &ts.tls)
         .await
         .expect("provider list-profiles");
+}
+
+#[tokio::test]
+async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results() {
+    let ts = run_server().await;
+
+    run::provider_create(
+        &ts.endpoint,
+        "work-github",
+        "github",
+        false,
+        &["GITHUB_TOKEN=ghp-test".to_string()],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
+        .await
+        .expect("sandbox provider attach");
+    run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
+        .await
+        .expect("sandbox provider attach is idempotent");
+    run::sandbox_provider_list(&ts.endpoint, "dev-sandbox", &ts.tls)
+        .await
+        .expect("sandbox provider list");
+    run::sandbox_provider_detach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
+        .await
+        .expect("sandbox provider detach");
+    run::sandbox_provider_detach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
+        .await
+        .expect("sandbox provider detach is idempotent");
+
+    let requests = ts.state.sandbox_provider_requests.lock().await.clone();
+    assert_eq!(
+        requests,
+        vec![
+            SandboxProviderRequestLog::Attach {
+                sandbox_name: "dev-sandbox".to_string(),
+                provider_name: "work-github".to_string(),
+            },
+            SandboxProviderRequestLog::Attach {
+                sandbox_name: "dev-sandbox".to_string(),
+                provider_name: "work-github".to_string(),
+            },
+            SandboxProviderRequestLog::List {
+                sandbox_name: "dev-sandbox".to_string(),
+            },
+            SandboxProviderRequestLog::Detach {
+                sandbox_name: "dev-sandbox".to_string(),
+                provider_name: "work-github".to_string(),
+            },
+            SandboxProviderRequestLog::Detach {
+                sandbox_name: "dev-sandbox".to_string(),
+                provider_name: "work-github".to_string(),
+            },
+        ]
+    );
+
+    let providers = ts.state.sandbox_providers.lock().await;
+    assert!(providers.get("dev-sandbox").is_none_or(Vec::is_empty));
+}
+
+#[tokio::test]
+async fn sandbox_provider_attach_cli_surfaces_server_errors() {
+    let ts = run_server().await;
+
+    let err =
+        run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "missing-provider", &ts.tls)
+            .await
+            .expect_err("missing provider should fail");
+
+    assert!(
+        err.to_string().contains("provider not found"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        ts.state.sandbox_provider_requests.lock().await.as_slice(),
+        [SandboxProviderRequestLog::Attach {
+            sandbox_name: "dev-sandbox".to_string(),
+            provider_name: "missing-provider".to_string(),
+        }]
+    );
 }
 
 #[tokio::test]

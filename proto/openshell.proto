@@ -30,6 +30,18 @@ service OpenShell {
   // List sandboxes.
   rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
 
+  // List provider records attached to a sandbox.
+  rpc ListSandboxProviders(ListSandboxProvidersRequest)
+      returns (ListSandboxProvidersResponse);
+
+  // Attach a provider record to an existing sandbox.
+  rpc AttachSandboxProvider(AttachSandboxProviderRequest)
+      returns (AttachSandboxProviderResponse);
+
+  // Detach a provider record from an existing sandbox.
+  rpc DetachSandboxProvider(DetachSandboxProviderRequest)
+      returns (DetachSandboxProviderResponse);
+
   // Delete a sandbox by name.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
@@ -333,6 +345,28 @@ message ListSandboxesRequest {
   string label_selector = 3;
 }
 
+// List providers attached to a sandbox request.
+message ListSandboxProvidersRequest {
+  // Sandbox name (canonical lookup key).
+  string sandbox_name = 1;
+}
+
+// Attach provider to sandbox request.
+message AttachSandboxProviderRequest {
+  // Sandbox name (canonical lookup key).
+  string sandbox_name = 1;
+  // Provider name to attach.
+  string provider_name = 2;
+}
+
+// Detach provider from sandbox request.
+message DetachSandboxProviderRequest {
+  // Sandbox name (canonical lookup key).
+  string sandbox_name = 1;
+  // Provider name to detach.
+  string provider_name = 2;
+}
+
 // Delete sandbox request.
 message DeleteSandboxRequest {
   // Sandbox name (canonical lookup key).
@@ -347,6 +381,25 @@ message SandboxResponse {
 // List sandboxes response.
 message ListSandboxesResponse {
   repeated Sandbox sandboxes = 1;
+}
+
+// List providers attached to a sandbox response.
+message ListSandboxProvidersResponse {
+  repeated openshell.datamodel.v1.Provider providers = 1;
+}
+
+// Attach provider to sandbox response.
+message AttachSandboxProviderResponse {
+  Sandbox sandbox = 1;
+  // True when the provider was newly attached. False means it was already attached.
+  bool attached = 2;
+}
+
+// Detach provider from sandbox response.
+message DetachSandboxProviderResponse {
+  Sandbox sandbox = 1;
+  // True when the provider was removed. False means it was not attached.
+  bool detached = 2;
 }
 
 // Delete sandbox response.
@@ -707,6 +760,8 @@ message GetSandboxProviderEnvironmentRequest {
 message GetSandboxProviderEnvironmentResponse {
   // Provider credential environment variables.
   map<string, string> environment = 1;
+  // Fingerprint for the provider credential inputs that produced environment.
+  uint64 provider_env_revision = 2;
 }
 
 // ---------------------------------------------------------------------------

@@ -99,6 +99,33 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    async fn list_sandbox_providers(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListSandboxProvidersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxProvidersResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ListSandboxProvidersResponse::default(),
+        ))
+    }
+
+    async fn attach_sandbox_provider(
+        &self,
+        _request: tonic::Request<openshell_core::proto::AttachSandboxProviderRequest>,
+    ) -> Result<Response<openshell_core::proto::AttachSandboxProviderResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::AttachSandboxProviderResponse::default(),
+        ))
+    }
+
+    async fn detach_sandbox_provider(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DetachSandboxProviderRequest>,
+    ) -> Result<Response<openshell_core::proto::DetachSandboxProviderResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::DetachSandboxProviderResponse::default(),
+        ))
+    }
+
     async fn delete_sandbox(
         &self,
         _request: tonic::Request<openshell_core::proto::DeleteSandboxRequest>,
