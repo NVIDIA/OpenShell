@@ -18,6 +18,7 @@ Before you begin, make sure you have:
 - The OpenShell CLI installed on your workstation.
 
 For a complete list of requirements, refer to [Support Matrix](/reference/support-matrix).
+If you have not chosen a runtime yet, refer to [Get OpenShell](/about/get-openshell).
 
 ## Install the OpenShell CLI
 
@@ -26,6 +27,8 @@ Run the install script:
 ```shell
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
+
+The install script uses Homebrew, RPM, or a Debian package based on your machine. It starts the local gateway server after installation.
 
 If you prefer [uv](https://docs.astral.sh/uv/):
 
@@ -95,14 +98,12 @@ Run the following command to create a sandbox with OpenClaw:
 openshell sandbox create --from openclaw
 ```
 
-The `--from` flag pulls a pre-built sandbox definition from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog.
-Each definition bundles a container image, a tailored policy, and optional skills into a single package.
+The `--from` flag pulls a pre-built sandbox container with its bundled policy and optional skills.
 </Tab>
 
-<Tab title="Community Sandbox">
+<Tab title="Base Sandbox">
 
-Use the `--from` flag to pull other OpenShell sandbox images from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog.
-For example, to pull the `base` image, run:
+Use the `--from` flag to create a sandbox from the base container:
 
 ```shell
 openshell sandbox create --from base

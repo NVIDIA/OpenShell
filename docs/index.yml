@@ -16,8 +16,7 @@ navigation:
   - folder: get-started/tutorials
     skip-slug: true
 - folder: sandboxes
-- folder: inference
-  title: "Inference Routing"
+  title: "How It Works"
 - folder: observability
   title: "Observability"
 - folder: reference

@@ -5,7 +5,7 @@ title: "Providers"
 sidebar-title: "Providers"
 description: "Create and manage credential providers that inject API keys and tokens into OpenShell sandboxes."
 keywords: "Generative AI, Cybersecurity, Providers, Credentials, API Keys, Sandbox, Security"
-position: 4
+position: 3
 ---
 
 AI agents typically need credentials to access external services: an API key for the AI model provider, a token for GitHub or GitLab, and so on. OpenShell manages these credentials as first-class entities called *providers*.
@@ -178,7 +178,7 @@ The following provider types are supported.
 | `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI — refer to [GitHub Sandbox](/get-started/tutorials/github-sandbox) |
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
-| `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint. Set `--config OPENAI_BASE_URL` to point to the provider. Refer to [Configure](/inference/configure). |
+| `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint. Set `--config OPENAI_BASE_URL` to point to the provider. Refer to [Inference Routing](/sandboxes/inference-routing). |
 | `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | opencode tool |
 
 <Tip>
@@ -202,12 +202,12 @@ The following providers have been tested with `inference.local`. Any provider th
 | Ollama (local) | `ollama` | `openai` | `http://host.openshell.internal:11434/v1` | `OPENAI_API_KEY` |
 | LM Studio (local) | `lmstudio` | `openai` | `http://host.openshell.internal:1234/v1` | `OPENAI_API_KEY` |
 
-Refer to your provider's documentation for the correct base URL, available models, and API key setup. To configure inference routing, refer to [Configure](/inference/configure).
+Refer to your provider's documentation for the correct base URL, available models, and API key setup. To configure inference routing, refer to [Inference Routing](/sandboxes/inference-routing).
 
 ## Next Steps
 
 Explore related topics:
 
 - To control what the agent can access, refer to [Policies](/sandboxes/policies).
-- To use a pre-built environment, refer to the [Community Sandboxes](/sandboxes/community-sandboxes) catalog.
+- To use the base sandbox container, refer to [Sandboxes](/sandboxes/manage-sandboxes#base-sandbox-container).
 - To view the complete field reference for the policy YAML, refer to the [Policy Schema Reference](/reference/policy-schema).

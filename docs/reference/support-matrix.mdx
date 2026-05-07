@@ -40,7 +40,7 @@ The gateway can manage sandboxes on several compute platforms.
 | Docker | Supported for local development and single-machine gateways. | Requires Docker Desktop or Docker Engine on the gateway host. |
 | Podman | Supported for rootless local and workstation workflows. | Requires a Podman-compatible socket and rootless networking setup. |
 | Kubernetes | Supported through the Helm chart in `deploy/helm/openshell`. | Requires a Kubernetes cluster supplied by the operator. |
-| MicroVM | Experimental. | Uses the VM compute driver and libkrun-based runtime work. |
+| MicroVM | Supported for VM-backed sandboxes. | Uses the VM compute driver and libkrun-based runtime. |
 
 ## Software Prerequisites
 
@@ -53,6 +53,7 @@ Install the software for the compute platform you use:
 | Kubernetes | 1.29 | Required for Helm deployments and Kubernetes sandbox scheduling. |
 | Helm | 3.x | Required to install `deploy/helm/openshell`. |
 | kubectl | Compatible with your cluster | Required for Kubernetes operational inspection and secret creation. |
+| Host virtualization | Host dependent | Required for MicroVM-backed gateways. MicroVM uses Hypervisor.framework on macOS and KVM on Linux. |
 
 ## Sandbox Runtime Versions
 

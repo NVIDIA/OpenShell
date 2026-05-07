@@ -3,16 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Manage Sandboxes"
 sidebar-title: "Sandboxes"
-description: "Set up gateways, create sandboxes, and manage the full sandbox lifecycle."
+description: "Create sandboxes, understand sandbox isolation, and manage the full sandbox lifecycle."
 keywords: "Generative AI, Cybersecurity, Gateway, Sandboxing, AI Agents, Sandbox Management, CLI"
-position: 2
+position: 1
 ---
 
-This page covers creating sandboxes and managing them. For background on what sandboxes are and how isolation works, refer to [About Sandboxes](/sandboxes/about).
+A sandbox is the OpenShell data plane: a safe, private execution environment where an AI agent runs. Each sandbox combines runtime isolation with OpenShell policy controls that prevent unauthorized data access, credential exposure, and network exfiltration.
 
 <Info>
-You need an active gateway before creating a sandbox. Docker-backed gateways require Docker to be running. Podman, Kubernetes, and MicroVM-backed gateways require their respective runtime or cluster to be reachable from the gateway.
-
+You need an active gateway before creating a sandbox.
 </Info>
 
 ## Create a Sandbox
@@ -30,10 +29,6 @@ openshell gateway add http://127.0.0.1:18080 --local --name local
 openshell gateway select local
 ```
 
-### Remote Gateways
-
-If you plan to run sandboxes on a remote host, Kubernetes cluster, or cloud-hosted gateway, set up the gateway first. Refer to [Manage Gateways](/sandboxes/manage-gateways) for deployment options and multi-gateway management.
-
 ### GPU Resources
 
 To request GPU resources, add `--gpu`:
@@ -48,34 +43,33 @@ updated Docker daemon capability.
 
 ### Custom Containers
 
-Use `--from` to create a sandbox from a pre-built community package, a local directory, or a container image:
+Use `--from` to create a sandbox from the base image, another pre-built sandbox name, a local directory, or a container image:
 
 ```shell
+openshell sandbox create --from base
 openshell sandbox create --from openclaw
+openshell sandbox create --from ollama
 openshell sandbox create --from ./my-sandbox-dir
 openshell sandbox create --from my-registry.example.com/my-image:latest
 ```
 
-The CLI resolves community names against the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog, pulls the bundled Dockerfile and policy, builds the image locally, and creates the sandbox. For the full catalog and how to contribute your own, refer to [Community Sandboxes](/sandboxes/community-sandboxes).
+Bare names such as `base`, `openclaw`, and `ollama` resolve to images under `ghcr.io/nvidia/openshell-community/sandboxes`. Set `OPENSHELL_COMMUNITY_REGISTRY` when you need to use an internal mirror.
 
 Local directories and Dockerfiles require a local gateway because the CLI builds
 through the local Docker daemon. Use a registry image reference for remote
 gateways.
 
-### Label a Sandbox
+## Base Sandbox Container
 
-Attach labels when you create a sandbox to track ownership, environment, or workflow grouping:
+The `base` sandbox container is the default runtime image for standard OpenShell sandboxes unless the gateway overrides its default sandbox image. It is published as `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` and maintained in the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) repository.
 
-```shell
-openshell sandbox create --label env=dev --label team=platform -- claude
-```
-
-List only the sandboxes that match a label selector:
+The base container includes common development tooling, supported agent CLIs, and the default sandbox policy. Use it when you want a general-purpose agent environment without a workflow-specific image:
 
 ```shell
-openshell sandbox list --selector env=dev
-openshell sandbox list --selector env=dev,team=platform
+openshell sandbox create --from base
 ```
+
+For default policy coverage by agent, refer to [Default Policy](/reference/default-policy). For the supported agent list, refer to [Supported Agents](/about/supported-agents).
 
 ## Connect to a Sandbox
 
@@ -127,6 +121,21 @@ OpenShell allocates a TTY automatically when both stdin and stdout are terminals
 | `--timeout` | Command timeout in seconds. `0` disables the timeout. |
 | `--tty` | Force TTY allocation. |
 | `--no-tty` | Disable TTY allocation even when attached to a terminal. |
+
+## Label a Sandbox
+
+Attach labels when you create a sandbox to track ownership, environment, or workflow grouping:
+
+```shell
+openshell sandbox create --label env=dev --label team=platform -- claude
+```
+
+List only the sandboxes that match a label selector:
+
+```shell
+openshell sandbox list --selector env=dev
+openshell sandbox list --selector env=dev,team=platform
+```
 
 ## Monitor and Debug
 
@@ -240,9 +249,33 @@ Deleting a sandbox stops all processes, releases resources, and purges injected 
 openshell sandbox delete my-sandbox
 ```
 
+## Sandbox Lifecycle
+
+Every sandbox moves through a defined set of phases:
+
+| Phase | Description |
+|---|---|
+| Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy. |
+| Ready | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
+| Error | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details. |
+| Deleting | The sandbox is being torn down. The system releases resources and purges credentials. |
+
+## Sandbox Isolation and Policies
+
+OpenShell ships a built-in policy that covers common agent workflows out of the box. When you create a sandbox without `--policy`, OpenShell applies the default policy.
+
+| Layer | What it controls | How it works |
+|---|---|---|
+| Filesystem | What the agent can access on disk. | Paths are split into read-only and read-write sets. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level. |
+| Network | What the agent can reach on the network. | Policy blocks pair allowed destinations with allowed binaries. The proxy matches every outbound connection to the binary that opened it. Both must match or the connection is denied. |
+| Process | What privileges the agent has. | The agent runs as an unprivileged user with seccomp filters that block dangerous system calls. Root execution, `sudo`, and `setuid` escalation paths are blocked. |
+| Inference | How model API traffic is routed. | Requests to `https://inference.local` route through the gateway so provider credentials stay outside the sandbox. |
+
+For the full breakdown of the built-in policy, refer to [Default Policy](/reference/default-policy). For custom policy structure and update workflows, refer to [Policies](/sandboxes/policies).
+
 ## Next Steps
 
 - To follow a complete end-to-end example, refer to the [GitHub Sandbox](/get-started/tutorials/github-sandbox) tutorial.
 - To supply API keys or tokens, refer to [Manage Providers](/sandboxes/manage-providers).
 - To control what the agent can access, refer to [Policies](/sandboxes/policies).
-- To use a pre-built environment, refer to the [Community Sandboxes](/sandboxes/community-sandboxes) catalog.
+- To use the default runtime image, refer to [Base Sandbox Container](#base-sandbox-container).
