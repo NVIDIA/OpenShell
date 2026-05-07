@@ -47,6 +47,8 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart
 
 See [`deploy/helm/openshell/README.md`](deploy/helm/openshell/README.md) for available versions, dev tag conventions, and configuration.
 
+For deploying OpenShell on OpenShift, see [`deploy/helm/openshell/README.md#install-on-openshift`](deploy/helm/openshell/README.md#install-on-openshift).
+
 ### Create a sandbox
 
 ```bash

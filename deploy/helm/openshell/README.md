@@ -4,10 +4,27 @@
 
 This chart deploys the OpenShell gateway into a Kubernetes cluster. It is published as an OCI artifact to GHCR at `oci://ghcr.io/nvidia/openshell/helm-chart`.
 
-## Install
+## Install on Kubernetes
 
 ```bash
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version>
+```
+
+## Install on OpenShift
+
+```bash
+# Precreate the openshell namespace so we can create the SCC cluster role
+oc create ns openshell
+
+# Sandboxes are deployed into the openshell namespace and use the default service account for now
+oc adm policy add-scc-to-user privileged -z default -n openshell
+
+# Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
+	--set pkiInitJob.enabled=false \
+	--set server.disableTls=true \
+	--set podSecurityContext.fsGroup=null \
+	--set securityContext.runAsUser=null
 ```
 
 ## Available versions
