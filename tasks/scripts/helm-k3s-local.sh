@@ -20,6 +20,9 @@ ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 _branch="$(git -C "${ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null)" || _branch=""
 _suffix="$(printf '%s' "${_branch##*/}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')"
 CLUSTER_NAME="${HELM_K3S_CLUSTER_NAME:-openshell-dev${_suffix:+-${_suffix}}}"
+# k3d caps cluster names at 32 chars; validated in cmd_create so the operator
+# gets an actionable hint instead of a deep-stack k3d validation error.
+K3D_CLUSTER_NAME_MAX=32
 # Host port forwarded to port 80 via the k3d load balancer.
 # Used by Envoy Gateway's LoadBalancer service (values-gateway.yaml).
 HOST_LB_PORT="${HELM_K3S_LB_HOST_PORT:-8080}"
@@ -153,6 +156,15 @@ cmd_create() {
   require_supported_os
   require_docker
   require_k3d
+
+  if (( ${#CLUSTER_NAME} > K3D_CLUSTER_NAME_MAX )); then
+    cat >&2 <<EOF
+error: derived cluster name '${CLUSTER_NAME}' is ${#CLUSTER_NAME} chars; k3d caps at ${K3D_CLUSTER_NAME_MAX}.
+Set HELM_K3S_CLUSTER_NAME to a shorter name, e.g.:
+  HELM_K3S_CLUSTER_NAME=openshell-dev-${_suffix:0:$(( K3D_CLUSTER_NAME_MAX - 14 ))} mise run helm:k3s:create
+EOF
+    exit 1
+  fi
 
   local lb_port_map="${HOST_LB_PORT}:80@loadbalancer"
 

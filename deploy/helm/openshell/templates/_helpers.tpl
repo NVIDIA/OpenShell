@@ -81,3 +81,19 @@ Namespaced Issuer (selfSigned) for cert-manager CA bootstrap.
 {{- define "openshell.issuerSelfSigned" -}}
 {{- printf "%s-selfsigned" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end }}
+
+{{/*
+gRPC endpoint sandbox pods use to call back into the gateway. An explicit
+.Values.server.grpcEndpoint is used verbatim. Otherwise it is derived from
+the in-cluster Service DNS, release namespace, service port, and disableTls
+flag — so the default value works for any release name or namespace without
+override.
+*/}}
+{{- define "openshell.grpcEndpoint" -}}
+{{- if .Values.server.grpcEndpoint -}}
+{{- .Values.server.grpcEndpoint -}}
+{{- else -}}
+{{- $scheme := ternary "http" "https" (default false .Values.server.disableTls) -}}
+{{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int .Values.service.port) -}}
+{{- end -}}
+{{- end }}

@@ -35,7 +35,6 @@ spec:
       dbUrl: __DB_URL__
       sshGatewayHost: __SSH_GATEWAY_HOST__
       sshGatewayPort: __SSH_GATEWAY_PORT__
-      grpcEndpoint: "https://openshell.openshell.svc.cluster.local:8080"
       hostGatewayIP: __HOST_GATEWAY_IP__
       disableGatewayAuth: __DISABLE_GATEWAY_AUTH__
       disableTls: __DISABLE_TLS__
