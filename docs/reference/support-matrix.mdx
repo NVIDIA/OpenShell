@@ -39,7 +39,7 @@ The gateway can manage sandboxes through several compute drivers.
 |---|---|---|
 | Docker | Supported for local development and single-machine gateways. | Requires Docker Desktop or Docker Engine on the gateway host. |
 | Podman | Supported for rootless local and workstation workflows. | Requires a Podman-compatible socket and rootless networking setup. |
-| Kubernetes | Supported through the Helm chart in `deploy/helm/openshell`. | Requires a Kubernetes cluster supplied by the operator. |
+| Kubernetes | Supported through the [OpenShell Helm chart](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md). | Requires a Kubernetes cluster supplied by the operator. |
 | MicroVM | Supported for VM-backed sandboxes. | Uses the VM compute driver and libkrun-based runtime. |
 
 ## Software Prerequisites
