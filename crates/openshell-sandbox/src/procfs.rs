@@ -57,8 +57,8 @@ struct DescendantPid {
 /// ### Unlinked binaries (`(deleted)` suffix)
 ///
 /// When a running binary is unlinked from its filesystem path — the common
-/// case is a `docker cp` hot-swap of `/opt/openshell/bin/openshell-sandbox`
-/// during a `cluster-deploy-fast` dev upgrade — the kernel appends the
+/// case is a hot-swap of `/opt/openshell/bin/openshell-sandbox` during a
+/// development upgrade — the kernel appends the
 /// literal string `" (deleted)"` to the `/proc/<pid>/exe` readlink target.
 /// The raw tainted path (e.g. `"/opt/openshell/bin/openshell-sandbox (deleted)"`)
 /// is not a real filesystem path: any downstream `stat()` fails with `ENOENT`.

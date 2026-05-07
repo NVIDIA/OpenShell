@@ -103,7 +103,7 @@ validate_env() {
     info "GitHub repo ${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO}@${DEMO_BRANCH} and token present"
 
     info "checking OpenShell gateway is reachable..."
-    "$OPENSHELL_BIN" status >/dev/null 2>&1 || fail "OpenShell gateway is not reachable; run: openshell gateway start"
+    "$OPENSHELL_BIN" status >/dev/null 2>&1 || fail "OpenShell gateway is not reachable; run: mise run gateway:docker"
 
     export CODEX_AUTH_ACCESS_TOKEN
     export CODEX_AUTH_REFRESH_TOKEN

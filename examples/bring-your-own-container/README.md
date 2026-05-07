@@ -6,7 +6,7 @@ your local machine through port forwarding.
 
 ## Prerequisites
 
-- A running OpenShell gateway (`openshell gateway start`)
+- A running OpenShell gateway (`mise run gateway:docker` for local development)
 - Docker daemon running
 
 ## What's in this example

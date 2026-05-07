@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       component:
-        description: "Component to build (gateway, supervisor, cluster)"
+        description: "Component to build (gateway, supervisor)"
         required: true
         type: string
       timeout-minutes:
@@ -78,7 +78,7 @@ jobs:
               binary_component=gateway
               binary_name=openshell-gateway
               ;;
-            supervisor|cluster)
+            supervisor)
               binary_component=sandbox
               binary_name=openshell-sandbox
               ;;
@@ -250,11 +250,6 @@ jobs:
               ;;
             supervisor)
               output="$(docker run --rm --platform "${{ matrix.platform }}" "$image" --version)"
-              echo "$output"
-              grep -q '^openshell-sandbox ' <<<"$output"
-              ;;
-            cluster)
-              output="$(docker run --rm --platform "${{ matrix.platform }}" --entrypoint /opt/openshell/bin/openshell-sandbox "$image" --version)"
               echo "$output"
               grep -q '^openshell-sandbox ' <<<"$output"
               ;;

@@ -64,8 +64,6 @@ openshell
 │   ├── update <name> --type [opts]
 │   └── delete <name>...
 ├── doctor
-│   ├── logs [--name] [-n] [--tail] [--remote] [--ssh-key]
-│   ├── exec [--name] [--remote] [--ssh-key] -- <command...>
 │   └── check
 ├── term
 ├── completions <shell>
@@ -115,32 +113,11 @@ Set the active gateway. Writes to `~/.config/openshell/active_gateway`. When cal
 
 ## Doctor Commands
 
-### `openshell doctor logs`
+### `openshell doctor check`
 
-Fetch logs when gateway metadata supports it. For Helm deployments, prefer `kubectl -n openshell logs statefulset/openshell`.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--name <NAME>` | active gateway | Gateway name |
-| `-n, --lines <N>` | all | Number of log lines to return |
-| `--tail` | false | Stream live logs (follow mode) |
-| `--remote <USER@HOST>` | auto-resolved | SSH destination for remote gateways |
-| `--ssh-key <PATH>` | none | SSH private key for remote gateways |
-
-### `openshell doctor exec -- <COMMAND...>`
-
-Run a diagnostic command when gateway metadata supports it. For Helm deployments, prefer direct `kubectl` and `helm` commands.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--name <NAME>` | active gateway | Gateway name |
-| `--remote <USER@HOST>` | auto-resolved | SSH destination for remote gateways |
-| `--ssh-key <PATH>` | none | SSH private key for remote gateways |
-
-Examples:
-- `kubectl -n openshell get pods`
-- `kubectl -n openshell logs statefulset/openshell`
-- `helm -n openshell status openshell`
+Validate local Docker prerequisites for standalone gateway development. For
+package-managed or Helm gateways, use `systemctl`, `journalctl`, `kubectl`, and
+`helm` directly.
 
 ---
 

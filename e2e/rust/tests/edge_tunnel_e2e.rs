@@ -192,7 +192,7 @@ async fn ws_tunnel_status_through_edge_proxy() {
     if !endpoint.starts_with("http://") {
         eprintln!(
             "Skipping ws_tunnel test: gateway endpoint is not plaintext HTTP: {endpoint}\n\
-             Deploy with `openshell gateway start --plaintext` for this test."
+             Use a plaintext local gateway such as `mise run gateway:docker` for this test."
         );
         return;
     }

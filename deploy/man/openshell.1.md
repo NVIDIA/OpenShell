@@ -142,9 +142,10 @@ development task, or behind a cloud reverse proxy.
 **term**
 :   Open the real-time TUI dashboard.
 
-**doctor check** \| **logs** \| **exec**
-:   Diagnostic tools for local Docker-backed gateways. For package-managed
-    gateways, prefer systemd, journalctl, kubectl, or Helm diagnostics.
+**doctor check**
+:   Validate local Docker prerequisites for standalone gateway development.
+    For package-managed gateways, prefer systemd, journalctl, kubectl, or Helm
+    diagnostics.
 
 **completions** *SHELL*
 :   Generate shell completions (bash, zsh, fish).

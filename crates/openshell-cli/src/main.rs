@@ -330,8 +330,6 @@ const DOCTOR_HELP: &str = "\x1b[1mALIAS\x1b[0m
 
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell doctor check
-  $ openshell doctor logs --lines 100
-  $ openshell doctor exec -- kubectl get pods -A
 ";
 
 /// `OpenShell` CLI - agent execution and management.
@@ -491,7 +489,7 @@ enum Commands {
     // ===================================================================
     /// Diagnose gateway issues.
     ///
-    /// Inspect logs and run commands inside the gateway container.
+    /// Check local prerequisites for gateway development.
     #[command(visible_alias = "dr", hide = true, after_help = DOCTOR_HELP, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Doctor {
         #[command(subcommand)]
@@ -959,59 +957,6 @@ enum InferenceCommands {
 
 #[derive(Subcommand, Debug)]
 enum DoctorCommands {
-    /// Fetch logs from the gateway container.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Logs {
-        /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY")]
-        name: Option<String>,
-
-        /// Number of log lines to return (default: all).
-        #[arg(short, long)]
-        lines: Option<usize>,
-
-        /// Stream live logs (follow mode).
-        #[arg(long)]
-        tail: bool,
-
-        /// Override SSH destination for remote gateways.
-        #[arg(long)]
-        remote: Option<String>,
-
-        /// Path to SSH private key for remote gateways.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        ssh_key: Option<String>,
-    },
-
-    /// Run a command inside the gateway container.
-    ///
-    /// Launches an interactive `docker exec` session in the gateway's k3s
-    /// container with KUBECONFIG pre-configured.  When the gateway is remote,
-    /// the session is tunnelled over SSH automatically.
-    ///
-    /// Examples:
-    ///   openshell doctor exec -- kubectl get pods -A
-    ///   openshell doctor exec -- k9s
-    ///   openshell doctor exec -- sh
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Exec {
-        /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY")]
-        name: Option<String>,
-
-        /// Override SSH destination for remote gateways.
-        #[arg(long)]
-        remote: Option<String>,
-
-        /// Path to SSH private key for remote gateways.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        ssh_key: Option<String>,
-
-        /// Command and arguments to run inside the container.
-        #[arg(trailing_var_arg = true, required = true)]
-        command: Vec<String>,
-    },
-
     /// Validate system prerequisites for running a gateway.
     ///
     /// Checks that a Docker-compatible runtime is installed, running, and
@@ -1723,29 +1668,6 @@ async fn main() -> Result<()> {
         Some(Commands::Doctor {
             command: Some(command),
         }) => match command {
-            DoctorCommands::Logs {
-                name,
-                lines,
-                tail,
-                remote,
-                ssh_key,
-            } => {
-                let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
-                    .unwrap_or_else(|| "openshell".to_string());
-                run::doctor_logs(&name, lines, tail, remote.as_deref(), ssh_key.as_deref())?;
-            }
-            DoctorCommands::Exec {
-                name,
-                remote,
-                ssh_key,
-                command,
-            } => {
-                let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
-                    .unwrap_or_else(|| "openshell".to_string());
-                run::doctor_exec(&name, remote.as_deref(), ssh_key.as_deref(), &command)?;
-            }
             DoctorCommands::Check => {
                 run::doctor_check()?;
             }
@@ -2771,11 +2693,6 @@ mod tests {
         fs::create_dir(temp.path().join("ctx")).expect("failed to create context directory");
 
         let cases: Vec<(Vec<&str>, usize, &str)> = vec![
-            (
-                vec!["openshell", "doctor", "logs", "--ssh-key", "id"],
-                4,
-                "id_rsa",
-            ),
             (
                 vec!["openshell", "sandbox", "upload", "demo", "Do"],
                 4,

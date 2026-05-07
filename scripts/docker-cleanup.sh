@@ -105,7 +105,7 @@ KEEP_IMAGE_PREFIXES=(
 should_keep_image() {
   local repo="$1"
 
-  # Keep current cluster images
+  # Keep current OpenShell images
   for prefix in "${CURRENT_IMAGE_PREFIXES[@]}"; do
     if [[ "$repo" == "$prefix"* ]]; then
       return 0
@@ -137,7 +137,7 @@ if [[ "$DRY_RUN" == true ]]; then
   echo
 elif [[ "$FORCE" != true ]]; then
   echo -e "${BOLD}This will remove stale images, unused volumes, and build cache.${RESET}"
-  echo "The currently deployed cluster images and running containers are preserved."
+  echo "The currently deployed OpenShell images and running containers are preserved."
   echo
   read -r -p "Continue? [y/N] " confirm
   if [[ ! "$confirm" =~ ^[Yy]$ ]]; then

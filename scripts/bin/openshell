@@ -10,10 +10,9 @@ CALLER_PWD="$PWD"
 # ---------------------------------------------------------------------------
 # Fingerprint-based rebuild check
 #
-# Mirrors the approach in tasks/scripts/cluster-deploy-fast.sh: collect dirty
-# files from git, filter to paths in the openshell-cli dependency closure,
-# hash their contents, and compare against a persisted state file.  We also
-# track HEAD so that branch switches / pulls are detected.
+# Collect dirty files from git, filter to paths in the openshell-cli dependency
+# closure, hash their contents, and compare against a persisted state file. We
+# also track HEAD so that branch switches / pulls are detected.
 # ---------------------------------------------------------------------------
 
 needs_build=0

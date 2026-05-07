@@ -7,7 +7,6 @@
 description = "Build all Docker images"
 depends = [
   "build:docker:gateway",
-  "build:docker:cluster",
   "build:docker:supervisor",
 ]
 hide = true
@@ -32,11 +31,6 @@ description = "Build the supervisor image (FROM scratch, binary only)"
 run = "tasks/scripts/docker-build-image.sh supervisor"
 hide = true
 
-["build:docker:cluster"]
-description = "Build the k3s cluster image (component images pulled at runtime from registry)"
-run = "tasks/scripts/docker-build-image.sh cluster"
-hide = true
-
 ["docker:build:gateway"]
 description = "Alias for build:docker:gateway"
 depends = ["build:docker:gateway"]
@@ -47,23 +41,18 @@ description = "Alias for build:docker:supervisor"
 depends = ["build:docker:supervisor"]
 hide = true
 
-["docker:build:cluster"]
-description = "Alias for build:docker:cluster"
-depends = ["build:docker:cluster"]
-hide = true
-
-["build:docker:cluster:multiarch"]
-description = "Build multi-arch cluster image and push to a registry"
+["build:docker:multiarch"]
+description = "Build multi-arch gateway and supervisor images and push to a registry"
 run = "tasks/scripts/docker-publish-multiarch.sh"
 hide = true
 
-["docker:build:cluster:multiarch"]
-description = "Alias for build:docker:cluster:multiarch"
-depends = ["build:docker:cluster:multiarch"]
+["docker:build:multiarch"]
+description = "Alias for build:docker:multiarch"
+depends = ["build:docker:multiarch"]
 hide = true
 
 ["docker:cleanup"]
-description = "Remove stale images, volumes, and build cache not used by the current cluster"
+description = "Remove stale images, volumes, and build cache not used by current deployments"
 run = "scripts/docker-cleanup.sh --force"
 
 ["docker:cleanup:dry-run"]

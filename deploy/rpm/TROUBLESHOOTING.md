@@ -44,9 +44,6 @@ systemd commands directly:
 | Follow logs | `journalctl --user -u openshell-gateway -f` |
 | Remove CLI registration | `openshell gateway remove [name]` |
 
-`openshell doctor exec` is not applicable to the RPM gateway because
-there is no K3s container to exec into.
-
 ### Building from local Dockerfiles
 
 `openshell sandbox create --from ./Dockerfile` builds via the local

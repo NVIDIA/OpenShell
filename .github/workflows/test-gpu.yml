@@ -25,7 +25,7 @@ jobs:
         with:
           required_label: test:e2e-gpu
 
-  build-gateway:
+  build-supervisor:
     needs: [pr_metadata]
     if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:
@@ -33,20 +33,10 @@ jobs:
       packages: write
     uses: ./.github/workflows/docker-build.yml
     with:
-      component: gateway
-
-  build-cluster:
-    needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: cluster
+      component: supervisor
 
   e2e-gpu:
-    needs: [pr_metadata, build-gateway, build-cluster]
+    needs: [pr_metadata, build-supervisor]
     if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:
       contents: read

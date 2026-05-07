@@ -70,7 +70,7 @@ The demo also exercises two OpenShell features:
 
 - OpenShell CLI from current `main` (or set `OPENSHELL_BIN` to the binary
   path)
-- A running OpenShell gateway: `openshell gateway start`
+- A running OpenShell gateway: `mise run gateway:docker` for local development
 - Local Codex sign-in on the host: `codex login`
 - `gh` (GitHub CLI) signed in, **or** a GitHub PAT with `contents:write`
 - `jq` on the host

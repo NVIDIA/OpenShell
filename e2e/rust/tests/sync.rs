@@ -6,7 +6,7 @@
 //! E2E test: bidirectional file upload/download with a sandbox.
 //!
 //! Prerequisites:
-//! - A running openshell gateway (`openshell gateway start`)
+//! - A running openshell gateway (`mise run gateway:docker`)
 //! - The `openshell` binary (built automatically from the workspace)
 
 use std::fs;

@@ -89,17 +89,8 @@ jobs:
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
       checkout-ref: ${{ inputs.tag || github.ref }}
 
-  build-cluster:
-    needs: [compute-versions]
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: cluster
-      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
-      checkout-ref: ${{ inputs.tag || github.ref }}
-
   e2e:
-    needs: [compute-versions, build-gateway, build-supervisor, build-cluster]
+    needs: [compute-versions, build-gateway, build-supervisor]
     uses: ./.github/workflows/e2e-test.yml
     with:
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
@@ -108,7 +99,7 @@ jobs:
 
   tag-ghcr-release:
     name: Tag GHCR Images for Release
-    needs: [compute-versions, build-gateway, build-supervisor, build-cluster, e2e]
+    needs: [compute-versions, build-gateway, build-supervisor, e2e]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     steps:
@@ -121,7 +112,7 @@ jobs:
           REGISTRY="ghcr.io/nvidia/openshell"
           VERSION="${{ needs.compute-versions.outputs.semver }}"
           SOURCE_TAG="${{ needs.compute-versions.outputs.source_sha }}"
-          for component in gateway supervisor cluster; do
+          for component in gateway supervisor; do
             echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION} and latest..."
             docker buildx imagetools create \
               --prefer-index=false \

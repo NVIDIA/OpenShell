@@ -14,7 +14,7 @@
 //! placeholder made it all the way through to the sandbox process environment.
 //!
 //! Prerequisites:
-//! - A running openshell gateway (`openshell gateway start`)
+//! - A running openshell gateway (`mise run gateway:docker`)
 //! - The `openshell` binary (built automatically from the workspace)
 
 use std::process::Stdio;

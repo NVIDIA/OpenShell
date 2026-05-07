@@ -8,7 +8,6 @@
 # Targets:
 #   gateway             Final gateway image
 #   supervisor          Final supervisor image (Ubuntu base, supervisor binary)
-#   cluster             Final cluster image
 #
 # Rust binaries are built natively before the image build and staged at:
 #   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-{gateway,sandbox}
@@ -17,14 +16,6 @@
 # binaries inside Docker instead. BuildKit only executes the selected binary
 # staging stage, so missing prebuilt files do not cause a build failure.
 
-# Pin by tag AND manifest-list digest to prevent silent upstream republishes
-# from breaking the build. Update both when bumping k3s versions.
-# To refresh: docker buildx imagetools inspect rancher/k3s:<tag> | head -3
-ARG K3S_VERSION=v1.35.3-k3s1
-ARG K3S_DIGEST=sha256:4607083d3cac07e1ccde7317297271d13ed5f60f35a78f33fcef84858a9f1d69
-ARG K9S_VERSION=v0.50.18
-ARG HELM_VERSION=v3.17.3
-ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
 # Controls binary source: 0 = prebuilt (release), 1 = compile in Docker (local dev).
 # Must be declared here (global scope) so it can be used in FROM instructions below.
 ARG BUILD_FROM_SOURCE=0
@@ -129,103 +120,3 @@ CMD ["--bind-address", "0.0.0.0", "--port", "8080"]
 # the binary, breaking the Kubernetes init-container path.
 FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS supervisor
 COPY --from=supervisor-binary /build/out/openshell-sandbox /openshell-sandbox
-
-# ---------------------------------------------------------------------------
-# Cluster asset stages
-# ---------------------------------------------------------------------------
-FROM rancher/k3s:${K3S_VERSION}@${K3S_DIGEST} AS k3s
-
-FROM ubuntu:24.04 AS k9s
-ARG K9S_VERSION
-ARG TARGETARCH
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
-    curl -fsSL "https://github.com/derailed/k9s/releases/download/${K9S_VERSION}/k9s_Linux_${TARGETARCH}.tar.gz" \
-      | tar xz -C /tmp k9s && \
-    chmod +x /tmp/k9s && \
-    rm -rf /var/lib/apt/lists/*
-
-FROM ubuntu:24.04 AS helm
-ARG HELM_VERSION
-ARG TARGETARCH
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
-    curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz" \
-      | tar xz --strip-components=1 -C /tmp "linux-${TARGETARCH}/helm" && \
-    chmod +x /tmp/helm && \
-    rm -rf /var/lib/apt/lists/*
-
-FROM ubuntu:24.04 AS nvidia-container-toolkit
-ARG NVIDIA_CONTAINER_TOOLKIT_VERSION
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        gpg curl ca-certificates && \
-    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-        | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && \
-    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
-        | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-        | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-        "nvidia-container-toolkit-base=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" && \
-    rm -rf /var/lib/apt/lists/*
-
-# ---------------------------------------------------------------------------
-# Final cluster image
-# ---------------------------------------------------------------------------
-FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS cluster
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    iptables \
-    mount \
-    dnsutils \
-    && apt-get install -y --only-upgrade gpgv \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=k3s /bin/ /bin/
-COPY --from=k9s /tmp/k9s /usr/local/bin/k9s
-COPY --from=helm /tmp/helm /usr/local/bin/helm
-COPY --from=k3s /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/k3s-ca-certificates.crt
-COPY --from=k3s /usr/share/zoneinfo/ /usr/share/zoneinfo/
-
-ENV PATH="/var/lib/rancher/k3s/data/cni:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/bin/aux" \
-    CRI_CONFIG_FILE="/var/lib/rancher/k3s/agent/etc/crictl.yaml"
-
-COPY --from=nvidia-container-toolkit /usr/bin/nvidia-cdi-hook /usr/bin/
-COPY --from=nvidia-container-toolkit /usr/bin/nvidia-container-runtime /usr/bin/
-COPY --from=nvidia-container-toolkit /usr/bin/nvidia-ctk /usr/bin/
-COPY --from=nvidia-container-toolkit /etc/nvidia-container-runtime /etc/nvidia-container-runtime
-COPY --from=supervisor-binary /build/out/openshell-sandbox /opt/openshell/bin/openshell-sandbox
-
-RUN mkdir -p /var/lib/rancher/k3s/server/manifests \
-             /var/lib/rancher/k3s/server/static/charts \
-             /etc/rancher/k3s \
-             /opt/openshell/manifests \
-             /opt/openshell/charts \
-             /opt/openshell/gpu-manifests \
-             /run/flannel
-
-COPY deploy/docker/cluster-entrypoint.sh /usr/local/bin/cluster-entrypoint.sh
-RUN chmod +x /usr/local/bin/cluster-entrypoint.sh
-
-COPY deploy/docker/cluster-healthcheck.sh /usr/local/bin/cluster-healthcheck.sh
-RUN chmod +x /usr/local/bin/cluster-healthcheck.sh
-
-COPY deploy/docker/.build/charts/*.tgz /opt/openshell/charts/
-# Only the core k3s auto-deploy manifests belong in the cluster image.
-# Gateway API routing is optional and requires Envoy Gateway CRDs, so
-# deploy/kube/manifests/envoy-gateway-openshell.yaml stays repo-local and is
-# applied manually by `mise run helm:gateway:apply` when grpcRoute is enabled.
-COPY deploy/kube/manifests/openshell-helmchart.yaml \
-     deploy/kube/manifests/agent-sandbox.yaml \
-     /opt/openshell/manifests/
-COPY deploy/kube/gpu-manifests/*.yaml /opt/openshell/gpu-manifests/
-
-ENTRYPOINT ["/usr/local/bin/cluster-entrypoint.sh"]
-# Default to "server" so bare `docker run <image>` works without requiring
-# the caller to pass a subcommand.  The openshell CLI already passes
-# ["server", "--disable=traefik", ...] as CMD; this default only affects
-# manual `docker run` invocations that omit a command.
-CMD ["server"]
-
-HEALTHCHECK --interval=5s --timeout=5s --start-period=20s --retries=60 \
-  CMD ["/usr/local/bin/cluster-healthcheck.sh"]
