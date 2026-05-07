@@ -38,6 +38,8 @@ Common gateway options:
 
 The gateway talks to the Docker daemon to create sandbox containers. Docker is also required for local image builds from directories or Dockerfiles.
 
+For maintainer-level implementation details, refer to the [Docker driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-docker/README.md).
+
 | Option | Environment variable | Description |
 |---|---|---|
 | `--drivers docker` | `OPENSHELL_DRIVERS=docker` | Select the Docker compute driver. |
@@ -54,6 +56,8 @@ For GPU-backed Docker sandboxes, configure Docker CDI before starting the gatewa
 
 The gateway talks to the Podman API socket. The Podman driver requires Podman 5.x, cgroups v2, rootless networking, and an active Podman user socket.
 
+For maintainer-level implementation details, refer to the [Podman driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md).
+
 | Option | Environment variable | Description |
 |---|---|---|
 | `--drivers podman` | `OPENSHELL_DRIVERS=podman` | Select the Podman compute driver. |
@@ -68,6 +72,8 @@ The gateway talks to the Podman API socket. The Podman driver requires Podman 5.
 MicroVM-backed sandboxes run inside VM-backed isolation instead of a container boundary. Use MicroVM when workloads need a VM boundary instead of a local container boundary.
 
 The gateway uses the VM compute driver to create VM-backed sandboxes. MicroVM requires host virtualization support. It uses [libkrun](https://github.com/containers/libkrun) with Apple's [Hypervisor framework](https://developer.apple.com/documentation/hypervisor) on macOS, KVM on Linux, and [QEMU](https://www.qemu.org/) for GPU-backed sandboxes on Linux.
+
+For maintainer-level implementation details, refer to the [VM driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md).
 
 | Option | Environment variable | Description |
 |---|---|---|
@@ -84,6 +90,8 @@ The gateway uses the VM compute driver to create VM-backed sandboxes. MicroVM re
 Kubernetes-backed sandboxes run as pods in the configured sandbox namespace. Use Kubernetes for shared clusters, remote compute, GPU scheduling, and operator-managed environments.
 
 Helm deployments set Kubernetes driver values through the chart.
+
+For maintainer-level implementation details, refer to the [Kubernetes driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-kubernetes/README.md).
 
 | Gateway option | Environment variable | Helm value | Description |
 |---|---|---|---|
