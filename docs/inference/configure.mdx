@@ -158,6 +158,8 @@ The client-supplied `model` and `api_key` values are not sent upstream. The priv
 
 Some SDKs require a non-empty API key even though `inference.local` does not use the sandbox-provided value. In those cases, pass any placeholder such as `test` or `unused`.
 
+OpenAI OAuth Codex clients can also use the local endpoint. If the Codex client appends `/codex/responses` to the configured base URL, set the base URL to `https://inference.local/v1`. OpenShell matches `/v1/codex/*` and forwards those requests to upstream backends that do not expose a `/v1` prefix.
+
 Use this endpoint when inference should stay local to the host for privacy and security reasons. External providers that should be reached directly belong in `network_policies` instead.
 
 When the upstream runs on the same machine as the gateway, bind it to `0.0.0.0` and point the provider at `host.openshell.internal` or the host's LAN IP. `127.0.0.1` and `localhost` usually fail because the request originates from the gateway or sandbox runtime, not from your shell.

@@ -109,6 +109,51 @@ async fn proxy_upstream_401_returns_error() {
 }
 
 #[tokio::test]
+async fn proxy_strips_v1_before_forwarding_codex_to_non_versioned_base() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .and(bearer_token("test-api-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = vec![ResolvedRoute {
+        name: "inference.local".to_string(),
+        endpoint: mock_server.uri(),
+        model: "gpt-5.4".to_string(),
+        api_key: "test-api-key".to_string(),
+        protocols: vec!["openai_responses".to_string()],
+        auth: AuthHeader::Bearer,
+        default_headers: Vec::new(),
+        passthrough_headers: Vec::new(),
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+    }];
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "gpt-5.4",
+        "input": "Hello"
+    }))
+    .unwrap();
+
+    let response = router
+        .proxy_with_candidates(
+            "openai_responses",
+            "POST",
+            "/v1/codex/responses",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            bytes::Bytes::from(body),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+}
+
+#[tokio::test]
 async fn proxy_no_compatible_route_returns_error() {
     let router = Router::new().unwrap();
     let candidates = vec![ResolvedRoute {
