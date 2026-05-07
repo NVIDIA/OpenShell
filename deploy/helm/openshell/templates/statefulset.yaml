@@ -77,7 +77,7 @@ spec:
               value: {{ .Values.supervisor.image.pullPolicy | quote }}
             {{- end }}
             - name: OPENSHELL_GRPC_ENDPOINT
-              value: {{ if .Values.server.disableTls }}{{ .Values.server.grpcEndpoint | replace "https://" "http://" | quote }}{{ else }}{{ .Values.server.grpcEndpoint | quote }}{{ end }}
+              value: {{ include "openshell.grpcEndpoint" . | quote }}
             {{- if .Values.server.sshGatewayHost }}
             - name: OPENSHELL_SSH_GATEWAY_HOST
               value: {{ .Values.server.sshGatewayHost | quote }}
