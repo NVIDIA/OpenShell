@@ -56,10 +56,48 @@ names, creation timestamps, and labels. Crate-level details live in
 
 ## Persistence
 
-The gateway stores protobuf payloads with indexed object metadata. SQLite is the
-default local store; Postgres is supported for deployments that need an external
-database. Persisted state includes sandboxes, providers, SSH sessions, policy
-revisions, settings, inference configuration, and deployment records.
+The gateway persistence layer is a protobuf object store. Domain services store
+typed protobuf messages as opaque binary payloads, while the database keeps a
+small set of indexed metadata columns for lookup, listing, versioning, and
+workflow state. The implementation lives in the
+[gateway persistence module](../crates/openshell-server/src/persistence/mod.rs);
+backend-specific SQL lives in the SQLite and Postgres migration directories
+under `crates/openshell-server/migrations/`.
+
+The storage schema is intentionally narrow:
+
+| Column | Purpose |
+|---|---|
+| `id` | Stable gateway-generated object ID and primary key. |
+| `object_type` | Logical resource kind, such as `sandbox`, `provider`, `ssh_session`, `inference_route`, `sandbox_policy`, or `draft_policy_chunk`. |
+| `name` | Human-readable name, unique within an object type when present. |
+| `scope` | Optional owner or namespace for scoped/versioned records, such as a sandbox ID for policy revisions. |
+| `version` | Optional monotonically increasing version for scoped records. |
+| `status` | Optional workflow state for records such as policy revisions or draft policy chunks. |
+| `dedup_key` and `hit_count` | Optional policy-advisor fields for coalescing repeated observations. |
+| `payload` | Prost-encoded protobuf payload for the full domain object. |
+| `created_at_ms` and `updated_at_ms` | Gateway timestamps used for ordering and list output. |
+| `labels` | JSON object carrying Kubernetes-style object labels for filtering and organization. |
+
+Common resources use generic helpers that derive `object_type`, `id`, `name`,
+and labels from protobuf metadata traits before encoding the full message into
+`payload`. Policy revisions and draft policy chunks use the same table but also
+populate `scope`, `version`, `status`, `dedup_key`, and `hit_count` so the
+gateway can efficiently fetch the latest policy, track load status, and manage
+advisor drafts without creating resource-specific tables.
+
+SQLite is the default local store; Postgres is supported for deployments that
+need an external database or multi-replica coordination. Both backends expose
+the same `Store` API and the same logical schema. Backend differences stay
+inside the adapters: for example, SQLite stores labels as JSON text and payloads
+as `BLOB`, while Postgres stores labels as `JSONB` and payloads as `BYTEA`.
+Domain code should depend on the object-store contract, not SQL dialect details.
+This keeps the gateway data model portable across storage backends and leaves
+room for future stores that can provide the same object, label, version, and
+scope semantics.
+
+Persisted state includes sandboxes, providers, SSH sessions, policy revisions,
+settings, inference configuration, and deployment records.
 
 Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The
