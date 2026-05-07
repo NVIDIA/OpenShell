@@ -12,7 +12,11 @@ description = "Run all end-to-end tests (Rust + Python)"
 depends = ["e2e:rust", "e2e:python"]
 
 ["e2e:gpu"]
-description = "Run GPU end-to-end tests"
+description = "Run Docker GPU end-to-end tests"
+depends = ["e2e:docker:gpu"]
+
+["e2e:k3s:gpu"]
+description = "Run k3s GPU end-to-end tests"
 depends = ["e2e:python:gpu"]
 
 ["test:rust"]
