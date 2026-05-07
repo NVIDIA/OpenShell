@@ -294,6 +294,32 @@ resolve_docker_supervisor_image() {
   printf '%s\n' ""
 }
 
+docker_pull_with_retry() {
+  local image=$1
+  local attempts=4
+  local delay=10
+  local attempt=1
+
+  while [ "${attempt}" -le "${attempts}" ]; do
+    if [ "${attempt}" -gt 1 ]; then
+      echo "Retrying Docker pull for ${image} (attempt ${attempt}/${attempts})..."
+    fi
+
+    if docker pull "${image}"; then
+      return 0
+    fi
+
+    if [ "${attempt}" -lt "${attempts}" ]; then
+      echo "Docker pull failed for ${image}; retrying in ${delay}s..." >&2
+      sleep "${delay}"
+    fi
+
+    attempt=$((attempt + 1))
+  done
+
+  return 1
+}
+
 ensure_docker_supervisor_image() {
   local image=$1
 
@@ -302,7 +328,7 @@ ensure_docker_supervisor_image() {
   fi
 
   echo "Pulling Docker supervisor image ${image}..."
-  if docker pull "${image}"; then
+  if docker_pull_with_retry "${image}"; then
     return 0
   fi
 
@@ -357,7 +383,10 @@ DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
 if ! docker image inspect "${SANDBOX_IMAGE}" >/dev/null 2>&1; then
   echo "Pulling ${SANDBOX_IMAGE}..."
-  docker pull "${SANDBOX_IMAGE}"
+  if ! docker_pull_with_retry "${SANDBOX_IMAGE}"; then
+    echo "ERROR: sandbox image '${SANDBOX_IMAGE}' is not available." >&2
+    exit 2
+  fi
 fi
 
 PKI_DIR="${WORKDIR}/pki"
