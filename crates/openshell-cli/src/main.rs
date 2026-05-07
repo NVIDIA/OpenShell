@@ -1061,8 +1061,9 @@ enum SandboxCommands {
         #[arg(long)]
         gpu: bool,
 
-        /// Target a specific GPU by PCI address (e.g. "0000:2d:00.0") or index (e.g. "0", "1").
-        /// Only valid with --gpu. When omitted with --gpu, the first available GPU is assigned.
+        /// Target a driver-specific GPU device. Docker and Podman use CDI device IDs
+        /// (for example "nvidia.com/gpu=0"); VM uses a PCI BDF or index.
+        /// Only valid with --gpu. When omitted with --gpu, the driver uses its default GPU selection.
         #[arg(long, requires = "gpu")]
         gpu_device: Option<String>,
 
