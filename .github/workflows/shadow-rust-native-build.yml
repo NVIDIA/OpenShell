@@ -37,6 +37,11 @@ on:
         required: false
         type: string
         default: ""
+      checkout-ref:
+        description: "Git ref to check out for build inputs (defaults to the workflow SHA)"
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       component:
@@ -72,6 +77,11 @@ on:
         default: 5
       artifact-name:
         description: "Artifact name override"
+        required: false
+        type: string
+        default: ""
+      checkout-ref:
+        description: "Git ref to check out for build inputs (defaults to the workflow SHA)"
         required: false
         type: string
         default: ""
@@ -113,6 +123,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
           fetch-depth: 0
 
       - name: Mark workspace safe for git

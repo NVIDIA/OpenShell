@@ -12,6 +12,11 @@ on:
         required: false
         type: string
         default: "linux-amd64-cpu8"
+      checkout-ref:
+        description: "Git ref to check out for test inputs (defaults to the workflow SHA)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -54,6 +59,8 @@ jobs:
       OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
 
       - name: Install OS test dependencies
         if: matrix.apt_packages != ''

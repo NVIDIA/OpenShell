@@ -37,6 +37,11 @@ on:
         required: false
         type: string
         default: ""
+      checkout-ref:
+        description: "Git ref to check out for build inputs (defaults to the workflow SHA)"
+        required: false
+        type: string
+        default: ""
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -150,6 +155,7 @@ jobs:
       component: ${{ needs.resolve.outputs.binary_component }}
       arch: ${{ matrix.arch }}
       cargo-version: ${{ inputs['cargo-version'] }}
+      checkout-ref: ${{ inputs['checkout-ref'] }}
       features: openshell-core/dev-settings
       artifact-name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
     secrets: inherit
@@ -181,6 +187,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
           fetch-depth: 0
 
       - name: Mark workspace safe for git
