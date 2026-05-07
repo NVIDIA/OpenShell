@@ -9,7 +9,7 @@ This chart deploys the OpenShell gateway into a Kubernetes cluster. It is publis
 The Kubernetes Agent Sandbox CRDs and controller must be installed on the cluster before deploying OpenShell. Install them with:
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.4.3/manifest.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/manifest.yaml
 ```
 
 ## Install on Kubernetes
