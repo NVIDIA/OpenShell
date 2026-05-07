@@ -52,4 +52,5 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset(
     ) in formula
     assert 'sha256 "' + "b" * 64 + '"' in formula
     assert 'OPENSHELL_DRIVER_DIR: "#{opt_libexec}"' in formula
+    assert "entitlements.atomic_write" in formula
     assert "brew services restart openshell" in formula

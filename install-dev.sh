@@ -288,6 +288,17 @@ homebrew_formula_path() {
   printf '%s/%s.rb\n' "$_formula_dir" "$_formula"
 }
 
+patch_homebrew_formula() {
+  _formula_file="$1"
+  _patched_file="${_formula_file}.patched"
+
+  if grep -q 'entitlements.write <<~XML' "$_formula_file"; then
+    info "patching Homebrew formula for idempotent postinstall..."
+    sed 's/entitlements\.write <<~XML/entitlements.atomic_write <<~XML/' "$_formula_file" >"$_patched_file"
+    mv "$_patched_file" "$_formula_file"
+  fi
+}
+
 start_user_gateway() {
   info "restarting openshell-gateway user service as ${TARGET_USER}..."
 
@@ -406,6 +417,7 @@ install_macos_homebrew() {
     error "failed to download ${_formula_url}; the selected release may not include a Homebrew formula"
   }
   chmod 0644 "$_formula_file"
+  patch_homebrew_formula "$_formula_file"
 
   _tap_formula_file="$(homebrew_formula_path "$HOMEBREW_DEV_TAP" "$HOMEBREW_FORMULA_NAME")"
   info "staging Homebrew formula in local tap ${HOMEBREW_DEV_TAP}..."

@@ -51,6 +51,11 @@ done
 [ -n "$output" ] || exit 2
 cat >"$output" <<'FORMULA'
 class Openshell < Formula
+  def post_install
+    entitlements.write <<~XML
+      <plist></plist>
+    XML
+  end
 end
 FORMULA
 EOF
@@ -123,6 +128,16 @@ assert_log_contains "openshell gateway add http://127.0.0.1:17670 --local --name
 
 if ! grep -qF "class Openshell < Formula" "${BREW_TAP_DIR}/Formula/openshell.rb"; then
   echo "formula was not staged into the local tap" >&2
+  exit 1
+fi
+
+if ! grep -qF "entitlements.atomic_write <<~XML" "${BREW_TAP_DIR}/Formula/openshell.rb"; then
+  echo "formula postinstall was not patched to use atomic_write" >&2
+  exit 1
+fi
+
+if grep -qF "entitlements.write <<~XML" "${BREW_TAP_DIR}/Formula/openshell.rb"; then
+  echo "formula postinstall still uses non-idempotent write" >&2
   exit 1
 fi
 
