@@ -9,21 +9,6 @@ sideloaded into each container via an OCI image volume mount.
 
 For a rootless networking deep dive, see [NETWORKING.md](NETWORKING.md).
 
-## Source File Index
-
-All paths are relative to `crates/openshell-driver-podman/src/`.
-
-| File | Purpose |
-|---|---|
-| `lib.rs` | Crate root and public re-exports. |
-| `main.rs` | Standalone binary entrypoint, CLI/env parsing, driver construction, and gRPC server startup. |
-| `driver.rs` | Core `PodmanComputeDriver`: sandbox lifecycle, image pulls, endpoint detection, GPU checks, rootless preflight checks, and bridge network setup. |
-| `client.rs` | `PodmanClient`: async HTTP/1.1 client over a Unix socket for the Podman libpod REST API. |
-| `container.rs` | Container spec construction: labels, environment, resource limits, capabilities, seccomp config, health checks, port mappings, image volumes, TLS mounts, and secret injection. |
-| `config.rs` | `PodmanComputeConfig`, `ImagePullPolicy`, default socket path resolution, TLS validation, and redacted `Debug` output. |
-| `grpc.rs` | `ComputeDriverService`: tonic gRPC service mapping compute driver RPCs to driver methods. |
-| `watcher.rs` | Watch stream: initial state sync via container list, then live Podman events mapped to `WatchSandboxesEvent` protobuf messages. |
-
 ## Architecture
 
 The Podman driver communicates with the Podman daemon over a Unix socket and
@@ -41,19 +26,6 @@ graph TB
     SV -->|enforces| LL["Landlock + seccomp"]
     SV -->|gRPC callback| GW
 ```
-
-### Driver Comparison
-
-| Aspect | Kubernetes | Docker | VM | Podman |
-|---|---|---|---|---|
-| Execution model | In-process | In-process | Standalone subprocess over gRPC UDS | In-process, with standalone binary support |
-| Backend | Kubernetes API | Docker daemon | libkrun and gvproxy | Podman REST API over Unix socket |
-| Isolation boundary | Pod plus nested sandbox namespace | Container plus nested sandbox namespace | Per-sandbox microVM | Container plus nested sandbox namespace |
-| Supervisor delivery | Supervisor image or init copy into pod volume | Extracted or mounted supervisor binary | Embedded guest bundle | OCI image volume, read-only |
-| Network model | Supervisor creates netns inside pod | Host networking plus nested netns | gvproxy virtio-net | Podman bridge plus nested netns |
-| Credential injection | Environment and Kubernetes Secret volume | Environment and mounted TLS bundle | Guest rootfs copy and environment | Podman `secret_env`, environment, and mounted TLS bundle |
-| GPU support | `nvidia.com/gpu` resource | CDI when daemon supports it | Experimental VFIO path | CDI device request when NVIDIA devices exist |
-| State storage | Kubernetes API | Docker daemon | Driver state dir | Podman daemon |
 
 ## Isolation Model
 

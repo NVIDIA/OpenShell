@@ -416,21 +416,3 @@ published ports, or the supervisor relay.
 | `2222` | Sandbox | Container port mapping default for the SSH compatibility port. |
 | `3128` | Sandbox proxy | HTTP CONNECT proxy inside the sandbox network model. |
 | `0` | Host | Ephemeral host port requested for the container SSH compatibility port. |
-
-## Key Source Files
-
-| File | What it controls |
-|---|---|
-| `crates/openshell-driver-podman/src/driver.rs` | Bridge network creation, gRPC endpoint auto-detection, rootless checks. |
-| `crates/openshell-driver-podman/src/container.rs` | Container spec: network mode, port mappings, host aliases, tmpfs, capabilities. |
-| `crates/openshell-driver-podman/src/client.rs` | Podman REST API calls for network ensure/inspect, port discovery, and events. |
-| `crates/openshell-driver-podman/src/config.rs` | Network name, socket path, SSH port, gateway port defaults. |
-| `crates/openshell-sandbox/src/sandbox/linux/netns.rs` | Inner network namespace, veth pair, IP addressing, iptables rules. |
-| `crates/openshell-sandbox/src/proxy.rs` | HTTP CONNECT proxy, OPA policy, SSRF protection, L7 inspection. |
-| `crates/openshell-sandbox/src/ssh.rs` | SSH daemon on Unix socket and shell process netns entry via `setns()`. |
-| `crates/openshell-sandbox/src/supervisor_session.rs` | gRPC `ConnectSupervisor` stream and `RelayStream` for SSH tunneling. |
-| `crates/openshell-sandbox/src/grpc_client.rs` | gRPC channel to gateway with mTLS or plaintext, keep-alive, and reconnect behavior. |
-| `crates/openshell-server/src/ssh_tunnel.rs` | Gateway-side SSH tunnel, HTTP CONNECT endpoint, relay bridging. |
-| `crates/openshell-server/src/supervisor_session.rs` | `SupervisorSessionRegistry`, relay claim/open lifecycle. |
-| `crates/openshell-server/src/compute/mod.rs` | `ComputeRuntime::new_podman()` driver initialization. |
-| `crates/openshell-core/src/config.rs` | Default constants for ports and network names. |
