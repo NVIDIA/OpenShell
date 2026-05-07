@@ -3019,14 +3019,11 @@ mod tests {
             "bin/sed",
             "sbin/ip",
             "opt/openshell/bin/openshell-sandbox",
-            "usr/local/bin/k3s",
         ] {
             let path = source_rootfs.join(path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, "").unwrap();
         }
-        fs::create_dir_all(source_rootfs.join("opt/openshell/manifests")).unwrap();
-        fs::write(source_rootfs.join("opt/openshell/manifests/old.yaml"), "").unwrap();
 
         create_rootfs_archive_from_dir(&source_rootfs, &exported_rootfs).unwrap();
         prepare_exported_rootfs_archive(
@@ -3045,8 +3042,6 @@ mod tests {
                 .join("opt/openshell/bin/openshell-sandbox")
                 .is_file()
         );
-        assert!(!extracted.join("usr/local/bin/k3s").exists());
-        assert!(!extracted.join("opt/openshell/manifests").exists());
         assert_eq!(
             fs::read_to_string(extracted.join("opt/openshell/.rootfs-type")).unwrap(),
             "sandbox\n"

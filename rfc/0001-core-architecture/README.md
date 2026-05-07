@@ -235,7 +235,7 @@ Background coordination must also avoid a singleton controller. Reconciliation, 
 
 ### Published Artifacts
 
-This architecture ships as three core binaries, a standalone VM binary for quick single-player getting started, two container images, and a Kubernetes deployment story.
+This architecture ships as three core binaries, a VM compute driver, two container images, and a Kubernetes deployment story.
 
 #### Binaries
 
@@ -245,7 +245,7 @@ This architecture ships as three core binaries, a standalone VM binary for quick
 
 `openshell-supervisor` **(Supervisor).** The sandbox-side security boundary. Runs inside every sandbox environment, connects outbound to the gateway, and enforces policy. Distributed as a standalone executable and as the entrypoint of the supervisor container image.
 
-`openshell-vm` **(VM).** The single-player runtime. Launches a lightweight microVM (via libkrun) that embeds both the gateway and supervisor in a single local VM, providing a fully self-contained sandbox environment without requiring a cluster or container runtime. Distributed as a standalone executable for macOS and Linux. Used by the CLI when running in single-player mode.
+`openshell-driver-vm` **(VM compute driver).** Launches per-sandbox microVMs through the gateway compute-driver interface. Distributed as a standalone helper binary for supported macOS and Linux hosts.
 
 #### Container images
 

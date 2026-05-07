@@ -137,16 +137,7 @@ fn append_symlink_to_archive(
 }
 
 fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
-    for relative in [
-        "usr/local/bin/k3s",
-        "usr/local/bin/kubectl",
-        "var/lib/rancher",
-        "etc/rancher",
-        "opt/openshell/charts",
-        "opt/openshell/manifests",
-        "opt/openshell/.initialized",
-        "opt/openshell/.rootfs-type",
-    ] {
+    for relative in ["opt/openshell/.initialized", "opt/openshell/.rootfs-type"] {
         remove_rootfs_path(rootfs, relative)?;
     }
 
@@ -326,14 +317,8 @@ mod tests {
         let dir = unique_temp_dir();
         let rootfs = dir.join("rootfs");
 
-        fs::create_dir_all(rootfs.join("usr/local/bin")).expect("create usr/local/bin");
         fs::create_dir_all(rootfs.join("etc")).expect("create etc");
-        fs::create_dir_all(rootfs.join("var/lib/rancher")).expect("create var/lib/rancher");
-        fs::create_dir_all(rootfs.join("opt/openshell/charts")).expect("create charts");
-        fs::create_dir_all(rootfs.join("opt/openshell/manifests")).expect("create manifests");
         fs::create_dir_all(rootfs.join("opt/openshell/bin")).expect("create openshell bin");
-        fs::write(rootfs.join("usr/local/bin/k3s"), b"k3s").expect("write k3s");
-        fs::write(rootfs.join("usr/local/bin/kubectl"), b"kubectl").expect("write kubectl");
         fs::write(rootfs.join("opt/openshell/.initialized"), b"yes").expect("write initialized");
         fs::write(
             rootfs.join("opt/openshell/bin/openshell-sandbox"),
@@ -357,11 +342,6 @@ mod tests {
         prepare_sandbox_rootfs(&rootfs).expect("prepare sandbox rootfs");
         validate_sandbox_rootfs(&rootfs).expect("validate sandbox rootfs");
 
-        assert!(!rootfs.join("usr/local/bin/k3s").exists());
-        assert!(!rootfs.join("usr/local/bin/kubectl").exists());
-        assert!(!rootfs.join("var/lib/rancher").exists());
-        assert!(!rootfs.join("opt/openshell/charts").exists());
-        assert!(!rootfs.join("opt/openshell/manifests").exists());
         assert!(rootfs.join("srv/openshell-vm-sandbox-init.sh").is_file());
         assert!(!rootfs.join("sandbox").exists());
         assert!(

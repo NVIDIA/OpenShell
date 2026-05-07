@@ -12,9 +12,7 @@ runtime/
 ```
 
 `openshell-driver-vm` embeds libkrun, libkrunfw, gvproxy, and the bundled
-`openshell-sandbox` supervisor. The legacy `crates/openshell-vm` crate remains
-in the repository, but normal workspace builds and release workflows do not use
-it.
+`openshell-sandbox` supervisor.
 
 ## Why
 

@@ -194,10 +194,6 @@ in `post_install`, and owns the `brew services` gateway lifecycle. The service
 also leaves `OPENSHELL_DRIVERS` unset so driver choice remains automatic unless
 the user explicitly overrides it.
 
-## Relationship to `openshell-vm`
-
-`openshell-vm` is a separate, legacy crate that runs the **whole OpenShell gateway inside a single VM**. It remains in the repository for later deprecation or removal, but is excluded from normal workspace builds and release paths. `openshell-driver-vm` is the active compute driver called by a host-resident gateway to spawn **per-sandbox VMs**. The driver vendors its own rootfs handling and runtime loader so `openshell-server` never has to link libkrun.
-
 ## TODOs
 
 - The gateway still configures the driver via CLI args; this will move to a gRPC bootstrap call so the driver interface is uniform across backends. See the `TODO(driver-abstraction)` notes in `crates/openshell-server/src/lib.rs` and `crates/openshell-server/src/compute/vm.rs`.

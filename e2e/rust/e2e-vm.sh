@@ -57,7 +57,7 @@ STATE_DIR_ROOT="/tmp"
 
 # Smoke test timeouts. First boot extracts the embedded libkrun runtime
 # (~60-90MB of zstd per architecture) and prepares a sandbox rootfs from the
-# configured image. The guest then runs k3s-free sandbox supervisor startup; a
+# configured image. The guest then starts the sandbox supervisor directly; a
 # cold microVM is typically ready within ~15s after image preparation.
 GATEWAY_READY_TIMEOUT=60
 SANDBOX_PROVISION_TIMEOUT=180

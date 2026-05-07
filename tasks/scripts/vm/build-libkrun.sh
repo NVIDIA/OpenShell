@@ -152,7 +152,7 @@ if [ -f "$KERNEL_CONFIG" ]; then
   echo "    Applied custom kernel config fragment: openshell.kconfig"
 else
   echo "Warning: Custom kernel config not found at ${KERNEL_CONFIG}" >&2
-  echo "    Building with default config (k3s networking may not work)" >&2
+  echo "    Building with default config (sandbox networking may lack required kernel features)" >&2
 fi
 
 echo "    Building kernel and libkrunfw (this may take 15-20 minutes)..."

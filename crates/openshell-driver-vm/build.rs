@@ -4,8 +4,7 @@
 //! Build script for openshell-driver-vm.
 //!
 //! This crate embeds the sandbox supervisor plus the minimal libkrun runtime
-//! artifacts it needs to boot VMs without depending on the openshell-vm binary
-//! or crate.
+//! artifacts it needs to boot VMs without a separate VM runtime binary.
 
 use std::path::{Path, PathBuf};
 use std::{env, fs};

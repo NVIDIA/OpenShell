@@ -14,7 +14,7 @@ OpenShell builds these main artifacts:
 | CLI package and Python SDK | `python/openshell` plus Rust binaries where packaged |
 | Gateway container image | `deploy/docker/Dockerfile.images` |
 | Helm chart | `deploy/helm/openshell` |
-| VM driver/runtime assets | `crates/openshell-driver-vm` and `crates/openshell-vm` |
+| VM driver/runtime assets | `crates/openshell-driver-vm` |
 | Published docs site | `docs/` rendered by Fern config in `fern/` |
 
 Sandbox community images are built outside this repository.
