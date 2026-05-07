@@ -64,6 +64,7 @@ PODMAN_NETWORK_MANAGED=0
 PODMAN_SERVICE_PID=""
 PODMAN_SERVICE_LOG="${WORKDIR}/podman-service.log"
 PODMAN_SOCKET=""
+GPU_MODE="${OPENSHELL_E2E_PODMAN_GPU:-0}"
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
