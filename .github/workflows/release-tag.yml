@@ -146,6 +146,8 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
       options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.semver }}
@@ -154,6 +156,9 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/setup-buildx
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"

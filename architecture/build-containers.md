@@ -60,8 +60,8 @@ Both the standalone artifact and the deployed container image use the `openshell
 
 OpenShell also publishes Python wheels for `linux/amd64`, `linux/arm64`, and macOS ARM64.
 
-- Linux wheels are built natively on matching Linux runners via `build:python:wheel:linux:amd64` and `build:python:wheel:linux:arm64` in `tasks/python.toml`.
-- There is no local Linux multiarch wheel build task. Release workflows own the per-arch Linux wheel production.
+- Released Linux wheels are built per-arch inside `deploy/docker/Dockerfile.python-wheels-linux`, which uses the PyPA `manylinux_2_28_{x86_64,aarch64}` images as a base. The resulting wheels are tagged `manylinux_2_28` and install on any Linux distribution shipping glibc >= 2.28 (RHEL 8, Debian 10+, Ubuntu 18.04+). The matrix job invokes `mise run python:build:linux:amd64` / `python:build:linux:arm64`, which fan out to `build:python:wheel:linux:{amd64,arm64}:docker`.
+- For fast local iteration, `build:python:wheel:linux:amd64` / `build:python:wheel:linux:arm64` still produce a non-portable wheel tagged for the host's glibc. These tasks are no longer used by release workflows.
 - The macOS ARM64 wheel is cross-compiled with `deploy/docker/Dockerfile.python-wheels-macos` via `build:python:wheel:macos`.
 - Release workflows mirror the CLI layout: a Linux matrix job for amd64/arm64, a separate macOS job, and release jobs that download the per-platform wheel artifacts directly before publishing.
 - Release CPU jobs run on `linux-amd64-cpu8` and `linux-arm64-cpu8`; the macOS wheel is still cross-compiled in Docker from the amd64 Linux runner.

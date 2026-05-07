@@ -44,6 +44,7 @@ url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658323"
 checksum = "sha256:7b98251d2d08926bb5d4639b56b1f0996a58ef6667c5830e3fe3cd3ad5f4214a"
 url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_linux_amd64.tar.gz"
 url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658325"
+provenance = "github-attestations"
 
 [tools."github:anchore/syft"."platforms.linux-x64-musl"]
 checksum = "sha256:7b98251d2d08926bb5d4639b56b1f0996a58ef6667c5830e3fe3cd3ad5f4214a"
@@ -358,6 +359,7 @@ url = "https://ziglang.org/download/0.14.1/zig-aarch64-linux-0.14.1.tar.xz"
 [tools.zig."platforms.linux-x64"]
 checksum = "sha256:24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c"
 url = "https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz"
+provenance = "minisign"
 
 [tools.zig."platforms.macos-arm64"]
 checksum = "sha256:39f3dc5e79c22088ce878edc821dedb4ca5a1cd9f5ef915e9b3cc3053e8faefa"
