@@ -567,6 +567,12 @@ fn network_endpoint_from_json(
                 path: rule.allow.path,
                 command: rule.allow.command,
                 query: HashMap::new(),
+                // GraphQL fields default empty — agent-authored proposals from
+                // policy.local target REST/SQL/L4 endpoints; GraphQL operation
+                // matching is set on the policy server side or via direct YAML.
+                operation_type: String::new(),
+                operation_name: String::new(),
+                fields: Vec::new(),
             }),
         })
         .collect();
@@ -578,6 +584,9 @@ fn network_endpoint_from_json(
             path: rule.path,
             command: rule.command,
             query: HashMap::new(),
+            operation_type: String::new(),
+            operation_name: String::new(),
+            fields: Vec::new(),
         })
         .collect();
 
@@ -593,6 +602,12 @@ fn network_endpoint_from_json(
         ports,
         deny_rules,
         allow_encoded_slash: endpoint.allow_encoded_slash,
+        // GraphQL persisted-query knobs and path scoping default empty —
+        // agent proposals don't author them today.
+        persisted_queries: String::new(),
+        graphql_persisted_queries: HashMap::new(),
+        graphql_max_body_bytes: 0,
+        path: String::new(),
     })
 }
 
