@@ -134,21 +134,29 @@ tokens can expire or be revoked.
 
 ## PKI Bootstrap
 
-On Kubernetes, the Helm chart runs a pre-install/pre-upgrade hook Job that
-invokes `openshell-gateway generate-certs` to create the gateway's server and
-client mTLS Secrets. The Job uses the gateway image itself — no separate
-cert-generation image — and reuses the same `rcgen`-based CA/leaf logic as the
-local `openshell` workflow.
+`openshell-gateway generate-certs` is the one place mTLS materials are
+created. Both deployment paths use it:
 
-The hook is idempotent: both target Secrets present → skip; exactly one
-present → fail with a recovery hint; neither present → generate and create.
-This guards mTLS continuity across upgrades while still recovering cleanly if
-an operator deletes both Secrets and reinstalls.
+| Output mode | Selector | Layout |
+|---|---|---|
+| Kubernetes Secrets | (default) `--namespace`, `--server-secret-name`, `--client-secret-name` | Two `kubernetes.io/tls` Secrets with `tls.crt` / `tls.key` / `ca.crt`. |
+| Filesystem | `--output-dir <DIR>` | `<dir>/{ca.crt, ca.key, server/tls.{crt,key}, client/tls.{crt,key}}`. Also copies client materials to `$XDG_CONFIG_HOME/openshell/gateways/openshell/mtls/` for CLI auto-discovery. |
+
+On Kubernetes, the Helm chart runs the command via a pre-install/pre-upgrade
+hook Job using the gateway image itself — no separate cert-generation image,
+no extra mirror burden in air-gapped environments. On the RPM gateway, the
+same command runs from the systemd unit's `ExecStartPre` to bootstrap PKI
+into the user's state directory on first start.
+
+Both modes share the same idempotency contract: all targets present → skip;
+partial state → fail with a recovery hint; nothing present → generate and
+write. This guards mTLS continuity across restarts and upgrades while still
+recovering cleanly if an operator deletes everything and starts over.
 
 Operators who manage PKI externally (cert-manager, an enterprise CA, or
-pre-created Secrets) disable the hook via `pkiInitJob.enabled=false`. The chart
-also ships a `certManager.*` path that produces equivalent Secrets through
-cert-manager `Issuer`/`Certificate` resources.
+pre-created Secrets) disable the Helm hook via `pkiInitJob.enabled=false`.
+The chart also ships a `certManager.*` path that produces equivalent Secrets
+through cert-manager `Issuer`/`Certificate` resources.
 
 ## Operational Constraints
 

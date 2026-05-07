@@ -604,6 +604,28 @@ mod tests {
     }
 
     #[test]
+    fn generate_certs_local_mode_parses_without_kube_flags() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("OPENSHELL_DB_URL");
+        let _g2 = EnvVarGuard::remove("POD_NAMESPACE");
+
+        let cli = Cli::try_parse_from([
+            "openshell-gateway",
+            "generate-certs",
+            "--output-dir",
+            "/tmp/openshell-certgen",
+        ])
+        .expect("--output-dir should make namespace/secret-name flags optional");
+
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::GenerateCerts(_))
+        ));
+    }
+
+    #[test]
     fn bare_invocation_with_no_db_url_errors_at_runtime_not_parse_time() {
         // db_url is Option<String> at the clap level so subcommand parsing
         // does not require it. The Run path validates it inside
