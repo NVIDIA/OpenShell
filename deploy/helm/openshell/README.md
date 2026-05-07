@@ -24,6 +24,6 @@ The `dev` tags are intended for testing changes ahead of a release. Production d
 
 See [`values.yaml`](values.yaml) for configurable values. Selected overlays:
 
-- [`values-gateway.yaml`](values-gateway.yaml) — gateway-only configuration
-- [`values-cert-manager.yaml`](values-cert-manager.yaml) — cert-manager integration
-- [`values-keycloak.yaml`](values-keycloak.yaml) — Keycloak OIDC integration
+- [`ci/values-gateway.yaml`](ci/values-gateway.yaml) — gateway-only configuration
+- [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) — cert-manager integration
+- [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) — Keycloak OIDC integration
