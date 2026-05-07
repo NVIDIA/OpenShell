@@ -25,18 +25,19 @@ use openshell_bootstrap::{
 };
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
-    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
-    CreateProviderRequest, CreateSandboxRequest, DeleteProviderProfileRequest,
-    DeleteProviderRequest, DeleteSandboxRequest, ExecSandboxRequest, GetClusterInferenceRequest,
+    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
+    ClearDraftChunksRequest, CreateProviderRequest, CreateSandboxRequest,
+    DeleteProviderProfileRequest, DeleteProviderRequest, DeleteSandboxRequest,
+    DetachSandboxProviderRequest, ExecSandboxRequest, GetClusterInferenceRequest,
     GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
     GetProviderProfileRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
     GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ImportProviderProfilesRequest,
     LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource, PolicyStatus, Provider,
-    ProviderProfile, ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
-    Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, SetClusterInferenceRequest,
-    SettingScope, SettingValue, UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest,
-    exec_sandbox_event, setting_value,
+    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest, PolicySource,
+    PolicyStatus, Provider, ProviderProfile, ProviderProfileDiagnostic, ProviderProfileImportItem,
+    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
+    SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
+    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -2510,6 +2511,116 @@ pub async fn sandbox_list(
     }
 
     Ok(())
+}
+
+pub async fn sandbox_provider_list(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .list_sandbox_providers(ListSandboxProvidersRequest {
+            sandbox_name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    let providers = response.into_inner().providers;
+
+    if providers.is_empty() {
+        println!("No providers attached to sandbox {name}.");
+        return Ok(());
+    }
+
+    print_provider_attachment_table(&providers);
+    Ok(())
+}
+
+pub async fn sandbox_provider_attach(
+    server: &str,
+    name: &str,
+    provider: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .attach_sandbox_provider(AttachSandboxProviderRequest {
+            sandbox_name: name.to_string(),
+            provider_name: provider.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if response.attached {
+        println!(
+            "{} Attached provider {} to sandbox {}",
+            "✓".green().bold(),
+            provider,
+            name
+        );
+    } else {
+        println!("Provider {provider} is already attached to sandbox {name}.");
+    }
+    Ok(())
+}
+
+pub async fn sandbox_provider_detach(
+    server: &str,
+    name: &str,
+    provider: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .detach_sandbox_provider(DetachSandboxProviderRequest {
+            sandbox_name: name.to_string(),
+            provider_name: provider.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if response.detached {
+        println!(
+            "{} Detached provider {} from sandbox {}",
+            "✓".green().bold(),
+            provider,
+            name
+        );
+    } else {
+        println!("Provider {provider} was not attached to sandbox {name}.");
+    }
+    Ok(())
+}
+
+fn print_provider_attachment_table(providers: &[Provider]) {
+    let name_width = providers
+        .iter()
+        .map(|provider| provider.object_name().len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let type_width = providers
+        .iter()
+        .map(|provider| provider.r#type.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    println!(
+        "{:<name_width$}  {:<type_width$}  {:<16}  {}",
+        "NAME".bold(),
+        "TYPE".bold(),
+        "CREDENTIAL_KEYS".bold(),
+        "CONFIG_KEYS".bold(),
+    );
+
+    for provider in providers {
+        println!(
+            "{:<name_width$}  {:<type_width$}  {:<16}  {}",
+            provider.object_name().to_string(),
+            provider.r#type,
+            provider.credentials.len(),
+            provider.config.len(),
+        );
+    }
 }
 
 /// Delete a sandbox by name, or all sandboxes when `all` is true.

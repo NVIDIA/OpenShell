@@ -41,6 +41,10 @@ const SCOPED_METHODS: &[(&str, &str)] = &[
     // sandbox:read
     ("/openshell.v1.OpenShell/GetSandbox", "sandbox:read"),
     ("/openshell.v1.OpenShell/ListSandboxes", "sandbox:read"),
+    (
+        "/openshell.v1.OpenShell/ListSandboxProviders",
+        "sandbox:read",
+    ),
     ("/openshell.v1.OpenShell/WatchSandbox", "sandbox:read"),
     ("/openshell.v1.OpenShell/GetSandboxLogs", "sandbox:read"),
     (
@@ -57,6 +61,14 @@ const SCOPED_METHODS: &[(&str, &str)] = &[
     ("/openshell.v1.OpenShell/ExecSandbox", "sandbox:write"),
     ("/openshell.v1.OpenShell/CreateSshSession", "sandbox:write"),
     ("/openshell.v1.OpenShell/RevokeSshSession", "sandbox:write"),
+    (
+        "/openshell.v1.OpenShell/AttachSandboxProvider",
+        "sandbox:write",
+    ),
+    (
+        "/openshell.v1.OpenShell/DetachSandboxProvider",
+        "sandbox:write",
+    ),
     // provider:read
     ("/openshell.v1.OpenShell/GetProvider", "provider:read"),
     ("/openshell.v1.OpenShell/ListProviders", "provider:read"),

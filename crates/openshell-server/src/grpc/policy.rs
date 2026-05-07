@@ -3323,6 +3323,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_config_and_provider_env_follow_attached_provider_lifecycle() {
+        use crate::grpc::sandbox::{
+            handle_attach_sandbox_provider, handle_detach_sandbox_provider,
+        };
+        use openshell_core::proto::{
+            AttachSandboxProviderRequest, DetachSandboxProviderRequest,
+            GetSandboxProviderEnvironmentRequest,
+        };
+
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-attach-lifecycle",
+                "attach-lifecycle",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let baseline_policy = get_sandbox_policy(&state, "sb-attach-lifecycle").await;
+        assert!(
+            !baseline_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+
+        handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "attach-lifecycle".to_string(),
+                provider_name: "work-github".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let attached_policy = get_sandbox_policy(&state, "sb-attach-lifecycle").await;
+        assert!(
+            attached_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+
+        let attached_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-attach-lifecycle".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .environment;
+        assert_eq!(
+            attached_env.get("GITHUB_TOKEN"),
+            Some(&"ghp-test".to_string())
+        );
+
+        handle_detach_sandbox_provider(
+            &state,
+            Request::new(DetachSandboxProviderRequest {
+                sandbox_name: "attach-lifecycle".to_string(),
+                provider_name: "work-github".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let detached_policy = get_sandbox_policy(&state, "sb-attach-lifecycle").await;
+        assert!(
+            !detached_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+
+        let detached_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-attach-lifecycle".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .environment;
+        assert!(!detached_env.contains_key("GITHUB_TOKEN"));
+    }
+
+    #[tokio::test]
     async fn global_policy_suppresses_provider_profile_layers_when_v2_enabled() {
         use openshell_core::proto::{
             GetSandboxConfigRequest, NetworkEndpoint, NetworkPolicyRule, SandboxPhase,
