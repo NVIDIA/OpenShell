@@ -42,24 +42,24 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs['checkout-ref'] }}
 
       - name: Download CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: cli-linux-${{ matrix.arch }}
           path: package-input/
 
       - name: Download gateway artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: gateway-binary-linux-${{ matrix.arch }}
           path: package-input/
 
       - name: Download VM driver artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: driver-vm-linux-${{ matrix.arch }}
           path: package-input/
@@ -85,7 +85,7 @@ jobs:
             tasks/scripts/package-deb.sh
 
       - name: Upload Debian package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: deb-linux-${{ matrix.arch }}
           path: artifacts/*.deb

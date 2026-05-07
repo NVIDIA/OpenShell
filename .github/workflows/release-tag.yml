@@ -44,7 +44,7 @@ jobs:
       # Semver without 'v' prefix (e.g. 0.6.0), used for image tags and release body
       semver: ${{ steps.v.outputs.semver }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -146,7 +146,7 @@ jobs:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.semver }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -171,7 +171,7 @@ jobs:
           ls -la ${{ matrix.output_path }}
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: python-wheels-${{ matrix.artifact }}
           path: ${{ matrix.output_path }}
@@ -194,7 +194,7 @@ jobs:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.semver }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -220,7 +220,7 @@ jobs:
           ls -la target/wheels/*.whl
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: python-wheels-macos
           path: target/wheels/*.whl
@@ -258,7 +258,7 @@ jobs:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.semver }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -335,7 +335,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cli-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
@@ -360,7 +360,7 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -400,7 +400,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cli-macos
           path: artifacts/*.tar.gz
@@ -432,7 +432,7 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -484,7 +484,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gateway-binary-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
@@ -516,7 +516,7 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -568,7 +568,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: supervisor-binary-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
@@ -593,7 +593,7 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -637,7 +637,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gateway-binary-macos
           path: artifacts/*.tar.gz
@@ -681,47 +681,47 @@ jobs:
     outputs:
       wheel_filenames: ${{ steps.wheel_filenames.outputs.wheel_filenames }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Download all CLI artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: cli-*
           path: release/
           merge-multiple: true
 
       - name: Download gateway binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: gateway-binary-*
           path: release/
           merge-multiple: true
 
       - name: Download supervisor binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: supervisor-binary-*
           path: release/
           merge-multiple: true
 
       - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: python-wheels-*
           path: release/
           merge-multiple: true
 
       - name: Download Debian package artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: deb-linux-*
           path: release/
           merge-multiple: true
 
       - name: Download RPM package artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: rpm-linux-*
           path: release/
@@ -758,7 +758,7 @@ jobs:
           cat openshell-sandbox-checksums-sha256.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: OpenShell ${{ env.RELEASE_TAG }}
           prerelease: false
@@ -795,12 +795,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "24"
 

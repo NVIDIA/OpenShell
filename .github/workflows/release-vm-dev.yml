@@ -42,7 +42,7 @@ jobs:
     outputs:
       cargo_version: ${{ steps.v.outputs.cargo }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
 
@@ -71,7 +71,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Download all runtime tarballs
         env:
@@ -109,7 +109,7 @@ jobs:
           done
 
       - name: Upload as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: kernel-runtime-tarballs
           path: runtime-artifacts/vm-runtime-*.tar.zst
@@ -144,7 +144,7 @@ jobs:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OPENSHELL_IMAGE_TAG: dev
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -173,7 +173,7 @@ jobs:
           echo "Rootfs tarball: $(du -sh target/vm-runtime-compressed/rootfs.tar.zst | cut -f1)"
 
       - name: Upload rootfs artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rootfs-${{ matrix.arch }}
           path: target/vm-runtime-compressed/rootfs.tar.zst
@@ -211,7 +211,7 @@ jobs:
       SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
       OPENSHELL_IMAGE_TAG: dev
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
 
@@ -235,13 +235,13 @@ jobs:
         run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
 
       - name: Download kernel runtime tarball
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: kernel-runtime-tarballs
           path: runtime-download/
 
       - name: Download rootfs tarball
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: rootfs-${{ matrix.arch }}
           path: rootfs-download/
@@ -303,7 +303,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: vm-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
@@ -329,7 +329,7 @@ jobs:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
 
@@ -349,13 +349,13 @@ jobs:
         run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
 
       - name: Download kernel runtime tarball
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: kernel-runtime-tarballs
           path: runtime-download/
 
       - name: Download rootfs tarball (arm64)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: rootfs-arm64
           path: rootfs-download/
@@ -410,7 +410,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: vm-macos
           path: artifacts/*.tar.gz
@@ -448,7 +448,7 @@ jobs:
       SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
       OPENSHELL_IMAGE_TAG: dev
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
 
@@ -472,7 +472,7 @@ jobs:
         run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
 
       - name: Download kernel runtime tarball
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: kernel-runtime-tarballs
           path: runtime-download/
@@ -537,7 +537,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: driver-vm-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
@@ -563,7 +563,7 @@ jobs:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
 
@@ -583,7 +583,7 @@ jobs:
         run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
 
       - name: Download kernel runtime tarball
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: kernel-runtime-tarballs
           path: runtime-download/
@@ -650,7 +650,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: driver-vm-macos
           path: artifacts/*.tar.gz
@@ -669,10 +669,10 @@ jobs:
     runs-on: build-amd64
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Download all VM binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: "{vm-*,driver-vm-*}"
           path: release/
@@ -716,7 +716,7 @@ jobs:
           git push --force origin vm-dev
 
       - name: Prune stale VM binary assets from vm-dev release
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
@@ -743,7 +743,7 @@ jobs:
             }
 
       - name: Upload to vm-dev GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: OpenShell VM Development Build
           prerelease: true

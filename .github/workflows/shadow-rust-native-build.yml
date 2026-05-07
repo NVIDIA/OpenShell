@@ -111,7 +111,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
 
@@ -235,7 +235,7 @@ jobs:
           ls -lh "$STAGE/"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ inputs['artifact-name'] != '' && inputs['artifact-name'] || format('rust-binary-{0}-linux-{1}', inputs.component, inputs.arch) }}
           path: prebuilt-binaries/${{ inputs.arch }}/${{ steps.target.outputs.binary }}
