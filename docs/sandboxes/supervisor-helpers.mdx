@@ -1,0 +1,105 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Supervisor Helpers"
+sidebar-title: "Supervisor Helpers"
+description: "Declare privileged helper processes that run alongside the sandboxed workload."
+keywords: "OpenShell, Sandbox, Linux Capabilities, Privileged Helper, Capability Broker"
+position: 7
+---
+
+Supervisor helpers are small, operator-audited daemons that run inside the sandbox pod alongside the workload. They are spawned by the supervisor before the workload and are not subject to the per-workload seccomp filter, `PR_SET_NO_NEW_PRIVS`, or Landlock. Use them for capabilities the workload must not hold directly — for example, a capability broker that sets up per-request isolation, or a privileged bridge to a local control socket.
+
+The workload itself remains sandboxed exactly as before. The trust boundary is the supervisor, and the operator vouches for each helper binary shipped in the image.
+
+## When to Use a Helper
+
+Consider a helper when a daemon needs a Linux capability that the workload is not allowed to hold. A workload with `PR_SET_NO_NEW_PRIVS` set cannot gain capabilities via file caps at `execve`, so the supervisor must hand capabilities to the helper directly. Typical use cases:
+
+- A capability broker that creates per-request user namespaces on behalf of the workload.
+- A privileged IPC bridge holding `CAP_NET_ADMIN` for traffic shaping.
+- A pre-seccomp setup daemon that mediates access to a resource the workload cannot open itself.
+
+If the workload can do the job itself inside its own policy surface, it should.
+
+## Declare Helpers
+
+Write a JSON config and pass its path on startup:
+
+```shell
+openshell-sandbox --helpers-config /etc/openshell/helpers.json -- my-workload
+```
+
+The flag is also bound to `OPENSHELL_HELPERS_CONFIG`.
+
+### Config Schema
+
+```json
+{
+  "helpers": [
+    {
+      "name": "example-broker",
+      "command": ["/opt/example/bin/broker", "--socket", "/var/run/example.sock"],
+      "env": {
+        "RUST_LOG": "info"
+      },
+      "ambient_caps": ["CAP_SETUID", "CAP_SETGID", "CAP_NET_ADMIN"]
+    }
+  ]
+}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `name` | yes | Human-readable name used in logs and OCSF events. Must be unique. |
+| `command` | yes | Full argv. `command[0]` must be an absolute path; the supervisor does not consult `$PATH`. |
+| `env` | no | Environment variables merged on top of the supervisor's environment. |
+| `ambient_caps` | no | Capabilities raised into the helper's ambient set before `execve`. Names accept `CAP_FOO` or `FOO`, case-insensitive. |
+
+Validation rejects empty names, duplicate names, empty commands, non-absolute `command[0]`, and unknown capability names. A helper that requests a capability outside the pod's bounding set fails at `capset(2)` with `EPERM` and the supervisor exits before the workload starts.
+
+## Runtime Behavior
+
+For each helper, in declaration order, the supervisor forks, raises the declared capabilities into the child's inheritable and ambient sets, and `execve`s the command. After `execve` the ambient set becomes part of the helper's permitted and effective sets.
+
+Helpers are spawned with `kill_on_drop(true)`. When the supervisor exits for any reason, the helper receives `SIGKILL`. The v0 release does not include structured shutdown, restart policy, or readiness gating.
+
+### What Helpers Do Not Get
+
+Helpers intentionally bypass the workload sandbox. They do not receive:
+
+- The per-workload seccomp filter.
+- `PR_SET_NO_NEW_PRIVS`.
+- Landlock filesystem restrictions.
+- The privilege drop applied to the workload (a helper keeps the supervisor's uid — typically 0).
+
+Helper containment is bounded by the pod's `securityContext` — the bounding set and the capabilities granted to the supervisor — plus whatever restrictions the helper binary applies to itself.
+
+## Security Model
+
+The trust boundary is the supervisor. A compromised supervisor was always catastrophic; letting it fork a declared set of other root-capable processes from a config file does not expand that blast radius. What does change is operator responsibility:
+
+- The `--helpers-config` path and its contents are part of the image's attack surface. Audit every helper binary and every capability it receives.
+- Helpers and the workload share the pod's filesystem. The v0 release does not offer per-helper Landlock isolation — a cap-less helper could read workload-writable paths, and vice versa. Helpers that need file-level isolation should apply it themselves.
+- The SSH handshake secret (`OPENSHELL_SSH_HANDSHAKE_SECRET`) is scrubbed from the helper's inherited environment.
+
+## Observability
+
+Each helper start emits an OCSF `AppLifecycle` event with `activity=Start`, `severity=Informational`, `status=Success`, and a message containing the helper name and pid. Structured helper stdout routing is deferred to a later release.
+
+## Interactions
+
+- **Policy.** Helpers sit outside the policy surface. OPA rules, network policy, and Landlock apply to the workload, not to helpers. A helper that needs to reach the policy-enforced proxy must speak HTTP to it like any other process.
+- **DNS proxy.** The existing hardcoded DNS proxy is unchanged. Future work may migrate it onto supervisor helpers.
+
+## Out of Scope for v0
+
+The following are additive on the v0 schema and tracked for future iterations:
+
+- Per-helper Landlock (`readOnly`, `readWrite`, `readExec`).
+- Workload rendezvous for connect-only access to a helper-owned socket.
+- Structured restart policy.
+- Readiness file descriptor convention for "helper is live" gating.
+- Helper stdio routing into the OCSF JSONL stream.
+- Per-helper cgroup resource limits.
+- Dropping the helper to a non-root uid while retaining requested capabilities.
