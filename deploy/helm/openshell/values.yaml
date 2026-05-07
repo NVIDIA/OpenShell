@@ -20,7 +20,7 @@ supervisor:
     tag: ""
 
 imagePullSecrets: []
-nameOverride: ""
+nameOverride: "openshell"
 fullnameOverride: ""
 
 serviceAccount:
