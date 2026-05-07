@@ -67,8 +67,8 @@ struct Args {
     /// `kubernetes,podman`. The configuration format is future-proofed for
     /// multiple drivers, but the gateway currently requires exactly one.
     /// When unset, the gateway auto-detects the driver based on the runtime
-    /// environment (Kubernetes → Podman → Docker). VM is never auto-detected
-    /// and requires explicit configuration.
+    /// environment (Kubernetes → Podman → Docker CLI or socket). VM is never
+    /// auto-detected and requires explicit configuration.
     #[arg(
         long,
         alias = "driver",

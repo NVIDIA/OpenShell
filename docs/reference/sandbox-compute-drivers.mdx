@@ -22,7 +22,7 @@ openshell-gateway --drivers docker
 
 You can also set the driver with `OPENSHELL_DRIVERS`. Supported values are `docker`, `podman`, `kubernetes`, and `vm`.
 
-When `--drivers` and `OPENSHELL_DRIVERS` are unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM driver is never auto-detected; configure it explicitly with `--drivers vm`.
+When `--drivers` and `OPENSHELL_DRIVERS` are unset, the gateway auto-detects Kubernetes, then Podman, then Docker by CLI availability or a local Unix socket. The VM driver is never auto-detected; configure it explicitly with `--drivers vm`.
 
 Common gateway options:
 
