@@ -19,7 +19,7 @@ permissions: {}
 jobs:
   hint:
     name: Post next-step hint for E2E label
-    if: github.event.label.name == 'test:e2e' || github.event.label.name == 'test:e2e-gpu'
+    if: github.event.label.name == 'test:e2e' || github.event.label.name == 'test:e2e-gpu' || github.event.label.name == 'test:e2e-helm'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -40,6 +40,7 @@ jobs:
           case "$LABEL_NAME" in
             test:e2e) workflow_file=branch-e2e.yml; workflow_name="Branch E2E Checks" ;;
             test:e2e-gpu) workflow_file=test-gpu.yml; workflow_name="GPU Test" ;;
+            test:e2e-helm) workflow_file=branch-helm-e2e.yml; workflow_name="Branch Helm E2E" ;;
             *) echo "Unrecognized label $LABEL_NAME"; exit 1 ;;
           esac
 

@@ -51,7 +51,7 @@ description = "Run Rust CLI e2e tests against a Podman-backed gateway"
 run = "e2e/rust/e2e-podman.sh"
 
 ["e2e:helm"]
-description = "Run smoke e2e against a Helm-deployed gateway (set OPENSHELL_E2E_KUBE_CONTEXT to reuse a cluster, otherwise creates a local k3d cluster)"
+description = "Run Rust CLI e2e tests against a Helm-deployed gateway (set OPENSHELL_E2E_KUBE_CONTEXT to reuse a cluster, otherwise creates a local k3d cluster; set OPENSHELL_E2E_KUBE_TEST=<name> to scope to one test)"
 run = "e2e/rust/e2e-helm.sh"
 
 ["e2e:vm"]
