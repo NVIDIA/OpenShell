@@ -225,6 +225,7 @@ pub(super) async fn handle_attach_sandbox_provider(
             }
         })?;
 
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let mut sandbox = sandbox_by_name(state, &request.sandbox_name).await?;
     let sandbox_name = sandbox
         .metadata
@@ -281,6 +282,7 @@ pub(super) async fn handle_detach_sandbox_provider(
         return Err(Status::invalid_argument("provider_name is required"));
     }
 
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let mut sandbox = sandbox_by_name(state, &request.sandbox_name).await?;
     let sandbox_name = sandbox
         .metadata

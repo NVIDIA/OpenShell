@@ -1000,19 +1000,32 @@ pub(super) async fn handle_update_config(
         validate_static_fields_unchanged(baseline_policy, &new_policy)?;
         validate_policy_safety(&new_policy)?;
     } else {
-        let mut sandbox = sandbox;
-        if let Some(ref mut spec) = sandbox.spec {
-            spec.policy = Some(new_policy.clone());
-        }
-        state
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+        let mut sandbox = state
             .store
-            .put_message(&sandbox)
+            .get_message::<Sandbox>(&sandbox_id)
             .await
-            .map_err(|e| Status::internal(format!("backfill spec.policy failed: {e}")))?;
-        info!(
-            sandbox_id = %sandbox_id,
-            "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
-        );
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let spec = sandbox
+            .spec
+            .as_mut()
+            .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+        if let Some(baseline_policy) = spec.policy.as_ref() {
+            validate_static_fields_unchanged(baseline_policy, &new_policy)?;
+            validate_policy_safety(&new_policy)?;
+        } else {
+            spec.policy = Some(new_policy.clone());
+            state
+                .store
+                .put_message(&sandbox)
+                .await
+                .map_err(|e| Status::internal(format!("backfill spec.policy failed: {e}")))?;
+            info!(
+                sandbox_id = %sandbox_id,
+                "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
+            );
+        }
     }
 
     let latest = state
@@ -1209,6 +1222,7 @@ pub(super) async fn handle_report_policy_status(
             .store
             .supersede_older_policies(&req.sandbox_id, version)
             .await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
         if let Ok(Some(mut sandbox)) = state.store.get_message::<Sandbox>(&req.sandbox_id).await {
             sandbox.current_policy_version = req.version;
             let _ = state.store.put_message(&sandbox).await;
