@@ -260,18 +260,11 @@ Every sandbox moves through a defined set of phases:
 | Error | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details. |
 | Deleting | The sandbox is being torn down. The system releases resources and purges credentials. |
 
-## Sandbox Isolation and Policies
+## Sandbox Compute Drivers
 
-OpenShell ships a built-in policy that covers common agent workflows out of the box. When you create a sandbox without `--policy`, OpenShell applies the default policy.
+The gateway's configured compute driver determines how OpenShell creates each sandbox. The CLI workflow stays the same across drivers: you create, connect to, inspect, and delete sandboxes through the gateway API.
 
-| Layer | What it controls | How it works |
-|---|---|---|
-| Filesystem | What the agent can access on disk. | Paths are split into read-only and read-write sets. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level. |
-| Network | What the agent can reach on the network. | Policy blocks pair allowed destinations with allowed binaries. The proxy matches every outbound connection to the binary that opened it. Both must match or the connection is denied. |
-| Process | What privileges the agent has. | The agent runs as an unprivileged user with seccomp filters that block dangerous system calls. Root execution, `sudo`, and `setuid` escalation paths are blocked. |
-| Inference | How model API traffic is routed. | Requests to `https://inference.local` route through the gateway so provider credentials stay outside the sandbox. |
-
-For the full breakdown of the built-in policy, refer to [Default Policy](/reference/default-policy). For custom policy structure and update workflows, refer to [Policies](/sandboxes/policies).
+For Docker, Podman, MicroVM, and Kubernetes behavior, refer to [Sandbox Compute Drivers](/reference/sandbox-compute-drivers).
 
 ## Next Steps
 

@@ -3,10 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Support Matrix"
 description: ""
-position: 4
+position: 5
 ---
 
-This page lists the host platform, compute platform, software, runtime, and kernel requirements for running OpenShell.
+This page lists the host platform, compute driver, software, runtime, and kernel requirements for running OpenShell.
 
 ## Supported Platforms
 
@@ -31,11 +31,11 @@ OpenShell publishes standalone `openshell-gateway` release assets for manual dow
 
 These artifacts are attached to GitHub releases. Kubernetes deployments should use the Helm chart and the published gateway image.
 
-## Compute Platforms
+## Compute Drivers
 
-The gateway can manage sandboxes on several compute platforms.
+The gateway can manage sandboxes through several compute drivers.
 
-| Compute platform | Status | Notes |
+| Compute Driver | Status | Notes |
 |---|---|---|
 | Docker | Supported for local development and single-machine gateways. | Requires Docker Desktop or Docker Engine on the gateway host. |
 | Podman | Supported for rootless local and workstation workflows. | Requires a Podman-compatible socket and rootless networking setup. |
@@ -44,7 +44,7 @@ The gateway can manage sandboxes on several compute platforms.
 
 ## Software Prerequisites
 
-Install the software for the compute platform you use:
+Install the software for the compute driver you use:
 
 | Component | Minimum Version | Notes |
 |---|---|---|

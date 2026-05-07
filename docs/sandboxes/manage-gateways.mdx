@@ -18,23 +18,23 @@ The gateway is responsible for:
 - Managing inference configuration and serving inference bundles so sandboxes can route requests to the correct backend.
 - Providing the SSH tunnel endpoint so you can connect to sandboxes without exposing them directly.
 
-OpenShell separates gateway access from the compute platform that runs sandboxes. Use [Installation](/about/installation) to install OpenShell, choose a runtime, and start a gateway. This page covers working with gateway entries after a gateway exists.
+OpenShell separates gateway access from the compute driver that runs sandboxes. Use [Installation](/about/installation) to install OpenShell, choose a compute driver, and start a gateway. This page covers working with gateway entries after a gateway exists.
 
-## Gateway Compute Platforms
+## Gateway Compute Drivers
 
-A gateway provisions sandboxes on the compute platform configured for that gateway.
+A gateway provisions sandboxes through the compute driver configured for that gateway.
 
-| Platform | Where sandboxes run | Best for |
+| Compute Driver | Where sandboxes run | Best for |
 |---|---|---|
 | Docker | Containers on the gateway host. | Solo development, quick iteration, and single-machine gateways. |
 | Podman | Rootless containers on the gateway host. | Workstations that avoid a rootful Docker daemon. |
 | Kubernetes | Pods in an operator-managed cluster. | Shared clusters and cloud environments. |
 | MicroVM | VM-backed sandboxes. | Workflows that need VM-backed isolation. |
 
-All compute platforms expose the same gateway API surface. Sandboxes, policies, and providers work the same after the CLI registers the gateway endpoint. The difference is how the gateway creates sandbox workloads and how operators expose the gateway to users.
+All compute drivers expose the same gateway API surface. Sandboxes, policies, and providers work the same after the CLI registers the gateway endpoint. The difference is how the gateway creates sandbox workloads and how operators expose the gateway to users.
 
 <Tip>
-For runtime setup, including Docker, Podman, MicroVM, and Kubernetes paths, refer to [Installation](/about/installation).
+For driver setup, including Docker, Podman, MicroVM, and Kubernetes paths, refer to [Installation](/about/installation).
 
 </Tip>
 
@@ -94,7 +94,7 @@ Use `openshell status` for a quick health check:
 openshell status
 ```
 
-Use `openshell gateway info` when you need the registered endpoint, gateway metadata, or runtime details:
+Use `openshell gateway info` when you need the registered endpoint, gateway metadata, or compute driver details:
 
 ```shell
 openshell gateway info
@@ -132,9 +132,9 @@ systemctl --user status openshell-gateway
 journalctl --user -u openshell-gateway --no-pager -n 50
 ```
 
-For sandbox startup failures, inspect the selected compute platform:
+For sandbox startup failures, inspect the selected compute driver:
 
-| Platform | What to check |
+| Compute Driver | What to check |
 |---|---|
 | Docker | Docker daemon health, image availability, gateway logs, and sandbox container state. |
 | Podman | Podman socket availability, rootless networking, image availability, and sandbox container state. |
@@ -143,5 +143,5 @@ For sandbox startup failures, inspect the selected compute platform:
 
 ## Next Steps
 
-- To install OpenShell and choose a runtime, refer to [Installation](/about/installation).
+- To install OpenShell and choose a compute driver, refer to [Installation](/about/installation).
 - To create a sandbox using the gateway, refer to [Manage Sandboxes](/sandboxes/manage-sandboxes).

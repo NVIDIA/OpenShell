@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Installation"
 sidebar-title: "Installation"
-description: "Install OpenShell, choose a sandbox runtime, and connect to a gateway."
+description: "Install OpenShell, choose a compute driver, and connect to a gateway."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Installation, Setup, Gateway, Docker, Podman, MicroVM, Kubernetes"
 position: 3
 ---
@@ -22,17 +22,17 @@ You can also download release artifacts directly from the [OpenShell GitHub Rele
 
 Use `openshell status` to confirm the CLI can reach the gateway.
 
-## Supported Sandbox Runtimes
+## Supported Compute Drivers
 
-OpenShell supports several local sandbox runtimes. The installer chooses a default runtime for your platform, and the gateway reads the runtime choice from its startup configuration. Sandbox commands use the same CLI workflow after the gateway is running.
+OpenShell supports several local compute drivers. The installer chooses a default driver for your platform, and the gateway reads the driver choice from its startup configuration. Sandbox commands use the same CLI workflow after the gateway is running.
 
-| Runtime | How It Is Configured | System Requirements |
+| Compute Driver | How It Is Configured | System Requirements |
 |---|---|---|
 | Podman | The gateway is configured to create rootless Podman containers through the Podman API socket. | Linux with Podman 5.x, cgroups v2, rootless networking, and an active Podman user socket. |
 | Docker | The gateway is configured to create containers through Docker Desktop or Docker Engine. | Docker Desktop or Docker Engine 28.04 or later on the gateway host. |
 | MicroVM | The gateway is configured to create VM-backed sandboxes. | Host virtualization support. MicroVM uses Hypervisor.framework on macOS, KVM on Linux, and QEMU for GPU-backed sandboxes on Linux. |
 
-For detailed runtime behavior, refer to [Gateways](/sandboxes/manage-gateways) and [Sandboxes](/sandboxes/manage-sandboxes).
+For detailed driver behavior, refer to [Sandbox Compute Drivers](/reference/sandbox-compute-drivers). For gateway and sandbox operations, refer to [Gateways](/sandboxes/manage-gateways) and [Sandboxes](/sandboxes/manage-sandboxes).
 
 ## macOS
 
