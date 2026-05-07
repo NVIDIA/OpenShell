@@ -221,7 +221,7 @@ install -d %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.di
 cat > %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-info/METADATA << EOF
 Metadata-Version: 2.1
 Name: %{name}
-Version: 0.0.37
+Version: %{openshell_python_version}
 Summary: OpenShell Python SDK for agent execution and management
 License: Apache-2.0
 Requires-Python: >=3.12
