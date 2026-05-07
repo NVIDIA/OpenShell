@@ -84,7 +84,6 @@ async fn auto_created_provider_credential_available_in_sandbox() {
         .arg("--provider")
         .arg("claude")
         .arg("--auto-providers")
-        .arg("--no-bootstrap")
         .arg("--")
         .arg("printenv")
         .arg("ANTHROPIC_API_KEY")
