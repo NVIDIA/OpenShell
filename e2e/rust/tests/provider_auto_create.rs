@@ -24,8 +24,16 @@ use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
 
 const TEST_API_KEY: &str = "sk-e2e-auto-provider-test-key";
-const TEST_API_KEY_PLACEHOLDER: &str = "openshell:resolve:env:ANTHROPIC_API_KEY";
 static CLAUDE_PROVIDER_LOCK: Mutex<()> = Mutex::new(());
+
+fn contains_placeholder_for_env_key(output: &str, key: &str) -> bool {
+    let legacy = format!("openshell:resolve:env:{key}");
+    let revision_prefix = "openshell:resolve:env:v";
+    let revision_suffix = format!("_{key}");
+    output.split_whitespace().any(|token| {
+        token == legacy || (token.starts_with(revision_prefix) && token.ends_with(&revision_suffix))
+    })
+}
 
 /// Helper: delete a provider by name, ignoring errors.
 async fn delete_provider(name: &str) {
@@ -123,7 +131,7 @@ async fn auto_created_provider_credential_available_in_sandbox() {
     );
 
     assert!(
-        clean.contains(TEST_API_KEY_PLACEHOLDER),
+        contains_placeholder_for_env_key(&clean, "ANTHROPIC_API_KEY"),
         "sandbox should have placeholder ANTHROPIC_API_KEY in its environment:\n{clean}"
     );
 
