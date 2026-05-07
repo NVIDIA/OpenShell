@@ -42,6 +42,11 @@ on:
         required: false
         type: string
         default: ""
+      image-tag:
+        description: "Supervisor image tag to bake into gateway binaries"
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       component:
@@ -82,6 +87,11 @@ on:
         default: ""
       checkout-ref:
         description: "Git ref to check out for build inputs (defaults to the workflow SHA)"
+        required: false
+        type: string
+        default: ""
+      image-tag:
+        description: "Supervisor image tag to bake into gateway binaries"
         required: false
         type: string
         default: ""
@@ -207,6 +217,7 @@ jobs:
           # Preserve the release-codegen setting used by the old Dockerfile
           # Rust build path so image artifacts keep the same release profile.
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+          OPENSHELL_IMAGE_TAG: ${{ inputs['image-tag'] }}
         run: |
           set -euo pipefail
           args=(

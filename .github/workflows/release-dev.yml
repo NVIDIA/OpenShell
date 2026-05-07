@@ -432,6 +432,8 @@ jobs:
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
 
       - name: Build ${{ matrix.target }}
+        env:
+          OPENSHELL_IMAGE_TAG: ${{ github.sha }}
         run: |
           set -euo pipefail
           mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-server

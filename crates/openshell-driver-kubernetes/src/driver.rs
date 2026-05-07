@@ -688,19 +688,19 @@ fn supervisor_volume_mount() -> serde_json::Value {
 
 /// Path of the supervisor binary inside the supervisor image.
 ///
-/// The supervisor image places the binary at the filesystem root and ships
-/// nothing else. We invoke it directly — there is no shell, `cp`, or PATH
-/// resolution available inside the image.
+/// The supervisor image places the binary at the filesystem root. We invoke
+/// it directly so the init path does not depend on shell utilities or PATH
+/// resolution inside the image.
 const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
 
 /// Build the init container that copies the supervisor binary into the emptyDir.
 ///
-/// The supervisor image contains only the supervisor binary at
-/// `/openshell-sandbox`. We invoke that binary with the `copy-self`
-/// subcommand so it copies itself into the shared emptyDir volume, where the
-/// agent container then executes it from a fixed, writable path. This pattern
-/// (binary self-copy) avoids requiring `sh`/`cp` in the supervisor image and
-/// mirrors the approach used by argoexec's emissary executor.
+/// The supervisor image contains the supervisor binary at `/openshell-sandbox`.
+/// We invoke that binary with the `copy-self` subcommand so it copies itself
+/// into the shared emptyDir volume, where the agent container then executes it
+/// from a fixed, writable path. This pattern (binary self-copy) avoids requiring
+/// `sh`/`cp` in the supervisor image and mirrors the approach used by argoexec's
+/// emissary executor.
 fn supervisor_init_container(
     supervisor_image: &str,
     supervisor_image_pull_policy: &str,
@@ -1559,8 +1559,8 @@ mod tests {
         assert_eq!(init_containers[0]["image"], "supervisor-image:latest");
         assert_eq!(init_containers[0]["imagePullPolicy"], "IfNotPresent");
 
-        // The supervisor image ships only the binary (no shell). The init
-        // container must invoke the binary directly with `copy-self <DEST>`.
+        // The init container must invoke the binary directly with
+        // `copy-self <DEST>` rather than depending on shell utilities.
         let init_command = init_containers[0]["command"]
             .as_array()
             .expect("init container command should be set");
@@ -1573,7 +1573,7 @@ mod tests {
         );
         assert!(
             !init_command.iter().any(|v| v == "sh"),
-            "init container must not depend on a shell (supervisor image ships only the binary)"
+            "init container must not depend on a shell"
         );
 
         // Agent container command should be overridden to the emptyDir path

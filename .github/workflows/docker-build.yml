@@ -155,6 +155,7 @@ jobs:
       component: ${{ needs.resolve.outputs.binary_component }}
       arch: ${{ matrix.arch }}
       cargo-version: ${{ inputs['cargo-version'] }}
+      image-tag: ${{ needs.resolve.outputs.image_tag_base }}
       checkout-ref: ${{ inputs['checkout-ref'] }}
       features: openshell-core/dev-settings
       artifact-name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
@@ -238,7 +239,6 @@ jobs:
             --cache-to "type=gha,mode=max,scope=${{ inputs.component }}-${{ matrix.arch }}"
 
       - name: Smoke check ${{ inputs.component }} image
-        if: ${{ !inputs.push }}
         run: |
           set -euo pipefail
           image="${IMAGE_REGISTRY}/${{ inputs.component }}:${IMAGE_TAG}"
@@ -249,7 +249,7 @@ jobs:
               grep -q '^openshell-gateway ' <<<"$output"
               ;;
             supervisor)
-              output="$(docker run --rm --platform "${{ matrix.platform }}" "$image" --version)"
+              output="$(docker run --rm --platform "${{ matrix.platform }}" --entrypoint /openshell-sandbox "$image" --version)"
               echo "$output"
               grep -q '^openshell-sandbox ' <<<"$output"
               ;;
