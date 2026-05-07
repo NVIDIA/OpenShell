@@ -1,0 +1,36 @@
+name: Branch E2E Podman
+
+# Triggered by copy-pr-bot when a PR push arrives. Runs the rootless-Podman
+# smoke suite when the PR carries the `test:e2e-podman` label. The result is
+# checked by the E2E Gate (`e2e-gate.yml`) before merge.
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  pr_metadata:
+    name: Resolve PR metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: gate
+        uses: ./.github/actions/pr-gate
+        with:
+          required_label: test:e2e-podman
+
+  e2e-podman:
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/e2e-podman.yml

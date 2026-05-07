@@ -1,0 +1,88 @@
+name: E2E Podman Test
+
+# Reusable workflow: start a rootless-Podman-backed gateway on the bare runner
+# (no Docker-in-Docker, no k3s) and run the Rust smoke suite against it.
+#
+# Unlike the k3s e2e, this runs directly on the runner host so that rootless
+# Podman user-namespaces are available. Binaries are compiled natively on the
+# runner; only the final scratch packaging step uses the container engine.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: "GitHub Actions runner label"
+        required: false
+        type: string
+        default: "ubuntu-24.04"
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-podman:
+    name: "E2E (podman)"
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Enable rootless Podman socket
+        run: |
+          systemctl --user start podman.socket
+          podman info
+
+      - name: Install mise
+        uses: jdx/mise-action@v2
+        with:
+          experimental: true
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: rust-podman-e2e
+          cache-directories: .cache/sccache
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libz3-dev \
+            openssh-client
+          sudo rm -rf /var/lib/apt/lists/*
+
+      # Build the sandbox binary (release) for the supervisor sideload image.
+      # No dev-settings needed — the sandbox doesn't use settings registry features.
+      - name: Build openshell-sandbox (release)
+        run: cargo build --release -p openshell-sandbox
+
+      # Stage the prebuilt binary where the Dockerfile expects it.
+      - name: Stage prebuilt supervisor binary
+        run: |
+          mkdir -p deploy/docker/.build/prebuilt-binaries/amd64/
+          cp target/release/openshell-sandbox deploy/docker/.build/prebuilt-binaries/amd64/
+
+      # Build the scratch image from the staged binary (skips cargo-in-Docker).
+      - name: Build supervisor sideload image
+        env:
+          USE_PREBUILT_BINARIES: "true"
+        run: mise run --no-deps --skip-deps build:docker:supervisor-sideload
+
+      # Pre-build gateway and CLI so the e2e script finds them and skips its
+      # own cargo build. Both need dev-settings for the settings management
+      # test fixtures. Debug profile matches what the e2e script expects.
+      - name: Build openshell-gateway and openshell-cli (debug, dev-settings)
+        run: cargo build -p openshell-server -p openshell-cli --features openshell-core/dev-settings
+
+      - name: Run Podman e2e smoke test
+        env:
+          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: mise run --no-deps --skip-deps e2e:podman
+
+      - name: sccache stats
+        if: always()
+        run: mise x -- sccache --show-stats
