@@ -412,7 +412,22 @@ mod tests {
         );
         assert!(
             policy
+                .check(&id, "/openshell.v1.OpenShell/ListSandboxProviders")
+                .is_ok()
+        );
+        assert!(
+            policy
                 .check(&id, "/openshell.v1.OpenShell/CreateSandbox")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/AttachSandboxProvider")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/DetachSandboxProvider")
                 .is_ok()
         );
     }
@@ -427,7 +442,7 @@ mod tests {
                 .is_ok()
         );
         let err = policy
-            .check(&id, "/openshell.v1.OpenShell/CreateSandbox")
+            .check(&id, "/openshell.v1.OpenShell/AttachSandboxProvider")
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(err.message().contains("sandbox:write"));

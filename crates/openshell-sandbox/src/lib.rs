@@ -17,6 +17,7 @@ pub mod opa;
 mod policy;
 mod process;
 pub mod procfs;
+mod provider_credentials;
 pub mod proxy;
 mod sandbox;
 mod secrets;
@@ -97,7 +98,6 @@ use crate::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
-use crate::secrets::SecretResolver;
 pub use process::{ProcessHandle, ProcessStatus};
 pub use sandbox::apply_supervisor_startup_hardening;
 
@@ -269,42 +269,46 @@ pub async fn run_sandbox(
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
-    let provider_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-        match grpc_client::fetch_provider_environment(endpoint, id).await {
-            Ok(env) => {
-                ocsf_emit!(
-                    ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Informational)
-                        .status(StatusId::Success)
-                        .state(StateId::Enabled, "loaded")
-                        .message(format!(
-                            "Fetched provider environment [env_count:{}]",
-                            env.len()
-                        ))
-                        .build()
-                );
-                env
+    let (provider_env_revision, provider_env) =
+        if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+            match grpc_client::fetch_provider_environment(endpoint, id).await {
+                Ok(result) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .message(format!(
+                                "Fetched provider environment [env_count:{}]",
+                                result.environment.len()
+                            ))
+                            .build()
+                    );
+                    (result.provider_env_revision, result.environment)
+                }
+                Err(e) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .state(StateId::Other, "degraded")
+                            .message(format!(
+                                "Failed to fetch provider environment, continuing without: {e}"
+                            ))
+                            .build()
+                    );
+                    (0, std::collections::HashMap::new())
+                }
             }
-            Err(e) => {
-                ocsf_emit!(
-                    ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .state(StateId::Other, "degraded")
-                        .message(format!(
-                            "Failed to fetch provider environment, continuing without: {e}"
-                        ))
-                        .build()
-                );
-                std::collections::HashMap::new()
-            }
-        }
-    } else {
-        std::collections::HashMap::new()
-    };
+        } else {
+            (0, std::collections::HashMap::new())
+        };
 
-    let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
-    let secret_resolver = secret_resolver.map(Arc::new);
+    let provider_credentials = provider_credentials::ProviderCredentialState::from_environment(
+        provider_env_revision,
+        provider_env,
+    );
+    let provider_env = provider_credentials.snapshot().child_env.clone();
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
@@ -480,7 +484,7 @@ pub async fn run_sandbox(
             entrypoint_pid.clone(),
             tls_state,
             inference_ctx,
-            secret_resolver.clone(),
+            Some(provider_credentials.clone()),
             denial_tx,
         )
         .await?;
@@ -619,7 +623,7 @@ pub async fn run_sandbox(
         let proxy_url = ssh_proxy_url;
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
-        let provider_env_clone = provider_env.clone();
+        let provider_credentials_clone = provider_credentials.clone();
 
         let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
 
@@ -632,7 +636,7 @@ pub async fn run_sandbox(
                 netns_fd,
                 proxy_url,
                 ca_paths,
-                provider_env_clone,
+                provider_credentials_clone,
             )
             .await
             {
@@ -796,6 +800,7 @@ pub async fn run_sandbox(
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_enabled.clone();
         let poll_pid = entrypoint_pid.clone();
+        let poll_provider_credentials = provider_credentials.clone();
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -809,6 +814,7 @@ pub async fn run_sandbox(
                 &poll_pid,
                 poll_interval_secs,
                 &poll_ocsf_enabled,
+                poll_provider_credentials,
             )
             .await
             {
@@ -2152,6 +2158,7 @@ async fn run_policy_poll_loop(
     entrypoint_pid: &Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: &std::sync::atomic::AtomicBool,
+    provider_credentials: provider_credentials::ProviderCredentialState,
 ) -> Result<()> {
     use crate::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::PolicySource;
@@ -2159,6 +2166,7 @@ async fn run_policy_poll_loop(
 
     let client = CachedOpenShellClient::connect(endpoint).await?;
     let mut current_config_revision: u64 = 0;
+    let mut current_provider_env_revision: u64 = provider_credentials.snapshot().revision;
     let mut current_policy_hash = String::new();
     let mut current_settings: std::collections::HashMap<
         String,
@@ -2193,7 +2201,8 @@ async fn run_policy_poll_loop(
             }
         };
 
-        if result.config_revision == current_config_revision {
+        let provider_env_changed = result.provider_env_revision != current_provider_env_revision;
+        if result.config_revision == current_config_revision && !provider_env_changed {
             continue;
         }
 
@@ -2209,11 +2218,45 @@ async fn run_policy_poll_loop(
             .unmapped("old_config_revision", serde_json::json!(current_config_revision))
             .unmapped("new_config_revision", serde_json::json!(result.config_revision))
             .unmapped("policy_changed", serde_json::json!(policy_changed))
+            .unmapped("provider_env_changed", serde_json::json!(provider_env_changed))
             .message(format!(
-                "Settings poll: config change detected [old_revision:{current_config_revision} new_revision:{} policy_changed:{policy_changed}]",
+                "Settings poll: config change detected [old_revision:{current_config_revision} new_revision:{} policy_changed:{policy_changed} provider_env_changed:{provider_env_changed}]",
                 result.config_revision
             ))
             .build());
+
+        if provider_env_changed {
+            match grpc_client::fetch_provider_environment(endpoint, sandbox_id).await {
+                Ok(env_result) => {
+                    let env_count = provider_credentials.install_environment(
+                        env_result.provider_env_revision,
+                        env_result.environment,
+                    );
+                    current_provider_env_revision = env_result.provider_env_revision;
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .unmapped(
+                                "provider_env_revision",
+                                serde_json::json!(current_provider_env_revision)
+                            )
+                            .message(format!(
+                                "Provider environment refreshed [revision:{current_provider_env_revision} env_count:{env_count}]"
+                            ))
+                            .build()
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        provider_env_revision = result.provider_env_revision,
+                        "Settings poll: failed to refresh provider environment"
+                    );
+                }
+            }
+        }
 
         // Only reload OPA when the policy payload actually changed.
         if policy_changed {

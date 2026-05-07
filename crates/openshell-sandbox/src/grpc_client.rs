@@ -244,7 +244,7 @@ pub async fn sync_policy(endpoint: &str, sandbox: &str, policy: &ProtoSandboxPol
 pub async fn fetch_provider_environment(
     endpoint: &str,
     sandbox_id: &str,
-) -> Result<HashMap<String, String>> {
+) -> Result<ProviderEnvironmentResult> {
     debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Fetching provider environment");
 
     let mut client = connect(endpoint).await?;
@@ -256,7 +256,11 @@ pub async fn fetch_provider_environment(
         .await
         .into_diagnostic()?;
 
-    Ok(response.into_inner().environment)
+    let inner = response.into_inner();
+    Ok(ProviderEnvironmentResult {
+        environment: inner.environment,
+        provider_env_revision: inner.provider_env_revision,
+    })
 }
 
 /// A reusable gRPC client for the `OpenShell` service.
@@ -279,6 +283,12 @@ pub struct SettingsPollResult {
     pub settings: HashMap<String, openshell_core::proto::EffectiveSetting>,
     /// When `policy_source` is `Global`, the version of the global policy revision.
     pub global_policy_version: u32,
+    pub provider_env_revision: u64,
+}
+
+pub struct ProviderEnvironmentResult {
+    pub environment: HashMap<String, String>,
+    pub provider_env_revision: u64,
 }
 
 impl CachedOpenShellClient {
@@ -315,6 +325,7 @@ impl CachedOpenShellClient {
                 .unwrap_or(PolicySource::Unspecified),
             settings: inner.settings,
             global_policy_version: inner.global_policy_version,
+            provider_env_revision: inner.provider_env_revision,
         })
     }
 

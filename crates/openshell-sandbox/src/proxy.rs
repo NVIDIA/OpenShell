@@ -8,6 +8,7 @@ use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy::ProxyPolicy;
+use crate::provider_credentials::ProviderCredentialState;
 use crate::secrets::{SecretResolver, rewrite_header_line};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
@@ -147,7 +148,7 @@ impl ProxyHandle {
     /// The proxy uses OPA for network decisions with process-identity binding
     /// via `/proc/net/tcp`. All connections are evaluated through OPA policy.
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_with_bind_addr(
+    pub(crate) async fn start_with_bind_addr(
         policy: &ProxyPolicy,
         bind_addr: Option<SocketAddr>,
         opa_engine: Arc<OpaEngine>,
@@ -155,7 +156,7 @@ impl ProxyHandle {
         entrypoint_pid: Arc<AtomicU32>,
         tls_state: Option<Arc<ProxyTlsState>>,
         inference_ctx: Option<Arc<InferenceContext>>,
-        secret_resolver: Option<Arc<SecretResolver>>,
+        provider_credentials: Option<ProviderCredentialState>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
@@ -194,7 +195,9 @@ impl ProxyHandle {
                         let spid = entrypoint_pid.clone();
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
-                        let resolver = secret_resolver.clone();
+                        let resolver = provider_credentials
+                            .as_ref()
+                            .and_then(ProviderCredentialState::resolver);
                         let dtx = denial_tx.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_connection(

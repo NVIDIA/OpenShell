@@ -760,6 +760,8 @@ message GetSandboxProviderEnvironmentRequest {
 message GetSandboxProviderEnvironmentResponse {
   // Provider credential environment variables.
   map<string, string> environment = 1;
+  // Fingerprint for the provider credential inputs that produced environment.
+  uint64 provider_env_revision = 2;
 }
 
 // ---------------------------------------------------------------------------

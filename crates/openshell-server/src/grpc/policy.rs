@@ -10,7 +10,7 @@
 #![allow(clippy::cast_precision_loss)] // f64->f32 for confidence scores
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
-use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, PolicyRecord, Store};
+use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store};
 use crate::policy_store::PolicyStoreExt;
 use crate::{ServerState, auth::oidc};
 use openshell_core::proto::policy_merge_operation;
@@ -472,6 +472,8 @@ pub(super) async fn handle_get_sandbox_config(
 
     let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
     let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
+    let provider_env_revision =
+        compute_provider_env_revision(state.store.as_ref(), &sandbox_provider_names).await?;
 
     Ok(Response::new(GetSandboxConfigResponse {
         policy,
@@ -481,7 +483,50 @@ pub(super) async fn handle_get_sandbox_config(
         config_revision,
         policy_source: policy_source.into(),
         global_policy_version,
+        provider_env_revision,
     }))
+}
+
+pub(super) async fn compute_provider_env_revision(
+    store: &Store,
+    provider_names: &[String],
+) -> Result<u64, Status> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openshell-provider-env-revision-v1");
+
+    for provider_name in provider_names {
+        hasher.update(provider_name.as_bytes());
+        match store
+            .get_by_name(Provider::object_type(), provider_name)
+            .await
+            .map_err(|e| {
+                Status::internal(format!("fetch provider '{provider_name}' failed: {e}"))
+            })? {
+            Some(record) => {
+                hasher.update(record.id.as_bytes());
+                hasher.update(record.updated_at_ms.to_le_bytes());
+
+                let provider = Provider::decode(record.payload.as_slice()).map_err(|e| {
+                    Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
+                })?;
+                hasher.update(provider.r#type.as_bytes());
+
+                let mut credential_keys: Vec<_> = provider.credentials.keys().collect();
+                credential_keys.sort();
+                for key in credential_keys {
+                    hasher.update(key.as_bytes());
+                }
+            }
+            None => {
+                hasher.update(b"missing");
+            }
+        }
+    }
+
+    let digest = hasher.finalize();
+    Ok(u64::from_le_bytes(digest[..8].try_into().map_err(
+        |_| Status::internal("provider env revision digest too short"),
+    )?))
 }
 
 async fn profile_provider_policy_layers(
@@ -571,19 +616,24 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .spec
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
+    let provider_names = spec.providers;
+    let provider_env_revision =
+        compute_provider_env_revision(state.store.as_ref(), &provider_names).await?;
     let environment =
-        super::provider::resolve_provider_environment(state.store.as_ref(), &spec.providers)
+        super::provider::resolve_provider_environment(state.store.as_ref(), &provider_names)
             .await?;
 
     info!(
         sandbox_id = %sandbox_id,
-        provider_count = spec.providers.len(),
+        provider_count = provider_names.len(),
         env_count = environment.len(),
+        provider_env_revision,
         "GetSandboxProviderEnvironment request completed successfully"
     );
 
     Ok(Response::new(GetSandboxProviderEnvironmentResponse {
         environment,
+        provider_env_revision,
     }))
 }
 
@@ -3323,6 +3373,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_env_revision_changes_when_attached_provider_record_changes() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
+        use std::time::Duration;
+
+        let state = test_server_state().await;
+        let mut provider = test_provider("work-github", "github");
+        state.store.put_message(&provider).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-provider-revision",
+                "provider-revision",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let first = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-provider-revision".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        provider
+            .credentials
+            .insert("GITHUB_TOKEN".to_string(), "rotated".to_string());
+        state.store.put_message(&provider).await.unwrap();
+
+        let second = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-provider-revision".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_ne!(
+            first.provider_env_revision, second.provider_env_revision,
+            "provider object updates must trigger sandbox credential refresh"
+        );
+        assert_eq!(
+            second.environment.get("GITHUB_TOKEN"),
+            Some(&"rotated".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn sandbox_config_and_provider_env_follow_attached_provider_lifecycle() {
         use crate::grpc::sandbox::{
             handle_attach_sandbox_provider, handle_detach_sandbox_provider,
@@ -3356,6 +3461,15 @@ mod tests {
                 .network_policies
                 .contains_key("_provider_work_github")
         );
+        let baseline_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-attach-lifecycle".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
 
         handle_attach_sandbox_provider(
             &state,
@@ -3382,10 +3496,13 @@ mod tests {
         )
         .await
         .unwrap()
-        .into_inner()
-        .environment;
+        .into_inner();
+        assert_ne!(
+            baseline_env.provider_env_revision,
+            attached_env.provider_env_revision
+        );
         assert_eq!(
-            attached_env.get("GITHUB_TOKEN"),
+            attached_env.environment.get("GITHUB_TOKEN"),
             Some(&"ghp-test".to_string())
         );
 
@@ -3414,9 +3531,12 @@ mod tests {
         )
         .await
         .unwrap()
-        .into_inner()
-        .environment;
-        assert!(!detached_env.contains_key("GITHUB_TOKEN"));
+        .into_inner();
+        assert_ne!(
+            attached_env.provider_env_revision,
+            detached_env.provider_env_revision
+        );
+        assert!(!detached_env.environment.contains_key("GITHUB_TOKEN"));
     }
 
     #[tokio::test]

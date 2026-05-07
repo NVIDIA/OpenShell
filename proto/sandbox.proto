@@ -257,4 +257,7 @@ message GetSandboxConfigResponse {
   // When policy_source is GLOBAL, the version of the global policy revision.
   // Zero when no global policy is active or when policy_source is SANDBOX.
   uint32 global_policy_version = 7;
+  // Fingerprint for provider credential inputs attached to this sandbox.
+  // Changes when attached provider names or attached provider records change.
+  uint64 provider_env_revision = 8;
 }

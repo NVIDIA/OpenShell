@@ -6,7 +6,7 @@
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
 use crate::persistence::{ObjectName, ObjectType, Store, generate_name};
-use openshell_core::proto::Provider;
+use openshell_core::proto::{Provider, Sandbox};
 use prost::Message;
 use tonic::Status;
 use tracing::warn;
@@ -175,10 +175,55 @@ pub(super) async fn delete_provider_record(store: &Store, name: &str) -> Result<
         return Err(Status::invalid_argument("name is required"));
     }
 
+    let blocking_sandboxes = sandboxes_using_provider(store, name).await?;
+    if !blocking_sandboxes.is_empty() {
+        return Err(Status::failed_precondition(format!(
+            "provider '{name}' is attached to sandbox(es): {}",
+            blocking_sandboxes.join(", ")
+        )));
+    }
+
     store
         .delete_by_name(Provider::object_type(), name)
         .await
         .map_err(|e| Status::internal(format!("delete provider failed: {e}")))
+}
+
+async fn sandboxes_using_provider(
+    store: &Store,
+    provider_name: &str,
+) -> Result<Vec<String>, Status> {
+    let mut blocking = Vec::new();
+    let mut offset = 0;
+    loop {
+        let records = store
+            .list(Sandbox::object_type(), 1000, offset)
+            .await
+            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+        if records.is_empty() {
+            break;
+        }
+        offset = offset
+            .checked_add(
+                u32::try_from(records.len())
+                    .map_err(|_| Status::internal("sandbox page size exceeded u32"))?,
+            )
+            .ok_or_else(|| Status::internal("sandbox pagination offset overflow"))?;
+
+        for record in records {
+            let sandbox = Sandbox::decode(record.payload.as_slice())
+                .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
+            let Some(spec) = sandbox.spec.as_ref() else {
+                continue;
+            };
+            if spec.providers.iter().any(|name| name == provider_name) {
+                blocking.push(sandbox.object_name().to_string());
+            }
+        }
+    }
+    blocking.sort();
+    blocking.dedup();
+    Ok(blocking)
 }
 
 /// Merge an incoming map into an existing map.
@@ -278,8 +323,8 @@ use openshell_core::proto::{
     ImportProviderProfilesRequest, ImportProviderProfilesResponse, LintProviderProfilesRequest,
     LintProviderProfilesResponse, ListProviderProfilesRequest, ListProviderProfilesResponse,
     ListProvidersRequest, ListProvidersResponse, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, ProviderProfileResponse, ProviderResponse, Sandbox,
-    StoredProviderProfile, UpdateProviderRequest,
+    ProviderProfileImportItem, ProviderProfileResponse, ProviderResponse, StoredProviderProfile,
+    UpdateProviderRequest,
 };
 use openshell_providers::{
     ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles, get_default_profile,
@@ -1412,6 +1457,43 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(missing.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn delete_provider_rejects_attached_provider() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        create_provider_record(&store, provider_with_values("gitlab-local", "gitlab"))
+            .await
+            .unwrap();
+        store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-id".to_string(),
+                    name: "attached-sandbox".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["gitlab-local".to_string()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let err = delete_provider_record(&store, "gitlab-local")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("attached-sandbox"),
+            "error should identify blocking sandbox: {}",
+            err.message()
+        );
     }
 
     #[tokio::test]
