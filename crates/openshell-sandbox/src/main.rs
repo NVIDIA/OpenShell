@@ -104,6 +104,14 @@ struct Args {
     /// Port for health check endpoint.
     #[arg(long, default_value = "8080")]
     health_port: u16,
+
+    /// Path to a JSON helpers config. Each listed helper is spawned before the
+    /// workload with its declared ambient capabilities, bypassing seccomp and
+    /// `PR_SET_NO_NEW_PRIVS`. Intended for small, audited daemons (capability
+    /// brokers, privileged bridges) that the workload will connect to via an
+    /// approved Landlock path.
+    #[arg(long, env = "OPENSHELL_HELPERS_CONFIG")]
+    helpers_config: Option<String>,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -294,6 +302,7 @@ fn main() -> Result<()> {
             args.health_check,
             args.health_port,
             args.inference_routes,
+            args.helpers_config,
             ocsf_enabled,
         )
         .await

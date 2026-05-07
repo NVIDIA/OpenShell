@@ -289,48 +289,85 @@ pub fn collect_cmdline_paths(pid: u32, stop_pid: u32, exclude: &[PathBuf]) -> Ve
 /// - Inode is field index 9 (0-indexed)
 #[cfg(target_os = "linux")]
 fn parse_proc_net_tcp(pid: u32, peer_port: u16) -> Result<u64> {
+    // Try the workload's netns first, then fall back to the supervisor's
+    // netns (pid 1).
+    //
+    // Workload-originated connections (the sandboxed entrypoint and its
+    // descendants, including processes started through `openshell sandbox
+    // connect`) live in the entrypoint's netns and always show up in
+    // `/proc/<entrypoint_pid>/net/tcp`.
+    //
+    // Supervisor helpers (declared in `--helpers-config`, spawned pre-
+    // workload by `helpers::spawn_helpers`) share the supervisor's netns.
+    // Their connections to the policy proxy don't appear in the workload's
+    // procfs view. Without the fallback, peer attribution fails and the
+    // proxy denies legitimate helper egress (e.g. a capability broker or
+    // an inference gateway running alongside the sandboxed agent).
+    //
+    // Security implications of the fallback:
+    //   - A process in the supervisor's netns that is NOT a registered
+    //     helper would also get attributed. The only processes there are
+    //     the supervisor itself and operator-declared helpers — same trust
+    //     level as the supervisor, which is the policy authority.
+    //   - Peer-port collisions between workload and supervisor netns are
+    //     possible in principle but benign: we try the workload's view
+    //     first, so workload-owned connections always win. A helper-owned
+    //     connection only surfaces when the workload has no entry for
+    //     that port.
+    //   - Downstream identity checks (binary hash TOFU + ancestor walk in
+    //     proxy.rs) apply unchanged to helper-owned connections. A helper
+    //     swapped out for a different binary still trips
+    //     "Binary integrity violation" the same way a workload binary
+    //     would.
+    let mut candidate_pids = vec![pid];
+    if pid != 1 {
+        candidate_pids.push(1);
+    }
+
     // Check IPv4 first (most common), then IPv6.
-    for suffix in &["tcp", "tcp6"] {
-        let path = format!("/proc/{pid}/net/{suffix}");
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-
-        for line in content.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 10 {
+    for lookup_pid in &candidate_pids {
+        for suffix in &["tcp", "tcp6"] {
+            let path = format!("/proc/{lookup_pid}/net/{suffix}");
+            let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
-            }
-
-            // Parse local_address to extract port.
-            // IPv4 format: AABBCCDD:PORT
-            // IPv6 format: 00000000000000000000000000000000:PORT
-            let local_addr = fields[1];
-            let local_port = match local_addr.rsplit_once(':') {
-                Some((_, port_hex)) => u16::from_str_radix(port_hex, 16).unwrap_or(0),
-                None => continue,
             };
 
-            // Check state is ESTABLISHED (01)
-            let state = fields[3];
-            if state != "01" {
-                continue;
-            }
-
-            if local_port == peer_port {
-                let inode: u64 = fields[9]
-                    .parse()
-                    .map_err(|_| miette::miette!("Failed to parse inode from {}", fields[9]))?;
-                if inode == 0 {
+            for line in content.lines().skip(1) {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() < 10 {
                     continue;
                 }
-                return Ok(inode);
+
+                // Parse local_address to extract port.
+                // IPv4 format: AABBCCDD:PORT
+                // IPv6 format: 00000000000000000000000000000000:PORT
+                let local_addr = fields[1];
+                let local_port = match local_addr.rsplit_once(':') {
+                    Some((_, port_hex)) => u16::from_str_radix(port_hex, 16).unwrap_or(0),
+                    None => continue,
+                };
+
+                // Check state is ESTABLISHED (01)
+                let state = fields[3];
+                if state != "01" {
+                    continue;
+                }
+
+                if local_port == peer_port {
+                    let inode: u64 = fields[9].parse().map_err(|_| {
+                        miette::miette!("Failed to parse inode from {}", fields[9])
+                    })?;
+                    if inode == 0 {
+                        continue;
+                    }
+                    return Ok(inode);
+                }
             }
         }
     }
 
     Err(miette::miette!(
-        "No ESTABLISHED TCP connection found for port {} in /proc/{}/net/tcp{{,6}}",
+        "No ESTABLISHED TCP connection found for port {} in /proc/{{{},1}}/net/tcp{{,6}}",
         peer_port,
         pid
     ))
