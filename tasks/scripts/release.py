@@ -293,7 +293,6 @@ class Openshell < Formula
       OPENSHELL_DISABLE_TLS: "true",
       OPENSHELL_DISABLE_GATEWAY_AUTH: "true",
       OPENSHELL_DB_URL: "sqlite:#{{var}}/openshell/gateway/openshell.db",
-      OPENSHELL_DRIVERS: "vm",
       OPENSHELL_GRPC_ENDPOINT: "http://127.0.0.1:{LOCAL_GATEWAY_PORT}",
       OPENSHELL_SSH_GATEWAY_HOST: "127.0.0.1",
       OPENSHELL_SSH_GATEWAY_PORT: "{LOCAL_GATEWAY_PORT}",

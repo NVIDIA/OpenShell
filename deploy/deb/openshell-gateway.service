@@ -12,7 +12,6 @@ Environment=OPENSHELL_SERVER_PORT=17670
 Environment=OPENSHELL_DISABLE_TLS=true
 Environment=OPENSHELL_DISABLE_GATEWAY_AUTH=true
 Environment=OPENSHELL_DB_URL=sqlite:%S/openshell/gateway/openshell.db
-Environment=OPENSHELL_DRIVERS=vm
 Environment=OPENSHELL_GRPC_ENDPOINT=http://127.0.0.1:17670
 Environment=OPENSHELL_SSH_GATEWAY_HOST=127.0.0.1
 Environment=OPENSHELL_SSH_GATEWAY_PORT=17670

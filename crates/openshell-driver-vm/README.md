@@ -182,13 +182,17 @@ The VM guest's serial console is appended to `<state-dir>/<sandbox-id>/console.l
 
 On Linux amd64 and arm64, `install-dev.sh` installs the Debian package from the
 selected `OPENSHELL_VERSION` release tag. That package includes
-`openshell-gateway` and `openshell-driver-vm`.
+`openshell-gateway` and `openshell-driver-vm`, but leaves
+`OPENSHELL_DRIVERS` unset so the gateway uses its normal runtime
+auto-detection. Set `OPENSHELL_DRIVERS=vm` to force the VM driver.
 
 On Apple Silicon macOS, `install-dev.sh` stages the generated `openshell.rb`
 formula from the selected release in the `nvidia/openshell` Homebrew tap.
 Homebrew installs `openshell`, `openshell-gateway`, and
 `openshell-driver-vm`, ad-hoc signs the driver with the Hypervisor entitlement
-in `post_install`, and owns the `brew services` gateway lifecycle.
+in `post_install`, and owns the `brew services` gateway lifecycle. The service
+also leaves `OPENSHELL_DRIVERS` unset so driver choice remains automatic unless
+the user explicitly overrides it.
 
 ## Relationship to `openshell-vm`
 
