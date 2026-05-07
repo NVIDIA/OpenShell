@@ -13,7 +13,7 @@ OpenShell enforces sandbox security across four layers: network, filesystem, pro
 This page documents every configurable control, its default, what it protects, and the risk of relaxing it.
 
 For the full policy YAML schema, refer to the [Policy Schema](/reference/policy-schema).
-For the architecture of each enforcement layer, refer to [Architecture](/about/architecture).
+For the architecture of each enforcement layer, refer to [How OpenShell Works](/about/how-it-works).
 
 <Note>
 If you use [NemoClaw](https://github.com/NVIDIA/NemoClaw) to run OpenClaw assistants, its [Security Best Practices](https://docs.nvidia.com/nemoclaw/latest/security/best-practices.html) guide covers additional entrypoint-level controls, policy presets, provider trust tiers, and posture profiles specific to the NemoClaw blueprint.
@@ -282,5 +282,5 @@ The following patterns weaken security without providing meaningful benefit.
 - [Policy Schema](/reference/policy-schema) for the full field-by-field YAML reference.
 - [Default Policy](/reference/default-policy) for the built-in default policy breakdown.
 - [Gateway Auth](/reference/gateway-auth) for gateway authentication details.
-- [Architecture](/about/architecture) for the system architecture.
+- [How OpenShell Works](/about/how-it-works) for the system architecture.
 - NemoClaw [Security Best Practices](https://docs.nvidia.com/nemoclaw/latest/security/best-practices.html) for entrypoint-level controls (capability drops, PATH hardening, build toolchain removal), policy presets, provider trust tiers, and posture profiles.

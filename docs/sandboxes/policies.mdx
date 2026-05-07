@@ -5,7 +5,7 @@ title: "Customize Sandbox Policies"
 sidebar-title: "Policies"
 description: "Apply, iterate, and debug sandbox network policies with hot-reload on running OpenShell sandboxes."
 keywords: "Generative AI, Cybersecurity, Policy, Network Policy, Sandbox, Security, Hot Reload"
-position: 5
+position: 4
 ---
 
 Use this page to apply and iterate policy changes on running sandboxes. For a full field-by-field YAML definition, use the [Policy Schema Reference](/reference/policy-schema).
@@ -56,7 +56,7 @@ Raw streams are connection-scoped and outside L7 live-reload guarantees. This in
 | `filesystem_policy` | Static | Controls which directories the agent can access on disk. Paths are split into `read_only` and `read_write` lists. Any path not listed in either list is inaccessible. Set `include_workdir: true` to automatically add the agent's working directory to `read_write`. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level. |
 | `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (skip individual inaccessible paths while applying remaining rules) or `hard_requirement` (fail if any path is inaccessible or the required kernel ABI is unavailable). See the [Policy Schema Reference](/reference/policy-schema#landlock) for the full behavior table. |
 | `process` | Static | Sets the OS-level identity for the agent process. `run_as_user` and `run_as_group` default to `sandbox`. Root (`root` or `0`) is rejected. The agent also runs with seccomp filters that block dangerous system calls. |
-| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br />Every outbound connection except `https://inference.local` goes through the proxy, which queries the [policy engine](/about/architecture) with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br />For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request is checked against that endpoint's `rules` (method and path). <br />Endpoints without `protocol` allow the TCP stream through without inspecting payloads. <br />If no endpoint matches, the connection is denied. Configure managed inference separately through [Configure](/inference/configure). |
+| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br />Every outbound connection except `https://inference.local` goes through the proxy, which queries the [policy engine](/about/overview#core-components) with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br />For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request can be checked against that endpoint's `rules` (method and path). <br />Endpoints without `protocol` allow the TCP stream through without inspecting payloads. <br />If no endpoint matches, the connection is denied. Configure managed inference separately through [Inference Routing](/sandboxes/inference-routing). |
 
 ## Baseline Filesystem Paths
 
@@ -589,6 +589,6 @@ GraphQL field names are application-specific, so treat these as starting shapes 
 
 Explore related topics:
 
-- To learn about network access rules and sandbox isolation layers, refer to [About Gateways and Sandboxes](/sandboxes/about).
+- To learn about the built-in sandbox policy, refer to [Default Policy](/reference/default-policy).
 - To view the full field-by-field YAML definition, refer to the [Policy Schema Reference](/reference/policy-schema).
 - To review the default policy breakdown, refer to [Default Policy](/reference/default-policy).
