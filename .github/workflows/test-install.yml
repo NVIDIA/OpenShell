@@ -4,12 +4,14 @@ on:
   pull_request:
     paths:
       - 'install.sh'
+      - 'install-dev.sh'
       - 'e2e/install/**'
       - '.github/workflows/test-install.yml'
   push:
     branches: [main]
     paths:
       - 'install.sh'
+      - 'install-dev.sh'
       - 'e2e/install/**'
       - '.github/workflows/test-install.yml'
   workflow_dispatch:
@@ -49,3 +51,13 @@ jobs:
 
       - name: Run tests (${{ matrix.shell }})
         run: ${{ matrix.run }}
+
+  test-install-dev:
+    name: install-dev.sh lookup
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run install-dev.sh lookup tests
+        run: sh e2e/install/install_dev_lookup_test.sh
