@@ -3554,6 +3554,166 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
+    async fn custom_imported_profile_policy_and_env_follow_attach_detach_lifecycle() {
+        use crate::grpc::provider::handle_import_provider_profiles;
+        use crate::grpc::sandbox::{
+            handle_attach_sandbox_provider, handle_detach_sandbox_provider,
+        };
+        use openshell_core::proto::{
+            AttachSandboxProviderRequest, DetachSandboxProviderRequest,
+            GetSandboxProviderEnvironmentRequest, ImportProviderProfilesRequest, NetworkBinary,
+            ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
+            ProviderProfileImportItem,
+        };
+
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    source: "custom-api.yaml".to_string(),
+                    profile: Some(ProviderProfile {
+                        id: "custom-api".to_string(),
+                        display_name: "Custom API".to_string(),
+                        description: String::new(),
+                        category: ProviderProfileCategory::Other as i32,
+                        credentials: vec![ProviderProfileCredential {
+                            name: "api_key".to_string(),
+                            env_vars: vec!["CUSTOM_API_KEY".to_string()],
+                            auth_style: "bearer".to_string(),
+                            header_name: "authorization".to_string(),
+                            required: true,
+                            ..Default::default()
+                        }],
+                        endpoints: vec![NetworkEndpoint {
+                            host: "api.custom.example".to_string(),
+                            port: 443,
+                            protocol: "rest".to_string(),
+                            rules: vec![L7Rule {
+                                allow: Some(openshell_core::proto::L7Allow {
+                                    method: "GET".to_string(),
+                                    path: "/v1/**".to_string(),
+                                    ..Default::default()
+                                }),
+                            }],
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/custom".to_string(),
+                            harness: true,
+                        }],
+                        inference_capable: false,
+                    }),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut provider = test_provider("work-custom", "custom-api");
+        provider.credentials =
+            std::iter::once(("CUSTOM_API_KEY".to_string(), "custom-secret".to_string())).collect();
+        state.store.put_message(&provider).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-custom-attach-lifecycle",
+                "custom-attach-lifecycle",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let baseline_policy = get_sandbox_policy(&state, "sb-custom-attach-lifecycle").await;
+        assert!(
+            !baseline_policy
+                .network_policies
+                .contains_key("_provider_work_custom")
+        );
+        let baseline_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-custom-attach-lifecycle".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "custom-attach-lifecycle".to_string(),
+                provider_name: "work-custom".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let attached_policy = get_sandbox_policy(&state, "sb-custom-attach-lifecycle").await;
+        let custom_rule = attached_policy
+            .network_policies
+            .get("_provider_work_custom")
+            .expect("custom provider rule should be composed after attach");
+        assert_eq!(custom_rule.endpoints[0].host, "api.custom.example");
+        assert_eq!(custom_rule.endpoints[0].protocol, "rest");
+        assert_eq!(custom_rule.endpoints[0].rules.len(), 1);
+        assert_eq!(custom_rule.binaries[0].path, "/usr/bin/custom");
+
+        let attached_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-custom-attach-lifecycle".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_ne!(
+            baseline_env.provider_env_revision,
+            attached_env.provider_env_revision
+        );
+        assert_eq!(
+            attached_env.environment.get("CUSTOM_API_KEY"),
+            Some(&"custom-secret".to_string())
+        );
+
+        handle_detach_sandbox_provider(
+            &state,
+            Request::new(DetachSandboxProviderRequest {
+                sandbox_name: "custom-attach-lifecycle".to_string(),
+                provider_name: "work-custom".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let detached_policy = get_sandbox_policy(&state, "sb-custom-attach-lifecycle").await;
+        assert!(
+            !detached_policy
+                .network_policies
+                .contains_key("_provider_work_custom")
+        );
+        let detached_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-custom-attach-lifecycle".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_ne!(
+            attached_env.provider_env_revision,
+            detached_env.provider_env_revision
+        );
+        assert!(!detached_env.environment.contains_key("CUSTOM_API_KEY"));
+    }
+
+    #[tokio::test]
     async fn global_policy_suppresses_provider_profile_layers_when_v2_enabled() {
         use openshell_core::proto::{
             GetSandboxConfigRequest, NetworkEndpoint, NetworkPolicyRule, SandboxPhase,

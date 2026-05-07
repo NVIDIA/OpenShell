@@ -11,6 +11,7 @@ persisted sandbox spec environment map.
 
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
@@ -181,6 +182,77 @@ def test_nvidia_provider_injects_nvidia_api_key_env_var(
             result = sb.exec_python(read_nvidia_key)
             assert result.exit_code == 0, result.stderr
             assert result.stdout.strip() == "openshell:resolve:env:NVIDIA_API_KEY"
+
+
+def test_attach_detach_updates_credentials_for_later_exec_launches(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """Later exec launches see provider attach/detach credential changes."""
+    stub = sandbox_client._stub
+    provider_name = "e2e-test-attach-detach-env"
+
+    with provider(
+        stub,
+        name=provider_name,
+        provider_type="generic",
+        credentials={"CUSTOM_ATTACH_TOKEN": "token-attach-detach"},
+    ):
+        spec = datamodel_pb2.SandboxSpec(policy=_default_policy(), providers=[])
+
+        def read_attach_token() -> str:
+            import os
+
+            return os.environ.get("CUSTOM_ATTACH_TOKEN", "NOT_SET")
+
+        def exec_token(sb: Sandbox) -> str:
+            result = sb.exec_python(read_attach_token)
+            assert result.exit_code == 0, result.stderr
+            return result.stdout.strip()
+
+        def wait_for_token(sb: Sandbox, expected: str) -> None:
+            deadline = time.monotonic() + 35
+            last = None
+            while time.monotonic() < deadline:
+                last = exec_token(sb)
+                if last == expected:
+                    return
+                time.sleep(2)
+            pytest.fail(f"expected {expected!r}, last exec saw {last!r}")
+
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            assert exec_token(sb) == "NOT_SET"
+
+            try:
+                stub.AttachSandboxProvider(
+                    openshell_pb2.AttachSandboxProviderRequest(
+                        sandbox_name=sb.sandbox.name,
+                        provider_name=provider_name,
+                    )
+                )
+                wait_for_token(
+                    sb,
+                    "openshell:resolve:env:CUSTOM_ATTACH_TOKEN",
+                )
+
+                stub.DetachSandboxProvider(
+                    openshell_pb2.DetachSandboxProviderRequest(
+                        sandbox_name=sb.sandbox.name,
+                        provider_name=provider_name,
+                    )
+                )
+                wait_for_token(sb, "NOT_SET")
+            finally:
+                try:
+                    stub.DetachSandboxProvider(
+                        openshell_pb2.DetachSandboxProviderRequest(
+                            sandbox_name=sb.sandbox.name,
+                            provider_name=provider_name,
+                        )
+                    )
+                except grpc.RpcError as exc:
+                    if exc.code() != grpc.StatusCode.NOT_FOUND:
+                        raise
 
 
 # ===========================================================================
