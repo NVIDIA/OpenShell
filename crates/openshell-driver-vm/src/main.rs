@@ -50,18 +50,28 @@ struct Args {
     #[arg(long, hide = true, default_value_t = 1)]
     vm_krun_log_level: u32,
 
-    #[arg(
-        long,
-        env = "OPENSHELL_COMPUTE_DRIVER_BIND",
-        default_value = "127.0.0.1:50061"
-    )]
-    bind_address: SocketAddr,
+    #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_BIND")]
+    bind_address: Option<SocketAddr>,
 
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: Option<PathBuf>,
 
     #[arg(long, hide = true)]
     expected_peer_pid: Option<u32>,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_COMPUTE_DRIVER_ALLOW_UNAUTHENTICATED_TCP",
+        default_value_t = false
+    )]
+    allow_unauthenticated_tcp: bool,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_COMPUTE_DRIVER_ALLOW_SAME_UID_PEER",
+        default_value_t = false
+    )]
+    allow_same_uid_peer: bool,
 
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
@@ -161,6 +171,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let listen_mode = compute_driver_listen_mode(&args).map_err(|err| miette::miette!("{err}"))?;
+
     // Arm procguard so that if the gateway is killed (SIGKILL or crash)
     // we also die. Without this the driver is reparented to init and
     // keeps its per-sandbox VM launchers alive forever. Launchers have
@@ -177,18 +189,18 @@ async fn main() -> Result<()> {
         openshell_endpoint: args
             .openshell_endpoint
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
-        state_dir: args.state_dir,
+        state_dir: args.state_dir.clone(),
         launcher_bin: None,
-        default_image: args.default_image,
-        ssh_handshake_secret: args.ssh_handshake_secret.unwrap_or_default(),
+        default_image: args.default_image.clone(),
+        ssh_handshake_secret: args.ssh_handshake_secret.clone().unwrap_or_default(),
         ssh_handshake_skew_secs: args.ssh_handshake_skew_secs,
-        log_level: args.log_level,
+        log_level: args.log_level.clone(),
         krun_log_level: args.krun_log_level,
         vcpus: args.vcpus,
         mem_mib: args.mem_mib,
-        guest_tls_ca: args.guest_tls_ca,
-        guest_tls_cert: args.guest_tls_cert,
-        guest_tls_key: args.guest_tls_key,
+        guest_tls_ca: args.guest_tls_ca.clone(),
+        guest_tls_cert: args.guest_tls_cert.clone(),
+        guest_tls_key: args.guest_tls_key.clone(),
         gpu_enabled: args.gpu,
         gpu_mem_mib: args.gpu_mem_mib,
         gpu_vcpus: args.gpu_vcpus,
@@ -196,30 +208,70 @@ async fn main() -> Result<()> {
     .await
     .map_err(|err| miette::miette!("{err}"))?;
 
-    if let Some(socket_path) = args.bind_socket {
-        prepare_compute_driver_socket(&socket_path).map_err(|err| miette::miette!("{err}"))?;
+    match listen_mode {
+        ComputeDriverListenMode::Unix {
+            socket_path,
+            expected_peer_pid,
+        } => {
+            prepare_compute_driver_socket(&socket_path).map_err(|err| miette::miette!("{err}"))?;
 
-        info!(socket = %socket_path.display(), "Starting vm compute driver");
-        let listener = UnixListener::bind(&socket_path).into_diagnostic()?;
-        restrict_socket_permissions(&socket_path).map_err(|err| miette::miette!("{err}"))?;
-        let result = tonic::transport::Server::builder()
-            .add_service(ComputeDriverServer::new(driver))
-            .serve_with_incoming(AuthenticatedUnixIncoming::new(
-                listener,
-                args.expected_peer_pid,
-            ))
-            .await
-            .into_diagnostic();
-        let _ = std::fs::remove_file(&socket_path);
-        result
-    } else {
-        info!(address = %args.bind_address, "Starting vm compute driver");
-        tonic::transport::Server::builder()
-            .add_service(ComputeDriverServer::new(driver))
-            .serve(args.bind_address)
-            .await
-            .into_diagnostic()
+            info!(socket = %socket_path.display(), "Starting vm compute driver");
+            let listener = UnixListener::bind(&socket_path).into_diagnostic()?;
+            restrict_socket_permissions(&socket_path).map_err(|err| miette::miette!("{err}"))?;
+            let result = tonic::transport::Server::builder()
+                .add_service(ComputeDriverServer::new(driver))
+                .serve_with_incoming(AuthenticatedUnixIncoming::new(listener, expected_peer_pid))
+                .await
+                .into_diagnostic();
+            let _ = std::fs::remove_file(&socket_path);
+            result
+        }
+        ComputeDriverListenMode::Tcp(bind_address) => {
+            info!(address = %bind_address, "Starting unauthenticated dev vm compute driver");
+            tonic::transport::Server::builder()
+                .add_service(ComputeDriverServer::new(driver))
+                .serve(bind_address)
+                .await
+                .into_diagnostic()
+        }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ComputeDriverListenMode {
+    Unix {
+        socket_path: PathBuf,
+        expected_peer_pid: Option<u32>,
+    },
+    Tcp(SocketAddr),
+}
+
+fn compute_driver_listen_mode(args: &Args) -> std::result::Result<ComputeDriverListenMode, String> {
+    if let Some(socket_path) = args.bind_socket.clone() {
+        if args.expected_peer_pid.is_none() && !args.allow_same_uid_peer {
+            return Err(
+                "--expected-peer-pid is required with --bind-socket; use --allow-same-uid-peer only for local development"
+                    .to_string(),
+            );
+        }
+        return Ok(ComputeDriverListenMode::Unix {
+            socket_path,
+            expected_peer_pid: args.expected_peer_pid,
+        });
+    }
+
+    if !args.allow_unauthenticated_tcp {
+        return Err(
+            "--bind-socket is required; unauthenticated TCP mode is disabled unless --allow-unauthenticated-tcp is set for local development"
+                .to_string(),
+        );
+    }
+
+    let Some(bind_address) = args.bind_address else {
+        return Err("--bind-address is required with --allow-unauthenticated-tcp".to_string());
+    };
+
+    Ok(ComputeDriverListenMode::Tcp(bind_address))
 }
 
 fn prepare_compute_driver_socket(socket_path: &Path) -> std::result::Result<(), String> {
@@ -489,7 +541,12 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerCredentials, authorize_peer_credentials};
+    use super::{
+        Args, ComputeDriverListenMode, PeerCredentials, authorize_peer_credentials,
+        compute_driver_listen_mode,
+    };
+    use clap::Parser;
+    use std::path::PathBuf;
 
     #[test]
     fn peer_authorization_accepts_matching_uid_and_pid() {
@@ -557,5 +614,89 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn listen_mode_rejects_default_tcp() {
+        let args = Args::parse_from(["openshell-driver-vm"]);
+        let err = compute_driver_listen_mode(&args).expect_err("default TCP should be disabled");
+        assert!(err.contains("--bind-socket is required"));
+    }
+
+    #[test]
+    fn listen_mode_rejects_bind_address_without_tcp_opt_in() {
+        let args = Args::parse_from(["openshell-driver-vm", "--bind-address", "127.0.0.1:50061"]);
+        let err =
+            compute_driver_listen_mode(&args).expect_err("TCP bind should require explicit opt-in");
+        assert!(err.contains("--allow-unauthenticated-tcp"));
+    }
+
+    #[test]
+    fn listen_mode_requires_bind_address_with_tcp_opt_in() {
+        let args = Args::parse_from(["openshell-driver-vm", "--allow-unauthenticated-tcp"]);
+        let err =
+            compute_driver_listen_mode(&args).expect_err("TCP opt-in should require an address");
+        assert!(err.contains("--bind-address is required"));
+    }
+
+    #[test]
+    fn listen_mode_accepts_explicit_unauthenticated_tcp() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--allow-unauthenticated-tcp",
+            "--bind-address",
+            "127.0.0.1:50061",
+        ]);
+        assert_eq!(
+            compute_driver_listen_mode(&args).unwrap(),
+            ComputeDriverListenMode::Tcp("127.0.0.1:50061".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn listen_mode_requires_expected_peer_pid_for_uds() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--bind-socket",
+            "/tmp/compute-driver.sock",
+        ]);
+        let err = compute_driver_listen_mode(&args)
+            .expect_err("UDS should require gateway peer pid by default");
+        assert!(err.contains("--expected-peer-pid is required"));
+    }
+
+    #[test]
+    fn listen_mode_accepts_uds_with_expected_peer_pid() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--bind-socket",
+            "/tmp/compute-driver.sock",
+            "--expected-peer-pid",
+            "42",
+        ]);
+        assert_eq!(
+            compute_driver_listen_mode(&args).unwrap(),
+            ComputeDriverListenMode::Unix {
+                socket_path: PathBuf::from("/tmp/compute-driver.sock"),
+                expected_peer_pid: Some(42),
+            }
+        );
+    }
+
+    #[test]
+    fn listen_mode_accepts_explicit_same_uid_uds_dev_mode() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--bind-socket",
+            "/tmp/compute-driver.sock",
+            "--allow-same-uid-peer",
+        ]);
+        assert_eq!(
+            compute_driver_listen_mode(&args).unwrap(),
+            ComputeDriverListenMode::Unix {
+                socket_path: PathBuf::from("/tmp/compute-driver.sock"),
+                expected_peer_pid: None,
+            }
+        );
     }
 }

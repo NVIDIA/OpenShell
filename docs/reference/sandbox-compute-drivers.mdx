@@ -79,6 +79,8 @@ The gateway uses the VM compute driver to create VM-backed sandboxes. MicroVM re
 | `--vm-krun-log-level <level>` | `OPENSHELL_VM_KRUN_LOG_LEVEL` | Set the libkrun log level for VM helper processes. |
 | `--vm-tls-ca`, `--vm-tls-cert`, `--vm-tls-key` | `OPENSHELL_VM_TLS_CA`, `OPENSHELL_VM_TLS_CERT`, `OPENSHELL_VM_TLS_KEY` | Copy sandbox client TLS materials into VM guests for mTLS callback to the gateway. |
 
+The gateway starts `openshell-driver-vm` over a private Unix socket and passes its process ID so the driver can reject unexpected local clients. The driver's standalone TCP listener is disabled unless `--allow-unauthenticated-tcp` is set for local development.
+
 ## Kubernetes Driver
 
 Kubernetes-backed sandboxes run as pods in the configured sandbox namespace. Use Kubernetes for shared clusters, remote compute, GPU scheduling, and operator-managed environments.

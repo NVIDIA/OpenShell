@@ -38,7 +38,7 @@ use std::fs;
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -362,7 +362,7 @@ impl VmDriver {
         let is_gpu = spec.is_some_and(|s| s.gpu);
         let gpu_device = spec.map_or("", |s| s.gpu_device.as_str());
 
-        let state_dir = sandbox_state_dir(&self.config.state_dir, &sandbox.id);
+        let state_dir = sandbox_state_dir(&self.config.state_dir, &sandbox.id)?;
         let rootfs = state_dir.join("rootfs");
         let image_ref = self.resolved_sandbox_image(sandbox).ok_or_else(|| {
             Status::failed_precondition(
@@ -620,6 +620,10 @@ impl VmDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<DeleteSandboxResponse, Status> {
+        if !sandbox_id.is_empty() {
+            validate_sandbox_id(sandbox_id)?;
+        }
+
         let record = {
             let registry = self.registry.lock().await;
             if let Some((id, record)) = registry.get_key_value(sandbox_id) {
@@ -670,13 +674,7 @@ impl VmDriver {
             self.release_gpu_and_subnet(&record_id);
         }
 
-        if let Err(err) = tokio::fs::remove_dir_all(&state_dir).await
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(Status::internal(format!(
-                "failed to remove state dir: {err}"
-            )));
-        }
+        remove_sandbox_state_dir(&self.config.state_dir, &state_dir).await?;
 
         {
             let mut registry = self.registry.lock().await;
@@ -692,6 +690,10 @@ impl VmDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<Option<Sandbox>, Status> {
+        if !sandbox_id.is_empty() {
+            validate_sandbox_id(sandbox_id)?;
+        }
+
         let registry = self.registry.lock().await;
         let sandbox = if sandbox_id.is_empty() {
             registry
@@ -1452,6 +1454,8 @@ fn check_gpu_privileges() -> Result<(), String> {
 // gRPC API surface, so boxing here would diverge from every other handler.
 #[allow(clippy::result_large_err)]
 fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Status> {
+    validate_sandbox_id(&sandbox.id)?;
+
     let spec = sandbox
         .spec
         .as_ref()
@@ -1483,6 +1487,32 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
                 "vm sandboxes do not support template.resources",
             ));
         }
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_sandbox_id(sandbox_id: &str) -> Result<(), Status> {
+    if sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox id is required"));
+    }
+    if sandbox_id.len() > 128 {
+        return Err(Status::invalid_argument(
+            "sandbox id exceeds maximum length (128 bytes)",
+        ));
+    }
+    if matches!(sandbox_id, "." | "..") {
+        return Err(Status::invalid_argument(
+            "sandbox id must match [A-Za-z0-9._-]{1,128}",
+        ));
+    }
+    if !sandbox_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(Status::invalid_argument(
+            "sandbox id must match [A-Za-z0-9._-]{1,128}",
+        ));
     }
     Ok(())
 }
@@ -2236,8 +2266,70 @@ fn sandboxes_root_dir(root: &Path) -> PathBuf {
     root.join("sandboxes")
 }
 
-fn sandbox_state_dir(root: &Path, sandbox_id: &str) -> PathBuf {
-    sandboxes_root_dir(root).join(sandbox_id)
+fn sandbox_state_dir(root: &Path, sandbox_id: &str) -> Result<PathBuf, Status> {
+    validate_sandbox_id(sandbox_id)?;
+    Ok(sandboxes_root_dir(root).join(sandbox_id))
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_sandbox_state_dir(root: &Path, state_dir: &Path) -> Result<(), Status> {
+    let sandboxes_root = sandboxes_root_dir(root);
+    let relative = state_dir.strip_prefix(&sandboxes_root).map_err(|_| {
+        Status::internal(format!(
+            "refusing to use sandbox state path outside vm state root: {}",
+            state_dir.display()
+        ))
+    })?;
+
+    let mut components = relative.components();
+    match components.next() {
+        Some(Component::Normal(_)) => {}
+        _ => {
+            return Err(Status::internal(format!(
+                "refusing to use malformed sandbox state path: {}",
+                state_dir.display()
+            )));
+        }
+    }
+    if components.next().is_some() {
+        return Err(Status::internal(format!(
+            "refusing to use nested sandbox state path: {}",
+            state_dir.display()
+        )));
+    }
+
+    Ok(())
+}
+
+async fn remove_sandbox_state_dir(root: &Path, state_dir: &Path) -> Result<(), Status> {
+    validate_sandbox_state_dir(root, state_dir)?;
+
+    let metadata = match tokio::fs::symlink_metadata(state_dir).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(Status::internal(format!(
+                "failed to stat sandbox state dir: {err}"
+            )));
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(Status::internal(format!(
+            "refusing to remove symlinked sandbox state dir: {}",
+            state_dir.display()
+        )));
+    }
+    if !file_type.is_dir() {
+        return Err(Status::internal(format!(
+            "sandbox state path is not a directory: {}",
+            state_dir.display()
+        )));
+    }
+
+    tokio::fs::remove_dir_all(state_dir)
+        .await
+        .map_err(|err| Status::internal(format!("failed to remove state dir: {err}")))
 }
 
 fn image_cache_root_dir(root: &Path) -> PathBuf {
@@ -2430,6 +2522,7 @@ mod tests {
     };
     use prost_types::{Struct, Value, value::Kind};
     use std::fs;
+    use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tonic::Code;
@@ -2437,6 +2530,7 @@ mod tests {
     #[test]
     fn validate_vm_sandbox_rejects_gpu_when_not_enabled() {
         let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
                 gpu: true,
                 ..Default::default()
@@ -2452,6 +2546,7 @@ mod tests {
     #[test]
     fn validate_vm_sandbox_accepts_gpu_when_enabled() {
         let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
                 gpu: true,
                 ..Default::default()
@@ -2464,6 +2559,7 @@ mod tests {
     #[test]
     fn validate_vm_sandbox_rejects_gpu_device_without_gpu() {
         let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
                 gpu: false,
                 gpu_device: "0000:2d:00.0".to_string(),
@@ -2480,6 +2576,7 @@ mod tests {
     #[test]
     fn validate_vm_sandbox_rejects_platform_config() {
         let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
                 template: Some(SandboxTemplate {
                     platform_config: Some(Struct {
@@ -2506,6 +2603,7 @@ mod tests {
     #[test]
     fn validate_vm_sandbox_accepts_template_image() {
         let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
                 template: Some(SandboxTemplate {
                     image: "ghcr.io/example/sandbox:latest".to_string(),
@@ -2516,6 +2614,51 @@ mod tests {
             ..Default::default()
         };
         validate_vm_sandbox(&sandbox, false).expect("template.image should be accepted");
+    }
+
+    #[test]
+    fn validate_vm_sandbox_rejects_path_unsafe_ids() {
+        let mut unsafe_ids = [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "/tmp/escape",
+            "nested/path",
+            "nested\\path",
+            "bad\nid",
+            "bad id",
+            "unicodé",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        unsafe_ids.push("a".repeat(129));
+
+        for sandbox_id in unsafe_ids {
+            let sandbox = Sandbox {
+                id: sandbox_id.clone(),
+                spec: Some(SandboxSpec {
+                    template: Some(SandboxTemplate {
+                        image: "ghcr.io/example/sandbox:latest".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let err = validate_vm_sandbox(&sandbox, false)
+                .expect_err("path-unsafe sandbox id should be rejected");
+            assert_eq!(err.code(), Code::InvalidArgument, "id={sandbox_id:?}");
+            assert!(err.message().contains("sandbox id"), "id={sandbox_id:?}");
+        }
+    }
+
+    #[test]
+    fn sandbox_state_dir_rejects_path_unsafe_ids() {
+        let err = sandbox_state_dir(Path::new("/tmp/openshell-vm"), "../escape")
+            .expect_err("path traversal should be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 
     #[test]
@@ -2919,9 +3062,14 @@ mod tests {
 
     #[tokio::test]
     async fn delete_sandbox_keeps_registry_entry_when_cleanup_fails() {
+        let base = unique_temp_dir();
+        let driver_state = base.join("driver-state");
         let (events, _) = broadcast::channel(WATCH_BUFFER);
         let driver = VmDriver {
-            config: VmDriverConfig::default(),
+            config: VmDriverConfig {
+                state_dir: driver_state.clone(),
+                ..Default::default()
+            },
             launcher_bin: PathBuf::from("openshell-driver-vm"),
             registry: Arc::new(Mutex::new(HashMap::new())),
             image_cache_lock: Arc::new(Mutex::new(())),
@@ -2933,9 +3081,8 @@ mod tests {
             ))),
         };
 
-        let base = unique_temp_dir();
-        std::fs::create_dir_all(&base).unwrap();
-        let state_file = base.join("state-file");
+        let state_file = sandbox_state_dir(&driver_state, "sandbox-123").unwrap();
+        std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
         std::fs::write(&state_file, "not a directory").unwrap();
 
         insert_test_record(
@@ -2950,10 +3097,11 @@ mod tests {
             .delete_sandbox("sandbox-123", "sandbox-123")
             .await
             .expect_err("state dir cleanup should fail for a file path");
-        assert!(err.message().contains("failed to remove state dir"));
+        assert!(err.message().contains("not a directory"));
         assert!(driver.registry.lock().await.contains_key("sandbox-123"));
 
-        let retry_state_dir = base.join("state-dir");
+        std::fs::remove_file(&state_file).unwrap();
+        let retry_state_dir = sandbox_state_dir(&driver_state, "sandbox-123").unwrap();
         std::fs::create_dir_all(&retry_state_dir).unwrap();
         {
             let mut registry = driver.registry.lock().await;
@@ -2971,6 +3119,40 @@ mod tests {
             .expect("delete retry should succeed once cleanup works");
         assert!(response.deleted);
         assert!(!driver.registry.lock().await.contains_key("sandbox-123"));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn remove_sandbox_state_dir_rejects_paths_outside_state_root() {
+        let base = unique_temp_dir();
+        let state_root = base.join("driver-state");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let err = remove_sandbox_state_dir(&state_root, &outside)
+            .await
+            .expect_err("outside state paths should be rejected");
+        assert!(err.message().contains("outside vm state root"));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_sandbox_state_dir_rejects_symlinked_state_dir() {
+        let base = unique_temp_dir();
+        let state_root = base.join("driver-state");
+        let target = base.join("target");
+        let state_dir = sandbox_state_dir(&state_root, "sandbox-123").unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(state_dir.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &state_dir).unwrap();
+
+        let err = remove_sandbox_state_dir(&state_root, &state_dir)
+            .await
+            .expect_err("symlinked state dir should be rejected");
+        assert!(err.message().contains("symlinked sandbox state dir"));
 
         let _ = std::fs::remove_dir_all(base);
     }

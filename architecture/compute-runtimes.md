@@ -25,6 +25,12 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Gateway spawns `openshell-driver-vm` as a subprocess over a private, state-local Unix socket. |
 
+VM runtime state paths are derived only from driver-validated sandbox IDs
+matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
+private `run/` directory plus Unix peer UID/PID checks. Standalone
+unauthenticated TCP mode is disabled unless explicitly enabled for local
+development.
+
 Runtime-specific implementation notes belong in the driver crate README:
 
 - `crates/openshell-driver-docker/README.md`
