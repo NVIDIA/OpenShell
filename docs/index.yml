@@ -19,8 +19,19 @@ navigation:
   title: "How It Works"
 - folder: observability
   title: "Observability"
-- folder: reference
-  title: "Reference"
+- section: "Reference"
+  slug: reference
+  contents:
+  - page: "Gateway Authentication"
+    path: reference/gateway-auth.mdx
+  - page: "Default Policy"
+    path: reference/default-policy.mdx
+  - page: "Policy Schema"
+    path: reference/policy-schema.mdx
+  - page: "Support Matrix"
+    path: reference/support-matrix.mdx
+  - folder: reference/kubernetes
+    title: "Kubernetes"
 - folder: security
   title: "Security"
 - folder: resources

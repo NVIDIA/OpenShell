@@ -1,0 +1,55 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Use cert-manager for PKI"
+description: "Configure the OpenShell Helm chart to use cert-manager for mTLS certificate issuance and automatic renewal."
+keywords: "Generative AI, Cybersecurity, Kubernetes, cert-manager, PKI, TLS, mTLS, Certificates"
+position: 2
+---
+
+By default, the OpenShell Helm chart generates mTLS certificates using a pre-install Kubernetes Job (`pkiInitJob`). This is the simplest path for getting started and requires no additional dependencies.
+
+Use cert-manager instead when you want automatic certificate rotation managed by a running controller rather than one-time generation at install time.
+
+<Note>
+cert-manager and `pkiInitJob` are mutually exclusive. The chart will fail if both are enabled at the same time.
+</Note>
+
+## Install cert-manager
+
+Add the Jetstack Helm repository and install cert-manager with CRD support enabled:
+
+```shell
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+helm upgrade --install cert-manager jetstack/cert-manager \
+  --namespace cert-manager \
+  --create-namespace \
+  --set crds.enabled=true \
+  --wait
+```
+
+Verify the cert-manager pods are running:
+
+```shell
+kubectl -n cert-manager get pods
+```
+
+## Install OpenShell with cert-manager PKI
+
+Pass the cert-manager values override when installing or upgrading the chart:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set certManager.enabled=true \
+  --set pkiInitJob.enabled=false
+```
+
+The chart creates a self-signed CA, issues server and client certificates from it, and cert-manager handles renewal before expiry.
+
+## Next Steps
+
+Return to [Get Started on Kubernetes](/reference/kubernetes/setup) to complete the installation.
