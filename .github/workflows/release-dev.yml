@@ -679,49 +679,49 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Download all CLI artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: cli-*
           path: release/
           merge-multiple: true
 
       - name: Download gateway binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: gateway-binary-*
           path: release/
           merge-multiple: true
 
       - name: Download supervisor binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: supervisor-binary-*
           path: release/
           merge-multiple: true
 
       - name: Download VM driver artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: driver-vm-*
           path: release/
           merge-multiple: true
 
       - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: python-wheels-*
           path: release/
           merge-multiple: true
 
       - name: Download Debian package artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: deb-linux-*
           path: release/
           merge-multiple: true
 
       - name: Download RPM package artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: rpm-linux-*
           path: release/

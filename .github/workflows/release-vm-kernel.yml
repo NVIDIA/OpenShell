@@ -140,7 +140,7 @@ jobs:
           brew install lld dtc xz
 
       - name: Download pre-built kernel.c
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: kernel-c-arm64
           path: target/kernel-artifact
@@ -179,7 +179,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Download all runtime artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: vm-runtime-*
           path: release/

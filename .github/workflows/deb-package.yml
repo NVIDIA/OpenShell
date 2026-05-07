@@ -47,19 +47,19 @@ jobs:
           ref: ${{ inputs['checkout-ref'] }}
 
       - name: Download CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: cli-linux-${{ matrix.arch }}
           path: package-input/
 
       - name: Download gateway artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: gateway-binary-linux-${{ matrix.arch }}
           path: package-input/
 
       - name: Download VM driver artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: driver-vm-linux-${{ matrix.arch }}
           path: package-input/

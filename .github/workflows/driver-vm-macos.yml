@@ -158,7 +158,7 @@ jobs:
         run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
 
       - name: Download kernel runtime tarball
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: vm-driver-macos-kernel-runtime-tarball
           path: runtime-download/
@@ -187,7 +187,7 @@ jobs:
           ls -lah "$COMPRESSED_DIR"
 
       - name: Download bundled supervisor
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: driver-vm-supervisor-arm64
           path: target/vm-runtime-compressed-macos/

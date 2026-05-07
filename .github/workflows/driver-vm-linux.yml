@@ -125,7 +125,7 @@ jobs:
         run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*
 
       - name: Download kernel runtime tarball
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: vm-driver-kernel-runtime-tarballs
           path: runtime-download/
