@@ -829,7 +829,7 @@ jobs:
             }
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: OpenShell ${{ env.RELEASE_TAG }}
           prerelease: false
