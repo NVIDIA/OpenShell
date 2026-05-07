@@ -53,17 +53,25 @@ async fn help_shows_restructured_commands() {
     }
 }
 
-/// `openshell gateway --help` must list start, stop, destroy, select, info.
+/// `openshell gateway --help` must list registration/auth commands, not
+/// service lifecycle commands.
 #[tokio::test]
 async fn gateway_help_shows_subcommands() {
     let (output, code) = run_isolated(&["gateway", "--help"]).await;
     assert_eq!(code, 0, "openshell gateway --help should exit 0");
 
     let clean = strip_ansi(&output);
-    for sub in ["start", "stop", "destroy", "select", "info"] {
+    for sub in ["add", "remove", "login", "logout", "select", "info", "list"] {
         assert!(
             clean.contains(sub),
             "expected '{sub}' in gateway --help output:\n{clean}"
+        );
+    }
+
+    for removed in ["start", "stop", "destroy"] {
+        assert!(
+            !clean.contains(removed),
+            "did not expect removed gateway lifecycle subcommand '{removed}' in help:\n{clean}"
         );
     }
 }
@@ -85,9 +93,7 @@ async fn sandbox_help_shows_upload_download() {
 }
 
 /// `openshell sandbox create --help` must show `--gpu`, `--upload`,
-/// `--no-git-ignore`, `--no-bootstrap`, `--editor`, and
-/// `--auto-providers`/`--no-auto-providers`.
-/// Note: `--bootstrap` is intentionally hidden (it's the default behaviour).
+/// `--no-git-ignore`, `--editor`, and `--auto-providers`/`--no-auto-providers`.
 #[tokio::test]
 async fn sandbox_create_help_shows_new_flags() {
     let (output, code) = run_isolated(&["sandbox", "create", "--help"]).await;
@@ -98,7 +104,6 @@ async fn sandbox_create_help_shows_new_flags() {
         "--gpu",
         "--upload",
         "--no-git-ignore",
-        "--no-bootstrap",
         "--editor",
         "--auto-providers",
         "--no-auto-providers",
@@ -123,20 +128,20 @@ async fn sandbox_connect_help_shows_editor_flag() {
     );
 }
 
-/// `openshell gateway start --help` must show key flags.
+/// Removed gateway lifecycle subcommands should fail during parsing.
 #[tokio::test]
-async fn gateway_start_help_shows_key_flags() {
-    let (output, code) = run_isolated(&["gateway", "start", "--help"]).await;
-    assert_eq!(code, 0, "openshell gateway start --help should exit 0");
-
-    let clean = strip_ansi(&output);
-    for flag in [
-        "--gpu",
-        "--recreate",
-    ] {
+async fn gateway_lifecycle_subcommands_are_removed() {
+    for subcommand in ["start", "stop", "destroy"] {
+        let (output, code) = run_isolated(&["gateway", subcommand, "--help"]).await;
         assert!(
-            clean.contains(flag),
-            "expected '{flag}' in gateway start --help:\n{clean}"
+            code != 0,
+            "openshell gateway {subcommand} should fail after lifecycle command removal"
+        );
+
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("unrecognized subcommand") || clean.contains("error:"),
+            "expected parser error for removed gateway subcommand '{subcommand}':\n{clean}"
         );
     }
 }
@@ -161,7 +166,7 @@ async fn status_without_gateway_prints_friendly_message() {
         "expected 'No gateway configured' in status output:\n{clean}"
     );
     assert!(
-        clean.contains("openshell gateway start"),
-        "expected hint to run 'openshell gateway start':\n{clean}"
+        clean.contains("openshell gateway add <endpoint>"),
+        "expected hint to register a gateway:\n{clean}"
     );
 }

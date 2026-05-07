@@ -141,41 +141,21 @@ jobs:
           fi
 
   canary:
-    name: Canary ${{ matrix.mode }} (${{ matrix.arch }})
+    name: Canary package gateway (${{ matrix.arch }})
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     strategy:
       fail-fast: false
       matrix:
-        arch:
-          - amd64
-          - arm64
-        mode:
-          - auto-bootstrap
-          - two-step
         include:
           - arch: amd64
             runner: linux-amd64-cpu8
-            target: x86_64-unknown-linux-musl
           - arch: arm64
             runner: linux-arm64-cpu8
-            target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
     env:
       OPENSHELL_REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # The CI container mounts the host Docker socket, so the gateway
-      # container is a sibling — not reachable at 127.0.0.1 from inside
-      # this container. OPENSHELL_GATEWAY_HOST tells the auto-bootstrap
-      # to advertise a reachable address instead.
-      OPENSHELL_GATEWAY_HOST: host.docker.internal
+      OPENSHELL_CANARY_PORT: "17670"
     steps:
       - uses: actions/checkout@v6
 
@@ -202,50 +182,83 @@ jobs:
             fi
           fi
 
-      - name: Install CLI from published install script
+      - name: Install Debian package
         run: |
           set -euo pipefail
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_VERSION=${{ steps.release.outputs.tag }} OPENSHELL_INSTALL_DIR=/usr/local/bin sh
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install-dev.sh \
+            | OPENSHELL_VERSION=${{ steps.release.outputs.tag }} sh
 
-      - name: Verify CLI installation
+      - name: Verify package binaries
         run: |
           set -euo pipefail
           command -v openshell
-          ACTUAL="$(openshell --version)"
-          echo "Installed: $ACTUAL"
+          command -v openshell-gateway
+          test -x /usr/libexec/openshell/openshell-driver-vm
+
+          CLI_ACTUAL="$(openshell --version)"
+          GATEWAY_ACTUAL="$(openshell-gateway --version)"
+          DRIVER_ACTUAL="$(/usr/libexec/openshell/openshell-driver-vm --version)"
+          echo "CLI:     ${CLI_ACTUAL}"
+          echo "Gateway: ${GATEWAY_ACTUAL}"
+          echo "Driver:  ${DRIVER_ACTUAL}"
+
           TAG="${{ steps.release.outputs.tag }}"
-          # For tagged releases (v1.2.3), verify the semver appears in the version string
           if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             EXPECTED="${TAG#v}"
-            if [[ "$ACTUAL" != *"$EXPECTED"* ]]; then
-              echo "::error::Version mismatch: expected '$EXPECTED' in '$ACTUAL'"
-              exit 1
-            fi
-            echo "Version check passed: found $EXPECTED in output"
+            for actual in "$CLI_ACTUAL" "$GATEWAY_ACTUAL" "$DRIVER_ACTUAL"; do
+              if [[ "$actual" != *"$EXPECTED"* ]]; then
+                echo "::error::Version mismatch: expected '$EXPECTED' in '$actual'"
+                exit 1
+              fi
+            done
+            echo "Version check passed: found $EXPECTED in package binaries"
           else
             echo "Non-release tag ($TAG), skipping version check"
           fi
 
-      - name: Resolve gateway host
-        run: |
-          # On Linux CI runners host.docker.internal is not set automatically
-          # (it's a Docker Desktop feature). Add it via the Docker bridge IP.
-          if ! getent hosts host.docker.internal >/dev/null 2>&1; then
-            BRIDGE_IP=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
-            echo "Adding /etc/hosts entry: ${BRIDGE_IP} host.docker.internal"
-            echo "${BRIDGE_IP} host.docker.internal" >> /etc/hosts
-          fi
-
-      # Two-step mode: explicitly start the gateway before creating a sandbox.
-      # --gateway-host is required because the gateway container is a Docker
-      # sibling (not in the same network namespace). Without it the metadata
-      # stores 127.0.0.1 which is unreachable from this CI container.
-      - name: Start gateway
-        if: matrix.mode == 'two-step'
+      - name: Start packaged gateway
         run: |
           set -euo pipefail
-          echo "Starting gateway..."
-          openshell gateway start --gateway-host "$OPENSHELL_GATEWAY_HOST"
+
+          # The CLI no longer owns gateway lifecycle. In CI we start the
+          # gateway binary installed by the Debian package directly, using the
+          # Docker driver so this canary can launch a real sandbox.
+          systemctl --user stop openshell-gateway >/dev/null 2>&1 || true
+
+          STATE_DIR="$(mktemp -d)"
+          LOG="${STATE_DIR}/openshell-gateway.log"
+          echo "GATEWAY_LOG=${LOG}" >> "$GITHUB_ENV"
+          echo "GATEWAY_STATE_DIR=${STATE_DIR}" >> "$GITHUB_ENV"
+
+          OPENSHELL_BIND_ADDRESS=0.0.0.0 \
+          OPENSHELL_SERVER_PORT="${OPENSHELL_CANARY_PORT}" \
+          OPENSHELL_DISABLE_TLS=true \
+          OPENSHELL_DISABLE_GATEWAY_AUTH=true \
+          OPENSHELL_DRIVERS=docker \
+          OPENSHELL_DB_URL="sqlite:${STATE_DIR}/openshell.db?mode=rwc" \
+          OPENSHELL_GRPC_ENDPOINT="http://host.openshell.internal:${OPENSHELL_CANARY_PORT}" \
+          OPENSHELL_SSH_GATEWAY_HOST=127.0.0.1 \
+          OPENSHELL_SSH_GATEWAY_PORT="${OPENSHELL_CANARY_PORT}" \
+          OPENSHELL_SANDBOX_NAMESPACE="canary-${{ matrix.arch }}-${{ github.run_id }}" \
+            nohup openshell-gateway >"${LOG}" 2>&1 &
+          PID=$!
+          echo "GATEWAY_PID=${PID}" >> "$GITHUB_ENV"
+
+          for _ in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:${OPENSHELL_CANARY_PORT}/healthz" >/dev/null; then
+              break
+            fi
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "::error::openshell-gateway exited before becoming healthy"
+              cat "$LOG"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          curl -fsS "http://127.0.0.1:${OPENSHELL_CANARY_PORT}/healthz"
+          openshell gateway remove local >/dev/null 2>&1 || true
+          openshell gateway add "http://127.0.0.1:${OPENSHELL_CANARY_PORT}" --local --name local
 
       - name: Run canary test
         run: |
@@ -266,4 +279,16 @@ jobs:
           else
             echo "::error::Canary test failed: 'hello world' not found in output"
             exit 1
+          fi
+
+      - name: Stop packaged gateway
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${GATEWAY_PID:-}" ]; then
+            kill "$GATEWAY_PID" >/dev/null 2>&1 || true
+          fi
+          if [ "${{ job.status }}" != "success" ] && [ -n "${GATEWAY_LOG:-}" ] && [ -f "$GATEWAY_LOG" ]; then
+            echo "Gateway log:"
+            cat "$GATEWAY_LOG"
           fi
