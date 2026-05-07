@@ -1,0 +1,71 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Kubernetes RBAC"
+sidebar-title: "RBAC"
+description: "RBAC permissions created by the OpenShell Helm chart, including the namespaced Role for sandbox lifecycle and the ClusterRole for GPU node inspection."
+keywords: "Generative AI, Cybersecurity, Kubernetes, RBAC, Role, ClusterRole, ServiceAccount, Helm, GPU"
+position: 6
+---
+
+The OpenShell Helm chart creates a ServiceAccount, a namespaced Role, and a cluster-scoped ClusterRole. This page documents each permission, explains why the gateway needs it, and shows how to adjust or replace the defaults.
+
+## What the chart creates
+
+| Resource | Scope | Name |
+|---|---|---|
+| ServiceAccount | Namespace | `openshell` |
+| Role | Namespace | `openshell-sandbox` |
+| RoleBinding | Namespace | `openshell-sandbox` |
+| ClusterRole | Cluster | `openshell-node-reader` |
+| ClusterRoleBinding | Cluster | `openshell-node-reader` |
+
+## Namespaced Role
+
+The `openshell-sandbox` Role is bound to the gateway ServiceAccount and covers the resources the gateway needs to manage sandbox workloads.
+
+| API Group | Resource | Verbs | Purpose |
+|---|---|---|---|
+| `agents.x-k8s.io` | `sandboxes` | create, delete, get, list, patch, update, watch | Sandbox lifecycle management |
+| `agents.x-k8s.io` | `sandboxes/status` | create, delete, get, list, patch, update, watch | Sandbox status updates |
+| `""` (core) | `events` | get, list, watch | Sandbox event observation |
+
+## ClusterRole
+
+The `openshell-node-reader` ClusterRole lets the gateway inspect node capacity. The gateway calls this when a sandbox requests GPU resources, to check allocatable GPU capacity across the cluster.
+
+| API Group | Resource | Verbs | Scope | Purpose |
+|---|---|---|---|---|
+| `""` (core) | `nodes` | get, list, watch | Cluster | GPU capacity validation for GPU sandbox requests |
+
+The chart binds this ClusterRole regardless of whether GPU sandboxes are enabled. If your cluster policy prohibits cluster-scoped roles, see the section below on disabling it.
+
+## ServiceAccount
+
+The chart creates a ServiceAccount named `openshell` in the release namespace by default. To use an existing ServiceAccount instead, set `serviceAccount.create` to `false` and provide the name:
+
+```shell
+helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=my-existing-sa
+```
+
+The ServiceAccount you provide must already have the Role and ClusterRole bindings described above, or the gateway fails to manage sandboxes.
+
+## Restrict to namespace-only access
+
+The current chart version does not provide a values flag to disable the ClusterRole. To remove the ClusterRole and ClusterRoleBinding, you need to patch the chart templates directly. File a feature request if your deployment requires namespace-only access without modifying chart templates.
+
+## Multi-tenant clusters
+
+In multi-tenant clusters, scope the gateway to a dedicated namespace and create the RBAC resources there. The chart deploys everything into the release namespace by default.
+
+If sandbox pods run in a separate namespace from the gateway, bind the Role in that namespace as well, so the gateway ServiceAccount can manage sandbox resources there.
+
+## Next Steps
+
+- To deploy the gateway on Kubernetes, see [Get Started on Kubernetes](/kubernetes/setup).
+- To configure OIDC or reverse-proxy authentication, see [Access Control](/kubernetes/access-control).
+- To create your first sandbox, see [Manage Sandboxes](/sandboxes/manage-sandboxes).
