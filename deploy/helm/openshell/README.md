@@ -29,10 +29,10 @@ oc adm policy add-scc-to-user privileged -z default -n openshell
 
 # Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
-	--set pkiInitJob.enabled=false \
-	--set server.disableTls=true \
-	--set podSecurityContext.fsGroup=null \
-	--set securityContext.runAsUser=null
+  --set pkiInitJob.enabled=false \
+  --set server.disableTls=true \
+  --set podSecurityContext.fsGroup=null \
+  --set securityContext.runAsUser=null
 ```
 
 ## Available versions
