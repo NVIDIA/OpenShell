@@ -17,13 +17,17 @@ pub struct PkiBundle {
     pub client_key_pem: String,
 }
 
-/// Default SANs always included on the server certificate.
+/// Default SANs always included on the server certificate. Covers the host
+/// aliases used by every supported runtime: Kubernetes service DNS,
+/// `host.docker.internal` for Docker Desktop and rootless Docker on Linux,
+/// and `host.containers.internal` for Podman containers reaching their host.
 const DEFAULT_SERVER_SANS: &[&str] = &[
     "openshell",
     "openshell.openshell.svc",
     "openshell.openshell.svc.cluster.local",
     "localhost",
     "host.docker.internal",
+    "host.containers.internal",
     "127.0.0.1",
 ];
 
