@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::sync::Mutex;
 
 use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::driver::skip_if_kube;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
@@ -190,6 +191,9 @@ network_policies:
 
 #[tokio::test]
 async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
+    if skip_if_kube("requires host.openshell.internal alias") {
+        return;
+    }
     let server = HostServer::start(r#"{"message":"hello-from-host"}"#)
         .await
         .expect("start host echo server");
@@ -225,6 +229,9 @@ async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
 
 #[tokio::test]
 async fn sandbox_inference_local_routes_to_host_openshell_internal() {
+    if skip_if_kube("requires host.openshell.internal alias") {
+        return;
+    }
     let _inference_lock = INFERENCE_ROUTE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -301,6 +308,9 @@ async fn sandbox_inference_local_routes_to_host_openshell_internal() {
 
 #[tokio::test]
 async fn inference_set_supports_no_verify_for_unreachable_endpoint() {
+    if skip_if_kube("uses host.openshell.internal as the unreachable target") {
+        return;
+    }
     let _inference_lock = INFERENCE_ROUTE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

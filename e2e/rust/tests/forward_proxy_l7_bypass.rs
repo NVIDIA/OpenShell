@@ -11,6 +11,7 @@
 use std::io::Write;
 
 use openshell_e2e::harness::container::ContainerHttpServer;
+use openshell_e2e::harness::driver::skip_if_kube;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
@@ -98,6 +99,9 @@ network_policies:
 /// GET /allowed should succeed — the L7 policy explicitly allows it.
 #[tokio::test]
 async fn forward_proxy_allows_l7_permitted_request() {
+    if skip_if_kube("uses host.openshell.internal to reach a sibling container") {
+        return;
+    }
     let server = start_test_server().await.expect("start test server");
     let policy =
         write_policy_with_l7_rules(&server.host, server.port).expect("write custom policy");
@@ -138,6 +142,9 @@ except Exception as e:
 /// POST /allowed should be denied — the L7 policy only allows GET.
 #[tokio::test]
 async fn forward_proxy_denies_l7_blocked_request() {
+    if skip_if_kube("uses host.openshell.internal to reach a sibling container") {
+        return;
+    }
     let server = start_test_server().await.expect("start test server");
     let policy =
         write_policy_with_l7_rules(&server.host, server.port).expect("write custom policy");

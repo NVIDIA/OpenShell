@@ -13,6 +13,7 @@
 use std::io::Write;
 
 use openshell_e2e::harness::container::ContainerHttpServer;
+use openshell_e2e::harness::driver::skip_if_kube;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
@@ -131,6 +132,9 @@ network_policies:
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn graphql_l7_enforces_allow_and_deny_rules_on_forward_and_connect_paths() {
+    if skip_if_kube("uses host.openshell.internal to reach a sibling container") {
+        return;
+    }
     let server = start_test_server().await.expect("start test server");
     let policy = write_graphql_policy(&server.host, server.port).expect("write custom policy");
     let policy_path = policy
