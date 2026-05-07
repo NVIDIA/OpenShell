@@ -14,7 +14,7 @@ jobs:
     steps:
       - name: Check contributor permissions
         id: contributor
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           result-encoding: string
           script: |
@@ -46,7 +46,7 @@ jobs:
 
       - name: Add triage label
         if: steps.contributor.outputs.result == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             await github.rest.issues.addLabels({

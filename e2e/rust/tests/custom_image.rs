@@ -41,7 +41,7 @@ const MARKER: &str = "custom-image-e2e-marker";
 /// created from it contains the expected marker file.
 #[tokio::test]
 async fn sandbox_from_custom_dockerfile() {
-    // Step 1 — Write a temporary Dockerfile.
+    // Step 1: Write a temporary Dockerfile.
     let tmpdir = tempfile::tempdir().expect("create tmpdir");
     let dockerfile_path = tmpdir.path().join("Dockerfile");
     {
@@ -50,7 +50,7 @@ async fn sandbox_from_custom_dockerfile() {
             .expect("write Dockerfile");
     }
 
-    // Step 2 — Create a sandbox from the Dockerfile.
+    // Step 2: Create a sandbox from the Dockerfile.
     let dockerfile_str = dockerfile_path.to_str().expect("Dockerfile path is UTF-8");
     let mut guard = SandboxGuard::create(&[
         "--from",
@@ -62,7 +62,7 @@ async fn sandbox_from_custom_dockerfile() {
     .await
     .expect("sandbox create from Dockerfile");
 
-    // Step 3 — Verify the marker file content appears in the output.
+    // Step 3: Verify the marker file content appears in the output.
     let clean_output = strip_ansi(&guard.create_output);
     assert!(
         clean_output.contains(MARKER),

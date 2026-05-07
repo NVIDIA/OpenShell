@@ -4111,4 +4111,10 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - agents.x-k8s.io
+  resources:
+  - sandboxes/finalizers
+  verbs:
+  - update
 ---

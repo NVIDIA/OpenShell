@@ -686,27 +686,34 @@ fn supervisor_volume_mount() -> serde_json::Value {
     })
 }
 
+/// Path of the supervisor binary inside the supervisor image.
+///
+/// The supervisor image places the binary at the filesystem root and ships
+/// nothing else. We invoke it directly — there is no shell, `cp`, or PATH
+/// resolution available inside the image.
+const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
+
 /// Build the init container that copies the supervisor binary into the emptyDir.
 ///
-/// The supervisor image is expected to have `openshell-sandbox` on its PATH
-/// (e.g. at `/usr/local/bin/openshell-sandbox`). The init container resolves
-/// the binary via `command -v` and copies it into the shared emptyDir volume
-/// so the agent container can execute it from a fixed, writable path.
+/// The supervisor image contains only the supervisor binary at
+/// `/openshell-sandbox`. We invoke that binary with the `copy-self`
+/// subcommand so it copies itself into the shared emptyDir volume, where the
+/// agent container then executes it from a fixed, writable path. This pattern
+/// (binary self-copy) avoids requiring `sh`/`cp` in the supervisor image and
+/// mirrors the approach used by argoexec's emissary executor.
 fn supervisor_init_container(
     supervisor_image: &str,
     supervisor_image_pull_policy: &str,
 ) -> serde_json::Value {
-    let copy_cmd = format!(
-        "set -e && \
-         mkdir -p {SUPERVISOR_MOUNT_PATH} && \
-         SUPERVISOR=$(command -v openshell-sandbox) && \
-         cp \"$SUPERVISOR\" {SUPERVISOR_MOUNT_PATH}/openshell-sandbox && \
-         chmod +x {SUPERVISOR_MOUNT_PATH}/openshell-sandbox"
-    );
+    let installed_path = format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox");
     let mut spec = serde_json::json!({
         "name": SUPERVISOR_INIT_CONTAINER_NAME,
         "image": supervisor_image,
-        "command": ["sh", "-c", copy_cmd],
+        "command": [
+            SUPERVISOR_IMAGE_BINARY_PATH,
+            "copy-self",
+            installed_path,
+        ],
         "securityContext": {"runAsUser": 0},
         "volumeMounts": [{
             "name": SUPERVISOR_VOLUME_NAME,
@@ -1551,6 +1558,23 @@ mod tests {
         assert_eq!(init_containers[0]["name"], SUPERVISOR_INIT_CONTAINER_NAME);
         assert_eq!(init_containers[0]["image"], "supervisor-image:latest");
         assert_eq!(init_containers[0]["imagePullPolicy"], "IfNotPresent");
+
+        // The supervisor image ships only the binary (no shell). The init
+        // container must invoke the binary directly with `copy-self <DEST>`.
+        let init_command = init_containers[0]["command"]
+            .as_array()
+            .expect("init container command should be set");
+        assert_eq!(init_command.len(), 3, "expected [binary, copy-self, dest]");
+        assert_eq!(init_command[0], SUPERVISOR_IMAGE_BINARY_PATH);
+        assert_eq!(init_command[1], "copy-self");
+        assert_eq!(
+            init_command[2].as_str().unwrap(),
+            format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox")
+        );
+        assert!(
+            !init_command.iter().any(|v| v == "sh"),
+            "init container must not depend on a shell (supervisor image ships only the binary)"
+        );
 
         // Agent container command should be overridden to the emptyDir path
         let command = pod_template["spec"]["containers"][0]["command"]

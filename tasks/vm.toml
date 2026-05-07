@@ -1,53 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# openshell-vm development tasks
+# VM driver development tasks
 #
 # Workflow:
 #   mise run vm:setup          # one-time: download pre-built runtime (~30s)
 #   mise run vm:supervisor     # build the bundled sandbox supervisor
 #   mise run gateway:vm        # start openshell-gateway with the VM driver
 #                              # (defined in tasks/gateway.toml)
-#   mise run vm                # build + run the standalone openshell-vm microVM
-#   mise run vm:clean          # wipe everything and start over
 #
 # See tasks/gateway.toml for `gateway:vm`,
-# crates/openshell-driver-vm/README.md for the VM driver workflow, and
-# crates/openshell-vm/README.md for the standalone microVM path.
+# crates/openshell-driver-vm/README.md for the VM driver workflow.
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Commands
 # ═══════════════════════════════════════════════════════════════════════════
 
-[vm]
-description = "Build and run the standalone openshell-vm microVM"
-depends = ["build:docker:gateway"]
-run = ["mise run vm:build", "tasks/scripts/vm/run-vm.sh"]
-
-["vm:build"]
-description = "Build the openshell-vm binary with embedded runtime"
-run = [
-  "tasks/scripts/vm/compress-vm-runtime.sh",
-  "OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed cargo build -p openshell-vm",
-  "tasks/scripts/vm/codesign-openshell-vm.sh",
-  "tasks/scripts/vm/bundle-vm-runtime.sh",
-]
-
 ["vm:setup"]
-description = "One-time setup: download (or build) the VM runtime"
+description = "One-time setup: download (or build) the VM driver runtime"
 run = "tasks/scripts/vm/vm-setup.sh"
 
 ["vm:supervisor"]
 description = "Build the bundled openshell-sandbox supervisor for openshell-driver-vm"
 run = "tasks/scripts/vm/build-supervisor-bundle.sh"
-
-["vm:rootfs"]
-description = "Build the VM rootfs tarball (use -- --base for lightweight)"
-run = "tasks/scripts/vm/build-rootfs-tarball.sh"
-
-["vm:clean"]
-description = "Remove all VM cached artifacts (runtime, rootfs, builds)"
-run = "tasks/scripts/vm/vm-clean.sh"
 
 ["vm:smoke:orphan-cleanup"]
 description = "Smoke test: start gateway+driver, create a sandbox, signal the gateway, assert no orphaned processes survive"

@@ -28,8 +28,13 @@ jobs:
         include:
           - suite: python
             cmd: "mise run --no-deps --skip-deps e2e:python"
-          - suite: rust
+            apt_packages: ""
+          - suite: rust-docker
             cmd: "mise run --no-deps --skip-deps e2e:rust"
+            apt_packages: "openssh-client"
+          - suite: rust-podman
+            cmd: "mise run --no-deps --skip-deps e2e:podman"
+            apt_packages: "openssh-client podman"
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -50,16 +55,24 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Log in to GHCR
+      - name: Install OS test dependencies
+        if: matrix.apt_packages != ''
+        env:
+          APT_PACKAGES: ${{ matrix.apt_packages }}
+        run: apt-get update && apt-get install -y ${APT_PACKAGES} && rm -rf /var/lib/apt/lists/*
+
+      - name: Log in to GHCR with Docker
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Log in to GHCR with Podman
+        if: matrix.suite == 'rust-podman'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Install Python dependencies and generate protobuf stubs
         if: matrix.suite == 'python'
         run: uv sync --frozen && mise run --no-deps python:proto
 
-      - name: Install SSH client
-        if: matrix.suite != 'python'
-        run: apt-get update && apt-get install -y --no-install-recommends openssh-client && rm -rf /var/lib/apt/lists/*
-
       - name: Run tests
+        env:
+          OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
         run: ${{ matrix.cmd }}

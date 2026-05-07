@@ -271,7 +271,7 @@ chore(deps): bump tokio to 1.40
 
 ### DCO
 
-All contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. See the [Developer Certificate of Origin](https://developercertificate.org/).
+All human contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. See the [Developer Certificate of Origin](https://developercertificate.org/). Dependabot-authored dependency update PRs are allowlisted because the bot cannot sign commits.
 
 ```bash
 git commit -s -m "feat(sandbox): add new capability"

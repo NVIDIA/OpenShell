@@ -379,6 +379,15 @@ struct Cli {
     )]
     gateway_endpoint: Option<String>,
 
+    /// Skip TLS certificate verification for gateway connections.
+    #[arg(
+        long,
+        global = true,
+        env = "OPENSHELL_GATEWAY_INSECURE",
+        help_heading = "GATEWAY FLAGS"
+    )]
+    gateway_insecure: bool,
+
     /// Increase verbosity (-v, -vv, -vvv).
     #[arg(short, long, action = clap::ArgAction::Count, global = true, help_heading = "GLOBAL FLAGS")]
     verbose: u8,
@@ -1796,7 +1805,8 @@ async fn main() -> Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
-    let tls = TlsOptions::default();
+    let mut tls = TlsOptions::default();
+    tls.gateway_insecure = cli.gateway_insecure;
 
     // Set up logging based on verbosity
     let log_level = match cli.verbose {

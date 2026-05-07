@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release Helm OCI
+description: >
+  Patch chart version/appVersion, refuse duplicate OCI versions on public
+  releases, package the chart, and push to GHCR OCI.
+
+inputs:
+  chart-version:
+    description: >
+      Chart.yaml version and OCI tag — SemVer without leading v
+      (e.g. 0.6.0 for tag releases, 0.0.0-dev for dev).
+    required: true
+  app-version:
+    description: >
+      Chart.yaml appVersion and default image tag
+      (e.g. 0.6.0 for tag releases, dev for dev).
+    required: true
+  release-kind:
+    description: "dev or public — controls the duplicate-version guard."
+    required: true
+  pin-sha:
+    description: >
+      Full commit SHA. When set on dev releases, a second chart is also pushed
+      as 0.0.0-dev.<sha> with appVersion set to the same SHA, enabling exact
+      version pinning alongside the floating 0.0.0-dev tag. Both chart version
+      and appVersion use the full SHA so the chart tag matches the image tag
+      pushed by docker-build.yml.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Log in to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+
+    - name: Install Helm
+      uses: azure/setup-helm@v4
+
+    - name: Stage chart and patch version
+      id: prep
+      env:
+        CHART_VERSION: ${{ inputs.chart-version }}
+        APP_VERSION: ${{ inputs.app-version }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        CHART_DIR="${RUNNER_TEMP}/chart-build"
+        cp -a deploy/helm/openshell/. "${CHART_DIR}"
+        sed -i "s/^version:.*/version: ${CHART_VERSION}/" "${CHART_DIR}/Chart.yaml"
+        sed -i "s/^appVersion:.*/appVersion: \"${APP_VERSION}\"/" "${CHART_DIR}/Chart.yaml"
+        echo "chart_dir=${CHART_DIR}" >> "$GITHUB_OUTPUT"
+        echo "chart_version=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
+
+    - name: Refuse duplicate chart version
+      if: inputs.release-kind == 'public'
+      env:
+        CHART_VERSION: ${{ steps.prep.outputs.chart_version }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        OCI_CHART="oci://ghcr.io/nvidia/openshell/helm-chart"
+        if helm show chart "${OCI_CHART}" --version "${CHART_VERSION}" >/dev/null 2>&1; then
+          echo "::error::Chart ${CHART_VERSION} is already published. Use a new tag or delete the existing package first."
+          exit 1
+        fi
+
+    - name: Package Helm chart
+      env:
+        CHART_DIR: ${{ steps.prep.outputs.chart_dir }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        helm package "${CHART_DIR}" --destination /tmp
+        ls /tmp/helm-chart-*.tgz
+
+    - name: Push Helm chart to GHCR OCI
+      shell: bash
+      run: |
+        set -euo pipefail
+        helm push /tmp/helm-chart-*.tgz oci://ghcr.io/nvidia/openshell
+
+    - name: Push SHA-pinned chart
+      if: inputs.pin-sha != ''
+      env:
+        PIN_SHA: ${{ inputs.pin-sha }}
+        CHART_DIR: ${{ steps.prep.outputs.chart_dir }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        SHA_CHART_DIR="${RUNNER_TEMP}/chart-build-sha"
+        cp -a "${CHART_DIR}/." "${SHA_CHART_DIR}"
+        sed -i "s/^version:.*/version: 0.0.0-dev.${PIN_SHA}/" "${SHA_CHART_DIR}/Chart.yaml"
+        sed -i "s/^appVersion:.*/appVersion: \"${PIN_SHA}\"/" "${SHA_CHART_DIR}/Chart.yaml"
+        helm package "${SHA_CHART_DIR}" --destination /tmp/sha-pin
+        helm push /tmp/sha-pin/helm-chart-*.tgz oci://ghcr.io/nvidia/openshell

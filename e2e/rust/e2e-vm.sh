@@ -23,7 +23,7 @@
 #   mise run e2e:vm
 #
 # What the script does:
-#   1. Ensures the VM runtime (libkrun + gvproxy + rootfs) is staged.
+#   1. Ensures the VM runtime (libkrun + gvproxy) and bundled supervisor are staged.
 #   2. Builds `openshell-gateway`, `openshell-driver-vm`, and the
 #      `openshell` CLI with the embedded runtime.
 #   3. On macOS, codesigns the VM driver (libkrun needs the
@@ -36,8 +36,8 @@
 #      log and every VM serial console log for post-mortem.
 #
 # Prerequisites (handled automatically by this script if missing):
-#   - `mise run vm:setup`             — downloads / builds the libkrun runtime.
-#   - `mise run vm:rootfs -- --base`  — builds the sandbox rootfs tarball.
+#   - `mise run vm:setup`      — downloads / builds the libkrun runtime.
+#   - `mise run vm:supervisor` — builds the bundled sandbox supervisor.
 
 set -euo pipefail
 
@@ -56,23 +56,24 @@ DRIVER_BIN="${ROOT}/target/debug/openshell-driver-vm"
 STATE_DIR_ROOT="/tmp"
 
 # Smoke test timeouts. First boot extracts the embedded libkrun runtime
-# (~60–90MB of zstd per architecture) and the sandbox rootfs (~200MB).
-# The guest then runs k3s-free sandbox supervisor startup; a cold
-# microVM is typically ready within ~15s.
+# (~60-90MB of zstd per architecture) and prepares a sandbox rootfs from the
+# configured image. The guest then runs k3s-free sandbox supervisor startup; a
+# cold microVM is typically ready within ~15s after image preparation.
 GATEWAY_READY_TIMEOUT=60
 SANDBOX_PROVISION_TIMEOUT=180
 
 # ── Build prerequisites ──────────────────────────────────────────────
 
-if [ ! -f "${COMPRESSED_DIR}/rootfs.tar.zst" ]; then
-  echo "==> Building base VM rootfs tarball (mise run vm:rootfs -- --base)"
-  mise run vm:rootfs -- --base
-fi
+mkdir -p "${COMPRESSED_DIR}"
 
-if [ ! -f "${COMPRESSED_DIR}/rootfs.tar.zst" ] \
-  || ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q .; then
+if ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q .; then
   echo "==> Preparing embedded VM runtime (mise run vm:setup)"
   mise run vm:setup
+fi
+
+if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ]; then
+  echo "==> Building bundled VM supervisor (mise run vm:supervisor)"
+  mise run vm:supervisor
 fi
 
 export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${COMPRESSED_DIR}}"
@@ -164,9 +165,9 @@ echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STA
 # Pin --driver-dir to the workspace `target/debug/` so we always pick up
 # the driver we just cargo-built. Without this, the gateway's
 # `resolve_compute_driver_bin` fallback prefers
-# `~/.local/libexec/openshell/openshell-driver-vm` when present
-# (install-vm.sh installs there), which silently shadows development
-# builds — a subtle source of stale-binary bugs in e2e runs.
+# `~/.local/libexec/openshell/openshell-driver-vm` when present,
+# which silently shadows development builds — a subtle source of
+# stale-binary bugs in e2e runs.
 # --grpc-endpoint is the URL the VM driver passes into each guest as
 # OPENSHELL_ENDPOINT. The supervisor inside the VM dials this address.
 # Use `host.containers.internal` rather than `127.0.0.1` so gvproxy's

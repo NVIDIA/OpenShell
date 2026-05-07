@@ -7,7 +7,7 @@
 #
 # Targets:
 #   gateway             Final gateway image
-#   supervisor          Final supervisor image (FROM scratch, binary only)
+#   supervisor          Final supervisor image (Ubuntu base, supervisor binary)
 #   cluster             Final cluster image
 #
 # Rust binaries are built natively before the image build and staged at:
@@ -47,6 +47,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY proto/ proto/
+COPY providers/ providers/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
@@ -114,10 +115,19 @@ CMD ["--bind-address", "0.0.0.0", "--port", "8080"]
 # ---------------------------------------------------------------------------
 # Final supervisor image
 # ---------------------------------------------------------------------------
-# Minimal FROM scratch image containing only the supervisor binary.
-# Used by both the Docker driver (binary extraction) and the Podman driver
-# (OCI image volume mount at /opt/openshell/bin).
-FROM scratch AS supervisor
+# Supervisor image based on the same NVIDIA Ubuntu base used by the gateway.
+#
+# Used by:
+#   - Docker driver: binary is extracted from the image and run inside the
+#     agent container.
+#   - Podman driver: image is mounted as an OCI volume at /opt/openshell/bin.
+#   - Kubernetes driver: image runs as an init container that invokes the
+#     binary's `copy-self` subcommand to seed an emptyDir volume.
+#
+# An Ubuntu base provides glibc and the dynamic loader needed to exec the
+# dynamically linked binary. `FROM scratch` would be smaller but cannot run
+# the binary, breaking the Kubernetes init-container path.
+FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS supervisor
 COPY --from=supervisor-binary /build/out/openshell-sandbox /openshell-sandbox
 
 # ---------------------------------------------------------------------------
@@ -201,7 +211,13 @@ COPY deploy/docker/cluster-healthcheck.sh /usr/local/bin/cluster-healthcheck.sh
 RUN chmod +x /usr/local/bin/cluster-healthcheck.sh
 
 COPY deploy/docker/.build/charts/*.tgz /opt/openshell/charts/
-COPY deploy/kube/manifests/*.yaml /opt/openshell/manifests/
+# Only the core k3s auto-deploy manifests belong in the cluster image.
+# Gateway API routing is optional and requires Envoy Gateway CRDs, so
+# deploy/kube/manifests/envoy-gateway-openshell.yaml stays repo-local and is
+# applied manually by `mise run helm:gateway:apply` when grpcRoute is enabled.
+COPY deploy/kube/manifests/openshell-helmchart.yaml \
+     deploy/kube/manifests/agent-sandbox.yaml \
+     /opt/openshell/manifests/
 COPY deploy/kube/gpu-manifests/*.yaml /opt/openshell/gpu-manifests/
 
 ENTRYPOINT ["/usr/local/bin/cluster-entrypoint.sh"]

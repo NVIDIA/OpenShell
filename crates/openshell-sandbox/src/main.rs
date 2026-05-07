@@ -3,6 +3,7 @@
 
 //! `OpenShell` Sandbox - process sandbox and monitor.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -15,6 +16,13 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 use openshell_sandbox::run_sandbox;
+
+/// Subcommand name used to self-copy the supervisor binary into a shared volume.
+///
+/// The supervisor image only ships the binary itself, so init containers
+/// cannot rely on `sh`/`cp` to copy the binary out. Invoking the binary itself
+/// with this argument performs the copy in pure Rust.
+const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 
 /// `OpenShell` Sandbox - process isolation and monitoring.
 #[derive(Parser, Debug)]
@@ -98,7 +106,59 @@ struct Args {
     health_port: u16,
 }
 
+/// Copy the running executable to `dest`, creating parent directories as
+/// needed and ensuring the result is executable (mode `0755`).
+///
+/// If `dest` already exists as a directory, the binary is placed inside it
+/// using the source executable's file name. This mirrors `cp` semantics so
+/// callers can pass either a full target path or a directory.
+fn copy_self(dest: &str) -> Result<()> {
+    let exe = std::env::current_exe().into_diagnostic()?;
+
+    let dest_path = Path::new(dest);
+    let final_path = if dest_path.is_dir() {
+        let file_name = exe
+            .file_name()
+            .ok_or_else(|| miette::miette!("current_exe has no file name: {}", exe.display()))?;
+        dest_path.join(file_name)
+    } else {
+        dest_path.to_path_buf()
+    };
+
+    if let Some(parent) = final_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).into_diagnostic()?;
+    }
+
+    std::fs::copy(&exe, &final_path).into_diagnostic()?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&final_path)
+            .into_diagnostic()?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&final_path, perms).into_diagnostic()?;
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    // Handle `copy-self <DEST>` before clap so it works without any of the
+    // sandbox flags. The supervisor image only ships the binary itself, and
+    // Kubernetes init containers invoke this path to seed an emptyDir volume
+    // that the agent container then executes from.
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.get(1).map(String::as_str) == Some(COPY_SELF_SUBCOMMAND) {
+        let dest = raw_args.get(2).ok_or_else(|| {
+            miette::miette!("usage: openshell-sandbox {COPY_SELF_SUBCOMMAND} <DEST>")
+        })?;
+        return copy_self(dest);
+    }
+
     let args = Args::parse();
 
     // Try to open a rolling log file; fall back to stderr-only logging if it fails
@@ -240,4 +300,63 @@ fn main() -> Result<()> {
     })?;
 
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Drives `copy_self`'s file-copy logic against an arbitrary source path
+    /// so tests don't depend on `current_exe()`.
+    fn copy_executable(src: &Path, dest: &Path) -> Result<()> {
+        let final_path = if dest.is_dir() {
+            dest.join(src.file_name().unwrap())
+        } else {
+            dest.to_path_buf()
+        };
+        if let Some(parent) = final_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).into_diagnostic()?;
+        }
+        std::fs::copy(src, &final_path).into_diagnostic()?;
+        let mut perms = std::fs::metadata(&final_path)
+            .into_diagnostic()?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&final_path, perms).into_diagnostic()?;
+        Ok(())
+    }
+
+    #[test]
+    fn copy_self_writes_executable_at_target_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("source-bin");
+        std::fs::write(&src, b"#!/bin/false\n").unwrap();
+
+        let dest = tmp.path().join("subdir/openshell-sandbox");
+        copy_executable(&src, &dest).unwrap();
+
+        assert!(dest.exists(), "destination file should exist");
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "destination must be 0755");
+        let copied = std::fs::read(&dest).unwrap();
+        assert_eq!(copied, b"#!/bin/false\n");
+    }
+
+    #[test]
+    fn copy_self_into_existing_directory_uses_source_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("openshell-sandbox");
+        std::fs::write(&src, b"binary").unwrap();
+
+        let dest_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        copy_executable(&src, &dest_dir).unwrap();
+
+        let final_path = dest_dir.join("openshell-sandbox");
+        assert!(final_path.exists(), "binary should land inside dest dir");
+    }
 }

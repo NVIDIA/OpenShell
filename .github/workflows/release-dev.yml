@@ -30,6 +30,8 @@ jobs:
       python_version: ${{ steps.v.outputs.python }}
       cargo_version: ${{ steps.v.outputs.cargo }}
       deb_version: ${{ steps.v.outputs.deb }}
+      rpm_version: ${{ steps.v.outputs.rpm_version }}
+      rpm_release: ${{ steps.v.outputs.rpm_release }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -48,6 +50,8 @@ jobs:
           echo "python=$(uv run python tasks/scripts/release.py get-version --python)" >> "$GITHUB_OUTPUT"
           echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
           echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)" >> "$GITHUB_OUTPUT"
+          echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --rpm-version)" >> "$GITHUB_OUTPUT"
+          echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --rpm-release)" >> "$GITHUB_OUTPUT"
 
   build-gateway:
     needs: [compute-versions]
@@ -71,7 +75,7 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
   e2e:
-    needs: [build-gateway, build-cluster]
+    needs: [build-gateway, build-supervisor, build-cluster]
     uses: ./.github/workflows/e2e-test.yml
     with:
       image-tag: ${{ github.sha }}
@@ -137,7 +141,7 @@ jobs:
         run: uv sync
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: python-wheel-linux-${{ matrix.arch }}
           cache-directories: .cache/sccache
@@ -150,7 +154,7 @@ jobs:
           ls -la ${{ matrix.output_path }}
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-wheels-${{ matrix.artifact }}
           path: ${{ matrix.output_path }}
@@ -198,7 +202,7 @@ jobs:
           ls -la target/wheels/*.whl
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-wheels-macos
           path: target/wheels/*.whl
@@ -250,7 +254,7 @@ jobs:
         run: mise install --locked
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: cli-musl-${{ matrix.arch }}
           cache-directories: .cache/sccache
@@ -312,7 +316,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cli-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
@@ -376,7 +380,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cli-macos
           path: artifacts/*.tar.gz
@@ -422,7 +426,7 @@ jobs:
         run: mise install --locked
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: gateway-binary-gnu-${{ matrix.arch }}
           cache-directories: .cache/sccache
@@ -459,7 +463,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gateway-binary-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
@@ -527,7 +531,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gateway-binary-macos
           path: artifacts/*.tar.gz
@@ -573,7 +577,7 @@ jobs:
         run: mise install --locked
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: supervisor-binary-gnu-${{ matrix.arch }}
           cache-directories: .cache/sccache
@@ -610,7 +614,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: supervisor-binary-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
@@ -620,6 +624,16 @@ jobs:
     name: Build Driver VM Linux
     needs: [compute-versions]
     uses: ./.github/workflows/driver-vm-linux.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      image-tag: dev
+      checkout-ref: ${{ github.sha }}
+    secrets: inherit
+
+  build-driver-vm-macos:
+    name: Build Driver VM macOS
+    needs: [compute-versions]
+    uses: ./.github/workflows/driver-vm-macos.yml
     with:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       image-tag: dev
@@ -641,16 +655,24 @@ jobs:
     uses: ./.github/workflows/rpm-package.yml
     with:
       checkout-ref: ${{ github.sha }}
+      rpm-version: ${{ needs.compute-versions.outputs.rpm_version }}
+      rpm-release: ${{ needs.compute-versions.outputs.rpm_release }}
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
     secrets: inherit
 
   # ---------------------------------------------------------------------------
-  # Create / update the dev GitHub Release with CLI binaries and wheels
+  # Create / update the dev GitHub Release with CLI, gateway, driver, and wheels
   # ---------------------------------------------------------------------------
   release-dev:
     name: Release Dev
-    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, build-deb, build-rpm]
+    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, build-driver-vm-linux, build-driver-vm-macos, build-deb, build-rpm]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     outputs:
       wheel_filenames: ${{ steps.wheel_filenames.outputs.wheel_filenames }}
     steps:
@@ -677,6 +699,13 @@ jobs:
           path: release/
           merge-multiple: true
 
+      - name: Download VM driver artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: driver-vm-*
+          path: release/
+          merge-multiple: true
+
       - name: Download wheel artifacts
         uses: actions/download-artifact@v4
         with:
@@ -698,6 +727,31 @@ jobs:
           path: release/
           merge-multiple: true
 
+      - name: Normalize dev package filenames
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          move_one() {
+            local dest="$1"
+            shift
+            local matches=("$@")
+            if [ "${#matches[@]}" -ne 1 ]; then
+              echo "expected exactly one source for ${dest}, found ${#matches[@]}: ${matches[*]-}" >&2
+              exit 1
+            fi
+            mv "${matches[0]}" "release/${dest}"
+          }
+
+          move_one openshell-dev-amd64.deb release/openshell_*_amd64.deb
+          move_one openshell-dev-arm64.deb release/openshell_*_arm64.deb
+          move_one openshell-dev-x86_64.rpm release/openshell-[0-9]*.x86_64.rpm
+          move_one openshell-dev-aarch64.rpm release/openshell-[0-9]*.aarch64.rpm
+          move_one openshell-gateway-dev-x86_64.rpm release/openshell-gateway-[0-9]*.x86_64.rpm
+          move_one openshell-gateway-dev-aarch64.rpm release/openshell-gateway-[0-9]*.aarch64.rpm
+
+          ls -la release/
+
       - name: Capture wheel filenames
         id: wheel_filenames
         run: |
@@ -714,7 +768,10 @@ jobs:
             openshell-x86_64-unknown-linux-musl.tar.gz \
             openshell-aarch64-unknown-linux-musl.tar.gz \
             openshell-aarch64-apple-darwin.tar.gz \
-            openshell_*.deb \
+            openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz \
+            openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz \
+            openshell-driver-vm-aarch64-apple-darwin.tar.gz \
+            *.deb \
             openshell-*.rpm \
             *.whl > openshell-checksums-sha256.txt
           cat openshell-checksums-sha256.txt
@@ -728,19 +785,28 @@ jobs:
             openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz > openshell-sandbox-checksums-sha256.txt
           cat openshell-sandbox-checksums-sha256.txt
 
-      - name: Prune stale wheel, deb, and rpm assets from dev release
-        uses: actions/github-script@v7
-        env:
-          WHEEL_VERSION: ${{ needs.compute-versions.outputs.python_version }}
+      - name: Generate Homebrew formula
+        run: |
+          set -euo pipefail
+          python3 tasks/scripts/release.py generate-homebrew-formula \
+            --release-tag dev \
+            --release-dir release \
+            --output release/openshell.rb
+          cat release/openshell.rb
+
+      - name: Attest VM driver artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
+
+      - name: Prune managed assets from dev release
+        uses: actions/github-script@v9
         with:
           script: |
-            const wheelVersion = process.env.WHEEL_VERSION;
-            const currentPrefix = `openshell-${wheelVersion}-`;
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
-
-            core.info(`=== Wheel pruning diagnostics ===`);
-            core.info(`WHEEL_VERSION: ${wheelVersion}`);
-            core.info(`CURRENT_PREFIX: ${currentPrefix}`);
 
             // Fetch the dev release
             let release;
@@ -760,27 +826,29 @@ jobs:
               core.info(`  ${String(a.id).padStart(12)}  ${a.name}`);
             }
 
-            // Delete stale wheels, debs, and rpms
-            let kept = 0, deleted = 0, debDeleted = 0, rpmDeleted = 0;
+            const managed = (name) => (
+              name.startsWith('openshell') &&
+              (
+                name.endsWith('.tar.gz') ||
+                name.endsWith('.txt') ||
+                name.endsWith('.whl') ||
+                name.endsWith('.deb') ||
+                name.endsWith('.rpm')
+              )
+            );
+
+            let deleted = 0, skipped = 0;
             for (const asset of assets) {
-              if (asset.name.endsWith('.deb')) {
-                core.info(`Deleting stale deb package: ${asset.name} (id=${asset.id})`);
-                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
-                debDeleted++;
-              } else if (asset.name.endsWith('.rpm')) {
-                core.info(`Deleting stale rpm package: ${asset.name} (id=${asset.id})`);
-                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
-                rpmDeleted++;
-              } else if (asset.name.endsWith('.whl') && asset.name.startsWith(currentPrefix)) {
-                core.info(`Keeping current wheel: ${asset.name}`);
-                kept++;
-              } else if (asset.name.endsWith('.whl')) {
-                core.info(`Deleting stale wheel: ${asset.name} (id=${asset.id})`);
+              if (managed(asset.name)) {
+                core.info(`Deleting managed dev asset: ${asset.name} (id=${asset.id})`);
                 await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
                 deleted++;
+              } else {
+                core.info(`Skipping unmanaged asset: ${asset.name}`);
+                skipped++;
               }
             }
-            core.info(`Summary: kept_wheels=${kept}, deleted_wheels=${deleted}, deleted_debs=${debDeleted}, deleted_rpms=${rpmDeleted}`);
+            core.info(`Summary: deleted=${deleted}, skipped=${skipped}`);
 
       - name: Move dev tag
         run: |
@@ -811,17 +879,39 @@ jobs:
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-apple-darwin.tar.gz
-            release/openshell_*.deb
+            release/openshell-dev-amd64.deb
+            release/openshell-dev-arm64.deb
             release/openshell-*.rpm
             release/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-gateway-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-gateway-aarch64-apple-darwin.tar.gz
             release/openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
             release/*.whl
+            release/openshell.rb
             release/openshell-checksums-sha256.txt
             release/openshell-gateway-checksums-sha256.txt
             release/openshell-sandbox-checksums-sha256.txt
+
+  release-helm:
+    name: Release Helm Chart (OCI, dev)
+    needs: [tag-ghcr-dev]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/release-helm-oci
+        with:
+          chart-version: 0.0.0-dev
+          app-version: dev
+          release-kind: dev
+          pin-sha: ${{ github.sha }}
 
   trigger-wheel-publish:
     name: Trigger Wheel Publish

@@ -4,6 +4,7 @@
 //! Shared test harness modules for CLI e2e tests.
 
 pub mod binary;
+pub mod container;
 pub mod gateway;
 pub mod output;
 pub mod port;

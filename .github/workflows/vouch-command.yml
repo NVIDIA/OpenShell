@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Process /vouch command
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const commenter = context.payload.comment.user.login;

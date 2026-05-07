@@ -66,6 +66,8 @@ For direct mTLS endpoints, place the CLI client certificate bundle in the gatewa
 
 One gateway is always the active gateway. All CLI commands target it by default. `gateway add` sets the new gateway as active.
 
+The active gateway is the persisted default. The `-g` flag and the `OPENSHELL_GATEWAY` environment variable override it when commands resolve a gateway. If `OPENSHELL_GATEWAY` is set to a different gateway, `openshell gateway select <name>` still saves the new default and warns that the current shell will keep using the environment value until you unset or update it.
+
 List all registered gateways:
 
 ```shell

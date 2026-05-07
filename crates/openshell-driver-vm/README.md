@@ -169,11 +169,30 @@ The VM guest's serial console is appended to `<state-dir>/<sandbox-id>/console.l
   builds the image and the VM driver exports it via the local Docker daemon
 - `gh` CLI (used by `mise run vm:setup` to download pre-built runtime artifacts)
 
+## Releases
+
+`openshell-driver-vm` is published as a normal OpenShell release artifact:
+
+- development builds: the rolling `dev` release
+- tagged builds: the corresponding `v*` release
+- runtime tarballs: the rolling `vm-runtime` release, rebuilt on demand by
+  `release-vm-kernel.yml`
+
+On Linux amd64 and arm64, `install-dev.sh` installs the Debian package from the
+selected `OPENSHELL_VERSION` release tag. That package includes
+`openshell-gateway` and `openshell-driver-vm`.
+
+On Apple Silicon macOS, `install-dev.sh` stages the generated `openshell.rb`
+formula from the selected release in the `nvidia/openshell` Homebrew tap.
+Homebrew installs `openshell`, `openshell-gateway`, and
+`openshell-driver-vm`, ad-hoc signs the driver with the Hypervisor entitlement
+in `post_install`, and owns the `brew services` gateway lifecycle.
+
 ## Relationship to `openshell-vm`
 
-`openshell-vm` is a separate, legacy crate that runs the **whole OpenShell gateway inside a single VM**. `openshell-driver-vm` is the compute driver called by a host-resident gateway to spawn **per-sandbox VMs**. Both embed libkrun but share no Rust code — the driver vendors its own rootfs handling and runtime loader so `openshell-server` never has to link libkrun.
+`openshell-vm` is a separate, legacy crate that runs the **whole OpenShell gateway inside a single VM**. It remains in the repository for later deprecation or removal, but is excluded from normal workspace builds and release paths. `openshell-driver-vm` is the active compute driver called by a host-resident gateway to spawn **per-sandbox VMs**. The driver vendors its own rootfs handling and runtime loader so `openshell-server` never has to link libkrun.
 
 ## TODOs
 
 - The gateway still configures the driver via CLI args; this will move to a gRPC bootstrap call so the driver interface is uniform across backends. See the `TODO(driver-abstraction)` notes in `crates/openshell-server/src/lib.rs` and `crates/openshell-server/src/compute/vm.rs`.
-- macOS codesigning is handled by `tasks/scripts/gateway-vm.sh`; a packaged release would need signing in CI.
+- macOS local builds are codesigned by `tasks/scripts/gateway-vm.sh`; the generated Homebrew formula signs the release tarball driver for local installs.

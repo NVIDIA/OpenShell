@@ -66,6 +66,22 @@ OpenShell also publishes Python wheels for `linux/amd64`, `linux/arm64`, and mac
 - Release workflows mirror the CLI layout: a Linux matrix job for amd64/arm64, a separate macOS job, and release jobs that download the per-platform wheel artifacts directly before publishing.
 - Release CPU jobs run on `linux-amd64-cpu8` and `linux-arm64-cpu8`; the macOS wheel is still cross-compiled in Docker from the amd64 Linux runner.
 
+## Development Release Assets
+
+The rolling `dev` release is installer-facing but still publishes the full
+artifact set: CLI tarballs, standalone gateway and sandbox tarballs, Python
+wheels, Debian packages, RPM packages, and checksums. Every artifact is built
+from the version computed once in `release-dev.yml`.
+
+Package-manager artifacts use stable dev aliases on the GitHub release
+(`openshell-dev-*.deb`, `openshell-dev-*.rpm`, and
+`openshell-gateway-dev-*.rpm`) so the rolling release stays readable. Python
+wheels keep their versioned filenames because wheel metadata requires it.
+
+The dev release workflow prunes workflow-owned `openshell*` assets before
+uploading the fresh set. `openshell-driver-vm` artifacts are intentionally not
+published on the main `dev` release; VM driver binaries live on `vm-dev`.
+
 ## Sandbox Images
 
 Sandbox images are not built in this repository. They are maintained in the [openshell-community](https://github.com/nvidia/openshell-community) repository and pulled from `ghcr.io/nvidia/openshell-community/sandboxes/` at runtime.

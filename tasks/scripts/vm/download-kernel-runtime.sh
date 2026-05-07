@@ -2,17 +2,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Download pre-built VM kernel runtime artifacts from the vm-dev GitHub Release
-# and stage them for the openshell-vm cargo build.
+# Download pre-built VM kernel runtime artifacts from the vm-runtime GitHub Release
+# and stage them for the openshell-driver-vm cargo build.
 #
-# This script is used by CI (release-vm-dev.yml) and can also be used locally
+# This script is used by driver release CI and can also be used locally
 # to avoid building libkrun/libkrunfw from source.
 #
 # Usage:
 #   ./download-kernel-runtime.sh [--platform PLATFORM]
 #
 # Environment:
-#   VM_RUNTIME_RELEASE_TAG  - GitHub Release tag (default: vm-dev)
+#   VM_RUNTIME_RELEASE_TAG  - GitHub Release tag (default: vm-runtime)
 #   GITHUB_REPOSITORY       - owner/repo (default: NVIDIA/OpenShell)
 #   OPENSHELL_VM_RUNTIME_COMPRESSED_DIR - Output directory (default: target/vm-runtime-compressed)
 #
@@ -24,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
 
-RELEASE_TAG="${VM_RUNTIME_RELEASE_TAG:-vm-dev}"
+RELEASE_TAG="${VM_RUNTIME_RELEASE_TAG:-vm-runtime}"
 REPO="${GITHUB_REPOSITORY:-NVIDIA/OpenShell}"
 OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
 
@@ -38,12 +38,12 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: $0 [--platform PLATFORM]"
             echo ""
-            echo "Download pre-built VM kernel runtime from the vm-dev GitHub Release."
+            echo "Download pre-built VM kernel runtime from the vm-runtime GitHub Release."
             echo ""
             echo "Platforms: linux-aarch64, linux-x86_64, darwin-aarch64"
             echo ""
             echo "Environment:"
-            echo "  VM_RUNTIME_RELEASE_TAG              Release tag (default: vm-dev)"
+            echo "  VM_RUNTIME_RELEASE_TAG              Release tag (default: vm-runtime)"
             echo "  GITHUB_REPOSITORY                   owner/repo (default: NVIDIA/OpenShell)"
             echo "  OPENSHELL_VM_RUNTIME_COMPRESSED_DIR Output directory"
             exit 0
@@ -90,7 +90,7 @@ gh release download "${RELEASE_TAG}" \
 if [ ! -f "${DOWNLOAD_DIR}/${TARBALL_NAME}" ]; then
     echo "Error: Download failed — ${TARBALL_NAME} not found." >&2
     echo "" >&2
-    echo "The vm-dev release may not have kernel runtime artifacts yet." >&2
+    echo "The vm-runtime release may not have kernel runtime artifacts yet." >&2
     echo "Run the 'Release VM Kernel' workflow first:" >&2
     echo "  gh workflow run release-vm-kernel.yml" >&2
     exit 1
@@ -120,17 +120,6 @@ ls -lah "$EXTRACT_DIR"
 echo ""
 compress_dir "$EXTRACT_DIR" "$OUTPUT_DIR"
 
-# ── Check for rootfs (may already be present from a separate build step) ──
-
-if [ -f "${OUTPUT_DIR}/rootfs.tar.zst" ]; then
-    echo ""
-    echo "    rootfs.tar.zst: $(du -h "${OUTPUT_DIR}/rootfs.tar.zst" | cut -f1) (pre-existing)"
-else
-    echo ""
-    echo "Note: rootfs.tar.zst not found in ${OUTPUT_DIR}."
-    echo "      Build it with: mise run vm:rootfs -- --base"
-fi
-
 echo ""
 echo "==> Staged artifacts in ${OUTPUT_DIR}:"
 ls -lah "$OUTPUT_DIR"
@@ -138,4 +127,4 @@ ls -lah "$OUTPUT_DIR"
 echo ""
 echo "==> Done."
 echo ""
-echo "Next step: mise run vm:build"
+echo "Next step: mise run vm:supervisor && cargo build -p openshell-driver-vm"

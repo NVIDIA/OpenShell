@@ -198,6 +198,7 @@ openshell logs <sandbox-name>
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs statefulset/openshell` |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
+| `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was auto-applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Confirm the cluster image only bundles core manifests; apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only when `grpcRoute` is enabled |
 
 ## Reporting
 

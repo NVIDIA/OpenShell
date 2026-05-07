@@ -28,12 +28,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
 
-# Source pinned dependency versions
-source "${ROOT}/crates/openshell-vm/pins.env" 2>/dev/null || true
+# Source pinned dependency versions.
+source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
 
 BUILD_DIR="${ROOT}/target/libkrun-build"
 OUTPUT_DIR="${BUILD_DIR}"
-KERNEL_CONFIG="${ROOT}/crates/openshell-vm/runtime/kernel/openshell.kconfig"
+KERNEL_CONFIG="${ROOT}/crates/openshell-driver-vm/runtime/kernel/openshell.kconfig"
 
 if [ "$(uname -s)" != "Linux" ]; then
   echo "Error: This script only runs on Linux" >&2
@@ -66,7 +66,7 @@ install_deps() {
   
   if command -v apt-get &>/dev/null; then
     # Debian/Ubuntu
-    DEPS="build-essential git python3 python3-pip python3-pyelftools flex bison libelf-dev libssl-dev bc curl libclang-dev cpio zstd jq"
+    DEPS="build-essential git python3 python3-pip python3-pyelftools flex bison libelf-dev libssl-dev libcap-ng-dev bc curl libclang-dev cpio zstd jq"
     MISSING=""
     for dep in $DEPS; do
       if ! dpkg -s "$dep" &>/dev/null; then
@@ -83,14 +83,14 @@ install_deps() {
     
   elif command -v dnf &>/dev/null; then
     # Fedora/RHEL
-    DEPS="make git python3 python3-pyelftools gcc flex bison elfutils-libelf-devel openssl-devel bc glibc-static curl clang-devel cpio zstd jq"
+    DEPS="make git python3 python3-pyelftools gcc flex bison elfutils-libelf-devel openssl-devel libcap-ng-devel bc glibc-static curl clang-devel cpio zstd jq"
     echo "    Installing dependencies via dnf..."
     $SUDO dnf install -y $DEPS
     
   else
     echo "Warning: Unknown package manager. Please install manually:" >&2
     echo "  build-essential git python3 python3-pyelftools flex bison" >&2
-    echo "  libelf-dev libssl-dev bc curl cpio" >&2
+    echo "  libelf-dev libssl-dev libcap-ng-dev bc curl cpio" >&2
   fi
 
 }
@@ -237,6 +237,21 @@ make -j"$(nproc)"
 
 # Copy output
 cp libkrunfw.so* "$OUTPUT_DIR/"
+if [ ! -f ABI_VERSION ]; then
+  ABI_VERSION_VALUE="$(awk '/^ABI_VERSION[[:space:]]*[:?+]?=/ { value=$0; sub(/^[^=]*=/, "", value); gsub(/[[:space:]]/, "", value); print value; exit }' Makefile)"
+  if [ -z "$ABI_VERSION_VALUE" ]; then
+    echo "ERROR: could not determine libkrunfw ABI_VERSION from Makefile" >&2
+    exit 1
+  fi
+  printf '%s\n' "$ABI_VERSION_VALUE" > ABI_VERSION
+fi
+for artifact in kernel.c ABI_VERSION; do
+  if [ ! -f "$artifact" ]; then
+    echo "ERROR: expected libkrunfw export missing: $artifact" >&2
+    exit 1
+  fi
+  cp "$artifact" "$OUTPUT_DIR/"
+done
 echo "    Built: $(ls "$OUTPUT_DIR"/libkrunfw.so* | xargs -n1 basename | tr '\n' ' ')"
 
 cd "$BUILD_DIR"
@@ -418,4 +433,4 @@ echo "    Artifacts:"
 ls -lah "$OUTPUT_DIR"/*.so*
 
 echo ""
-echo "Next step: mise run vm:build"
+echo "Next step: mise run vm:supervisor && cargo build -p openshell-driver-vm"

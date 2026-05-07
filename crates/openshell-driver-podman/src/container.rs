@@ -33,6 +33,8 @@ fn is_selinux_enabled() -> bool {
 pub const LABEL_SANDBOX_ID: &str = "openshell.sandbox-id";
 /// Label key for the sandbox name.
 pub const LABEL_SANDBOX_NAME: &str = "openshell.sandbox-name";
+/// Label key for the sandbox namespace.
+pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.sandbox-namespace";
 /// Label applied to all managed containers.
 pub const LABEL_MANAGED: &str = "openshell.managed";
 /// Label filter string for list/event queries.
@@ -308,6 +310,7 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
     // Managed labels (highest priority -- always overwrite).
     labels.insert(LABEL_SANDBOX_ID.into(), sandbox.id.clone());
     labels.insert(LABEL_SANDBOX_NAME.into(), sandbox.name.clone());
+    labels.insert(LABEL_SANDBOX_NAMESPACE.into(), sandbox.namespace.clone());
     labels.insert(LABEL_MANAGED.into(), "true".into());
 
     labels
@@ -499,12 +502,13 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
             secret_name(&sandbox.id),
         )]),
         stop_timeout: config.stop_timeout_secs,
-        // Inject host.containers.internal into /etc/hosts so sandbox
-        // containers can reach the gateway server on the host. The
-        // "host-gateway" magic value tells Podman to resolve to the
-        // host's actual IP (pasta uses 169.254.1.2 in rootless mode).
-        // This is the Podman equivalent of Docker's host.docker.internal.
-        hostadd: vec!["host.containers.internal:host-gateway".into()],
+        // Inject stable host aliases into /etc/hosts so sandbox containers can
+        // reach services on the host. `host.openshell.internal` is the driver-
+        // neutral alias used by policies and e2e tests.
+        hostadd: vec![
+            "host.containers.internal:host-gateway".into(),
+            "host.openshell.internal:host-gateway".into(),
+        ],
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
@@ -856,11 +860,16 @@ mod tests {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("real-id", "real-name");
+        sandbox.namespace = "real-namespace".to_string();
         let mut label_overrides = std::collections::HashMap::new();
         label_overrides.insert("openshell.sandbox-id".to_string(), "spoofed-id".to_string());
         label_overrides.insert(
             "openshell.sandbox-name".to_string(),
             "spoofed-name".to_string(),
+        );
+        label_overrides.insert(
+            "openshell.sandbox-namespace".to_string(),
+            "spoofed-namespace".to_string(),
         );
         sandbox.spec = Some(DriverSandboxSpec {
             template: Some(DriverSandboxTemplate {
@@ -887,6 +896,40 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("real-name"),
             "openshell.sandbox-name must not be overridden by template labels"
+        );
+        assert_eq!(
+            labels
+                .get("openshell.sandbox-namespace")
+                .and_then(|v| v.as_str()),
+            Some("real-namespace"),
+            "openshell.sandbox-namespace must not be overridden by template labels"
+        );
+    }
+
+    #[test]
+    fn container_spec_injects_host_aliases() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let hostadd: Vec<&str> = spec["hostadd"]
+            .as_array()
+            .expect("hostadd should be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        assert!(
+            hostadd.contains(&"host.containers.internal:host-gateway"),
+            "missing Podman host alias"
+        );
+        assert!(
+            hostadd.contains(&"host.openshell.internal:host-gateway"),
+            "missing OpenShell stable host alias"
+        );
+        assert!(
+            !hostadd.contains(&"host.docker.internal:host-gateway"),
+            "Podman should not inject Docker's host alias"
         );
     }
 
