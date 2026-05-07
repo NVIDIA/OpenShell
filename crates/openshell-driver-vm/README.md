@@ -183,8 +183,8 @@ selected `OPENSHELL_VERSION` release tag. That package includes
 `openshell-gateway` and `openshell-driver-vm`.
 
 On Apple Silicon macOS, `install-dev.sh` stages the generated `openshell.rb`
-formula from the selected release in a local `nvidia/openshell-dev` Homebrew
-tap. Homebrew installs `openshell`, `openshell-gateway`, and
+formula from the selected release in the `nvidia/openshell` Homebrew tap.
+Homebrew installs `openshell`, `openshell-gateway`, and
 `openshell-driver-vm`, ad-hoc signs the driver with the Hypervisor entitlement
 in `post_install`, and owns the `brew services` gateway lifecycle.
 
