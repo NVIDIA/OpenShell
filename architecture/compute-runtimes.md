@@ -23,7 +23,7 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 | Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. |
 | Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API, OCI image volumes, and CDI GPU devices when available. |
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
-| VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Gateway spawns `openshell-driver-vm` as a subprocess over a Unix socket. |
+| VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Gateway spawns `openshell-driver-vm` as a subprocess over a private, state-local Unix socket. |
 
 Runtime-specific implementation notes belong in the driver crate README:
 

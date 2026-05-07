@@ -3633,6 +3633,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "miette",
+ "nix",
  "openshell-core",
  "openshell-driver-docker",
  "openshell-driver-kubernetes",

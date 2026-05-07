@@ -73,7 +73,7 @@ The gateway uses the VM compute driver to create VM-backed sandboxes. MicroVM re
 |---|---|---|
 | `--drivers vm` | `OPENSHELL_DRIVERS=vm` | Select the VM compute driver. VM is never auto-detected. |
 | `--driver-dir <path>` | `OPENSHELL_DRIVER_DIR` | Search a custom directory for `openshell-driver-vm`. |
-| `--vm-driver-state-dir <path>` | `OPENSHELL_VM_DRIVER_STATE_DIR` | Store VM rootfs, console logs, runtime state, and image-rootfs cache under this directory. |
+| `--vm-driver-state-dir <path>` | `OPENSHELL_VM_DRIVER_STATE_DIR` | Store VM rootfs, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket under this directory. |
 | `--vm-driver-vcpus <count>` | `OPENSHELL_VM_DRIVER_VCPUS` | Set the default vCPU count for VM sandboxes. |
 | `--vm-driver-mem-mib <mib>` | `OPENSHELL_VM_DRIVER_MEM_MIB` | Set the default memory allocation for VM sandboxes in MiB. |
 | `--vm-krun-log-level <level>` | `OPENSHELL_VM_KRUN_LOG_LEVEL` | Set the libkrun log level for VM helper processes. |
