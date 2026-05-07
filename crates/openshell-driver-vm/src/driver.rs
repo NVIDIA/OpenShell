@@ -2266,6 +2266,7 @@ fn sandboxes_root_dir(root: &Path) -> PathBuf {
     root.join("sandboxes")
 }
 
+#[allow(clippy::result_large_err)]
 fn sandbox_state_dir(root: &Path, sandbox_id: &str) -> Result<PathBuf, Status> {
     validate_sandbox_id(sandbox_id)?;
     Ok(sandboxes_root_dir(root).join(sandbox_id))

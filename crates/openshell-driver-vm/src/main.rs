@@ -22,6 +22,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(name = "openshell-driver-vm")]
 #[command(version = VERSION)]
+#[allow(clippy::struct_excessive_bools)]
 struct Args {
     #[arg(long, hide = true, default_value_t = false)]
     internal_run_vm: bool,
