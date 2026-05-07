@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use openshell_core::config::DEFAULT_SERVER_PORT;
+use openshell_core::config::{CDI_GPU_DEVICE_ALL, DEFAULT_SERVER_PORT};
 use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
 };
@@ -504,6 +504,30 @@ fn build_container_create_body_maps_gpu_to_all_cdi_device() {
     assert_eq!(
         request.device_ids.as_ref().unwrap(),
         &vec![CDI_GPU_DEVICE_ALL.to_string()]
+    );
+}
+
+#[test]
+fn build_container_create_body_passes_explicit_cdi_device_id_through() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.gpu = true;
+    spec.gpu_device = "nvidia.com/gpu=0".to_string();
+
+    let create_body = build_container_create_body(&sandbox, &config).unwrap();
+    let request = create_body
+        .host_config
+        .as_ref()
+        .and_then(|host_config| host_config.device_requests.as_ref())
+        .and_then(|requests| requests.first())
+        .expect("GPU request should add a Docker device request");
+
+    assert_eq!(request.driver.as_deref(), Some("cdi"));
+    assert_eq!(
+        request.device_ids.as_ref().unwrap(),
+        &vec!["nvidia.com/gpu=0".to_string()]
     );
 }
 
