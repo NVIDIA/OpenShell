@@ -18,7 +18,7 @@ The gateway is responsible for:
 - Managing inference configuration and serving inference bundles so sandboxes can route requests to the correct backend.
 - Providing the SSH tunnel endpoint so you can connect to sandboxes without exposing them directly.
 
-OpenShell separates gateway access from the compute platform that runs sandboxes. Use [Get OpenShell](/about/get-openshell) to install OpenShell, choose a runtime, and start a gateway. This page covers working with gateway entries after a gateway exists.
+OpenShell separates gateway access from the compute platform that runs sandboxes. Use [Installation](/about/installation) to install OpenShell, choose a runtime, and start a gateway. This page covers working with gateway entries after a gateway exists.
 
 ## Gateway Compute Platforms
 
@@ -34,7 +34,7 @@ A gateway provisions sandboxes on the compute platform configured for that gatew
 All compute platforms expose the same gateway API surface. Sandboxes, policies, and providers work the same after the CLI registers the gateway endpoint. The difference is how the gateway creates sandbox workloads and how operators expose the gateway to users.
 
 <Tip>
-For runtime setup, including Docker, Podman, MicroVM, and Kubernetes paths, refer to [Get OpenShell](/about/get-openshell).
+For runtime setup, including Docker, Podman, MicroVM, and Kubernetes paths, refer to [Installation](/about/installation).
 
 </Tip>
 
@@ -141,5 +141,5 @@ For sandbox startup failures, inspect the selected compute platform:
 
 ## Next Steps
 
-- To install OpenShell and choose a runtime, refer to [Get OpenShell](/about/get-openshell).
+- To install OpenShell and choose a runtime, refer to [Installation](/about/installation).
 - To create a sandbox using the gateway, refer to [Manage Sandboxes](/sandboxes/manage-sandboxes).
