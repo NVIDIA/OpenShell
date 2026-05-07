@@ -23,8 +23,8 @@ Make sure the following are in place before you install.
 | Kubernetes 1.29+ with RBAC enabled | Yes | — |
 | Helm 3.x | Yes | — |
 | Agent Sandbox controller and CRDs | Yes | Install before the OpenShell chart — see [Install Agent Sandbox](#install-agent-sandbox) below |
-| cert-manager | No | See [Use cert-manager for PKI](/reference/kubernetes/cert-manager) — only needed if you prefer cert-manager over the built-in PKI job |
-| Kubernetes Gateway API | No | See [Enable Gateway API Access](/reference/kubernetes/gateway-api) — only needed for external ingress without port-forwarding |
+| cert-manager | No | See [Managing Certificates](/kubernetes/managing-certificates) — only needed if you prefer cert-manager over the built-in PKI job |
+| Kubernetes Gateway API | No | See [Ingress](/kubernetes/ingress) — only needed for external access without port-forwarding |
 
 ## Install Agent Sandbox
 
@@ -94,7 +94,7 @@ kubectl -n openshell port-forward svc/openshell 8080:8080
 ```
 
 <Warning>
-The port-forward is for local evaluation only. For shared environments, expose the gateway through your ingress controller or access proxy. See [Enable Gateway API Access](/reference/kubernetes/gateway-api) for an external ingress option.
+The port-forward is for local evaluation only. For shared environments, expose the gateway through your ingress controller or access proxy. See [Ingress](/kubernetes/ingress) for an external access option.
 </Warning>
 
 ## Install the client mTLS certificate
@@ -149,7 +149,7 @@ helm upgrade --install openshell \
 
 ## Next Steps
 
-- To enable automatic certificate rotation, see [Use cert-manager for PKI](/reference/kubernetes/cert-manager).
-- To expose the gateway externally without port-forwarding, see [Enable Gateway API Access](/reference/kubernetes/gateway-api).
-- To configure OIDC or reverse-proxy authentication, see [Configure Gateway Authentication](/reference/kubernetes/authentication).
+- To enable automatic certificate rotation with cert-manager, see [Managing Certificates](/kubernetes/managing-certificates).
+- To expose the gateway externally without port-forwarding, see [Ingress](/kubernetes/ingress).
+- To configure OIDC or reverse-proxy authentication, see [Access Control](/kubernetes/access-control).
 - To create your first sandbox, see [Manage Sandboxes](/sandboxes/manage-sandboxes).

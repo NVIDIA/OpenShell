@@ -1,15 +1,21 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Use cert-manager for PKI"
+title: "Managing Certificates"
+sidebar-title: "Managing Certificates"
 description: "Configure the OpenShell Helm chart to use cert-manager for mTLS certificate issuance and automatic renewal."
 keywords: "Generative AI, Cybersecurity, Kubernetes, cert-manager, PKI, TLS, mTLS, Certificates"
 position: 2
 ---
 
-By default, the OpenShell Helm chart generates mTLS certificates using a pre-install Kubernetes Job (`pkiInitJob`). This is the simplest path for getting started and requires no additional dependencies.
+The OpenShell gateway requires mTLS certificates for sandbox supervisors and clients. The Helm chart supports two ways to provision and manage them:
 
-Use cert-manager instead when you want automatic certificate rotation managed by a running controller rather than one-time generation at install time.
+| Mode | When to use |
+|---|---|
+| Built-in `pkiInitJob` (default) | Simplest path. A pre-install Kubernetes Job generates a self-signed CA and certificates once at install time. No additional dependencies. |
+| cert-manager | Production deployments that need automatic certificate rotation managed by a running controller. |
+
+The rest of this page covers switching to cert-manager. The built-in mode requires no configuration.
 
 <Note>
 cert-manager and `pkiInitJob` are mutually exclusive. The chart will fail if both are enabled at the same time.
@@ -52,4 +58,4 @@ The chart creates a self-signed CA, issues server and client certificates from i
 
 ## Next Steps
 
-Return to [Get Started on Kubernetes](/reference/kubernetes/setup) to complete the installation.
+Return to [Setup](/kubernetes/setup) to complete the installation.

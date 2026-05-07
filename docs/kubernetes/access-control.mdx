@@ -1,16 +1,21 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Configure Gateway Authentication"
-sidebar-title: "Authentication"
+title: "Access Control"
+sidebar-title: "Access Control"
 description: "Configure OIDC user authentication or reverse-proxy auth termination for a Kubernetes-deployed OpenShell gateway."
 keywords: "Generative AI, Cybersecurity, Kubernetes, Authentication, mTLS, OIDC, Keycloak, Entra ID, Okta, Gateway Auth"
 position: 4
 ---
 
-OIDC is the recommended authentication method for Kubernetes deployments. It integrates with your existing identity provider, supports role-based access control, and gives each user their own identity without requiring manual certificate distribution.
+The OpenShell gateway supports two access-control models for human callers on Kubernetes:
 
-The Helm chart also generates mTLS certificates at install time, which the gateway uses for transport-layer security regardless of which authentication method you choose. The mTLS client bundle in the `openshell-client-tls` secret is used internally by sandbox supervisors to communicate back to the gateway, not for distributing access to individual users.
+| Model | When to use |
+|---|---|
+| OIDC (recommended) | Production deployments. Integrates with an existing identity provider, supports role-based access control, and gives each user their own identity without distributing certificates. |
+| Reverse-proxy auth termination | An access proxy (Cloudflare Access, ngrok, corporate SSO) authenticates callers in front of the gateway. The gateway trusts the proxy and skips its own client-cert check. |
+
+The Helm chart always generates mTLS certificates at install time. The gateway uses them for transport-layer security regardless of which access-control model you choose. The client bundle in the `openshell-client-tls` secret is used internally by sandbox supervisors, not for granting access to individual users.
 
 For how the CLI resolves gateways and stores credentials, refer to [Gateway Authentication](/reference/gateway-auth).
 

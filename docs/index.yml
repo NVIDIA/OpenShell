@@ -19,6 +19,8 @@ navigation:
   title: "How It Works"
 - folder: observability
   title: "Observability"
+- folder: kubernetes
+  title: "Kubernetes"
 - section: "Reference"
   slug: reference
   contents:
@@ -30,8 +32,6 @@ navigation:
     path: reference/policy-schema.mdx
   - page: "Support Matrix"
     path: reference/support-matrix.mdx
-  - folder: reference/kubernetes
-    title: "Kubernetes"
 - folder: security
   title: "Security"
 - folder: resources

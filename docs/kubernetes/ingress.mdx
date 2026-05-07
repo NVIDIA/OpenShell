@@ -1,16 +1,16 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Enable Kubernetes Gateway API Access"
-sidebar-title: "Gateway API Access"
+title: "Ingress"
+sidebar-title: "Ingress"
 description: "Expose the OpenShell gateway externally using the Kubernetes Gateway API and a GRPCRoute."
 keywords: "Generative AI, Cybersecurity, Kubernetes, Gateway API, Envoy Gateway, GRPCRoute, Ingress, External Access"
 position: 3
 ---
 
-By default, the OpenShell gateway is only reachable inside the cluster. Use the Kubernetes Gateway API to expose it externally so CLI clients can connect without a port-forward.
+By default, the OpenShell gateway is only reachable inside the cluster. To let CLI clients connect without a `kubectl port-forward`, expose the gateway through an ingress.
 
-The OpenShell chart creates a `GRPCRoute` resource that routes inbound gRPC traffic to the gateway pod. You need a Gateway API implementation installed on your cluster to fulfill the `GRPCRoute`. The chart is tested with [Envoy Gateway](https://gateway.envoyproxy.io).
+OpenShell uses the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) for ingress. The chart creates a `GRPCRoute` that routes inbound gRPC traffic to the gateway pod. You need a Gateway API implementation installed on your cluster to fulfill the `GRPCRoute`. This page uses [Envoy Gateway](https://gateway.envoyproxy.io), which the chart is tested with.
 
 ## Install Envoy Gateway
 
@@ -80,4 +80,4 @@ helm upgrade openshell \
 
 ## Next Steps
 
-Return to [Get Started on Kubernetes](/reference/kubernetes/setup) to complete the installation.
+Return to [Setup](/kubernetes/setup) to complete the installation.
