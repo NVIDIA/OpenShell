@@ -15,14 +15,34 @@ use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use crate::certgen;
 use crate::compute::{DockerComputeConfig, VmComputeConfig};
 use crate::{run_server, tracing_bus::TracingLogBus};
 
 /// `OpenShell` gateway process - gRPC and HTTP server with protocol multiplexing.
+///
+/// Top-level CLI. When invoked without a subcommand the binary runs the
+/// gateway server using `RunArgs`. The `generate-certs` subcommand is used by
+/// the Helm pre-install hook to bootstrap mTLS Secrets.
 #[derive(Parser, Debug)]
 #[command(version = openshell_core::VERSION)]
 #[command(about = "OpenShell gRPC/HTTP server", long_about = None)]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Commands {
+    /// Generate mTLS PKI and write Kubernetes Secrets (Helm pre-install hook).
+    GenerateCerts(certgen::CertgenArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct RunArgs {
     /// IP address to bind the server, health, and metrics listeners to.
     #[arg(long, default_value = "127.0.0.1", env = "OPENSHELL_BIND_ADDRESS")]
     bind_address: IpAddr,
@@ -58,8 +78,12 @@ struct Args {
     tls_client_ca: Option<PathBuf>,
 
     /// Database URL for persistence.
-    #[arg(long, env = "OPENSHELL_DB_URL", required = true)]
-    db_url: String,
+    ///
+    /// Required when running the gateway. Validated at the call site rather
+    /// than as a clap-level requirement so the `generate-certs` subcommand
+    /// (which does not need a database) can run without it.
+    #[arg(long, env = "OPENSHELL_DB_URL")]
+    db_url: Option<String>,
 
     /// Compute drivers configured for this gateway.
     ///
@@ -279,7 +303,7 @@ struct Args {
 }
 
 pub fn command() -> Command {
-    Args::command()
+    Cli::command()
         .name("openshell-gateway")
         .bin_name("openshell-gateway")
 }
@@ -289,12 +313,15 @@ pub async fn run_cli() -> Result<()> {
         .install_default()
         .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
 
-    let args = Args::from_arg_matches(&command().get_matches()).expect("clap validated args");
+    let cli = Cli::from_arg_matches(&command().get_matches()).expect("clap validated args");
 
-    Box::pin(run_from_args(args)).await
+    match cli.command {
+        Some(Commands::GenerateCerts(args)) => certgen::run(args).await,
+        None => Box::pin(run_from_args(cli.run)).await,
+    }
 }
 
-async fn run_from_args(args: Args) -> Result<()> {
+async fn run_from_args(args: RunArgs) -> Result<()> {
     let tracing_log_bus = TracingLogBus::new();
     tracing_log_bus.install_subscriber(
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
@@ -325,6 +352,10 @@ async fn run_from_args(args: Args) -> Result<()> {
             allow_unauthenticated: args.disable_gateway_auth,
         })
     };
+
+    let db_url = args
+        .db_url
+        .ok_or_else(|| miette::miette!("--db-url is required (or set OPENSHELL_DB_URL)"))?;
 
     let mut config = openshell_core::Config::new(tls)
         .with_bind_address(bind)
@@ -359,7 +390,7 @@ async fn run_from_args(args: Args) -> Result<()> {
     }
 
     config = config
-        .with_database_url(args.db_url)
+        .with_database_url(db_url)
         .with_compute_drivers(args.drivers)
         .with_sandbox_namespace(args.sandbox_namespace)
         .with_ssh_gateway_host(args.ssh_gateway_host)
@@ -444,7 +475,7 @@ fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, S
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, command};
+    use super::{Cli, command};
     use clap::Parser;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{LazyLock, Mutex};
@@ -507,9 +538,9 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _guard = EnvVarGuard::remove("OPENSHELL_BIND_ADDRESS");
-        let args =
-            Args::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
-        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let cli =
+            Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+        assert_eq!(cli.run.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 
     #[test]
@@ -518,7 +549,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _guard = EnvVarGuard::remove("OPENSHELL_BIND_ADDRESS");
-        let args = Args::try_parse_from([
+        let cli = Cli::try_parse_from([
             "openshell-gateway",
             "--db-url",
             "sqlite::memory:",
@@ -526,7 +557,7 @@ mod tests {
             "127.0.0.1",
         ])
         .unwrap();
-        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(cli.run.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 
     #[test]
@@ -536,9 +567,55 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _guard = EnvVarGuard::set("OPENSHELL_BIND_ADDRESS", "0.0.0.0");
 
-        let args = Args::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"])
+        let cli = Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"])
             .expect("env should provide bind address");
 
-        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(cli.run.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn generate_certs_subcommand_parses_without_db_url() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("OPENSHELL_DB_URL");
+        let _g2 = EnvVarGuard::remove("POD_NAMESPACE");
+
+        let cli = Cli::try_parse_from([
+            "openshell-gateway",
+            "generate-certs",
+            "--namespace",
+            "openshell",
+            "--server-secret-name",
+            "openshell-server-tls",
+            "--client-secret-name",
+            "openshell-client-tls",
+            "--server-san",
+            "openshell.example.com",
+            "--server-san",
+            "10.0.0.1",
+        ])
+        .expect("generate-certs should parse without --db-url");
+
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::GenerateCerts(_))
+        ));
+    }
+
+    #[test]
+    fn bare_invocation_with_no_db_url_errors_at_runtime_not_parse_time() {
+        // db_url is Option<String> at the clap level so subcommand parsing
+        // does not require it. The Run path validates it inside
+        // run_from_args. This test asserts the parse step succeeds with no
+        // --db-url, mirroring what the runtime check sees.
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::remove("OPENSHELL_DB_URL");
+
+        let cli = Cli::try_parse_from(["openshell-gateway"]).expect("parses without --db-url");
+        assert!(cli.command.is_none());
+        assert!(cli.run.db_url.is_none());
     }
 }

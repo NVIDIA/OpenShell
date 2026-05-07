@@ -15,6 +15,7 @@ name = "openshell-gateway"
 path = "src/main.rs"
 
 [dependencies]
+openshell-bootstrap = { path = "../openshell-bootstrap" }
 openshell-core = { path = "../openshell-core" }
 openshell-driver-docker = { path = "../openshell-driver-docker" }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
@@ -23,6 +24,10 @@ openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-router = { path = "../openshell-router" }
+
+# Kubernetes client (used by the `generate-certs` subcommand)
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }

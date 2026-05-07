@@ -20,6 +20,7 @@
 //! [`compute::vm`]; keep this file driver-agnostic going forward.
 
 mod auth;
+pub mod certgen;
 pub mod cli;
 mod compute;
 mod grpc;

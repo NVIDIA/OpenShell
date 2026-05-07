@@ -132,6 +132,24 @@ The same relay pattern backs interactive SSH, command execution, and file sync.
 The gateway tracks live sessions in memory and persists session records so
 tokens can expire or be revoked.
 
+## PKI Bootstrap
+
+On Kubernetes, the Helm chart runs a pre-install/pre-upgrade hook Job that
+invokes `openshell-gateway generate-certs` to create the gateway's server and
+client mTLS Secrets. The Job uses the gateway image itself — no separate
+cert-generation image — and reuses the same `rcgen`-based CA/leaf logic as the
+local `openshell` workflow.
+
+The hook is idempotent: both target Secrets present → skip; exactly one
+present → fail with a recovery hint; neither present → generate and create.
+This guards mTLS continuity across upgrades while still recovering cleanly if
+an operator deletes both Secrets and reinstalls.
+
+Operators who manage PKI externally (cert-manager, an enterprise CA, or
+pre-created Secrets) disable the hook via `pkiInitJob.enabled=false`. The chart
+also ships a `certManager.*` path that produces equivalent Secrets through
+cert-manager `Issuer`/`Certificate` resources.
+
 ## Operational Constraints
 
 - Gateway TLS and client certificate distribution are deployment concerns owned

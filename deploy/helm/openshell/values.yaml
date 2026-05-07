@@ -154,32 +154,23 @@ sshHandshake:
   value: ""
 
 # PKI bootstrap via a pre-install/pre-upgrade hook Job.
-# Generates a self-signed CA, server TLS secret, and client TLS secret using
-# openssl (ECDSA P-256) inside the cluster. Key material is written directly to
-# K8s Secrets and never appears in Helm release history. Idempotent: existing
-# secrets are left untouched on upgrade.
-# Air-gapped environments should override pkiInitJob.image with an image that has
-# openssl and curl pre-installed (the default alpine image fetches them at runtime).
+# Runs `openshell-gateway generate-certs` to create the server and client TLS
+# Secrets in-cluster. Key material is written directly to K8s Secrets and
+# never appears in Helm release history. Idempotent: existing secrets are
+# left untouched on upgrade. Reuses the gateway image — no extra image to
+# mirror in air-gapped environments.
+#
+# The server certificate already includes the built-in cluster SANs
+# (`openshell`, `openshell.openshell.svc`, the cluster.local FQDN, `localhost`,
+# `host.docker.internal`, and `127.0.0.1`) baked into the gateway binary. The
+# lists below are *additional* SANs appended on top — typically a public
+# hostname or load-balancer IP for remote deployments.
 pkiInitJob:
   enabled: true
-  image:
-    repository: alpine
-    tag: "3"
-    pullPolicy: IfNotPresent
-  # Days until the CA certificate expires.
-  caValidityDays: 3650
-  # Days until server and client certificates expire.
-  certValidityDays: 3650
-  # DNS SANs for the server certificate.
-  serverDnsNames:
-    - openshell
-    - openshell.openshell.svc
-    - openshell.openshell.svc.cluster.local
-    - localhost
-    - host.docker.internal
-  # IP SANs for the server certificate.
-  serverIpAddresses:
-    - 127.0.0.1
+  # Extra DNS SANs to append to the server certificate.
+  serverDnsNames: []
+  # Extra IP SANs to append to the server certificate.
+  serverIpAddresses: []
 
 # cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
 # Uses namespaced Issuers only (no ClusterIssuer). Does not install cert-manager itself.
