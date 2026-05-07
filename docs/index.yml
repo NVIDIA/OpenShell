@@ -21,17 +21,8 @@ navigation:
   title: "Observability"
 - folder: kubernetes
   title: "Kubernetes"
-- section: "Reference"
-  slug: reference
-  contents:
-  - page: "Gateway Authentication"
-    path: reference/gateway-auth.mdx
-  - page: "Default Policy"
-    path: reference/default-policy.mdx
-  - page: "Policy Schema"
-    path: reference/policy-schema.mdx
-  - page: "Support Matrix"
-    path: reference/support-matrix.mdx
+- folder: reference
+  title: "Reference"
 - folder: security
   title: "Security"
 - folder: resources
