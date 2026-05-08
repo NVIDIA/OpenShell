@@ -40,6 +40,7 @@ For local access, the server certificate must be valid for the endpoint the CLI 
 
 Package-managed local gateways on Homebrew and Debian generate this bundle automatically for the `openshell` gateway name and use `https://127.0.0.1:17670` by default.
 When you register a package-managed local gateway with `openshell gateway add https://127.0.0.1:17670 --local --name openshell`, the CLI refreshes its mTLS bundle from the package-managed TLS directory.
+On Homebrew, the gateway service also mirrors the Docker sandbox client bundle into `$HOME/.local/state/openshell/homebrew/tls` before startup so Docker Desktop can bind-mount the files into sandbox containers.
 
 The CLI loads its mTLS bundle from `~/.config/openshell/gateways/<name>/mtls/`:
 

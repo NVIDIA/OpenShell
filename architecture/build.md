@@ -30,6 +30,10 @@ gateway binary so Docker sandboxes do not depend on `:latest` by default.
 Package formulas also pin Docker supervisor extraction to the matching release
 image tag so standalone gateway binaries do not infer image tags from package
 versions.
+The Homebrew service keeps gateway TLS under the Homebrew state directory but
+mirrors Docker sandbox client TLS into `$HOME/.local/state/openshell/homebrew/tls`
+at service start, because Docker Desktop bind mounts must use paths visible to
+the macOS user's shared home directory.
 
 Local image work should use `mise` tasks rather than direct Docker commands so
 the same staging and tagging assumptions are used locally and in CI.

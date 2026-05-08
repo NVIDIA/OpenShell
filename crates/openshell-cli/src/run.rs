@@ -5457,9 +5457,8 @@ mod tests {
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
         git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
         inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
-        parse_credential_pairs,
-        plaintext_gateway_is_remote, provisioning_timeout_message, ready_false_condition_message,
-        resolve_from, sandbox_should_persist,
+        parse_credential_pairs, plaintext_gateway_is_remote, provisioning_timeout_message,
+        ready_false_condition_message, resolve_from, sandbox_should_persist,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;

@@ -56,5 +56,11 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
     assert (
         'OPENSHELL_DOCKER_SUPERVISOR_IMAGE: "ghcr.io/nvidia/openshell/supervisor:0.0.10"'
     ) in formula
+    assert 'run opt_libexec/"openshell-gateway-homebrew-service"' in formula
+    assert (
+        'docker_tls_dir="${OPENSHELL_DOCKER_TLS_DIR:-${HOME}/.local/state/openshell/homebrew/tls}"'
+    ) in formula
+    assert 'export OPENSHELL_DOCKER_TLS_CA="${docker_tls_dir}/ca.crt"' in formula
+    assert 'OPENSHELL_DOCKER_TLS_CA: "#{var}/openshell/tls/ca.crt"' not in formula
     assert "entitlements.atomic_write" in formula
     assert "brew services restart openshell" in formula

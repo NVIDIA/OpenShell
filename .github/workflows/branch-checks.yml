@@ -128,7 +128,7 @@ jobs:
           stats_bin="${SCCACHE_PATH:-sccache}"
           "$stats_bin" --show-stats
           status=$?
-          if [[ $status -ne 0 ]]; then
+          if [ "$status" -ne 0 ]; then
             echo "::warning::sccache stats unavailable (exit $status)"
           fi
           exit 0

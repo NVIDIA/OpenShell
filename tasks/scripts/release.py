@@ -269,6 +269,30 @@ class Openshell < Formula
     resource("openshell-driver-vm").stage do
       libexec.install "openshell-driver-vm"
     end
+
+    (libexec/"openshell-gateway-homebrew-service").write <<~SH
+      #!/bin/sh
+      set -eu
+
+      if [ -z "${{HOME:-}}" ]; then
+        echo "HOME must be set for Docker TLS bind mounts" >&2
+        exit 1
+      fi
+
+      docker_tls_dir="${{OPENSHELL_DOCKER_TLS_DIR:-${{HOME}}/.local/state/openshell/homebrew/tls}}"
+      mkdir -p "${{docker_tls_dir}}/client"
+      chmod 700 "${{docker_tls_dir}}" "${{docker_tls_dir}}/client"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/ca.crt" "${{docker_tls_dir}}/ca.crt"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/client/tls.crt" "${{docker_tls_dir}}/client/tls.crt"
+      /usr/bin/install -m 0600 "#{{var}}/openshell/tls/client/tls.key" "${{docker_tls_dir}}/client/tls.key"
+
+      export OPENSHELL_DOCKER_TLS_CA="${{docker_tls_dir}}/ca.crt"
+      export OPENSHELL_DOCKER_TLS_CERT="${{docker_tls_dir}}/client/tls.crt"
+      export OPENSHELL_DOCKER_TLS_KEY="${{docker_tls_dir}}/client/tls.key"
+
+      exec "#{{opt_bin}}/openshell-gateway"
+    SH
+    chmod 0755, libexec/"openshell-gateway-homebrew-service"
   end
 
   def post_install
@@ -293,7 +317,7 @@ class Openshell < Formula
   end
 
   service do
-    run opt_bin/"openshell-gateway"
+    run opt_libexec/"openshell-gateway-homebrew-service"
     environment_variables(
       OPENSHELL_BIND_ADDRESS: "127.0.0.1",
       OPENSHELL_SERVER_PORT: "{LOCAL_GATEWAY_PORT}",
@@ -309,9 +333,6 @@ class Openshell < Formula
       OPENSHELL_VM_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
       OPENSHELL_VM_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
       OPENSHELL_DOCKER_SUPERVISOR_IMAGE: "{docker_supervisor_image}",
-      OPENSHELL_DOCKER_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
-      OPENSHELL_DOCKER_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
-      OPENSHELL_DOCKER_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
       OPENSHELL_PODMAN_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
       OPENSHELL_PODMAN_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
       OPENSHELL_PODMAN_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
