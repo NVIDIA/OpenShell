@@ -4,9 +4,9 @@
 #
 # Install the OpenShell development build from a GitHub release.
 #
-# Linux keeps the Debian package install path. Apple Silicon macOS installs the
-# generated Homebrew formula from the selected release, so Homebrew owns the
-# binary layout and launchd service lifecycle.
+# Linux installs either the Debian or RPM packages from the selected release.
+# Apple Silicon macOS installs the generated Homebrew formula, so Homebrew owns
+# the binary layout and launchd service lifecycle.
 #
 set -e
 
@@ -52,7 +52,8 @@ NOTES:
     This installs the selected release from:
     ${GITHUB_URL}/releases/tag/${RELEASE_TAG}
 
-    Linux installs the Debian package on amd64 and arm64.
+    Linux installs the Debian package on amd64/arm64 or the RPM packages on
+    x86_64/aarch64, depending on the host package manager.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
@@ -84,10 +85,10 @@ download_release_asset() {
     return 0
   fi
 
-  # GitHub normalizes `~` to `.` in release asset names, while the checksum file
-  # still records the Debian package filename with `~dev` for correct version
-  # ordering. Download the normalized asset but verify it against the checksum
-  # entry for the original package filename.
+  # GitHub normalizes `~` to `.` in release asset names, while checksum files
+  # can still record package filenames with `~dev` for correct version ordering.
+  # Download the normalized asset but verify it against the checksum entry for
+  # the original package filename.
   _normalized="$(printf '%s' "$_filename" | tr '~' '.')"
   if [ "$_normalized" != "$_filename" ]; then
     if download "${GITHUB_URL}/releases/download/${_tag}/${_normalized}" "$_output"; then
@@ -186,7 +187,25 @@ detect_platform() {
   esac
 }
 
-check_linux_platform() {
+linux_package_method() {
+  if has_cmd dpkg; then
+    echo "deb"
+  elif has_cmd rpm; then
+    echo "rpm"
+  else
+    error "Linux dev installs require either dpkg or rpm"
+  fi
+}
+
+set_linux_target_runtime_dir() {
+  if [ "$(id -u)" -eq "$TARGET_UID" ] && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    TARGET_RUNTIME_DIR="$XDG_RUNTIME_DIR"
+  else
+    TARGET_RUNTIME_DIR="/run/user/${TARGET_UID}"
+  fi
+}
+
+check_linux_deb_platform() {
   require_cmd dpkg
 }
 
@@ -222,6 +241,30 @@ get_deb_arch() {
   esac
 }
 
+get_rpm_arch() {
+  if has_cmd rpm; then
+    _arch="$(rpm --eval '%{_arch}' 2>/dev/null || true)"
+  else
+    _arch=""
+  fi
+
+  if [ -z "$_arch" ]; then
+    _arch="$(uname -m)"
+  fi
+
+  case "$_arch" in
+    x86_64|amd64)
+      echo "x86_64"
+      ;;
+    aarch64|arm64)
+      echo "aarch64"
+      ;;
+    *)
+      error "no dev RPM package is published for architecture: ${_arch}"
+      ;;
+  esac
+}
+
 find_deb_asset() {
   _checksums="$1"
   _arch="$2"
@@ -231,6 +274,50 @@ find_deb_asset() {
       sub("^\\*", "", $2)
       print $2
       exit
+    }
+  ' "$_checksums"
+}
+
+find_rpm_asset() {
+  _checksums="$1"
+  _arch="$2"
+  _package="$3"
+
+  case "$_package" in
+    openshell)
+      _dev_name="openshell-dev-${_arch}.rpm"
+      _fallback_re="^openshell-[0-9].*\\.${_arch}\\.rpm$"
+      ;;
+    openshell-gateway)
+      _dev_name="openshell-gateway-dev-${_arch}.rpm"
+      _fallback_re="^openshell-gateway-[0-9].*\\.${_arch}\\.rpm$"
+      ;;
+    *)
+      error "unknown RPM package selector: ${_package}"
+      ;;
+  esac
+
+  awk -v dev_name="$_dev_name" -v fallback_re="$_fallback_re" '
+    {
+      name = $2
+      sub("^\\*", "", name)
+
+      if (name == dev_name) {
+        selected = name
+        found = 1
+        exit
+      }
+
+      if (fallback == "" && name ~ fallback_re) {
+        fallback = name
+      }
+    }
+    END {
+      if (found) {
+        print selected
+      } else if (fallback != "") {
+        print fallback
+      }
     }
   ' "$_checksums"
 }
@@ -268,6 +355,21 @@ install_deb_package() {
       "$_deb_path"
   else
     as_root dpkg --force-confdef --force-confnew -i "$_deb_path"
+  fi
+}
+
+install_rpm_packages() {
+  if has_cmd dnf; then
+    as_root dnf install -y "$@"
+  elif has_cmd yum; then
+    as_root yum install -y "$@"
+  elif has_cmd zypper; then
+    as_root zypper --non-interactive install --allow-unsigned-rpm "$@"
+  elif has_cmd rpm; then
+    warn "installing with rpm directly; dependencies must already be installed"
+    as_root rpm -Uvh --replacepkgs "$@"
+  else
+    error "'dnf', 'yum', 'zypper', or 'rpm' is required to install RPM packages"
   fi
 }
 
@@ -427,13 +529,8 @@ print_gateway_add_output() {
 }
 
 install_linux_deb() {
-  check_linux_platform
-
-  if [ "$(id -u)" -eq "$TARGET_UID" ] && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-    TARGET_RUNTIME_DIR="$XDG_RUNTIME_DIR"
-  else
-    TARGET_RUNTIME_DIR="/run/user/${TARGET_UID}"
-  fi
+  check_linux_deb_platform
+  set_linux_target_runtime_dir
 
   _arch="$(get_deb_arch)"
   _tmpdir="$(mktemp -d)"
@@ -468,6 +565,53 @@ install_linux_deb() {
   info "installing ${_deb_file}..."
   install_deb_package "$_deb_path"
   info "installed ${APP_NAME} package from ${RELEASE_TAG}"
+  start_user_gateway
+}
+
+install_linux_rpm() {
+  require_cmd rpm
+  set_linux_target_runtime_dir
+
+  _arch="$(get_rpm_arch)"
+  _tmpdir="$(mktemp -d)"
+  chmod 0755 "$_tmpdir"
+  trap 'rm -rf "$_tmpdir"' EXIT
+
+  _checksums_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${CHECKSUMS_NAME}"
+  info "downloading ${RELEASE_TAG} release checksums..."
+  download "$_checksums_url" "${_tmpdir}/${CHECKSUMS_NAME}" || {
+    error "failed to download ${_checksums_url}"
+  }
+
+  _rpm_file="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" openshell)"
+  if [ -z "$_rpm_file" ]; then
+    error "no dev openshell RPM package found for architecture: ${_arch}"
+  fi
+
+  _gateway_rpm_file="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" openshell-gateway)"
+  if [ -z "$_gateway_rpm_file" ]; then
+    error "no dev openshell-gateway RPM package found for architecture: ${_arch}"
+  fi
+
+  info "selected ${_rpm_file} and ${_gateway_rpm_file}"
+
+  for _package_file in "$_rpm_file" "$_gateway_rpm_file"; do
+    _package_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${_package_file}"
+    _package_path="${_tmpdir}/${_package_file}"
+
+    info "downloading ${_package_file}..."
+    download_release_asset "$RELEASE_TAG" "$_package_file" "$_package_path" || {
+      error "failed to download ${_package_url}"
+    }
+    chmod 0644 "$_package_path"
+
+    info "verifying checksum for ${_package_file}..."
+    verify_checksum "$_package_path" "${_tmpdir}/${CHECKSUMS_NAME}" "$_package_file"
+  done
+
+  info "installing ${_rpm_file} and ${_gateway_rpm_file}..."
+  install_rpm_packages "${_tmpdir}/${_rpm_file}" "${_tmpdir}/${_gateway_rpm_file}"
+  info "installed ${APP_NAME} RPM packages from ${RELEASE_TAG}"
   start_user_gateway
 }
 
@@ -548,7 +692,17 @@ main() {
 
   case "$PLATFORM" in
     linux)
-      install_linux_deb
+      case "$(linux_package_method)" in
+        deb)
+          install_linux_deb
+          ;;
+        rpm)
+          install_linux_rpm
+          ;;
+        *)
+          error "unsupported Linux package method"
+          ;;
+      esac
       ;;
     darwin)
       install_macos_homebrew
