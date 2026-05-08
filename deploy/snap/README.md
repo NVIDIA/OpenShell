@@ -1,22 +1,44 @@
 # Building a snap package
 
-OpenShell snap packages are hand-staged and packed with `snap pack`. They do
-not use Snapcraft yet.
+OpenShell snap packages are defined by the root `snapcraft.yaml` and built with
+Snapcraft from source.
+
+The helper task under `tasks/` still stages the same payload from pre-built
+binaries when you want to inspect the snap root or produce local artifacts.
 
 ## Prerequisites
 
 - Linux on `amd64` or `arm64`
 - `snap` from `snapd`
+- `snapcraft`
 - Docker from the Docker snap (`sudo snap install docker`)
-- `mise`
-- Release binaries for:
-  - `openshell`
-  - `openshell-gateway`
-  - `openshell-sandbox`
 
-## Build local binaries
+## Build with Snapcraft
 
-Build the release binaries that the snap packaging hook consumes:
+Build the snap from source with the root manifest:
+
+```shell
+snapcraft pack
+```
+
+The manifest builds the Rust binaries inside Snapcraft, installs the CLI,
+gateway, and sandbox supervisor into the snap, and keeps the same runtime
+environment as the current deployment logic.
+
+## Staged helper flow
+
+The helper task under `tasks/` still stages the same payload from pre-built
+binaries when you want to inspect the snap root or produce local artifacts.
+
+For that flow, install `mise` and build:
+
+- `openshell`
+- `openshell-gateway`
+- `openshell-sandbox`
+
+## Build helper binaries
+
+Build the release binaries used by the staged helper flow:
 
 ```shell
 mise run build:rust:snap

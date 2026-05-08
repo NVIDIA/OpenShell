@@ -212,5 +212,9 @@ rfc.md
 *.tar.xz
 *.tar.bz2
 
+# Snap build artifacts
+*.snap
+*.comp
+
 # Markdown/mermaid lint tooling deps
 scripts/lint-mermaid/node_modules/

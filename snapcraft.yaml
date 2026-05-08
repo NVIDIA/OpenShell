@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: openshell
+title: OpenShell
+adopt-info: openshell
+summary: Safe, sandboxed runtimes for autonomous AI agents
+description: |
+  OpenShell provides safe, sandboxed runtimes for autonomous AI agents.
+  It offers a CLI for managing gateways, sandboxes, and providers with
+  policy-enforced egress routing, credential proxying, and privacy-aware
+  LLM inference routing.
+
+base: core24
+# TODO: this prevents publishing a snap to latest/stable.
+grade: devel
+confinement: strict
+license: Apache-2.0
+website: https://docs.nvidia.com/openshell/latest/index.html
+source-code: https://github.com/NVIDIA/OpenShell
+issues: https://github.com/NVIDIA/OpenShell/issues
+contact: https://github.com/NVIDIA/OpenShell/security/policy
+platforms:
+  amd64:
+    build-on: [amd64]
+    build-for: [amd64]
+  arm64:
+    build-on: [arm64]
+    build-for: [arm64]
+
+apps:
+  openshell:
+    command: bin/openshell
+    plugs:
+      - home
+      - network
+      - ssh-keys
+      - system-observe
+  gateway:
+    command: bin/openshell-gateway
+    daemon: simple
+    refresh-mode: endure
+    environment:
+      OPENSHELL_BIND_ADDRESS: 127.0.0.1
+      OPENSHELL_SERVER_PORT: 17670
+      OPENSHELL_DB_URL: "sqlite:$SNAP_COMMON/gateway.db?mode=rwc"
+      OPENSHELL_GRPC_ENDPOINT: http://host.openshell.internal:17670
+      OPENSHELL_DISABLE_TLS: "true"
+      OPENSHELL_DRIVERS: docker
+      OPENSHELL_DOCKER_SUPERVISOR_BIN: "$SNAP/bin/openshell-sandbox"
+      OPENSHELL_DOCKER_NETWORK_NAME: openshell-snap
+      OPENSHELL_SANDBOX_IMAGE: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+      OPENSHELL_SANDBOX_IMAGE_PULL_POLICY: IfNotPresent
+      OPENSHELL_SANDBOX_SSH_PORT: 2222
+      OPENSHELL_SSH_GATEWAY_HOST: 127.0.0.1
+      OPENSHELL_SSH_GATEWAY_PORT: 8080
+      XDG_DATA_HOME: "$SNAP_COMMON"
+      XDG_RUNTIME_DIR: "$SNAP_COMMON"
+    plugs:
+      - docker
+      - log-observe
+      - network
+      - network-bind
+      - ssh-keys
+      - system-observe
+
+parts:
+  openshell:
+    plugin: rust
+    rust-channel: "1.95.0"
+    source: .
+    build-packages:
+      - build-essential
+      - ca-certificates
+      - clang
+      - cmake
+      - git
+      - libclang-dev
+      - libssl-dev
+      - libz3-dev
+      - pkg-config
+      - python3
+    override-pull: |
+      craftctl default
+      craftctl set version="$(python3 "$CRAFT_PROJECT_DIR/tasks/scripts/release.py" get-version --snap)"
+    override-build: |
+      set -euo pipefail
+
+      cargo build --release --locked -p openshell-cli --features bundled-z3
+      cargo build --release --locked -p openshell-server --bin openshell-gateway
+      cargo build --release --locked -p openshell-sandbox --bin openshell-sandbox
+
+      install -D -m 0755 "$CRAFT_PROJECT_DIR/target/release/openshell" \
+        "$CRAFT_PART_INSTALL/bin/openshell"
+      install -D -m 0755 "$CRAFT_PROJECT_DIR/target/release/openshell-gateway" \
+        "$CRAFT_PART_INSTALL/bin/openshell-gateway"
+      install -D -m 0755 "$CRAFT_PROJECT_DIR/target/release/openshell-sandbox" \
+        "$CRAFT_PART_INSTALL/bin/openshell-sandbox"
+      install -D -m 0644 "$CRAFT_PROJECT_DIR/LICENSE" \
+        "$CRAFT_PART_INSTALL/usr/share/doc/openshell/LICENSE"
+      install -D -m 0644 "$CRAFT_PROJECT_DIR/README.md" \
+        "$CRAFT_PART_INSTALL/usr/share/doc/openshell/README.md"
