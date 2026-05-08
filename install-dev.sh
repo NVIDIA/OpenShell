@@ -400,18 +400,6 @@ patch_homebrew_formula() {
     mv "$_patched_file" "$_formula_file"
   fi
 
-  if ! grep -q 'OPENSHELL_DRIVERS:' "$_formula_file"; then
-    info "patching Homebrew formula to use VM driver..."
-    awk '
-      {
-        print
-        if ($0 ~ /^[[:space:]]*environment_variables\(/) {
-          print "      OPENSHELL_DRIVERS: \"vm\","
-        }
-      }
-    ' "$_formula_file" >"$_patched_file"
-    mv "$_patched_file" "$_formula_file"
-  fi
 }
 
 start_user_gateway() {
