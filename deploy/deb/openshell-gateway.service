@@ -27,7 +27,7 @@ Environment=OPENSHELL_PODMAN_TLS_CA=%S/openshell/tls/ca.crt
 Environment=OPENSHELL_PODMAN_TLS_CERT=%S/openshell/tls/client/tls.crt
 Environment=OPENSHELL_PODMAN_TLS_KEY=%S/openshell/tls/client/tls.key
 EnvironmentFile=-%h/.config/openshell/gateway.env
-ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir %S/openshell/tls
+ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir %S/openshell/tls --server-san host.openshell.internal
 ExecStart=/usr/bin/openshell-gateway
 Restart=on-failure
 RestartSec=5s
