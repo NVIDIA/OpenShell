@@ -34,4 +34,18 @@ message Provider {
   map<string, string> credentials = 3;
   // Non-secret provider configuration.
   map<string, string> config = 4;
+  // Subset of `credentials` keys whose real values should be injected directly
+  // into the agent process environment instead of the canonical
+  // `openshell:resolve:env:<KEY>` placeholder. The L7 proxy does not rewrite
+  // these on egress because the real value is already on the client side.
+  //
+  // Use sparingly: this drops the "agent never sees the real secret" invariant
+  // for the listed keys. Required for SDKs that validate credential format
+  // in-process (Slack `xoxb-*`/`xapp-*`), credentials consumed in in-process
+  // crypto (HMAC signing secrets, signature verification), and transports the
+  // proxy cannot rewrite (WebSocket payloads after HTTP 101 upgrade).
+  //
+  // Each entry must be a valid environment variable name and present in
+  // `credentials`.
+  repeated string passthrough_credentials = 5;
 }

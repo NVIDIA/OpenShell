@@ -238,13 +238,24 @@ pub async fn sync_policy(endpoint: &str, sandbox: &str, policy: &ProtoSandboxPol
 
 /// Fetch provider environment variables for a sandbox from `OpenShell` server via gRPC.
 ///
-/// Returns a map of environment variable names to values derived from provider
-/// credentials configured on the sandbox. Returns an empty map if the sandbox
-/// has no providers or the call fails.
+/// Resolved provider environment for the sandbox.
+#[derive(Debug, Default, Clone)]
+pub struct ProviderEnvironment {
+    /// Credential environment variables (canonical and passthrough mixed).
+    pub environment: HashMap<String, String>,
+    /// Subset of `environment` keys whose value is the real credential and
+    /// must be injected directly into the agent process — bypassing the
+    /// canonical placeholder substitution and L7 proxy rewriting.
+    pub passthrough_keys: Vec<String>,
+}
+
+/// Returns the env map and passthrough keys derived from provider credentials
+/// configured on the sandbox. Returns an empty result if the sandbox has no
+/// providers or the call fails.
 pub async fn fetch_provider_environment(
     endpoint: &str,
     sandbox_id: &str,
-) -> Result<HashMap<String, String>> {
+) -> Result<ProviderEnvironment> {
     debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Fetching provider environment");
 
     let mut client = connect(endpoint).await?;
@@ -256,7 +267,11 @@ pub async fn fetch_provider_environment(
         .await
         .into_diagnostic()?;
 
-    Ok(response.into_inner().environment)
+    let inner = response.into_inner();
+    Ok(ProviderEnvironment {
+        environment: inner.environment,
+        passthrough_keys: inner.passthrough_keys,
+    })
 }
 
 /// A reusable gRPC client for the `OpenShell` service.

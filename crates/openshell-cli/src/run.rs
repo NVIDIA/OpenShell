@@ -2776,6 +2776,7 @@ async fn auto_create_provider(
                 r#type: provider_type.to_string(),
                 credentials: discovered.credentials.clone(),
                 config: discovered.config.clone(),
+                passthrough_credentials: Vec::new(),
             }),
         };
 
@@ -2816,6 +2817,7 @@ async fn auto_create_provider(
                     r#type: provider_type.to_string(),
                     credentials: discovered.credentials.clone(),
                     config: discovered.config.clone(),
+                    passthrough_credentials: Vec::new(),
                 }),
             };
 
@@ -2876,6 +2878,50 @@ fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String,
     Ok(map)
 }
 
+/// Parse `--passthrough KEY` flags into a deduplicated list. Validates that
+/// each entry is non-empty and that no key is supplied more than once.
+///
+/// Cross-referencing against the credential map is intentionally not done
+/// here — call [`ensure_passthrough_in_credentials`] when the caller has the
+/// full local credential set (e.g. on `provider create` after
+/// `--from-existing` discovery). On `provider update` the credential set
+/// lives only on the server, and the server re-validates anyway.
+fn parse_passthrough_keys(items: &[String]) -> Result<Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let key = item.trim();
+        if key.is_empty() {
+            return Err(miette::miette!("--passthrough key cannot be empty"));
+        }
+        if !seen.insert(key.to_string()) {
+            return Err(miette::miette!(
+                "--passthrough key '{key}' was supplied more than once"
+            ));
+        }
+        out.push(key.to_string());
+    }
+    Ok(out)
+}
+
+/// Reject any passthrough key that is not present in `credential_map`. The
+/// caller is responsible for assembling the full local credential set before
+/// invoking — typically explicit `--credential` entries merged with anything
+/// `--from-existing` discovered.
+fn ensure_passthrough_in_credentials(
+    passthrough: &[String],
+    credential_map: &HashMap<String, String>,
+) -> Result<()> {
+    for key in passthrough {
+        if !credential_map.contains_key(key) {
+            return Err(miette::miette!(
+                "--passthrough '{key}' is not present in resolved credentials"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
 
@@ -2912,6 +2958,7 @@ fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
+#[allow(clippy::too_many_arguments)] // user-facing CLI command
 pub async fn provider_create(
     server: &str,
     name: &str,
@@ -2919,6 +2966,7 @@ pub async fn provider_create(
     from_existing: bool,
     credentials: &[String],
     config: &[String],
+    passthrough: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
     if from_existing && !credentials.is_empty() {
@@ -2959,6 +3007,7 @@ pub async fn provider_create(
 
     let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
+    let passthrough_credentials = parse_passthrough_keys(passthrough)?;
 
     if from_existing {
         let registry = ProviderRegistry::new();
@@ -2986,6 +3035,11 @@ pub async fn provider_create(
         ));
     }
 
+    // The full credential set is known locally on create (--credential plus
+    // anything --from-existing discovered), so cross-check passthrough keys
+    // here for fast feedback. The server re-validates regardless.
+    ensure_passthrough_in_credentials(&passthrough_credentials, &credential_map)?;
+
     let response = client
         .create_provider(CreateProviderRequest {
             provider: Some(Provider {
@@ -2998,6 +3052,7 @@ pub async fn provider_create(
                 r#type: provider_type.clone(),
                 credentials: credential_map,
                 config: config_map,
+                passthrough_credentials,
             }),
         })
         .await
@@ -3030,8 +3085,25 @@ pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<
         .provider
         .ok_or_else(|| miette::miette!("provider missing from response"))?;
 
-    let credential_keys = provider.credentials.keys().cloned().collect::<Vec<_>>();
-    let config_keys = provider.config.keys().cloned().collect::<Vec<_>>();
+    let passthrough: HashSet<&str> = provider
+        .passthrough_credentials
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut credential_keys = provider
+        .credentials
+        .keys()
+        .map(|k| {
+            if passthrough.contains(k.as_str()) {
+                format!("{k} (passthrough)")
+            } else {
+                k.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    credential_keys.sort();
+    let mut config_keys = provider.config.keys().cloned().collect::<Vec<_>>();
+    config_keys.sort();
 
     println!("{}", "Provider:".cyan().bold());
     println!();
@@ -3102,19 +3174,21 @@ pub async fn provider_list(
         .max(4);
 
     println!(
-        "{:<name_width$}  {:<type_width$}  {:<16}  {}",
+        "{:<name_width$}  {:<type_width$}  {:<16}  {:<13}  {}",
         "NAME".bold(),
         "TYPE".bold(),
         "CREDENTIAL_KEYS".bold(),
+        "PASSTHROUGH".bold(),
         "CONFIG_KEYS".bold(),
     );
 
     for provider in providers {
         println!(
-            "{:<name_width$}  {:<type_width$}  {:<16}  {}",
+            "{:<name_width$}  {:<type_width$}  {:<16}  {:<13}  {}",
             provider.object_name().to_string(),
             provider.r#type,
             provider.credentials.len(),
+            provider.passthrough_credentials.len(),
             provider.config.len(),
         );
     }
@@ -3442,6 +3516,7 @@ pub async fn provider_update(
     from_existing: bool,
     credentials: &[String],
     config: &[String],
+    passthrough: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
     if from_existing && !credentials.is_empty() {
@@ -3454,6 +3529,11 @@ pub async fn provider_update(
 
     let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
+    // On update the local --credential set may legitimately be empty (the
+    // operator is only changing the passthrough list against existing stored
+    // credentials), so the cross-check against credentials is delegated to
+    // server-side validation, which sees the post-merge state.
+    let passthrough_credentials = parse_passthrough_keys(passthrough)?;
 
     if from_existing {
         // Fetch the existing provider to discover its type for credential lookup.
@@ -3498,6 +3578,7 @@ pub async fn provider_update(
                 r#type: String::new(),
                 credentials: credential_map,
                 config: config_map,
+                passthrough_credentials,
             }),
         })
         .await

@@ -58,6 +58,7 @@ def provider(
     name: str,
     provider_type: str,
     credentials: dict[str, str],
+    passthrough_credentials: list[str] | None = None,
 ) -> Iterator[str]:
     """Create a provider for the duration of the block, then delete it."""
     _delete_provider(stub, name)
@@ -67,6 +68,7 @@ def provider(
                 metadata=datamodel_pb2.ObjectMeta(name=name),
                 type=provider_type,
                 credentials=credentials,
+                passthrough_credentials=passthrough_credentials or [],
             )
         )
     )
@@ -181,6 +183,81 @@ def test_nvidia_provider_injects_nvidia_api_key_env_var(
             result = sb.exec_python(read_nvidia_key)
             assert result.exit_code == 0, result.stderr
             assert result.stdout.strip() == "openshell:resolve:env:NVIDIA_API_KEY"
+
+
+# ===========================================================================
+# Tests: selective passthrough
+# ===========================================================================
+
+
+def test_passthrough_credential_visible_as_real_value(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """A credential listed in passthrough_credentials is injected as the real
+    value, not as the canonical openshell:resolve:env:* placeholder."""
+    real_value = "xoxb-e2e-passthrough-real-value-for-slack"
+    with provider(
+        sandbox_client._stub,
+        name="e2e-test-passthrough-real-value",
+        provider_type="generic",
+        credentials={"SLACK_BOT_TOKEN": real_value},
+        passthrough_credentials=["SLACK_BOT_TOKEN"],
+    ) as provider_name:
+        spec = datamodel_pb2.SandboxSpec(
+            policy=_default_policy(),
+            providers=[provider_name],
+        )
+
+        def read_slack_token() -> str:
+            import os
+
+            return os.environ.get("SLACK_BOT_TOKEN", "NOT_SET")
+
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            result = sb.exec_python(read_slack_token)
+            assert result.exit_code == 0, result.stderr
+            value = result.stdout.strip()
+            assert value == real_value
+            assert value != "openshell:resolve:env:SLACK_BOT_TOKEN"
+
+
+def test_passthrough_and_canonical_credentials_coexist(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """A provider with one passthrough and one canonical credential injects
+    each in its own mode: real value for the passthrough key, canonical
+    placeholder for the other."""
+    real_signing_secret = "e2e-passthrough-real-signing-secret"
+    with provider(
+        sandbox_client._stub,
+        name="e2e-test-passthrough-mixed",
+        provider_type="generic",
+        credentials={
+            "SLACK_SIGNING_SECRET": real_signing_secret,
+            "SLACK_API_KEY": "irrelevant-canonical-value",
+        },
+        passthrough_credentials=["SLACK_SIGNING_SECRET"],
+    ) as provider_name:
+        spec = datamodel_pb2.SandboxSpec(
+            policy=_default_policy(),
+            providers=[provider_name],
+        )
+
+        def read_both_envs() -> str:
+            import os
+
+            signing = os.environ.get("SLACK_SIGNING_SECRET", "NOT_SET")
+            api = os.environ.get("SLACK_API_KEY", "NOT_SET")
+            return f"{signing}|{api}"
+
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            result = sb.exec_python(read_both_envs)
+            assert result.exit_code == 0, result.stderr
+            signing, api = result.stdout.strip().split("|", 1)
+            assert signing == real_signing_secret
+            assert api == "openshell:resolve:env:SLACK_API_KEY"
 
 
 # ===========================================================================

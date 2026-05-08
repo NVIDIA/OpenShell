@@ -683,6 +683,15 @@ enum ProviderCommands {
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
         config: Vec<String>,
+
+        /// Credential key whose real value is injected directly into the
+        /// agent process, bypassing the canonical placeholder substitution
+        /// and L7 proxy rewriting. Each key must also appear in `--credential`
+        /// (or be discovered via `--from-existing`). Drops the "agent never
+        /// sees the real secret" invariant for that key — see provider docs
+        /// for the security trade-off.
+        #[arg(long = "passthrough", value_name = "KEY")]
+        passthrough: Vec<String>,
     },
 
     /// Fetch a provider by name.
@@ -743,6 +752,15 @@ enum ProviderCommands {
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
         config: Vec<String>,
+
+        /// Credential key whose real value is injected directly into the
+        /// agent process, bypassing the canonical placeholder substitution
+        /// and L7 proxy rewriting. Replaces the existing passthrough list
+        /// when non-empty. Each key must also be present in the merged
+        /// credentials. Drops the "agent never sees the real secret"
+        /// invariant for that key.
+        #[arg(long = "passthrough", value_name = "KEY")]
+        passthrough: Vec<String>,
     },
 
     /// Delete providers by name.
@@ -2404,6 +2422,7 @@ async fn main() -> Result<()> {
                     from_existing,
                     credentials,
                     config,
+                    passthrough,
                 } => {
                     run::provider_create(
                         endpoint,
@@ -2412,6 +2431,7 @@ async fn main() -> Result<()> {
                         from_existing,
                         &credentials,
                         &config,
+                        &passthrough,
                         &tls,
                     )
                     .await?;
@@ -2460,6 +2480,7 @@ async fn main() -> Result<()> {
                     from_existing,
                     credentials,
                     config,
+                    passthrough,
                 } => {
                     run::provider_update(
                         endpoint,
@@ -2467,6 +2488,7 @@ async fn main() -> Result<()> {
                         from_existing,
                         &credentials,
                         &config,
+                        &passthrough,
                         &tls,
                     )
                     .await?;
