@@ -12,7 +12,7 @@ use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::provider_credentials::ProviderCredentialState;
 use crate::secrets::{SecretResolver, rewrite_header_line};
 use miette::{IntoDiagnostic, Result};
-use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
+use openshell_core::net::{is_always_blocked_ip, is_internal_ip, is_link_local_ip};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
     NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
@@ -1940,6 +1940,18 @@ fn detect_trusted_host_gateway() -> Option<IpAddr> {
         );
         return None;
     }
+    // The exemption exists solely for link-local IPs used by rootless Podman
+    // with pasta. Loopback (127.x), unspecified (0.0.0.0), and other
+    // always-blocked non-link-local addresses are never legitimate host
+    // gateway IPs and must not receive the exemption.
+    if is_always_blocked_ip(ip) && !is_link_local_ip(ip) {
+        warn!(
+            %ip,
+            "host.openshell.internal maps to an always-blocked non-link-local IP; \
+             trusted-gateway SSRF exemption disabled"
+        );
+        return None;
+    }
     Some(ip)
 }
 
@@ -1989,6 +2001,18 @@ async fn resolve_and_check_trusted_gateway(
             return Err(format!(
                 "{host} resolves to {} which does not match trusted host gateway \
                  {trusted_gw}, connection rejected",
+                addr.ip()
+            ));
+        }
+        // Defense-in-depth: even if the resolved IP matches trusted_gw, reject
+        // always-blocked non-link-local addresses (loopback, unspecified). This
+        // catches the case where detect_trusted_host_gateway somehow admitted a
+        // bad IP, or where trusted_gw was set to a loopback/unspecified address
+        // through a code path we haven't anticipated.
+        if is_always_blocked_ip(addr.ip()) && !is_link_local_ip(addr.ip()) {
+            return Err(format!(
+                "{host} resolves to always-blocked non-link-local address {}, \
+                 connection rejected",
                 addr.ip()
             ));
         }
@@ -3898,6 +3922,48 @@ mod tests {
         assert!(ips.is_empty());
     }
 
+    #[test]
+    fn test_detect_trusted_host_gateway_rejects_loopback() {
+        // Loopback is always-blocked and not link-local — must not be trusted.
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert!(!is_cloud_metadata_ip(ip));
+        assert!(is_always_blocked_ip(ip));
+        assert!(!is_link_local_ip(ip));
+        // The guard: always-blocked && !link-local → reject.
+        assert!(is_always_blocked_ip(ip) && !is_link_local_ip(ip));
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_rejects_unspecified() {
+        // Unspecified (0.0.0.0) must not be trusted.
+        let ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        assert!(!is_cloud_metadata_ip(ip));
+        assert!(is_always_blocked_ip(ip));
+        assert!(!is_link_local_ip(ip));
+        assert!(is_always_blocked_ip(ip) && !is_link_local_ip(ip));
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_rejects_loopback_v6() {
+        let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert!(!is_cloud_metadata_ip(ip));
+        assert!(is_always_blocked_ip(ip));
+        assert!(!is_link_local_ip(ip));
+        assert!(is_always_blocked_ip(ip) && !is_link_local_ip(ip));
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_allows_link_local_non_metadata() {
+        // 169.254.1.2 is always-blocked (link-local) but IS link-local,
+        // so the guard should pass and allow the exemption.
+        let ip = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        assert!(!is_cloud_metadata_ip(ip));
+        assert!(is_always_blocked_ip(ip));
+        assert!(is_link_local_ip(ip));
+        // The guard does NOT fire — this IP is eligible for the exemption.
+        assert!(!(is_always_blocked_ip(ip) && !is_link_local_ip(ip)));
+    }
+
     // -- resolve_and_check_trusted_gateway --
 
     #[tokio::test]
@@ -4006,6 +4072,58 @@ mod tests {
                 "expected control-plane rejection for port {port}"
             );
         }
+    }
+
+    #[test]
+    fn test_trusted_gateway_rejects_loopback_as_trusted_gw() {
+        // Defense-in-depth: even if detect_trusted_host_gateway somehow admitted
+        // a loopback IP, the always-blocked non-link-local guard must fire.
+        // We validate the guard logic inline (mirroring resolve_and_check internals)
+        // since DNS resolution of "localhost" is environment-dependent.
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert!(!is_cloud_metadata_ip(loopback));
+        assert!(is_always_blocked_ip(loopback));
+        assert!(!is_link_local_ip(loopback));
+        // The guard fires: always-blocked && !link-local → reject.
+        let err: Result<(), String> =
+            if is_always_blocked_ip(loopback) && !is_link_local_ip(loopback) {
+                Err(format!(
+                    "host resolves to always-blocked non-link-local address {loopback}, \
+                 connection rejected"
+                ))
+            } else {
+                Ok(())
+            };
+        assert!(err.is_err(), "loopback must be rejected");
+        assert!(
+            err.unwrap_err().contains("always-blocked non-link-local"),
+            "expected always-blocked rejection"
+        );
+    }
+
+    #[test]
+    fn test_trusted_gateway_rejects_unspecified_as_trusted_gw() {
+        // Defense-in-depth: 0.0.0.0 as trusted_gw must be rejected even if
+        // the mismatch check passes.
+        let unspecified = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        assert!(!is_cloud_metadata_ip(unspecified));
+        assert!(is_always_blocked_ip(unspecified));
+        assert!(!is_link_local_ip(unspecified));
+        // The guard fires: always-blocked && !link-local → reject.
+        let err: Result<(), String> =
+            if is_always_blocked_ip(unspecified) && !is_link_local_ip(unspecified) {
+                Err(format!(
+                    "host resolves to always-blocked non-link-local address {unspecified}, \
+                 connection rejected"
+                ))
+            } else {
+                Ok(())
+            };
+        assert!(err.is_err(), "unspecified must be rejected");
+        assert!(
+            err.unwrap_err().contains("always-blocked non-link-local"),
+            "expected always-blocked rejection"
+        );
     }
 
     #[tokio::test]

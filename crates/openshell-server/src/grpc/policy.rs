@@ -2141,6 +2141,7 @@ fn generate_security_notes(host: &str, port: u16) -> String {
         || host.starts_with("192.168.")
         || host == "localhost"
         || host.starts_with("127.")
+        || host.starts_with("169.254.")
     {
         notes.push(format!(
             "Destination '{host}' appears to be an internal/private address."

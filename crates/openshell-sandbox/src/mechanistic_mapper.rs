@@ -295,12 +295,13 @@ fn generate_security_notes(host: &str, port: u16, is_ssrf: bool) -> String {
         );
     }
 
-    // Check for private IP patterns in the host.
+    // Check for private/reserved IP patterns in the host.
     if host.starts_with("10.")
         || host.starts_with("172.")
         || host.starts_with("192.168.")
         || host == "localhost"
         || host.starts_with("127.")
+        || host.starts_with("169.254.")
     {
         notes.push(format!(
             "Destination '{host}' appears to be an internal/private address."
