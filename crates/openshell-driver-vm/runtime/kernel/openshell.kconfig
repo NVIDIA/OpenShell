@@ -8,6 +8,13 @@
 #
 # See also: check-vm-capabilities.sh for runtime verification.
 
+# ── Root disk transport and filesystem ─────────────────────────────────
+CONFIG_BLOCK=y
+CONFIG_BLK_DEV=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_EXT4_FS=y
+CONFIG_EXT4_USE_FOR_EXT2=y
+
 # ── Network Namespaces (required for pod isolation) ─────────────────────
 CONFIG_NET_NS=y
 CONFIG_NAMESPACES=y

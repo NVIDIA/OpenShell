@@ -10,7 +10,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::{embedded_runtime, ffi, procguard};
+use crate::{embedded_runtime, ffi, procguard, rootfs};
 
 pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
 
@@ -18,7 +18,7 @@ pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
 /// Used by the SIGTERM/SIGINT handler to forward signals to the VM.
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
-/// PID of the helper process (gvproxy for libkrun, virtiofsd for QEMU).
+/// PID of the helper process (gvproxy for libkrun; zero for QEMU).
 /// Zero when not running. Used by the SIGTERM/SIGINT handler and
 /// procguard cleanup callback to ensure the helper doesn't outlive the
 /// launcher (especially on macOS where `PR_SET_PDEATHSIG` is absent).
@@ -45,7 +45,7 @@ const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_HOST_UFO;
 
 pub struct VmLaunchConfig {
-    pub rootfs: PathBuf,
+    pub root_disk: PathBuf,
     pub vcpus: u8,
     pub mem_mib: u32,
     pub exec_path: String,
@@ -96,10 +96,10 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .as_deref()
         .ok_or("host_ip is required for QEMU backend")?;
 
-    if !config.rootfs.is_dir() {
+    if !config.root_disk.is_file() {
         return Err(format!(
-            "rootfs directory not found: {}",
-            config.rootfs.display()
+            "root disk image not found: {}",
+            config.root_disk.display()
         ));
     }
 
@@ -111,69 +111,12 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     check_kvm_access()?;
 
     let guest_env = qemu_guest_env_vars(config, host_dns_server());
-    write_guest_env_file(&config.rootfs, &guest_env)?;
-
-    let rootfs_str = config.rootfs.to_str().ok_or("rootfs path not UTF-8")?;
-    let sandbox_dir = config.rootfs.parent().unwrap_or(&config.rootfs);
-    let sock_prefix = tap_device.trim_start_matches("vmtap-");
-    let virtiofsd_sock_dir = PathBuf::from(format!("/tmp/ovm-qemu-{sock_prefix}"));
-    std::fs::create_dir_all(&virtiofsd_sock_dir)
-        .map_err(|e| format!("create virtiofsd sock dir: {e}"))?;
-    let virtiofsd_sock = virtiofsd_sock_dir.join("virtiofsd.sock");
-    let shm_path = format!("/dev/shm/ovm-qemu-{sock_prefix}");
-
-    std::fs::create_dir_all(&shm_path).map_err(|e| format!("create shm dir: {e}"))?;
+    write_guest_env_file(&config.root_disk, &guest_env)?;
 
     let runtime_dir = qemu_runtime_dir()?;
-
     let gw_port = config.gateway_port.unwrap_or(0);
     setup_tap_networking(tap_device, host_ip, gw_port)?;
     let mut tap_guard = TapGuard::new(tap_device.to_string(), host_ip.to_string(), gw_port);
-
-    let virtiofsd_log = sandbox_dir.join("virtiofsd.log");
-    let virtiofsd_log_file =
-        std::fs::File::create(&virtiofsd_log).map_err(|e| format!("create virtiofsd log: {e}"))?;
-
-    let virtiofsd_bin = {
-        let runtime_virtiofsd = runtime_dir.join("virtiofsd");
-        if runtime_virtiofsd.is_file() {
-            runtime_virtiofsd
-        } else {
-            PathBuf::from("virtiofsd")
-        }
-    };
-
-    let mut virtiofsd_cmd = StdCommand::new(&virtiofsd_bin);
-    virtiofsd_cmd
-        .arg("--socket-path")
-        .arg(&virtiofsd_sock)
-        .arg("--shared-dir")
-        .arg(rootfs_str)
-        .arg("--cache=auto")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(virtiofsd_log_file);
-
-    #[cfg(target_os = "linux")]
-    {
-        use nix::sys::signal::Signal;
-        use std::os::unix::process::CommandExt as _;
-        unsafe {
-            virtiofsd_cmd.pre_exec(|| {
-                nix::sys::prctl::set_pdeathsig(Signal::SIGKILL)
-                    .map_err(|err| std::io::Error::other(format!("pdeathsig: {err}")))
-            });
-        }
-    }
-
-    let virtiofsd_child = virtiofsd_cmd
-        .spawn()
-        .map_err(|e| format!("failed to start virtiofsd: {e}"))?;
-    let virtiofsd_pid = virtiofsd_child.id().cast_signed();
-    GVPROXY_PID.store(virtiofsd_pid, Ordering::Relaxed);
-    let mut virtiofsd_guard = GvproxyGuard::new(virtiofsd_child);
-
-    wait_for_path(&virtiofsd_sock, Duration::from_secs(5), "virtiofsd socket")?;
 
     let vmlinux = runtime_dir.join("vmlinux");
     if !vmlinux.is_file() {
@@ -198,20 +141,13 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .arg(&vmlinux)
         .arg("-append")
         .arg(&kernel_cmdline)
-        .arg("-chardev")
+        .arg("-drive")
         .arg(format!(
-            "socket,id=virtiofs,path={}",
-            virtiofsd_sock.display()
+            "file={},if=none,format=raw,id=rootfs",
+            config.root_disk.display()
         ))
         .arg("-device")
-        .arg("vhost-user-fs-pci,chardev=virtiofs,tag=rootfs")
-        .arg("-object")
-        .arg(format!(
-            "memory-backend-memfd,id=mem,size={}M,share=on",
-            config.mem_mib
-        ))
-        .arg("-numa")
-        .arg("node,memdev=mem")
+        .arg("virtio-blk-pci,drive=rootfs")
         .arg("-netdev")
         .arg(format!(
             "tap,id=net0,ifname={tap_device},script=no,downscript=no"
@@ -263,15 +199,8 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .map_err(|e| format!("failed to wait for QEMU: {e}"))?;
 
     CHILD_PID.store(0, Ordering::Relaxed);
-    unsafe {
-        libc::kill(virtiofsd_pid, libc::SIGTERM);
-    }
-    virtiofsd_guard.disarm();
-    GVPROXY_PID.store(0, Ordering::Relaxed);
     teardown_tap_networking(tap_device, host_ip, gw_port);
     tap_guard.disarm();
-    let _ = std::fs::remove_dir_all(&shm_path);
-    let _ = std::fs::remove_dir_all(&virtiofsd_sock_dir);
 
     if status.success() {
         Ok(())
@@ -280,12 +209,11 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     }
 }
 
-/// Write environment variables into the rootfs so the guest init script
-/// can source them. virtiofs shares the host rootfs directory into the guest.
-fn write_guest_env_file(rootfs: &Path, env_vars: &[String]) -> Result<(), String> {
-    let srv_dir = rootfs.join("srv");
-    std::fs::create_dir_all(&srv_dir).map_err(|e| format!("create /srv in rootfs: {e}"))?;
-    let env_file = srv_dir.join("openshell-env.sh");
+/// Write environment variables into the root disk so the guest init script can
+/// source them. QEMU does not provide a `krun_set_exec` equivalent, so the
+/// launcher injects this small per-sandbox file into the copied root image
+/// before boot.
+fn write_guest_env_file(root_disk: &Path, env_vars: &[String]) -> Result<(), String> {
     let mut content = String::new();
     for var in env_vars {
         if let Some((key, value)) = var.split_once('=') {
@@ -293,8 +221,7 @@ fn write_guest_env_file(rootfs: &Path, env_vars: &[String]) -> Result<(), String
             let _ = writeln!(content, "export {key}=\"{}\"", shell_escape(value));
         }
     }
-    std::fs::write(&env_file, &content).map_err(|e| format!("write guest env file: {e}"))?;
-    Ok(())
+    rootfs::write_rootfs_image_file(root_disk, "/srv/openshell-env.sh", content.as_bytes())
 }
 
 fn qemu_guest_env_vars(config: &VmLaunchConfig, dns_server: Option<String>) -> Vec<String> {
@@ -331,8 +258,8 @@ fn shell_escape(s: &str) -> String {
 fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
     let mut parts = vec![
         "console=ttyS0".to_string(),
-        "root=rootfs".to_string(),
-        "rootfstype=virtiofs".to_string(),
+        "root=/dev/vda".to_string(),
+        "rootfstype=ext4".to_string(),
         "rw".to_string(),
         "panic=-1".to_string(),
         format!("init={}", config.exec_path),
@@ -674,10 +601,10 @@ fn procguard_kill_children() {
 }
 
 fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
-    if !config.rootfs.is_dir() {
+    if !config.root_disk.is_file() {
         return Err(format!(
-            "rootfs directory not found: {}",
-            config.rootfs.display()
+            "root disk image not found: {}",
+            config.root_disk.display()
         ));
     }
 
@@ -702,7 +629,7 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
 
     let vm = VmContext::create(&runtime_dir, config.log_level)?;
     vm.set_vm_config(config.vcpus, config.mem_mib)?;
-    vm.set_root(&config.rootfs)?;
+    vm.set_root_disk(&config.root_disk)?;
     vm.set_workdir(&config.workdir)?;
 
     // Run gvproxy strictly as the guest's virtual NIC / DHCP / router.
@@ -749,12 +676,12 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
             ));
         }
 
-        let sock_base = gvproxy_socket_base(&config.rootfs)?;
+        let sock_base = gvproxy_socket_base(&config.root_disk)?;
         let net_sock = sock_base.with_extension("v");
         let _ = std::fs::remove_file(&net_sock);
         let _ = std::fs::remove_file(sock_base.with_extension("v-krun.sock"));
 
-        let run_dir = config.rootfs.parent().unwrap_or(&config.rootfs);
+        let run_dir = config.root_disk.parent().unwrap_or(&config.root_disk);
         let gvproxy_log = run_dir.join("gvproxy.log");
         let gvproxy_log_file = std::fs::File::create(&gvproxy_log)
             .map_err(|e| format!("create gvproxy log {}: {e}", gvproxy_log.display()))?;
@@ -1013,11 +940,37 @@ impl VmContext {
         )
     }
 
-    fn set_root(&self, rootfs: &Path) -> Result<(), String> {
-        let rootfs_c = path_to_cstring(rootfs)?;
+    fn set_root_disk(&self, root_disk: &Path) -> Result<(), String> {
+        let root_disk_c = path_to_cstring(root_disk)?;
+        let block_id_c = CString::new("root").map_err(|e| format!("invalid block id: {e}"))?;
         check(
-            unsafe { (self.krun.krun_set_root)(self.ctx_id, rootfs_c.as_ptr()) },
-            "krun_set_root",
+            unsafe {
+                (self.krun.krun_add_disk)(
+                    self.ctx_id,
+                    block_id_c.as_ptr(),
+                    root_disk_c.as_ptr(),
+                    false,
+                )
+            },
+            "krun_add_disk",
+        )?;
+
+        let device_c =
+            CString::new("/dev/vda").map_err(|e| format!("invalid root disk device: {e}"))?;
+        let fstype_c =
+            CString::new("ext4").map_err(|e| format!("invalid root disk fstype: {e}"))?;
+        let options_c =
+            CString::new("rw").map_err(|e| format!("invalid root disk options: {e}"))?;
+        check(
+            unsafe {
+                (self.krun.krun_set_root_disk_remount)(
+                    self.ctx_id,
+                    device_c.as_ptr(),
+                    fstype_c.as_ptr(),
+                    options_c.as_ptr(),
+                )
+            },
+            "krun_set_root_disk_remount",
         )
     }
 
@@ -1234,8 +1187,8 @@ fn secure_socket_base(subdir: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn gvproxy_socket_base(rootfs: &Path) -> Result<PathBuf, String> {
-    Ok(secure_socket_base("osd-gv")?.join(hash_path_id(rootfs)))
+fn gvproxy_socket_base(root_disk: &Path) -> Result<PathBuf, String> {
+    Ok(secure_socket_base("osd-gv")?.join(hash_path_id(root_disk)))
 }
 
 fn install_signal_forwarding(pid: i32) {
@@ -1342,7 +1295,7 @@ mod tests {
 
     fn qemu_config() -> VmLaunchConfig {
         VmLaunchConfig {
-            rootfs: PathBuf::from("/rootfs"),
+            root_disk: PathBuf::from("/rootfs.ext4"),
             vcpus: 2,
             mem_mib: 2048,
             exec_path: "/srv/openshell-vm-sandbox-init.sh".to_string(),
@@ -1377,6 +1330,8 @@ mod tests {
     fn kernel_cmdline_keeps_guest_init_metadata_out_of_proc_cmdline() {
         let cmdline = build_kernel_cmdline(&qemu_config());
 
+        assert!(cmdline.contains("root=/dev/vda"));
+        assert!(cmdline.contains("rootfstype=ext4"));
         assert!(cmdline.contains("ip=10.0.128.2::10.0.128.1:255.255.255.252:sandbox::off"));
         assert!(cmdline.contains("firmware_class.path=/lib/firmware"));
         assert!(!cmdline.contains("VM_NET_IP="));
