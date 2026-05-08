@@ -24,9 +24,9 @@ jobs:
         run: |
           launchctl setenv OPENSHELL_DRIVERS vm
 
-      - name: Install dev and check status
+      - name: Install and check status
         run: |
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | OPENSHELL_VERSION=dev sh
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           openshell status
 
   ubuntu:
@@ -46,9 +46,9 @@ jobs:
           printf 'OPENSHELL_DRIVERS=docker\n' > "${HOME}/.config/openshell/gateway.env"
           docker info
 
-      - name: Install dev and check status
+      - name: Install and check status
         run: |
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | OPENSHELL_VERSION=dev sh
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           openshell status
 
   fedora:
@@ -67,7 +67,7 @@ jobs:
           printf 'OPENSHELL_DRIVERS=podman\n' > "${HOME}/.config/openshell/gateway.env"
           podman info
 
-      - name: Install dev and check status
+      - name: Install and check status
         run: |
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | OPENSHELL_VERSION=dev sh
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           openshell status
