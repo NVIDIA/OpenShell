@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Fish e2e tests for install.sh.
+# Fish e2e tests for install-legacy.sh.
 #
-# Downloads the latest release for real and validates:
+# Downloads the latest legacy tarball release for real and validates:
 #   - Binary is installed to the correct directory
 #   - Binary is executable and runs
 #   - PATH guidance shows fish_add_path (not export PATH)
@@ -15,7 +15,7 @@ set -g FAIL 0
 # Resolve paths relative to this script
 set -g SCRIPT_DIR (builtin cd (dirname (status filename)) && pwd)
 set -g REPO_ROOT (builtin cd "$SCRIPT_DIR/../.." && pwd)
-set -g INSTALL_SCRIPT "$REPO_ROOT/install.sh"
+set -g INSTALL_SCRIPT "$REPO_ROOT/install-legacy.sh"
 
 # Set by run_install
 set -g INSTALL_DIR ""
@@ -71,7 +71,7 @@ function run_install
         sh "$INSTALL_SCRIPT" 2>&1)
 
     if test $status -ne 0
-        printf 'install.sh failed:\n%s\n' "$INSTALL_OUTPUT" >&2
+        printf 'install-legacy.sh failed:\n%s\n' "$INSTALL_OUTPUT" >&2
         return 1
     end
 end
@@ -129,7 +129,7 @@ end
 # Runner
 # ---------------------------------------------------------------------------
 
-printf '=== install.sh e2e tests: fish ===\n\n'
+printf '=== install-legacy.sh e2e tests: fish ===\n\n'
 
 printf 'Installing openshell...\n'
 run_install

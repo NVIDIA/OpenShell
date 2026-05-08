@@ -22,7 +22,7 @@ jobs:
     steps:
       - name: Install dev and check status
         run: |
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install-dev.sh | sh
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | OPENSHELL_VERSION=dev sh
           openshell status
 
   ubuntu:
@@ -44,5 +44,5 @@ jobs:
 
       - name: Install dev and check status
         run: |
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install-dev.sh | sh
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | OPENSHELL_VERSION=dev sh
           openshell status

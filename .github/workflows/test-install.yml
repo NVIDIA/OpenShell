@@ -1,15 +1,15 @@
-name: Test Install Script
+name: Test Legacy Install Script
 
 on:
   pull_request:
     paths:
-      - 'install.sh'
+      - 'install-legacy.sh'
       - 'e2e/install/**'
       - '.github/workflows/test-install.yml'
   push:
     branches: [main]
     paths:
-      - 'install.sh'
+      - 'install-legacy.sh'
       - 'e2e/install/**'
       - '.github/workflows/test-install.yml'
   workflow_dispatch:
@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   test-install:
-    name: install.sh (${{ matrix.shell }})
+    name: install-legacy.sh (${{ matrix.shell }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

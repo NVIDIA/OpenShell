@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Bash e2e tests for install.sh.
+# Bash e2e tests for install-legacy.sh.
 #
-# Downloads the latest release for real and validates:
+# Downloads the latest legacy tarball release for real and validates:
 #   - Binary is installed to the correct directory
 #   - Binary is executable and runs
 #   - PATH guidance shows the correct export command for bash
@@ -65,7 +65,7 @@ test_guidance_mentions_not_on_path() {
 # Runner
 # ---------------------------------------------------------------------------
 
-printf '=== install.sh e2e tests: bash ===\n\n'
+printf '=== install-legacy.sh e2e tests: bash ===\n\n'
 
 printf 'Installing openshell...\n'
 SHELL="/bin/bash" run_install

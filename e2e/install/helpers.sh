@@ -2,19 +2,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Shared test helpers for install.sh e2e tests.
+# Shared test helpers for install-legacy.sh e2e tests.
 # Sourced by each per-shell test file (except fish, which has its own helpers).
 #
 # Provides:
 #   - pass / fail / print_summary
 #   - assert_output_contains / assert_output_not_contains
-#   - run_install          (runs the real install.sh to a temp dir, captures output)
+#   - run_install          (runs install-legacy.sh to a temp dir, captures output)
 #   - REPO_ROOT / INSTALL_SCRIPT paths
 #   - INSTALL_DIR / INSTALL_OUTPUT (set after run_install)
 
 HELPERS_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HELPERS_DIR/../.." && pwd)"
-INSTALL_SCRIPT="$REPO_ROOT/install.sh"
+INSTALL_SCRIPT="$REPO_ROOT/install-legacy.sh"
 
 _PASS=0
 _FAIL=0
@@ -68,7 +68,7 @@ assert_output_not_contains() {
 # Install runner
 # ---------------------------------------------------------------------------
 
-# Run the real install.sh, installing to a temp directory with the install
+# Run install-legacy.sh, installing to a temp directory with the install
 # dir removed from PATH so we always get PATH guidance output.
 #
 # Sets INSTALL_DIR and INSTALL_OUTPUT for subsequent assertions.
@@ -85,7 +85,7 @@ run_install() {
   INSTALL_OUTPUT="$(OPENSHELL_INSTALL_DIR="$INSTALL_DIR" \
     PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     sh "$INSTALL_SCRIPT" 2>&1)" || {
-    printf 'install.sh failed:\n%s\n' "$INSTALL_OUTPUT" >&2
+    printf 'install-legacy.sh failed:\n%s\n' "$INSTALL_OUTPUT" >&2
     return 1
   }
 }
