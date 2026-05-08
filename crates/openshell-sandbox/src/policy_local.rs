@@ -118,6 +118,19 @@ async fn route_request(
     body: &[u8],
 ) -> (u16, serde_json::Value) {
     let (route, query) = path.split_once('?').map_or((path, ""), |(r, q)| (r, q));
+    // Gate every route on the feature flag so the agent surface is fully off
+    // when the flag is off — including the diagnostic `current_policy` and
+    // `denials` routes. The skill is also not installed in that mode, so a
+    // disabled sandbox has no entry point into this API at all.
+    if !crate::agent_proposals_enabled() {
+        return (
+            404,
+            serde_json::json!({
+                "error": "feature_disabled",
+                "detail": "agent-driven policy proposals are not enabled in this sandbox; set the `agent_policy_proposals_enabled` setting to true to enable"
+            }),
+        );
+    }
     match (method, route) {
         ("GET", ROUTE_POLICY_CURRENT) => current_policy_response(ctx).await,
         ("GET", ROUTE_DENIALS) => recent_denials_response(ctx, query).await,
@@ -136,8 +149,15 @@ async fn route_request(
 /// machine-readable pointers to this API. Centralizes the shape here to keep
 /// the deny body and the actual route table from drifting — adding or
 /// renaming a route only requires touching the route constants above.
+///
+/// Returns an empty array when `agent_proposals_enabled()` is false so a
+/// disabled sandbox doesn't advertise a surface that 404s. The deny body
+/// caller still emits the field (with `[]`) so the wire shape is stable.
 #[must_use]
 pub fn agent_next_steps() -> serde_json::Value {
+    if !crate::agent_proposals_enabled() {
+        return serde_json::json!([]);
+    }
     let host = POLICY_LOCAL_HOST;
     serde_json::json!([
         {
@@ -1051,8 +1071,63 @@ mod tests {
         assert!(surfaced.ends_with("...[truncated]"));
     }
 
+    use crate::test_helpers::ProposalsFlagGuard;
+
+    #[test]
+    fn agent_next_steps_returns_empty_when_flag_off() {
+        let _guard = ProposalsFlagGuard::set(false);
+        let steps = agent_next_steps();
+        let arr = steps.as_array().expect("agent_next_steps is an array");
+        assert!(
+            arr.is_empty(),
+            "expected empty next_steps when feature is off, got {steps}"
+        );
+    }
+
+    #[test]
+    fn agent_next_steps_returns_full_array_when_flag_on() {
+        let _guard = ProposalsFlagGuard::set(true);
+        let steps = agent_next_steps();
+        let arr = steps.as_array().expect("agent_next_steps is an array");
+        assert_eq!(arr.len(), 4, "expected 4 next_steps when feature is on");
+        let actions: Vec<&str> = arr
+            .iter()
+            .filter_map(|v| v.get("action").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(actions.contains(&"read_skill"));
+        assert!(actions.contains(&"submit_proposal"));
+    }
+
+    #[tokio::test]
+    async fn route_request_returns_feature_disabled_when_flag_off() {
+        let _guard = ProposalsFlagGuard::set(false);
+        let ctx = PolicyLocalContext::new(
+            Some(ProtoSandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+
+        // Even the otherwise-public `current_policy` route returns 404 with
+        // a feature_disabled error: when the surface is off it's off
+        // entirely, not selectively.
+        let (status, payload) = route_request(&ctx, "GET", ROUTE_POLICY_CURRENT, &[]).await;
+        assert_eq!(status, 404);
+        assert_eq!(payload["error"], "feature_disabled");
+        assert!(
+            payload["detail"]
+                .as_str()
+                .unwrap()
+                .contains("agent_policy_proposals_enabled"),
+            "feature_disabled detail must name the setting key for actionability"
+        );
+    }
+
     #[tokio::test]
     async fn current_policy_route_returns_yaml_envelope() {
+        let _guard = ProposalsFlagGuard::set(true);
         let ctx = PolicyLocalContext::new(
             Some(ProtoSandboxPolicy {
                 version: 1,

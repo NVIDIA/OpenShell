@@ -51,6 +51,8 @@ The first implementation is tracked in [#1062](https://github.com/NVIDIA/OpenShe
 
 The MVP deliberately defers the supervisor Unix-socket API, server-streaming multi-sandbox inbox, Slack/web adapters, org ceilings, trusted auto-apply, and in-process prover optimization. Those remain aligned with the RFC direction, but they are not required to prove the initial loop.
 
+The entire MVP surface is gated behind the `agent_policy_proposals_enabled` setting (see `crates/openshell-core/src/settings.rs`), default false. When disabled, the supervisor does not install the skill, the `policy.local` routes return `404 feature_disabled`, and L7 deny bodies omit the `next_steps` array. The flag is independent of the per-proposal developer approval gate; both apply when the feature is on. Treat this as a soft launch: enable per-sandbox or globally once the loop is validated, and leave it off in environments where agent-authored proposals should not be available at all.
+
 ## Non-goals
 
 - Allowing an in-sandbox agent to self-approve or unilaterally apply its own policy changes.

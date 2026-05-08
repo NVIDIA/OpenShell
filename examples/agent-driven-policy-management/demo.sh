@@ -97,6 +97,18 @@ cleanup() {
     "$OPENSHELL_BIN" provider delete "$DEMO_CODEX_PROVIDER_NAME" >/dev/null 2>&1 || true
     "$OPENSHELL_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
 
+    # Restore the agent_policy_proposals_enabled setting to what it was
+    # before this run.
+    if [[ -n "${PRIOR_PROPOSALS_FLAG:-}" ]]; then
+        if [[ "$PRIOR_PROPOSALS_FLAG" == "(unset)" ]]; then
+            "$OPENSHELL_BIN" settings delete --global --key agent_policy_proposals_enabled \
+                >/dev/null 2>&1 || true
+        else
+            "$OPENSHELL_BIN" settings set --global --key agent_policy_proposals_enabled \
+                --value "$PRIOR_PROPOSALS_FLAG" >/dev/null 2>&1 || true
+        fi
+    fi
+
     if [[ $status -eq 0 ]]; then
         rm -rf "$TMP_DIR"
     else
@@ -391,6 +403,21 @@ show_logs() {
         | sed 's/^/  /' || true
 }
 
+enable_agent_proposals() {
+    # The agent-driven proposal surface (skill, policy.local routes, deny
+    # next_steps) is opt-in. Snapshot the prior global value so cleanup()
+    # can restore it; the sentinel "(unset)" round-trips through `settings
+    # delete` rather than a value write.
+    local prior
+    prior="$("$OPENSHELL_BIN" settings get --global --json 2>/dev/null \
+        | grep -o '"agent_policy_proposals_enabled"[^,}]*' \
+        | grep -o 'true\|false' | head -1)"
+    PRIOR_PROPOSALS_FLAG="${prior:-(unset)}"
+    "$OPENSHELL_BIN" settings set --global \
+        --key agent_policy_proposals_enabled --value true >/dev/null \
+        || fail "could not enable agent_policy_proposals_enabled globally"
+}
+
 main() {
     validate_env
 
@@ -399,6 +426,7 @@ main() {
     check_github_access
     render_payload
     create_providers
+    enable_agent_proposals
 
     show_run_summary
 

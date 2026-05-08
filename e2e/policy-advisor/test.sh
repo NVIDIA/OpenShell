@@ -63,6 +63,18 @@ cleanup() {
         printf "\n${YELLOW}Keeping sandbox because DEMO_KEEP_SANDBOX=1: %s${RESET}\n" "$DEMO_SANDBOX_NAME"
     fi
 
+    # Restore the agent_policy_proposals_enabled setting to what it was
+    # before this run. We saved the prior value in $PRIOR_PROPOSALS_FLAG.
+    if [[ -n "${PRIOR_PROPOSALS_FLAG:-}" ]]; then
+        if [[ "$PRIOR_PROPOSALS_FLAG" == "(unset)" ]]; then
+            "$OPENSHELL_BIN" settings delete --global --key agent_policy_proposals_enabled \
+                >/dev/null 2>&1 || true
+        else
+            "$OPENSHELL_BIN" settings set --global --key agent_policy_proposals_enabled \
+                --value "$PRIOR_PROPOSALS_FLAG" >/dev/null 2>&1 || true
+        fi
+    fi
+
     "$OPENSHELL_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
 
     if [[ $status -eq 0 ]]; then
@@ -195,6 +207,21 @@ create_provider() {
         --name "$DEMO_GITHUB_PROVIDER_NAME" \
         --type github \
         --credential GITHUB_TOKEN
+}
+
+enable_agent_proposals() {
+    step "Enabling agent-driven policy proposals"
+    # Snapshot the prior value so cleanup() can restore it. Use a sentinel
+    # for "unset" so we can distinguish from an explicit false on restore.
+    local prior
+    prior="$("$OPENSHELL_BIN" settings get --global --json 2>/dev/null \
+        | grep -o '"agent_policy_proposals_enabled"[^,}]*' \
+        | grep -o 'true\|false' | head -1)"
+    PRIOR_PROPOSALS_FLAG="${prior:-(unset)}"
+    info "  Prior global value: $PRIOR_PROPOSALS_FLAG"
+    "$OPENSHELL_BIN" settings set --global \
+        --key agent_policy_proposals_enabled --value true >/dev/null \
+        || fail "could not set agent_policy_proposals_enabled globally"
 }
 
 create_sandbox() {
@@ -368,6 +395,7 @@ main() {
     check_gateway
     check_github_access
     create_provider
+    enable_agent_proposals
     create_sandbox
     connect_ssh
     run_policy_local_checks

@@ -90,6 +90,70 @@ pub(crate) fn ocsf_ctx() -> &'static SandboxContext {
     OCSF_CTX.get().unwrap_or(&OCSF_CTX_FALLBACK)
 }
 
+/// Process-wide flag for the agent-driven policy proposal surface.
+/// Set once during `run_sandbox()` startup and updated by the settings poll
+/// loop when `agent_policy_proposals_enabled` changes. Read by the
+/// `policy.local` route handler and the L7 deny body's `next_steps` builder
+/// to gate the agent-controlled mutation surface. Exposed `pub(crate)` so
+/// unit tests in sibling modules can flip the flag through a serialized
+/// guard (see `policy_local::tests::ProposalsFlagGuard`).
+pub(crate) static AGENT_PROPOSALS_ENABLED:
+    OnceLock<Arc<std::sync::atomic::AtomicBool>> = OnceLock::new();
+
+/// Read the current value of the agent proposals feature flag.
+///
+/// Returns `false` if `run_sandbox()` has not initialized the flag (e.g.
+/// during unit tests), matching the documented default for the setting.
+pub(crate) fn agent_proposals_enabled() -> bool {
+    AGENT_PROPOSALS_ENABLED
+        .get()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+/// Test-only helpers shared across sibling test modules.
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    #![allow(clippy::redundant_pub_crate, reason = "intentional crate-private module")]
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::MutexGuard;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Guard for tests that toggle the process-wide
+    /// `AGENT_PROPOSALS_ENABLED` flag. Acquires a process-wide mutex on
+    /// construction so concurrent tests don't race on the atomic, swaps in
+    /// the requested value, and restores the previous value on drop. Hold
+    /// the guard for the duration of any code that reads
+    /// `agent_proposals_enabled()`.
+    pub(crate) struct ProposalsFlagGuard {
+        prev: bool,
+        flag: Arc<AtomicBool>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl ProposalsFlagGuard {
+        pub(crate) fn set(enabled: bool) -> Self {
+            static LOCK: Mutex<()> = Mutex::new(());
+            let lock = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let flag = super::AGENT_PROPOSALS_ENABLED
+                .get_or_init(|| Arc::new(AtomicBool::new(false)))
+                .clone();
+            let prev = flag.swap(enabled, Ordering::Relaxed);
+            Self {
+                prev,
+                flag,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ProposalsFlagGuard {
+        fn drop(&mut self) {
+            self.flag.store(self.prev, Ordering::Relaxed);
+        }
+    }
+}
+
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
@@ -325,16 +389,46 @@ pub async fn run_sandbox(
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
 
-    match skills::install_static_skills() {
-        Ok(installed) => {
-            info!(
-                path = %installed.policy_advisor.display(),
-                "Installed sandbox agent skill"
-            );
+    // Initialize the agent-proposals feature flag. Default false until the
+    // initial settings fetch (or the poll loop) tells us otherwise. The flag
+    // gates the skill install, the policy.local route handler, and the L7
+    // deny body's `next_steps` field — see `agent_proposals_enabled()`.
+    let proposals_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if AGENT_PROPOSALS_ENABLED.set(proposals_enabled.clone()).is_err() {
+        debug!("agent proposals flag already initialized, keeping existing");
+    }
+
+    // Eagerly fetch the initial settings so skill install can honor the flag
+    // at startup rather than waiting for the poll loop's first tick. In
+    // offline/file-mode there is no gateway, so the flag stays false.
+    if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint)
+        && let Ok(client) = grpc_client::CachedOpenShellClient::connect(endpoint).await
+        && let Ok(result) = client.poll_settings(id).await
+    {
+        let initial = extract_bool_setting(
+            &result.settings,
+            openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY,
+        )
+        .unwrap_or(false);
+        proposals_enabled.store(initial, Ordering::Relaxed);
+    }
+
+    if agent_proposals_enabled() {
+        match skills::install_static_skills() {
+            Ok(installed) => {
+                info!(
+                    path = %installed.policy_advisor.display(),
+                    "Installed sandbox agent skill"
+                );
+            }
+            Err(error) => {
+                warn!(error = %error, "Failed to install sandbox agent skill");
+            }
         }
-        Err(error) => {
-            warn!(error = %error, "Failed to install sandbox agent skill");
-        }
+    } else {
+        debug!(
+            "agent_policy_proposals_enabled is false at startup; skipping skill install"
+        );
     }
 
     // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
@@ -2367,6 +2461,40 @@ async fn run_policy_poll_loop(
         let prev_ocsf = ocsf_enabled.swap(new_ocsf, Ordering::Relaxed);
         if new_ocsf != prev_ocsf {
             info!(ocsf_json_enabled = new_ocsf, "OCSF JSONL logging toggled");
+        }
+
+        // Apply the agent-proposals feature toggle. On a false→true transition
+        // we lazily install the skill so a sandbox that started with the flag
+        // off picks up the surface without a recreate. We never uninstall on
+        // a true→false transition: stale skill content on disk is harmless
+        // because route_request and agent_next_steps both gate on the live
+        // atomic, so the agent that reads the skill will see 404s and an
+        // empty `next_steps` array regardless.
+        if let Some(flag) = AGENT_PROPOSALS_ENABLED.get() {
+            let new_proposals = extract_bool_setting(
+                &result.settings,
+                openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY,
+            )
+            .unwrap_or(false);
+            let prev_proposals = flag.swap(new_proposals, Ordering::Relaxed);
+            if new_proposals != prev_proposals {
+                info!(
+                    agent_policy_proposals_enabled = new_proposals,
+                    "agent-driven policy proposals toggled"
+                );
+                if new_proposals && !prev_proposals {
+                    match skills::install_static_skills() {
+                        Ok(installed) => info!(
+                            path = %installed.policy_advisor.display(),
+                            "Installed sandbox agent skill on toggle-on"
+                        ),
+                        Err(error) => warn!(
+                            error = %error,
+                            "Failed to install sandbox agent skill on toggle-on"
+                        ),
+                    }
+                }
+            }
         }
 
         current_config_revision = result.config_revision;
