@@ -11,8 +11,8 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     DenialSummary, GetInferenceBundleRequest, GetInferenceBundleResponse, GetSandboxConfigRequest,
     GetSandboxProviderEnvironmentRequest, PolicySource, PolicyStatus, ReportPolicyStatusRequest,
-    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, UpdateConfigRequest,
-    inference_client::InferenceClient, open_shell_client::OpenShellClient,
+    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    UpdateConfigRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -318,15 +318,20 @@ impl CachedOpenShellClient {
         })
     }
 
-    /// Submit denial summaries for policy analysis.
+    /// Submit denial summaries and/or agent-authored proposals for policy analysis.
+    ///
+    /// Returns the gateway response so callers can surface accepted/rejected
+    /// counts and rejection reasons (e.g., the `policy.local` API forwards
+    /// these to the in-sandbox agent).
     pub async fn submit_policy_analysis(
         &self,
         sandbox_name: &str,
         summaries: Vec<DenialSummary>,
         proposed_chunks: Vec<openshell_core::proto::PolicyChunk>,
         analysis_mode: &str,
-    ) -> Result<()> {
-        self.client
+    ) -> Result<SubmitPolicyAnalysisResponse> {
+        let response = self
+            .client
             .clone()
             .submit_policy_analysis(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.to_string(),
@@ -337,7 +342,7 @@ impl CachedOpenShellClient {
             .await
             .into_diagnostic()?;
 
-        Ok(())
+        Ok(response.into_inner())
     }
 
     /// Report policy load status back to the server.

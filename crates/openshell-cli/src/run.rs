@@ -5220,15 +5220,55 @@ pub async fn sandbox_draft_history(server: &str, name: &str, tls: &TlsOptions) -
 fn format_endpoints(rule: &openshell_core::proto::NetworkPolicyRule) -> String {
     rule.endpoints
         .iter()
-        .map(|e| {
-            if e.port > 0 {
-                format!("{}:{}", e.host, e.port)
-            } else {
-                e.host.clone()
-            }
-        })
+        .map(format_endpoint)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Render an endpoint as `host:port [layer, …allows…, …denies…]` so a reader
+/// can tell L4-only access apart from a method/path-scoped L7 grant. The L7
+/// fields (`protocol: rest`, `rules`, `access`) materially change what gets
+/// allowed; surfacing them in the default text output is what makes
+/// `openshell rule get` useful for approval review.
+fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String {
+    let host_port = if endpoint.port > 0 {
+        format!("{}:{}", endpoint.host, endpoint.port)
+    } else {
+        endpoint.host.clone()
+    };
+
+    let mut tags: Vec<String> = Vec::new();
+    let layer_tag = if endpoint.protocol.eq_ignore_ascii_case("rest") {
+        "L7 rest"
+    } else if endpoint.protocol.is_empty() {
+        "L4"
+    } else {
+        endpoint.protocol.as_str()
+    };
+    tags.push(layer_tag.to_string());
+
+    if !endpoint.access.is_empty() {
+        tags.push(format!("access={}", endpoint.access));
+    }
+
+    for r in &endpoint.rules {
+        if let Some(allow) = &r.allow {
+            let method = non_empty_or(&allow.method, "*");
+            let path = non_empty_or(&allow.path, "*");
+            tags.push(format!("allow {method} {path}"));
+        }
+    }
+    for r in &endpoint.deny_rules {
+        let method = non_empty_or(&r.method, "*");
+        let path = non_empty_or(&r.path, "*");
+        tags.push(format!("deny {method} {path}"));
+    }
+
+    format!("{host_port} [{}]", tags.join(", "))
+}
+
+fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.is_empty() { fallback } else { value }
 }
 
 /// Format a millisecond timestamp into a readable string.
@@ -5250,10 +5290,10 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TlsOptions, dockerfile_sources_supported_for_gateway, format_gateway_select_header,
-        format_gateway_select_items, gateway_add, gateway_auth_label, gateway_env_override_warning,
-        gateway_select_with, gateway_type_label, git_sync_files, http_health_check,
-        image_requests_gpu, inferred_provider_type, parse_cli_setting_value,
+        GatewayControlTarget, TlsOptions, dockerfile_sources_supported_for_gateway, format_endpoint,
+        format_gateway_select_header, format_gateway_select_items, gateway_add, gateway_auth_label,
+        gateway_env_override_warning, gateway_select_with, gateway_type_label, git_sync_files,
+        http_health_check, image_requests_gpu, inferred_provider_type, parse_cli_setting_value,
         parse_credential_pairs, plaintext_gateway_is_remote, provisioning_timeout_message,
         ready_false_condition_message, resolve_from, sandbox_should_persist,
     };
@@ -5968,5 +6008,51 @@ mod tests {
 
         server.join().expect("server thread");
         assert_eq!(status, Some(StatusCode::OK));
+    }
+    #[test]
+    fn format_endpoint_distinguishes_l4_from_l7_rest() {
+        use openshell_core::proto::{L7Allow, L7DenyRule, L7Rule, NetworkEndpoint};
+
+        let l4 = NetworkEndpoint {
+            host: "host.example.test".to_string(),
+            port: 443,
+            ..Default::default()
+        };
+        assert_eq!(format_endpoint(&l4), "host.example.test:443 [L4]");
+
+        let l7_readonly = NetworkEndpoint {
+            host: "host.example.test".to_string(),
+            port: 443,
+            protocol: "rest".to_string(),
+            access: "read-only".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_endpoint(&l7_readonly),
+            "host.example.test:443 [L7 rest, access=read-only]"
+        );
+
+        let l7_scoped = NetworkEndpoint {
+            host: "host.example.test".to_string(),
+            port: 443,
+            protocol: "rest".to_string(),
+            rules: vec![L7Rule {
+                allow: Some(L7Allow {
+                    method: "PUT".to_string(),
+                    path: "/v1/example/resource".to_string(),
+                    ..Default::default()
+                }),
+            }],
+            deny_rules: vec![L7DenyRule {
+                method: "DELETE".to_string(),
+                path: "/v1/example/resource".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            format_endpoint(&l7_scoped),
+            "host.example.test:443 [L7 rest, allow PUT /v1/example/resource, deny DELETE /v1/example/resource]"
+        );
     }
 }

@@ -15,11 +15,13 @@ pub mod log_push;
 pub mod mechanistic_mapper;
 pub mod opa;
 mod policy;
+mod policy_local;
 mod process;
 pub mod procfs;
 pub mod proxy;
 mod sandbox;
 mod secrets;
+mod skills;
 mod ssh;
 mod supervisor_session;
 
@@ -260,6 +262,11 @@ pub async fn run_sandbox(
         policy_data,
     )
     .await?;
+    let policy_local_ctx = Arc::new(policy_local::PolicyLocalContext::new(
+        retained_proto.clone(),
+        openshell_endpoint.clone(),
+        sandbox_name_for_agg.clone().or_else(|| sandbox_id.clone()),
+    ));
 
     // Validate that the required "sandbox" user exists in this image.
     // All sandbox images must include this user for privilege dropping.
@@ -313,6 +320,18 @@ pub async fn run_sandbox(
 
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
+
+    match skills::install_static_skills() {
+        Ok(installed) => {
+            info!(
+                path = %installed.policy_advisor.display(),
+                "Installed sandbox agent skill"
+            );
+        }
+        Err(error) => {
+            warn!(error = %error, "Failed to install sandbox agent skill");
+        }
+    }
 
     // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
     // The CA cert is written to disk so sandbox processes can trust it.
@@ -480,6 +499,7 @@ pub async fn run_sandbox(
             entrypoint_pid.clone(),
             tls_state,
             inference_ctx,
+            Some(policy_local_ctx.clone()),
             secret_resolver.clone(),
             denial_tx,
         )
@@ -796,6 +816,7 @@ pub async fn run_sandbox(
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_enabled.clone();
         let poll_pid = entrypoint_pid.clone();
+        let poll_policy_local = policy_local_ctx.clone();
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -809,6 +830,7 @@ pub async fn run_sandbox(
                 &poll_pid,
                 poll_interval_secs,
                 &poll_ocsf_enabled,
+                Some(poll_policy_local),
             )
             .await
             {
@@ -2152,6 +2174,7 @@ async fn run_policy_poll_loop(
     entrypoint_pid: &Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: &std::sync::atomic::AtomicBool,
+    policy_local_ctx: Option<Arc<policy_local::PolicyLocalContext>>,
 ) -> Result<()> {
     use crate::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::PolicySource;
@@ -2233,6 +2256,9 @@ async fn run_policy_poll_loop(
             let pid = entrypoint_pid.load(Ordering::Acquire);
             match opa_engine.reload_from_proto_with_pid(policy, pid) {
                 Ok(()) => {
+                    if let Some(ctx) = policy_local_ctx.as_ref() {
+                        ctx.set_current_policy(policy.clone()).await;
+                    }
                     if result.global_policy_version > 0 {
                         ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Informational)
