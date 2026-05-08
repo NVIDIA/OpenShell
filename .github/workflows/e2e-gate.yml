@@ -57,11 +57,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          run_id=$(gh api "repos/$GH_REPO/actions/workflows/e2e-gate.yml/runs?event=pull_request&head_sha=$HEAD_SHA" \
-            --jq '.workflow_runs | sort_by(.created_at) | reverse | .[0].id // empty')
-          if [ -z "$run_id" ]; then
+          latest=$(gh api "repos/$GH_REPO/actions/workflows/e2e-gate.yml/runs?event=pull_request&head_sha=$HEAD_SHA" \
+            --jq '.workflow_runs | sort_by(.created_at) | reverse | .[0] // empty')
+          if [ -z "$latest" ]; then
             echo "No pull_request-triggered E2E Gate run found for $HEAD_SHA — nothing to re-run."
             exit 0
           fi
+
+          run_id=$(jq -r '.id' <<< "$latest")
+          status=$(jq -r '.status' <<< "$latest")
+          if [ "$status" != "completed" ]; then
+            echo "E2E Gate run $run_id is already $status for $HEAD_SHA — no new re-run needed."
+            exit 0
+          fi
+
           echo "Re-running E2E Gate run $run_id so it re-evaluates and posts a fresh check on the PR."
-          gh api --method POST "repos/$GH_REPO/actions/runs/$run_id/rerun"
+          if ! output=$(gh api --method POST "repos/$GH_REPO/actions/runs/$run_id/rerun" 2>&1); then
+            if grep -q "This workflow is already running" <<< "$output"; then
+              echo "E2E Gate run $run_id is already running for $HEAD_SHA — no new re-run needed."
+              exit 0
+            fi
+            echo "$output" >&2
+            exit 1
+          fi
