@@ -57,7 +57,8 @@ mise run helm:skaffold:run
 ```
 
 Both commands build the `gateway` and `supervisor` images and deploy the OpenShell Helm
-chart. The `pkiInitJob` hook runs on first install to generate mTLS secrets. Envoy Gateway  opt-in; see the Optional Add-ons section below.
+chart. The `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway generate-certs`)
+generates mTLS secrets on first install. Envoy Gateway opt-in; see the Optional Add-ons section below.
 
 The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or `kubectl port-forward`.
 

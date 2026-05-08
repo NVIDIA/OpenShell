@@ -52,3 +52,21 @@ See [`values.yaml`](values.yaml) for configurable values. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) — gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) — cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) — Keycloak OIDC integration
+
+## PKI bootstrap
+
+By default, a pre-install/pre-upgrade hook Job runs `openshell-gateway generate-certs`
+to create the gateway's server and client mTLS Secrets. The Job uses the gateway image
+itself, so air-gapped environments only need to mirror that one image (no separate
+openssl/alpine sidecar).
+
+The Job is idempotent:
+
+- Both target Secrets exist → log and exit 0.
+- Exactly one exists → fail with `kubectl delete secret -n <ns> <server> <client>` recovery hint.
+- Neither exists → generate a CA, server cert, and client cert; POST both `kubernetes.io/tls`
+  Secrets (`tls.crt`, `tls.key`, `ca.crt`).
+
+Disable with `--set pkiInitJob.enabled=false` when bringing your own PKI (cert-manager,
+external CA, or pre-created Secrets). See `certManager.*` in `values.yaml` for the
+cert-manager alternative.
