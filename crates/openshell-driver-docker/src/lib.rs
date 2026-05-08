@@ -89,7 +89,7 @@ pub fn default_docker_supervisor_image() -> String {
 /// fallback covers image build wrappers that already tag the gateway and
 /// supervisor together. Standalone release binaries also patch the Cargo
 /// package version, so use it when it has been set to a real release value.
-fn default_docker_supervisor_image_tag() -> &'static str {
+fn default_docker_supervisor_image_tag() -> String {
     resolve_default_docker_supervisor_image_tag(
         option_env!("OPENSHELL_IMAGE_TAG"),
         option_env!("IMAGE_TAG"),
@@ -101,8 +101,8 @@ fn resolve_default_docker_supervisor_image_tag(
     openshell_image_tag: Option<&'static str>,
     image_tag: Option<&'static str>,
     cargo_pkg_version: &'static str,
-) -> &'static str {
-    openshell_image_tag
+) -> String {
+    let tag = openshell_image_tag
         .filter(|tag| !tag.is_empty())
         .or_else(|| image_tag.filter(|tag| !tag.is_empty()))
         .unwrap_or_else(|| {
@@ -111,7 +111,9 @@ fn resolve_default_docker_supervisor_image_tag(
             } else {
                 cargo_pkg_version
             }
-        })
+        });
+
+    tag.replace('+', "-")
 }
 
 /// Queried by the Docker driver to decide when a sandbox's supervisor

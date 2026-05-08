@@ -643,6 +643,60 @@ fn mtls_certs_exist_for_endpoint(name: &str, endpoint: &str) -> bool {
     })
 }
 
+fn package_managed_tls_dirs() -> Vec<PathBuf> {
+    if let Some(path) = std::env::var_os("OPENSHELL_LOCAL_TLS_DIR") {
+        return vec![PathBuf::from(path)];
+    }
+
+    let mut dirs = Vec::new();
+
+    if cfg!(target_os = "macos") {
+        dirs.push(PathBuf::from("/opt/homebrew/var/openshell/tls"));
+        dirs.push(PathBuf::from("/usr/local/var/openshell/tls"));
+    }
+
+    let state_dir = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")));
+    if let Some(state_dir) = state_dir {
+        dirs.push(state_dir.join("openshell/tls"));
+    }
+
+    dirs
+}
+
+fn import_local_package_mtls_bundle(name: &str) -> Result<Option<PathBuf>> {
+    for dir in package_managed_tls_dirs() {
+        let ca = dir.join("ca.crt");
+        let cert = dir.join("client/tls.crt");
+        let key = dir.join("client/tls.key");
+        if !(ca.is_file() && cert.is_file() && key.is_file()) {
+            continue;
+        }
+
+        let bundle = openshell_bootstrap::pki::PkiBundle {
+            ca_cert_pem: std::fs::read_to_string(&ca)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to read {}", ca.display()))?,
+            ca_key_pem: String::new(),
+            server_cert_pem: String::new(),
+            server_key_pem: String::new(),
+            client_cert_pem: std::fs::read_to_string(&cert)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to read {}", cert.display()))?,
+            client_key_pem: std::fs::read_to_string(&key)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to read {}", key.display()))?,
+        };
+        openshell_bootstrap::mtls::store_pki_bundle(name, &bundle)
+            .wrap_err_with(|| format!("failed to store mTLS bundle for gateway '{name}'"))?;
+
+        return Ok(Some(dir));
+    }
+
+    Ok(None)
+}
+
 fn plaintext_gateway_is_remote(endpoint: &str, remote: Option<&str>, local: bool) -> bool {
     if local {
         return false;
@@ -924,16 +978,13 @@ pub async fn gateway_add(
 
         // Verify the gateway is reachable.
         let tls = TlsOptions::default();
-        match http_health_check(&endpoint, &tls).await {
-            Ok(Some(status)) if status.is_success() => {}
-            _ => {
-                eprintln!(
-                    "{} Gateway is not reachable at {endpoint}",
-                    "⚠".yellow().bold(),
-                );
-                if !has_mtls_certs {
-                    eprintln!("  Verify the gateway is running and the endpoint is correct.");
-                }
+        if !gateway_reachable(&endpoint, &tls).await {
+            eprintln!(
+                "{} Gateway is not reachable at {endpoint}",
+                "⚠".yellow().bold(),
+            );
+            if !has_mtls_certs {
+                eprintln!("  Verify the gateway is running and the endpoint is correct.");
             }
         }
 
@@ -951,7 +1002,13 @@ pub async fn gateway_add(
 
     if remote.is_some() || local {
         // mTLS gateway (remote or local).
-        let certs_on_disk = mtls_certs_exist_for_endpoint(name, &endpoint);
+        let imported_mtls_dir = if local {
+            import_local_package_mtls_bundle(name)?
+        } else {
+            None
+        };
+        let certs_on_disk =
+            imported_mtls_dir.is_some() || mtls_certs_exist_for_endpoint(name, &endpoint);
         if !certs_on_disk {
             return Err(miette::miette!(
                 "mTLS certificates for gateway '{name}' were not found.\n\
@@ -984,14 +1041,11 @@ pub async fn gateway_add(
 
         // Verify the gateway is reachable over mTLS.
         let tls = TlsOptions::default().with_gateway_name(name);
-        match http_health_check(&endpoint, &tls).await {
-            Ok(Some(status)) if status.is_success() => {}
-            _ => {
-                eprintln!(
-                    "{} Gateway is not reachable at {endpoint}. Verify the gateway is running.",
-                    "⚠".yellow().bold(),
-                );
-            }
+        if !gateway_reachable(&endpoint, &tls).await {
+            eprintln!(
+                "{} Gateway is not reachable at {endpoint}. Verify the gateway is running.",
+                "⚠".yellow().bold(),
+            );
         }
 
         eprintln!(
@@ -1250,6 +1304,16 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
         .into_diagnostic()?;
     let resp = client.request(req).await.into_diagnostic()?;
     Ok(Some(resp.status()))
+}
+
+async fn gateway_reachable(server: &str, tls: &TlsOptions) -> bool {
+    if let Ok(mut client) = grpc_client(server, tls).await
+        && client.health(HealthRequest {}).await.is_ok()
+    {
+        return true;
+    }
+
+    matches!(http_health_check(server, tls).await, Ok(Some(status)) if status.is_success())
 }
 
 fn remove_gateway_registration(name: &str) {
@@ -5391,10 +5455,11 @@ mod tests {
         TlsOptions, dockerfile_sources_supported_for_gateway, format_gateway_select_header,
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
-        git_sync_files, http_health_check, image_requests_gpu, inferred_provider_type,
-        parse_cli_setting_value, parse_credential_pairs, plaintext_gateway_is_remote,
-        provisioning_timeout_message, ready_false_condition_message, resolve_from,
-        sandbox_should_persist,
+        git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
+        inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
+        parse_credential_pairs,
+        plaintext_gateway_is_remote, provisioning_timeout_message, ready_false_condition_message,
+        resolve_from, sandbox_should_persist,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -5402,7 +5467,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::thread;
 
@@ -6021,6 +6086,52 @@ mod tests {
         };
 
         assert_eq!(gateway_auth_label(&gateway), "mtls");
+    }
+
+    #[test]
+    fn package_managed_tls_dirs_respects_override() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _tls_dir = EnvVarGuard::set("OPENSHELL_LOCAL_TLS_DIR", "/tmp/openshell-test-tls");
+
+        assert_eq!(
+            package_managed_tls_dirs(),
+            vec![PathBuf::from("/tmp/openshell-test-tls")],
+        );
+    }
+
+    #[test]
+    fn import_local_package_mtls_bundle_copies_client_materials() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let package_tls = tmpdir.path().join("package-tls");
+        fs::create_dir_all(package_tls.join("client")).expect("create package tls dir");
+        fs::write(package_tls.join("ca.crt"), "ca").expect("write ca");
+        fs::write(package_tls.join("client/tls.crt"), "client cert").expect("write cert");
+        fs::write(package_tls.join("client/tls.key"), "client key").expect("write key");
+
+        with_tmp_xdg(tmpdir.path(), || {
+            let _tls_dir = EnvVarGuard::set(
+                "OPENSHELL_LOCAL_TLS_DIR",
+                package_tls.to_str().expect("temp path should be utf-8"),
+            );
+
+            let imported =
+                import_local_package_mtls_bundle("openshell").expect("import local bundle");
+
+            assert_eq!(imported.as_deref(), Some(package_tls.as_path()));
+
+            let mtls = tmpdir.path().join("openshell/gateways/openshell/mtls");
+            assert_eq!(fs::read_to_string(mtls.join("ca.crt")).unwrap(), "ca");
+            assert_eq!(
+                fs::read_to_string(mtls.join("tls.crt")).unwrap(),
+                "client cert",
+            );
+            assert_eq!(
+                fs::read_to_string(mtls.join("tls.key")).unwrap(),
+                "client key",
+            );
+        });
     }
 
     #[test]

@@ -620,6 +620,7 @@ jobs:
           docker buildx build \
             --file deploy/docker/Dockerfile.gateway-macos \
             --build-arg OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" \
+            --build-arg OPENSHELL_IMAGE_TAG="${{ needs.compute-versions.outputs.semver }}" \
             --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
             --target binary \
             --output type=local,dest=out/ \

@@ -214,6 +214,11 @@ def _asset_url(release_tag: str, filename: str) -> str:
     return f"{GITHUB_RELEASE_DOWNLOADS}/{release_tag}/{filename}"
 
 
+def _homebrew_supervisor_image(release_tag: str) -> str:
+    image_tag = "dev" if release_tag == "dev" else release_tag.removeprefix("v")
+    return f"ghcr.io/nvidia/openshell/supervisor:{image_tag}"
+
+
 def render_homebrew_formula(
     *,
     release_tag: str,
@@ -225,6 +230,7 @@ def render_homebrew_formula(
         raise ValueError(f"release tag contains unsupported characters: {release_tag}")
 
     version = release_tag.removeprefix("v")
+    docker_supervisor_image = _homebrew_supervisor_image(release_tag)
     return f"""# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -302,6 +308,7 @@ class Openshell < Formula
       OPENSHELL_VM_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
       OPENSHELL_VM_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
       OPENSHELL_VM_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
+      OPENSHELL_DOCKER_SUPERVISOR_IMAGE: "{docker_supervisor_image}",
       OPENSHELL_DOCKER_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
       OPENSHELL_DOCKER_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
       OPENSHELL_DOCKER_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",

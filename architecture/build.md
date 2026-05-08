@@ -27,6 +27,9 @@ target architecture, stages them under `deploy/docker/.build/`, and then uses
 Buildx to publish per-architecture images and multi-architecture tags.
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.
+Package formulas also pin Docker supervisor extraction to the matching release
+image tag so standalone gateway binaries do not infer image tags from package
+versions.
 
 Local image work should use `mise` tasks rather than direct Docker commands so
 the same staging and tagging assumptions are used locally and in CI.

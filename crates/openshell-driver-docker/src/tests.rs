@@ -723,6 +723,22 @@ fn docker_supervisor_image_tag_prefers_explicit_build_tags() {
 }
 
 #[test]
+fn docker_supervisor_image_tag_sanitizes_build_metadata_for_docker() {
+    assert_eq!(
+        resolve_default_docker_supervisor_image_tag(None, None, "0.0.37-dev.156+g1d3b741ee"),
+        "0.0.37-dev.156-g1d3b741ee",
+    );
+    assert_eq!(
+        resolve_default_docker_supervisor_image_tag(
+            Some("0.0.37-dev.156+g1d3b741ee"),
+            None,
+            "0.0.0",
+        ),
+        "0.0.37-dev.156-g1d3b741ee",
+    );
+}
+
+#[test]
 fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
     let base = PathBuf::from("/var/cache/share");
     let path =

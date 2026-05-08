@@ -53,5 +53,8 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
     assert 'sha256 "' + "b" * 64 + '"' in formula
     assert "OPENSHELL_DRIVERS" not in formula
     assert 'OPENSHELL_DRIVER_DIR: "#{opt_libexec}"' in formula
+    assert (
+        'OPENSHELL_DOCKER_SUPERVISOR_IMAGE: "ghcr.io/nvidia/openshell/supervisor:0.0.10"'
+    ) in formula
     assert "entitlements.atomic_write" in formula
     assert "brew services restart openshell" in formula
