@@ -416,9 +416,9 @@ start_user_gateway() {
   as_target_user systemctl --user restart openshell-gateway
   as_target_user systemctl --user is-active --quiet openshell-gateway
 
-  wait_for_local_gateway_listener
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
+  wait_for_local_gateway_listener
   wait_for_local_gateway_status
 }
 
@@ -661,9 +661,9 @@ install_macos_homebrew() {
     OPENSHELL_REGISTER_BIN="${_brew_prefix}/bin/openshell"
   fi
 
-  wait_for_local_gateway_listener
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
+  wait_for_local_gateway_listener
   wait_for_local_gateway_status
 }
 
