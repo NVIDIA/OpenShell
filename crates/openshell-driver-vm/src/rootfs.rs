@@ -3,13 +3,20 @@
 
 use std::fs;
 use std::fs::File;
-use std::io::{BufWriter, Cursor};
-use std::path::Path;
+#[cfg(test)]
+use std::io::BufWriter;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sandbox.zst"));
 const ROOTFS_VARIANT_MARKER: &str = ".openshell-rootfs-variant";
 const SANDBOX_GUEST_INIT_PATH: &str = "/srv/openshell-vm-sandbox-init.sh";
 const SANDBOX_SUPERVISOR_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
+const ROOTFS_IMAGE_MIN_SIZE_BYTES: u64 = 512 * 1024 * 1024;
+const ROOTFS_IMAGE_MIN_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
+static INJECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const fn sandbox_guest_init_path() -> &'static str {
     SANDBOX_GUEST_INIT_PATH
@@ -44,6 +51,7 @@ pub fn extract_rootfs_archive_to(archive_path: &Path, dest: &Path) -> Result<(),
         .map_err(|e| format!("extract rootfs tarball into {}: {e}", dest.display()))
 }
 
+#[cfg(test)]
 pub fn create_rootfs_archive_from_dir(source: &Path, archive_path: &Path) -> Result<(), String> {
     if let Some(parent) = archive_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
@@ -65,6 +73,104 @@ pub fn create_rootfs_archive_from_dir(source: &Path, archive_path: &Path) -> Res
         .map_err(|e| format!("finalize {}: {e}", archive_path.display()))
 }
 
+pub fn create_rootfs_image_from_dir(source: &Path, image_path: &Path) -> Result<(), String> {
+    if let Some(parent) = image_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    if image_path.exists() {
+        fs::remove_file(image_path)
+            .map_err(|e| format!("remove old rootfs image {}: {e}", image_path.display()))?;
+    }
+
+    let image_size = rootfs_image_size_bytes(source)?;
+    let image = File::create(image_path)
+        .map_err(|e| format!("create rootfs image {}: {e}", image_path.display()))?;
+    image
+        .set_len(image_size)
+        .map_err(|e| format!("size rootfs image {}: {e}", image_path.display()))?;
+    drop(image);
+
+    if let Err(err) = format_ext4_image_from_dir(source, image_path) {
+        let _ = fs::remove_file(image_path);
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+pub fn copy_rootfs_image_to(source: &Path, dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    if dest.exists() {
+        fs::remove_file(dest)
+            .map_err(|e| format!("remove old rootfs image {}: {e}", dest.display()))?;
+    }
+
+    let mut input = File::open(source)
+        .map_err(|e| format!("open cached rootfs image {}: {e}", source.display()))?;
+    let mut output =
+        File::create(dest).map_err(|e| format!("create rootfs image {}: {e}", dest.display()))?;
+    let mut buf = vec![0; 1024 * 1024];
+    let mut total = 0_u64;
+
+    loop {
+        let len = input
+            .read(&mut buf)
+            .map_err(|e| format!("read rootfs image {}: {e}", source.display()))?;
+        if len == 0 {
+            break;
+        }
+        total += len as u64;
+        if buf[..len].iter().all(|byte| *byte == 0) {
+            let offset = i64::try_from(len).map_err(|e| {
+                format!(
+                    "convert sparse rootfs image seek offset for {}: {e}",
+                    dest.display()
+                )
+            })?;
+            output
+                .seek(SeekFrom::Current(offset))
+                .map_err(|e| format!("seek sparse rootfs image {}: {e}", dest.display()))?;
+        } else {
+            output
+                .write_all(&buf[..len])
+                .map_err(|e| format!("write rootfs image {}: {e}", dest.display()))?;
+        }
+    }
+
+    output
+        .set_len(total)
+        .map_err(|e| format!("finalize rootfs image {}: {e}", dest.display()))
+}
+
+pub fn write_rootfs_image_file(
+    image_path: &Path,
+    guest_path: &str,
+    contents: &[u8],
+) -> Result<(), String> {
+    ensure_rootfs_image_parent_dirs(image_path, guest_path);
+
+    let tmp_path = temporary_injection_path(image_path);
+    fs::write(&tmp_path, contents).map_err(|e| format!("write {}: {e}", tmp_path.display()))?;
+    let _ = run_debugfs(image_path, &format!("rm {guest_path}"));
+    let result = run_debugfs(
+        image_path,
+        &format!("write {} {}", tmp_path.display(), guest_path),
+    );
+    let _ = fs::remove_file(&tmp_path);
+    result
+}
+
+pub fn set_rootfs_image_file_mode(
+    image_path: &Path,
+    guest_path: &str,
+    mode: u32,
+) -> Result<(), String> {
+    run_debugfs(image_path, &format!("sif {guest_path} mode {mode:o}"))
+}
+
+#[cfg(test)]
 fn append_rootfs_tree_to_archive(
     builder: &mut tar::Builder<BufWriter<File>>,
     source: &Path,
@@ -119,6 +225,7 @@ fn append_rootfs_tree_to_archive(
     Ok(())
 }
 
+#[cfg(test)]
 fn append_symlink_to_archive(
     builder: &mut tar::Builder<BufWriter<File>>,
     source_path: &Path,
@@ -165,6 +272,7 @@ fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
     fs::write(opt_dir.join(".rootfs-type"), "sandbox\n")
         .map_err(|e| format!("write sandbox rootfs marker: {e}"))?;
     ensure_sandbox_guest_user(rootfs)?;
+    create_sandbox_mountpoint(&rootfs.join("sandbox"))?;
 
     Ok(())
 }
@@ -180,6 +288,159 @@ pub fn validate_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
     )?;
     require_any_rootfs_path(rootfs, &["/bin/sed", "/usr/bin/sed"])?;
     Ok(())
+}
+
+fn create_sandbox_mountpoint(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn rootfs_image_size_bytes(source: &Path) -> Result<u64, String> {
+    let used = directory_size_bytes(source)?;
+    let headroom = (used / 4).max(ROOTFS_IMAGE_MIN_HEADROOM_BYTES);
+    let size = (used + headroom).max(ROOTFS_IMAGE_MIN_SIZE_BYTES);
+    Ok(round_up_to_mib(size))
+}
+
+fn directory_size_bytes(path: &Path) -> Result<u64, String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Ok(metadata.len());
+    }
+    if !metadata.file_type().is_dir() {
+        return Ok(0);
+    }
+
+    let mut size = 4096;
+    for entry in fs::read_dir(path).map_err(|e| format!("read {}: {e}", path.display()))? {
+        let entry = entry.map_err(|e| format!("read {}: {e}", path.display()))?;
+        size += directory_size_bytes(&entry.path())?;
+    }
+    Ok(size)
+}
+
+fn round_up_to_mib(bytes: u64) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    bytes.div_ceil(MIB) * MIB
+}
+
+fn format_ext4_image_from_dir(source: &Path, image_path: &Path) -> Result<(), String> {
+    let mut last_error = None;
+    for tool in ["mke2fs", "mkfs.ext4"] {
+        for candidate in e2fs_tool_candidates(tool) {
+            let label = candidate.display().to_string();
+            let output = Command::new(&candidate)
+                .arg("-q")
+                .arg("-F")
+                .arg("-t")
+                .arg("ext4")
+                .arg("-E")
+                .arg("root_owner=0:0")
+                .arg("-d")
+                .arg(source)
+                .arg(image_path)
+                .output();
+            match output {
+                Ok(output) if output.status.success() => return Ok(()),
+                Ok(output) => {
+                    last_error = Some(format!(
+                        "{label} failed with status {}\nstdout: {}\nstderr: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    last_error = Some(format!("{label} not found"));
+                }
+                Err(err) => {
+                    last_error = Some(format!("run {label}: {err}"));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "failed to create ext4 rootfs image from {}: {}. Install e2fsprogs (mke2fs/mkfs.ext4) and retry",
+        source.display(),
+        last_error.unwrap_or_else(|| "no ext4 formatter found".to_string())
+    ))
+}
+
+fn ensure_rootfs_image_parent_dirs(image_path: &Path, guest_path: &str) {
+    let Some(parent) = Path::new(guest_path).parent() else {
+        return;
+    };
+    let mut current = String::new();
+    for component in parent.components() {
+        let part = component.as_os_str().to_string_lossy();
+        if part == "/" || part.is_empty() {
+            continue;
+        }
+        current.push('/');
+        current.push_str(&part);
+        let _ = run_debugfs(image_path, &format!("mkdir {current}"));
+    }
+}
+
+fn run_debugfs(image_path: &Path, command: &str) -> Result<(), String> {
+    let mut last_error = None;
+    for candidate in e2fs_tool_candidates("debugfs") {
+        let label = candidate.display().to_string();
+        let output = Command::new(&candidate)
+            .arg("-w")
+            .arg("-R")
+            .arg(command)
+            .arg(image_path)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                last_error = Some(format!(
+                    "{label} failed with status {}\nstdout: {}\nstderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(format!("{label} not found"));
+            }
+            Err(err) => {
+                last_error = Some(format!("run {label}: {err}"));
+            }
+        }
+    }
+    Err(format!(
+        "debugfs command '{command}' failed for {}: {}. Install e2fsprogs (debugfs) and retry",
+        image_path.display(),
+        last_error.unwrap_or_else(|| "debugfs not found".to_string())
+    ))
+}
+
+fn e2fs_tool_candidates(tool: &str) -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from(tool)];
+    for root in ["/opt/homebrew/opt/e2fsprogs", "/usr/local/opt/e2fsprogs"] {
+        candidates.push(Path::new(root).join("sbin").join(tool));
+        candidates.push(Path::new(root).join("bin").join(tool));
+    }
+    candidates
+}
+
+fn temporary_injection_path(image_path: &Path) -> PathBuf {
+    let n = INJECTION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let parent = image_path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        ".openshell-rootfs-inject-{}-{n}",
+        std::process::id()
+    ))
 }
 
 fn ensure_sandbox_guest_user(rootfs: &Path) -> Result<(), String> {
@@ -343,7 +604,13 @@ mod tests {
         validate_sandbox_rootfs(&rootfs).expect("validate sandbox rootfs");
 
         assert!(rootfs.join("srv/openshell-vm-sandbox-init.sh").is_file());
-        assert!(!rootfs.join("sandbox").exists());
+        assert!(rootfs.join("sandbox").is_dir());
+        assert!(
+            fs::read_dir(rootfs.join("sandbox"))
+                .expect("read sandbox")
+                .next()
+                .is_none()
+        );
         assert!(
             fs::read_to_string(rootfs.join("etc/passwd"))
                 .expect("read passwd")
@@ -363,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_sandbox_rootfs_preserves_image_workdir_contents() {
+    fn prepare_sandbox_rootfs_preserves_image_workdir_contents_in_rootfs() {
         let dir = unique_temp_dir();
         let rootfs = dir.join("rootfs");
 
@@ -378,6 +645,7 @@ mod tests {
 
         prepare_sandbox_rootfs(&rootfs).expect("prepare sandbox rootfs");
 
+        assert!(rootfs.join("sandbox").is_dir());
         assert_eq!(
             fs::read_to_string(rootfs.join("sandbox/app.py")).expect("read app"),
             "print('hello')\n"

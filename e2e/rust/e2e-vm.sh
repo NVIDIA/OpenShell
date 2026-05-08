@@ -56,9 +56,9 @@ DRIVER_BIN="${ROOT}/target/debug/openshell-driver-vm"
 STATE_DIR_ROOT="/tmp"
 
 # Smoke test timeouts. First boot extracts the embedded libkrun runtime
-# (~60-90MB of zstd per architecture) and prepares a sandbox rootfs from the
-# configured image. The guest then starts the sandbox supervisor directly; a
-# cold microVM is typically ready within ~15s after image preparation.
+# (~60-90MB of zstd per architecture) and prepares an ext4 root disk from the
+# configured image. The guest then starts the sandbox supervisor directly; a cold
+# microVM is typically ready within ~15s after image preparation.
 GATEWAY_READY_TIMEOUT=60
 SANDBOX_PROVISION_TIMEOUT=180
 
@@ -104,7 +104,7 @@ s.close()')"
 
 # Per-run state dir so concurrent e2e runs don't collide on the UDS or
 # sandbox state. The VM driver creates `<state_dir>/compute-driver.sock`
-# and `<state_dir>/sandboxes/<id>/rootfs/` under here. Keep the
+# and `<state_dir>/sandboxes/<id>/rootfs.ext4` under here. Keep the
 # basename short — see the SUN_LEN comment above.
 RUN_STATE_DIR="${STATE_DIR_ROOT}/os-vm-e2e-${HOST_PORT}-$$"
 mkdir -p "${RUN_STATE_DIR}"
@@ -147,7 +147,7 @@ cleanup() {
 
   rm -f "${GATEWAY_LOG}" 2>/dev/null || true
   # Only wipe the per-run state dir on success. On failure, leave it for
-  # post-mortem (serial console logs, gvproxy logs, rootfs dumps).
+  # post-mortem (serial console logs, gvproxy logs, root disk images).
   if [ "${exit_code}" -eq 0 ]; then
     rm -rf "${RUN_STATE_DIR}" 2>/dev/null || true
   else
@@ -220,10 +220,10 @@ echo "==> Gateway ready after ${elapsed}s"
 
 export OPENSHELL_GATEWAY_ENDPOINT="http://127.0.0.1:${HOST_PORT}"
 
-# The VM driver creates each sandbox VM from scratch — the embedded
-# rootfs is extracted per sandbox, and the guest's sandbox supervisor
-# then initializes policy, netns, Landlock, and sshd. On a cold host
-# this is ~15s; allow 180s for slower CI runners.
+# The VM driver creates each sandbox VM from a copied ext4 root disk, and the
+# guest's sandbox supervisor then initializes policy, netns, Landlock, and sshd.
+# On a cold host this is ~15s after image preparation; allow 180s for slower CI
+# runners.
 export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
 echo "==> Running e2e smoke test (endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})"

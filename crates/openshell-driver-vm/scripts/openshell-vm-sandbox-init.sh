@@ -239,7 +239,8 @@ setup_gpu() {
         return 1
     fi
 
-    # Stage GSP firmware from virtiofs to tmpfs to avoid slow FUSE reads
+    # Stage GSP firmware to tmpfs so module loading reads it from a stable
+    # early-boot path.
     if [ -d /lib/firmware/nvidia ]; then
         ts "staging GPU firmware to tmpfs"
         mkdir -p /run/firmware/nvidia
@@ -273,6 +274,15 @@ setup_gpu() {
     fi
 }
 
+setup_sandbox_workdir() {
+    mkdir -p /sandbox
+    if ! chown -R sandbox:sandbox /sandbox 2>/dev/null; then
+        chown -R 10001:10001 /sandbox
+    fi
+    chmod 0755 /sandbox
+    ts "prepared /sandbox ownership"
+}
+
 mount -t proc proc /proc 2>/dev/null &
 mount -t sysfs sysfs /sys 2>/dev/null &
 mount -t tmpfs tmpfs /tmp 2>/dev/null &
@@ -285,6 +295,8 @@ mount -t devpts devpts /dev/pts 2>/dev/null &
 mount -t tmpfs tmpfs /dev/shm 2>/dev/null &
 mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null &
 wait
+
+setup_sandbox_workdir
 
 hostname openshell-sandbox-vm 2>/dev/null || true
 ip link set lo up 2>/dev/null || true

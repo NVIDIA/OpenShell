@@ -29,7 +29,18 @@ type KrunInitLog =
 type KrunCreateCtx = unsafe extern "C" fn() -> i32;
 type KrunFreeCtx = unsafe extern "C" fn(ctx_id: u32) -> i32;
 type KrunSetVmConfig = unsafe extern "C" fn(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> i32;
-type KrunSetRoot = unsafe extern "C" fn(ctx_id: u32, root_path: *const c_char) -> i32;
+type KrunAddDisk = unsafe extern "C" fn(
+    ctx_id: u32,
+    block_id: *const c_char,
+    disk_path: *const c_char,
+    read_only: bool,
+) -> i32;
+type KrunSetRootDiskRemount = unsafe extern "C" fn(
+    ctx_id: u32,
+    device: *const c_char,
+    fstype: *const c_char,
+    options: *const c_char,
+) -> i32;
 type KrunSetWorkdir = unsafe extern "C" fn(ctx_id: u32, workdir_path: *const c_char) -> i32;
 type KrunSetExec = unsafe extern "C" fn(
     ctx_id: u32,
@@ -67,7 +78,8 @@ pub struct LibKrun {
     pub krun_create_ctx: KrunCreateCtx,
     pub krun_free_ctx: KrunFreeCtx,
     pub krun_set_vm_config: KrunSetVmConfig,
-    pub krun_set_root: KrunSetRoot,
+    pub krun_add_disk: KrunAddDisk,
+    pub krun_set_root_disk_remount: KrunSetRootDiskRemount,
     pub krun_set_workdir: KrunSetWorkdir,
     pub krun_set_exec: KrunSetExec,
     pub krun_set_console_output: KrunSetConsoleOutput,
@@ -119,7 +131,12 @@ impl LibKrun {
             krun_create_ctx: load_symbol(library, b"krun_create_ctx\0", &libkrun_path)?,
             krun_free_ctx: load_symbol(library, b"krun_free_ctx\0", &libkrun_path)?,
             krun_set_vm_config: load_symbol(library, b"krun_set_vm_config\0", &libkrun_path)?,
-            krun_set_root: load_symbol(library, b"krun_set_root\0", &libkrun_path)?,
+            krun_add_disk: load_symbol(library, b"krun_add_disk\0", &libkrun_path)?,
+            krun_set_root_disk_remount: load_symbol(
+                library,
+                b"krun_set_root_disk_remount\0",
+                &libkrun_path,
+            )?,
             krun_set_workdir: load_symbol(library, b"krun_set_workdir\0", &libkrun_path)?,
             krun_set_exec: load_symbol(library, b"krun_set_exec\0", &libkrun_path)?,
             krun_set_console_output: load_symbol(
