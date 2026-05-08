@@ -83,6 +83,15 @@ Namespaced Issuer (selfSigned) for cert-manager CA bootstrap.
 {{- end }}
 
 {{/*
+Namespace where sandbox pods are created. An explicit
+.Values.server.sandboxNamespace is used verbatim. Otherwise it defaults to
+.Release.Namespace so `helm install -n my-ns` works without extra overrides.
+*/}}
+{{- define "openshell.sandboxNamespace" -}}
+{{- .Values.server.sandboxNamespace | default .Release.Namespace -}}
+{{- end }}
+
+{{/*
 gRPC endpoint sandbox pods use to call back into the gateway. An explicit
 .Values.server.grpcEndpoint is used verbatim. Otherwise it is derived from
 the in-cluster Service DNS, release namespace, service port, and disableTls

@@ -79,7 +79,9 @@ affinity: {}
 # Server configuration
 server:
   logLevel: info
-  sandboxNamespace: openshell
+  # Namespace where sandbox pods are created. Defaults to the Helm release
+  # namespace (.Release.Namespace) when left empty.
+  sandboxNamespace: ""
   dbUrl: "sqlite:/var/openshell/openshell.db"
   sandboxImage: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
   # Kubernetes imagePullPolicy for sandbox pods.  Empty = Kubernetes default

@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: sandboxNamespace defaulting
+templates:
+  - templates/statefulset.yaml
+  - templates/networkpolicy.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: defaults OPENSHELL_SANDBOX_NAMESPACE to release namespace
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_SANDBOX_NAMESPACE
+            value: "my-namespace"
+
+  - it: uses explicit sandboxNamespace when set
+    template: templates/statefulset.yaml
+    set:
+      server.sandboxNamespace: other-ns
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_SANDBOX_NAMESPACE
+            value: "other-ns"
+
+  - it: defaults NetworkPolicy namespace to release namespace
+    template: templates/networkpolicy.yaml
+    set:
+      networkPolicy.enabled: true
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: my-namespace
+
+  - it: uses explicit sandboxNamespace for NetworkPolicy
+    template: templates/networkpolicy.yaml
+    set:
+      networkPolicy.enabled: true
+      server.sandboxNamespace: other-ns
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: other-ns

@@ -63,7 +63,7 @@ spec:
             - {{ .Values.server.dbUrl | quote }}
           env:
             - name: OPENSHELL_SANDBOX_NAMESPACE
-              value: {{ .Values.server.sandboxNamespace | quote }}
+              value: {{ include "openshell.sandboxNamespace" . | quote }}
             - name: OPENSHELL_SANDBOX_IMAGE
               value: {{ .Values.server.sandboxImage | quote }}
             {{- if .Values.server.sandboxImagePullPolicy }}
