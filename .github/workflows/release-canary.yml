@@ -46,3 +46,24 @@ jobs:
         run: |
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install-dev.sh | sh
           openshell status
+
+  fedora:
+    name: Fedora RPM
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 20
+    container:
+      image: fedora:latest
+      options: --privileged
+    steps:
+      - name: Ensure Podman
+        run: |
+          dnf install -y curl podman
+          mkdir -p "${HOME}/.config/openshell"
+          printf 'OPENSHELL_DRIVERS=podman\n' > "${HOME}/.config/openshell/gateway.env"
+          podman info
+
+      - name: Install dev and check status
+        run: |
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install-dev.sh | sh
+          openshell status
