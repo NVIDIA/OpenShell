@@ -381,23 +381,6 @@ impl PodmanClient {
         }
     }
 
-    /// Perform a versioned HTTP request with a raw byte body (not JSON).
-    async fn request_raw(
-        &self,
-        method: hyper::Method,
-        path: &str,
-        content_type: &str,
-        body: Bytes,
-    ) -> Result<(hyper::StatusCode, Bytes), PodmanApiError> {
-        let req = Self::build_request(
-            method,
-            &format!("/{API_VERSION}{path}"),
-            Full::new(body),
-            Some(content_type),
-        );
-        self.send_request(req, API_TIMEOUT).await
-    }
-
     /// POST a JSON body and ignore 409 Conflict (resource already exists).
     async fn create_ignore_conflict(&self, path: &str, body: &Value) -> Result<(), PodmanApiError> {
         match self
@@ -548,64 +531,6 @@ impl PodmanClient {
             .and_then(|g| g.as_str())
             .map(String::from);
         Ok(gateway)
-    }
-
-    // ── Secret operations ────────────────────────────────────────────────
-
-    /// Create a Podman secret with the given name and raw value.
-    ///
-    /// Idempotent: if a secret with the same name already exists it is
-    /// replaced (delete + recreate) so the value is always up-to-date.
-    pub async fn create_secret(&self, name: &str, value: &[u8]) -> Result<(), PodmanApiError> {
-        validate_name(name)?;
-        let encoded_name = url_encode(name);
-        let path = format!("/libpod/secrets/create?name={encoded_name}");
-        let (status, bytes) = self
-            .request_raw(
-                hyper::Method::POST,
-                &path,
-                "application/octet-stream",
-                Bytes::copy_from_slice(value),
-            )
-            .await?;
-
-        match status.as_u16() {
-            200 | 201 => Ok(()),
-            409 => {
-                // Secret already exists — replace it.
-                self.remove_secret(name).await?;
-                let (status2, bytes2) = self
-                    .request_raw(
-                        hyper::Method::POST,
-                        &path,
-                        "application/octet-stream",
-                        Bytes::copy_from_slice(value),
-                    )
-                    .await?;
-                if status2.is_success() {
-                    Ok(())
-                } else {
-                    Err(error_from_response(status2.as_u16(), &bytes2))
-                }
-            }
-            _ => Err(error_from_response(status.as_u16(), &bytes)),
-        }
-    }
-
-    /// Remove a Podman secret by name. Idempotent (not-found is ignored).
-    pub async fn remove_secret(&self, name: &str) -> Result<(), PodmanApiError> {
-        validate_name(name)?;
-        match self
-            .request_ok(
-                hyper::Method::DELETE,
-                &format!("/libpod/secrets/{name}"),
-                None,
-            )
-            .await
-        {
-            Ok(()) | Err(PodmanApiError::NotFound(_)) => Ok(()),
-            Err(e) => Err(e),
-        }
     }
 
     // ── Image operations ────────────────────────────────────────────────

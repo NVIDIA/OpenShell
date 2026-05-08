@@ -9,10 +9,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use openshell_core::VERSION;
-use openshell_core::config::{
-    DEFAULT_NETWORK_NAME, DEFAULT_SSH_HANDSHAKE_SKEW_SECS, DEFAULT_SSH_PORT,
-    DEFAULT_STOP_TIMEOUT_SECS,
-};
+use openshell_core::config::{DEFAULT_NETWORK_NAME, DEFAULT_SSH_PORT, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_podman::config::ImagePullPolicy;
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
@@ -73,12 +70,6 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_SSH_PORT", default_value_t = DEFAULT_SSH_PORT)]
     sandbox_ssh_port: u16,
 
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
-    ssh_handshake_secret: String,
-
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS", default_value_t = DEFAULT_SSH_HANDSHAKE_SKEW_SECS)]
-    ssh_handshake_skew_secs: u64,
-
     /// Container stop timeout in seconds (SIGTERM → SIGKILL).
     #[arg(long, env = "OPENSHELL_STOP_TIMEOUT", default_value_t = DEFAULT_STOP_TIMEOUT_SECS)]
     stop_timeout: u32,
@@ -122,8 +113,6 @@ async fn main() -> Result<()> {
         sandbox_ssh_socket_path: args.sandbox_ssh_socket_path,
         network_name: args.network_name,
         ssh_port: args.sandbox_ssh_port,
-        ssh_handshake_secret: args.ssh_handshake_secret,
-        ssh_handshake_skew_secs: args.ssh_handshake_skew_secs,
         stop_timeout_secs: args.stop_timeout,
         supervisor_image: args.supervisor_image,
         guest_tls_ca: args.podman_tls_ca,

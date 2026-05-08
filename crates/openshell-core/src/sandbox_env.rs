@@ -20,12 +20,6 @@ pub const SANDBOX_ID: &str = "OPENSHELL_SANDBOX_ID";
 /// Filesystem path to the UNIX socket used for the in-sandbox SSH server.
 pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 
-/// Shared secret used for HMAC-based SSH handshake authentication.
-pub const SSH_HANDSHAKE_SECRET: &str = "OPENSHELL_SSH_HANDSHAKE_SECRET";
-
-/// Allowed clock-skew tolerance in seconds for the SSH handshake.
-pub const SSH_HANDSHAKE_SKEW_SECS: &str = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS";
-
 /// Log level for the sandbox supervisor (e.g. `"debug"`, `"info"`, `"warn"`).
 pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 

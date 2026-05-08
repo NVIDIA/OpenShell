@@ -145,7 +145,6 @@ impl MultiplexService {
             GrpcRouter::new(openshell, inference),
             self.state.oidc_cache.clone(),
             authz_policy,
-            self.state.config.ssh_handshake_secret.clone(),
         );
         let http_service = http_router(self.state.clone());
 
@@ -253,13 +252,17 @@ where
 /// Authentication is provider-specific (currently OIDC via `oidc.rs`).
 /// Authorization is provider-agnostic (via `authz.rs`). This separation
 /// aligns with RFC 0001's control-plane identity design.
+///
+/// Sandbox-class methods (`oidc::is_sandbox_method`) accept callers without
+/// a Bearer token: the gRPC channel's mTLS handshake is the trust
+/// boundary. The router marks such requests with the
+/// `INTERNAL_AUTH_SOURCE_HEADER` so handlers (`policy.rs`) can apply
+/// sandbox-restricted scope.
 #[derive(Clone)]
 pub struct AuthGrpcRouter<S> {
     inner: S,
     oidc_cache: Option<Arc<oidc::JwksCache>>,
     authz_policy: Option<AuthzPolicy>,
-    /// SSH handshake secret used to validate sandbox-to-server RPCs.
-    sandbox_secret: String,
 }
 
 impl<S> AuthGrpcRouter<S> {
@@ -267,13 +270,11 @@ impl<S> AuthGrpcRouter<S> {
         inner: S,
         oidc_cache: Option<Arc<oidc::JwksCache>>,
         authz_policy: Option<AuthzPolicy>,
-        sandbox_secret: String,
     ) -> Self {
         Self {
             inner,
             oidc_cache,
             authz_policy,
-            sandbox_secret,
         }
     }
 }
@@ -299,7 +300,6 @@ where
     fn call(&mut self, req: Request<B>) -> Self::Future {
         let oidc_cache = self.oidc_cache.clone();
         let authz_policy = self.authz_policy.clone();
-        let sandbox_secret = self.sandbox_secret.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -318,28 +318,21 @@ where
                 return inner.ready().await?.call(req).await;
             }
 
-            // Sandbox-to-server RPCs — authenticated via shared secret,
-            // not OIDC Bearer tokens.
-            if oidc::is_sandbox_secret_method(&path) {
-                if let Err(status) = oidc::validate_sandbox_secret(req.headers(), &sandbox_secret) {
-                    let response = status.into_http();
-                    let (parts, body) = response.into_parts();
-                    let body = tonic::body::BoxBody::new(body);
-                    return Ok(Response::from_parts(parts, body));
-                }
-                oidc::mark_sandbox_secret_authenticated(req.headers_mut());
+            // Sandbox-class RPCs — no Bearer expected. The gRPC channel's
+            // mTLS handshake (or the operator's fronting proxy when
+            // `--disable-gateway-auth` is set) is the trust boundary.
+            if oidc::is_sandbox_method(&path) {
+                oidc::mark_sandbox_caller(req.headers_mut());
                 return inner.ready().await?.call(req).await;
             }
 
-            // Dual-auth methods (e.g. UpdateConfig) — accept either a
-            // Bearer token (CLI users) or sandbox secret (supervisor).
-            if oidc::is_dual_auth_method(&path)
-                && oidc::validate_sandbox_secret(req.headers(), &sandbox_secret).is_ok()
-            {
-                oidc::mark_sandbox_secret_authenticated(req.headers_mut());
+            // Dual-auth methods (e.g. UpdateConfig) — Bearer present grants
+            // full scope (CLI users); Bearer absent marks the caller as
+            // sandbox-class for restricted scope downstream.
+            if oidc::is_dual_auth_method(&path) && !has_bearer_token(req.headers()) {
+                oidc::mark_sandbox_caller(req.headers_mut());
                 return inner.ready().await?.call(req).await;
             }
-            // Fall through to Bearer token validation below.
 
             // Extract Bearer token from the authorization header.
             let token = req
@@ -475,6 +468,13 @@ where
             })
         }
     }
+}
+
+fn has_bearer_token(headers: &http::HeaderMap) -> bool {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("Bearer "))
 }
 
 fn grpc_method_from_path(path: &str) -> String {

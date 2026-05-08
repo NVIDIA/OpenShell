@@ -105,11 +105,6 @@ spec:
             {{- end }}
             - name: OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP
               value: {{ .Values.server.enableLoopbackServiceHttp | quote }}
-            - name: OPENSHELL_SSH_HANDSHAKE_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.server.sshHandshakeSecretName | quote }}
-                  key: secret
             {{- if .Values.server.disableTls }}
             - name: OPENSHELL_DISABLE_TLS
               value: "true"

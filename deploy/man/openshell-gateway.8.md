@@ -104,14 +104,6 @@ gRPC and HTTP, secured by mutual TLS (mTLS) by default.
 :   Image pull policy: Always, IfNotPresent, Never.
     Environment: **OPENSHELL_SANDBOX_IMAGE_PULL_POLICY**.
 
-**--ssh-handshake-secret** *SECRET*
-:   Shared secret for gateway-to-sandbox SSH handshake.
-    Environment: **OPENSHELL_SSH_HANDSHAKE_SECRET**.
-
-**--ssh-handshake-skew-secs** *SECONDS*
-:   Allowed clock skew in seconds for SSH handshake. Default: **30**.
-    Environment: **OPENSHELL_SSH_HANDSHAKE_SKEW_SECS**.
-
 **--ssh-gateway-host** *HOST*
 :   Public host for the SSH gateway endpoint. Default: **127.0.0.1**.
     Environment: **OPENSHELL_SSH_GATEWAY_HOST**.

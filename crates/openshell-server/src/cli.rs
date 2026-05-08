@@ -6,10 +6,7 @@
 use clap::{ArgAction, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::ComputeDriverKind;
-use openshell_core::config::{
-    DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS,
-    DEFAULT_SSH_PORT,
-};
+use openshell_core::config::{DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_SERVER_PORT, DEFAULT_SSH_PORT};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use tracing::info;
@@ -131,13 +128,6 @@ struct RunArgs {
     /// SSH port inside sandbox pods.
     #[arg(long, env = "OPENSHELL_SANDBOX_SSH_PORT", default_value_t = DEFAULT_SSH_PORT)]
     sandbox_ssh_port: u16,
-    /// Shared secret for gateway-to-sandbox SSH handshake.
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
-    ssh_handshake_secret: Option<String>,
-
-    /// Allowed clock skew in seconds for SSH handshake.
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS", default_value_t = DEFAULT_SSH_HANDSHAKE_SKEW_SECS)]
-    ssh_handshake_skew_secs: u64,
 
     /// Kubernetes secret name containing client TLS materials for sandbox pods.
     #[arg(long, env = "OPENSHELL_CLIENT_TLS_SECRET_NAME")]
@@ -412,7 +402,6 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
         .with_ssh_gateway_host(args.ssh_gateway_host)
         .with_ssh_gateway_port(args.ssh_gateway_port)
         .with_sandbox_ssh_port(args.sandbox_ssh_port)
-        .with_ssh_handshake_skew_secs(args.ssh_handshake_skew_secs)
         .with_server_sans(args.server_sans)
         .with_loopback_service_http(args.enable_loopback_service_http);
 
@@ -426,10 +415,6 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
 
     if let Some(endpoint) = args.grpc_endpoint {
         config = config.with_grpc_endpoint(endpoint);
-    }
-
-    if let Some(secret) = args.ssh_handshake_secret {
-        config = config.with_ssh_handshake_secret(secret);
     }
 
     if let Some(name) = args.client_tls_secret_name {

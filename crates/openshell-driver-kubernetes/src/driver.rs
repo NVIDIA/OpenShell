@@ -176,10 +176,6 @@ impl KubernetesComputeDriver {
         &self.config.ssh_socket_path
     }
 
-    pub const fn ssh_handshake_skew_secs(&self) -> u64 {
-        self.config.ssh_handshake_skew_secs
-    }
-
     fn watch_api(&self) -> Api<DynamicObject> {
         let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, SANDBOX_VERSION, SANDBOX_KIND);
         let resource = ApiResource::from_gvk(&gvk);
@@ -296,10 +292,6 @@ impl KubernetesComputeDriver {
         }
     }
 
-    fn ssh_handshake_secret(&self) -> &str {
-        &self.config.ssh_handshake_secret
-    }
-
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
         let name = sandbox.name.as_str();
         info!(
@@ -328,8 +320,6 @@ impl KubernetesComputeDriver {
             sandbox_name: &sandbox.name,
             grpc_endpoint: &self.config.grpc_endpoint,
             ssh_socket_path: self.ssh_socket_path(),
-            ssh_handshake_secret: self.ssh_handshake_secret(),
-            ssh_handshake_skew_secs: self.ssh_handshake_skew_secs(),
             client_tls_secret_name: &self.config.client_tls_secret_name,
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
@@ -984,8 +974,6 @@ struct SandboxPodParams<'a> {
     sandbox_name: &'a str,
     grpc_endpoint: &'a str,
     ssh_socket_path: &'a str,
-    ssh_handshake_secret: &'a str,
-    ssh_handshake_skew_secs: u64,
     client_tls_secret_name: &'a str,
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
@@ -1146,8 +1134,6 @@ fn sandbox_template_to_k8s(
         params.sandbox_name,
         params.grpc_endpoint,
         params.ssh_socket_path,
-        params.ssh_handshake_secret,
-        params.ssh_handshake_skew_secs,
         !params.client_tls_secret_name.is_empty(),
     );
 
@@ -1310,8 +1296,6 @@ fn build_env_list(
     sandbox_name: &str,
     grpc_endpoint: &str,
     ssh_socket_path: &str,
-    ssh_handshake_secret: &str,
-    ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
 ) -> Vec<serde_json::Value> {
     let mut env = existing_env.cloned().unwrap_or_default();
@@ -1323,8 +1307,6 @@ fn build_env_list(
         sandbox_name,
         grpc_endpoint,
         ssh_socket_path,
-        ssh_handshake_secret,
-        ssh_handshake_skew_secs,
         tls_enabled,
     );
     env
@@ -1341,15 +1323,12 @@ fn apply_env_map(
 
 // Required env vars are passed individually for clarity at call sites; grouping into a struct
 // would not improve readability for this internal helper.
-#[allow(clippy::too_many_arguments)]
 fn apply_required_env(
     env: &mut Vec<serde_json::Value>,
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
     ssh_socket_path: &str,
-    ssh_handshake_secret: &str,
-    ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
 ) {
     upsert_env(env, openshell_core::sandbox_env::SANDBOX_ID, sandbox_id);
@@ -1367,16 +1346,6 @@ fn apply_required_env(
             ssh_socket_path,
         );
     }
-    upsert_env(
-        env,
-        openshell_core::sandbox_env::SSH_HANDSHAKE_SECRET,
-        ssh_handshake_secret,
-    );
-    upsert_env(
-        env,
-        openshell_core::sandbox_env::SSH_HANDSHAKE_SKEW_SECS,
-        &ssh_handshake_skew_secs.to_string(),
-    );
     // TLS cert paths for sandbox-to-server mTLS. Only set when TLS is enabled
     // and the client TLS secret is mounted into the sandbox pod.
     if tls_enabled {
@@ -1535,7 +1504,7 @@ mod tests {
     use prost_types::{Struct, Value, value::Kind};
 
     #[test]
-    fn apply_required_env_always_injects_ssh_handshake_secret() {
+    fn apply_required_env_does_not_inject_handshake_env() {
         let mut env = Vec::new();
         apply_required_env(
             &mut env,
@@ -1543,21 +1512,19 @@ mod tests {
             "my-sandbox",
             "https://endpoint:8080",
             "0.0.0.0:2222",
-            "my-secret-value",
-            300,
             true,
         );
 
-        let secret_entry = env
-            .iter()
-            .find(|e| {
-                e.get("name").and_then(|v| v.as_str()) == Some("OPENSHELL_SSH_HANDSHAKE_SECRET")
-            })
-            .expect("OPENSHELL_SSH_HANDSHAKE_SECRET must be present in env");
-        assert_eq!(
-            secret_entry.get("value").and_then(|v| v.as_str()),
-            Some("my-secret-value")
-        );
+        for name in [
+            "OPENSHELL_SSH_HANDSHAKE_SECRET",
+            "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS",
+        ] {
+            assert!(
+                !env.iter()
+                    .any(|e| e.get("name").and_then(|v| v.as_str()) == Some(name)),
+                "{name} must not appear in sandbox pod env after handshake-secret removal"
+            );
+        }
     }
 
     #[test]
@@ -1790,8 +1757,6 @@ mod tests {
             "my-sandbox",
             "https://endpoint:8080",
             "0.0.0.0:2222",
-            "secret",
-            300,
             true, // tls_enabled
         );
 

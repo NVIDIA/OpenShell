@@ -215,12 +215,8 @@ via sandbox templates:
 - `OPENSHELL_SANDBOX_ID`
 - `OPENSHELL_ENDPOINT`
 - `OPENSHELL_SSH_SOCKET_PATH`
-- `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS`
 - `OPENSHELL_CONTAINER_IMAGE`
 - `OPENSHELL_SANDBOX_COMMAND`
-
-The `PodmanComputeConfig::Debug` implementation redacts the handshake secret as
-`[REDACTED]`.
 
 ## Sandbox Lifecycle
 
@@ -239,18 +235,15 @@ sequenceDiagram
     D->>P: pull_image(supervisor, "missing")
     D->>P: pull_image(sandbox_image, policy)
 
-    D->>P: create_secret(handshake)
-    Note over D: On failure below, rollback secret
-
     D->>P: create_volume(workspace)
-    Note over D: On failure below, rollback volume + secret
+    Note over D: On failure below, rollback volume
 
     D->>P: create_container(spec)
     alt Conflict (409)
-        D->>P: remove_volume + remove_secret
+        D->>P: remove_volume
         D-->>GW: AlreadyExists
     end
-    Note over D: On failure below, rollback container + volume + secret
+    Note over D: On failure below, rollback container + volume
 
     D->>P: start_container
     D-->>GW: Ok
@@ -300,8 +293,6 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_GATEWAY_PORT` | `--gateway-port` | `8080` | Gateway port used for endpoint auto-detection by the standalone binary. |
 | `OPENSHELL_NETWORK_NAME` | `--network-name` | `openshell` | Podman bridge network name. |
 | `OPENSHELL_SANDBOX_SSH_PORT` | `--sandbox-ssh-port` | `2222` | SSH compatibility port inside the container. |
-| `OPENSHELL_SSH_HANDSHAKE_SECRET` | `--ssh-handshake-secret` | Required standalone, gateway-generated in-process | Shared secret for the NSSH1 handshake. |
-| `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS` | `--ssh-handshake-skew-secs` | `300` | Allowed timestamp skew for SSH handshake validation. |
 | `OPENSHELL_SANDBOX_SSH_SOCKET_PATH` | `--sandbox-ssh-socket-path` | `/run/openshell/ssh.sock` | Standalone driver only: supervisor Unix socket path in `PodmanComputeConfig`. In-gateway Podman uses server `config.sandbox_ssh_socket_path`. |
 | `OPENSHELL_STOP_TIMEOUT` | `--stop-timeout` | `10` | Container stop timeout in seconds. |
 | `OPENSHELL_SUPERVISOR_IMAGE` | `--supervisor-image` | `openshell/supervisor:latest` through the gateway, required standalone | OCI image containing the supervisor binary. |

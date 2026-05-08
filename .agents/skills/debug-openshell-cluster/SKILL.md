@@ -114,7 +114,6 @@ Check required Helm deployment secrets:
 
 ```bash
 kubectl -n openshell get secret \
-  openshell-ssh-handshake \
   openshell-server-tls \
   openshell-server-client-ca \
   openshell-client-tls

@@ -83,14 +83,6 @@ struct Args {
     #[arg(long, env = openshell_core::sandbox_env::SSH_SOCKET_PATH)]
     ssh_socket_path: Option<String>,
 
-    /// Shared secret for gateway-to-sandbox SSH handshake.
-    #[arg(long, env = openshell_core::sandbox_env::SSH_HANDSHAKE_SECRET)]
-    ssh_handshake_secret: Option<String>,
-
-    /// Allowed clock skew for SSH handshake validation.
-    #[arg(long, env = openshell_core::sandbox_env::SSH_HANDSHAKE_SKEW_SECS, default_value = "300")]
-    ssh_handshake_skew_secs: u64,
-
     /// Path to YAML inference routes for standalone routing.
     /// When set, inference routes are loaded from this file instead of
     /// fetching a bundle from the gateway.
@@ -288,8 +280,6 @@ fn main() -> Result<()> {
             args.policy_rules,
             args.policy_data,
             args.ssh_socket_path,
-            args.ssh_handshake_secret,
-            args.ssh_handshake_skew_secs,
             args.health_check,
             args.health_port,
             args.inference_routes,

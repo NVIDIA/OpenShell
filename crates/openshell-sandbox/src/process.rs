@@ -22,16 +22,10 @@ use std::process::Stdio;
 use tokio::process::{Child, Command};
 use tracing::debug;
 
-const SSH_HANDSHAKE_SECRET_ENV: &str = "OPENSHELL_SSH_HANDSHAKE_SECRET";
-
 fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>) {
     for (key, value) in provider_env {
         cmd.env(key, value);
     }
-}
-
-fn scrub_sensitive_env(cmd: &mut Command) {
-    cmd.env_remove(SSH_HANDSHAKE_SECRET_ENV);
 }
 
 #[cfg(unix)]
@@ -161,7 +155,6 @@ impl ProcessHandle {
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1");
 
-        scrub_sensitive_env(&mut cmd);
         inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workdir {
@@ -288,7 +281,6 @@ impl ProcessHandle {
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1");
 
-        scrub_sensitive_env(&mut cmd);
         inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workdir {
@@ -802,21 +794,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn harden_child_process_marks_process_nondumpable() {
         assert_eq!(probe_hardened_child(dumpable_flag_probe), 0);
-    }
-
-    #[tokio::test]
-    async fn scrub_sensitive_env_removes_ssh_handshake_secret() {
-        let mut cmd = Command::new("/usr/bin/env");
-        cmd.stdin(StdStdio::null())
-            .stdout(StdStdio::piped())
-            .stderr(StdStdio::null())
-            .env(SSH_HANDSHAKE_SECRET_ENV, "super-secret");
-
-        scrub_sensitive_env(&mut cmd);
-
-        let output = cmd.output().await.expect("spawn env");
-        let stdout = String::from_utf8(output.stdout).expect("utf8");
-        assert!(!stdout.contains(SSH_HANDSHAKE_SECRET_ENV));
     }
 
     #[tokio::test]

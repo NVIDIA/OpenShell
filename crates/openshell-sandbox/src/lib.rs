@@ -291,8 +291,6 @@ pub async fn run_sandbox(
     policy_rules: Option<String>,
     policy_data: Option<String>,
     ssh_socket_path: Option<String>,
-    ssh_handshake_secret: Option<String>,
-    ssh_handshake_skew_secs: u64,
     _health_check: bool,
     _health_port: u16,
     inference_routes: Option<String>,
@@ -746,8 +744,6 @@ pub async fn run_sandbox(
     if let Some(listen_path) = ssh_socket_path.clone() {
         let policy_clone = policy.clone();
         let workdir_clone = workdir.clone();
-        let _ = ssh_handshake_secret; // retained in the signature for compat; unused
-        let _ = ssh_handshake_skew_secs;
         let proxy_url = ssh_proxy_url;
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();

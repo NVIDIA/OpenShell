@@ -1664,9 +1664,7 @@ mod tests {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         let compute = new_test_runtime(store.clone()).await;
         Arc::new(ServerState::new(
-            Config::new(None)
-                .with_database_url("sqlite::memory:")
-                .with_ssh_handshake_secret("test-secret"),
+            Config::new(None).with_database_url("sqlite::memory:"),
             store,
             compute,
             SandboxIndex::new(),

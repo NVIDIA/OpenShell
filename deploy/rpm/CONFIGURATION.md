@@ -160,7 +160,6 @@ across package upgrades.
 | `OPENSHELL_LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `OPENSHELL_DRIVERS` | `podman` | Compute driver (`podman`, `docker`, `kubernetes`) |
 | `OPENSHELL_DB_URL` | `sqlite://$XDG_STATE_HOME/openshell/gateway.db` | SQLite database URL for state persistence |
-| `OPENSHELL_SSH_HANDSHAKE_SECRET` | (auto-generated) | Shared secret for sandbox SSH authentication |
 | `OPENSHELL_DISABLE_GATEWAY_AUTH` | (unset) | Set to `true` to skip mTLS client certificate checks |
 
 ### TLS settings

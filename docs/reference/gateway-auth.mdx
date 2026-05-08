@@ -123,7 +123,7 @@ The connection flow:
 
 If `OPENSHELL_OIDC_SCOPES_CLAIM` is set, the gateway also enforces scopes. It accepts space-delimited scope strings such as `scope: "openid sandbox:read"` and JSON arrays such as `scp: ["sandbox:read"]`. Standard OIDC scopes such as `openid`, `profile`, `email`, and `offline_access` are ignored for authorization. `openshell:all` grants access to all scoped methods.
 
-Supervisor-to-gateway RPCs do not use user OIDC tokens. When OIDC is enabled, sandbox supervisors authenticate their internal RPCs with the shared sandbox secret so log upload, policy status, credential environment lookup, inference bundle lookup, and sandbox config sync continue to work.
+Supervisor-to-gateway RPCs do not use user OIDC tokens. The gRPC channel's mTLS handshake is the trust boundary: the gateway treats requests with a verified client cert and no `Authorization: Bearer` header as sandbox-class callers. Log upload, policy status, credential environment lookup, inference bundle lookup, and sandbox config sync run with sandbox-restricted scope, while CLI users present a Bearer token for full-scope access. Operators using `--disable-gateway-auth` (TLS terminated at a fronting proxy) must enforce caller authentication at the proxy, since the gateway does not see a verified client cert in that mode.
 
 Re-authenticate an OIDC gateway with:
 

@@ -331,14 +331,12 @@ mod tests {
         let sandbox_name = "demo";
         let container_name = container::container_name(sandbox_name);
         let volume_name = container::volume_name(sandbox_id);
-        let secret_name = container::secret_name(sandbox_id);
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "forward-id",
             vec![
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
-                StubResponse::new(StatusCode::NO_CONTENT, ""),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
@@ -386,10 +384,6 @@ mod tests {
                 format!(
                     "DELETE {}",
                     api_path(&format!("/libpod/volumes/{volume_name}"))
-                ),
-                format!(
-                    "DELETE {}",
-                    api_path(&format!("/libpod/secrets/{secret_name}"))
                 ),
             ]
         );

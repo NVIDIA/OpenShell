@@ -108,10 +108,6 @@ server:
   sshGatewayPort: 0
   # TLS configuration for the server. The server always terminates mTLS
   # directly and requires client certificates.
-  # Name of the Kubernetes Secret holding the NSSH1 HMAC handshake key.
-  # The secret must contain a `secret` key with the hex-encoded HMAC key.
-  # By default a pre-install/pre-upgrade hook creates it when missing (see sshHandshake).
-  sshHandshakeSecretName: "openshell-ssh-handshake"
   # Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get
   # hostAliases entries mapping host.docker.internal and host.openshell.internal
   # to this IP, allowing them to reach services running on the Docker host.
@@ -168,16 +164,6 @@ server:
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
   enabled: true
-
-# NSSH1 SSH gateway handshake Secret (`server.sshHandshakeSecretName`).
-# Helm hook creates it only when the Secret does not already exist (safe upgrades).
-# Set sshHandshake.value from a gitignored values file for a stable dev secret.
-sshHandshake:
-  hook:
-    enabled: true
-  # 64 hex chars (32 bytes), matching openshell-bootstrap. If empty, Helm generates
-  # a random value at install template time (two UUIDs, dashes stripped).
-  value: ""
 
 # PKI bootstrap via a pre-install/pre-upgrade hook Job.
 # Runs `openshell-gateway generate-certs` to create the server and client TLS

@@ -63,15 +63,6 @@ pub fn volume_name(sandbox_id: &str) -> String {
     format!("{VOLUME_PREFIX}{sandbox_id}-workspace")
 }
 
-/// Podman secret name prefix.
-const SECRET_PREFIX: &str = "openshell-handshake-";
-
-/// Build the Podman secret name for a sandbox's SSH handshake secret.
-#[must_use]
-pub fn secret_name(sandbox_id: &str) -> String {
-    format!("{SECRET_PREFIX}{sandbox_id}")
-}
-
 /// Truncate a container ID to 12 characters (standard short form).
 #[must_use]
 pub fn short_id(id: &str) -> String {
@@ -283,13 +274,6 @@ fn build_env(
     env.insert(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.into(),
         config.sandbox_ssh_socket_path.clone(),
-    );
-    // NOTE: The SSH handshake secret is injected via a Podman secret
-    // (see the "secrets" field below) rather than a plaintext env var.
-    // This prevents exposure through `podman inspect`.
-    env.insert(
-        openshell_core::sandbox_env::SSH_HANDSHAKE_SKEW_SECS.into(),
-        config.ssh_handshake_skew_secs.to_string(),
     );
     env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
     env.insert(
@@ -515,16 +499,7 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
             start_period: 5_000_000_000,
         },
         resource_limits,
-        // Inject the SSH handshake secret via Podman's secret_env map so it
-        // does not appear in `podman inspect` output. The libpod SpecGenerator
-        // uses `secret_env` (map of env_var → secret_name) for env-type secrets,
-        // distinct from `secrets` which only handles file mounts under /run/secrets/.
-        // The secret is created by the driver before the container
-        // (see `PodmanComputeDriver::create_sandbox`).
-        secret_env: BTreeMap::from([(
-            openshell_core::sandbox_env::SSH_HANDSHAKE_SECRET.into(),
-            secret_name(&sandbox.id),
-        )]),
+        secret_env: BTreeMap::new(),
         stop_timeout: config.stop_timeout_secs,
         // Inject stable host aliases into /etc/hosts so sandbox containers can
         // reach services on the host. `host.openshell.internal` is the driver-
@@ -738,11 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn secret_name_uses_id() {
-        assert_eq!(secret_name("abc-123"), "openshell-handshake-abc-123");
-    }
-
-    #[test]
     fn short_id_truncates() {
         assert_eq!(short_id("abc123def456789"), "abc123def456");
         assert_eq!(short_id("short"), "short");
@@ -844,30 +814,28 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_uses_secret_env_not_plaintext() {
+    fn container_spec_does_not_inject_handshake_env() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
         let spec = build_container_spec(&sandbox, &config);
 
-        // The handshake secret must NOT appear in the plaintext env map.
         let env_map = spec["env"].as_object().expect("env should be an object");
-        assert!(
-            !env_map.contains_key("OPENSHELL_SSH_HANDSHAKE_SECRET"),
-            "handshake secret should not be in plaintext env"
-        );
+        for name in [
+            "OPENSHELL_SSH_HANDSHAKE_SECRET",
+            "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS",
+        ] {
+            assert!(
+                !env_map.contains_key(name),
+                "{name} must not appear in container env"
+            );
+        }
 
-        // It should appear in secret_env (the libpod env-type secret map) instead.
         let secret_env = spec["secret_env"]
             .as_object()
             .expect("secret_env should be an object");
         assert!(
-            secret_env.contains_key("OPENSHELL_SSH_HANDSHAKE_SECRET"),
-            "secret_env should map OPENSHELL_SSH_HANDSHAKE_SECRET to its secret name"
-        );
-        assert_eq!(
-            secret_env["OPENSHELL_SSH_HANDSHAKE_SECRET"].as_str(),
-            Some("openshell-handshake-test-id"),
-            "secret_env value should be the Podman secret name for the sandbox"
+            !secret_env.contains_key("OPENSHELL_SSH_HANDSHAKE_SECRET"),
+            "handshake secret must not appear in secret_env"
         );
     }
 
@@ -1071,7 +1039,6 @@ mod tests {
             default_image: "test-image:latest".to_string(),
             grpc_endpoint: "http://localhost:50051".to_string(),
             sandbox_ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
-            ssh_handshake_secret: "test-secret-value".to_string(),
             ..PodmanComputeConfig::default()
         }
     }

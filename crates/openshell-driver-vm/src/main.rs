@@ -90,12 +90,6 @@ struct Args {
     )]
     state_dir: PathBuf,
 
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
-    ssh_handshake_secret: Option<String>,
-
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS", default_value_t = 300)]
-    ssh_handshake_skew_secs: u64,
-
     #[arg(long = "guest-tls-ca", env = "OPENSHELL_VM_TLS_CA")]
     guest_tls_ca: Option<PathBuf>,
 
@@ -193,8 +187,6 @@ async fn main() -> Result<()> {
         state_dir: args.state_dir.clone(),
         launcher_bin: None,
         default_image: args.default_image.clone(),
-        ssh_handshake_secret: args.ssh_handshake_secret.clone().unwrap_or_default(),
-        ssh_handshake_skew_secs: args.ssh_handshake_skew_secs,
         log_level: args.log_level.clone(),
         krun_log_level: args.krun_log_level,
         vcpus: args.vcpus,

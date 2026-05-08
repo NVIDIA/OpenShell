@@ -11,8 +11,8 @@
 # Usage:
 #   init-gateway-env.sh <env-file>
 #
-# The generated file contains an auto-generated SSH handshake secret
-# and commented defaults for all gateway environment variables.
+# The generated file contains commented defaults for gateway
+# environment variables.
 
 set -euo pipefail
 
@@ -26,9 +26,6 @@ fi
 # ── Create parent directory ─────────────────────────────────────────
 mkdir -p "$(dirname "${ENV_FILE}")"
 
-# ── Generate SSH handshake secret ───────────────────────────────────
-SECRET=$(od -An -tx1 -N32 /dev/urandom | tr -dc 0-9a-f)
-
 # ── Write environment file ──────────────────────────────────────────
 cat > "${ENV_FILE}" << EOF
 # OpenShell Gateway Environment Configuration
@@ -36,13 +33,6 @@ cat > "${ENV_FILE}" << EOF
 #
 # Run 'openshell-gateway --help' for the full list of options.
 # See /usr/share/doc/openshell-gateway/ for guides.
-
-# ---- Required ----
-
-# Shared secret for gateway-to-sandbox SSH handshake authentication.
-# Auto-generated on first start. To regenerate:
-#   openssl rand -hex 32
-OPENSHELL_SSH_HANDSHAKE_SECRET=${SECRET}
 
 # ---- Optional (uncomment to override defaults) ----
 

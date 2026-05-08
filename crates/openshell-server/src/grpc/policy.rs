@@ -314,31 +314,31 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
     }
 }
 
-fn is_sandbox_secret_authenticated<T>(request: &Request<T>) -> bool {
-    oidc::is_sandbox_secret_authenticated(request.metadata())
+fn is_sandbox_caller<T>(request: &Request<T>) -> bool {
+    oidc::is_sandbox_caller(request.metadata())
 }
 
-/// Sandbox-secret-authenticated callers may only perform sandbox-scoped policy
-/// sync. They must not be able to mutate global config or sandbox settings.
-fn validate_sandbox_secret_update(req: &UpdateConfigRequest) -> Result<(), Status> {
+/// Sandbox-class callers may only perform sandbox-scoped policy sync. They
+/// must not mutate global config or sandbox settings.
+fn validate_sandbox_caller_update(req: &UpdateConfigRequest) -> Result<(), Status> {
     if req.global {
         return Err(Status::permission_denied(
-            "sandbox secret cannot mutate global config",
+            "sandbox callers cannot mutate global config",
         ));
     }
     if req.delete_setting {
         return Err(Status::permission_denied(
-            "sandbox secret cannot delete settings",
+            "sandbox callers cannot delete settings",
         ));
     }
     if req.name.trim().is_empty() {
         return Err(Status::permission_denied(
-            "sandbox secret may only perform sandbox policy sync",
+            "sandbox callers may only perform sandbox policy sync",
         ));
     }
     if req.policy.is_none() || !req.setting_key.trim().is_empty() {
         return Err(Status::permission_denied(
-            "sandbox secret may only perform sandbox policy sync",
+            "sandbox callers may only perform sandbox policy sync",
         ));
     }
     Ok(())
@@ -651,10 +651,10 @@ pub(super) async fn handle_update_config(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
-    let sandbox_secret_auth = is_sandbox_secret_authenticated(&request);
+    let sandbox_caller = is_sandbox_caller(&request);
     let req = request.into_inner();
-    if sandbox_secret_auth {
-        validate_sandbox_secret_update(&req)?;
+    if sandbox_caller {
+        validate_sandbox_caller_update(&req)?;
     }
     let key = req.setting_key.trim();
     let has_policy = req.policy.is_some();
@@ -2800,46 +2800,46 @@ mod tests {
     use tonic::Code;
 
     #[test]
-    fn sandbox_secret_update_validation_allows_sandbox_policy_sync() {
+    fn sandbox_caller_update_validation_allows_sandbox_policy_sync() {
         let req = UpdateConfigRequest {
             name: "sandbox-1".to_string(),
             policy: Some(ProtoSandboxPolicy::default()),
             ..Default::default()
         };
-        assert!(validate_sandbox_secret_update(&req).is_ok());
+        assert!(validate_sandbox_caller_update(&req).is_ok());
     }
 
     #[test]
-    fn sandbox_secret_update_validation_rejects_global_mutation() {
+    fn sandbox_caller_update_validation_rejects_global_mutation() {
         let req = UpdateConfigRequest {
             global: true,
             policy: Some(ProtoSandboxPolicy::default()),
             ..Default::default()
         };
-        let err = validate_sandbox_secret_update(&req).unwrap_err();
+        let err = validate_sandbox_caller_update(&req).unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     #[test]
-    fn sandbox_secret_update_validation_rejects_setting_mutation() {
+    fn sandbox_caller_update_validation_rejects_setting_mutation() {
         let req = UpdateConfigRequest {
             name: "sandbox-1".to_string(),
             setting_key: "inference.model".to_string(),
             setting_value: Some(SettingValue { value: None }),
             ..Default::default()
         };
-        let err = validate_sandbox_secret_update(&req).unwrap_err();
+        let err = validate_sandbox_caller_update(&req).unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     #[test]
-    fn sandbox_secret_marker_detected_from_metadata() {
+    fn sandbox_caller_marker_detected_from_metadata() {
         let mut req = Request::new(());
         req.metadata_mut().insert(
             oidc::INTERNAL_AUTH_SOURCE_HEADER,
-            oidc::AUTH_SOURCE_SANDBOX_SECRET.parse().unwrap(),
+            oidc::AUTH_SOURCE_SANDBOX.parse().unwrap(),
         );
-        assert!(is_sandbox_secret_authenticated(&req));
+        assert!(is_sandbox_caller(&req));
     }
 
     // ---- Sandbox without policy ----
@@ -3921,9 +3921,7 @@ mod tests {
         );
         let compute = new_test_runtime(store.clone()).await;
         Arc::new(ServerState::new(
-            Config::new(None)
-                .with_database_url("sqlite::memory:?cache=shared")
-                .with_ssh_handshake_secret("test-secret"),
+            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
             store,
             compute,
             SandboxIndex::new(),

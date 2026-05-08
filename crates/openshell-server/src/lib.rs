@@ -158,15 +158,6 @@ pub async fn run_server(
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
-    let driver = configured_compute_driver(&config)?;
-    if config.ssh_handshake_secret.is_empty()
-        && !matches!(driver, ComputeDriverKind::Docker | ComputeDriverKind::Vm)
-    {
-        return Err(Error::config(
-            "ssh_handshake_secret is required. Set --ssh-handshake-secret or OPENSHELL_SSH_HANDSHAKE_SECRET",
-        ));
-    }
-
     let store = Arc::new(Store::connect(database_url).await?);
 
     let oidc_cache = if let Some(ref oidc) = config.oidc {
@@ -587,8 +578,6 @@ async fn build_compute_runtime(
                     .unwrap_or_default(),
                     grpc_endpoint: config.grpc_endpoint.clone(),
                     ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
-                    ssh_handshake_secret: config.ssh_handshake_secret.clone(),
-                    ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
                     client_tls_secret_name: config.client_tls_secret_name.clone(),
                     host_gateway_ip: config.host_gateway_ip.clone(),
                     enable_user_namespaces: config.enable_user_namespaces,
@@ -677,8 +666,6 @@ async fn build_compute_runtime(
                     sandbox_ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
                     network_name,
                     ssh_port: config.sandbox_ssh_port,
-                    ssh_handshake_secret: config.ssh_handshake_secret.clone(),
-                    ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
                     stop_timeout_secs,
                     supervisor_image,
                     guest_tls_ca: podman_tls_ca,

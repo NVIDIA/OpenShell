@@ -33,17 +33,9 @@ The systemd user unit reads it via:
     EnvironmentFile=-~/.config/openshell/gateway.env
 
 The **-** prefix means the service starts normally if the file does not
-exist (the unit has built-in defaults for all required settings except
-the SSH handshake secret).
+exist (the unit has built-in defaults for all required settings).
 
 # VARIABLES
-
-## Required
-
-**OPENSHELL_SSH_HANDSHAKE_SECRET**
-:   Shared HMAC secret for gateway-to-sandbox SSH handshake
-    authentication. Auto-generated as a 32-byte hex string on first
-    start. To regenerate: **openssl rand -hex 32**.
 
 ## Gateway
 

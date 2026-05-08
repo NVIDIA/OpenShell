@@ -843,9 +843,7 @@ mod tests {
         );
         let compute = new_test_runtime(store.clone()).await;
         Arc::new(ServerState::new(
-            Config::new(None)
-                .with_database_url("sqlite::memory:?cache=shared")
-                .with_ssh_handshake_secret("test-secret"),
+            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
             store,
             compute,
             SandboxIndex::new(),
