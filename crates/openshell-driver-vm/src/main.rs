@@ -27,8 +27,8 @@ struct Args {
     #[arg(long, hide = true, default_value_t = false)]
     internal_run_vm: bool,
 
-    #[arg(long, hide = true)]
-    vm_rootfs: Option<PathBuf>,
+    #[arg(long = "vm-root-disk", hide = true, alias = "vm-rootfs")]
+    vm_root_disk: Option<PathBuf>,
 
     #[arg(long, hide = true)]
     vm_exec: Option<String>,
@@ -448,10 +448,10 @@ impl Stream for AuthenticatedUnixIncoming {
 }
 
 fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, String> {
-    let rootfs = args
-        .vm_rootfs
+    let root_disk = args
+        .vm_root_disk
         .clone()
-        .ok_or_else(|| "--vm-rootfs is required in internal VM mode".to_string())?;
+        .ok_or_else(|| "--vm-root-disk is required in internal VM mode".to_string())?;
     let exec_path = args
         .vm_exec
         .clone()
@@ -468,7 +468,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
     };
 
     Ok(VmLaunchConfig {
-        rootfs,
+        root_disk,
         vcpus: args.vm_vcpus,
         mem_mib: args.vm_mem_mib,
         exec_path,

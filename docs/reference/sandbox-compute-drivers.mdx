@@ -73,6 +73,8 @@ MicroVM-backed sandboxes run inside VM-backed isolation instead of a container b
 
 The gateway uses the VM compute driver to create VM-backed sandboxes. MicroVM requires host virtualization support. It uses [libkrun](https://github.com/containers/libkrun) with Apple's [Hypervisor framework](https://developer.apple.com/documentation/hypervisor) on macOS, KVM on Linux, and [QEMU](https://www.qemu.org/) for GPU-backed sandboxes on Linux.
 
+The VM driver prepares an ext4 root disk image from the selected sandbox image and boots each sandbox from its own copy. Host state owns the disk image file; guest UID/GID ownership, including `/sandbox`, lives inside the ext4 filesystem metadata.
+
 For maintainer-level implementation details, refer to the [VM driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md).
 
 | Option | Environment variable | Description |

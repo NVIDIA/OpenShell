@@ -5,8 +5,9 @@ use crate::gpu::{
     GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
 };
 use crate::rootfs::{
-    create_rootfs_archive_from_dir, extract_rootfs_archive_to,
-    prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
+    copy_rootfs_image_to, create_rootfs_image_from_dir, extract_rootfs_archive_to,
+    prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path, set_rootfs_image_file_mode,
+    write_rootfs_image_file,
 };
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
@@ -37,7 +38,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::net::Ipv4Addr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -84,13 +84,13 @@ const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
 /// `GVPROXY_HOST_LOOPBACK_IP` — they do **not** go through the gateway IP.
 const GVPROXY_HOST_LOOPBACK_ALIAS: &str = "host.containers.internal";
 const GUEST_SSH_SOCKET_PATH: &str = "/run/openshell/ssh.sock";
-const GUEST_TLS_DIR: &str = "/opt/openshell/tls";
 const GUEST_TLS_CA_PATH: &str = "/opt/openshell/tls/ca.crt";
 const GUEST_TLS_CERT_PATH: &str = "/opt/openshell/tls/tls.crt";
 const GUEST_TLS_KEY_PATH: &str = "/opt/openshell/tls/tls.key";
 const IMAGE_CACHE_ROOT_DIR: &str = "images";
-const IMAGE_CACHE_ROOTFS_ARCHIVE: &str = "rootfs.tar";
+const IMAGE_CACHE_ROOTFS_IMAGE: &str = "rootfs.ext4";
 const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
+const IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-rootfs-ext4-v1";
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
 static IMAGE_CACHE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -363,7 +363,7 @@ impl VmDriver {
         let gpu_device = spec.map_or("", |s| s.gpu_device.as_str());
 
         let state_dir = sandbox_state_dir(&self.config.state_dir, &sandbox.id)?;
-        let rootfs = state_dir.join("rootfs");
+        let root_disk = state_dir.join(IMAGE_CACHE_ROOTFS_IMAGE);
         let image_ref = self.resolved_sandbox_image(sandbox).ok_or_else(|| {
             Status::failed_precondition(
                 "vm sandboxes require template.image or a configured default sandbox image",
@@ -373,7 +373,7 @@ impl VmDriver {
             sandbox_id = %sandbox.id,
             image_ref = %image_ref,
             state_dir = %state_dir.display(),
-            "vm driver: resolved image ref, preparing rootfs"
+            "vm driver: resolved image ref, preparing root disk"
         );
 
         tokio::fs::create_dir_all(&state_dir)
@@ -398,14 +398,14 @@ impl VmDriver {
         );
 
         let image_identity = match self
-            .prepare_runtime_rootfs(&sandbox.id, &image_ref, &rootfs)
+            .prepare_runtime_rootfs(&sandbox.id, &image_ref, &root_disk)
             .await
         {
             Ok(image_identity) => {
                 info!(
                     sandbox_id = %sandbox.id,
                     image_identity = %image_identity,
-                    "vm driver: rootfs prepared"
+                    "vm driver: root disk prepared"
                 );
                 image_identity
             }
@@ -413,14 +413,14 @@ impl VmDriver {
                 warn!(
                     sandbox_id = %sandbox.id,
                     error = %err.message(),
-                    "vm driver: rootfs preparation failed"
+                    "vm driver: root disk preparation failed"
                 );
                 let _ = tokio::fs::remove_dir_all(&state_dir).await;
                 return Err(err);
             }
         };
         if let Some(tls_paths) = tls_paths.as_ref()
-            && let Err(err) = prepare_guest_tls_materials(&rootfs, tls_paths).await
+            && let Err(err) = prepare_guest_tls_materials(&root_disk, tls_paths).await
         {
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
             return Err(Status::internal(format!(
@@ -474,7 +474,7 @@ impl VmDriver {
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
         command.arg("--internal-run-vm");
-        command.arg("--vm-rootfs").arg(&rootfs);
+        command.arg("--vm-root-disk").arg(&root_disk);
         command.arg("--vm-exec").arg(sandbox_guest_init_path());
         command.arg("--vm-workdir").arg("/");
         command.arg("--vm-console-output").arg(&console_output);
@@ -733,17 +733,17 @@ impl VmDriver {
         &self,
         sandbox_id: &str,
         image_ref: &str,
-        rootfs: &Path,
+        root_disk: &Path,
     ) -> Result<String, Status> {
         let image_identity = self
-            .ensure_cached_image_rootfs_archive(sandbox_id, image_ref)
+            .ensure_cached_image_rootfs_image(sandbox_id, image_ref)
             .await?;
-        let archive_path = image_cache_rootfs_archive(&self.config.state_dir, &image_identity);
-        let rootfs_dest = rootfs.to_path_buf();
-        tokio::task::spawn_blocking(move || extract_rootfs_archive_to(&archive_path, &rootfs_dest))
+        let cached_image = image_cache_rootfs_image(&self.config.state_dir, &image_identity);
+        let root_disk_dest = root_disk.to_path_buf();
+        tokio::task::spawn_blocking(move || copy_rootfs_image_to(&cached_image, &root_disk_dest))
             .await
-            .map_err(|err| Status::internal(format!("sandbox rootfs extraction panicked: {err}")))?
-            .map_err(|err| Status::internal(format!("extract sandbox rootfs failed: {err}")))?;
+            .map_err(|err| Status::internal(format!("sandbox root disk copy panicked: {err}")))?
+            .map_err(|err| Status::internal(format!("copy sandbox root disk failed: {err}")))?;
 
         Ok(image_identity)
     }
@@ -757,14 +757,14 @@ impl VmDriver {
             })
     }
 
-    async fn ensure_cached_image_rootfs_archive(
+    async fn ensure_cached_image_rootfs_image(
         &self,
         sandbox_id: &str,
         image_ref: &str,
     ) -> Result<String, Status> {
         if let Some((docker, image_identity)) = self.resolve_local_docker_image(image_ref).await? {
             return self
-                .ensure_cached_local_image_rootfs_archive(
+                .ensure_cached_local_image_rootfs_image(
                     sandbox_id,
                     image_ref,
                     &docker,
@@ -773,7 +773,7 @@ impl VmDriver {
                 .await;
         }
 
-        info!(image_ref = %image_ref, "vm driver: ensuring cached image rootfs archive (registry)");
+        info!(image_ref = %image_ref, "vm driver: ensuring cached root disk image (registry)");
         let reference = parse_registry_reference(image_ref)?;
         let client = registry_client();
         let auth = registry_auth(image_ref)?;
@@ -787,7 +787,7 @@ impl VmDriver {
                 ))
             })?;
         info!(image_ref = %image_ref, "vm driver: fetching manifest digest");
-        let image_identity = client
+        let source_image_identity = client
             .fetch_manifest_digest(&reference, &auth)
             .await
             .map_err(|err| {
@@ -797,10 +797,11 @@ impl VmDriver {
             })?;
         info!(
             image_ref = %image_ref,
-            image_identity = %image_identity,
+            image_identity = %source_image_identity,
             "vm driver: manifest digest resolved"
         );
-        let archive_path = image_cache_rootfs_archive(&self.config.state_dir, &image_identity);
+        let image_identity = prepared_image_cache_identity(&source_image_identity);
+        let image_path = image_cache_rootfs_image(&self.config.state_dir, &image_identity);
 
         // Mirror the K8s `Pulling` event so the CLI flips to the
         // image-pull spinner with the image name as detail. We emit it
@@ -816,37 +817,37 @@ impl VmDriver {
             ),
         );
 
-        if tokio::fs::metadata(&archive_path).await.is_ok() {
+        if tokio::fs::metadata(&image_path).await.is_ok() {
             info!(
                 image_identity = %image_identity,
-                archive_path = %archive_path.display(),
-                "vm driver: image rootfs archive cache hit (no build needed)"
+                image_path = %image_path.display(),
+                "vm driver: root disk image cache hit (no build needed)"
             );
-            self.publish_pulled_event(sandbox_id, image_ref, &archive_path)
+            self.publish_pulled_event(sandbox_id, image_ref, &image_path)
                 .await;
             return Ok(image_identity);
         }
 
         info!(
             image_identity = %image_identity,
-            "vm driver: image rootfs archive cache miss, acquiring build lock"
+            "vm driver: root disk image cache miss, acquiring build lock"
         );
         let _cache_guard = self.image_cache_lock.lock().await;
         info!(
             image_identity = %image_identity,
             "vm driver: build lock acquired"
         );
-        if tokio::fs::metadata(&archive_path).await.is_ok() {
+        if tokio::fs::metadata(&image_path).await.is_ok() {
             info!(
                 image_identity = %image_identity,
-                "vm driver: image rootfs archive cache hit after lock (built by another task)"
+                "vm driver: root disk image cache hit after lock (built by another task)"
             );
-            self.publish_pulled_event(sandbox_id, image_ref, &archive_path)
+            self.publish_pulled_event(sandbox_id, image_ref, &image_path)
                 .await;
             return Ok(image_identity);
         }
 
-        self.build_cached_registry_image_rootfs_archive(
+        self.build_cached_registry_image_rootfs_image(
             sandbox_id,
             &client,
             &reference,
@@ -855,7 +856,7 @@ impl VmDriver {
             &image_identity,
         )
         .await?;
-        self.publish_pulled_event(sandbox_id, image_ref, &archive_path)
+        self.publish_pulled_event(sandbox_id, image_ref, &image_path)
             .await;
         Ok(image_identity)
     }
@@ -936,14 +937,15 @@ impl VmDriver {
         }
     }
 
-    async fn ensure_cached_local_image_rootfs_archive(
+    async fn ensure_cached_local_image_rootfs_image(
         &self,
         sandbox_id: &str,
         image_ref: &str,
         docker: &Docker,
         image_identity: &str,
     ) -> Result<String, Status> {
-        let archive_path = image_cache_rootfs_archive(&self.config.state_dir, image_identity);
+        let cache_identity = prepared_image_cache_identity(image_identity);
+        let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
 
         self.publish_platform_event(
             sandbox_id.to_string(),
@@ -955,38 +957,38 @@ impl VmDriver {
             ),
         );
 
-        if tokio::fs::metadata(&archive_path).await.is_ok() {
-            self.publish_pulled_event(sandbox_id, image_ref, &archive_path)
+        if tokio::fs::metadata(&image_path).await.is_ok() {
+            self.publish_pulled_event(sandbox_id, image_ref, &image_path)
                 .await;
-            return Ok(image_identity.to_string());
+            return Ok(cache_identity);
         }
 
         let _cache_guard = self.image_cache_lock.lock().await;
-        if tokio::fs::metadata(&archive_path).await.is_ok() {
-            self.publish_pulled_event(sandbox_id, image_ref, &archive_path)
+        if tokio::fs::metadata(&image_path).await.is_ok() {
+            self.publish_pulled_event(sandbox_id, image_ref, &image_path)
                 .await;
-            return Ok(image_identity.to_string());
+            return Ok(cache_identity);
         }
 
-        self.build_cached_local_image_rootfs_archive(docker, image_ref, image_identity)
+        self.build_cached_local_image_rootfs_image(docker, image_ref, &cache_identity)
             .await?;
-        self.publish_pulled_event(sandbox_id, image_ref, &archive_path)
+        self.publish_pulled_event(sandbox_id, image_ref, &image_path)
             .await;
-        Ok(image_identity.to_string())
+        Ok(cache_identity)
     }
 
-    async fn build_cached_local_image_rootfs_archive(
+    async fn build_cached_local_image_rootfs_image(
         &self,
         docker: &Docker,
         image_ref: &str,
         image_identity: &str,
     ) -> Result<(), Status> {
         let cache_dir = image_cache_dir(&self.config.state_dir, image_identity);
-        let archive_path = image_cache_rootfs_archive(&self.config.state_dir, image_identity);
+        let image_path = image_cache_rootfs_image(&self.config.state_dir, image_identity);
         let staging_dir = image_cache_staging_dir(&self.config.state_dir, image_identity);
         let exported_rootfs = staging_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
         let prepared_rootfs = staging_dir.join("rootfs");
-        let prepared_archive = staging_dir.join(IMAGE_CACHE_ROOTFS_ARCHIVE);
+        let prepared_image = staging_dir.join(IMAGE_CACHE_ROOTFS_IMAGE);
 
         tokio::fs::create_dir_all(image_cache_root_dir(&self.config.state_dir))
             .await
@@ -1021,14 +1023,14 @@ impl VmDriver {
         let image_identity_owned = image_identity.to_string();
         let exported_rootfs_for_build = exported_rootfs.clone();
         let prepared_rootfs_for_build = prepared_rootfs.clone();
-        let prepared_archive_for_build = prepared_archive.clone();
+        let prepared_image_for_build = prepared_image.clone();
         let build_result = tokio::task::spawn_blocking(move || {
-            prepare_exported_rootfs_archive(
+            prepare_exported_rootfs_image(
                 &image_ref_owned,
                 &image_identity_owned,
                 &exported_rootfs_for_build,
                 &prepared_rootfs_for_build,
-                &prepared_archive_for_build,
+                &prepared_image_for_build,
             )
         })
         .await
@@ -1039,19 +1041,19 @@ impl VmDriver {
             return Err(Status::failed_precondition(err));
         }
 
-        if tokio::fs::metadata(&archive_path).await.is_ok() {
+        if tokio::fs::metadata(&image_path).await.is_ok() {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             return Ok(());
         }
 
-        tokio::fs::rename(&prepared_archive, &archive_path)
+        tokio::fs::rename(&prepared_image, &image_path)
             .await
-            .map_err(|err| Status::internal(format!("store cached image rootfs failed: {err}")))?;
+            .map_err(|err| Status::internal(format!("store cached rootfs image failed: {err}")))?;
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         Ok(())
     }
 
-    async fn build_cached_registry_image_rootfs_archive(
+    async fn build_cached_registry_image_rootfs_image(
         &self,
         sandbox_id: &str,
         client: &OciClient,
@@ -1061,10 +1063,10 @@ impl VmDriver {
         image_identity: &str,
     ) -> Result<(), Status> {
         let cache_dir = image_cache_dir(&self.config.state_dir, image_identity);
-        let archive_path = image_cache_rootfs_archive(&self.config.state_dir, image_identity);
+        let image_path = image_cache_rootfs_image(&self.config.state_dir, image_identity);
         let staging_dir = image_cache_staging_dir(&self.config.state_dir, image_identity);
         let prepared_rootfs = staging_dir.join("rootfs");
-        let prepared_archive = staging_dir.join(IMAGE_CACHE_ROOTFS_ARCHIVE);
+        let prepared_image = staging_dir.join(IMAGE_CACHE_ROOTFS_IMAGE);
 
         tokio::fs::create_dir_all(image_cache_root_dir(&self.config.state_dir))
             .await
@@ -1115,13 +1117,13 @@ impl VmDriver {
         }
         info!(
             image_ref = %image_ref,
-            "vm driver: image layers pulled, preparing rootfs archive"
+            "vm driver: image layers pulled, preparing rootfs image"
         );
 
         let image_ref_owned = image_ref.to_string();
         let image_identity_owned = image_identity.to_string();
         let prepared_rootfs_for_build = prepared_rootfs.clone();
-        let prepared_archive_for_build = prepared_archive.clone();
+        let prepared_image_for_build = prepared_image.clone();
         let build_result = tokio::task::spawn_blocking(move || {
             prepare_sandbox_rootfs_from_image_root(
                 &prepared_rootfs_for_build,
@@ -1130,7 +1132,7 @@ impl VmDriver {
             .map_err(|err| {
                 format!("vm sandbox image '{image_ref_owned}' is not base-compatible: {err}")
             })?;
-            create_rootfs_archive_from_dir(&prepared_rootfs_for_build, &prepared_archive_for_build)
+            create_rootfs_image_from_dir(&prepared_rootfs_for_build, &prepared_image_for_build)
         })
         .await
         .map_err(|err| Status::internal(format!("image rootfs preparation panicked: {err}")))?;
@@ -1139,28 +1141,28 @@ impl VmDriver {
             warn!(
                 image_ref = %image_ref,
                 error = %err,
-                "vm driver: rootfs archive build failed"
+                "vm driver: rootfs image build failed"
             );
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             return Err(Status::failed_precondition(err));
         }
 
-        if tokio::fs::metadata(&archive_path).await.is_ok() {
+        if tokio::fs::metadata(&image_path).await.is_ok() {
             info!(
                 image_identity = %image_identity,
-                "vm driver: another task wrote archive while we were building, discarding ours"
+                "vm driver: another task wrote image while we were building, discarding ours"
             );
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             return Ok(());
         }
 
-        tokio::fs::rename(&prepared_archive, &archive_path)
+        tokio::fs::rename(&prepared_image, &image_path)
             .await
-            .map_err(|err| Status::internal(format!("store cached image rootfs failed: {err}")))?;
+            .map_err(|err| Status::internal(format!("store cached rootfs image failed: {err}")))?;
         info!(
             image_identity = %image_identity,
-            archive_path = %archive_path.display(),
-            "vm driver: image rootfs archive committed to cache"
+            image_path = %image_path.display(),
+            "vm driver: root disk image committed to cache"
         );
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         Ok(())
@@ -1633,17 +1635,17 @@ async fn export_local_image_rootfs_to_path(
     }
 }
 
-fn prepare_exported_rootfs_archive(
+fn prepare_exported_rootfs_image(
     image_ref: &str,
     image_identity: &str,
     exported_rootfs: &Path,
     prepared_rootfs: &Path,
-    prepared_archive: &Path,
+    prepared_image: &Path,
 ) -> Result<(), String> {
     extract_rootfs_archive_to(exported_rootfs, prepared_rootfs)?;
     prepare_sandbox_rootfs_from_image_root(prepared_rootfs, image_identity)
         .map_err(|err| format!("vm sandbox image '{image_ref}' is not base-compatible: {err}"))?;
-    create_rootfs_archive_from_dir(prepared_rootfs, prepared_archive)
+    create_rootfs_image_from_dir(prepared_rootfs, prepared_image)
 }
 
 fn registry_client() -> OciClient {
@@ -1807,8 +1809,8 @@ impl VmDriver {
     /// Emit a `Pulled` platform event with a message that mirrors the
     /// kubelet's `Successfully pulled image ... Image size: N bytes.`
     /// format so the CLI's `extract_image_size` parser works unchanged.
-    async fn publish_pulled_event(&self, sandbox_id: &str, image_ref: &str, archive_path: &Path) {
-        let size_suffix = tokio::fs::metadata(archive_path).await.map_or_else(
+    async fn publish_pulled_event(&self, sandbox_id: &str, image_ref: &str, image_path: &Path) {
+        let size_suffix = tokio::fs::metadata(image_path).await.map_or_else(
             |_| String::new(),
             |meta| format!(" Image size: {} bytes.", meta.len()),
         );
@@ -2341,8 +2343,8 @@ fn image_cache_dir(root: &Path, image_identity: &str) -> PathBuf {
     image_cache_root_dir(root).join(sanitize_image_identity(image_identity))
 }
 
-fn image_cache_rootfs_archive(root: &Path, image_identity: &str) -> PathBuf {
-    image_cache_dir(root, image_identity).join(IMAGE_CACHE_ROOTFS_ARCHIVE)
+fn image_cache_rootfs_image(root: &Path, image_identity: &str) -> PathBuf {
+    image_cache_dir(root, image_identity).join(IMAGE_CACHE_ROOTFS_IMAGE)
 }
 
 fn image_cache_staging_dir(root: &Path, image_identity: &str) -> PathBuf {
@@ -2351,6 +2353,10 @@ fn image_cache_staging_dir(root: &Path, image_identity: &str) -> PathBuf {
         sanitize_image_identity(image_identity),
         unique_image_cache_suffix()
     ))
+}
+
+fn prepared_image_cache_identity(image_identity: &str) -> String {
+    format!("{IMAGE_CACHE_LAYOUT_VERSION}:{image_identity}")
 }
 
 fn sanitize_image_identity(image_identity: &str) -> String {
@@ -2391,26 +2397,28 @@ async fn write_sandbox_image_metadata(
 }
 
 async fn prepare_guest_tls_materials(
-    rootfs: &Path,
+    root_disk: &Path,
     paths: &VmDriverTlsPaths,
-) -> Result<(), std::io::Error> {
-    let guest_tls_dir = rootfs.join(GUEST_TLS_DIR.trim_start_matches('/'));
-    tokio::fs::create_dir_all(&guest_tls_dir).await?;
+) -> Result<(), String> {
+    let ca = tokio::fs::read(&paths.ca)
+        .await
+        .map_err(|err| format!("read {}: {err}", paths.ca.display()))?;
+    let cert = tokio::fs::read(&paths.cert)
+        .await
+        .map_err(|err| format!("read {}: {err}", paths.cert.display()))?;
+    let key = tokio::fs::read(&paths.key)
+        .await
+        .map_err(|err| format!("read {}: {err}", paths.key.display()))?;
+    let root_disk = root_disk.to_path_buf();
 
-    copy_guest_tls_material(&paths.ca, &guest_tls_dir.join("ca.crt"), 0o644).await?;
-    copy_guest_tls_material(&paths.cert, &guest_tls_dir.join("tls.crt"), 0o644).await?;
-    copy_guest_tls_material(&paths.key, &guest_tls_dir.join("tls.key"), 0o600).await?;
-    Ok(())
-}
-
-async fn copy_guest_tls_material(
-    source: &Path,
-    dest: &Path,
-    mode: u32,
-) -> Result<(), std::io::Error> {
-    tokio::fs::copy(source, dest).await?;
-    tokio::fs::set_permissions(dest, fs::Permissions::from_mode(mode)).await?;
-    Ok(())
+    tokio::task::spawn_blocking(move || {
+        write_rootfs_image_file(&root_disk, GUEST_TLS_CA_PATH, &ca)?;
+        write_rootfs_image_file(&root_disk, GUEST_TLS_CERT_PATH, &cert)?;
+        write_rootfs_image_file(&root_disk, GUEST_TLS_KEY_PATH, &key)?;
+        set_rootfs_image_file_mode(&root_disk, GUEST_TLS_KEY_PATH, 0o100_600)
+    })
+    .await
+    .map_err(|err| format!("guest TLS material injection panicked: {err}"))?
 }
 
 async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
@@ -3188,54 +3196,11 @@ mod tests {
     }
 
     #[test]
-    fn prepare_exported_rootfs_archive_rewrites_docker_exported_rootfs() {
-        let base = unique_temp_dir();
-        let source_rootfs = base.join("source-rootfs");
-        let exported_rootfs = base.join("exported-rootfs.tar");
-        let prepared_rootfs = base.join("prepared-rootfs");
-        let prepared_archive = base.join("prepared-rootfs.tar");
-        let extracted = base.join("extracted");
-
-        for path in [
-            "bin/bash",
-            "bin/mount",
-            "bin/sed",
-            "sbin/ip",
-            "opt/openshell/bin/openshell-sandbox",
-        ] {
-            let path = source_rootfs.join(path);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, "").unwrap();
-        }
-
-        create_rootfs_archive_from_dir(&source_rootfs, &exported_rootfs).unwrap();
-        prepare_exported_rootfs_archive(
-            "openshell/sandbox-from:123",
-            "sha256:local-image",
-            &exported_rootfs,
-            &prepared_rootfs,
-            &prepared_archive,
-        )
-        .unwrap();
-        extract_rootfs_archive_to(&prepared_archive, &extracted).unwrap();
-
-        assert!(extracted.join("srv/openshell-vm-sandbox-init.sh").is_file());
-        assert!(
-            extracted
-                .join("opt/openshell/bin/openshell-sandbox")
-                .is_file()
-        );
+    fn prepared_image_cache_identity_includes_rootfs_layout_version() {
         assert_eq!(
-            fs::read_to_string(extracted.join("opt/openshell/.rootfs-type")).unwrap(),
-            "sandbox\n"
+            prepared_image_cache_identity("sha256:local-image"),
+            format!("{IMAGE_CACHE_LAYOUT_VERSION}:sha256:local-image")
         );
-        assert!(
-            fs::read_to_string(extracted.join(".openshell-rootfs-variant"))
-                .unwrap()
-                .contains("sha256:local-image")
-        );
-
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -3247,50 +3212,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_guest_tls_materials_copies_bundle_into_rootfs() {
+    async fn prepare_guest_tls_materials_reports_missing_input() {
         let base = unique_temp_dir();
-        let source_dir = base.join("source");
-        let rootfs = base.join("rootfs");
-        std::fs::create_dir_all(&source_dir).unwrap();
-        std::fs::create_dir_all(&rootfs).unwrap();
+        let source_dir = base.join("missing-source");
 
-        let ca = source_dir.join("ca.crt");
-        let cert = source_dir.join("tls.crt");
-        let key = source_dir.join("tls.key");
-        std::fs::write(&ca, "ca").unwrap();
-        std::fs::write(&cert, "cert").unwrap();
-        std::fs::write(&key, "key").unwrap();
-
-        prepare_guest_tls_materials(
-            &rootfs,
+        let err = prepare_guest_tls_materials(
+            &base.join("rootfs.ext4"),
             &VmDriverTlsPaths {
-                ca: ca.clone(),
-                cert: cert.clone(),
-                key: key.clone(),
+                ca: source_dir.join("ca.crt"),
+                cert: source_dir.join("tls.crt"),
+                key: source_dir.join("tls.key"),
             },
         )
         .await
-        .unwrap();
+        .expect_err("missing TLS materials should fail before image injection");
 
-        let guest_dir = rootfs.join(GUEST_TLS_DIR.trim_start_matches('/'));
-        assert_eq!(
-            std::fs::read_to_string(guest_dir.join("ca.crt")).unwrap(),
-            "ca"
-        );
-        assert_eq!(
-            std::fs::read_to_string(guest_dir.join("tls.crt")).unwrap(),
-            "cert"
-        );
-        assert_eq!(
-            std::fs::read_to_string(guest_dir.join("tls.key")).unwrap(),
-            "key"
-        );
-        let key_mode = std::fs::metadata(guest_dir.join("tls.key"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(key_mode, 0o600);
+        assert!(err.contains("ca.crt"));
 
         let _ = std::fs::remove_dir_all(base);
     }
