@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Local-dev overlay enabling the ServiceMonitor (scraped by kube-prometheus-stack)
+# and OTLP trace export to a Jaeger all-in-one Service.
+#
+# Prerequisite: install the cluster monitoring add-ons one time:
+#   mise run observability:k8s:setup
+#
+# Then uncomment values-monitoring.yaml in skaffold.yaml or pass it explicitly:
+#   helm upgrade --install openshell . \
+#     -f values.yaml -f ci/values-skaffold.yaml -f ci/values-monitoring.yaml
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    scrapeTimeout: 10s
+    # kube-prometheus-stack's default Prometheus instance selects ServiceMonitors
+    # that carry `release: kube-prometheus-stack`. The setup task installs the
+    # bundle under that release name.
+    labels:
+      release: kube-prometheus-stack
+  tracing:
+    enabled: true
+    # Jaeger all-in-one OTLP/gRPC receiver, installed by the setup task.
+    endpoint: "http://jaeger-collector.observability.svc.cluster.local:4317"
+    protocol: grpc
+    samplingRatio: "1.0"
+    resourceAttributes:
+      deployment.environment: dev

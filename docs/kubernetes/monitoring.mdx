@@ -1,0 +1,135 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Monitoring the Gateway"
+sidebar-title: "Monitoring"
+description: "Scrape the OpenShell gateway with Prometheus and export traces over OTLP from a Helm-managed deployment."
+keywords: "Generative AI, Cybersecurity, Monitoring, Prometheus, OpenTelemetry, OTLP, Jaeger, Grafana, Helm, Kubernetes"
+position: 6
+---
+
+The OpenShell gateway exposes two telemetry surfaces operators usually plug directly into a cluster monitoring stack:
+
+- **Prometheus metrics** at `/metrics` on a dedicated port — scraped over HTTP.
+- **OpenTelemetry traces** exported over OTLP/gRPC — pushed to a collector or backend.
+
+Both are off by default in the chart. This page enables them on a real cluster, and shows the local-dev path that bundles `kube-prometheus-stack` and Jaeger.
+
+<Note>
+For sandbox-internal logs (OCSF), see [Observability → Sandbox Logging](/observability/logging). That surface is independent of the gateway control-plane telemetry described here.
+</Note>
+
+## Prerequisites
+
+| Prerequisite | Required for | Notes |
+|---|---|---|
+| Prometheus Operator | Metrics | The chart creates a `monitoring.coreos.com/v1` `ServiceMonitor`. The CRD ships with `kube-prometheus-stack`. |
+| OTLP-compatible backend | Traces | Jaeger, Tempo, an OpenTelemetry Collector, or any vendor backend that accepts OTLP/gRPC on `:4317`. |
+| Helm chart values access | Both | Either `--set` flags on the install command, or a values file passed via `-f`. |
+
+## Enable on the Helm release
+
+Add a `monitoring` block to your values file:
+
+```yaml
+monitoring:
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    # Match the Prometheus instance's serviceMonitorSelector. The
+    # kube-prometheus-stack default selector is `release: <release-name>`.
+    labels:
+      release: kube-prometheus-stack
+  tracing:
+    enabled: true
+    endpoint: "http://otel-collector.observability.svc.cluster.local:4317"
+    protocol: grpc
+    samplingRatio: "1.0"
+    resourceAttributes:
+      deployment.environment: production
+```
+
+Then upgrade the release:
+
+```shell
+helm upgrade --install openshell oci://ghcr.io/nvidia/openshell/charts/openshell \
+  -f values.yaml
+```
+
+When `monitoring.tracing.enabled` is `true`, the chart projects the standard `OTEL_*` env vars onto the gateway container. The gateway initializes the OTLP exporter at startup and flushes spans on `SIGTERM`.
+
+<Warning>
+The gateway currently exports OTLP over **gRPC only**. Setting `monitoring.tracing.protocol` to anything other than `grpc` is not supported and the value is ignored at the gateway.
+</Warning>
+
+## Verify it works
+
+### Metrics
+
+Confirm the `ServiceMonitor` was created and Prometheus picked it up:
+
+```shell
+kubectl get servicemonitor -n <release-namespace>
+kubectl exec -n monitoring deploy/prometheus-server -- \
+  promtool query instant http://localhost:9090 'up{job="openshell"}'
+```
+
+Then query a metric the gateway exports while you exercise the API:
+
+```shell
+openshell sandbox create --name probe
+```
+
+```promql
+rate(openshell_server_grpc_requests_total[1m])
+```
+
+### Traces
+
+Create a sandbox via the CLI to drive at least one inbound request, then look in your trace UI for the `openshell-gateway` service. You should see a `request` span with `method`, `path`, and `request_id` attributes.
+
+```shell
+openshell sandbox create --name trace-probe
+```
+
+In Jaeger UI: select **Service: openshell-gateway** and **Find Traces**. In Grafana Tempo / OTLP backends: query `service.name="openshell-gateway"`.
+
+## Local development
+
+The repo ships a one-shot mise task that installs `kube-prometheus-stack` (slimmed-down: no Alertmanager, node-exporter, or kube-state) and a Jaeger all-in-one Pod into the local k3s cluster.
+
+```shell
+# 1. Bring up the cluster (skip if already running):
+mise run helm:k3s:create
+
+# 2. Install Prometheus + Grafana + Jaeger:
+mise run observability:k8s:setup
+
+# 3. Open ci/values-monitoring.yaml on the openshell release:
+#    Uncomment `- ci/values-monitoring.yaml` in deploy/helm/openshell/skaffold.yaml
+
+# 4. Deploy / restart the openshell release:
+mise run helm:skaffold:dev
+
+# 5. Forward UIs to localhost:
+mise run observability:port-forward
+```
+
+Then visit:
+
+- Grafana — http://localhost:3000 (admin / admin)
+- Prometheus — http://localhost:9090
+- Jaeger UI — http://localhost:16686
+
+Tear it all down with:
+
+```shell
+mise run observability:k8s:teardown
+```
+
+## Production guidance
+
+- **OpenTelemetry Collector** is the recommended pattern in front of multi-backend trace pipelines. Point `monitoring.tracing.endpoint` at the Collector, then route from the Collector to Jaeger / Tempo / your vendor.
+- **Sampling**: `samplingRatio: "1.0"` (record everything) is fine for low-traffic gateways. Drop to `"0.1"` or lower for high-throughput deployments. The chart sets `parentbased_traceidratio` so upstream parent decisions are honored when present.
+- **Resource attributes**: Add `deployment.environment`, `cluster.name`, or other identifiers via `monitoring.tracing.resourceAttributes`. They appear on every span as part of the OTel Resource.
+- **Prometheus selector**: The chart-rendered `ServiceMonitor` carries the standard chart labels. Most Prometheus instances also require an explicit selector label (often `release: <prometheus-release-name>`) — set it via `monitoring.serviceMonitor.labels`.

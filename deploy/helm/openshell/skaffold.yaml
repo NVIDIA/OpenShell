@@ -81,6 +81,30 @@ deploy:
       #  # wait ensures Gateway API CRDs are registered before the openshell
       #  # release attempts to create Gateway and HTTPRoute resources.
       #  wait: true
+      # Monitoring add-ons — comment in along with ci/values-monitoring.yaml
+      # below to scrape the gateway from Prometheus and export traces to Jaeger.
+      # Prefer running the dedicated mise task (`mise run observability:k8s:setup`)
+      # for the initial install; these blocks are kept for parity.
+      #- name: kube-prometheus-stack
+      #  repo: https://prometheus-community.github.io/helm-charts
+      #  remoteChart: kube-prometheus-stack
+      #  version: 75.0.0
+      #  namespace: monitoring
+      #  createNamespace: true
+      #  wait: true
+      #- name: jaeger
+      #  repo: https://jaegertracing.github.io/helm-charts
+      #  remoteChart: jaeger
+      #  version: 3.4.0
+      #  namespace: observability
+      #  createNamespace: true
+      #  setValues:
+      #    allInOne.enabled: true
+      #    storage.type: memory
+      #    provisionDataStore.cassandra: false
+      #    agent.enabled: false
+      #    collector.enabled: false
+      #    query.enabled: false
       - name: openshell
         chartPath: .
         namespace: openshell
@@ -97,6 +121,10 @@ deploy:
           #- ci/values-keycloak.yaml
           # To enable the Gateway API HTTPRoute (requires Envoy Gateway above):
           #- ci/values-gateway.yaml
+          # To enable Prometheus scraping + OTLP traces → Jaeger:
+          #   mise run observability:k8s:setup
+          # then uncomment the line below.
+          #- ci/values-monitoring.yaml
         setValueTemplates:
           image.repository: '{{.IMAGE_REPO_openshell_gateway}}'
           image.tag: '{{.IMAGE_TAG_openshell_gateway}}'

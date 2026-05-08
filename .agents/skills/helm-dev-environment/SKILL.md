@@ -169,6 +169,39 @@ To remove Keycloak:
 mise run keycloak:k8s:teardown
 ```
 
+### Monitoring (Prometheus + Grafana + Jaeger)
+
+One-time setup — installs `kube-prometheus-stack` (slimmed: no Alertmanager,
+node-exporter, or kube-state-metrics) and a Jaeger all-in-one Pod:
+
+```bash
+mise run observability:k8s:setup
+```
+
+Then activate monitoring on the gateway:
+
+1. Uncomment `#- ci/values-monitoring.yaml` in `skaffold.yaml`
+2. Redeploy: `mise run helm:skaffold:run`
+
+Forward UIs to localhost:
+
+```bash
+mise run observability:port-forward
+# Grafana       http://localhost:3000  (admin / admin)
+# Prometheus    http://localhost:9090
+# Jaeger UI     http://localhost:16686
+```
+
+Teardown:
+
+```bash
+mise run observability:k8s:teardown
+```
+
+The chart's `monitoring.serviceMonitor.enabled` creates a `ServiceMonitor`
+that Prometheus scrapes, and `monitoring.tracing.enabled` projects `OTEL_*`
+env vars onto the gateway so it exports OTLP/gRPC traces to Jaeger.
+
 ---
 
 ## Cluster Lifecycle (suspend/resume)

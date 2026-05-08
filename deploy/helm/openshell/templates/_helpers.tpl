@@ -125,3 +125,14 @@ init-container
 {{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int .Values.service.port) -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+Render the user-supplied monitoring.tracing.resourceAttributes map as a
+comma-prefixed `key=value` list suitable for appending to OTEL_RESOURCE_ATTRIBUTES.
+Returns an empty string when no attributes are configured.
+*/}}
+{{- define "openshell.tracingResourceAttributes" -}}
+{{- with .Values.monitoring.tracing.resourceAttributes }}
+{{- range $k, $v := . }},{{ $k }}={{ $v }}{{- end }}
+{{- end }}
+{{- end }}

@@ -238,3 +238,39 @@ grpcRoute:
       protocol: HTTP
       # "Same" restricts attached routes to the release namespace; "All" allows any namespace.
       allowedRoutes: Same
+
+# Observability: Prometheus ServiceMonitor and OpenTelemetry trace export.
+# Both subsections are independent and disabled by default. The chart never
+# bundles a monitoring stack; operators run kube-prometheus-stack and Jaeger
+# (or any OTLP backend) themselves and point the gateway at them here.
+monitoring:
+  serviceMonitor:
+    # Create a Prometheus-Operator ServiceMonitor scraping the gateway's
+    # /metrics endpoint. Requires the monitoring.coreos.com/v1 CRDs.
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    # Extra labels added to the ServiceMonitor (commonly required to match
+    # the Prometheus instance's serviceMonitorSelector — kube-prometheus-stack
+    # defaults to selecting on `release: <release-name>`).
+    labels: {}
+    # Namespace where the ServiceMonitor is created. Empty = release namespace.
+    namespace: ""
+  tracing:
+    # Project OTEL_* env vars onto the gateway container so the in-process
+    # OTLP exporter starts up. The gateway exports OTLP/gRPC; Helm currently
+    # only supports the gRPC protocol.
+    enabled: false
+    # OTLP/gRPC collector endpoint (host:port or full URL). Required when
+    # tracing.enabled is true.
+    # e.g. http://jaeger-collector.observability.svc:4317
+    endpoint: ""
+    # OTLP transport. Currently only "grpc" is supported by the gateway.
+    protocol: grpc
+    # Trace sampling. parent_based(traceidratio=...) is the recommended
+    # production default — record according to the upstream parent's
+    # decision, fall back to the configured ratio for new traces.
+    samplingRatio: "1.0"
+    # Extra resource attributes appended to OTEL_RESOURCE_ATTRIBUTES,
+    # e.g. {deployment.environment: production}.
+    resourceAttributes: {}

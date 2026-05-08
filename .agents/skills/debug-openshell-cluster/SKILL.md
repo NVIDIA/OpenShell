@@ -193,6 +193,17 @@ openshell status
 openshell logs <sandbox-name>
 ```
 
+## Telemetry Signals
+
+Before drilling into logs, check whether the gateway is exporting telemetry — the pull-based metrics surface and the push-based trace export are the fastest signals that the control plane is alive and that requests are reaching it.
+
+| Signal | Where it shows up | When to use it |
+|---|---|---|
+| Prometheus metrics on `/metrics` | A scrape target via the chart's `ServiceMonitor` (`monitoring.serviceMonitor.enabled`). Local: `kubectl -n openshell port-forward statefulset/openshell <metrics-port>:<metrics-port>`. | Confirm the gateway listener is up and gRPC requests are landing. `up{job="openshell"} == 1` in Prometheus is a quick liveness ping. |
+| OTLP traces | Jaeger / Tempo / OTel backend (`monitoring.tracing.enabled`). Look for service `openshell-gateway`. | Confirm an inbound request reached the multiplex layer; spans carry `method`, `path`, `request_id`. Missing traces under load means OTLP export is misconfigured or the endpoint is unreachable. |
+
+If the chart's `monitoring.serviceMonitor.enabled` or `monitoring.tracing.enabled` were not set, those signals are unavailable — fall back to gateway logs. See [Monitoring the Gateway](../../../docs/kubernetes/monitoring.mdx) for setup.
+
 ## Common Failure Patterns
 
 | Symptom | Likely cause | Check |

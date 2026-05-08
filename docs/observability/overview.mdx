@@ -15,3 +15,7 @@ This section covers:
 - **[Sandbox Logging](/observability/logging)**: How the two log formats work, where logs are stored, and how to read them.
 - **[Accessing Logs](/observability/accessing-logs)**: How to view logs through the CLI, TUI, and directly on the sandbox filesystem.
 - **[OCSF JSON Export](/observability/ocsf-json-export)**: How to enable full OCSF JSON output for integration with SIEMs, log aggregators, and compliance tools.
+
+## Sandbox logs vs. gateway telemetry
+
+Sandbox-internal logs (the OCSF surface above) are distinct from the gateway control-plane telemetry — Prometheus metrics on `/metrics` and OpenTelemetry traces over OTLP. The two pipelines are independent and configured separately. For scraping the gateway from Prometheus or shipping traces to Jaeger / Tempo / an OTel Collector, see [Monitoring the Gateway](/kubernetes/monitoring).

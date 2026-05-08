@@ -64,6 +64,12 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# OpenTelemetry tracing export (opt-in, configured via env)
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
 # Metrics
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }

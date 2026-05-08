@@ -17,7 +17,10 @@ use tracing_subscriber::EnvFilter;
 
 use crate::certgen;
 use crate::compute::{DockerComputeConfig, VmComputeConfig};
-use crate::{run_server, tracing_bus::TracingLogBus};
+use crate::{
+    run_server,
+    tracing_bus::{OtlpTracingConfig, TracingLogBus},
+};
 
 /// `OpenShell` gateway process - gRPC and HTTP server with protocol multiplexing.
 ///
@@ -297,6 +300,13 @@ struct RunArgs {
     /// Keycloak: "scope". Okta: "scp". Leave empty to disable scope enforcement.
     #[arg(long, env = "OPENSHELL_OIDC_SCOPES_CLAIM", default_value = "")]
     oidc_scopes_claim: String,
+
+    /// OTLP/gRPC endpoint for OpenTelemetry trace export (e.g.
+    /// `http://jaeger-collector.observability.svc:4317`). When unset, no
+    /// traces are exported. The signal-specific
+    /// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` takes precedence over this flag.
+    #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<String>,
 }
 
 pub fn command() -> Command {
@@ -320,8 +330,10 @@ pub async fn run_cli() -> Result<()> {
 
 async fn run_from_args(args: RunArgs) -> Result<()> {
     let tracing_log_bus = TracingLogBus::new();
+    let otlp = OtlpTracingConfig::resolve(args.otlp_endpoint.clone());
     tracing_log_bus.install_subscriber(
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+        otlp,
     );
 
     let bind = SocketAddr::new(args.bind_address, args.port);

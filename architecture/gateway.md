@@ -55,6 +55,23 @@ Domain objects use shared metadata: stable server-generated IDs, human-readable
 names, creation timestamps, and labels. Crate-level details live in
 `crates/openshell-core/README.md`.
 
+### Observability surface
+
+The gateway exposes three independent telemetry surfaces, each with its own
+configuration knob and consumer:
+
+| Surface | Direction | Configured by | Consumers |
+|---|---|---|---|
+| Prometheus metrics on `/metrics` | Pull | `--metrics-port` (CLI), `monitoring.serviceMonitor.*` (Helm) | Prometheus / kube-prometheus-stack via `ServiceMonitor`. |
+| OpenTelemetry traces over OTLP/gRPC | Push | `--otlp-endpoint` / `OTEL_EXPORTER_OTLP_*` env, `monitoring.tracing.*` (Helm) | Any OTLP backend (Jaeger, Tempo, OTel Collector). The per-request span set up by `TraceLayer` becomes the OTLP root. |
+| Sandbox log fan-out | Push (gRPC stream) | Always on per sandbox subscription | CLI / TUI / SDK consumers via `WatchSandbox` and `GetSandboxLogs`; OCSF JSONL when enabled inside the sandbox. |
+
+Trace export is opt-in: the gateway only installs the OpenTelemetry layer
+when an OTLP endpoint is supplied. Spans flush on `SIGTERM` via an explicit
+`shutdown()` in the gateway shutdown path. See
+[Monitoring the Gateway](../docs/kubernetes/monitoring.mdx) for the operator
+guide.
+
 ## Persistence
 
 The gateway persistence layer is a protobuf object store. Domain services store

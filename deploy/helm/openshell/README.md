@@ -52,6 +52,7 @@ See [`values.yaml`](values.yaml) for configurable values. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) — gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) — cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) — Keycloak OIDC integration
+- [`ci/values-monitoring.yaml`](ci/values-monitoring.yaml) — Prometheus `ServiceMonitor` + OTLP traces (local-dev defaults)
 
 ## PKI bootstrap
 
@@ -70,3 +71,12 @@ The Job is idempotent:
 Disable with `--set pkiInitJob.enabled=false` when bringing your own PKI (cert-manager,
 external CA, or pre-created Secrets). See `certManager.*` in `values.yaml` for the
 cert-manager alternative.
+
+## Monitoring
+
+The chart can opt into two independent observability surfaces:
+
+- `monitoring.serviceMonitor.enabled` — creates a Prometheus-Operator `ServiceMonitor` scraping the gateway's `/metrics` endpoint. Requires the `monitoring.coreos.com/v1` CRD (ships with `kube-prometheus-stack`).
+- `monitoring.tracing.enabled` — projects standard `OTEL_*` env vars onto the gateway container so it exports OTLP/gRPC traces to the configured `monitoring.tracing.endpoint`.
+
+Both are off by default. See [Monitoring the Gateway](../../../docs/kubernetes/monitoring.mdx) for the operator guide and `mise run observability:k8s:setup` for the local-dev `kube-prometheus-stack` + Jaeger bundle.

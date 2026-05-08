@@ -142,6 +142,23 @@ spec:
               value: {{ .Values.server.oidc.scopesClaim | quote }}
             {{- end }}
             {{- end }}
+            {{- if and .Values.monitoring .Values.monitoring.tracing.enabled }}
+            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              value: {{ required "monitoring.tracing.endpoint is required when monitoring.tracing.enabled is true" .Values.monitoring.tracing.endpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: {{ .Values.monitoring.tracing.protocol | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: "openshell-gateway"
+            - name: OTEL_TRACES_SAMPLER
+              value: "parentbased_traceidratio"
+            - name: OTEL_TRACES_SAMPLER_ARG
+              value: {{ .Values.monitoring.tracing.samplingRatio | quote }}
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: {{ printf "service.namespace=%s,service.version=%s%s"
+                .Release.Namespace
+                .Chart.AppVersion
+                (include "openshell.tracingResourceAttributes" .) | quote }}
+            {{- end }}
           volumeMounts:
             - name: openshell-data
               mountPath: /var/openshell

@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Cluster observability add-ons (Prometheus + Grafana + Jaeger).
+# These tasks target the local k3s cluster created by `mise run helm:k3s:create`.
+# Production users install kube-prometheus-stack and an OTLP backend separately
+# and point the gateway at them via Helm values; see docs/kubernetes/monitoring.mdx.
+
+["observability:k8s:setup"]
+description = "Install kube-prometheus-stack + Jaeger all-in-one into the local k3s cluster (one-time)"
+run = "tasks/scripts/observability-k8s-setup.sh"
+
+["observability:k8s:teardown"]
+description = "Remove kube-prometheus-stack and Jaeger from the local k3s cluster"
+run = "tasks/scripts/observability-k8s-teardown.sh"
+
+["observability:port-forward"]
+description = "Port-forward Grafana (3000), Prometheus (9090), and Jaeger UI (16686) until interrupted"
+run = "tasks/scripts/observability-port-forward.sh"

@@ -324,6 +324,9 @@ pub async fn run_server(
         .await
         .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
 
+    // Flush any pending OTLP spans. No-op when OTLP export is not configured.
+    state.tracing_log_bus.shutdown();
+
     Ok(())
 }
 

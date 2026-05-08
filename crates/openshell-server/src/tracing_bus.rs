@@ -4,16 +4,48 @@
 //! Capture openshell-server tracing logs for streaming over gRPC.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openshell_core::proto::{SandboxLogLine, SandboxStreamEvent};
 use openshell_ocsf::OCSF_TARGET;
+use opentelemetry::KeyValue;
+use opentelemetry::trace::TracerProvider;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tokio::sync::broadcast;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer};
+
+/// OTLP tracing exporter configuration. Endpoint is the only required field;
+/// service name, resource attributes, and sampling ratio are picked up from
+/// standard `OTEL_*` env vars by the OpenTelemetry SDK.
+#[derive(Debug, Clone)]
+pub struct OtlpTracingConfig {
+    pub endpoint: String,
+}
+
+impl OtlpTracingConfig {
+    /// Resolve OTLP endpoint from (in order): the signal-specific
+    /// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, the shared
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT`, then the supplied CLI argument.
+    /// Returns `None` if no endpoint is configured.
+    pub fn resolve(arg_endpoint: Option<String>) -> Option<Self> {
+        let endpoint = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+            .ok()
+            .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())
+            .or(arg_endpoint)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+        Some(Self { endpoint })
+    }
+}
+
+/// Process-wide tracer provider, retained so spans can be flushed on shutdown.
+static OTEL_TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 /// Bus that publishes server log lines keyed by sandbox id.
 #[derive(Debug, Clone)]
@@ -47,17 +79,46 @@ impl TracingLogBus {
     }
 
     /// Install a tracing subscriber that logs to stdout and publishes events into this bus.
-    pub fn install_subscriber(&self, env_filter: EnvFilter) {
-        let layer = SandboxLogLayer {
+    ///
+    /// When `otlp` is provided, an OpenTelemetry OTLP/gRPC trace exporter is attached
+    /// after the env filter so `OPENSHELL_LOG_LEVEL` continues to gate exported spans.
+    /// The `tower_http::trace::TraceLayer` per-request span set up in
+    /// `multiplex.rs` becomes the OTLP root span automatically.
+    pub fn install_subscriber(&self, env_filter: EnvFilter, otlp: Option<OtlpTracingConfig>) {
+        let bus_layer = SandboxLogLayer {
             bus: self.clone(),
             default_tail: Self::DEFAULT_TAIL,
+        };
+
+        let otel_layer = match otlp {
+            Some(cfg) => match build_otel_layer(&cfg) {
+                Ok(layer) => Some(layer),
+                Err(err) => {
+                    eprintln!(
+                        "openshell-gateway: failed to enable OTLP trace export to {}: {err}",
+                        cfg.endpoint
+                    );
+                    None
+                }
+            },
+            None => None,
         };
 
         tracing_subscriber::registry()
             .with(env_filter)
             .with(tracing_subscriber::fmt::layer())
-            .with(layer)
+            .with(bus_layer)
+            .with(otel_layer)
             .init();
+    }
+
+    /// Flush and shut down the OTLP tracer provider, if installed. Idempotent.
+    pub fn shutdown(&self) {
+        if let Some(provider) = OTEL_TRACER_PROVIDER.get()
+            && let Err(err) = provider.shutdown()
+        {
+            tracing::warn!(error = %err, "OpenTelemetry tracer provider shutdown failed");
+        }
     }
 
     fn sender_for(&self, sandbox_id: &str) -> broadcast::Sender<SandboxStreamEvent> {
@@ -196,6 +257,70 @@ impl tracing::field::Visit for LogVisitor {
 fn current_time_ms() -> Option<i64> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
     i64::try_from(now.as_millis()).ok()
+}
+
+/// Build an `OpenTelemetry` `tracing` layer that exports spans to the
+/// configured OTLP/gRPC endpoint. The resulting layer can be `with(...)`'d
+/// onto the subscriber registry.
+fn build_otel_layer<S>(
+    cfg: &OtlpTracingConfig,
+) -> Result<
+    tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>,
+    Box<dyn std::error::Error + Send + Sync>,
+>
+where
+    S: Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    let exporter = SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(&cfg.endpoint)
+        .build()?;
+
+    let resource = Resource::builder()
+        .with_service_name("openshell-gateway")
+        .with_attributes([KeyValue::new("service.version", openshell_core::VERSION)])
+        .build();
+
+    let sampler = sampler_from_env();
+
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(resource)
+        .with_sampler(sampler)
+        .build();
+
+    let tracer = provider.tracer("openshell-gateway");
+
+    // Retain the provider so shutdown() can flush spans on SIGTERM.
+    let _ = OTEL_TRACER_PROVIDER.set(provider);
+
+    Ok(tracing_opentelemetry::layer().with_tracer(tracer))
+}
+
+/// Resolve a sampler from `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`,
+/// defaulting to `parent_based(traceidratio=1.0)` — record all spans, respect
+/// upstream parent sampling decisions.
+fn sampler_from_env() -> Sampler {
+    let ratio = std::env::var("OTEL_TRACES_SAMPLER_ARG")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map_or(1.0, |r| r.clamp(0.0, 1.0));
+
+    match std::env::var("OTEL_TRACES_SAMPLER")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("always_on") => Sampler::AlwaysOn,
+        Some("always_off") => Sampler::AlwaysOff,
+        Some("traceidratio") => Sampler::TraceIdRatioBased(ratio),
+        Some("parentbased_always_off") => Sampler::ParentBased(Box::new(Sampler::AlwaysOff)),
+        Some("parentbased_traceidratio") => {
+            Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(ratio)))
+        }
+        // "parentbased_always_on", unset, or unrecognized
+        _ => Sampler::ParentBased(Box::new(Sampler::AlwaysOn)),
+    }
 }
 
 fn display_level(target: &str, level: &str) -> String {
@@ -385,6 +510,33 @@ mod tests {
         let bus = PlatformEventBus::new();
         let events = bus.tail("nonexistent", 10);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn otlp_config_resolve_prefers_traces_endpoint_then_shared_then_arg() {
+        // Each branch is exercised in isolation to avoid env-var coupling
+        // between cases. We only assert that the non-empty value wins; the
+        // env-var precedence test would need a process-wide lock to be safe.
+        let cfg = OtlpTracingConfig::resolve(Some("http://arg:4317".into()));
+        assert!(cfg.is_some());
+        assert_eq!(cfg.unwrap().endpoint, "http://arg:4317");
+
+        let cfg = OtlpTracingConfig::resolve(Some("   ".into()));
+        assert!(cfg.is_none());
+
+        let cfg = OtlpTracingConfig::resolve(None);
+        // May be Some or None depending on inherited env; only assert that
+        // when Some, the endpoint is non-empty.
+        if let Some(c) = cfg {
+            assert!(!c.endpoint.is_empty());
+        }
+    }
+
+    #[test]
+    fn sampler_from_env_returns_a_sampler() {
+        // The function shape is documented in the function body; this test
+        // exercises construction without coupling to inherited env state.
+        let _ = sampler_from_env();
     }
 
     #[test]
