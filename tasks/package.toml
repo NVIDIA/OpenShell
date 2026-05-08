@@ -23,3 +23,26 @@ hide = true
 ["package:deb:install"]
 description = "Build OpenShell from source and install the deb locally (requires sudo)"
 run = "tasks/scripts/package-deb-install.sh"
+
+["package:snap"]
+description = "Build a snap package from supplied OpenShell binaries"
+run = "tasks/scripts/package-snap.sh"
+hide = true
+
+["package:snap:amd64"]
+description = "Build an amd64 snap package from supplied OpenShell binaries"
+env = { OPENSHELL_SNAP_ARCH = "amd64" }
+run = "tasks/scripts/package-snap.sh"
+hide = true
+
+["package:snap:arm64"]
+description = "Build an arm64 snap package from supplied OpenShell binaries"
+env = { OPENSHELL_SNAP_ARCH = "arm64" }
+run = "tasks/scripts/package-snap.sh"
+hide = true
+
+["package:snap:stage"]
+description = "Stage a snap root from supplied OpenShell binaries without running snap pack"
+env = { OPENSHELL_SNAP_PACK = "0", OPENSHELL_SNAP_STAGE_DIR = "artifacts/snap-root" }
+run = "tasks/scripts/package-snap.sh"
+hide = true
