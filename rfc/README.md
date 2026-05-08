@@ -1,17 +1,46 @@
 # OpenShell RFCs
 
-Substantial changes to OpenShell should be proposed in writing before implementation begins. An RFC provides a consistent way to propose an idea, collect feedback from the community, build consensus, and document the decision for future contributors. Not every change needs an RFC — bug fixes, small features, and routine maintenance go through normal pull requests. RFCs are for the changes that are cross-cutting, potentially controversial, or significant enough that stakeholders should weigh in before code is written.
+Substantial technical changes to OpenShell should be proposed in writing before
+implementation begins. An RFC provides a consistent way to review technical
+design, collect feedback from the community, build consensus, and document the
+decision for future contributors.
+
+RFCs are not the first step for new product capabilities. Feature-shaped work
+should start with a feature request in `feature-requests/` so maintainers can
+first decide whether the capability belongs in OpenShell, what product surface
+it should occupy, and where users should expect it to be available. Once the
+feature request has been discussed and approved by core maintainers, an RFC can
+describe the detailed technical design.
+
+## Start with product approval
+
+Before opening an RFC for a new feature or product behavior, confirm:
+
+1. A feature request document exists under `feature-requests/`.
+2. The feature request was discussed through a linked GitHub issue, with any
+   supporting discussion or pull request links included as needed.
+3. Core maintainers approved the feature request.
+4. The RFC links back to the approved feature request and GitHub issue.
+
+If the answer to any of these is "no", create or finish the feature request
+before asking for RFC review. RFCs may skip this gate only when they are not
+feature-shaped, such as internal process changes, test strategy, or technical
+architecture cleanup without a new product capability.
 
 ## Start with a GitHub Discussion
 
-Before writing an RFC, consider opening a [GitHub Discussion](https://github.com/NVIDIA/OpenShell/discussions) to gauge interest and get early feedback. This helps:
+Before writing a feature request or RFC, consider opening a
+[GitHub Discussion](https://github.com/NVIDIA/OpenShell/discussions) to gauge
+interest and get early feedback. This helps:
 
 - Validate that the problem is worth solving
 - Surface potential concerns early
 - Build consensus before investing in a detailed proposal
 - Identify the right reviewers and stakeholders
 
-If the discussion shows sufficient interest and the idea has merit, then it's time to write an RFC to detail the plan and technical approach.
+If the discussion shows sufficient interest and the idea has merit, write a
+feature request first when the work changes product behavior. After that feature
+request is approved, write an RFC if detailed technical design is needed.
 
 ## RFCs vs other artifacts
 
@@ -20,18 +49,26 @@ OpenShell has several places where design information lives. Use this guide to p
 | Artifact | Purpose | When to use |
 |----------|---------|-------------|
 | **GitHub Discussion** | Gauge interest in a rough idea | You have a thought but aren't sure it's worth a proposal yet |
+| **Feature request** | Define product requirements and get maintainer approval for a capability | You know the user problem and want maintainers to evaluate OpenShell fit, scope, priority, and availability expectations |
 | **Spike issue** (`create-spike`) | Investigate implementation feasibility for a scoped change | You need to explore the codebase and produce a buildable issue for a specific component or feature |
-| **RFC** | Propose a cross-cutting decision that needs broad consensus | Architectural changes, API contracts, process changes, or anything that spans multiple components or teams |
+| **RFC** | Propose technical design for approved or clearly needed work that requires consensus | Architecture, API contracts, protocol changes, test design, or anything that spans multiple components or teams |
 | **Architecture doc** (`architecture/`) | Document how things work today | Living reference material — updated as the system evolves |
 
-The key distinction: **spikes investigate whether and how something can be done; RFCs propose that we should do it and seek agreement on the approach.** A spike may precede an RFC (to gather data) or follow one (to flesh out implementation details). When an RFC reaches `implemented`, its relevant content should be folded into the appropriate `architecture/` docs so the living reference stays current.
+The key distinction: **feature requests decide whether OpenShell should own a
+capability; RFCs decide how an approved capability or technical change should be
+designed; spikes investigate whether and how something can be done.** A spike
+may precede an RFC to gather data or follow one to flesh out implementation
+details. When an RFC reaches `implemented`, its relevant content should be
+folded into the appropriate `architecture/` docs so the living reference stays
+current.
 
 ## When to use an RFC
 
 The following are examples of when an RFC is appropriate:
 
+- An approved feature request needs detailed technical design
 - An architectural or design decision for the platform
-- Change to an API or command-line tool
+- Change to an API, protocol, or command-line contract
 - Change to an internal API or tool
 - Add or change a company or team process
 - A design for testing
@@ -42,6 +79,7 @@ RFCs don't only apply to technical ideas but overall project ideas and processes
 
 Not everything needs an RFC. Skip the RFC process for:
 
+- Feature ideas that have not gone through feature request approval
 - Bug fixes
 - Small feature additions scoped to a single component (use a spike instead)
 - Documentation changes
@@ -85,11 +123,26 @@ An RFC can be in one of the following states:
 
 ## RFC lifecycle
 
-### 1. Reserve an RFC number
+### 1. Confirm feature request approval
+
+For feature-shaped work, make sure the product proposal is complete before
+starting RFC review:
+
+- Create a feature request under `feature-requests/`.
+- Link the GitHub issue where the feature request was discussed, plus any
+  supporting discussion or PR links.
+- Confirm core maintainers approved the feature request.
+- Add the approved feature request and GitHub issue links to the RFC front
+  matter.
+
+If the RFC is not tied to a feature request, explain why the feature request gate
+does not apply.
+
+### 2. Reserve an RFC number
 
 Look at the existing RFC folders in this directory and choose the next available number. If two authors happen to pick the same number on separate branches, the conflict is resolved during PR review — the later PR simply picks the next available number.
 
-### 2. Create your RFC
+### 3. Create your RFC
 
 Each RFC lives in its own folder:
 
@@ -109,25 +162,25 @@ cp -r rfc/0000-template rfc/NNNN-my-feature
 
 Fill in the metadata and start writing. The state should be `draft` while you're iterating.
 
-### 3. Open a pull request
+### 4. Open a pull request
 
-When you're ready for feedback, update the state to `review` and open a pull request. Add the PR link to the `pr` field in the metadata.
+When you're ready for feedback, update the state to `review` and open a pull request. Add the PR link to the `links` field in the metadata.
 
 The PR is where discussion happens. Anyone subscribed to the repo will get a notification and can read your RFC and provide feedback.
 
-### 4. Iterate and build consensus
+### 5. Iterate and build consensus
 
 The comments you choose to accept are up to you as the owner of the RFC, but you should remain empathetic in how you engage. For those giving feedback, be sure that all feedback is constructive.
 
 RFCs rarely go through this process unchanged. Make edits as new commits to the PR and leave comments explaining your changes.
 
-### 5. Merge the pull request
+### 6. Merge the pull request
 
 After there has been time for folks to comment, the RFC author requests merge and a maintainer approves and merges. The state should be updated from `review` to `accepted`. If the proposal is declined, the state should be set to `rejected`. The timing is left to the author's discretion. As a guideline, a few business days seems reasonable, but circumstances may dictate a different timeline.
 
 In general, RFCs shouldn't be merged if no one else has read or commented on it. If no one is reading your RFC, it's time to explicitly ask someone to give it a read!
 
-### 6. Implementation
+### 7. Implementation
 
 Once an RFC has been entirely implemented, its state should be moved to `implemented`. This represents ideas that have been fully developed. While discussion on implemented RFCs is permitted, changes would be expected to be infrequent.
 

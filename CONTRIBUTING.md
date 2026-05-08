@@ -34,7 +34,7 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 
 Issues labeled [`good-first-issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3Agood-first-issue) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
-All open issues are actionable — if it's in the issue tracker, it's ready to be worked on.
+Open issues are not all the same: bugs and implementation issues may be ready to work, while feature proposal issues are product discussions until maintainers accept the feature request.
 
 ## Before You Open an Issue
 
@@ -43,12 +43,14 @@ This project ships with [agent skills](#agent-skills-for-contributors) that can 
 1. Clone the repo and point your coding agent at it.
 2. Load the relevant skill - `debug-openshell-cluster` for gateway or deployment problems, `debug-inference` for inference setup problems, `openshell-cli` for usage questions, `generate-sandbox-policy` for policy help.
 3. Have your agent investigate. Let it run diagnostics, read the architecture docs, and attempt a fix.
-4. If the agent cannot resolve it, open an issue **with the agent's diagnostic output attached**. The issue template requires this.
+4. If the agent cannot resolve it, open an issue. For bug and troubleshooting
+   reports, attach the agent's diagnostic output; those issue templates require
+   it.
 
 ### When to Open an Issue
 
 - A real bug that your agent confirmed and could not fix.
-- A feature proposal with a design — not a "please build this" request.
+- A completed feature request document that needs product discussion. For substantial product changes, use `create-feature-request` to start a feature request draft, complete the draft, make it visible through a GitHub URL, and then create a GitHub issue that links to the doc or PR for discussion.
 - An infrastructure problem that the gateway deployment troubleshooting skill could not resolve.
 - An inference setup problem that the `debug-inference` skill could not resolve.
 - Security vulnerabilities must follow [SECURITY.md](SECURITY.md) — **not** GitHub issues.
@@ -70,6 +72,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Getting Started | `debug-inference`         | Diagnose `inference.local`, host-backed local inference, and direct external inference setup issues |
 | Contributing    | `create-spike`            | Investigate a problem, produce a structured GitHub issue                                            |
 | Contributing    | `build-from-issue`        | Plan and implement work from a GitHub issue (maintainer workflow)                                   |
+| Contributing    | `create-feature-request`  | Start and iteratively fill a numbered feature request draft                                         |
 | Contributing    | `create-github-issue`     | Create well-structured GitHub issues                                                                |
 | Contributing    | `create-github-pr`        | Create pull requests with proper conventions                                                        |
 | Reviewing       | `review-github-pr`        | Summarize PR diffs and key design decisions                                                         |
@@ -88,6 +91,7 @@ Skills connect into pipelines. Individual skill files don't describe these relat
 
 - **Community inflow:** `triage-issue` → `create-spike` → `build-from-issue`
 - **Internal development:** `create-spike` → `build-from-issue`
+- **Feature proposals:** `create-feature-request` → user completes proposal → feature request PR/doc link → linked GitHub issue → product review
 - **Security:** `review-security-issue` → `fix-security-issue`
 - **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
 
@@ -196,12 +200,26 @@ These are the primary `mise` tasks for day-to-day development:
 | `docs/`         | Published Fern docs source, navigation, and content assets |
 | `fern/`         | Fern site config, components, and theme assets |
 | `architecture/` | Architecture docs and plans                   |
+| `feature-requests/` | Product requirements and feature proposal templates |
 | `rfc/`          | Request for Comments proposals                |
 | `.agents/`      | Agent skills and persona definitions          |
 
-## RFCs
+## Feature Requests and RFCs
 
-For cross-cutting architectural decisions, API contract changes, or process proposals that need broad consensus, use the RFC process. RFCs live in `rfc/` — copy the template, fill it in, and open a PR for discussion. See [rfc/README.md](rfc/README.md) for the full lifecycle and guidelines on when to write an RFC versus a spike issue or architecture doc.
+Feature requests are product proposals. Use them when you want maintainers to decide whether a capability belongs in OpenShell, who it serves, what user outcome it should provide, and where users should expect it to be available. For substantial proposals, use the `create-feature-request` skill to start a draft under `feature-requests/`, complete the draft, make it visible through a GitHub URL, and then create a GitHub issue that links to the completed feature request doc or PR.
+
+RFCs are technical design proposals. Use them after a feature request has been discussed and approved by core maintainers, or for non-feature technical decisions such as architecture, API contracts, process changes, or test design. RFCs live in `rfc/`; copy the template, fill it in, and link the approved feature request when applicable.
+
+Typical flow for new product capabilities:
+
+1. Use `create-feature-request` to start a numbered draft.
+2. Complete the feature request draft.
+3. Open a PR or push the doc so it has a GitHub URL.
+4. Create a GitHub issue that links to the completed feature request doc or PR.
+5. Review the feature request in the PR and linked issue, then get core maintainer approval on the product direction.
+6. Create an RFC only if detailed technical design is needed.
+
+See [feature-requests/README.md](feature-requests/README.md) and [rfc/README.md](rfc/README.md) for the full processes.
 
 ## Documentation
 
