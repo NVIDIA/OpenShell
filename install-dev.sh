@@ -326,8 +326,29 @@ start_user_gateway() {
   as_target_user systemctl --user restart openshell-gateway
   as_target_user systemctl --user is-active --quiet openshell-gateway
 
+  wait_for_local_gateway
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
+}
+
+wait_for_local_gateway() {
+  _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
+  _elapsed=0
+  _last_output=""
+  _health_url="http://127.0.0.1:${LOCAL_GATEWAY_PORT}/healthz"
+
+  info "waiting for local gateway to become reachable..."
+  while [ "$_elapsed" -lt "$_timeout" ]; do
+    if _last_output="$(as_target_user curl -fsS --max-time 2 "$_health_url" 2>&1 >/dev/null)"; then
+      info "local gateway is reachable"
+      return 0
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+
+  printf '%s\n' "$_last_output" >&2
+  error "local gateway did not become reachable at ${_health_url} within ${_timeout}s"
 }
 
 remove_local_gateway_registration() {
@@ -463,6 +484,7 @@ install_macos_homebrew() {
     OPENSHELL_REGISTER_BIN="${_brew_prefix}/bin/openshell"
   fi
 
+  wait_for_local_gateway
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
 }
