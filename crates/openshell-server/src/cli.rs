@@ -220,6 +220,11 @@ struct Args {
     )]
     docker_network_name: String,
 
+    /// Enable Kubernetes user namespace isolation (hostUsers: false) for
+    /// sandbox pods.
+    #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
+    enable_user_namespaces: bool,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -403,6 +408,8 @@ async fn run_from_args(args: Args) -> Result<()> {
             scopes_claim: args.oidc_scopes_claim,
         });
     }
+
+    config.enable_user_namespaces = args.enable_user_namespaces;
 
     let vm_config = VmComputeConfig {
         state_dir: args.vm_driver_state_dir,

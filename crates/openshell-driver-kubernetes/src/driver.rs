@@ -308,21 +308,22 @@ impl KubernetesComputeDriver {
             labels: Some(sandbox_labels(sandbox)),
             ..Default::default()
         };
-        obj.data = sandbox_to_k8s_spec(
-            sandbox.spec.as_ref(),
-            &self.config.default_image,
-            &self.config.image_pull_policy,
-            &self.config.supervisor_image,
-            &self.config.supervisor_image_pull_policy,
-            &sandbox.id,
-            &sandbox.name,
-            &self.config.grpc_endpoint,
-            self.ssh_socket_path(),
-            self.ssh_handshake_secret(),
-            self.ssh_handshake_skew_secs(),
-            &self.config.client_tls_secret_name,
-            &self.config.host_gateway_ip,
-        );
+        let params = SandboxPodParams {
+            default_image: &self.config.default_image,
+            image_pull_policy: &self.config.image_pull_policy,
+            supervisor_image: &self.config.supervisor_image,
+            supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
+            sandbox_id: &sandbox.id,
+            sandbox_name: &sandbox.name,
+            grpc_endpoint: &self.config.grpc_endpoint,
+            ssh_socket_path: self.ssh_socket_path(),
+            ssh_handshake_secret: self.ssh_handshake_secret(),
+            ssh_handshake_skew_secs: self.ssh_handshake_skew_secs(),
+            client_tls_secret_name: &self.config.client_tls_secret_name,
+            host_gateway_ip: &self.config.host_gateway_ip,
+            enable_user_namespaces: self.config.enable_user_namespaces,
+        };
+        obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
         let api = self.api();
 
         match tokio::time::timeout(KUBE_API_TIMEOUT, api.create(&PostParams::default(), &obj)).await
@@ -926,21 +927,27 @@ fn default_workspace_volume_claim_templates() -> serde_json::Value {
     }])
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Parameters shared by `sandbox_to_k8s_spec` and `sandbox_template_to_k8s`.
+#[derive(Default)]
+struct SandboxPodParams<'a> {
+    default_image: &'a str,
+    image_pull_policy: &'a str,
+    supervisor_image: &'a str,
+    supervisor_image_pull_policy: &'a str,
+    sandbox_id: &'a str,
+    sandbox_name: &'a str,
+    grpc_endpoint: &'a str,
+    ssh_socket_path: &'a str,
+    ssh_handshake_secret: &'a str,
+    ssh_handshake_skew_secs: u64,
+    client_tls_secret_name: &'a str,
+    host_gateway_ip: &'a str,
+    enable_user_namespaces: bool,
+}
+
 fn sandbox_to_k8s_spec(
     spec: Option<&SandboxSpec>,
-    default_image: &str,
-    image_pull_policy: &str,
-    supervisor_image: &str,
-    supervisor_image_pull_policy: &str,
-    sandbox_id: &str,
-    sandbox_name: &str,
-    grpc_endpoint: &str,
-    ssh_socket_path: &str,
-    ssh_handshake_secret: &str,
-    ssh_handshake_skew_secs: u64,
-    client_tls_secret_name: &str,
-    host_gateway_ip: &str,
+    params: &SandboxPodParams<'_>,
 ) -> serde_json::Value {
     let mut root = serde_json::Map::new();
 
@@ -971,20 +978,9 @@ fn sandbox_to_k8s_spec(
                 sandbox_template_to_k8s(
                     template,
                     spec.gpu,
-                    default_image,
-                    image_pull_policy,
-                    supervisor_image,
-                    supervisor_image_pull_policy,
-                    sandbox_id,
-                    sandbox_name,
-                    grpc_endpoint,
-                    ssh_socket_path,
-                    ssh_handshake_secret,
-                    ssh_handshake_skew_secs,
                     &spec.environment,
-                    client_tls_secret_name,
-                    host_gateway_ip,
                     inject_workspace,
+                    params,
                 ),
             );
             if !template.agent_socket_path.is_empty() {
@@ -1019,20 +1015,9 @@ fn sandbox_to_k8s_spec(
             sandbox_template_to_k8s(
                 &SandboxTemplate::default(),
                 spec.as_ref().is_some_and(|s| s.gpu),
-                default_image,
-                image_pull_policy,
-                supervisor_image,
-                supervisor_image_pull_policy,
-                sandbox_id,
-                sandbox_name,
-                grpc_endpoint,
-                ssh_socket_path,
-                ssh_handshake_secret,
-                ssh_handshake_skew_secs,
                 spec_env,
-                client_tls_secret_name,
-                host_gateway_ip,
                 inject_workspace,
+                params,
             ),
         );
     }
@@ -1042,24 +1027,12 @@ fn sandbox_to_k8s_spec(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn sandbox_template_to_k8s(
     template: &SandboxTemplate,
     gpu: bool,
-    default_image: &str,
-    image_pull_policy: &str,
-    supervisor_image: &str,
-    supervisor_image_pull_policy: &str,
-    sandbox_id: &str,
-    sandbox_name: &str,
-    grpc_endpoint: &str,
-    ssh_socket_path: &str,
-    ssh_handshake_secret: &str,
-    ssh_handshake_skew_secs: u64,
     spec_environment: &std::collections::HashMap<String, String>,
-    client_tls_secret_name: &str,
-    host_gateway_ip: &str,
     inject_workspace: bool,
+    params: &SandboxPodParams<'_>,
 ) -> serde_json::Value {
     let mut metadata = serde_json::Map::new();
     if !template.labels.is_empty() {
@@ -1077,20 +1050,34 @@ fn sandbox_template_to_k8s(
         );
     }
 
+    // Per-sandbox platform_config.host_users overrides the cluster-wide default.
+    let use_user_namespaces = platform_config_bool(template, "host_users")
+        .map_or(params.enable_user_namespaces, |host_users| !host_users);
+
+    if use_user_namespaces {
+        spec.insert("hostUsers".to_string(), serde_json::json!(false));
+        if gpu {
+            warn!(
+                "GPU sandbox with user namespaces enabled — \
+                 NVIDIA device plugin compatibility is unverified"
+            );
+        }
+    }
+
     let mut container = serde_json::Map::new();
     container.insert("name".to_string(), serde_json::json!("agent"));
     // Use template image if provided, otherwise fall back to default
     let image = if template.image.is_empty() {
-        default_image
+        params.default_image
     } else {
         &template.image
     };
     if !image.is_empty() {
         container.insert("image".to_string(), serde_json::json!(image));
-        if !image_pull_policy.is_empty() {
+        if !params.image_pull_policy.is_empty() {
             container.insert(
                 "imagePullPolicy".to_string(),
-                serde_json::json!(image_pull_policy),
+                serde_json::json!(params.image_pull_policy),
             );
         }
     }
@@ -1100,34 +1087,36 @@ fn sandbox_template_to_k8s(
         None,
         &template.environment,
         spec_environment,
-        sandbox_id,
-        sandbox_name,
-        grpc_endpoint,
-        ssh_socket_path,
-        ssh_handshake_secret,
-        ssh_handshake_skew_secs,
-        !client_tls_secret_name.is_empty(),
+        params.sandbox_id,
+        params.sandbox_name,
+        params.grpc_endpoint,
+        params.ssh_socket_path,
+        params.ssh_handshake_secret,
+        params.ssh_handshake_skew_secs,
+        !params.client_tls_secret_name.is_empty(),
     );
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
 
-    // The sandbox process needs SYS_ADMIN (for seccomp filter installation and
-    // network namespace creation), NET_ADMIN (for network namespace veth setup),
-    // SYS_PTRACE (for the CONNECT proxy to read /proc/<pid>/fd/ of sandbox-user
-    // processes to resolve binary identity for network policy enforcement),
-    // and SYSLOG (for reading /dev/kmsg to surface bypass detection diagnostics).
-    // This mirrors the capabilities used by `mise run sandbox`.
+    let mut capabilities: Vec<&str> = vec!["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"];
+    if use_user_namespaces {
+        // In a user namespace the bounding set is reset. SETUID/SETGID are
+        // needed for the supervisor to drop privileges to the sandbox user.
+        // DAC_READ_SEARCH is needed for cross-UID /proc/<pid>/fd/ access
+        // for process identity resolution in network policy enforcement.
+        capabilities.extend(["SETUID", "SETGID", "DAC_READ_SEARCH"]);
+    }
     container.insert(
         "securityContext".to_string(),
         serde_json::json!({
             "capabilities": {
-                "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
+                "add": capabilities
             }
         }),
     );
 
     // Mount client TLS secret for mTLS to the server.
-    if !client_tls_secret_name.is_empty() {
+    if !params.client_tls_secret_name.is_empty() {
         container.insert(
             "volumeMounts".to_string(),
             serde_json::json!([{
@@ -1148,22 +1137,22 @@ fn sandbox_template_to_k8s(
 
     // Add TLS secret volume.  Mode 0400 (owner-read) prevents the
     // unprivileged sandbox user from reading the mTLS private key.
-    if !client_tls_secret_name.is_empty() {
+    if !params.client_tls_secret_name.is_empty() {
         spec.insert(
             "volumes".to_string(),
             serde_json::json!([{
                 "name": "openshell-client-tls",
-                "secret": { "secretName": client_tls_secret_name, "defaultMode": 256 }
+                "secret": { "secretName": params.client_tls_secret_name, "defaultMode": 256 }
             }]),
         );
     }
 
     // Add hostAliases so sandbox pods can reach the Docker host.
-    if !host_gateway_ip.is_empty() {
+    if !params.host_gateway_ip.is_empty() {
         spec.insert(
             "hostAliases".to_string(),
             serde_json::json!([{
-                "ip": host_gateway_ip,
+                "ip": params.host_gateway_ip,
                 "hostnames": ["host.docker.internal", "host.openshell.internal"]
             }]),
         );
@@ -1179,13 +1168,17 @@ fn sandbox_template_to_k8s(
 
     // Side-load the supervisor binary via an init container that copies it
     // from the supervisor image into a shared emptyDir volume.
-    apply_supervisor_sideload(&mut result, supervisor_image, supervisor_image_pull_policy);
+    apply_supervisor_sideload(
+        &mut result,
+        params.supervisor_image,
+        params.supervisor_image_pull_policy,
+    );
 
     // Inject workspace persistence (init container + PVC volume mount) so
     // that /sandbox data survives pod rescheduling.  Skipped when the user
     // provides custom volumeClaimTemplates to avoid conflicts.
     if inject_workspace {
-        apply_workspace_persistence(&mut result, image, image_pull_policy);
+        apply_workspace_persistence(&mut result, image, params.image_pull_policy);
     }
 
     result
@@ -1342,6 +1335,15 @@ fn platform_config_string(template: &SandboxTemplate, key: &str) -> Option<Strin
     let value = config.fields.get(key)?;
     match value.kind.as_ref() {
         Some(prost_types::value::Kind::StringValue(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn platform_config_bool(template: &SandboxTemplate, key: &str) -> Option<bool> {
+    let config = template.platform_config.as_ref()?;
+    let value = config.fields.get(key)?;
+    match value.kind.as_ref() {
+        Some(prost_types::value::Kind::BoolValue(b)) => Some(*b),
         _ => None,
     }
 }
@@ -1645,24 +1647,16 @@ mod tests {
 
     #[test]
     fn gpu_sandbox_adds_runtime_class_and_gpu_limit() {
-        let pod_template = sandbox_template_to_k8s(
-            &SandboxTemplate::default(),
-            true,
-            "openshell/sandbox:latest",
-            "",
-            "openshell/supervisor:latest",
-            "",
-            "sandbox-id",
-            "sandbox-name",
-            "https://gateway.example.com",
-            "0.0.0.0:2222",
-            "secret",
-            300,
-            &std::collections::HashMap::new(),
-            "",
-            "",
-            true,
-        );
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &SandboxTemplate::default(),
+                true,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
 
         assert_eq!(
             pod_template["spec"]["runtimeClassName"],
@@ -1689,24 +1683,16 @@ mod tests {
             ..SandboxTemplate::default()
         };
 
-        let pod_template = sandbox_template_to_k8s(
-            &template,
-            true,
-            "openshell/sandbox:latest",
-            "",
-            "openshell/supervisor:latest",
-            "",
-            "sandbox-id",
-            "sandbox-name",
-            "https://gateway.example.com",
-            "0.0.0.0:2222",
-            "secret",
-            300,
-            &std::collections::HashMap::new(),
-            "",
-            "",
-            true,
-        );
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                true,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
 
         assert_eq!(
             pod_template["spec"]["runtimeClassName"],
@@ -1729,24 +1715,16 @@ mod tests {
             ..SandboxTemplate::default()
         };
 
-        let pod_template = sandbox_template_to_k8s(
-            &template,
-            false,
-            "openshell/sandbox:latest",
-            "",
-            "openshell/supervisor:latest",
-            "",
-            "sandbox-id",
-            "sandbox-name",
-            "https://gateway.example.com",
-            "0.0.0.0:2222",
-            "secret",
-            300,
-            &std::collections::HashMap::new(),
-            "",
-            "",
-            true,
-        );
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
 
         assert_eq!(
             pod_template["spec"]["runtimeClassName"],
@@ -1765,24 +1743,16 @@ mod tests {
             ..SandboxTemplate::default()
         };
 
-        let pod_template = sandbox_template_to_k8s(
-            &template,
-            true,
-            "openshell/sandbox:latest",
-            "",
-            "openshell/supervisor:latest",
-            "",
-            "sandbox-id",
-            "sandbox-name",
-            "https://gateway.example.com",
-            "0.0.0.0:2222",
-            "secret",
-            300,
-            &std::collections::HashMap::new(),
-            "",
-            "",
-            true,
-        );
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                true,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
 
         let limits = &pod_template["spec"]["containers"][0]["resources"]["limits"];
         assert_eq!(limits["cpu"], serde_json::json!("2"));
@@ -1794,24 +1764,19 @@ mod tests {
 
     #[test]
     fn host_aliases_injected_when_gateway_ip_set() {
-        let pod_template = sandbox_template_to_k8s(
-            &SandboxTemplate::default(),
-            false,
-            "openshell/sandbox:latest",
-            "",
-            "openshell/supervisor:latest",
-            "",
-            "sandbox-id",
-            "sandbox-name",
-            "https://gateway.example.com",
-            "0.0.0.0:2222",
-            "secret",
-            300,
-            &std::collections::HashMap::new(),
-            "",
-            "172.17.0.1",
-            true,
-        );
+        let pod_template = {
+            let params = SandboxPodParams {
+                host_gateway_ip: "172.17.0.1",
+                ..Default::default()
+            };
+            sandbox_template_to_k8s(
+                &SandboxTemplate::default(),
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
 
         let host_aliases = pod_template["spec"]["hostAliases"]
             .as_array()
@@ -1827,24 +1792,16 @@ mod tests {
 
     #[test]
     fn host_aliases_not_injected_when_gateway_ip_empty() {
-        let pod_template = sandbox_template_to_k8s(
-            &SandboxTemplate::default(),
-            false,
-            "openshell/sandbox:latest",
-            "",
-            "openshell/supervisor:latest",
-            "",
-            "sandbox-id",
-            "sandbox-name",
-            "https://gateway.example.com",
-            "0.0.0.0:2222",
-            "secret",
-            300,
-            &std::collections::HashMap::new(),
-            "",
-            "",
-            true,
-        );
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &SandboxTemplate::default(),
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
 
         assert!(
             pod_template["spec"]["hostAliases"].is_null(),
@@ -1855,24 +1812,19 @@ mod tests {
     #[test]
     fn tls_secret_volume_uses_restrictive_default_mode() {
         let template = SandboxTemplate::default();
-        let pod_template = sandbox_template_to_k8s(
-            &template,
-            false,
-            "openshell/sandbox:latest",
-            "",
-            "openshell/supervisor:latest",
-            "",
-            "sandbox-id",
-            "sandbox-name",
-            "https://gateway.example.com",
-            "0.0.0.0:2222",
-            "secret",
-            300,
-            &std::collections::HashMap::new(),
-            "my-tls-secret",
-            "",
-            true,
-        );
+        let pod_template = {
+            let params = SandboxPodParams {
+                client_tls_secret_name: "my-tls-secret",
+                ..Default::default()
+            };
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
 
         let volumes = pod_template["spec"]["volumes"]
             .as_array()
@@ -2000,23 +1952,13 @@ mod tests {
 
     #[test]
     fn workspace_persistence_skipped_when_inject_workspace_false() {
+        let params = SandboxPodParams::default();
         let pod_template = sandbox_template_to_k8s(
             &SandboxTemplate::default(),
             false,
-            "openshell/sandbox:latest",
-            "",
-            "openshell/supervisor:latest",
-            "",
-            "sandbox-id",
-            "sandbox-name",
-            "https://gateway.example.com",
-            "0.0.0.0:2222",
-            "secret",
-            300,
             &std::collections::HashMap::new(),
-            "",
-            "",
             false, // user provided custom VCTs
+            &params,
         );
 
         // Only the supervisor init container should be present — no workspace init container
@@ -2038,5 +1980,176 @@ mod tests {
             !has_workspace_mount,
             "workspace mount must NOT be present when inject_workspace is false"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // User namespace tests
+    // -----------------------------------------------------------------------
+
+    fn default_template_to_k8s(enable_user_namespaces: bool) -> serde_json::Value {
+        let params = SandboxPodParams {
+            enable_user_namespaces,
+            ..Default::default()
+        };
+        sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        )
+    }
+
+    #[test]
+    fn user_namespaces_disabled_by_default() {
+        let pod_template = default_template_to_k8s(false);
+        assert!(
+            pod_template["spec"]["hostUsers"].is_null(),
+            "hostUsers must not be set when user namespaces are disabled"
+        );
+        let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
+            .as_array()
+            .unwrap();
+        assert_eq!(caps.len(), 4);
+        assert!(!caps.contains(&serde_json::json!("SETUID")));
+    }
+
+    #[test]
+    fn user_namespaces_enabled_by_cluster_default() {
+        let pod_template = default_template_to_k8s(true);
+        assert_eq!(
+            pod_template["spec"]["hostUsers"],
+            serde_json::json!(false),
+            "hostUsers must be false when user namespaces are enabled"
+        );
+    }
+
+    #[test]
+    fn user_namespaces_adds_extra_capabilities() {
+        let pod_template = default_template_to_k8s(true);
+        let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
+            .as_array()
+            .unwrap();
+        assert!(caps.contains(&serde_json::json!("SYS_ADMIN")));
+        assert!(caps.contains(&serde_json::json!("NET_ADMIN")));
+        assert!(caps.contains(&serde_json::json!("SYS_PTRACE")));
+        assert!(caps.contains(&serde_json::json!("SYSLOG")));
+        assert!(caps.contains(&serde_json::json!("SETUID")));
+        assert!(caps.contains(&serde_json::json!("SETGID")));
+        assert!(caps.contains(&serde_json::json!("DAC_READ_SEARCH")));
+        assert_eq!(caps.len(), 7);
+    }
+
+    #[test]
+    fn user_namespaces_per_sandbox_override_enables() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "host_users".to_string(),
+                    Value {
+                        kind: Some(Kind::BoolValue(false)),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let params = SandboxPodParams::default(); // cluster default is off
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["hostUsers"],
+            serde_json::json!(false),
+            "per-sandbox host_users: false must enable user namespaces"
+        );
+        let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
+            .as_array()
+            .unwrap();
+        assert!(caps.contains(&serde_json::json!("SETUID")));
+    }
+
+    #[test]
+    fn user_namespaces_per_sandbox_override_disables() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "host_users".to_string(),
+                    Value {
+                        kind: Some(Kind::BoolValue(true)),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let params = SandboxPodParams {
+            enable_user_namespaces: true, // cluster default is on
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert!(
+            pod_template["spec"]["hostUsers"].is_null(),
+            "per-sandbox host_users: true must disable user namespaces even when cluster default is on"
+        );
+        let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            caps.len(),
+            4,
+            "extra capabilities must not be added when user namespaces are disabled"
+        );
+    }
+
+    #[test]
+    fn platform_config_bool_extracts_value() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "my_bool".to_string(),
+                    Value {
+                        kind: Some(Kind::BoolValue(true)),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        assert_eq!(platform_config_bool(&template, "my_bool"), Some(true));
+        assert_eq!(platform_config_bool(&template, "missing"), None);
+    }
+
+    #[test]
+    fn platform_config_bool_returns_none_for_non_bool() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "a_string".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("hello".to_string())),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        assert_eq!(platform_config_bool(&template, "a_string"), None);
     }
 }
