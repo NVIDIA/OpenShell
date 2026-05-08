@@ -30,7 +30,7 @@ jobs:
   # ---------------------------------------------------------------------------
   compute-versions:
     name: Compute Versions
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 5
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -41,8 +41,12 @@ jobs:
       python_version: ${{ steps.v.outputs.python }}
       cargo_version: ${{ steps.v.outputs.cargo }}
       deb_version: ${{ steps.v.outputs.deb }}
+      rpm_version: ${{ steps.v.outputs.rpm_version }}
+      rpm_release: ${{ steps.v.outputs.rpm_release }}
       # Semver without 'v' prefix (e.g. 0.6.0), used for image tags and release body
       semver: ${{ steps.v.outputs.semver }}
+      # Commit resolved from RELEASE_TAG, used for image tags and downstream metadata
+      source_sha: ${{ steps.v.outputs.source_sha }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -62,7 +66,10 @@ jobs:
           echo "python=$(uv run python tasks/scripts/release.py get-version --python)" >> "$GITHUB_OUTPUT"
           echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
           echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)" >> "$GITHUB_OUTPUT"
+          echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --rpm-version)" >> "$GITHUB_OUTPUT"
+          echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --rpm-release)" >> "$GITHUB_OUTPUT"
           echo "semver=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build-gateway:
     needs: [compute-versions]
@@ -70,6 +77,8 @@ jobs:
     with:
       component: gateway
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
 
   build-supervisor:
     needs: [compute-versions]
@@ -77,25 +86,21 @@ jobs:
     with:
       component: supervisor
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-
-  build-cluster:
-    needs: [compute-versions]
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: cluster
-      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
 
   e2e:
-    needs: [build-gateway, build-cluster]
+    needs: [compute-versions, build-gateway, build-supervisor]
     uses: ./.github/workflows/e2e-test.yml
     with:
-      image-tag: ${{ github.sha }}
-      runner: build-arm64
+      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+      runner: linux-arm64-cpu8
 
   tag-ghcr-release:
     name: Tag GHCR Images for Release
-    needs: [compute-versions, build-gateway, build-supervisor, build-cluster, e2e]
-    runs-on: build-amd64
+    needs: [compute-versions, build-gateway, build-supervisor, e2e]
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     steps:
       - name: Log in to GHCR
@@ -106,16 +111,17 @@ jobs:
           set -euo pipefail
           REGISTRY="ghcr.io/nvidia/openshell"
           VERSION="${{ needs.compute-versions.outputs.semver }}"
-          for component in gateway supervisor cluster; do
-            echo "Tagging ${REGISTRY}/${component}:${{ github.sha }} as ${VERSION} and latest..."
+          SOURCE_TAG="${{ needs.compute-versions.outputs.source_sha }}"
+          for component in gateway supervisor; do
+            echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION} and latest..."
             docker buildx imagetools create \
               --prefer-index=false \
               -t "${REGISTRY}/${component}:${VERSION}" \
-              "${REGISTRY}/${component}:${{ github.sha }}"
+              "${REGISTRY}/${component}:${SOURCE_TAG}"
             docker buildx imagetools create \
               --prefer-index=false \
               -t "${REGISTRY}/${component}:latest" \
-              "${REGISTRY}/${component}:${{ github.sha }}"
+              "${REGISTRY}/${component}:${SOURCE_TAG}"
           done
 
   build-python-wheels-linux:
@@ -125,12 +131,12 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             artifact: linux-amd64
             task: python:build:linux:amd64
             output_path: target/wheels/linux-amd64/*.whl
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             artifact: linux-arm64
             task: python:build:linux:arm64
             output_path: target/wheels/linux-arm64/*.whl
@@ -144,7 +150,6 @@ jobs:
       options: --privileged
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
       OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.semver }}
     steps:
       - uses: actions/checkout@v6
@@ -159,7 +164,7 @@ jobs:
         run: uv sync
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: python-wheel-linux-${{ matrix.arch }}
           cache-directories: .cache/sccache
@@ -172,7 +177,7 @@ jobs:
           ls -la ${{ matrix.output_path }}
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-wheels-${{ matrix.artifact }}
           path: ${{ matrix.output_path }}
@@ -181,7 +186,7 @@ jobs:
   build-python-wheel-macos:
     name: Build Python Wheel (macOS)
     needs: [compute-versions]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 120
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -193,7 +198,6 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
       OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.semver }}
     steps:
       - uses: actions/checkout@v6
@@ -206,6 +210,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
+        with:
+          driver: local
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -220,7 +226,7 @@ jobs:
           ls -la target/wheels/*.whl
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-wheels-macos
           path: target/wheels/*.whl
@@ -239,11 +245,11 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-musl
             zig_target: x86_64-linux-musl
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-musl
             zig_target: aarch64-linux-musl
     runs-on: ${{ matrix.runner }}
@@ -256,7 +262,6 @@ jobs:
       options: --privileged
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
       OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.semver }}
     steps:
       - uses: actions/checkout@v6
@@ -274,7 +279,7 @@ jobs:
         run: mise install --locked
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: cli-musl-${{ matrix.arch }}
           cache-directories: .cache/sccache
@@ -336,7 +341,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cli-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
@@ -348,7 +353,7 @@ jobs:
   build-cli-macos:
     name: Build CLI (macOS)
     needs: [compute-versions]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 60
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -360,7 +365,6 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -378,6 +382,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
+        with:
+          driver: local
 
       - name: Build macOS binary via Docker
         run: |
@@ -400,7 +406,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cli-macos
           path: artifacts/*.tar.gz
@@ -416,10 +422,10 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-gnu
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -431,7 +437,6 @@ jobs:
       options: --privileged
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -448,7 +453,7 @@ jobs:
         run: mise install --locked
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: gateway-binary-gnu-${{ matrix.arch }}
           cache-directories: .cache/sccache
@@ -461,6 +466,8 @@ jobs:
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
 
       - name: Build ${{ matrix.target }}
+        env:
+          OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.source_sha }}
         run: |
           set -euo pipefail
           mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-server
@@ -485,7 +492,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gateway-binary-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
@@ -501,10 +508,10 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-gnu
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -516,7 +523,6 @@ jobs:
       options: --privileged
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -533,7 +539,7 @@ jobs:
         run: mise install --locked
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: supervisor-binary-gnu-${{ matrix.arch }}
           cache-directories: .cache/sccache
@@ -570,7 +576,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: supervisor-binary-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
@@ -582,7 +588,7 @@ jobs:
   build-gateway-binary-macos:
     name: Build Gateway Binary (macOS)
     needs: [compute-versions]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 60
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -594,7 +600,6 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -612,6 +617,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
+        with:
+          driver: local
 
       - name: Build macOS binary via Docker
         run: |
@@ -638,7 +645,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gateway-binary-macos
           path: artifacts/*.tar.gz
@@ -654,6 +661,16 @@ jobs:
       checkout-ref: ${{ inputs.tag || github.ref }}
     secrets: inherit
 
+  build-driver-vm-macos:
+    name: Build Driver VM macOS
+    needs: [compute-versions]
+    uses: ./.github/workflows/driver-vm-macos.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
   build-deb:
     name: Build Debian Packages
     needs: [compute-versions, build-cli-linux, build-gateway-binary-linux, build-driver-vm-linux]
@@ -663,14 +680,30 @@ jobs:
       checkout-ref: ${{ inputs.tag || github.ref }}
     secrets: inherit
 
+  build-rpm:
+    name: Build RPM Packages
+    needs: [compute-versions]
+    uses: ./.github/workflows/rpm-package.yml
+    with:
+      checkout-ref: ${{ inputs.tag || github.ref }}
+      rpm-version: ${{ needs.compute-versions.outputs.rpm_version }}
+      rpm-release: ${{ needs.compute-versions.outputs.rpm_release }}
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+    secrets: inherit
+
   # ---------------------------------------------------------------------------
-  # Create a tagged GitHub Release with CLI binaries and wheels
+  # Create a tagged GitHub Release with CLI, gateway, driver, and wheels
   # ---------------------------------------------------------------------------
   release:
     name: Release
-    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, tag-ghcr-release, build-deb]
-    runs-on: build-amd64
+    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, tag-ghcr-release, build-driver-vm-linux, build-driver-vm-macos, build-deb, build-rpm]
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     outputs:
       wheel_filenames: ${{ steps.wheel_filenames.outputs.wheel_filenames }}
     steps:
@@ -699,6 +732,13 @@ jobs:
           path: release/
           merge-multiple: true
 
+      - name: Download VM driver artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: driver-vm-*
+          path: release/
+          merge-multiple: true
+
       - name: Download wheel artifacts
         uses: actions/download-artifact@v4
         with:
@@ -710,6 +750,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: deb-linux-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download RPM package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rpm-linux-*
           path: release/
           merge-multiple: true
 
@@ -729,7 +776,11 @@ jobs:
             openshell-x86_64-unknown-linux-musl.tar.gz \
             openshell-aarch64-unknown-linux-musl.tar.gz \
             openshell-aarch64-apple-darwin.tar.gz \
+            openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz \
+            openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz \
+            openshell-driver-vm-aarch64-apple-darwin.tar.gz \
             openshell_*.deb \
+            openshell-*.rpm \
             *.whl > openshell-checksums-sha256.txt
           cat openshell-checksums-sha256.txt
           sha256sum \
@@ -741,6 +792,45 @@ jobs:
             openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz \
             openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz > openshell-sandbox-checksums-sha256.txt
           cat openshell-sandbox-checksums-sha256.txt
+
+      - name: Generate Homebrew formula
+        run: |
+          set -euo pipefail
+          python3 tasks/scripts/release.py generate-homebrew-formula \
+            --release-tag "${RELEASE_TAG}" \
+            --release-dir release \
+            --output release/openshell.rb
+          cat release/openshell.rb
+
+      - name: Attest VM driver artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
+
+      - name: Prune removed VM checksum asset
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: process.env.RELEASE_TAG });
+            } catch (err) {
+              if (err.status === 404) {
+                core.info(`No existing ${process.env.RELEASE_TAG} release; skipping VM checksum pruning.`);
+                return;
+              }
+              throw err;
+            }
+            for (const asset of release.data.assets) {
+              if (asset.name === 'openshell-driver-vm-checksums-sha256.txt') {
+                core.info(`Deleting removed VM checksum asset: ${asset.name}`);
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
+              }
+            }
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -763,12 +853,17 @@ jobs:
             release/openshell-aarch64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-apple-darwin.tar.gz
             release/openshell_*.deb
+            release/openshell-*.rpm
             release/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-gateway-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-gateway-aarch64-apple-darwin.tar.gz
             release/openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
             release/*.whl
+            release/openshell.rb
             release/openshell-checksums-sha256.txt
             release/openshell-gateway-checksums-sha256.txt
             release/openshell-sandbox-checksums-sha256.txt
@@ -799,6 +894,24 @@ jobs:
         working-directory: ./fern
         run: fern generate --docs
 
+  release-helm:
+    name: Release Helm Chart (OCI)
+    needs: [compute-versions, tag-ghcr-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: ./.github/actions/release-helm-oci
+        with:
+          chart-version: ${{ needs.compute-versions.outputs.semver }}
+          app-version: ${{ needs.compute-versions.outputs.semver }}
+          release-kind: public
+
   trigger-wheel-publish:
     name: Trigger Wheel Publish
     needs: [compute-versions, release]
@@ -809,6 +922,7 @@ jobs:
         env:
           GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
           GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
+          COMMIT_SHA: ${{ needs.compute-versions.outputs.source_sha }}
           RELEASE_VERSION: ${{ needs.compute-versions.outputs.python_version }}
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
           WHEEL_FILENAMES: ${{ needs.release.outputs.wheel_filenames }}
@@ -827,7 +941,7 @@ jobs:
             -F "ref=main" \
             -F "variables[PIPELINE_ACTION]=publish_wheels" \
             -F "variables[GITHUB_REPOSITORY]=${GITHUB_REPOSITORY}" \
-            -F "variables[COMMIT_SHA]=${GITHUB_SHA}" \
+            -F "variables[COMMIT_SHA]=${COMMIT_SHA}" \
             -F "variables[RELEASE_TAG]=${RELEASE_TAG}" \
             -F "variables[RELEASE_VERSION]=${RELEASE_VERSION}" \
             -F "variables[RELEASE_KIND]=stable" \

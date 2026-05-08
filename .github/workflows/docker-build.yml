@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       component:
-        description: "Component to build (gateway, supervisor, cluster)"
+        description: "Component to build (gateway, supervisor)"
         required: true
         type: string
       timeout-minutes:
@@ -26,7 +26,7 @@ on:
         description: "Deprecated; per-arch native runners are selected automatically"
         required: false
         type: string
-        default: "build-amd64"
+        default: "linux-amd64-cpu8"
       cargo-version:
         description: "Pre-computed cargo version (skips internal git-based computation)"
         required: false
@@ -34,6 +34,11 @@ on:
         default: ""
       image-tag:
         description: "Image tag base to build/push (defaults to the GitHub SHA)"
+        required: false
+        type: string
+        default: ""
+      checkout-ref:
+        description: "Git ref to check out for build inputs (defaults to the workflow SHA)"
         required: false
         type: string
         default: ""
@@ -73,7 +78,7 @@ jobs:
               binary_component=gateway
               binary_name=openshell-gateway
               ;;
-            supervisor|cluster)
+            supervisor)
               binary_component=sandbox
               binary_name=openshell-sandbox
               ;;
@@ -150,6 +155,8 @@ jobs:
       component: ${{ needs.resolve.outputs.binary_component }}
       arch: ${{ matrix.arch }}
       cargo-version: ${{ inputs['cargo-version'] }}
+      image-tag: ${{ needs.resolve.outputs.image_tag_base }}
+      checkout-ref: ${{ inputs['checkout-ref'] }}
       features: openshell-core/dev-settings
       artifact-name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
     secrets: inherit
@@ -181,6 +188,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
           fetch-depth: 0
 
       - name: Mark workspace safe for git
@@ -231,7 +239,6 @@ jobs:
             --cache-to "type=gha,mode=max,scope=${{ inputs.component }}-${{ matrix.arch }}"
 
       - name: Smoke check ${{ inputs.component }} image
-        if: ${{ !inputs.push }}
         run: |
           set -euo pipefail
           image="${IMAGE_REGISTRY}/${{ inputs.component }}:${IMAGE_TAG}"
@@ -242,12 +249,7 @@ jobs:
               grep -q '^openshell-gateway ' <<<"$output"
               ;;
             supervisor)
-              output="$(docker run --rm --platform "${{ matrix.platform }}" "$image" --version)"
-              echo "$output"
-              grep -q '^openshell-sandbox ' <<<"$output"
-              ;;
-            cluster)
-              output="$(docker run --rm --platform "${{ matrix.platform }}" --entrypoint /opt/openshell/bin/openshell-sandbox "$image" --version)"
+              output="$(docker run --rm --platform "${{ matrix.platform }}" --entrypoint /openshell-sandbox "$image" --version)"
               echo "$output"
               grep -q '^openshell-sandbox ' <<<"$output"
               ;;

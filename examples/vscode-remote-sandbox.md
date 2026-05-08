@@ -6,7 +6,7 @@ extension so you get a full IDE experience inside the sandbox environment.
 
 ## Prerequisites
 
-- A running openshell gateway (`openshell gateway start`)
+- A running OpenShell gateway (`mise run gateway:docker` for local development)
 - [VSCode](https://code.visualstudio.com/) with the
   [Remote - SSH](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh)
   extension installed

@@ -5,7 +5,7 @@
 
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
-use crate::persistence::{ObjectType, Store, generate_name};
+use crate::persistence::{ObjectName, ObjectType, Store, generate_name};
 use openshell_core::proto::Provider;
 use prost::Message;
 use tonic::Status;
@@ -326,8 +326,17 @@ impl ObjectType for Provider {
 
 use crate::ServerState;
 use openshell_core::proto::{
-    CreateProviderRequest, DeleteProviderRequest, DeleteProviderResponse, GetProviderRequest,
-    ListProvidersRequest, ListProvidersResponse, ProviderResponse, UpdateProviderRequest,
+    CreateProviderRequest, DeleteProviderProfileRequest, DeleteProviderProfileResponse,
+    DeleteProviderRequest, DeleteProviderResponse, GetProviderProfileRequest, GetProviderRequest,
+    ImportProviderProfilesRequest, ImportProviderProfilesResponse, LintProviderProfilesRequest,
+    LintProviderProfilesResponse, ListProviderProfilesRequest, ListProviderProfilesResponse,
+    ListProvidersRequest, ListProvidersResponse, ProviderProfile, ProviderProfileDiagnostic,
+    ProviderProfileImportItem, ProviderProfileResponse, ProviderResponse, Sandbox,
+    StoredProviderProfile, UpdateProviderRequest,
+};
+use openshell_providers::{
+    ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles, get_default_profile,
+    normalize_profile_id, normalize_provider_type, validate_profile_set,
 };
 use std::sync::Arc;
 use tonic::{Request, Response};
@@ -370,6 +379,356 @@ pub(super) async fn handle_list_providers(
     Ok(Response::new(ListProvidersResponse { providers }))
 }
 
+impl ObjectType for StoredProviderProfile {
+    fn object_type() -> &'static str {
+        "provider_profile"
+    }
+}
+
+pub(super) async fn handle_list_provider_profiles(
+    state: &Arc<ServerState>,
+    request: Request<ListProviderProfilesRequest>,
+) -> Result<Response<ListProviderProfilesResponse>, Status> {
+    let request = request.into_inner();
+    let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE) as usize;
+    let offset = request.offset as usize;
+    let mut profiles = merged_provider_profiles(state.store.as_ref()).await?;
+    profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    let profiles = profiles
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|profile| profile.to_proto())
+        .collect();
+
+    Ok(Response::new(ListProviderProfilesResponse { profiles }))
+}
+
+pub(super) async fn handle_get_provider_profile(
+    state: &Arc<ServerState>,
+    request: Request<GetProviderProfileRequest>,
+) -> Result<Response<ProviderProfileResponse>, Status> {
+    let id = request.into_inner().id;
+    let id = normalize_profile_id_request(&id)?;
+    let profile = get_provider_type_profile(state.store.as_ref(), &id)
+        .await?
+        .ok_or_else(|| Status::not_found("provider profile not found"))?
+        .to_proto();
+
+    Ok(Response::new(ProviderProfileResponse {
+        profile: Some(profile),
+    }))
+}
+
+pub(super) async fn handle_import_provider_profiles(
+    state: &Arc<ServerState>,
+    request: Request<ImportProviderProfilesRequest>,
+) -> Result<Response<ImportProviderProfilesResponse>, Status> {
+    let request = request.into_inner();
+    let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
+    add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
+    diagnostics.extend(profile_conflict_diagnostics(state.store.as_ref(), &profiles).await?);
+    diagnostics.extend(validate_profile_set(&profiles));
+
+    if has_errors(&diagnostics) {
+        return Ok(Response::new(ImportProviderProfilesResponse {
+            diagnostics: diagnostics.into_iter().map(proto_diagnostic).collect(),
+            profiles: Vec::new(),
+            imported: false,
+        }));
+    }
+
+    let mut imported = Vec::with_capacity(profiles.len());
+    for (_, profile) in profiles {
+        let stored = stored_provider_profile(profile.to_proto());
+        state
+            .store
+            .put_message(&stored)
+            .await
+            .map_err(|e| Status::internal(format!("persist provider profile failed: {e}")))?;
+        imported.push(stored.profile.unwrap_or_default());
+    }
+
+    Ok(Response::new(ImportProviderProfilesResponse {
+        diagnostics: Vec::new(),
+        profiles: imported,
+        imported: true,
+    }))
+}
+
+pub(super) async fn handle_lint_provider_profiles(
+    state: &Arc<ServerState>,
+    request: Request<LintProviderProfilesRequest>,
+) -> Result<Response<LintProviderProfilesResponse>, Status> {
+    let request = request.into_inner();
+    let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
+    add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
+    diagnostics.extend(profile_conflict_diagnostics(state.store.as_ref(), &profiles).await?);
+    diagnostics.extend(validate_profile_set(&profiles));
+    let valid = !has_errors(&diagnostics);
+
+    Ok(Response::new(LintProviderProfilesResponse {
+        diagnostics: diagnostics.into_iter().map(proto_diagnostic).collect(),
+        valid,
+    }))
+}
+
+pub(super) async fn handle_delete_provider_profile(
+    state: &Arc<ServerState>,
+    request: Request<DeleteProviderProfileRequest>,
+) -> Result<Response<DeleteProviderProfileResponse>, Status> {
+    let id = request.into_inner().id;
+    let id = normalize_profile_id_request(&id)?;
+    if get_default_profile(&id).is_some() {
+        return Err(Status::failed_precondition(
+            "built-in provider profiles cannot be deleted",
+        ));
+    }
+
+    let existing = state
+        .store
+        .get_message_by_name::<StoredProviderProfile>(&id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?;
+    if existing.is_none() {
+        return Err(Status::not_found("provider profile not found"));
+    }
+
+    let blocking_sandboxes = sandboxes_using_profile(state.store.as_ref(), &id).await?;
+    if !blocking_sandboxes.is_empty() {
+        return Err(Status::failed_precondition(format!(
+            "provider profile '{id}' is in use by sandboxes: {}",
+            blocking_sandboxes.join(", ")
+        )));
+    }
+
+    let deleted = state
+        .store
+        .delete_by_name(StoredProviderProfile::object_type(), &id)
+        .await
+        .map_err(|e| Status::internal(format!("delete provider profile failed: {e}")))?;
+
+    Ok(Response::new(DeleteProviderProfileResponse { deleted }))
+}
+
+pub(super) async fn get_provider_type_profile(
+    store: &Store,
+    id: &str,
+) -> Result<Option<ProviderTypeProfile>, Status> {
+    let Some(id) = normalize_profile_id(id) else {
+        return Ok(None);
+    };
+    if let Some(profile) = get_default_profile(&id) {
+        return Ok(Some(profile.clone()));
+    }
+    let profile = store
+        .get_message_by_name::<StoredProviderProfile>(&id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
+        .and_then(|stored| stored.profile)
+        .map(|profile| ProviderTypeProfile::from_proto(&profile));
+    Ok(profile)
+}
+
+async fn merged_provider_profiles(store: &Store) -> Result<Vec<ProviderTypeProfile>, Status> {
+    let mut profiles = default_profiles().to_vec();
+    profiles.extend(
+        custom_provider_profiles(store)
+            .await?
+            .into_iter()
+            .filter_map(|stored| stored.profile)
+            .map(|profile| ProviderTypeProfile::from_proto(&profile)),
+    );
+    Ok(profiles)
+}
+
+async fn custom_provider_profiles(store: &Store) -> Result<Vec<StoredProviderProfile>, Status> {
+    let records = store
+        .list(StoredProviderProfile::object_type(), 10_000, 0)
+        .await
+        .map_err(|e| Status::internal(format!("list provider profiles failed: {e}")))?;
+
+    let mut profiles = Vec::with_capacity(records.len());
+    for record in records {
+        let profile = StoredProviderProfile::decode(record.payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode provider profile failed: {e}")))?;
+        profiles.push(profile);
+    }
+    Ok(profiles)
+}
+
+fn normalize_profile_id_request(id: &str) -> Result<String, Status> {
+    if id.trim().is_empty() {
+        return Err(Status::invalid_argument("id is required"));
+    }
+    normalize_profile_id(id).ok_or_else(|| {
+        Status::invalid_argument("id must be lowercase kebab-case using only a-z, 0-9, and '-'")
+    })
+}
+
+fn profiles_from_import_items(
+    items: &[ProviderProfileImportItem],
+) -> (
+    Vec<(String, ProviderTypeProfile)>,
+    Vec<ProfileValidationDiagnostic>,
+) {
+    let mut profiles = Vec::new();
+    let mut diagnostics = Vec::new();
+    for item in items {
+        let source = item.source.clone();
+        let Some(profile) = item.profile.as_ref() else {
+            diagnostics.push(ProfileValidationDiagnostic {
+                source,
+                profile_id: String::new(),
+                field: "profile".to_string(),
+                message: "provider profile is required".to_string(),
+                severity: "error".to_string(),
+            });
+            continue;
+        };
+        profiles.push((source, ProviderTypeProfile::from_proto(profile)));
+    }
+    (profiles, diagnostics)
+}
+
+fn add_empty_profile_set_diagnostic(
+    profiles: &[(String, ProviderTypeProfile)],
+    diagnostics: &mut Vec<ProfileValidationDiagnostic>,
+) {
+    if profiles.is_empty() && diagnostics.is_empty() {
+        diagnostics.push(ProfileValidationDiagnostic {
+            source: String::new(),
+            profile_id: String::new(),
+            field: "profiles".to_string(),
+            message: "at least one provider profile is required".to_string(),
+            severity: "error".to_string(),
+        });
+    }
+}
+
+async fn profile_conflict_diagnostics(
+    store: &Store,
+    profiles: &[(String, ProviderTypeProfile)],
+) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
+    let mut diagnostics = Vec::new();
+    for (source, profile) in profiles {
+        let Some(id) = normalize_profile_id(&profile.id) else {
+            continue;
+        };
+        if get_default_profile(&id).is_some() {
+            diagnostics.push(ProfileValidationDiagnostic {
+                source: source.clone(),
+                profile_id: id.clone(),
+                field: "id".to_string(),
+                message: format!("provider profile '{id}' is built-in and cannot be overwritten"),
+                severity: "error".to_string(),
+            });
+            continue;
+        }
+        if let Some(provider_type) = normalize_provider_type(&id) {
+            diagnostics.push(ProfileValidationDiagnostic {
+                source: source.clone(),
+                profile_id: id.clone(),
+                field: "id".to_string(),
+                message: format!(
+                    "provider profile id '{id}' is reserved for legacy provider type '{provider_type}'"
+                ),
+                severity: "error".to_string(),
+            });
+            continue;
+        }
+        if store
+            .get_message_by_name::<StoredProviderProfile>(&id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
+            .is_some()
+        {
+            diagnostics.push(ProfileValidationDiagnostic {
+                source: source.clone(),
+                profile_id: id.clone(),
+                field: "id".to_string(),
+                message: format!("custom provider profile '{id}' already exists"),
+                severity: "error".to_string(),
+            });
+        }
+    }
+    Ok(diagnostics)
+}
+
+fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
+    use crate::persistence::current_time_ms;
+    let now_ms = current_time_ms().unwrap_or_default();
+    StoredProviderProfile {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: profile.id.clone(),
+            created_at_ms: now_ms,
+            labels: std::collections::HashMap::new(),
+        }),
+        profile: Some(profile),
+    }
+}
+
+fn proto_diagnostic(diagnostic: ProfileValidationDiagnostic) -> ProviderProfileDiagnostic {
+    ProviderProfileDiagnostic {
+        source: diagnostic.source,
+        profile_id: diagnostic.profile_id,
+        field: diagnostic.field,
+        message: diagnostic.message,
+        severity: diagnostic.severity,
+    }
+}
+
+fn has_errors(diagnostics: &[ProfileValidationDiagnostic]) -> bool {
+    diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == "error")
+}
+
+async fn sandboxes_using_profile(store: &Store, profile_id: &str) -> Result<Vec<String>, Status> {
+    let mut blocking = Vec::new();
+    let mut offset = 0;
+    loop {
+        let records = store
+            .list(Sandbox::object_type(), 1000, offset)
+            .await
+            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+        if records.is_empty() {
+            break;
+        }
+        offset = offset
+            .checked_add(
+                u32::try_from(records.len())
+                    .map_err(|_| Status::internal("sandbox page size exceeded u32"))?,
+            )
+            .ok_or_else(|| Status::internal("sandbox pagination offset overflow"))?;
+
+        for record in records {
+            let sandbox = Sandbox::decode(record.payload.as_slice())
+                .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
+            let Some(spec) = sandbox.spec.as_ref() else {
+                continue;
+            };
+            for provider_name in &spec.providers {
+                let Some(provider) = store
+                    .get_message_by_name::<Provider>(provider_name)
+                    .await
+                    .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+                else {
+                    continue;
+                };
+                if normalize_profile_id(&provider.r#type).as_deref() == Some(profile_id) {
+                    blocking.push(sandbox.object_name().to_string());
+                    break;
+                }
+            }
+        }
+    }
+    blocking.sort();
+    blocking.dedup();
+    Ok(blocking)
+}
+
 pub(super) async fn handle_update_provider(
     state: &Arc<ServerState>,
     request: Request<UpdateProviderRequest>,
@@ -402,10 +761,24 @@ pub(super) async fn handle_delete_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ServerState;
+    use crate::compute::new_test_runtime;
     use crate::grpc::MAX_MAP_KEY_LEN;
+    use crate::sandbox_index::SandboxIndex;
+    use crate::sandbox_watch::SandboxWatchBus;
+    use crate::supervisor_session::SupervisorSessionRegistry;
+    use crate::tracing_bus::TracingLogBus;
+    use openshell_core::Config;
+    use openshell_core::proto::{
+        DeleteProviderProfileRequest, GetProviderProfileRequest, ImportProviderProfilesRequest,
+        L7Allow, L7Rule, LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkBinary,
+        NetworkEndpoint, ProviderProfile, ProviderProfileCategory, ProviderProfileImportItem,
+        Sandbox, SandboxSpec,
+    };
     use openshell_core::{ObjectId, ObjectName};
     use std::collections::HashMap;
-    use tonic::Code;
+    use std::sync::Arc;
+    use tonic::{Code, Request};
 
     #[test]
     fn env_key_validation_accepts_valid_keys() {
@@ -447,6 +820,560 @@ mod tests {
             .collect(),
             passthrough_credentials: Vec::new(),
         }
+    }
+
+    fn custom_profile(id: &str) -> ProviderProfile {
+        ProviderProfile {
+            id: id.to_string(),
+            display_name: format!("{id} Profile"),
+            description: String::new(),
+            category: ProviderProfileCategory::Other as i32,
+            credentials: Vec::new(),
+            endpoints: Vec::new(),
+            binaries: Vec::new(),
+            inference_capable: false,
+        }
+    }
+
+    fn custom_profile_with_invalid_endpoint(id: &str) -> ProviderProfile {
+        let mut profile = custom_profile(id);
+        profile.endpoints.push(NetworkEndpoint {
+            host: String::new(),
+            port: 0,
+            ..Default::default()
+        });
+        profile
+    }
+
+    async fn test_server_state() -> Arc<ServerState> {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        let compute = new_test_runtime(store.clone()).await;
+        Arc::new(ServerState::new(
+            Config::new(None)
+                .with_database_url("sqlite::memory:?cache=shared")
+                .with_ssh_handshake_secret("test-secret"),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        ))
+    }
+
+    #[tokio::test]
+    async fn list_provider_profiles_returns_built_in_profile_categories() {
+        let state = test_server_state().await;
+        let response = handle_list_provider_profiles(
+            &state,
+            Request::new(ListProviderProfilesRequest {
+                limit: 100,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let github = response
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "github")
+            .expect("github profile should be listed");
+        assert_eq!(
+            github.category,
+            ProviderProfileCategory::SourceControl as i32
+        );
+        assert!(
+            response
+                .profiles
+                .iter()
+                .all(|profile| profile.id != "generic"),
+            "generic remains a legacy provider type without a v2 profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_provider_profile_returns_profile_or_not_found() {
+        let state = test_server_state().await;
+        let github = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: "github".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profile
+        .expect("github profile should be returned");
+        assert_eq!(github.id, "github");
+        assert_eq!(
+            github.category,
+            ProviderProfileCategory::SourceControl as i32
+        );
+
+        let generic_err = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: "generic".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(generic_err.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_lists_and_gets_custom_profile() {
+        let state = test_server_state().await;
+        let response = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("custom-api")),
+                    source: "custom-api.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(response.imported);
+        assert!(response.diagnostics.is_empty());
+
+        let listed = handle_list_provider_profiles(
+            &state,
+            Request::new(ListProviderProfilesRequest {
+                limit: 100,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(
+            listed
+                .profiles
+                .iter()
+                .any(|profile| profile.id == "custom-api")
+        );
+
+        let fetched = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: "custom-api".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profile
+        .unwrap();
+        assert_eq!(fetched.id, "custom-api");
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_rejects_builtin_overwrite() {
+        let state = test_server_state().await;
+        let response = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("github")),
+                    source: "github.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.imported);
+        assert!(
+            response
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("built-in"))
+        );
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_rejects_legacy_provider_type_ids() {
+        let state = test_server_state().await;
+        let response = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("generic")),
+                    source: "generic.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.imported);
+        assert!(
+            response
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("reserved"))
+        );
+
+        let missing = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: "generic".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_rejects_noncanonical_ids() {
+        let state = test_server_state().await;
+        let response = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile(" alex-api ")),
+                        source: "space.yaml".to_string(),
+                    },
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile("alex_api")),
+                        source: "underscore.yaml".to_string(),
+                    },
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile("Alex-API")),
+                        source: "case.yaml".to_string(),
+                    },
+                ],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.imported);
+        assert_eq!(
+            response
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("lowercase kebab-case"))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_profile_get_and_delete_normalize_request_ids() {
+        let state = test_server_state().await;
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("alex-api")),
+                    source: "alex-api.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let fetched = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: " Alex-API ".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profile
+        .unwrap();
+        assert_eq!(fetched.id, "alex-api");
+
+        let deleted = handle_delete_provider_profile(
+            &state,
+            Request::new(DeleteProviderProfileRequest {
+                id: " Alex-API ".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(deleted.deleted);
+    }
+
+    #[tokio::test]
+    async fn import_provider_profiles_rejects_mixed_batch_without_partial_import() {
+        let state = test_server_state().await;
+        let response = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile("bulk-one")),
+                        source: "bulk-one.yaml".to_string(),
+                    },
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile_with_invalid_endpoint("bulk-bad")),
+                        source: "bulk-bad.yaml".to_string(),
+                    },
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile("bulk-two")),
+                        source: "bulk-two.yaml".to_string(),
+                    },
+                ],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.imported);
+        assert!(response.profiles.is_empty());
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.profile_id == "bulk-bad"
+                && diagnostic.field == "endpoints[0]"
+                && diagnostic.message.contains("invalid endpoint")
+        }));
+
+        for id in ["bulk-one", "bulk-two"] {
+            let missing = handle_get_provider_profile(
+                &state,
+                Request::new(GetProviderProfileRequest { id: id.to_string() }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(missing.code(), Code::NotFound);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn import_provider_profiles_preserves_advanced_proto_policy_fields() {
+        let state = test_server_state().await;
+        let response = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(ProviderProfile {
+                        id: "advanced-api".to_string(),
+                        display_name: "Advanced API".to_string(),
+                        description: String::new(),
+                        category: ProviderProfileCategory::Other as i32,
+                        credentials: Vec::new(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "api.advanced.example".to_string(),
+                            protocol: "rest".to_string(),
+                            ports: vec![443, 8443],
+                            allowed_ips: vec!["10.0.0.0/24".to_string()],
+                            rules: vec![L7Rule {
+                                allow: Some(L7Allow {
+                                    method: "GET".to_string(),
+                                    path: "/v1/**".to_string(),
+                                    ..Default::default()
+                                }),
+                            }],
+                            allow_encoded_slash: true,
+                            path: "/v1".to_string(),
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/advanced".to_string(),
+                            harness: true,
+                        }],
+                        inference_capable: false,
+                    }),
+                    source: "advanced-api.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(response.imported);
+
+        let fetched = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: "advanced-api".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profile
+        .expect("profile should exist");
+        let endpoint = fetched.endpoints.first().expect("endpoint should exist");
+        assert_eq!(endpoint.ports, vec![443, 8443]);
+        assert_eq!(endpoint.allowed_ips, vec!["10.0.0.0/24"]);
+        assert_eq!(endpoint.rules.len(), 1);
+        assert_eq!(
+            endpoint.rules[0]
+                .allow
+                .as_ref()
+                .map(|allow| allow.path.as_str()),
+            Some("/v1/**")
+        );
+        assert!(endpoint.allow_encoded_slash);
+        assert_eq!(endpoint.path, "/v1");
+        assert!(fetched.binaries[0].harness);
+    }
+
+    #[tokio::test]
+    async fn lint_provider_profiles_reports_mixed_batch_diagnostics() {
+        let state = test_server_state().await;
+        let response = handle_lint_provider_profiles(
+            &state,
+            Request::new(LintProviderProfilesRequest {
+                profiles: vec![
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile("lint-one")),
+                        source: "lint-one.yaml".to_string(),
+                    },
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile_with_invalid_endpoint("lint-bad")),
+                        source: "lint-bad.yaml".to_string(),
+                    },
+                    ProviderProfileImportItem {
+                        profile: Some(custom_profile("lint-two")),
+                        source: "lint-two.yaml".to_string(),
+                    },
+                ],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.valid);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.profile_id == "lint-bad"
+                && diagnostic.field == "endpoints[0]"
+                && diagnostic.message.contains("invalid endpoint")
+        }));
+
+        for id in ["lint-one", "lint-two"] {
+            let missing = handle_get_provider_profile(
+                &state,
+                Request::new(GetProviderProfileRequest { id: id.to_string() }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(missing.code(), Code::NotFound);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_provider_profile_rejects_builtin_and_in_use_custom_profiles() {
+        let state = test_server_state().await;
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("custom-api")),
+                    source: "custom-api.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let builtin_err = handle_delete_provider_profile(
+            &state,
+            Request::new(DeleteProviderProfileRequest {
+                id: "github".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(builtin_err.code(), Code::FailedPrecondition);
+
+        create_provider_record(
+            state.store.as_ref(),
+            provider_with_values("custom-provider", "custom-api"),
+        )
+        .await
+        .unwrap();
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-id".to_string(),
+                    name: "sandbox-using-custom".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["custom-provider".to_string()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let in_use_err = handle_delete_provider_profile(
+            &state,
+            Request::new(DeleteProviderProfileRequest {
+                id: "custom-api".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(in_use_err.code(), Code::FailedPrecondition);
+        assert!(in_use_err.message().contains("sandbox-using-custom"));
+    }
+
+    #[tokio::test]
+    async fn delete_provider_profile_removes_unused_custom_profile() {
+        let state = test_server_state().await;
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("custom-api")),
+                    source: "custom-api.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let deleted = handle_delete_provider_profile(
+            &state,
+            Request::new(DeleteProviderProfileRequest {
+                id: "custom-api".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(deleted.deleted);
+
+        let missing = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: "custom-api".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code(), Code::NotFound);
     }
 
     #[tokio::test]

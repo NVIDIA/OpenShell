@@ -67,7 +67,7 @@ SSRF override allows the connection.
 
 ### Prerequisites
 
-- A running OpenShell gateway (`openshell gateway start` or a remote gateway)
+- A running OpenShell gateway (`mise run gateway:docker` or a remote gateway)
 - The `openshell` CLI installed
 - Two terminal windows
 

@@ -19,7 +19,7 @@ The OpenShell TUI is a ratatui-based terminal UI for the OpenShell platform. It 
   - `tonic` with TLS — gRPC client for the OpenShell gateway
   - `tokio` — async runtime for event loop, spawned tasks, and mpsc channels
   - `openshell-core` — proto-generated types (`OpenShellClient`, request/response structs)
-  - `openshell-bootstrap` — cluster discovery (`list_clusters()`)
+  - `openshell-bootstrap` — gateway discovery (`list_gateways()`)
 - **Theme:** Adaptive dark/light via `Theme` struct — NVIDIA-branded green accents. Controlled by `--theme` flag, `OPENSHELL_THEME` env var, or auto-detection.
 
 ## 2. Domain Object Hierarchy
@@ -33,7 +33,7 @@ Gateway (discovered via openshell_bootstrap::list_gateways())
 ```
 
 - **Gateways** are discovered from on-disk config via `openshell_bootstrap::list_gateways()`. Each gateway has a name, endpoint, and local/remote flag.
-- **Sandboxes** belong to the active cluster. Fetched via `ListSandboxes` gRPC call with a periodic tick refresh. Each sandbox has: `id`, `name`, `phase`, `created_at_ms`, and `spec.template.image`.
+- **Sandboxes** belong to the active gateway. Fetched via `ListSandboxes` gRPC call with a periodic tick refresh. Each sandbox has: `id`, `name`, `phase`, `created_at_ms`, and `spec.template.image`.
 - **Logs** belong to a single sandbox. Initial batch fetched via `GetSandboxLogs` (500 lines), then live-tailed via `WatchSandbox` with `follow_logs: true`.
 
 The **title bar** always reflects this hierarchy, reading left-to-right from general to specific:
@@ -90,7 +90,7 @@ Every frame renders four vertical regions:
 
 ```
 ┌─────────────────────────────────────────────┐
-│ Title bar (1 row) — brand + cluster + context│
+│ Title bar (1 row) — brand + gateway + context│
 ├─────────────────────────────────────────────┤
 │                                             │
 │ Main content (flexible)                     │
@@ -270,7 +270,7 @@ TUI actions should parallel `openshell` CLI commands so users have familiar ment
 | `openshell sandbox list` | Sandbox table on Dashboard |
 | `openshell sandbox delete <name>` | `[d]` on sandbox detail, then `[y]` to confirm |
 | `openshell logs <name>` | `[l]` on sandbox detail to open log viewer |
-| `openshell status` | Status in title bar + cluster list |
+| `openshell status` | Status in title bar + gateway list |
 
 When adding new TUI features, check what the CLI offers and maintain consistency.
 
@@ -364,7 +364,7 @@ lib.rs (event loop, gRPC, async tasks)
   ├── theme.rs (colors + styles)
   └── ui/
         ├── mod.rs (draw dispatcher, chrome)
-        ├── dashboard.rs (cluster list + sandbox table layout)
+        ├── dashboard.rs (gateway list + sandbox table layout)
         ├── sandboxes.rs (sandbox table widget)
         ├── sandbox_detail.rs (detail view)
         └── sandbox_logs.rs (log viewer)
@@ -415,7 +415,7 @@ All gRPC calls use a 5-second timeout:
 tokio::time::timeout(Duration::from_secs(5), client.health(req)).await
 ```
 
-The connect timeout for cluster switching is 10 seconds with HTTP/2 keepalive at 10-second intervals.
+The connect timeout for gateway switching is 10 seconds with HTTP/2 keepalive at 10-second intervals.
 
 ### Log streaming lifecycle
 
@@ -443,7 +443,7 @@ The connect timeout for cluster switching is 10 seconds with HTTP/2 keepalive at
 # Build the crate
 cargo build -p openshell-tui
 
-# Run the TUI against the active cluster
+# Run the TUI against the active gateway
 mise run term
 
 # Run with cargo-watch for hot-reload during development
@@ -466,13 +466,21 @@ mise run pre-commit
 
 ### Gateway changes
 
-If you change sandbox or server code that affects the backend, redeploy the gateway:
+If you change sandbox or server code that affects the backend, restart or redeploy the gateway for the compute platform you are using.
+
+For Docker-backed local development:
 
 ```bash
-mise run cluster:deploy all
+mise run gateway:docker
 ```
 
-To pick up new sandbox images after changing sandbox code, delete the pod manually so it gets recreated:
+For Kubernetes Helm deployments:
+
+```bash
+helm upgrade --install openshell deploy/helm/openshell --namespace openshell
+```
+
+For Kubernetes, pick up new sandbox images after changing sandbox code by deleting the pod manually so it gets recreated:
 
 ```bash
 kubectl delete pod <pod-name> -n <namespace>

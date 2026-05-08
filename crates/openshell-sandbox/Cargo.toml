@@ -63,8 +63,11 @@ base64 = { workspace = true }
 ipnet = "2"
 
 # Serialization
+serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
+apollo-parser = { workspace = true }
+glob = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

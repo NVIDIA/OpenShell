@@ -31,6 +31,7 @@ spec:
     server:
       sandboxImage: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
       sandboxImagePullPolicy: __SANDBOX_IMAGE_PULL_POLICY__
+      supervisorImage: ghcr.io/nvidia/openshell/supervisor:latest
       dbUrl: __DB_URL__
       sshGatewayHost: __SSH_GATEWAY_HOST__
       sshGatewayPort: __SSH_GATEWAY_PORT__

@@ -10,6 +10,7 @@
 use miette::{IntoDiagnostic, Result};
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
+use std::path::Path;
 use std::process::Command;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -18,6 +19,13 @@ use uuid::Uuid;
 const SUBNET_PREFIX: &str = "10.200.0";
 const HOST_IP_SUFFIX: u8 = 1;
 const SANDBOX_IP_SUFFIX: u8 = 2;
+const IP_SEARCH_PATHS: &[&str] = &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"];
+const NSENTER_SEARCH_PATHS: &[&str] = &[
+    "/usr/bin/nsenter",
+    "/bin/nsenter",
+    "/usr/sbin/nsenter",
+    "/sbin/nsenter",
+];
 
 /// Handle to a network namespace with veth pair.
 ///
@@ -661,14 +669,19 @@ impl Drop for NetworkNamespace {
 
 /// Run an `ip` command on the host.
 fn run_ip(args: &[&str]) -> Result<()> {
-    debug!(command = %format!("ip {}", args.join(" ")), "Running ip command");
+    let ip_path = find_trusted_binary("ip", IP_SEARCH_PATHS)?;
 
-    let output = Command::new("ip").args(args).output().into_diagnostic()?;
+    debug!(command = %format!("{ip_path} {}", args.join(" ")), "Running ip command");
+
+    let output = Command::new(ip_path)
+        .args(args)
+        .output()
+        .into_diagnostic()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(miette::miette!(
-            "ip {} failed: {}",
+            "{ip_path} {} failed: {}",
             args.join(" "),
             stderr.trim()
         ));
@@ -688,15 +701,20 @@ fn run_ip(args: &[&str]) -> Result<()> {
 /// The supervisor's operations (addr add, link set, route add) are all
 /// netlink-based and do not need sysfs access.
 fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
+    let ip_path = find_trusted_binary("ip", IP_SEARCH_PATHS)?;
+    let nsenter_path = find_trusted_binary("nsenter", NSENTER_SEARCH_PATHS)?;
     let ns_path = format!("/var/run/netns/{netns}");
     let net_flag = format!("--net={ns_path}");
 
-    let mut full_args = vec![net_flag.as_str(), "--", "ip"];
+    let mut full_args = vec![net_flag.as_str(), "--", ip_path];
     full_args.extend(args);
 
-    debug!(command = %format!("nsenter {}", full_args.join(" ")), "Running ip in namespace via nsenter");
+    debug!(
+        command = %format!("{nsenter_path} {}", full_args.join(" ")),
+        "Running ip in namespace via nsenter"
+    );
 
-    let output = Command::new("nsenter")
+    let output = Command::new(nsenter_path)
         .args(&full_args)
         .output()
         .into_diagnostic()?;
@@ -704,7 +722,7 @@ fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(miette::miette!(
-            "nsenter --net={} ip {} failed: {}",
+            "{nsenter_path} --net={} {ip_path} {} failed: {}",
             ns_path,
             args.join(" "),
             stderr.trim()
@@ -719,6 +737,7 @@ fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
 /// Uses `nsenter` instead of `ip netns exec` to avoid the sysfs remount
 /// that fails in rootless container runtimes. See `run_ip_netns` for details.
 fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<()> {
+    let nsenter_path = find_trusted_binary("nsenter", NSENTER_SEARCH_PATHS)?;
     let ns_path = format!("/var/run/netns/{netns}");
     let net_flag = format!("--net={ns_path}");
 
@@ -726,11 +745,11 @@ fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<
     full_args.extend(args);
 
     debug!(
-        command = %format!("nsenter {}", full_args.join(" ")),
+        command = %format!("{nsenter_path} {}", full_args.join(" ")),
         "Running iptables in namespace via nsenter"
     );
 
-    let output = Command::new("nsenter")
+    let output = Command::new(nsenter_path)
         .args(&full_args)
         .output()
         .into_diagnostic()?;
@@ -738,7 +757,7 @@ fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(miette::miette!(
-            "nsenter --net={} {} failed: {}",
+            "{nsenter_path} --net={} {} failed: {}",
             ns_path,
             iptables_cmd,
             stderr.trim()
@@ -753,6 +772,22 @@ fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<
 /// explicit paths rather than relying on `which`.
 const IPTABLES_SEARCH_PATHS: &[&str] =
     &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"];
+
+fn find_trusted_binary<'a>(name: &str, paths: &'a [&str]) -> Result<&'a str> {
+    paths
+        .iter()
+        .copied()
+        .find(|path| {
+            let path = Path::new(path);
+            path.is_absolute() && path.is_file()
+        })
+        .ok_or_else(|| {
+            miette::miette!(
+                "trusted {name} helper not found; checked {}",
+                paths.join(", ")
+            )
+        })
+}
 
 /// Returns true if xt extension modules (e.g. `xt_comment`) cannot be used
 /// via the given iptables binary.
@@ -823,12 +858,12 @@ fn xt_extensions_unavailable(iptables_path: &str) -> bool {
 fn find_iptables() -> Option<String> {
     let standard_path = IPTABLES_SEARCH_PATHS
         .iter()
-        .find(|path| std::path::Path::new(path).exists())
+        .find(|path| Path::new(path).exists())
         .copied()?;
 
     if xt_extensions_unavailable(standard_path) {
         let legacy_path = standard_path.replace("iptables", "iptables-legacy");
-        if std::path::Path::new(&legacy_path).exists() {
+        if Path::new(&legacy_path).exists() {
             debug!(
                 legacy = legacy_path,
                 "xt extensions unavailable; using iptables-legacy"
@@ -843,7 +878,7 @@ fn find_iptables() -> Option<String> {
 /// Find the ip6tables binary path, deriving it from the iptables location.
 fn find_ip6tables(iptables_path: &str) -> Option<String> {
     let ip6_path = iptables_path.replace("iptables", "ip6tables");
-    if std::path::Path::new(&ip6_path).exists() {
+    if Path::new(&ip6_path).exists() {
         Some(ip6_path)
     } else {
         None
@@ -853,9 +888,31 @@ fn find_ip6tables(iptables_path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     // These tests require root and network namespace support
     // Run with: sudo cargo test -- --ignored
+
+    #[test]
+    fn find_trusted_binary_uses_absolute_existing_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let helper = tempdir.path().join("ip");
+        fs::write(&helper, b"test helper").unwrap();
+        let helper = helper.to_str().unwrap();
+
+        assert_eq!(
+            find_trusted_binary("ip", &["relative-ip", "/missing/ip", helper]).unwrap(),
+            helper
+        );
+    }
+
+    #[test]
+    fn find_trusted_binary_rejects_missing_helpers() {
+        let err =
+            find_trusted_binary("nsenter", &["relative-nsenter", "/missing/nsenter"]).unwrap_err();
+
+        assert!(err.to_string().contains("trusted nsenter helper not found"));
+    }
 
     #[test]
     #[ignore = "requires root privileges"]
@@ -865,10 +922,7 @@ mod tests {
 
         // Verify namespace exists
         let ns_path = format!("/var/run/netns/{name}");
-        assert!(
-            std::path::Path::new(&ns_path).exists(),
-            "Namespace file should exist"
-        );
+        assert!(Path::new(&ns_path).exists(), "Namespace file should exist");
 
         // Verify IPs are set correctly
         assert_eq!(
@@ -885,7 +939,7 @@ mod tests {
 
         // Verify namespace is gone
         assert!(
-            !std::path::Path::new(&ns_path).exists(),
+            !Path::new(&ns_path).exists(),
             "Namespace should be cleaned up"
         );
     }

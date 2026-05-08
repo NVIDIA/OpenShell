@@ -1,6 +1,6 @@
 ---
 name: openshell-cli
-description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, provider configuration, policy iteration, BYOC workflows, and inference routing. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox connect, logs, provider create, policy set, policy get, image push, forward, port forward, BYOC, bring your own container, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway start, gateway select.
+description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, gateway registration, provider configuration, policy iteration, BYOC workflows, and inference routing. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox connect, logs, provider create, policy set, policy get, image push, forward, port forward, BYOC, bring your own container, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway add, gateway select.
 ---
 
 # OpenShell CLI
@@ -9,7 +9,7 @@ Guide agents through using the `openshell` CLI for sandbox and platform manageme
 
 ## Overview
 
-The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes, providers, policies, inference routes, and gateways. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
+The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes, providers, policies, inference routes, and gateway registrations. Gateway service lifecycle is handled outside the CLI by packages, systemd, Helm, or development tasks. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
 
 **Companion skill**: For creating or modifying sandbox policy YAML content (network rules, L7 inspection, access presets), use the `generate-sandbox-policy` skill. This skill covers the CLI *commands* for the policy lifecycle; `generate-sandbox-policy` covers policy *content authoring*.
 
@@ -26,8 +26,9 @@ This is your primary fallback. Use it freely -- the CLI's help output is authori
 ## Prerequisites
 
 - `openshell` is on the PATH (install via `cargo install --path crates/openshell-cli`)
-- Docker is running (required for gateway operations and BYOC)
-- For remote clusters: SSH access to the target host
+- A reachable OpenShell gateway backed by Docker, Podman, Kubernetes, or the experimental VM driver
+- Docker is running only when using BYOC local builds or Docker-backed development workflows
+- For Kubernetes deployments: `kubectl` and Helm access to the target cluster
 
 ## Command Reference
 
@@ -37,29 +38,23 @@ See [cli-reference.md](cli-reference.md) for the full command tree with all flag
 
 ## Workflow 1: Getting Started
 
-Use this workflow when no cluster exists yet and the user wants to get a sandbox running for the first time.
+Use this workflow when the user has a gateway endpoint and wants to get a sandbox running for the first time.
 
-### Step 1: Bootstrap a cluster
-
-```bash
-openshell gateway start
-```
-
-This provisions a local k3s cluster in Docker. The CLI will prompt interactively if a cluster already exists. The cluster is automatically set as the active gateway.
-
-For remote deployment:
+### Step 1: Register a gateway
 
 ```bash
-openshell gateway start --remote user@host --ssh-key ~/.ssh/id_rsa
+openshell gateway add http://127.0.0.1:8080 --local --name local
 ```
 
-### Step 2: Verify the cluster
+Use an `http://` endpoint only for trusted local port-forwarding or a protected private path. For a gateway behind an authenticated reverse proxy, register its HTTPS endpoint with `openshell gateway add https://gateway.example.com`.
+
+### Step 2: Verify the gateway
 
 ```bash
 openshell status
 ```
 
-Confirm the cluster is reachable and shows a version.
+Confirm the gateway is reachable and shows a version.
 
 ### Step 3: Create a sandbox
 
@@ -69,7 +64,7 @@ The simplest way to get a sandbox running:
 openshell sandbox create
 ```
 
-This creates a sandbox with defaults and drops you into an interactive shell. The CLI auto-bootstraps a cluster if none exists.
+This creates a sandbox with defaults and drops you into an interactive shell.
 
 **Shortcut for known tools**: When the trailing command is a recognized tool, the CLI auto-creates the required provider from local credentials:
 
@@ -325,7 +320,7 @@ openshell sandbox create --from ./Dockerfile --name my-app
 
 The `--from` flag accepts a Dockerfile path, a directory containing a Dockerfile, a full image reference (e.g. `myregistry.com/img:tag`), or a community sandbox name (e.g. `openclaw`).
 
-When given a Dockerfile or directory, the image is built locally via Docker and imported directly into the cluster's containerd runtime. No external registry needed.
+When given a Dockerfile or directory, the image is built locally via Docker and delivered through the selected compute driver. Docker and Podman-backed gateways can use local images directly. Kubernetes gateways usually need the image available to the cluster through a registry or driver-supported image push path.
 
 When `--from` is specified, the CLI:
 - Clears default `run_as_user`/`run_as_group` (custom images may not have the `sandbox` user)
@@ -471,8 +466,8 @@ openshell inference get
 ### How sandboxes use it
 
 - Agents send HTTPS requests to `inference.local`.
-- The sandbox intercepts those requests locally and routes them through the cluster inference config.
-- Sandbox policy is separate from cluster inference configuration.
+- The sandbox intercepts those requests locally and routes them through the gateway inference config.
+- Sandbox policy is separate from gateway inference configuration.
 
 ---
 
@@ -482,34 +477,28 @@ openshell inference get
 
 ```bash
 openshell gateway select            # See all gateways (no args shows list)
-openshell gateway select my-cluster # Switch active gateway
+openshell gateway select production # Switch active gateway
 openshell status                    # Verify connectivity
 ```
 
-### Lifecycle
+### Registration
 
 ```bash
-openshell gateway start                                 # Start local cluster
-openshell gateway stop                                  # Stop (preserves state)
-openshell gateway start                                 # Restart (reuses state)
-openshell gateway destroy                               # Destroy permanently
+openshell gateway add http://127.0.0.1:8080 --local --name local
+openshell gateway add https://gateway.example.com --name production
+openshell gateway remove local                         # Remove local registration
 ```
 
-### Remote clusters
+### Platform-specific deployment inspection
 
 ```bash
-# Deploy to remote host
-openshell gateway start --remote user@host --ssh-key ~/.ssh/id_rsa --name remote-cluster
-
-# View gateway container logs
-openshell doctor logs --name remote-cluster
-
-# Run kubectl inside the remote gateway container
-openshell doctor exec --name remote-cluster -- kubectl get pods -A
-
-# Get cluster info
-openshell gateway info --name remote-cluster
+# Inspect a Kubernetes Helm release and gateway pod
+helm -n openshell status openshell
+kubectl -n openshell get pods,svc
+kubectl -n openshell logs statefulset/openshell --tail=100
 ```
+
+For Docker, Podman, and VM-backed gateways, inspect the gateway process or container logs and the selected runtime directly.
 
 ---
 
@@ -539,8 +528,8 @@ $ openshell sandbox upload --help
 
 | Task | Command |
 |------|---------|
-| Deploy local cluster | `openshell gateway start` |
-| Check cluster health | `openshell status` |
+| Register local port-forwarded gateway | `openshell gateway add http://127.0.0.1:8080 --local --name local` |
+| Check gateway health | `openshell status` |
 | List/switch gateways | `openshell gateway select [name]` |
 | Create sandbox (interactive) | `openshell sandbox create` |
 | Create sandbox with tool | `openshell sandbox create -- claude` |
@@ -560,7 +549,7 @@ $ openshell sandbox upload --help
 | Configure gateway inference | `openshell inference set --provider P --model M` |
 | View gateway inference | `openshell inference get` |
 | Delete sandbox | `openshell sandbox delete <name>` |
-| Destroy cluster | `openshell gateway destroy` |
+| Remove gateway registration | `openshell gateway remove <name>` |
 | Self-teach any command | `openshell <group> <cmd> --help` |
 
 ## Companion Skills
@@ -568,6 +557,6 @@ $ openshell sandbox upload --help
 | Skill | When to use |
 |-------|------------|
 | `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration) |
-| `debug-openshell-cluster` | Diagnosing cluster startup or health failures |
+| `debug-openshell-cluster` | Diagnosing gateway deployment, runtime, or health failures |
 | `debug-inference` | Diagnosing `inference.local`, host-backed local inference, and provider base URL issues |
 | `tui-development` | Developing features for the OpenShell TUI (`openshell term`) |

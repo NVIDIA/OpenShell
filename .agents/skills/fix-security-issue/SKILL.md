@@ -157,24 +157,10 @@ If the review identified a specific exploit scenario, verify that it is no longe
 
 ## Step 7: Update Documentation
 
-Use the `arch-doc-writer` sub-agent to update any architecture documentation affected by the fix. Use the Task tool:
-
-```
-Task tool with subagent_type="arch-doc-writer"
-```
-
-In the prompt, provide:
-- Which files were changed and why
-- The security context (what vulnerability was fixed)
-- Which architecture docs in `architecture/` are likely affected
-
-The `arch-doc-writer` will determine which docs need updating and make the changes. Common cases include:
-- A new validation layer or middleware was added
-- An API contract changed (new required headers, changed error responses, etc.)
-- Access control or authentication flow was modified
-- Network or infrastructure security boundaries changed
-
-If the fix is purely internal (e.g., switching to parameterized queries with no external behavior change), documentation updates may not be needed -- let the `arch-doc-writer` make that determination.
+Review the documentation requirements in `AGENTS.md` and update any affected
+docs as part of the security fix. If the fix is purely internal, such as
+switching to parameterized queries with no external behavior change,
+documentation updates may not be needed.
 
 ## Step 8: Commit, Push, and Open PR
 
@@ -232,7 +218,7 @@ Closes #<issue-id>
 - **Integration/E2E:** <test file and what it covers, or "N/A" if not applicable>
 
 ### Documentation Updated
-- `<architecture/doc.md>`: <what was updated>
+- `<doc path>`: <what was updated, or "None needed">
 
 ### Verification
 <how the fix was verified -- tests passed, exploit scenario tested, etc.>
@@ -281,7 +267,7 @@ User says: "Fix security issue #42"
 4. Create branch `fix/security-42-input-sanitization`
 5. Implement the fix
 6. Add unit tests for the sanitization function and an integration test for the endpoint
-7. Run `arch-doc-writer` to update `architecture/sandbox.md` with the new input validation layer
+7. Update affected documentation per `AGENTS.md`, if needed
 8. Commit, push, and open PR with `Closes #42`
 9. Report the PR link and changes to the user
 
@@ -294,7 +280,7 @@ User says: "Fix any ready security issues"
 3. Fetch the review comment -- determination is "Legitimate concern"
 4. Implement parameterized queries
 5. Add `test_rejects_sql_injection_in_search_query` unit test and e2e test for the search endpoint
-6. `arch-doc-writer` updates API docs to note the query parameter validation
+6. Update affected documentation per `AGENTS.md`, if needed
 7. Commit, push, open PR with `Closes #78`, report to user
 
 ### Issue with non-actionable review

@@ -13,7 +13,7 @@ OpenShell enforces sandbox security across four layers: network, filesystem, pro
 This page documents every configurable control, its default, what it protects, and the risk of relaxing it.
 
 For the full policy YAML schema, refer to the [Policy Schema](/reference/policy-schema).
-For the architecture of each enforcement layer, refer to [Architecture](/about/architecture).
+For the architecture of each enforcement layer, refer to [How OpenShell Works](/about/how-it-works).
 
 <Note>
 If you use [NemoClaw](https://github.com/NVIDIA/NemoClaw) to run OpenClaw assistants, its [Security Best Practices](https://docs.nvidia.com/nemoclaw/latest/security/best-practices.html) guide covers additional entrypoint-level controls, policy presets, provider trust tiers, and posture profiles specific to the NemoClaw blueprint.
@@ -83,13 +83,13 @@ The `protocol` field on an endpoint controls whether the proxy inspects individu
 | Aspect | Detail |
 |---|---|
 | Default | Endpoints without a `protocol` field use L4-only enforcement: the proxy checks host, port, and binary, then relays the TCP stream without inspecting payloads. |
-| What you can change | Add `protocol: rest` to enable per-request HTTP inspection. Pair it with `rules` (fine-grained method and path control) or `access` presets (`full`, `read-only`, `read-write`). |
-| Risk if relaxed | L4-only endpoints allow the agent to send any data through the tunnel after the initial connection is permitted. The proxy cannot see HTTP methods, paths, or bodies. Adding `access: full` with `protocol: rest` enables inspection but permits all methods and paths, providing observability without restriction. |
-| Recommendation | Use `protocol: rest` with specific `rules` for APIs where you want method and path control. Use `access: read-only` for read-only endpoints. Omit `protocol` for non-HTTP protocols (WebSocket, gRPC streaming). |
+| What you can change | Add `protocol: rest` to enable per-request HTTP method/path inspection, or `protocol: graphql` to inspect GraphQL operation type, operation name, and root fields. Pair either protocol with `rules` or access presets (`full`, `read-only`, `read-write`). |
+| Risk if relaxed | L4-only endpoints allow the agent to send any data through the tunnel after the initial connection is permitted. The proxy cannot see HTTP methods, paths, or GraphQL operations. Adding `access: full` with L7 inspection enables observability but permits all inspected actions. |
+| Recommendation | Use `protocol: rest` with specific `rules` for APIs where intent is encoded in method and path. Use `protocol: graphql` for GraphQL APIs where destructive operations are body-encoded. Prefer `access: read-only` or explicit allowlists, and deny hash-only persisted queries unless you maintain a trusted registry. Omit `protocol` for non-HTTP protocols (WebSocket, gRPC streaming). |
 
 ### Enforcement Mode (`audit` vs `enforce`)
 
-When `protocol: rest` is active, the `enforcement` field controls whether the proxy blocks or logs rule violations.
+When L7 inspection is active, the `enforcement` field controls whether the proxy blocks or logs rule violations.
 
 | Aspect | Detail |
 |---|---|
@@ -238,16 +238,16 @@ The agent never receives the provider API key.
 
 ## Gateway Security
 
-The gateway secures communication between the CLI, sandbox pods, and external clients with mutual TLS and token-based authentication.
+The gateway secures communication between the CLI, sandbox workloads, and external clients with mutual TLS and token-based authentication.
 
 ### mTLS
 
-Communication between the CLI, sandbox pods, and the gateway is secured by mutual TLS.
-OpenShell generates a cluster CA at bootstrap and distributes it through Kubernetes secrets.
+Communication between the CLI, sandbox workloads, and the gateway is secured by mutual TLS.
+For Helm deployments, provide a CA and certificate bundle through the Kubernetes secrets consumed by the chart.
 
 | Aspect | Detail |
 |---|---|
-| Default | mTLS required. Both client and server present certificates that the cluster CA signed. |
+| Default | mTLS required. Both client and server present certificates that the deployment CA signed. |
 | What you can change | Enable dual-auth mode (`allow_unauthenticated=true`) for Cloudflare Tunnel deployments, or disable TLS entirely for trusted reverse-proxy setups. |
 | Risk if relaxed | Dual-auth mode accepts clients without certificates and defers authentication to the HTTP layer (Cloudflare JWT). Disabling TLS removes transport-level authentication entirely. |
 | Recommendation | Use mTLS (the default) unless deploying behind Cloudflare or a trusted reverse proxy. |
@@ -282,5 +282,5 @@ The following patterns weaken security without providing meaningful benefit.
 - [Policy Schema](/reference/policy-schema) for the full field-by-field YAML reference.
 - [Default Policy](/reference/default-policy) for the built-in default policy breakdown.
 - [Gateway Auth](/reference/gateway-auth) for gateway authentication details.
-- [Architecture](/about/architecture) for the system architecture.
+- [How OpenShell Works](/about/how-it-works) for the system architecture.
 - NemoClaw [Security Best Practices](https://docs.nvidia.com/nemoclaw/latest/security/best-practices.html) for entrypoint-level controls (capability drops, PATH hardening, build toolchain removal), policy presets, provider trust tiers, and posture profiles.

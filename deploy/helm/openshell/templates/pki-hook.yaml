@@ -1,0 +1,191 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if and .Values.pkiInitJob.enabled .Values.certManager.enabled }}
+{{- fail "pkiInitJob.enabled and certManager.enabled cannot both be true; disable one to avoid conflicting PKI sources." }}
+{{- end }}
+{{- if .Values.pkiInitJob.enabled }}
+{{- $hookName := printf "%s-pki-hook" (include "openshell.fullname" .) }}
+{{- $ns := .Release.Namespace }}
+{{- $serverSecret := .Values.server.tls.certSecretName }}
+{{- $clientSecret := .Values.server.tls.clientTlsSecretName }}
+{{- $sanParts := list }}
+{{- range .Values.pkiInitJob.serverDnsNames }}{{- $sanParts = append $sanParts (printf "DNS:%s" .) }}{{- end }}
+{{- range .Values.pkiInitJob.serverIpAddresses }}{{- $sanParts = append $sanParts (printf "IP:%s" .) }}{{- end }}
+{{- $serverSans := join "," $sanParts }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $hookName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-30"
+    helm.sh/hook-delete-policy: before-hook-creation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $hookName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-30"
+    helm.sh/hook-delete-policy: before-hook-creation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $hookName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-30"
+    helm.sh/hook-delete-policy: before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $hookName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $hookName }}
+    namespace: {{ $ns }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $hookName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-20"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 120
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        {{- include "openshell.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ $hookName }}
+      containers:
+        - name: pki-gen
+          image: {{ .Values.pkiInitJob.image.repository }}:{{ .Values.pkiInitJob.image.tag }}
+          imagePullPolicy: {{ .Values.pkiInitJob.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SERVER_SECRET
+              value: {{ $serverSecret | quote }}
+            - name: CLIENT_SECRET
+              value: {{ $clientSecret | quote }}
+            - name: CA_DAYS
+              value: {{ .Values.pkiInitJob.caValidityDays | quote }}
+            - name: CERT_DAYS
+              value: {{ .Values.pkiInitJob.certValidityDays | quote }}
+            - name: SERVER_SANS
+              value: {{ $serverSans | quote }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              apk add --no-cache openssl curl >/dev/null 2>&1
+
+              TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+              K8S_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+              API=https://kubernetes.default.svc
+
+              # Idempotency: skip only when both TLS secrets already exist.
+              # Checking one is insufficient — a partial cleanup can leave one half
+              # of the pair behind, which would cause mTLS to fail at runtime.
+              HTTP_SERVER=$(curl -s -o /dev/null -w "%{http_code}" \
+                -H "Authorization: Bearer $TOKEN" --cacert "$K8S_CA" \
+                "$API/api/v1/namespaces/$NAMESPACE/secrets/$SERVER_SECRET")
+              HTTP_CLIENT=$(curl -s -o /dev/null -w "%{http_code}" \
+                -H "Authorization: Bearer $TOKEN" --cacert "$K8S_CA" \
+                "$API/api/v1/namespaces/$NAMESPACE/secrets/$CLIENT_SECRET")
+              if [ "$HTTP_SERVER" = "200" ] && [ "$HTTP_CLIENT" = "200" ]; then
+                echo "PKI secrets already exist, skipping."
+                exit 0
+              fi
+              if [ "$HTTP_SERVER" = "200" ] || [ "$HTTP_CLIENT" = "200" ]; then
+                echo "ERROR: partial PKI state — one secret exists but not both." >&2
+                echo "To recover: kubectl delete secret -n $NAMESPACE $SERVER_SECRET $CLIENT_SECRET" >&2
+                exit 1
+              fi
+
+              cd /tmp
+
+              # CA (ECDSA P-256)
+              openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ca.key 2>/dev/null
+              openssl req -new -x509 -sha256 -key ca.key -out ca.crt \
+                -days "$CA_DAYS" -subj "/O=openshell/CN=openshell-ca" \
+                -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+                -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+              # Server cert (ECDSA P-256)
+              printf "[ext]\nsubjectAltName=%s\nextendedKeyUsage=serverAuth\nkeyUsage=digitalSignature,keyEncipherment\n" \
+                "$SERVER_SANS" > server.ext
+              openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out server.key 2>/dev/null
+              openssl req -new -sha256 -key server.key -out server.csr -subj "/CN=openshell-server"
+              openssl x509 -req -sha256 -in server.csr -CA ca.crt -CAkey ca.key \
+                -CAcreateserial -days "$CERT_DAYS" -extensions ext -extfile server.ext -out server.crt
+
+              # Client cert (ECDSA P-256)
+              printf "[ext]\nextendedKeyUsage=clientAuth\nkeyUsage=digitalSignature,keyEncipherment\n" \
+                > client.ext
+              openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out client.key 2>/dev/null
+              openssl req -new -sha256 -key client.key -out client.csr -subj "/CN=openshell-client"
+              openssl x509 -req -sha256 -in client.csr -CA ca.crt -CAkey ca.key \
+                -CAcreateserial -days "$CERT_DAYS" -extensions ext -extfile client.ext -out client.crt
+
+              CA_B64=$(base64 -w0 ca.crt)
+              SERVER_CRT_B64=$(base64 -w0 server.crt)
+              SERVER_KEY_B64=$(base64 -w0 server.key)
+              CLIENT_CRT_B64=$(base64 -w0 client.crt)
+              CLIENT_KEY_B64=$(base64 -w0 client.key)
+
+              # Create server TLS secret
+              printf '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"%s","namespace":"%s"},"type":"kubernetes.io/tls","data":{"tls.crt":"%s","tls.key":"%s","ca.crt":"%s"}}\n' \
+                "$SERVER_SECRET" "$NAMESPACE" \
+                "$SERVER_CRT_B64" "$SERVER_KEY_B64" "$CA_B64" > server-secret.json
+              curl -sf -X POST \
+                -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+                --cacert "$K8S_CA" "$API/api/v1/namespaces/$NAMESPACE/secrets" \
+                -d @server-secret.json
+
+              # Create client TLS secret
+              printf '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"%s","namespace":"%s"},"type":"kubernetes.io/tls","data":{"tls.crt":"%s","tls.key":"%s","ca.crt":"%s"}}\n' \
+                "$CLIENT_SECRET" "$NAMESPACE" \
+                "$CLIENT_CRT_B64" "$CLIENT_KEY_B64" "$CA_B64" > client-secret.json
+              curl -sf -X POST \
+                -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+                --cacert "$K8S_CA" "$API/api/v1/namespaces/$NAMESPACE/secrets" \
+                -d @client-secret.json
+
+              rm -f *.key *.csr *.crt *.ext *.srl *.json
+              echo "PKI secrets created."
+{{- end }}

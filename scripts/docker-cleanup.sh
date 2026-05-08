@@ -105,7 +105,7 @@ KEEP_IMAGE_PREFIXES=(
 should_keep_image() {
   local repo="$1"
 
-  # Keep current cluster images
+  # Keep current OpenShell images
   for prefix in "${CURRENT_IMAGE_PREFIXES[@]}"; do
     if [[ "$repo" == "$prefix"* ]]; then
       return 0
@@ -137,7 +137,7 @@ if [[ "$DRY_RUN" == true ]]; then
   echo
 elif [[ "$FORCE" != true ]]; then
   echo -e "${BOLD}This will remove stale images, unused volumes, and build cache.${RESET}"
-  echo "The currently deployed cluster images and running containers are preserved."
+  echo "The currently deployed OpenShell images and running containers are preserved."
   echo
   read -r -p "Continue? [y/N] " confirm
   if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
@@ -177,7 +177,12 @@ info "Removing stale tagged images..."
 
 # Collect image IDs that are directly used by running containers so we never
 # touch them regardless of tag matching.
-running_image_ids=$(ce ps -q 2>/dev/null | xargs -r ce inspect --format '{{.Image}}' 2>/dev/null | sort -u)
+container_ids=($(ce ps -q 2>/dev/null))
+if [[ ${#container_ids[@]} -gt 0 ]]; then
+  running_image_ids=$(ce inspect --format '{{.Image}}' "${container_ids[@]}" 2>/dev/null | sort -u)
+else
+  running_image_ids=""
+fi
 
 stale_images=()
 while IFS=$'\t' read -r repo tag id; do
@@ -215,9 +220,13 @@ echo
 info "Removing unused volumes..."
 
 # Identify volumes in use by running containers
-in_use_volumes=$(ce ps -q 2>/dev/null \
-  | xargs -r ce inspect --format '{{range .Mounts}}{{.Name}} {{end}}' 2>/dev/null \
-  | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+container_ids=($(ce ps -q 2>/dev/null))
+if [[ ${#container_ids[@]} -gt 0 ]]; then
+  in_use_volumes=$(ce inspect --format '{{range .Mounts}}{{.Name}} {{end}}' "${container_ids[@]}" 2>/dev/null \
+    | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+else
+  in_use_volumes=""
+fi
 
 unused_volumes=()
 while read -r vol; do

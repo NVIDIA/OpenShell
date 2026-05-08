@@ -6,7 +6,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 
@@ -30,6 +32,9 @@ pub const DEFAULT_SSH_HANDSHAKE_SKEW_SECS: u64 = 300;
 
 /// Default Podman bridge network name.
 pub const DEFAULT_NETWORK_NAME: &str = "openshell";
+
+/// Default Docker bridge network name for local sandboxes.
+pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 
 /// Default OCI image for the openshell-sandbox supervisor binary.
 pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
@@ -105,8 +110,8 @@ pub fn detect_driver() -> Option<ComputeDriverKind> {
         return Some(ComputeDriverKind::Podman);
     }
 
-    // Docker: check if docker binary is available
-    if is_binary_available("docker") {
+    // Docker: check if the CLI is available or a local Docker socket exists.
+    if is_docker_available() {
         return Some(ComputeDriverKind::Docker);
     }
 
@@ -119,6 +124,55 @@ fn is_binary_available(name: &str) -> bool {
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+fn is_docker_available() -> bool {
+    is_binary_available("docker") || docker_socket_available()
+}
+
+fn docker_socket_available() -> bool {
+    docker_socket_candidates()
+        .iter()
+        .any(|path| is_unix_socket(path))
+}
+
+fn docker_socket_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(host) = std::env::var("DOCKER_HOST")
+        && let Some(path) = docker_host_unix_socket_path(&host)
+    {
+        candidates.push(path);
+    }
+
+    candidates.push(PathBuf::from("/var/run/docker.sock"));
+
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".docker/run/docker.sock"));
+    }
+
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        candidates.push(PathBuf::from(runtime_dir).join("docker.sock"));
+    }
+
+    candidates
+}
+
+fn docker_host_unix_socket_path(host: &str) -> Option<PathBuf> {
+    let path = host.trim().strip_prefix("unix://")?;
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+#[cfg(unix)]
+fn is_unix_socket(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_socket())
+}
+
+#[cfg(not(unix))]
+fn is_unix_socket(path: &Path) -> bool {
+    let _ = path;
+    false
 }
 
 /// Server configuration.
@@ -139,6 +193,15 @@ pub struct Config {
     /// When `None`, the dedicated metrics listener is disabled.
     #[serde(default)]
     pub metrics_bind_address: Option<SocketAddr>,
+
+    /// Additional bind addresses that serve the same multiplexed gRPC/HTTP
+    /// surface as `bind_address`.
+    ///
+    /// Compute drivers may register extra listeners during startup so that
+    /// sandbox workloads can call back into the gateway over an interface
+    /// that the operator-supplied `bind_address` does not expose.
+    #[serde(default)]
+    pub extra_bind_addresses: Vec<SocketAddr>,
 
     /// Log level (trace, debug, info, warn, error).
     #[serde(default = "default_log_level")]
@@ -327,6 +390,7 @@ impl Config {
             bind_address: default_bind_address(),
             health_bind_address: None,
             metrics_bind_address: None,
+            extra_bind_addresses: Vec::new(),
             log_level: default_log_level(),
             tls,
             oidc: None,
@@ -365,6 +429,19 @@ impl Config {
     #[must_use]
     pub const fn with_metrics_bind_address(mut self, addr: SocketAddr) -> Self {
         self.metrics_bind_address = Some(addr);
+        self
+    }
+
+    /// Append an extra listener address to the multiplex service.
+    ///
+    /// Duplicate entries (matching `bind_address` or any existing entry) are
+    /// silently dropped so callers can naively push driver-derived addresses
+    /// without checking for collisions.
+    #[must_use]
+    pub fn with_extra_bind_address(mut self, addr: SocketAddr) -> Self {
+        if addr != self.bind_address && !self.extra_bind_addresses.contains(&addr) {
+            self.extra_bind_addresses.push(addr);
+        }
         self
     }
 
@@ -492,7 +569,7 @@ impl Config {
 }
 
 fn default_bind_address() -> SocketAddr {
-    "0.0.0.0:8080".parse().expect("valid default address")
+    "127.0.0.1:8080".parse().expect("valid default address")
 }
 
 fn default_log_level() -> String {
@@ -537,8 +614,13 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComputeDriverKind, Config, detect_driver};
+    use super::{
+        ComputeDriverKind, Config, detect_driver, docker_host_unix_socket_path, is_unix_socket,
+    };
     use std::net::SocketAddr;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
 
     #[test]
     fn compute_driver_kind_parses_supported_values() {
@@ -567,6 +649,12 @@ mod tests {
     }
 
     #[test]
+    fn config_defaults_to_loopback_bind_address() {
+        let expected: SocketAddr = "127.0.0.1:8080".parse().expect("valid address");
+        assert_eq!(Config::new(None).bind_address, expected);
+    }
+
+    #[test]
     fn config_new_disables_health_bind_by_default() {
         let cfg = Config::new(None);
         assert!(cfg.health_bind_address.is_none());
@@ -582,10 +670,34 @@ mod tests {
     #[test]
     fn detect_driver_returns_none_without_k8s_env_or_binaries() {
         // When KUBERNETES_SERVICE_HOST is not set and no docker/podman binaries
-        // are available, detect_driver should return None.
+        // or Docker socket are available, detect_driver should return None.
         // This test may pass or fail depending on the test environment,
         // but it documents the expected behavior.
         let _ = detect_driver(); // Returns Some or None based on environment
+    }
+
+    #[test]
+    fn docker_host_unix_socket_path_parses_unix_hosts() {
+        assert_eq!(
+            docker_host_unix_socket_path("unix:///var/run/docker.sock"),
+            Some(PathBuf::from("/var/run/docker.sock"))
+        );
+        assert_eq!(docker_host_unix_socket_path("tcp://127.0.0.1:2375"), None);
+        assert_eq!(docker_host_unix_socket_path("unix://"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_unix_socket_detects_socket_files() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let socket_path = temp_dir.path().join("docker.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind unix socket");
+
+        assert!(is_unix_socket(&socket_path));
+
+        let regular_file = temp_dir.path().join("not-a-socket");
+        std::fs::write(&regular_file, b"not a socket").expect("write regular file");
+        assert!(!is_unix_socket(&regular_file));
     }
 
     #[test]

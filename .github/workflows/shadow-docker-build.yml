@@ -33,11 +33,3 @@ jobs:
       platform: ${{ inputs.platform }}
       push: false
     secrets: inherit
-
-  cluster:
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: cluster
-      platform: ${{ inputs.platform }}
-      push: false
-    secrets: inherit

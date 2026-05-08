@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Shared helpers for openshell-vm build scripts.
+# Shared helpers for VM runtime build scripts.
 # Source this file from other scripts:
 #   source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
 

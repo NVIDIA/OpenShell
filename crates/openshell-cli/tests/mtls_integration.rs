@@ -177,6 +177,41 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    async fn list_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn import_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ImportProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ImportProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn lint_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::LintProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::LintProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn update_provider(
         &self,
         _request: tonic::Request<UpdateProviderRequest>,
@@ -449,4 +484,45 @@ async fn cli_requires_client_cert_for_https() {
     let endpoint = format!("https://localhost:{}", addr.port());
     let result = grpc_client(&endpoint, &tls).await;
     assert!(result.is_err());
+}
+
+async fn run_server_no_client_auth(
+    server_cert: String,
+    server_key: String,
+) -> std::net::SocketAddr {
+    let identity = Identity::from_pem(server_cert, server_key);
+    let tls = ServerTlsConfig::new().identity(identity);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = TcpListenerStream::new(listener);
+    tokio::spawn(async move {
+        Server::builder()
+            .tls_config(tls)
+            .unwrap()
+            .add_service(OpenShellServer::new(TestOpenShell))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    addr
+}
+
+#[tokio::test]
+async fn cli_connects_with_gateway_insecure() {
+    install_rustls_provider();
+
+    let (ca, ca_key) = build_ca();
+    let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
+
+    let addr = run_server_no_client_auth(server_cert, server_key).await;
+
+    let mut tls = TlsOptions::default();
+    tls.gateway_insecure = true;
+
+    let endpoint = format!("https://localhost:{}", addr.port());
+    let mut client = grpc_client(&endpoint, &tls).await.unwrap();
+    let response = client.health(HealthRequest {}).await.unwrap();
+    assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
 }

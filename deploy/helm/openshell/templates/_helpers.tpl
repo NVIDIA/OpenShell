@@ -58,3 +58,26 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Gateway image reference. Uses image.tag when set; falls back to .Chart.AppVersion
+so a released chart automatically pulls the matching image without extra overrides.
+*/}}
+{{- define "openshell.image" -}}
+{{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
+{{- end }}
+
+{{/*
+Supervisor image reference. Same appVersion fallback as openshell.image so
+the supervisor and gateway images stay in sync across releases.
+*/}}
+{{- define "openshell.supervisorImage" -}}
+{{- printf "%s:%s" .Values.supervisor.image.repository (.Values.supervisor.image.tag | default .Chart.AppVersion) }}
+{{- end }}
+
+{{/*
+Namespaced Issuer (selfSigned) for cert-manager CA bootstrap.
+*/}}
+{{- define "openshell.issuerSelfSigned" -}}
+{{- printf "%s-selfsigned" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}

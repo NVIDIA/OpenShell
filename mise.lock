@@ -120,6 +120,38 @@ url = "https://get.helm.sh/helm-v4.1.4-linux-amd64.tar.gz"
 checksum = "sha256:7c2eca678e8001fa863cdf8cbf6ac1b3799f9404a89eb55c08260ef5732e658d"
 url = "https://get.helm.sh/helm-v4.1.4-darwin-arm64.tar.gz"
 
+[[tools.k3d]]
+version = "5.8.3"
+backend = "aqua:k3d-io/k3d"
+
+[tools.k3d."platforms.linux-arm64"]
+checksum = "sha256:0b8110f2229631af7402fb828259330985918b08fefd38b7f1b788a1c8687216"
+url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-linux-arm64"
+
+[tools.k3d."platforms.linux-arm64-musl"]
+checksum = "sha256:0b8110f2229631af7402fb828259330985918b08fefd38b7f1b788a1c8687216"
+url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-linux-arm64"
+
+[tools.k3d."platforms.linux-x64"]
+checksum = "sha256:dbaa79a76ace7f4ca230a1ff41dc7d8a5036a8ad0309e9c54f9bf3836dbe853e"
+url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-linux-amd64"
+
+[tools.k3d."platforms.linux-x64-musl"]
+checksum = "sha256:dbaa79a76ace7f4ca230a1ff41dc7d8a5036a8ad0309e9c54f9bf3836dbe853e"
+url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-linux-amd64"
+
+[tools.k3d."platforms.macos-arm64"]
+checksum = "sha256:8da468daa7dc7cf7cdd4735f90a9bb05179fa27858250f62e3d8cdf5b5ca0698"
+url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-darwin-arm64"
+
+[tools.k3d."platforms.macos-x64"]
+checksum = "sha256:fd0f8e9e8ea4d8bc3674572ca6ed0833b639bf57c43c708616d937377324cfea"
+url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-darwin-amd64"
+
+[tools.k3d."platforms.windows-x64"]
+checksum = "sha256:655d2aadcb1f0a0dd196c5cbc564687ba945a9547c8e82c9fc532051fb260e22"
+url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-windows-amd64.exe"
+
 [[tools.kubectl]]
 version = "1.35.4"
 backend = "aqua:kubernetes/kubernetes/kubectl"
@@ -212,8 +244,8 @@ backend = "core:python"
 precompiled_flavor = "install_only_stripped"
 
 [tools.python."platforms.linux-arm64"]
-checksum = "sha256:0556f1260a9a1fc83210dcecf9d4cbacf17eb4a684541c84798ffc8b4d618c35"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
+checksum = "sha256:7fda891fac489ae1380fdf7050acf5ed4d3cb1ce0a84d6a4a6f51f6b5aee2d6d"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260504/cpython-3.13.13+20260504-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.linux-arm64-musl"]
@@ -222,8 +254,8 @@ url = "https://github.com/astral-sh/python-build-standalone/releases/download/20
 provenance = "github-attestations"
 
 [tools.python."platforms.linux-x64"]
-checksum = "sha256:13d3b6d15f4c3c1dd1955a3c81e06bdc5aef4cb5cb65076878374948be3b0412"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+checksum = "sha256:701c00bb8cc5b172b9c8a31eb6be57b6bc72cfe0addbff8e013db79a28981642"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260504/cpython-3.13.13+20260504-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.linux-x64-musl"]
@@ -232,8 +264,8 @@ url = "https://github.com/astral-sh/python-build-standalone/releases/download/20
 provenance = "github-attestations"
 
 [tools.python."platforms.macos-arm64"]
-checksum = "sha256:874f9931ad40dcce38caf6f408aa7e10ec3d0dfce2184ba7af62a965a66b9cd9"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-aarch64-apple-darwin-install_only_stripped.tar.gz"
+checksum = "sha256:001872dfdea7fdb5b985cbe03a5b15d1ba7d8a5df6056615d433423e2adb27c5"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260504/cpython-3.13.13+20260504-aarch64-apple-darwin-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.macos-x64"]
@@ -249,6 +281,32 @@ provenance = "github-attestations"
 [[tools.rust]]
 version = "1.95.0"
 backend = "core:rust"
+
+[[tools.skaffold]]
+version = "2.19.0"
+backend = "aqua:GoogleContainerTools/skaffold"
+
+[tools.skaffold."platforms.linux-arm64"]
+url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-arm64"
+
+[tools.skaffold."platforms.linux-arm64-musl"]
+url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-arm64"
+
+[tools.skaffold."platforms.linux-x64"]
+checksum = "blake3:de828fa7e9d89de048a6e89425cbdac7199d59a9fb0750b44ffe31734c074104"
+url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-amd64"
+
+[tools.skaffold."platforms.linux-x64-musl"]
+url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-amd64"
+
+[tools.skaffold."platforms.macos-arm64"]
+url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-darwin-arm64"
+
+[tools.skaffold."platforms.macos-x64"]
+url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-darwin-amd64"
+
+[tools.skaffold."platforms.windows-x64"]
+url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-windows-amd64.exe"
 
 [[tools.uv]]
 version = "0.10.12"

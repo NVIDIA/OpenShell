@@ -5,7 +5,7 @@
 
 """Record the ARC baseline for OS-49 Phase 1.
 
-Pulls workflow-run history from the GitHub Actions API for each of the ten
+Pulls workflow-run history from the GitHub Actions API for each of the tracked
 workflows currently pinned to the `build-amd64` / `build-arm64` ARC scale sets
 and reports wall time, queue time, and success rate over a rolling window.
 Output is both machine-readable JSON and a Markdown table so Phase 6/7 cut-over
@@ -47,7 +47,6 @@ WORKFLOWS: list[str] = [
     "release-canary.yml",
     "release-dev.yml",
     "release-tag.yml",
-    "release-vm-dev.yml",
     "release-vm-kernel.yml",
 ]
 

@@ -3,14 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Support Matrix"
 description: ""
-position: 4
+position: 5
 ---
 
-This page lists the platform, software, runtime, and kernel requirements for running OpenShell.
+This page lists the host platform, compute driver, software, runtime, and kernel requirements for running OpenShell.
 
 ## Supported Platforms
 
-OpenShell publishes multi-architecture container images for `linux/amd64` and `linux/arm64`. The CLI and standalone gateway binary are supported on the following host platforms:
+OpenShell publishes multi-architecture gateway images for `linux/amd64` and `linux/arm64`. The CLI and standalone gateway binary are supported on the following host platforms:
 
 | Platform                         | Architecture          | Status    |
 | -------------------------------- | --------------------- | --------- |
@@ -29,15 +29,31 @@ OpenShell publishes standalone `openshell-gateway` release assets for manual dow
 | Linux aarch64 (arm64) | `openshell-gateway-aarch64-unknown-linux-gnu`  |
 | macOS Apple Silicon   | `openshell-gateway-aarch64-apple-darwin`       |
 
-These artifacts are attached to GitHub releases. `openshell gateway start` continues to use the published cluster and gateway container images.
+These artifacts are attached to GitHub releases. Kubernetes deployments should use the Helm chart and the published gateway image.
+
+## Compute Drivers
+
+The gateway can manage sandboxes through several compute drivers.
+
+| Compute Driver | Status | Notes |
+|---|---|---|
+| Docker | Supported for local development and single-machine gateways. | Requires Docker Desktop or Docker Engine on the gateway host. |
+| Podman | Supported for rootless local and workstation workflows. | Requires a Podman-compatible socket and rootless networking setup. |
+| Kubernetes | Supported through the [OpenShell Helm chart](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md). | Requires a Kubernetes cluster supplied by the operator. |
+| MicroVM | Supported for VM-backed sandboxes. | Uses the VM compute driver and libkrun-based runtime. |
 
 ## Software Prerequisites
 
-The following software must be installed on the host before using the OpenShell CLI:
+Install the software for the compute driver you use:
 
-| Component                       | Minimum Version | Notes                                           |
-| ------------------------------- | --------------- | ----------------------------------------------- |
-| Docker Desktop or Docker Engine | 28.04           | Must be running before any `openshell` command. |
+| Component | Minimum Version | Notes |
+|---|---|---|
+| Docker Desktop or Docker Engine | 28.04 | Required for Docker-backed gateways, local image builds, and Docker development workflows. |
+| Podman | 5.x | Required for Podman-backed gateways. |
+| Kubernetes | 1.29 | Required for Helm deployments and Kubernetes sandbox scheduling. |
+| Helm | 3.x | Required to install `deploy/helm/openshell`. |
+| kubectl | Compatible with your cluster | Required for Kubernetes operational inspection and secret creation. |
+| Host virtualization | Host dependent | Required for MicroVM-backed gateways. MicroVM uses Hypervisor.framework on macOS and KVM on Linux. |
 
 ## Sandbox Runtime Versions
 
@@ -45,23 +61,22 @@ Sandbox container images are maintained in the [openshell-community](https://git
 
 ## Container Images
 
-OpenShell publishes two container images. Both are published for `linux/amd64` and `linux/arm64`.
+OpenShell publishes the gateway image for `linux/amd64` and `linux/arm64`.
 
-| Image   | Reference                                 | Pulled When                      |
-| ------- | ----------------------------------------- | -------------------------------- |
-| Cluster | `ghcr.io/nvidia/openshell/cluster:latest` | `openshell gateway start`        |
-| Gateway | `ghcr.io/nvidia/openshell/gateway:latest` | Cluster startup (via Helm chart) |
+| Image | Reference | Pulled When |
+|---|---|---|
+| Gateway | `ghcr.io/nvidia/openshell/gateway:latest` | Helm chart install or upgrade, or standalone container deployment |
 
-The cluster image bundles the Helm charts, Kubernetes manifests, and the `openshell-sandbox` supervisor binary required to bootstrap the control plane. The supervisor binary is side-loaded into sandbox pods at runtime through a read-only host volume mount. The gateway image is pulled at cluster startup and runs the API server.
+The Helm chart in `deploy/helm/openshell` deploys the gateway StatefulSet, service account, service, persistent storage, and network policy for Kubernetes.
 
 Sandbox images are maintained separately in the [openshell-community](https://github.com/nvidia/openshell-community) repository.
 
-To override the default image references, set the following environment variables:
+To override the default image references, use Helm values:
 
-| Variable                       | Purpose                                             |
-| ------------------------------ | --------------------------------------------------- |
-| `OPENSHELL_CLUSTER_IMAGE`      | Override the cluster image reference.               |
-| `OPENSHELL_COMMUNITY_REGISTRY` | Override the registry for community sandbox images. |
+| Helm value | Purpose |
+|---|---|
+| `image.repository` / `image.tag` | Override the gateway image reference. |
+| `server.sandboxImage` | Override the default sandbox image. |
 
 ## Kernel Requirements
 

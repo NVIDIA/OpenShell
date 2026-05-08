@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 usage() {
-  echo "Usage: stage-prebuilt-binaries.sh <gateway|sandbox|supervisor|cluster|supervisor-output|all>" >&2
+  echo "Usage: stage-prebuilt-binaries.sh <gateway|sandbox|supervisor|supervisor-output|all>" >&2
 }
 
 normalize_arch() {
@@ -70,7 +70,7 @@ components_for_target() {
     gateway)
       echo "gateway"
       ;;
-    sandbox|supervisor|cluster|supervisor-output)
+    sandbox|supervisor|supervisor-output)
       echo "sandbox"
       ;;
     all)

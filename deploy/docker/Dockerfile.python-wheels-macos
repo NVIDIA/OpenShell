@@ -4,12 +4,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-ARG OSXCROSS_IMAGE=crazymax/osxcross:latest
+ARG OSXCROSS_IMAGE=ghcr.io/crazy-max/osxcross:latest
+ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python
 ARG PYTHON_VERSION=3.12
 
 FROM ${OSXCROSS_IMAGE} AS osxcross
 
-FROM python:${PYTHON_VERSION}-slim AS builder
+FROM ${PYTHON_IMAGE}:${PYTHON_VERSION}-slim AS builder
 
 ARG TARGETARCH
 ARG CARGO_TARGET_CACHE_SCOPE=default
@@ -91,6 +92,7 @@ RUN --mount=type=cache,id=cargo-registry-python-wheels-macos-${TARGETARCH},shari
 
 # Copy actual source code and Python packaging files.
 COPY crates/ crates/
+COPY providers/ providers/
 COPY pyproject.toml README.md ./
 COPY python/ python/
 

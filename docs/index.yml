@@ -16,10 +16,11 @@ navigation:
   - folder: get-started/tutorials
     skip-slug: true
 - folder: sandboxes
-- folder: inference
-  title: "Inference Routing"
+  title: "How It Works"
 - folder: observability
   title: "Observability"
+- folder: kubernetes
+  title: "Kubernetes"
 - folder: reference
   title: "Reference"
 - folder: security

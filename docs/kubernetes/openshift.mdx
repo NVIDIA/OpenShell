@@ -1,0 +1,88 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "OpenShift"
+sidebar-title: "OpenShift"
+description: "Install the OpenShell Helm chart on OpenShift, including the SCC binding and chart overrides required by OpenShift's Security Context Constraints."
+keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, SCC, Security Context Constraints, Helm, Gateway, Installation"
+position: 5
+---
+
+<Warning>
+The OpenShift install path is experimental. It currently requires running sandbox pods under the `privileged` SCC and installing the gateway with TLS and the PKI init job disabled. Use only for evaluation on a private network.
+</Warning>
+
+OpenShift's [Security Context Constraints](https://docs.openshift.com/container-platform/latest/authentication/managing-security-context-constraints.html) reject the chart's default pod security settings. Installing on OpenShift requires precreating the namespace, granting the `privileged` SCC to the default service account, and overriding a few chart values so the cluster admission controller can assign UIDs and FS groups itself.
+
+## Prerequisites
+
+- OpenShift 4.x cluster with `oc` configured
+- Helm 3.x
+- [Agent Sandbox](/kubernetes/setup#install-agent-sandbox) controller and CRDs installed
+
+## Install
+
+<Steps>
+
+## Create the namespace
+
+Pre-create the namespace so the SCC binding can be applied before the chart installs:
+
+```shell
+oc create ns openshell
+```
+
+## Grant the privileged SCC to sandbox pods
+
+Sandbox pods run under the `default` service account in the `openshell` namespace and require the `privileged` SCC:
+
+```shell
+oc adm policy add-scc-to-user privileged -z default -n openshell
+```
+
+## Install the chart with OpenShift overrides
+
+```shell
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set pkiInitJob.enabled=false \
+  --set server.disableTls=true \
+  --set podSecurityContext.fsGroup=null \
+  --set securityContext.runAsUser=null
+```
+
+| Override | Reason |
+|---|---|
+| `pkiInitJob.enabled=false` | The PKI init Job runs as a non-root user with a fixed UID, which the SCC admission rewrites or rejects. Disabling it skips the Job; TLS must also be disabled. |
+| `server.disableTls=true` | The gateway has no certificates without `pkiInitJob`, so it must run plaintext. |
+| `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Clear the chart's hardcoded UID and fsGroup so OpenShift's SCC admission can assign them. |
+
+## Wait for the gateway to be ready
+
+```shell
+oc -n openshell rollout status statefulset/openshell
+```
+
+</Steps>
+
+## Connect to the gateway
+
+The gateway is now running over plaintext HTTP. Connect with `oc port-forward`:
+
+```shell
+oc -n openshell port-forward svc/openshell 8080:8080
+```
+
+Register the gateway with the CLI:
+
+```shell
+openshell gateway add http://127.0.0.1:8080 --local --name openshift
+openshell status
+```
+
+## Next Steps
+
+- For TLS-enabled deployments, see [Managing Certificates](/kubernetes/managing-certificates) once SCC-compatible PKI is supported.
+- To expose the gateway externally, see [Ingress](/kubernetes/ingress).
+- To configure OIDC authentication, see [Access Control](/kubernetes/access-control).

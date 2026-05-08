@@ -37,6 +37,16 @@ on:
         required: false
         type: string
         default: ""
+      checkout-ref:
+        description: "Git ref to check out for build inputs (defaults to the workflow SHA)"
+        required: false
+        type: string
+        default: ""
+      image-tag:
+        description: "Supervisor image tag to bake into gateway binaries"
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       component:
@@ -72,6 +82,16 @@ on:
         default: 5
       artifact-name:
         description: "Artifact name override"
+        required: false
+        type: string
+        default: ""
+      checkout-ref:
+        description: "Git ref to check out for build inputs (defaults to the workflow SHA)"
+        required: false
+        type: string
+        default: ""
+      image-tag:
+        description: "Supervisor image tag to bake into gateway binaries"
         required: false
         type: string
         default: ""
@@ -113,6 +133,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
           fetch-depth: 0
 
       - name: Mark workspace safe for git
@@ -166,10 +187,10 @@ jobs:
       - name: Configure GHA sccache backend
         # Exposes ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN so sccache (wrapped
         # around rustc via mise's RUSTC_WRAPPER) can initialize the GHA cache.
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: rust-native-${{ inputs.component }}-${{ inputs.arch }}
           cache-directories: .cache/sccache
@@ -196,6 +217,7 @@ jobs:
           # Preserve the release-codegen setting used by the old Dockerfile
           # Rust build path so image artifacts keep the same release profile.
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+          OPENSHELL_IMAGE_TAG: ${{ inputs['image-tag'] }}
         run: |
           set -euo pipefail
           args=(
@@ -235,7 +257,7 @@ jobs:
           ls -lh "$STAGE/"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs['artifact-name'] != '' && inputs['artifact-name'] || format('rust-binary-{0}-linux-{1}', inputs.component, inputs.arch) }}
           path: prebuilt-binaries/${{ inputs.arch }}/${{ steps.target.outputs.binary }}

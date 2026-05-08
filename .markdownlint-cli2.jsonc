@@ -10,7 +10,11 @@
     ".opencode/**",
     ".github/**",
     "THIRD-PARTY-NOTICES/**",
-    "CLAUDE.md"
+    "CLAUDE.md",
+    // Man page sources use pandoc markdown with multiple H1 sections
+    // (NAME, SYNOPSIS, DESCRIPTION, etc.) which is standard for man
+    // pages but violates MD025.
+    "deploy/man/**"
   ],
   "config": {
     "default": true,

@@ -154,36 +154,44 @@ Each endpoint defines a reachable destination and optional inspection rules.
 |---|---|---|---|
 | `host` | string | Yes | Hostname or IP address. Supports wildcards: `*.example.com` matches any subdomain. |
 | `port` | integer | Yes | TCP port number. |
-| `protocol` | string | No | Set to `rest` to enable HTTP request inspection. Omit for TCP passthrough. |
-| `tls` | string | No | TLS handling mode. The proxy auto-detects TLS by peeking the first bytes of each connection and terminates it when `protocol` is `rest`, so this field is optional in most cases. Set to `skip` to disable auto-detection for edge cases such as client-certificate mTLS or non-standard protocols. The values `terminate` and `passthrough` are deprecated and log a warning; they are still accepted for backward compatibility but have no effect on behavior. |
+| `path` | string | No | Optional HTTP path glob used to select between L7 endpoints that share the same host and port. Empty means all paths. Use this when REST and GraphQL live under the same host, such as `/repos/**` and `/graphql`. |
+| `protocol` | string | No | Set to `rest` for HTTP method/path inspection or `graphql` for GraphQL operation inspection. Omit for TCP passthrough. |
+| `tls` | string | No | TLS handling mode. The proxy auto-detects TLS by peeking the first bytes of each connection and terminates it for inspected HTTPS traffic, so this field is optional in most cases. Set to `skip` to disable auto-detection for edge cases such as client-certificate mTLS or non-standard protocols. The values `terminate` and `passthrough` are deprecated and log a warning; they are still accepted for backward compatibility but have no effect on behavior. |
 | `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
-| `access` | string | No | HTTP access level. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. |
-| `rules` | list of rule objects | No | Fine-grained per-method, per-path allow rules. Mutually exclusive with `access`. |
+| `access` | string | No | Access preset. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. |
+| `rules` | list of rule objects | No | Fine-grained protocol-specific allow rules. Mutually exclusive with `access`. |
 | `deny_rules` | list of deny rule objects | No | L7 deny rules that block specific requests even when allowed by `access` or `rules`. Deny rules take precedence over allow rules. |
 | `allowed_ips` | list of string | No | CIDR or IP allowlist for SSRF override. Entries overlapping loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), or unspecified (`0.0.0.0`) are rejected at load time. |
 | `allow_encoded_slash` | bool | No | When `true`, L7 request parsing preserves `%2F` inside path segments instead of rejecting it. Use this for registries and APIs such as npm scoped packages (`/@scope%2Fname`). Defaults to `false`. |
+| `persisted_queries` | string | No | GraphQL hash-only behavior. Default is `deny`; use `allow_registered` only with `graphql_persisted_queries`. |
+| `graphql_persisted_queries` | map | No | Trusted GraphQL persisted-query registry keyed by hash or saved-query ID. Values contain `operation_type`, optional `operation_name`, and optional root `fields`. |
+| `graphql_max_body_bytes` | integer | No | Maximum GraphQL request body bytes buffered for inspection. Defaults to `65536`. |
 
 #### Access Levels
 
 The `access` field accepts one of the following values:
 
-| Value | Allowed HTTP Methods |
-|---|---|
-| `full` | All methods and paths. |
-| `read-only` | `GET`, `HEAD`, `OPTIONS`. |
-| `read-write` | `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`. |
+| Value | REST expansion | GraphQL expansion |
+|---|---|---|
+| `full` | All methods and paths. | All operation types. |
+| `read-only` | `GET`, `HEAD`, `OPTIONS`. | `query` operations. |
+| `read-write` | `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`. | `query` and `mutation` operations. |
 
-#### Rule Object
+#### Allow Rule Objects
 
-Used when `access` is not set. Each rule explicitly allows a method and path combination.
+Used when `access` is not set. Each entry in `rules` contains an `allow` object. The tables below list the fields inside that `allow` object.
+
+##### REST Allow Rule (`protocol: rest`)
+
+REST allow rules match HTTP requests by method, path, and optional query parameters.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `allow.method` | string | Yes | HTTP method to allow (for example, `GET`, `POST`). |
-| `allow.path` | string | Yes | URL path pattern. Supports `*` and `**` glob syntax. |
-| `allow.query` | map | No | Query parameter matchers keyed by decoded param name. Matcher value can be a glob string (`tag: "foo-*"`) or an object with `any` (`tag: { any: ["foo-*", "bar-*"] }`). |
+| `method` | string | Yes | HTTP method to allow (for example, `GET`, `POST`). `*` matches any method. |
+| `path` | string | Yes | URL path pattern. Supports `*` and `**` glob syntax. |
+| `query` | map | No | Query parameter matchers keyed by decoded param name. Matcher value can be a glob string (`tag: "foo-*"`) or an object with `any` (`tag: { any: ["foo-*", "bar-*"] }`). |
 
-Example with rules:
+Example REST allow rules:
 
 ```yaml showLineNumbers={false}
 rules:
@@ -200,21 +208,44 @@ rules:
           any: ["v1.*", "v2.*"]
 ```
 
-#### Deny Rule Object
+##### GraphQL Allow Rule (`protocol: graphql`)
 
-Blocks specific operations on endpoints that otherwise have broad access. Each deny rule
-matches a method and path (and optionally query parameters or SQL commands). Deny rules are
-evaluated after allow rules and take precedence -- if a request matches any deny rule, it is
-blocked regardless of what the allow rules or access preset permit.
+GraphQL allow rules match parsed GraphQL operations by operation type, optional operation name, and optional root fields.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `method` | string | No | HTTP method to deny (for example, `POST`, `DELETE`). `*` matches any method. |
-| `path` | string | No | URL path pattern. Same glob syntax as allow rules. |
-| `command` | string | No | SQL command to deny (`SELECT`, `INSERT`, etc.). For `protocol: sql` only. |
+| `operation_type` | string | Yes | GraphQL operation type: `query`, `mutation`, `subscription`, or `*`. |
+| `operation_name` | string | No | GraphQL operation-name glob. Omit to match any operation name. |
+| `fields` | list of string | No | GraphQL root-field globs. Every selected root field must match one configured glob. Omit to match all root fields. |
+
+Example GraphQL allow rules:
+
+```yaml showLineNumbers={false}
+rules:
+  - allow:
+      operation_type: query
+      fields: [viewer, repository]
+  - allow:
+      operation_type: mutation
+      operation_name: Issue*
+      fields: [createIssue]
+```
+
+#### Deny Rule Objects
+
+Blocks specific operations on endpoints that otherwise have broad access. Deny rules are evaluated after allow rules and take precedence: if a request matches any deny rule, it is blocked regardless of what the allow rules or access preset permit.
+
+##### REST Deny Rule (`protocol: rest`)
+
+REST deny rules use the same field names as REST allow rules, but they appear directly under each `deny_rules` entry instead of under an `allow` wrapper.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `method` | string | Yes | HTTP method to deny (for example, `POST`, `DELETE`). `*` matches any method. |
+| `path` | string | Yes | URL path pattern. Same glob syntax as allow rules. Use `**` to match any path. |
 | `query` | map | No | Query parameter matchers. Same syntax as allow rule `query`. |
 
-Example -- grant read-write access to GitHub but block admin operations:
+Example REST deny rules:
 
 ```yaml showLineNumbers={false}
 endpoints:
@@ -230,6 +261,32 @@ endpoints:
         path: "/repos/*/branches/*/protection"
       - method: "*"
         path: "/repos/*/rulesets"
+```
+
+##### GraphQL Deny Rule (`protocol: graphql`)
+
+GraphQL deny rules use the same field names as GraphQL allow rules, but they appear directly under each `deny_rules` entry instead of under an `allow` wrapper.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `operation_type` | string | Yes | GraphQL operation type to deny: `query`, `mutation`, `subscription`, or `*`. |
+| `operation_name` | string | No | GraphQL operation-name glob. |
+| `fields` | list of string | No | GraphQL root-field globs. Any matching root field blocks the request. Omit to deny every operation that matches `operation_type` and `operation_name`. |
+
+Example GraphQL deny rules:
+
+```yaml showLineNumbers={false}
+endpoints:
+  - host: api.github.com
+    port: 443
+    protocol: graphql
+    enforcement: enforce
+    access: read-write
+    deny_rules:
+      - operation_type: mutation
+        fields: [deleteRepository]
+      - operation_type: mutation
+        operation_name: Admin*
 ```
 
 ### Binary Object

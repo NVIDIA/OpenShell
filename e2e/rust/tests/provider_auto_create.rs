@@ -14,7 +14,7 @@
 //! placeholder made it all the way through to the sandbox process environment.
 //!
 //! Prerequisites:
-//! - A running openshell gateway (`openshell gateway start`)
+//! - A running openshell gateway (`mise run gateway:docker`)
 //! - The `openshell` binary (built automatically from the workspace)
 
 use std::process::Stdio;
@@ -84,7 +84,6 @@ async fn auto_created_provider_credential_available_in_sandbox() {
         .arg("--provider")
         .arg("claude")
         .arg("--auto-providers")
-        .arg("--no-bootstrap")
         .arg("--")
         .arg("printenv")
         .arg("ANTHROPIC_API_KEY")

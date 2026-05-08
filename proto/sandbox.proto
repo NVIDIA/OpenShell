@@ -70,7 +70,7 @@ message NetworkEndpoint {
   // Single port (backwards compat). Use `ports` for multiple ports.
   // Mutually exclusive with `ports` — if both are set, `ports` takes precedence.
   uint32 port = 2;
-  // Application protocol for L7 inspection: "rest", "sql", or "" (L4-only).
+  // Application protocol for L7 inspection: "rest", "graphql", "sql", or "" (L4-only).
   string protocol = 3;
   // TLS handling: "terminate" or "passthrough" (default).
   string tls = 4;
@@ -102,6 +102,30 @@ message NetworkEndpoint {
   // upstreams like GitLab that embed %2F in namespaced resource paths.
   // Defaults to false (strict).
   bool allow_encoded_slash = 11;
+  // GraphQL persisted-query behavior for hash-only/saved-query requests:
+  // "deny" (default) or "allow_registered".
+  string persisted_queries = 12;
+  // Trusted GraphQL persisted-query registry keyed by hash or service-specific ID.
+  // Only used when persisted_queries is "allow_registered".
+  map<string, GraphqlOperation> graphql_persisted_queries = 13;
+  // Maximum GraphQL request body bytes to buffer for inspection.
+  // Defaults to 65536 when unset.
+  uint32 graphql_max_body_bytes = 14;
+  // Optional HTTP path glob that scopes this L7 endpoint on shared host:port APIs.
+  // Example: use path "/graphql" for protocol "graphql" and "/repos/**" for
+  // protocol "rest" when both surfaces live under api.example.com:443.
+  // Empty means all paths.
+  string path = 15;
+}
+
+// Trusted GraphQL operation classification.
+message GraphqlOperation {
+  // Operation type: "query", "mutation", or "subscription".
+  string operation_type = 1;
+  // Operation name, if known.
+  string operation_name = 2;
+  // Root field names selected by the operation.
+  repeated string fields = 3;
 }
 
 // An L7 deny rule that blocks specific requests.
@@ -117,6 +141,13 @@ message L7DenyRule {
   // Query parameter matcher map (REST).
   // Same semantics as L7Allow.query.
   map<string, L7QueryMatcher> query = 4;
+  // GraphQL operation type: "query", "mutation", "subscription", or "*" for any.
+  string operation_type = 5;
+  // GraphQL operation name glob. "*" matches any operation name.
+  string operation_name = 6;
+  // GraphQL root field globs. Deny rules match when any selected root field
+  // matches any configured glob.
+  repeated string fields = 7;
 }
 
 // An L7 policy rule (allow-only).
@@ -136,6 +167,13 @@ message L7Allow {
   // Key is the decoded query parameter name (case-sensitive).
   // Value supports either a single glob (`glob`) or a list (`any`).
   map<string, L7QueryMatcher> query = 4;
+  // GraphQL operation type: "query", "mutation", "subscription", or "*" for any.
+  string operation_type = 5;
+  // GraphQL operation name glob. "*" matches any operation name.
+  string operation_name = 6;
+  // GraphQL root field globs. Allow rules match only when every selected root
+  // field matches one of the configured globs. Omit to match all fields.
+  repeated string fields = 7;
 }
 
 // Query value matcher for one query parameter key.

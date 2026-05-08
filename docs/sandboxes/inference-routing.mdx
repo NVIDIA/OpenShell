@@ -1,0 +1,230 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Inference Routing"
+sidebar-title: "Inference Routing"
+description: "Understand and configure OpenShell inference routing through inference.local and external endpoints."
+keywords: "Generative AI, Cybersecurity, Inference Routing, Configuration, Privacy, LLM, Provider"
+position: 5
+---
+
+OpenShell handles inference traffic through two paths: external endpoints and `inference.local`.
+
+| Path | How it works |
+|---|---|
+| External endpoints | Traffic to hosts like `api.openai.com` or `api.anthropic.com` is treated like any other outbound request, allowed or denied by `network_policies`. Refer to [Policies](/sandboxes/policies). |
+| `inference.local` | A sandbox-local HTTPS endpoint that routes model requests through the gateway. The privacy router strips sandbox-supplied credentials, forwards only approved inference headers, injects the configured backend credentials, and forwards to the managed model endpoint. |
+
+## How `inference.local` Works
+
+When code inside a sandbox calls `https://inference.local`, the privacy router routes the request to the configured backend for that gateway. The configured model is applied to generation requests, provider credentials come from OpenShell rather than from code inside the sandbox, and only approved inference headers are forwarded upstream.
+
+If code calls an external inference host directly, OpenShell evaluates that traffic only through `network_policies`.
+
+| Property | Detail |
+|---|---|
+| Credentials | No sandbox API keys needed. Credentials come from the configured provider record. The router strips caller-supplied `Authorization` before forwarding the request. |
+| Header forwarding | `inference.local` forwards only a per-provider header allowlist. OpenAI routes allow `openai-organization` and `x-model-id`. Anthropic routes allow `anthropic-version` and `anthropic-beta`. NVIDIA routes allow `x-model-id`. All other caller headers are stripped. |
+| Configuration | One provider and one model define sandbox inference for the active gateway. Every sandbox on that gateway sees the same `inference.local` backend. |
+| Provider support | NVIDIA, any OpenAI-compatible provider, and Anthropic all work through the same endpoint. |
+| Streaming reliability | The router tolerates idle gaps of up to 120 seconds between streamed chunks so long reasoning responses are not cut off mid-stream. |
+| Hot refresh | OpenShell picks up provider credential changes and inference updates without recreating sandboxes. Changes propagate within about 5 seconds by default. |
+
+## Supported API Patterns
+
+Supported request patterns depend on the provider configured for `inference.local`.
+
+<Tabs>
+<Tab title="OpenAI-compatible">
+
+| Pattern | Method | Path |
+|---|---|---|
+| Chat Completions | `POST` | `/v1/chat/completions` |
+| Completions | `POST` | `/v1/completions` |
+| Responses | `POST` | `/v1/responses` |
+| Model Discovery | `GET` | `/v1/models` |
+| Model Discovery | `GET` | `/v1/models/*` |
+
+</Tab>
+
+<Tab title="Anthropic-compatible">
+
+| Pattern | Method | Path |
+|---|---|---|
+| Messages | `POST` | `/v1/messages` |
+
+</Tab>
+</Tabs>
+
+Requests to `inference.local` that do not match the configured provider's supported patterns are denied.
+
+## Configure Inference Routing
+
+The managed local inference endpoint uses three values:
+
+| Value | Description |
+|---|---|
+| Provider record | The credential backend OpenShell uses to authenticate with the upstream model host. |
+| Model ID | The model to use for generation requests. |
+| Timeout | Per-request timeout in seconds for upstream inference calls. Defaults to 60 seconds. |
+
+For tested providers and base URLs, refer to [Supported Inference Providers](/sandboxes/manage-providers#supported-inference-providers).
+
+## Create a Provider
+
+Create a provider that holds the backend credentials you want OpenShell to use.
+
+<Tabs>
+<Tab title="NVIDIA API Catalog">
+
+```shell
+openshell provider create --name nvidia-prod --type nvidia --from-existing
+```
+
+This reads `NVIDIA_API_KEY` from your environment.
+
+</Tab>
+
+<Tab title="OpenAI-compatible Provider">
+
+Any cloud provider that exposes an OpenAI-compatible API works with the `openai` provider type. You need three values from the provider: the base URL, an API key, and a model name.
+
+```shell
+openshell provider create \
+    --name my-cloud-provider \
+    --type openai \
+    --credential OPENAI_API_KEY=<your_api_key> \
+    --config OPENAI_BASE_URL=https://api.example.com/v1
+```
+
+Replace the base URL and API key with the values from your provider. For supported providers out of the box, refer to [Supported Inference Providers](/sandboxes/manage-providers#supported-inference-providers). For other providers, refer to your provider's documentation for the correct base URL, available models, and API key setup.
+
+</Tab>
+
+<Tab title="Local Endpoint">
+
+```shell
+openshell provider create \
+    --name my-local-model \
+    --type openai \
+    --credential OPENAI_API_KEY=empty-if-not-required \
+    --config OPENAI_BASE_URL=http://host.openshell.internal:11434/v1
+```
+
+Use `--config OPENAI_BASE_URL` to point to any OpenAI-compatible server running where the gateway runs. For host-backed local inference, use `host.openshell.internal` or the host's LAN IP. Avoid `127.0.0.1` and `localhost`. Set `OPENAI_API_KEY` to a dummy value if the server does not require authentication.
+
+<Tip>
+For a self-contained setup, the Ollama sandbox bundles Ollama inside the sandbox itself, so no host-level provider is needed. See [Inference Ollama](/get-started/tutorials/inference-ollama) for details.
+
+</Tip>
+
+Ollama also supports cloud-hosted models using the `:cloud` tag suffix, for example `qwen3.5:cloud`.
+
+</Tab>
+
+<Tab title="Anthropic">
+
+```shell
+openshell provider create --name anthropic-prod --type anthropic --from-existing
+```
+
+This reads `ANTHROPIC_API_KEY` from your environment.
+
+</Tab>
+</Tabs>
+
+## Set Inference Routing
+
+Point `inference.local` at that provider and choose the model to use:
+
+```shell
+openshell inference set \
+    --provider nvidia-prod \
+    --model nvidia/nemotron-3-nano-30b-a3b
+```
+
+To override the default 60-second per-request timeout, add `--timeout`:
+
+```shell
+openshell inference set \
+    --provider nvidia-prod \
+    --model nvidia/nemotron-3-nano-30b-a3b \
+    --timeout 300
+```
+
+The value is in seconds. When `--timeout` is omitted or set to `0`, the default of 60 seconds applies. Increase `--timeout` when you expect extended thinking phases so the full response completes before the request deadline.
+
+## Inspect and Update the Config
+
+Confirm that the provider and model are set correctly:
+
+```shell
+openshell inference get
+Gateway inference:
+
+  Provider: nvidia-prod
+  Model: nvidia/nemotron-3-nano-30b-a3b
+  Timeout: 300s
+  Version: 1
+```
+
+Use `update` when you want to change only one field:
+
+```shell
+openshell inference update --model nvidia/nemotron-3-nano-30b-a3b
+openshell inference update --provider openai-prod
+openshell inference update --timeout 120
+```
+
+## Use the Local Endpoint from a Sandbox
+
+After inference is configured, code inside any sandbox can call `https://inference.local` directly:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="https://inference.local/v1", api_key="unused")
+
+response = client.chat.completions.create(
+    model="anything",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+The client-supplied `model` and `api_key` values are not sent upstream. The privacy router injects the real credentials from the configured provider and rewrites the model before forwarding. Some SDKs require a non-empty API key even though `inference.local` does not use the sandbox-provided value. In those cases, pass any placeholder such as `test` or `unused`.
+
+Use this endpoint when inference should stay local to the host for privacy and security reasons. External providers that should be reached directly belong in `network_policies` instead.
+
+When the upstream runs on the same machine as the gateway, bind it to `0.0.0.0` and point the provider at `host.openshell.internal` or the host's LAN IP. `127.0.0.1` and `localhost` usually fail because the request originates from the gateway or sandbox runtime, not from your shell.
+
+If the gateway runs on a remote host or behind a cloud deployment, `host.openshell.internal` points to that remote machine, not to your laptop. A locally running Ollama or vLLM process is not reachable from a remote gateway unless you add your own tunnel or shared network path.
+
+## Verify from a Sandbox
+
+`openshell inference set` and `openshell inference update` verify the resolved upstream endpoint by default before saving the configuration. If the endpoint is not live yet, retry with `--no-verify` to persist the route without the probe.
+
+To confirm end-to-end connectivity from a sandbox, run:
+
+```shell
+curl https://inference.local/v1/responses \
+    -H "Content-Type: application/json" \
+    -d '{
+      "instructions": "You are a helpful assistant.",
+      "input": "Hello!"
+    }'
+```
+
+A successful response confirms the privacy router can reach the configured backend and the model is serving requests.
+
+- Gateway-scoped: Every sandbox using the active gateway sees the same `inference.local` backend.
+- HTTPS only: `inference.local` is intercepted only for HTTPS traffic.
+- Hot reload: Provider, model, and timeout changes are picked up by running sandboxes within about 5 seconds by default. No sandbox recreation is required.
+
+## Next Steps
+
+Explore related topics:
+
+- To follow a complete Ollama-based local setup, refer to [Inference Ollama](/get-started/tutorials/inference-ollama).
+- To follow a complete LM Studio-based local setup, refer to [Local Inference LM Studio](/get-started/tutorials/local-inference-lmstudio).
+- To control external endpoints, refer to [Policies](/sandboxes/policies).
+- To manage provider records, refer to [Providers](/sandboxes/manage-providers).

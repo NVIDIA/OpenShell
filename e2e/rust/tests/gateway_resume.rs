@@ -3,335 +3,224 @@
 
 #![cfg(feature = "e2e")]
 
-//! E2E tests for gateway resume from existing state.
+//! E2E coverage for resuming Docker sandboxes after a standalone gateway restart.
 //!
-//! All scenarios run inside a **single** `#[tokio::test]` so they execute
-//! in a deterministic order and share a known-good gateway state.  Each
-//! scenario restores the gateway to a healthy state before the next one
-//! begins, preventing cascading failures.
-//!
-//! **Requires a running gateway** — the `e2e:rust` mise task bootstraps one.
+//! This intentionally targets the Docker-driver gateway started by
+//! `e2e/with-docker-gateway.sh`. Existing-endpoint E2E runs do not own the
+//! gateway process, so they skip this restart-only coverage.
 
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::gateway::ManagedGateway;
 use openshell_e2e::harness::output::strip_ansi;
+use openshell_e2e::harness::sandbox::SandboxGuard;
 use tokio::time::sleep;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+const MANAGED_BY_LABEL_FILTER: &str = "label=openshell.ai/managed-by=openshell";
+const READY_MARKER: &str = "gateway-resume-ready";
+const SANDBOX_NAMESPACE_LABEL: &str = "openshell.ai/sandbox-namespace";
+const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
 
-/// Resolve the gateway name from the `OPENSHELL_GATEWAY` env var (the same
-/// variable the CLI reads), falling back to `"openshell"` which matches CI.
-fn gateway_name() -> String {
-    std::env::var("OPENSHELL_GATEWAY").unwrap_or_else(|_| "openshell".to_string())
-}
-
-/// Docker container name for the e2e gateway.
-fn container_name() -> String {
-    format!("openshell-cluster-{}", gateway_name())
-}
-
-/// Run `openshell <args>` and return (combined output, exit code).
 async fn run_cli(args: &[&str]) -> (String, i32) {
     let mut cmd = openshell_cmd();
-    cmd.args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = cmd.output().await.expect("spawn openshell");
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
     let code = output.status.code().unwrap_or(-1);
     (combined, code)
 }
 
-/// Run `docker <args>` synchronously and return (stdout, exit code).
-fn docker_cmd(args: &[&str]) -> (String, i32) {
+async fn wait_for_healthy(timeout: Duration) -> Result<(), String> {
+    let start = Instant::now();
+    let mut last_output: String;
+
+    loop {
+        let (output, code) = run_cli(&["status"]).await;
+        let clean = strip_ansi(&output);
+        let lower = clean.to_lowercase();
+        if code == 0
+            && (lower.contains("healthy")
+                || lower.contains("running")
+                || lower.contains("connected"))
+        {
+            return Ok(());
+        }
+        last_output = clean;
+
+        if start.elapsed() > timeout {
+            return Err(format!(
+                "gateway did not become healthy within {}s. Last output:\n{last_output}",
+                timeout.as_secs()
+            ));
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn sandbox_names() -> Result<Vec<String>, String> {
+    let (output, code) = run_cli(&["sandbox", "list", "--names"]).await;
+    let clean = strip_ansi(&output);
+    if code != 0 {
+        return Err(format!("sandbox list failed (exit {code}):\n{clean}"));
+    }
+
+    Ok(clean
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+fn sandbox_container_id(namespace: &str, sandbox_name: &str) -> Result<String, String> {
+    let namespace_filter = format!("label={SANDBOX_NAMESPACE_LABEL}={namespace}");
+    let sandbox_name_filter = format!("label={SANDBOX_NAME_LABEL}={sandbox_name}");
     let output = Command::new("docker")
-        .args(args)
+        .args(["ps", "-aq", "--filter", MANAGED_BY_LABEL_FILTER, "--filter"])
+        .arg(namespace_filter)
+        .args(["--filter"])
+        .arg(sandbox_name_filter)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("spawn docker");
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let code = output.status.code().unwrap_or(-1);
-    (stdout, code)
-}
-
-/// Wait for the gateway to become healthy by polling `openshell status`.
-async fn wait_for_healthy(timeout: Duration) {
-    let start = std::time::Instant::now();
-    loop {
-        let (output, code) = run_cli(&["status"]).await;
-        let clean = strip_ansi(&output).to_lowercase();
-        if code == 0
-            && (clean.contains("healthy")
-                || clean.contains("running")
-                || clean.contains("connected")
-                || clean.contains("✓"))
-        {
-            return;
-        }
-        if start.elapsed() > timeout {
-            panic!(
-                "gateway did not become healthy within {}s. Last output:\n{}",
-                timeout.as_secs(),
-                strip_ansi(&output)
-            );
-        }
-        sleep(Duration::from_secs(3)).await;
+        .map_err(|err| format!("failed to run docker ps: {err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    if !output.status.success() {
+        return Err(format!(
+            "docker ps failed (exit {:?}):\n{combined}",
+            output.status.code()
+        ));
     }
-}
 
-/// Read the SSH handshake secret from the K8s secret inside the cluster.
-fn read_ssh_handshake_secret() -> Option<String> {
-    let cname = container_name();
-    let (output, code) = docker_cmd(&[
-        "exec",
-        &cname,
-        "sh",
-        "-c",
-        "KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n openshell get secret openshell-ssh-handshake -o jsonpath='{.data.secret}' 2>/dev/null",
-    ]);
-    if code == 0 && !output.trim().is_empty() {
-        Some(output.trim().to_string())
-    } else {
-        None
-    }
-}
-
-/// Extract the sandbox name from `openshell sandbox create` output.
-fn extract_sandbox_name(output: &str) -> String {
-    strip_ansi(output)
+    let ids = stdout
         .lines()
-        .find_map(|line| {
-            if let Some((_, rest)) = line.split_once("Created sandbox:") {
-                rest.split_whitespace().next().map(ToOwned::to_owned)
-            } else if let Some((_, rest)) = line.split_once("Name:") {
-                rest.split_whitespace().next().map(ToOwned::to_owned)
-            } else {
-                None
-            }
-        })
-        .expect("should extract sandbox name from create output")
-}
-
-/// Run `gateway start` and log the output if it fails (non-fatal — the
-/// test relies on [`wait_for_healthy`] for the real assertion).
-async fn start_gateway() {
-    let (output, code) = run_cli(&["gateway", "start"]).await;
-    if code != 0 {
-        eprintln!(
-            "gateway start exited {code} (may still recover):\n{}",
-            strip_ansi(&output)
-        );
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    match ids.as_slice() {
+        [id] => Ok((*id).to_string()),
+        [] => Err(format!(
+            "no Docker container found for sandbox '{sandbox_name}' in namespace '{namespace}'"
+        )),
+        _ => Err(format!(
+            "multiple Docker containers found for sandbox '{sandbox_name}' in namespace '{namespace}': {ids:?}"
+        )),
     }
 }
 
-// ---------------------------------------------------------------------------
-// Orchestrated test suite
-// ---------------------------------------------------------------------------
+fn sandbox_container_running(namespace: &str, sandbox_name: &str) -> Result<bool, String> {
+    let container_id = sandbox_container_id(namespace, sandbox_name)?;
+    let output = Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Running}}", &container_id])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("failed to run docker inspect: {err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    if !output.status.success() {
+        return Err(format!(
+            "docker inspect failed (exit {:?}):\n{combined}",
+            output.status.code()
+        ));
+    }
 
-/// Single entry-point that runs every resume scenario in a fixed order.
-///
-/// Running as one `#[tokio::test]` gives us:
-///   - **Deterministic ordering** — no async-mutex races.
-///   - **Cascade prevention** — each scenario starts only after the previous
-///     one left the gateway healthy.
-///   - **No task-runner hacks** — no `--test-threads`, `--skip`, or split
-///     cargo invocations.
+    match stdout.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!(
+            "unexpected Docker running state for container {container_id}: {other}"
+        )),
+    }
+}
+
+async fn wait_for_container_running(
+    namespace: &str,
+    sandbox_name: &str,
+    expected: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let start = Instant::now();
+    let mut last_state: String;
+
+    loop {
+        match sandbox_container_running(namespace, sandbox_name) {
+            Ok(running) if running == expected => return Ok(()),
+            Ok(running) => last_state = format!("running={running}"),
+            Err(err) => last_state = err,
+        }
+
+        if start.elapsed() > timeout {
+            return Err(format!(
+                "sandbox container '{sandbox_name}' did not reach running={expected} within {}s. Last state: {last_state}",
+                timeout.as_secs()
+            ));
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
 #[tokio::test]
-async fn gateway_resume_scenarios() {
-    // The gateway must already be running (bootstrapped by the `cluster` task).
-    wait_for_healthy(Duration::from_secs(30)).await;
+async fn docker_gateway_restart_resumes_running_sandbox() {
+    let Some(gateway) = ManagedGateway::from_env().expect("load managed e2e gateway metadata")
+    else {
+        eprintln!("Skipping gateway resume test: e2e gateway is not managed by this test run");
+        return;
+    };
+    let Some(namespace) = std::env::var("OPENSHELL_E2E_DOCKER_NETWORK_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        eprintln!("Skipping gateway resume test: Docker e2e namespace is unavailable");
+        return;
+    };
 
-    // Warm the sandbox base image by creating (and deleting) a throwaway
-    // sandbox.  On a fresh cluster the ~1 GB image pull can take minutes;
-    // doing it once up-front keeps the actual scenarios snappy.
-    eprintln!("--- warmup: pulling sandbox base image ---");
-    let (output, code) =
-        run_cli(&["sandbox", "create", "--", "echo", "warmup"]).await;
-    if code == 0 {
-        let name = extract_sandbox_name(&output);
-        let _ = run_cli(&["sandbox", "delete", &name]).await;
-    } else {
-        eprintln!(
-            "warmup sandbox create failed (non-fatal, image may already be cached):\n{}",
-            strip_ansi(&output)
-        );
-    }
+    wait_for_healthy(Duration::from_secs(30))
+        .await
+        .expect("gateway should start healthy");
 
-    scenario_start_on_running_gateway().await;
-    scenario_ssh_secret_persists_across_restart().await;
-    scenario_stop_start_resumes_with_sandbox().await;
-    scenario_container_kill_resumes().await;
-    scenario_container_removal_resumes().await;
-}
+    let mut sandbox = SandboxGuard::create_keep(
+        &[
+            "sh",
+            "-c",
+            "echo gateway-resume-ready; while true; do sleep 1; done",
+        ],
+        READY_MARKER,
+    )
+    .await
+    .expect("create long-running sandbox");
 
-// ---------------------------------------------------------------------------
-// Scenario: `gateway start` on an already-running gateway
-// ---------------------------------------------------------------------------
+    wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_secs(60))
+        .await
+        .expect("sandbox container should be running before gateway restart");
 
-async fn scenario_start_on_running_gateway() {
-    eprintln!("--- scenario: start on running gateway ---");
+    gateway.stop().expect("stop e2e gateway");
+    wait_for_container_running(&namespace, &sandbox.name, false, Duration::from_secs(120))
+        .await
+        .expect("gateway shutdown should stop managed Docker sandboxes");
 
-    let (output, code) = run_cli(&["gateway", "start"]).await;
-    let clean = strip_ansi(&output);
+    gateway.start().expect("restart e2e gateway");
+    wait_for_healthy(Duration::from_secs(120))
+        .await
+        .expect("gateway should become healthy after restart");
+    wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_secs(120))
+        .await
+        .expect("gateway startup should resume the Docker sandbox container");
 
-    assert_eq!(
-        code, 0,
-        "gateway start on running gateway should exit 0:\n{clean}"
-    );
+    let names = sandbox_names().await.expect("list sandboxes after restart");
     assert!(
-        clean.to_lowercase().contains("already running"),
-        "output should indicate gateway is already running:\n{clean}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Scenario: SSH handshake secret persists across restart
-// ---------------------------------------------------------------------------
-
-async fn scenario_ssh_secret_persists_across_restart() {
-    eprintln!("--- scenario: SSH secret persists across restart ---");
-
-    let secret_before =
-        read_ssh_handshake_secret().expect("SSH handshake secret should exist before restart");
-    assert!(
-        !secret_before.is_empty(),
-        "SSH handshake secret should not be empty"
+        names.contains(&sandbox.name),
+        "sandbox '{}' should still be listed after gateway restart. Names: {names:?}",
+        sandbox.name
     );
 
-    // Stop → start.
-    let (_, stop_code) = run_cli(&["gateway", "stop"]).await;
-    assert_eq!(stop_code, 0, "gateway stop should succeed");
-    sleep(Duration::from_secs(3)).await;
-
-    start_gateway().await;
-    wait_for_healthy(Duration::from_secs(300)).await;
-
-    let secret_after =
-        read_ssh_handshake_secret().expect("SSH handshake secret should exist after restart");
-    assert_eq!(
-        secret_before, secret_after,
-        "SSH handshake secret should be identical before and after restart"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Scenario: stop → start resumes, sandbox survives
-// ---------------------------------------------------------------------------
-
-async fn scenario_stop_start_resumes_with_sandbox() {
-    eprintln!("--- scenario: stop/start resumes with sandbox ---");
-
-    // Create a sandbox.
-    let (output, code) =
-        run_cli(&["sandbox", "create", "--", "echo", "resume-test"]).await;
-    assert_eq!(
-        code, 0,
-        "sandbox create should succeed:\n{}",
-        strip_ansi(&output)
-    );
-    let sandbox_name = extract_sandbox_name(&output);
-
-    // Stop → start.
-    let (stop_output, stop_code) = run_cli(&["gateway", "stop"]).await;
-    assert_eq!(
-        stop_code, 0,
-        "gateway stop should succeed:\n{}",
-        strip_ansi(&stop_output)
-    );
-    sleep(Duration::from_secs(3)).await;
-
-    // Verify container is stopped.
-    let (inspect_out, _) = docker_cmd(&[
-        "inspect",
-        "-f",
-        "{{.State.Running}}",
-        &container_name(),
-    ]);
-    assert_eq!(
-        inspect_out.trim(),
-        "false",
-        "container should be stopped after gateway stop"
-    );
-
-    start_gateway().await;
-    wait_for_healthy(Duration::from_secs(300)).await;
-
-    // Verify sandbox survived.
-    let (list_output, list_code) = run_cli(&["sandbox", "list", "--names"]).await;
-    let clean_list = strip_ansi(&list_output);
-    assert_eq!(
-        list_code, 0,
-        "sandbox list should succeed:\n{clean_list}"
-    );
-    assert!(
-        clean_list.contains(&sandbox_name),
-        "sandbox '{sandbox_name}' should survive stop/start.\nList:\n{clean_list}"
-    );
-
-    let _ = run_cli(&["sandbox", "delete", &sandbox_name]).await;
-}
-
-// ---------------------------------------------------------------------------
-// Scenario: container killed → resume with stale network
-// ---------------------------------------------------------------------------
-
-async fn scenario_container_kill_resumes() {
-    eprintln!("--- scenario: container kill resumes ---");
-
-    let cname = container_name();
-    let net_name = format!("openshell-cluster-{}", gateway_name());
-
-    // Kill the container.
-    let (_, kill_code) = docker_cmd(&["kill", &cname]);
-    assert_eq!(kill_code, 0, "docker kill should succeed");
-    sleep(Duration::from_secs(3)).await;
-
-    // Remove the network to simulate a stale network reference.
-    // The bootstrap `ensure_network` always destroys and recreates, so
-    // after this the container's stored network ID will be invalid.
-    let _ = docker_cmd(&["network", "disconnect", "-f", &net_name, &cname]);
-    let (_, net_rm_code) = docker_cmd(&["network", "rm", &net_name]);
-    assert_eq!(
-        net_rm_code, 0,
-        "docker network rm should succeed"
-    );
-
-    // Resume — must handle stale network + reuse existing PKI.
-    start_gateway().await;
-    wait_for_healthy(Duration::from_secs(300)).await;
-}
-
-// ---------------------------------------------------------------------------
-// Scenario: container removed → resume from volume
-// ---------------------------------------------------------------------------
-
-async fn scenario_container_removal_resumes() {
-    eprintln!("--- scenario: container removal resumes ---");
-
-    // Force-remove the container.
-    let (_, rm_code) = docker_cmd(&["rm", "-f", &container_name()]);
-    assert_eq!(rm_code, 0, "docker rm -f should succeed");
-
-    // Volume should survive.
-    let (vol_out, vol_code) = docker_cmd(&[
-        "volume",
-        "inspect",
-        &format!("openshell-cluster-{}", gateway_name()),
-    ]);
-    assert_eq!(
-        vol_code, 0,
-        "volume should still exist after container removal:\n{vol_out}"
-    );
-
-    // Resume from volume.
-    start_gateway().await;
-    wait_for_healthy(Duration::from_secs(300)).await;
+    sandbox.cleanup().await;
 }

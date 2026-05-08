@@ -34,12 +34,11 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-sandbox/` | Sandbox runtime | Container supervision, policy-enforced egress routing |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
 | `crates/openshell-router/` | Privacy router | Privacy-aware LLM routing |
-| `crates/openshell-bootstrap/` | Cluster bootstrap | K3s cluster setup, image loading, mTLS PKI |
+| `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.7.0 event types, builders, shorthand/JSONL formatters, tracing layers |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
 | `crates/openshell-providers/` | Provider management | Credential provider backends |
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
-| `crates/openshell-vm/` | MicroVM runtime | Experimental, work-in-progress libkrun-based VM execution |
 | `crates/openshell-driver-kubernetes/` | Kubernetes compute driver | In-process `ComputeDriver` backend for K8s sandbox pods |
 | `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
@@ -154,7 +153,7 @@ ocsf_emit!(event);
 
 ## Sandbox Infra Changes
 
-- If you change sandbox infrastructure, ensure `mise run sandbox` succeeds.
+- If you change sandbox infrastructure, ensure the relevant sandbox e2e path succeeds.
 
 ## Commits
 
@@ -172,7 +171,7 @@ ocsf_emit!(event);
 
 - `mise run pre-commit` — Lint, format, license headers. Run before every commit.
 - `mise run test` — Unit test suite. Run after code changes.
-- `mise run e2e` — End-to-end tests against a running cluster. Run for infrastructure, sandbox, or policy changes.
+- `mise run e2e` — End-to-end tests against a running gateway. Run for infrastructure, sandbox, or policy changes.
 - `mise run ci` — Full local CI (lint + compile/type checks + tests). Run before opening a PR.
 
 ## Python
@@ -185,7 +184,7 @@ ocsf_emit!(event);
 
 ## Cluster Infrastructure Changes
 
-- If you change cluster bootstrap infrastructure (e.g., `openshell-bootstrap` crate, `deploy/docker/Dockerfile.images`, `cluster-entrypoint.sh`, `cluster-healthcheck.sh`, deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `.agents/skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
+- If you change gateway deployment infrastructure (e.g., Helm values/templates, gateway image packaging, or deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `.agents/skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
 
 ## Documentation
 
@@ -195,6 +194,17 @@ ocsf_emit!(event);
 - Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
 - Fern PR previews run through `.github/workflows/branch-docs.yml`, and production publish runs through the `publish-fern-docs` job in `.github/workflows/release-tag.yml`.
 - Use the `update-docs` skill to scan recent commits and draft doc updates.
+
+### Architecture Docs
+
+- Architecture docs are short canonical subsystem overviews, not exhaustive implementation notes.
+- Update one of the existing top-level architecture docs before adding a new file.
+- Put useful crate-specific details in the relevant crate `README.md`.
+- Add a new top-level architecture doc only when explicitly requested or when an RFC-level design needs a stable home.
+- Keep architecture docs focused on stable boundaries, data/control flow, invariants, and operational constraints.
+- Remove stale detail instead of preserving it by default.
+- Do not include testing transcripts, historical debugging notes, long source-file inventories, or field-by-field schema references.
+- Put user-facing instructions in `docs/`, broad design proposals in `rfc/`, and temporary plans in ignored `architecture/plans/`.
 
 ## Security
 

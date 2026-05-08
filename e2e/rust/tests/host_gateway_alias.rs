@@ -4,20 +4,19 @@
 #![cfg(feature = "e2e")]
 
 use std::io::Write;
-use std::process::Command;
 use std::process::Stdio;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::port::find_free_port;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
-use tokio::time::{interval, timeout};
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 
 const INFERENCE_PROVIDER_NAME: &str = "e2e-host-inference";
 const INFERENCE_PROVIDER_UNREACHABLE_NAME: &str = "e2e-host-inference-unreachable";
-const TEST_SERVER_IMAGE: &str = "public.ecr.aws/docker/library/python:3.13-alpine";
 static INFERENCE_ROUTE_LOCK: Mutex<()> = Mutex::new(());
 
 async fn run_cli(args: &[&str]) -> Result<String, String> {
@@ -44,117 +43,63 @@ async fn run_cli(args: &[&str]) -> Result<String, String> {
     Ok(combined)
 }
 
-struct DockerServer {
+struct HostServer {
     port: u16,
-    container_id: String,
+    task: JoinHandle<()>,
 }
 
-impl DockerServer {
+impl HostServer {
     async fn start(response_body: &str) -> Result<Self, String> {
-        let port = find_free_port();
-        let script = r#"from http.server import BaseHTTPRequestHandler, HTTPServer
-import os
-
-BODY = os.environ["RESPONSE_BODY"].encode()
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(BODY)))
-        self.end_headers()
-        self.wfile.write(BODY)
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        if length:
-            self.rfile.read(length)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(BODY)))
-        self.end_headers()
-        self.wfile.write(BODY)
-
-    def log_message(self, format, *args):
-        pass
-
-HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
-"#;
-
-        let output = Command::new("docker")
-            .args([
-                "run",
-                "--detach",
-                "--rm",
-                "-e",
-                &format!("RESPONSE_BODY={response_body}"),
-                "-p",
-                &format!("{port}:8000"),
-                TEST_SERVER_IMAGE,
-                "python3",
-                "-c",
-                script,
-            ])
-            .output()
-            .map_err(|e| format!("start docker test server: {e}"))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        if !output.status.success() {
-            return Err(format!(
-                "docker run failed (exit {:?}):\n{stderr}",
-                output.status.code()
-            ));
-        }
-
-        let server = Self {
-            port,
-            container_id: stdout,
-        };
-        server.wait_until_ready().await?;
-        Ok(server)
-    }
-
-    async fn wait_until_ready(&self) -> Result<(), String> {
-        let container_id = self.container_id.clone();
-        timeout(Duration::from_secs(60), async move {
-            let mut tick = interval(Duration::from_millis(500));
+        let listener = TcpListener::bind(("0.0.0.0", 0))
+            .await
+            .map_err(|e| format!("bind host test server: {e}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| format!("read host test server address: {e}"))?
+            .port();
+        let response_body = response_body.as_bytes().to_vec();
+        let task = tokio::spawn(async move {
             loop {
-                tick.tick().await;
-                let output = Command::new("docker")
-                    .args([
-                        "exec",
-                        &container_id,
-                        "python3",
-                        "-c",
-                        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000', timeout=1).read()",
-                    ])
-                    .output();
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = response_body.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
 
-                match output {
-                    Ok(result) if result.status.success() => return Ok(()),
-                    Ok(_) | Err(_) => continue,
-                }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    if stream.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.shutdown().await;
+                });
             }
-        })
-        .await
-        .map_err(|_| {
-            format!(
-                "docker test server {} did not become ready within 60s",
-                self.container_id
-            )
-        })?
+        });
+
+        Ok(Self { port, task })
     }
 }
 
-impl Drop for DockerServer {
+impl Drop for HostServer {
     fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &self.container_id])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        self.task.abort();
     }
 }
 
@@ -228,7 +173,10 @@ network_policies:
       - host: host.openshell.internal
         port: {port}
         allowed_ips:
+          - "10.0.0.0/8"
           - "172.0.0.0/8"
+          - "192.168.0.0/16"
+          - "fc00::/7"
     binaries:
       - path: /usr/bin/curl
 "#
@@ -242,7 +190,7 @@ network_policies:
 
 #[tokio::test]
 async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
-    let server = DockerServer::start(r#"{"message":"hello-from-host"}"#)
+    let server = HostServer::start(r#"{"message":"hello-from-host"}"#)
         .await
         .expect("start host echo server");
     let policy = write_policy(server.port).expect("write custom policy");
@@ -289,7 +237,7 @@ async fn sandbox_inference_local_routes_to_host_openshell_internal() {
         return;
     }
 
-    let server = DockerServer::start(
+    let server = HostServer::start(
         r#"{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"host-echo","choices":[{"index":0,"message":{"role":"assistant","content":"hello-from-host"},"finish_reason":"stop"}]}"#,
     )
     .await
@@ -299,7 +247,7 @@ async fn sandbox_inference_local_routes_to_host_openshell_internal() {
         delete_provider(INFERENCE_PROVIDER_NAME).await;
     }
 
-    let create_output = create_openai_provider(
+    create_openai_provider(
         INFERENCE_PROVIDER_NAME,
         &format!("http://host.openshell.internal:{}/v1", server.port),
     )
@@ -313,17 +261,14 @@ async fn sandbox_inference_local_routes_to_host_openshell_internal() {
         INFERENCE_PROVIDER_NAME,
         "--model",
         "host-echo-model",
+        "--no-verify",
     ])
     .await
     .expect("point inference.local at host-backed provider");
 
     assert!(
-        inference_output.contains("Validated Endpoints:"),
-        "expected verification details in output:\n{inference_output}"
-    );
-    assert!(
-        inference_output.contains("/v1/chat/completions (openai_chat_completions)"),
-        "expected validated endpoint in output:\n{inference_output}"
+        !inference_output.contains("Validated Endpoints:"),
+        "did not expect local CLI verification for host-only alias:\n{inference_output}"
     );
 
     let guard = SandboxGuard::create(&[
@@ -352,8 +297,6 @@ async fn sandbox_inference_local_routes_to_host_openshell_internal() {
         "expected sandbox to receive echoed inference content:\n{}",
         guard.create_output
     );
-
-    let _ = create_output;
 }
 
 #[tokio::test]

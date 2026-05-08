@@ -1,0 +1,77 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Installation"
+sidebar-title: "Installation"
+description: "Install OpenShell, choose a compute driver, and connect to a gateway."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Installation, Setup, Gateway, Docker, Podman, MicroVM, Kubernetes"
+position: 3
+---
+
+## Install OpenShell
+
+Install OpenShell with a single command:
+
+```shell
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+```
+
+The script detects your operating system and installs the OpenShell CLI and gateway with your native package manager. It then starts the local gateway server so you can begin creating sandboxes.
+
+You can also download release artifacts directly from the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
+
+Use `openshell status` to confirm the CLI can reach the gateway.
+
+## Supported Compute Drivers
+
+OpenShell supports several local compute drivers. The installer chooses a default driver for your platform, and the gateway reads the driver choice from its startup configuration. Sandbox commands use the same CLI workflow after the gateway is running.
+
+| Compute Driver | How It Is Configured | System Requirements |
+|---|---|---|
+| Podman | The gateway is configured to create rootless Podman containers through the Podman API socket. | Linux with Podman 5.x, cgroups v2, rootless networking, and an active Podman user socket. |
+| Docker | The gateway is configured to create containers through Docker Desktop or Docker Engine. | Docker Desktop or Docker Engine 28.04 or later on the gateway host. |
+| MicroVM | The gateway is configured to create VM-backed sandboxes. | Host virtualization support. MicroVM uses Hypervisor.framework on macOS, KVM on Linux, and QEMU for GPU-backed sandboxes on Linux. |
+
+For detailed driver behavior, refer to [Sandbox Compute Drivers](/reference/sandbox-compute-drivers). For gateway and sandbox operations, refer to [Gateways](/sandboxes/manage-gateways) and [Sandboxes](/sandboxes/manage-sandboxes).
+
+## macOS
+
+On macOS, the install script uses Homebrew. The Homebrew package installs the `openshell` CLI, the gateway binary, and a Homebrew-managed gateway service.
+
+The installer starts the service for you. Use Homebrew service commands when you need to inspect, restart, or stop the gateway service:
+
+```shell
+brew services list
+brew services restart openshell
+```
+
+## Linux
+
+On Fedora and RHEL, the install script uses RPM packages. The RPM installs the `openshell` CLI, the `openshell-gateway` daemon, and a systemd user service.
+
+On Debian and Ubuntu, the install script uses a Debian package. The Debian package installs the `openshell` CLI, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
+
+The installer starts the service for you. Use systemd user commands when you need to inspect, restart, or stop the gateway service:
+
+```shell
+systemctl --user status openshell-gateway
+systemctl --user restart openshell-gateway
+journalctl --user -u openshell-gateway -f
+```
+
+To keep the user service running after logout, enable linger:
+
+```shell
+sudo loginctl enable-linger $USER
+```
+
+## Kubernetes
+
+Kubernetes deployments use the OpenShell Helm chart. For step-by-step installation, refer to [Kubernetes Setup](/kubernetes/setup). For chart values and packaging details, refer to the [Helm chart README](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md).
+
+## Next Steps
+
+- To create your first sandbox, refer to the [Quickstart](/get-started/quickstart).
+- To register, select, and inspect gateways, refer to [Gateways](/sandboxes/manage-gateways).
+- To supply API keys or tokens, refer to [Manage Providers](/sandboxes/manage-providers).
+- To control what the agent can access, refer to [Policies](/sandboxes/policies).

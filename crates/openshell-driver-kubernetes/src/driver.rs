@@ -312,6 +312,8 @@ impl KubernetesComputeDriver {
             sandbox.spec.as_ref(),
             &self.config.default_image,
             &self.config.image_pull_policy,
+            &self.config.supervisor_image,
+            &self.config.supervisor_image_pull_policy,
             &sandbox.id,
             &sandbox.name,
             &self.config.grpc_endpoint,
@@ -657,27 +659,21 @@ fn map_kube_event_to_platform(
 }
 
 /// Path where the supervisor binary is mounted inside the agent container.
-/// The supervisor is always side-loaded from the k3s node filesystem via a
-/// read-only hostPath volume — it is never baked into sandbox images.
 const SUPERVISOR_MOUNT_PATH: &str = "/opt/openshell/bin";
 
 /// Name of the volume used to side-load the supervisor binary.
 const SUPERVISOR_VOLUME_NAME: &str = "openshell-supervisor-bin";
 
-/// Path on the k3s node filesystem where the supervisor binary lives.
-/// This is baked into the cluster image at build time and can be updated
-/// via `docker cp` during local development.
-const SUPERVISOR_HOST_PATH: &str = "/opt/openshell/bin";
+/// Name of the init container that installs the supervisor binary.
+const SUPERVISOR_INIT_CONTAINER_NAME: &str = "openshell-supervisor-install";
 
-/// Build the hostPath volume definition that exposes the supervisor binary
-/// from the k3s node filesystem.
+/// Build the emptyDir volume that holds the supervisor binary.
+///
+/// The init container writes the binary here; the agent container reads it.
 fn supervisor_volume() -> serde_json::Value {
     serde_json::json!({
         "name": SUPERVISOR_VOLUME_NAME,
-        "hostPath": {
-            "path": SUPERVISOR_HOST_PATH,
-            "type": "DirectoryOrCreate"
-        }
+        "emptyDir": {}
     })
 }
 
@@ -690,26 +686,68 @@ fn supervisor_volume_mount() -> serde_json::Value {
     })
 }
 
+/// Path of the supervisor binary inside the supervisor image.
+///
+/// The supervisor image places the binary at the filesystem root. We invoke
+/// it directly so the init path does not depend on shell utilities or PATH
+/// resolution inside the image.
+const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
+
+/// Build the init container that copies the supervisor binary into the emptyDir.
+///
+/// The supervisor image contains the supervisor binary at `/openshell-sandbox`.
+/// We invoke that binary with the `copy-self` subcommand so it copies itself
+/// into the shared emptyDir volume, where the agent container then executes it
+/// from a fixed, writable path. This pattern (binary self-copy) avoids requiring
+/// `sh`/`cp` in the supervisor image and mirrors the approach used by argoexec's
+/// emissary executor.
+fn supervisor_init_container(
+    supervisor_image: &str,
+    supervisor_image_pull_policy: &str,
+) -> serde_json::Value {
+    let installed_path = format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox");
+    let mut spec = serde_json::json!({
+        "name": SUPERVISOR_INIT_CONTAINER_NAME,
+        "image": supervisor_image,
+        "command": [
+            SUPERVISOR_IMAGE_BINARY_PATH,
+            "copy-self",
+            installed_path,
+        ],
+        "securityContext": {"runAsUser": 0},
+        "volumeMounts": [{
+            "name": SUPERVISOR_VOLUME_NAME,
+            "mountPath": SUPERVISOR_MOUNT_PATH,
+            "readOnly": false
+        }]
+    });
+    if !supervisor_image_pull_policy.is_empty() {
+        spec["imagePullPolicy"] = serde_json::json!(supervisor_image_pull_policy);
+    }
+    spec
+}
+
 /// Apply supervisor side-load transforms to an already-built pod template JSON.
 ///
-/// This injects the hostPath volume, volume mount, command override, and
-/// `runAsUser: 0` into the pod template, targeting the `agent` container
-/// (or the first container if no `agent` is found).
-///
-/// The supervisor binary is always side-loaded from the k3s node filesystem
-/// via a read-only hostPath volume. No init container is needed.
+/// Injects an emptyDir volume, an init container that copies the supervisor
+/// binary from the supervisor image into that volume, and a read-only volume
+/// mount + command override on the agent container.
 ///
 /// The `runAsUser: 0` override ensures the supervisor binary runs as root
 /// regardless of the image's `USER` directive. The supervisor needs root for
 /// network namespace creation, proxy setup, and Landlock/seccomp configuration.
 /// It drops to the appropriate non-root user for child processes via the
 /// policy's `run_as_user`/`run_as_group`.
-fn apply_supervisor_sideload(pod_template: &mut serde_json::Value) {
+fn apply_supervisor_sideload(
+    pod_template: &mut serde_json::Value,
+    supervisor_image: &str,
+    supervisor_image_pull_policy: &str,
+) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
     };
 
-    // 1. Add the hostPath volume to spec.volumes
+    // 1. Add the emptyDir volume to spec.volumes
     let volumes = spec
         .entry("volumes")
         .or_insert_with(|| serde_json::json!([]))
@@ -718,7 +756,19 @@ fn apply_supervisor_sideload(pod_template: &mut serde_json::Value) {
         volumes.push(supervisor_volume());
     }
 
-    // 2. Find the agent container and add volume mount + command override
+    // 2. Add the init container that copies the binary into the emptyDir
+    let init_containers = spec
+        .entry("initContainers")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(init_containers) = init_containers {
+        init_containers.push(supervisor_init_container(
+            supervisor_image,
+            supervisor_image_pull_policy,
+        ));
+    }
+
+    // 3. Find the agent container and add volume mount + command override
     let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
         return;
     };
@@ -881,6 +931,8 @@ fn sandbox_to_k8s_spec(
     spec: Option<&SandboxSpec>,
     default_image: &str,
     image_pull_policy: &str,
+    supervisor_image: &str,
+    supervisor_image_pull_policy: &str,
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
@@ -921,6 +973,8 @@ fn sandbox_to_k8s_spec(
                     spec.gpu,
                     default_image,
                     image_pull_policy,
+                    supervisor_image,
+                    supervisor_image_pull_policy,
                     sandbox_id,
                     sandbox_name,
                     grpc_endpoint,
@@ -967,6 +1021,8 @@ fn sandbox_to_k8s_spec(
                 spec.as_ref().is_some_and(|s| s.gpu),
                 default_image,
                 image_pull_policy,
+                supervisor_image,
+                supervisor_image_pull_policy,
                 sandbox_id,
                 sandbox_name,
                 grpc_endpoint,
@@ -992,6 +1048,8 @@ fn sandbox_template_to_k8s(
     gpu: bool,
     default_image: &str,
     image_pull_policy: &str,
+    supervisor_image: &str,
+    supervisor_image_pull_policy: &str,
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
@@ -1003,9 +1061,6 @@ fn sandbox_template_to_k8s(
     host_gateway_ip: &str,
     inject_workspace: bool,
 ) -> serde_json::Value {
-    // The supervisor binary is always side-loaded from the node filesystem
-    // via a hostPath volume, regardless of which sandbox image is used.
-
     let mut metadata = serde_json::Map::new();
     if !template.labels.is_empty() {
         metadata.insert("labels".to_string(), serde_json::json!(template.labels));
@@ -1122,8 +1177,9 @@ fn sandbox_template_to_k8s(
 
     let mut result = serde_json::Value::Object(template_value);
 
-    // Always side-load the supervisor binary from the node filesystem
-    apply_supervisor_sideload(&mut result);
+    // Side-load the supervisor binary via an init container that copies it
+    // from the supervisor image into a shared emptyDir volume.
+    apply_supervisor_sideload(&mut result, supervisor_image, supervisor_image_pull_policy);
 
     // Inject workspace persistence (init container + PVC volume mount) so
     // that /sandbox data survives pod rescheduling.  Skipped when the user
@@ -1437,7 +1493,7 @@ mod tests {
             }
         });
 
-        apply_supervisor_sideload(&mut pod_template);
+        apply_supervisor_sideload(&mut pod_template, "custom-image:latest", "IfNotPresent");
 
         let sc = &pod_template["spec"]["containers"][0]["securityContext"];
         assert_eq!(sc["runAsUser"], 0, "runAsUser must be 0 for supervisor");
@@ -1461,7 +1517,7 @@ mod tests {
             }
         });
 
-        apply_supervisor_sideload(&mut pod_template);
+        apply_supervisor_sideload(&mut pod_template, "supervisor-image:latest", "IfNotPresent");
 
         let sc = &pod_template["spec"]["containers"][0]["securityContext"];
         assert_eq!(
@@ -1471,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_sideload_injects_hostpath_volume_and_mount() {
+    fn supervisor_sideload_injects_emptydir_volume_init_container_and_mount() {
         let mut pod_template = serde_json::json!({
             "spec": {
                 "containers": [{
@@ -1481,24 +1537,46 @@ mod tests {
             }
         });
 
-        apply_supervisor_sideload(&mut pod_template);
+        apply_supervisor_sideload(&mut pod_template, "supervisor-image:latest", "IfNotPresent");
 
-        // No init containers should be present (hostPath, not emptyDir+init)
-        assert!(
-            pod_template["spec"]["initContainers"].is_null(),
-            "hostPath sideload should not create init containers"
-        );
-
-        // Volume should be a hostPath volume
+        // Volume should be an emptyDir
         let volumes = pod_template["spec"]["volumes"]
             .as_array()
             .expect("volumes should exist");
         assert_eq!(volumes.len(), 1);
         assert_eq!(volumes[0]["name"], SUPERVISOR_VOLUME_NAME);
-        assert_eq!(volumes[0]["hostPath"]["path"], SUPERVISOR_HOST_PATH);
-        assert_eq!(volumes[0]["hostPath"]["type"], "DirectoryOrCreate");
+        assert!(
+            volumes[0]["emptyDir"].is_object(),
+            "volume should be emptyDir, not hostPath"
+        );
 
-        // Agent container command should be overridden
+        // Init container should use the supervisor image, not the sandbox image
+        let init_containers = pod_template["spec"]["initContainers"]
+            .as_array()
+            .expect("initContainers should exist");
+        assert_eq!(init_containers.len(), 1);
+        assert_eq!(init_containers[0]["name"], SUPERVISOR_INIT_CONTAINER_NAME);
+        assert_eq!(init_containers[0]["image"], "supervisor-image:latest");
+        assert_eq!(init_containers[0]["imagePullPolicy"], "IfNotPresent");
+
+        // The init container must invoke the binary directly with
+        // `copy-self <DEST>` rather than depending on shell utilities.
+        let init_command = init_containers[0]["command"]
+            .as_array()
+            .expect("init container command should be set");
+        assert_eq!(init_command.len(), 3, "expected [binary, copy-self, dest]");
+        assert_eq!(init_command[0], SUPERVISOR_IMAGE_BINARY_PATH);
+        assert_eq!(init_command[1], "copy-self");
+        assert_eq!(
+            init_command[2].as_str().unwrap(),
+            format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox")
+        );
+        assert!(
+            !init_command.iter().any(|v| v == "sh"),
+            "init container must not depend on a shell"
+        );
+
+        // Agent container command should be overridden to the emptyDir path
         let command = pod_template["spec"]["containers"][0]["command"]
             .as_array()
             .expect("command should be set");
@@ -1507,7 +1585,7 @@ mod tests {
             format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox")
         );
 
-        // Volume mount should be read-only
+        // Agent volume mount should be read-only
         let mounts = pod_template["spec"]["containers"][0]["volumeMounts"]
             .as_array()
             .expect("volumeMounts should exist");
@@ -1572,6 +1650,8 @@ mod tests {
             true,
             "openshell/sandbox:latest",
             "",
+            "openshell/supervisor:latest",
+            "",
             "sandbox-id",
             "sandbox-name",
             "https://gateway.example.com",
@@ -1614,6 +1694,8 @@ mod tests {
             true,
             "openshell/sandbox:latest",
             "",
+            "openshell/supervisor:latest",
+            "",
             "sandbox-id",
             "sandbox-name",
             "https://gateway.example.com",
@@ -1652,6 +1734,8 @@ mod tests {
             false,
             "openshell/sandbox:latest",
             "",
+            "openshell/supervisor:latest",
+            "",
             "sandbox-id",
             "sandbox-name",
             "https://gateway.example.com",
@@ -1686,6 +1770,8 @@ mod tests {
             true,
             "openshell/sandbox:latest",
             "",
+            "openshell/supervisor:latest",
+            "",
             "sandbox-id",
             "sandbox-name",
             "https://gateway.example.com",
@@ -1712,6 +1798,8 @@ mod tests {
             &SandboxTemplate::default(),
             false,
             "openshell/sandbox:latest",
+            "",
+            "openshell/supervisor:latest",
             "",
             "sandbox-id",
             "sandbox-name",
@@ -1744,6 +1832,8 @@ mod tests {
             false,
             "openshell/sandbox:latest",
             "",
+            "openshell/supervisor:latest",
+            "",
             "sandbox-id",
             "sandbox-name",
             "https://gateway.example.com",
@@ -1769,6 +1859,8 @@ mod tests {
             &template,
             false,
             "openshell/sandbox:latest",
+            "",
+            "openshell/supervisor:latest",
             "",
             "sandbox-id",
             "sandbox-name",
@@ -1913,6 +2005,8 @@ mod tests {
             false,
             "openshell/sandbox:latest",
             "",
+            "openshell/supervisor:latest",
+            "",
             "sandbox-id",
             "sandbox-name",
             "https://gateway.example.com",
@@ -1925,12 +2019,14 @@ mod tests {
             false, // user provided custom VCTs
         );
 
-        // No init container should be present
+        // Only the supervisor init container should be present — no workspace init container
+        let init_containers = pod_template["spec"]["initContainers"]
+            .as_array()
+            .expect("supervisor init container should always be present");
         assert!(
-            pod_template["spec"]["initContainers"].is_null()
-                || pod_template["spec"]["initContainers"]
-                    .as_array()
-                    .is_none_or(Vec::is_empty),
+            !init_containers
+                .iter()
+                .any(|c| c["name"] == WORKSPACE_INIT_CONTAINER_NAME),
             "workspace init container must NOT be present when inject_workspace is false"
         );
 

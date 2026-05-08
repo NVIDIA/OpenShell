@@ -112,7 +112,7 @@ fi
 echo "  Token is set"
 
 if ! openshell status >/dev/null 2>&1; then
-    echo -e "${RED}Error: No healthy gateway. Run: openshell gateway start${RESET}"
+    echo -e "${RED}Error: No healthy gateway. Run: mise run gateway:docker${RESET}"
     exit 1
 fi
 echo "  Gateway is healthy"

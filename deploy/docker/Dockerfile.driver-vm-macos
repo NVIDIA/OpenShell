@@ -8,7 +8,7 @@
 #
 # openshell-driver-vm loads libkrun/libkrunfw at runtime via dlopen, so it
 # does NOT need Hypervisor.framework headers at build time. Pre-compressed
-# runtime artifacts (libkrun, libkrunfw, gvproxy, rootfs) are injected via
+# runtime artifacts (libkrun, libkrunfw, gvproxy, bundled supervisor) are injected via
 # the vm-runtime-compressed build context and embedded into the binary via
 # include_bytes!().
 #
@@ -18,11 +18,12 @@
 #     --build-context vm-runtime-compressed=/path/to/compressed-dir \
 #     --output type=local,dest=out/ .
 
-ARG OSXCROSS_IMAGE=crazymax/osxcross:latest
+ARG OSXCROSS_IMAGE=ghcr.io/crazy-max/osxcross:latest
+ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12-slim
 
 FROM ${OSXCROSS_IMAGE} AS osxcross
 
-FROM python:3.12-slim AS builder
+FROM ${PYTHON_IMAGE} AS builder
 
 ARG CARGO_TARGET_CACHE_SCOPE=default
 
