@@ -20,6 +20,10 @@ jobs:
     runs-on: macos-latest-xlarge
     timeout-minutes: 20
     steps:
+      - name: Ensure VM driver
+        run: |
+          launchctl setenv OPENSHELL_DRIVERS vm
+
       - name: Install dev and check status
         run: |
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | OPENSHELL_VERSION=dev sh
