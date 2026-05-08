@@ -360,10 +360,7 @@ fn is_ocsf_denial_line(line: &str) -> bool {
     line.contains(" OCSF ") && line.contains(" DENIED ")
 }
 
-fn collect_shorthand_log_files(
-    log_dir: &Path,
-    max_files: usize,
-) -> std::io::Result<Vec<PathBuf>> {
+fn collect_shorthand_log_files(log_dir: &Path, max_files: usize) -> std::io::Result<Vec<PathBuf>> {
     let mut entries: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(log_dir)?
         .filter_map(std::result::Result::ok)
         .filter_map(|entry| {
@@ -1075,7 +1072,7 @@ mod tests {
 
     #[test]
     fn agent_next_steps_returns_empty_when_flag_off() {
-        let _guard = ProposalsFlagGuard::set(false);
+        let _guard = ProposalsFlagGuard::set_blocking(false);
         let steps = agent_next_steps();
         let arr = steps.as_array().expect("agent_next_steps is an array");
         assert!(
@@ -1086,7 +1083,7 @@ mod tests {
 
     #[test]
     fn agent_next_steps_returns_full_array_when_flag_on() {
-        let _guard = ProposalsFlagGuard::set(true);
+        let _guard = ProposalsFlagGuard::set_blocking(true);
         let steps = agent_next_steps();
         let arr = steps.as_array().expect("agent_next_steps is an array");
         assert_eq!(arr.len(), 4, "expected 4 next_steps when feature is on");
@@ -1100,7 +1097,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_request_returns_feature_disabled_when_flag_off() {
-        let _guard = ProposalsFlagGuard::set(false);
+        let _guard = ProposalsFlagGuard::set(false).await;
         let ctx = PolicyLocalContext::new(
             Some(ProtoSandboxPolicy {
                 version: 1,
@@ -1127,7 +1124,7 @@ mod tests {
 
     #[tokio::test]
     async fn current_policy_route_returns_yaml_envelope() {
-        let _guard = ProposalsFlagGuard::set(true);
+        let _guard = ProposalsFlagGuard::set(true).await;
         let ctx = PolicyLocalContext::new(
             Some(ProtoSandboxPolicy {
                 version: 1,

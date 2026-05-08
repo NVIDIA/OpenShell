@@ -28,9 +28,9 @@ DEMO_KEEP_SANDBOX="${DEMO_KEEP_SANDBOX:-0}"
 DEMO_RETRY_ATTEMPTS="${DEMO_RETRY_ATTEMPTS:-30}"
 DEMO_RETRY_SLEEP="${DEMO_RETRY_SLEEP:-2}"
 
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-agent-policy.XXXXXX")"
-POLICY_FILE="${TMP_DIR}/policy.yaml"
-SSH_CONFIG="${TMP_DIR}/ssh_config"
+TMP_DIR=""
+POLICY_FILE=""
+SSH_CONFIG=""
 SSH_HOST=""
 
 BOLD='\033[1m'
@@ -63,19 +63,11 @@ cleanup() {
         printf "\n${YELLOW}Keeping sandbox because DEMO_KEEP_SANDBOX=1: %s${RESET}\n" "$DEMO_SANDBOX_NAME"
     fi
 
-    # Restore the agent_policy_proposals_enabled setting to what it was
-    # before this run. We saved the prior value in $PRIOR_PROPOSALS_FLAG.
-    if [[ -n "${PRIOR_PROPOSALS_FLAG:-}" ]]; then
-        if [[ "$PRIOR_PROPOSALS_FLAG" == "(unset)" ]]; then
-            "$OPENSHELL_BIN" settings delete --global --key agent_policy_proposals_enabled \
-                >/dev/null 2>&1 || true
-        else
-            "$OPENSHELL_BIN" settings set --global --key agent_policy_proposals_enabled \
-                --value "$PRIOR_PROPOSALS_FLAG" >/dev/null 2>&1 || true
-        fi
-    fi
-
     "$OPENSHELL_BIN" provider delete "$DEMO_GITHUB_PROVIDER_NAME" >/dev/null 2>&1 || true
+
+    if [[ -z "$TMP_DIR" ]]; then
+        return
+    fi
 
     if [[ $status -eq 0 ]]; then
         rm -rf "$TMP_DIR"
@@ -209,19 +201,23 @@ create_provider() {
         --credential GITHUB_TOKEN
 }
 
-enable_agent_proposals() {
-    step "Enabling agent-driven policy proposals"
-    # Snapshot the prior value so cleanup() can restore it. Use a sentinel
-    # for "unset" so we can distinguish from an explicit false on restore.
-    local prior
-    prior="$("$OPENSHELL_BIN" settings get --global --json 2>/dev/null \
-        | grep -o '"agent_policy_proposals_enabled"[^,}]*' \
-        | grep -o 'true\|false' | head -1)"
-    PRIOR_PROPOSALS_FLAG="${prior:-(unset)}"
-    info "  Prior global value: $PRIOR_PROPOSALS_FLAG"
-    "$OPENSHELL_BIN" settings set --global \
-        --key agent_policy_proposals_enabled --value true >/dev/null \
-        || fail "could not set agent_policy_proposals_enabled globally"
+check_agent_proposals_enabled() {
+    step "Checking agent-driven policy proposal opt-in"
+    local value
+    value="$("$OPENSHELL_BIN" settings get --global --json 2>/dev/null \
+        | jq -r '.settings.agent_policy_proposals_enabled // "<unset>"')"
+    if [[ "$value" != "true" ]]; then
+        fail "agent_policy_proposals_enabled must be true before running this test.
+Enable it with:
+  $OPENSHELL_BIN settings set --global --key agent_policy_proposals_enabled --value true --yes"
+    fi
+    info "${GREEN}agent_policy_proposals_enabled=true${RESET}"
+}
+
+create_temp_workspace() {
+    TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-agent-policy.XXXXXX")"
+    POLICY_FILE="${TMP_DIR}/policy.yaml"
+    SSH_CONFIG="${TMP_DIR}/ssh_config"
 }
 
 create_sandbox() {
@@ -393,9 +389,10 @@ show_logs() {
 main() {
     validate_env
     check_gateway
+    check_agent_proposals_enabled
+    create_temp_workspace
     check_github_access
     create_provider
-    enable_agent_proposals
     create_sandbox
     connect_ssh
     run_policy_local_checks

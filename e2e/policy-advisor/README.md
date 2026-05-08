@@ -18,12 +18,37 @@ runs the same loop with Codex driving from inside the sandbox.
 
 ## Run it
 
+Run against an ephemeral Docker gateway:
+
 ```bash
+DEMO_GITHUB_OWNER=<your-handle> \
+DEMO_GITHUB_REPO=openshell-policy-demo \
+e2e/with-docker-gateway.sh bash -lc '
+  target/debug/openshell settings set --global \
+    --key agent_policy_proposals_enabled \
+    --value true \
+    --yes
+  OPENSHELL_BIN="$PWD/target/debug/openshell" bash e2e/policy-advisor/test.sh
+'
+```
+
+To keep the sandbox for debugging, start a local gateway first with
+`mise run gateway:docker`, then run:
+
+```bash
+target/debug/openshell settings set --global \
+  --key agent_policy_proposals_enabled \
+  --value true \
+  --yes
+
+OPENSHELL_GATEWAY=docker-dev \
+OPENSHELL_BIN="$PWD/target/debug/openshell" \
+DEMO_KEEP_SANDBOX=1 \
 DEMO_GITHUB_OWNER=<your-handle> \
 DEMO_GITHUB_REPO=openshell-policy-demo \
 bash e2e/policy-advisor/test.sh
 ```
 
-Requires an active OpenShell gateway (`openshell gateway start`) and a GitHub
-token with contents write on the repository (auto-resolved from `gh auth token`,
-`GITHUB_TOKEN`, or `GH_TOKEN`).
+Requires Docker, `agent_policy_proposals_enabled=true`, and a GitHub token with
+contents write on the repository. The test auto-resolves the token from
+`DEMO_GITHUB_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`.

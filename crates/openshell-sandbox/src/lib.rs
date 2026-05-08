@@ -97,8 +97,8 @@ pub(crate) fn ocsf_ctx() -> &'static SandboxContext {
 /// to gate the agent-controlled mutation surface. Exposed `pub(crate)` so
 /// unit tests in sibling modules can flip the flag through a serialized
 /// guard (see `policy_local::tests::ProposalsFlagGuard`).
-pub(crate) static AGENT_PROPOSALS_ENABLED:
-    OnceLock<Arc<std::sync::atomic::AtomicBool>> = OnceLock::new();
+pub(crate) static AGENT_PROPOSALS_ENABLED: OnceLock<Arc<std::sync::atomic::AtomicBool>> =
+    OnceLock::new();
 
 /// Read the current value of the agent proposals feature flag.
 ///
@@ -113,17 +113,22 @@ pub(crate) fn agent_proposals_enabled() -> bool {
 /// Test-only helpers shared across sibling test modules.
 #[cfg(test)]
 pub(crate) mod test_helpers {
-    #![allow(clippy::redundant_pub_crate, reason = "intentional crate-private module")]
+    #![allow(
+        clippy::redundant_pub_crate,
+        reason = "intentional crate-private module"
+    )]
     use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::MutexGuard;
+    use std::sync::LazyLock;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::MutexGuard;
+
+    static PROPOSALS_FLAG_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     /// Guard for tests that toggle the process-wide
-    /// `AGENT_PROPOSALS_ENABLED` flag. Acquires a process-wide mutex on
-    /// construction so concurrent tests don't race on the atomic, swaps in
-    /// the requested value, and restores the previous value on drop. Hold
-    /// the guard for the duration of any code that reads
+    /// `AGENT_PROPOSALS_ENABLED` flag. Acquires a process-wide async mutex,
+    /// swaps in the requested value, and restores the previous value on drop.
+    /// Hold the guard for the duration of any code that reads
     /// `agent_proposals_enabled()`.
     pub(crate) struct ProposalsFlagGuard {
         prev: bool,
@@ -132,9 +137,17 @@ pub(crate) mod test_helpers {
     }
 
     impl ProposalsFlagGuard {
-        pub(crate) fn set(enabled: bool) -> Self {
-            static LOCK: Mutex<()> = Mutex::new(());
-            let lock = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        pub(crate) async fn set(enabled: bool) -> Self {
+            let lock = PROPOSALS_FLAG_LOCK.lock().await;
+            Self::with_lock(enabled, lock)
+        }
+
+        pub(crate) fn set_blocking(enabled: bool) -> Self {
+            let lock = PROPOSALS_FLAG_LOCK.blocking_lock();
+            Self::with_lock(enabled, lock)
+        }
+
+        fn with_lock(enabled: bool, lock: MutexGuard<'static, ()>) -> Self {
             let flag = super::AGENT_PROPOSALS_ENABLED
                 .get_or_init(|| Arc::new(AtomicBool::new(false)))
                 .clone();
@@ -394,7 +407,10 @@ pub async fn run_sandbox(
     // gates the skill install, the policy.local route handler, and the L7
     // deny body's `next_steps` field — see `agent_proposals_enabled()`.
     let proposals_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if AGENT_PROPOSALS_ENABLED.set(proposals_enabled.clone()).is_err() {
+    if AGENT_PROPOSALS_ENABLED
+        .set(proposals_enabled.clone())
+        .is_err()
+    {
         debug!("agent proposals flag already initialized, keeping existing");
     }
 
@@ -426,9 +442,7 @@ pub async fn run_sandbox(
             }
         }
     } else {
-        debug!(
-            "agent_policy_proposals_enabled is false at startup; skipping skill install"
-        );
+        debug!("agent_policy_proposals_enabled is false at startup; skipping skill install");
     }
 
     // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
