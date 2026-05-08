@@ -1929,9 +1929,26 @@ fn is_cloud_metadata_ip(ip: IpAddr) -> bool {
 #[cfg(any(target_os = "linux", test))]
 fn detect_trusted_host_gateway() -> Option<IpAddr> {
     let contents = std::fs::read_to_string("/etc/hosts").ok()?;
-    let ip = parse_hosts_file_for_host(&contents, "host.openshell.internal")
-        .into_iter()
-        .next()?;
+    let ips = parse_hosts_file_for_host(&contents, "host.openshell.internal");
+
+    // Multiple distinct IPs for the alias is unexpected — compute drivers
+    // always inject exactly one. Warn loudly so operators can diagnose the
+    // inconsistency; we still proceed with the first entry rather than
+    // disabling the exemption entirely, because the mismatch guard in
+    // resolve_and_check_trusted_gateway() will reject any runtime resolution
+    // that returns a different IP.
+    if ips.len() > 1 {
+        warn!(
+            ips = ?ips,
+            "host.openshell.internal has {} distinct IPs in /etc/hosts; \
+             expected exactly one. Using first entry. \
+             Connections resolving to any other IP will be rejected.",
+            ips.len()
+        );
+    }
+
+    let ip = ips.into_iter().next()?;
+
     if is_cloud_metadata_ip(ip) {
         warn!(
             %ip,
@@ -3964,6 +3981,93 @@ mod tests {
         assert!(!(is_always_blocked_ip(ip) && !is_link_local_ip(ip)));
     }
 
+    // -- parse_hosts_file_for_host: multi-entry / duplicate scenarios --
+
+    #[test]
+    fn test_parse_hosts_file_single_entry() {
+        // Normal driver-injected case: exactly one IP for the alias.
+        let contents = "169.254.1.2\thost.openshell.internal host.containers.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+    }
+
+    #[test]
+    fn test_parse_hosts_file_duplicate_same_ip_deduplicated() {
+        // Same IP on two separate lines for the same alias — deduplicated to one.
+        let contents = "169.254.1.2\thost.openshell.internal\n\
+                        169.254.1.2\thost.openshell.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(
+            ips,
+            vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))],
+            "identical IPs across lines must be deduplicated"
+        );
+    }
+
+    #[test]
+    fn test_parse_hosts_file_multiple_distinct_ips() {
+        // Two distinct IPs for the same alias — both returned, first entry wins
+        // in detect_trusted_host_gateway(), second would cause mismatch rejection
+        // in resolve_and_check_trusted_gateway().
+        let contents = "169.254.1.2\thost.openshell.internal\n\
+                        169.254.1.3\thost.openshell.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips.len(), 2, "two distinct IPs must both be returned");
+        assert_eq!(ips[0], IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2)));
+        assert_eq!(ips[1], IpAddr::V4(Ipv4Addr::new(169, 254, 1, 3)));
+    }
+
+    #[test]
+    fn test_parse_hosts_file_first_entry_wins_on_ambiguity() {
+        // detect_trusted_host_gateway() pins to the first entry via .next().
+        // Verify the ordering guarantee: first line wins.
+        let contents = "169.254.1.3\thost.openshell.internal\n\
+                        169.254.1.2\thost.openshell.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(
+            ips[0],
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 3)),
+            "first line must be first in the returned vec"
+        );
+    }
+
+    #[test]
+    fn test_parse_hosts_file_ignores_other_aliases_on_same_line() {
+        // An entry with multiple aliases — only the matching alias counts.
+        let contents =
+            "169.254.1.2\thost.containers.internal host.openshell.internal host.docker.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+        // Non-matching aliases on the same line do not produce extra entries.
+        let ips2 = parse_hosts_file_for_host(contents, "host.docker.internal");
+        assert_eq!(ips2, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+    }
+
+    #[test]
+    fn test_parse_hosts_file_alias_not_present() {
+        let contents = "127.0.0.1\tlocalhost\n\
+                        ::1\t\tlocalhost\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert!(ips.is_empty());
+    }
+
+    #[test]
+    fn test_parse_hosts_file_comment_lines_skipped() {
+        let contents = "# 169.254.1.2 host.openshell.internal\n\
+                        169.254.1.2\thost.openshell.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        // Commented-out line must not produce an entry.
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+    }
+
+    #[test]
+    fn test_parse_hosts_file_inline_comment_stripped() {
+        // Anything after '#' on a data line is treated as a comment.
+        let contents = "169.254.1.2\thost.openshell.internal # injected by driver\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+    }
+
     // -- resolve_and_check_trusted_gateway --
 
     #[tokio::test]
@@ -4074,55 +4178,63 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_trusted_gateway_rejects_loopback_as_trusted_gw() {
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_loopback_as_trusted_gw() {
         // Defense-in-depth: even if detect_trusted_host_gateway somehow admitted
-        // a loopback IP, the always-blocked non-link-local guard must fire.
-        // We validate the guard logic inline (mirroring resolve_and_check internals)
-        // since DNS resolution of "localhost" is environment-dependent.
+        // a loopback IP, resolve_and_check_trusted_gateway must reject it.
+        // Using an IP literal as the host bypasses DNS and gives a deterministic
+        // resolved address, allowing us to exercise the actual function.
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        assert!(!is_cloud_metadata_ip(loopback));
-        assert!(is_always_blocked_ip(loopback));
-        assert!(!is_link_local_ip(loopback));
-        // The guard fires: always-blocked && !link-local → reject.
-        let err: Result<(), String> =
-            if is_always_blocked_ip(loopback) && !is_link_local_ip(loopback) {
-                Err(format!(
-                    "host resolves to always-blocked non-link-local address {loopback}, \
-                 connection rejected"
-                ))
-            } else {
-                Ok(())
-            };
-        assert!(err.is_err(), "loopback must be rejected");
+        let result = resolve_and_check_trusted_gateway("127.0.0.1", 8080, loopback, 0).await;
+        assert!(result.is_err(), "loopback must be rejected");
+        let err = result.unwrap_err();
         assert!(
-            err.unwrap_err().contains("always-blocked non-link-local"),
-            "expected always-blocked rejection"
+            err.contains("always-blocked non-link-local"),
+            "expected always-blocked rejection, got: {err}"
         );
     }
 
-    #[test]
-    fn test_trusted_gateway_rejects_unspecified_as_trusted_gw() {
-        // Defense-in-depth: 0.0.0.0 as trusted_gw must be rejected even if
-        // the mismatch check passes.
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_unspecified_as_trusted_gw() {
+        // Defense-in-depth: 0.0.0.0 as trusted_gw must be rejected.
+        // IP literal resolves to 0.0.0.0 directly, bypassing DNS.
         let unspecified = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-        assert!(!is_cloud_metadata_ip(unspecified));
-        assert!(is_always_blocked_ip(unspecified));
-        assert!(!is_link_local_ip(unspecified));
-        // The guard fires: always-blocked && !link-local → reject.
-        let err: Result<(), String> =
-            if is_always_blocked_ip(unspecified) && !is_link_local_ip(unspecified) {
-                Err(format!(
-                    "host resolves to always-blocked non-link-local address {unspecified}, \
-                 connection rejected"
-                ))
-            } else {
-                Ok(())
-            };
-        assert!(err.is_err(), "unspecified must be rejected");
+        let result = resolve_and_check_trusted_gateway("0.0.0.0", 8080, unspecified, 0).await;
+        assert!(result.is_err(), "unspecified must be rejected");
+        let err = result.unwrap_err();
         assert!(
-            err.unwrap_err().contains("always-blocked non-link-local"),
-            "expected always-blocked rejection"
+            err.contains("always-blocked non-link-local"),
+            "expected always-blocked rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_ip_literal_mismatch() {
+        // If the requested IP literal doesn't match trusted_gw, the mismatch
+        // guard fires. This exercises the full resolution→validation path.
+        let trusted_gw = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        let other_ip = "10.0.0.1"; // RFC1918, resolves as a literal
+        let result = resolve_and_check_trusted_gateway(other_ip, 8080, trusted_gw, 0).await;
+        assert!(result.is_err(), "IP mismatch must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("does not match trusted host gateway"),
+            "expected mismatch rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_cloud_metadata_literal() {
+        // Cloud metadata IP as a literal address — must be rejected even when
+        // it matches trusted_gw (which detect_trusted_host_gateway prevents,
+        // but this is the defense-in-depth layer).
+        let metadata = IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254));
+        let result = resolve_and_check_trusted_gateway("169.254.169.254", 80, metadata, 0).await;
+        assert!(result.is_err(), "cloud metadata IP must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("cloud metadata"),
+            "expected cloud-metadata rejection, got: {err}"
         );
     }
 
