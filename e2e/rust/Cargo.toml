@@ -19,6 +19,7 @@ publish = false
 e2e = []
 e2e-docker = ["e2e"]
 e2e-docker-gpu = ["e2e-docker"]
+e2e-kubernetes = ["e2e"]
 
 [[test]]
 name = "custom_image"
@@ -39,6 +40,11 @@ required-features = ["e2e-docker"]
 name = "gateway_resume"
 path = "tests/gateway_resume.rs"
 required-features = ["e2e-docker"]
+
+[[test]]
+name = "user_namespaces"
+path = "tests/user_namespaces.rs"
+required-features = ["e2e-kubernetes"]
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
