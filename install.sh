@@ -114,10 +114,10 @@ download_release_asset() {
     return 0
   fi
 
-  # GitHub normalizes `~` to `.` in release asset names, while the checksum file
-  # still records the Debian package filename with `~dev` for correct version
-  # ordering. Download the normalized asset but verify it against the checksum
-  # entry for the original package filename.
+  # GitHub normalizes `~` to `.` in release asset names, while checksum files
+  # can still record package filenames with `~dev` for correct version ordering.
+  # Download the normalized asset but verify it against the checksum entry for
+  # the original package filename.
   _normalized="$(printf '%s' "$_filename" | tr '~' '.')"
   if [ "$_normalized" != "$_filename" ]; then
     if download "${GITHUB_URL}/releases/download/${_tag}/${_normalized}" "$_output"; then
@@ -429,18 +429,6 @@ patch_homebrew_formula() {
     mv "$_patched_file" "$_formula_file"
   fi
 
-  if ! grep -q 'OPENSHELL_DRIVERS:' "$_formula_file"; then
-    info "patching Homebrew formula to use VM driver..."
-    awk '
-      {
-        print
-        if ($0 ~ /^[[:space:]]*environment_variables\(/) {
-          print "      OPENSHELL_DRIVERS: \"vm\","
-        }
-      }
-    ' "$_formula_file" >"$_patched_file"
-    mv "$_patched_file" "$_formula_file"
-  fi
 }
 
 start_user_gateway() {
@@ -514,7 +502,7 @@ remove_local_gateway_registration() {
   [ -n "$TARGET_HOME" ] || error "cannot resolve home directory for ${TARGET_USER}"
   _config_dir="${TARGET_HOME}/.config/openshell"
 
-  # The package-installed gateway is a user service. Replace the CLI registration
+  # The install-dev gateway is a user service. Replace the CLI registration
   # directly instead of asking `gateway destroy` to tear down Docker resources.
   # shellcheck disable=SC2016
   as_target_user sh -c '
