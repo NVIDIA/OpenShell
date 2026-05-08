@@ -14,8 +14,10 @@ though it listens on all interfaces (`0.0.0.0`).
 
 ### Auto-generated certificates
 
-On first start, the `init-pki.sh` script generates certificates using
-OpenSSL:
+On first start, the gateway's `ExecStartPre` runs
+`openshell-gateway generate-certs --output-dir <state-dir>/openshell/tls`,
+which generates the certificates with `rcgen` (the same routine the CLI
+uses for local mTLS bundles):
 
 | File | Purpose | Location |
 |------|---------|----------|
@@ -245,7 +247,7 @@ For air-gapped environments:
 | Gateway binary | `/usr/bin/openshell-gateway` |
 | CLI binary | `/usr/bin/openshell` |
 | Systemd user unit | `/usr/lib/systemd/user/openshell-gateway.service` |
-| PKI bootstrap script | `/usr/libexec/openshell/init-pki.sh` |
+| PKI bootstrap | `openshell-gateway generate-certs` (run from `ExecStartPre`) |
 | Env generator script | `/usr/libexec/openshell/init-gateway-env.sh` |
 | TLS certificates | `~/.local/state/openshell/tls/` |
 | CLI client certs | `~/.config/openshell/gateways/openshell/mtls/` |

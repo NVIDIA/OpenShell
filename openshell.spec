@@ -149,9 +149,10 @@ Type=exec
 # CLI discovers them automatically.
 # See /usr/share/doc/openshell-gateway/ for details.
 
-# Auto-generate PKI on first start if not present.
-# %%S expands to $XDG_STATE_HOME (~/.local/state) in user units.
-ExecStartPre=%{_libexecdir}/openshell/init-pki.sh %%S/openshell/tls
+# Auto-generate PKI on first start. Idempotent: skips when all six PEMs are
+# already in place. %%S expands to $XDG_STATE_HOME (~/.local/state) in user
+# units.
+ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir %%S/openshell/tls
 
 # Auto-generate gateway.env (SSH handshake secret + commented config
 # reference) on first start if not present.
@@ -186,9 +187,8 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 WantedBy=default.target
 EOF
 
-# --- PKI bootstrap script and gateway env generator ---
+# --- Gateway env generator ---
 install -d %{buildroot}%{_libexecdir}/%{name}
-install -pm 0755 deploy/rpm/init-pki.sh %{buildroot}%{_libexecdir}/%{name}/init-pki.sh
 install -pm 0755 deploy/rpm/init-gateway-env.sh %{buildroot}%{_libexecdir}/%{name}/init-gateway-env.sh
 # Patch commented image defaults to match the build type (dev or latest).
 # The source file uses :latest as a generic reference; the installed copy
@@ -275,7 +275,6 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata
 %doc %{_docdir}/%{name}-gateway/TROUBLESHOOTING.md
 %{_bindir}/%{name}-gateway
 %{_userunitdir}/%{name}-gateway.service
-%{_libexecdir}/%{name}/init-pki.sh
 %{_libexecdir}/%{name}/init-gateway-env.sh
 %{_mandir}/man8/openshell-gateway.8*
 %{_mandir}/man5/openshell-gateway.env.5*

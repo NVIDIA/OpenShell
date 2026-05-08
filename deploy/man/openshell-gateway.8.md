@@ -134,13 +134,14 @@ View logs:
     journalctl --user -u openshell-gateway
     journalctl --user -u openshell-gateway -f
 
-The unit runs two **ExecStartPre** scripts on first start:
+The unit runs two **ExecStartPre** steps on first start:
 
-1. **init-pki.sh** generates a self-signed PKI bundle for mTLS.
+1. **openshell-gateway generate-certs --output-dir** generates a
+   self-signed PKI bundle for mTLS.
 2. **init-gateway-env.sh** generates the environment configuration
    file with an auto-generated SSH handshake secret.
 
-Both scripts are idempotent and skip generation if their output files
+Both steps are idempotent and skip generation if their output files
 already exist.
 
 To persist the service across logouts:
@@ -166,9 +167,6 @@ This creates a drop-in override that persists across package upgrades.
 
 */usr/lib/systemd/user/openshell-gateway.service*
 :   Systemd user unit file.
-
-*/usr/libexec/openshell/init-pki.sh*
-:   PKI bootstrap script.
 
 */usr/libexec/openshell/init-gateway-env.sh*
 :   Gateway environment file generator.
