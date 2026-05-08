@@ -3,7 +3,7 @@ authors:
   - "@your-github-username"
 state: draft
 links:
-  - (related PRs, discussions, or issues)
+  - (approved feature request, GitHub issue, PRs, discussions, or prior art)
 ---
 
 # RFC NNNN - Your Title Here
@@ -11,6 +11,19 @@ links:
 <!--
 See rfc/README.md for the full RFC process and state definitions.
 -->
+
+## Feature request approval
+
+Before opening this RFC for review, confirm the product proposal has already
+been approved.
+
+- [ ] Feature request document exists: `feature-requests/NNNN-feature-name/README.md`
+- [ ] Feature request was discussed in a linked GitHub issue
+- [ ] Core maintainers approved the feature request
+- [ ] This RFC links to the approved feature request and GitHub issue in the front matter
+
+If this RFC is not tied to a feature request, explain why the feature request
+gate does not apply.
 
 ## Summary
 

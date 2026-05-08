@@ -1,6 +1,6 @@
 ---
 name: create-github-issue
-description: Create GitHub issues using the gh CLI. Use when the user wants to create a new issue, report a bug, request a feature, or create a task in GitHub. Trigger keywords - create issue, new issue, file bug, report bug, feature request, github issue.
+description: Create GitHub issues using the gh CLI. Use when the user wants to create a new issue, report a bug, create a linked feature request discussion issue, or create a task in GitHub. Trigger keywords - create issue, new issue, file bug, report bug, feature request issue, github issue.
 ---
 
 # Create GitHub Issue
@@ -56,31 +56,59 @@ EOF
 
 ### Feature Requests
 
-Do not add a type label automatically. The body must include a **Proposed Design** — not a "please build this" request. Apply area or topic labels only when they are clearly known.
+Feature request issues are discussion threads for completed feature request
+documents. They are not the first artifact for substantial feature ideas.
+
+If the user asks to create a feature issue but does not have a completed,
+GitHub-visible feature request doc or PR, do not create the issue yet. Tell the
+user to use `create-feature-request` first.
+
+If the user already has a PR containing the completed feature request doc, use
+that PR as the link target. Confirm the PR contains or links to a
+`feature-requests/NNNN-*/README.md` document before creating the issue.
+
+Useful PR lookup:
+
+```bash
+gh pr view <pr-number-or-url> --json title,url,body,files
+```
+
+Do not add a type label automatically. Apply area or topic labels only when
+they are clearly known.
 
 ```bash
 gh issue create \
-  --title "feat: <concise description>" \
+  --title "feat: <concise feature title>" \
   --body "$(cat <<'EOF'
-## Problem Statement
+## Feature request document or PR
 
-<What problem does this solve? Why does it matter?>
+<Link the completed feature request document, or the PR containing it if the
+document is not merged yet.>
 
-## Proposed Design
+## Summary
 
-<How should this work? Describe the system behavior, components involved,
-and user-facing interface.>
+<Briefly summarize the feature and user-visible outcome.>
 
-## Alternatives Considered
+## Review focus
 
-<What other approaches were evaluated? Why is this design better?>
+<What feedback do you want from maintainers?>
 
-## Agent Investigation
+## Related work and prior art
 
-<If the agent explored the codebase to assess feasibility, paste findings here.>
+<Link related issues, discussions, docs, examples, or similar features in other
+projects.>
+
+## Checklist
+
+- [ ] The linked feature request doc or PR is complete and ready for discussion
+- [ ] The linked feature request doc describes product requirements, not an implementation plan
 EOF
 )"
 ```
+
+After creating a feature request discussion issue, report the issue URL and
+suggest adding it back to the feature request doc front matter and PR
+description. Do not update the PR or doc unless the user explicitly asks.
 
 ### Tasks
 
