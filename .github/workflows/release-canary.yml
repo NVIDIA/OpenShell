@@ -29,6 +29,14 @@ jobs:
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           openshell status
 
+      - name: Create sandbox
+        run: |
+          openshell sandbox create \
+            --no-keep \
+            --no-tty \
+            --no-auto-providers \
+            -- /bin/sh -lc 'echo openshell-canary-sandbox-ok'
+
   ubuntu:
     name: Ubuntu Docker
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
@@ -51,6 +59,14 @@ jobs:
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           openshell status
 
+      - name: Create sandbox
+        run: |
+          openshell sandbox create \
+            --no-keep \
+            --no-tty \
+            --no-auto-providers \
+            -- /bin/sh -lc 'echo openshell-canary-sandbox-ok'
+
   fedora:
     name: Fedora RPM
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
@@ -71,3 +87,11 @@ jobs:
         run: |
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           openshell status
+
+      - name: Create sandbox
+        run: |
+          openshell sandbox create \
+            --no-keep \
+            --no-tty \
+            --no-auto-providers \
+            -- /bin/sh -lc 'echo openshell-canary-sandbox-ok'
