@@ -38,6 +38,8 @@ Set these environment variables before starting the gateway:
 
 For local access, the server certificate must be valid for the endpoint the CLI uses. Include `localhost` and `127.0.0.1` in the certificate SANs when users connect to a local gateway through loopback.
 
+Package-managed local gateways on Homebrew and Debian generate this bundle automatically for the `openshell` gateway name and use `https://127.0.0.1:17670` by default.
+
 The CLI loads its mTLS bundle from `~/.config/openshell/gateways/<name>/mtls/`:
 
 | File | Purpose |

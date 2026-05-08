@@ -28,8 +28,8 @@ cd "$repo_root"
 VERSION="${OPENSHELL_DEB_VERSION:-0.0.0-local}"
 OUTPUT_DIR="${OPENSHELL_OUTPUT_DIR:-artifacts}"
 ARCH="${OPENSHELL_DEB_ARCH:-$(dpkg --print-architecture 2>/dev/null || uname -m)}"
-GATEWAY_NAME="local"
-GATEWAY_ENDPOINT="http://127.0.0.1:17670"
+GATEWAY_NAME="openshell"
+GATEWAY_ENDPOINT="https://127.0.0.1:17670"
 
 remove_existing_gateway_registration() {
 	local config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"

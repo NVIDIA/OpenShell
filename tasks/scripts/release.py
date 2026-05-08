@@ -269,6 +269,7 @@ class Openshell < Formula
     (var/"openshell/gateway").mkpath
     (var/"openshell/vm-driver").mkpath
     (var/"log/openshell").mkpath
+    system bin/"openshell-gateway", "generate-certs", "--output-dir", var/"openshell/tls"
 
     entitlements = var/"openshell/openshell-driver-vm.entitlements.plist"
     entitlements.atomic_write <<~XML
@@ -290,13 +291,23 @@ class Openshell < Formula
     environment_variables(
       OPENSHELL_BIND_ADDRESS: "127.0.0.1",
       OPENSHELL_SERVER_PORT: "{LOCAL_GATEWAY_PORT}",
-      OPENSHELL_DISABLE_TLS: "true",
-      OPENSHELL_DISABLE_GATEWAY_AUTH: "true",
+      OPENSHELL_TLS_CERT: "#{{var}}/openshell/tls/server/tls.crt",
+      OPENSHELL_TLS_KEY: "#{{var}}/openshell/tls/server/tls.key",
+      OPENSHELL_TLS_CLIENT_CA: "#{{var}}/openshell/tls/ca.crt",
       OPENSHELL_DB_URL: "sqlite:#{{var}}/openshell/gateway/openshell.db",
-      OPENSHELL_GRPC_ENDPOINT: "http://127.0.0.1:{LOCAL_GATEWAY_PORT}",
+      OPENSHELL_GRPC_ENDPOINT: "https://127.0.0.1:{LOCAL_GATEWAY_PORT}",
       OPENSHELL_SSH_GATEWAY_HOST: "127.0.0.1",
       OPENSHELL_SSH_GATEWAY_PORT: "{LOCAL_GATEWAY_PORT}",
       OPENSHELL_VM_DRIVER_STATE_DIR: "#{{var}}/openshell/vm-driver",
+      OPENSHELL_VM_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
+      OPENSHELL_VM_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
+      OPENSHELL_VM_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
+      OPENSHELL_DOCKER_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
+      OPENSHELL_DOCKER_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
+      OPENSHELL_DOCKER_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
+      OPENSHELL_PODMAN_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
+      OPENSHELL_PODMAN_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
+      OPENSHELL_PODMAN_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
       OPENSHELL_DRIVER_DIR: "#{{opt_libexec}}",
     )
     keep_alive successful_exit: false
@@ -310,7 +321,7 @@ class Openshell < Formula
         brew services restart openshell
 
       Register it with the OpenShell CLI:
-        openshell gateway add http://127.0.0.1:{LOCAL_GATEWAY_PORT} --local --name local
+        openshell gateway add https://127.0.0.1:{LOCAL_GATEWAY_PORT} --local --name openshell
     EOS
   end
 

@@ -420,7 +420,7 @@ start_user_gateway() {
   if ! as_target_user systemctl --user daemon-reload; then
     info "could not reach the user systemd manager for ${TARGET_USER}"
     info "restart the gateway later with: systemctl --user enable openshell-gateway && systemctl --user restart openshell-gateway"
-    info "then register it with: openshell gateway add http://127.0.0.1:17670 --local --name local"
+    info "then register it with: openshell gateway add https://127.0.0.1:17670 --local --name openshell"
     return 0
   fi
 
@@ -438,11 +438,14 @@ wait_for_local_gateway_listener() {
   _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
   _last_output=""
-  _probe_url="http://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+  _probe_url="https://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+  _mtls_dir="${TARGET_HOME}/.config/openshell/gateways/openshell/mtls"
 
   info "waiting for local gateway listener to become reachable..."
   while [ "$_elapsed" -lt "$_timeout" ]; do
-    if _last_output="$(as_target_user curl -sS --max-time 2 -o /dev/null "$_probe_url" 2>&1)"; then
+    if [ ! -f "${_mtls_dir}/ca.crt" ] || [ ! -f "${_mtls_dir}/tls.crt" ] || [ ! -f "${_mtls_dir}/tls.key" ]; then
+      _last_output="mTLS client bundle is not ready under ${_mtls_dir}"
+    elif _last_output="$(as_target_user curl -sS --max-time 2 --cacert "${_mtls_dir}/ca.crt" --cert "${_mtls_dir}/tls.crt" --key "${_mtls_dir}/tls.key" -o /dev/null "$_probe_url" 2>&1)"; then
       info "local gateway listener is reachable"
       return 0
     fi
@@ -488,8 +491,15 @@ remove_local_gateway_registration() {
   as_target_user sh -c '
     config_dir=$1
     rm -rf "${config_dir}/gateways/local"
+    mkdir -p "${config_dir}/gateways/openshell"
+    rm -f \
+      "${config_dir}/gateways/openshell/metadata.json" \
+      "${config_dir}/gateways/openshell/edge_token" \
+      "${config_dir}/gateways/openshell/cf_token" \
+      "${config_dir}/gateways/openshell/oidc_token.json"
     active="${config_dir}/active_gateway"
-    if [ "$(cat "$active" 2>/dev/null || true)" = "local" ]; then
+    active_name="$(cat "$active" 2>/dev/null || true)"
+    if [ "$active_name" = "local" ] || [ "$active_name" = "openshell" ]; then
       rm -f "$active"
     fi
   ' sh "$_config_dir"
@@ -498,7 +508,7 @@ remove_local_gateway_registration() {
 register_local_gateway() {
   _register_bin="${OPENSHELL_REGISTER_BIN:-openshell}"
 
-  if _add_output="$(as_target_user "$_register_bin" gateway add "http://127.0.0.1:${LOCAL_GATEWAY_PORT}" --local --name local 2>&1)"; then
+  if _add_output="$(as_target_user "$_register_bin" gateway add "https://127.0.0.1:${LOCAL_GATEWAY_PORT}" --local --name openshell 2>&1)"; then
     [ -z "$_add_output" ] || print_gateway_add_output "$_add_output"
     return 0
   else
@@ -509,7 +519,7 @@ register_local_gateway() {
     *"already exists"*)
       info "local gateway already exists; removing and re-adding it..."
       remove_local_gateway_registration
-      as_target_user "$_register_bin" gateway add "http://127.0.0.1:${LOCAL_GATEWAY_PORT}" --local --name local
+      as_target_user "$_register_bin" gateway add "https://127.0.0.1:${LOCAL_GATEWAY_PORT}" --local --name openshell
       ;;
     *)
       printf '%s\n' "$_add_output" >&2
@@ -521,7 +531,7 @@ register_local_gateway() {
 print_gateway_add_output() {
   printf '%s\n' "$1" | while IFS= read -r _line; do
     case "$_line" in
-      *"Gateway is not reachable at http://127.0.0.1:${LOCAL_GATEWAY_PORT}"*) ;;
+      *"Gateway is not reachable at https://127.0.0.1:${LOCAL_GATEWAY_PORT}"*) ;;
       *"Verify the gateway is running and the endpoint is correct."*) ;;
       *) printf '%s\n' "$_line" >&2 ;;
     esac
@@ -654,7 +664,7 @@ install_macos_homebrew() {
   if ! as_target_user brew services restart "$_formula_ref"; then
     warn "could not restart the OpenShell Homebrew service"
     info "restart it later with: brew services restart ${_formula_ref}"
-    info "then register it with: openshell gateway add http://127.0.0.1:${LOCAL_GATEWAY_PORT} --local --name local"
+    info "then register it with: openshell gateway add https://127.0.0.1:${LOCAL_GATEWAY_PORT} --local --name openshell"
     return 0
   fi
 

@@ -70,16 +70,16 @@ pub async fn run(args: CertgenArgs) -> Result<()> {
         )
         .init();
 
-    let bundle = generate_pki(&args.server_sans)?;
-
     if args.dry_run {
+        let bundle = generate_pki(&args.server_sans)?;
         print_bundle(&bundle);
         return Ok(());
     }
 
     if let Some(dir) = args.output_dir.as_deref() {
-        run_local(dir, &bundle)
+        run_local(dir, &args.server_sans)
     } else {
+        let bundle = generate_pki(&args.server_sans)?;
         run_kubernetes(&args, &bundle).await
     }
 }
@@ -277,12 +277,13 @@ fn decide_local(present: usize) -> LocalAction {
     }
 }
 
-fn run_local(dir: &Path, bundle: &PkiBundle) -> Result<()> {
+fn run_local(dir: &Path, server_sans: &[String]) -> Result<()> {
     let paths = LocalPaths::resolve(dir);
 
-    match decide_local(paths.existence_count()) {
+    let bundle = match decide_local(paths.existence_count()) {
         LocalAction::Skip => {
             info!(dir = %dir.display(), "PKI files already exist, skipping.");
+            read_local_bundle(&paths)?
         }
         LocalAction::PartialState => {
             return Err(miette::miette!(
@@ -292,19 +293,38 @@ fn run_local(dir: &Path, bundle: &PkiBundle) -> Result<()> {
             ));
         }
         LocalAction::Create => {
-            write_local_bundle(dir, bundle, &paths)?;
+            let bundle = generate_pki(server_sans)?;
+            write_local_bundle(dir, &bundle, &paths)?;
             info!(dir = %dir.display(), "PKI files created.");
+            bundle
         }
-    }
+    };
 
     // Always make sure the CLI auto-discovery copy is in place. This
     // self-heals the case where the operator wiped ~/.config/openshell but
     // left the gateway state directory intact.
-    if let Err(e) = openshell_bootstrap::mtls::store_pki_bundle("openshell", bundle) {
+    if let Err(e) = openshell_bootstrap::mtls::store_pki_bundle("openshell", &bundle) {
         warn!(error = %e, "failed to copy client mTLS materials for CLI auto-discovery");
     }
 
     Ok(())
+}
+
+fn read_local_bundle(paths: &LocalPaths) -> Result<PkiBundle> {
+    Ok(PkiBundle {
+        ca_cert_pem: read_pem(&paths.ca_crt)?,
+        ca_key_pem: read_pem(&paths.ca_key)?,
+        server_cert_pem: read_pem(&paths.server_crt)?,
+        server_key_pem: read_pem(&paths.server_key)?,
+        client_cert_pem: read_pem(&paths.client_crt)?,
+        client_key_pem: read_pem(&paths.client_key)?,
+    })
+}
+
+fn read_pem(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}", path.display()))
 }
 
 fn write_local_bundle(dir: &Path, bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> {
@@ -386,8 +406,8 @@ fn print_bundle(bundle: &PkiBundle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        K8sAction, LocalAction, LocalPaths, decide_k8s, decide_local, sibling_temp_dir, tls_secret,
-        write_local_bundle,
+        K8sAction, LocalAction, LocalPaths, decide_k8s, decide_local, read_local_bundle,
+        sibling_temp_dir, tls_secret, write_local_bundle,
     };
     use openshell_bootstrap::pki::generate_pki;
     use std::path::Path;
@@ -488,6 +508,21 @@ mod tests {
         assert!(ca.contains("BEGIN CERTIFICATE"));
         let server_key = std::fs::read_to_string(&paths.server_key).unwrap();
         assert!(server_key.contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[test]
+    fn read_local_bundle_uses_existing_files() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let dir = parent.path().join("tls");
+        let bundle = generate_pki(&[]).expect("generate_pki");
+        let paths = LocalPaths::resolve(&dir);
+
+        write_local_bundle(&dir, &bundle, &paths).expect("write_local_bundle");
+
+        let read = read_local_bundle(&paths).expect("read_local_bundle");
+        assert_eq!(read.ca_cert_pem, bundle.ca_cert_pem);
+        assert_eq!(read.client_cert_pem, bundle.client_cert_pem);
+        assert_eq!(read.client_key_pem, bundle.client_key_pem);
     }
 
     #[cfg(unix)]
