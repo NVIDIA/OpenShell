@@ -934,20 +934,19 @@ pub async fn run_sandbox(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
+        let poll_ctx = PolicyPollLoopContext {
+            endpoint: poll_endpoint,
+            sandbox_id: poll_id,
+            opa_engine: poll_engine,
+            entrypoint_pid: poll_pid,
+            interval_secs: poll_interval_secs,
+            ocsf_enabled: poll_ocsf_enabled,
+            provider_credentials: poll_provider_credentials,
+            policy_local_ctx: Some(poll_policy_local),
+        };
 
         tokio::spawn(async move {
-            if let Err(e) = run_policy_poll_loop(
-                &poll_endpoint,
-                &poll_id,
-                &poll_engine,
-                &poll_pid,
-                poll_interval_secs,
-                &poll_ocsf_enabled,
-                poll_provider_credentials,
-                Some(poll_policy_local),
-            )
-            .await
-            {
+            if let Err(e) = run_policy_poll_loop(poll_ctx).await {
                 ocsf_emit!(
                     AppLifecycleBuilder::new(ocsf_ctx())
                         .activity(ActivityId::Fail)
@@ -2281,23 +2280,25 @@ async fn flush_proposals_to_gateway(
 ///
 /// When the entrypoint PID is available, policy reloads include symlink
 /// resolution for binary paths via the container filesystem.
-async fn run_policy_poll_loop(
-    endpoint: &str,
-    sandbox_id: &str,
-    opa_engine: &Arc<OpaEngine>,
-    entrypoint_pid: &Arc<AtomicU32>,
+struct PolicyPollLoopContext {
+    endpoint: String,
+    sandbox_id: String,
+    opa_engine: Arc<OpaEngine>,
+    entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
-    ocsf_enabled: &std::sync::atomic::AtomicBool,
+    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
     provider_credentials: provider_credentials::ProviderCredentialState,
     policy_local_ctx: Option<Arc<policy_local::PolicyLocalContext>>,
-) -> Result<()> {
+}
+
+async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     use crate::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::PolicySource;
     use std::sync::atomic::Ordering;
 
-    let client = CachedOpenShellClient::connect(endpoint).await?;
+    let client = CachedOpenShellClient::connect(&ctx.endpoint).await?;
     let mut current_config_revision: u64 = 0;
-    let mut current_provider_env_revision: u64 = provider_credentials.snapshot().revision;
+    let mut current_provider_env_revision: u64 = ctx.provider_credentials.snapshot().revision;
     let mut current_policy_hash = String::new();
     let mut current_settings: std::collections::HashMap<
         String,
@@ -2305,7 +2306,7 @@ async fn run_policy_poll_loop(
     > = std::collections::HashMap::new();
 
     // Initialize revision from the first poll.
-    match client.poll_settings(sandbox_id).await {
+    match client.poll_settings(&ctx.sandbox_id).await {
         Ok(result) => {
             current_config_revision = result.config_revision;
             current_policy_hash = result.policy_hash.clone();
@@ -2320,11 +2321,11 @@ async fn run_policy_poll_loop(
         }
     }
 
-    let interval = Duration::from_secs(interval_secs);
+    let interval = Duration::from_secs(ctx.interval_secs);
     loop {
         tokio::time::sleep(interval).await;
 
-        let result = match client.poll_settings(sandbox_id).await {
+        let result = match client.poll_settings(&ctx.sandbox_id).await {
             Ok(r) => r,
             Err(e) => {
                 debug!(error = %e, "Settings poll: server unreachable, will retry");
@@ -2357,9 +2358,9 @@ async fn run_policy_poll_loop(
             .build());
 
         if provider_env_changed {
-            match grpc_client::fetch_provider_environment(endpoint, sandbox_id).await {
+            match grpc_client::fetch_provider_environment(&ctx.endpoint, &ctx.sandbox_id).await {
                 Ok(env_result) => {
-                    let env_count = provider_credentials.install_environment(
+                    let env_count = ctx.provider_credentials.install_environment(
                         env_result.provider_env_revision,
                         env_result.environment,
                     );
@@ -2404,11 +2405,11 @@ async fn run_policy_poll_loop(
                 continue;
             };
 
-            let pid = entrypoint_pid.load(Ordering::Acquire);
-            match opa_engine.reload_from_proto_with_pid(policy, pid) {
+            let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
+            match ctx.opa_engine.reload_from_proto_with_pid(policy, pid) {
                 Ok(()) => {
-                    if let Some(ctx) = policy_local_ctx.as_ref() {
-                        ctx.set_current_policy(policy.clone()).await;
+                    if let Some(policy_local_ctx) = ctx.policy_local_ctx.as_ref() {
+                        policy_local_ctx.set_current_policy(policy.clone()).await;
                     }
                     if result.global_policy_version > 0 {
                         ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -2440,7 +2441,7 @@ async fn run_policy_poll_loop(
                     if result.version > 0
                         && result.policy_source == PolicySource::Sandbox
                         && let Err(e) = client
-                            .report_policy_status(sandbox_id, result.version, true, "")
+                            .report_policy_status(&ctx.sandbox_id, result.version, true, "")
                             .await
                     {
                         warn!(error = %e, "Failed to report policy load success");
@@ -2461,7 +2462,12 @@ async fn run_policy_poll_loop(
                     if result.version > 0
                         && result.policy_source == PolicySource::Sandbox
                         && let Err(report_err) = client
-                            .report_policy_status(sandbox_id, result.version, false, &e.to_string())
+                            .report_policy_status(
+                                &ctx.sandbox_id,
+                                result.version,
+                                false,
+                                &e.to_string(),
+                            )
                             .await
                     {
                         warn!(error = %report_err, "Failed to report policy load failure");
@@ -2472,7 +2478,7 @@ async fn run_policy_poll_loop(
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
         let new_ocsf = extract_bool_setting(&result.settings, "ocsf_json_enabled").unwrap_or(false);
-        let prev_ocsf = ocsf_enabled.swap(new_ocsf, Ordering::Relaxed);
+        let prev_ocsf = ctx.ocsf_enabled.swap(new_ocsf, Ordering::Relaxed);
         if new_ocsf != prev_ocsf {
             info!(ocsf_json_enabled = new_ocsf, "OCSF JSONL logging toggled");
         }
