@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_default_driver(
+def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_and_vm_driver(
     tmp_path: Path,
 ) -> None:
     release_dir = tmp_path / "release"
@@ -51,7 +51,7 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
         "v0.0.10/openshell-driver-vm-aarch64-apple-darwin.tar.gz"
     ) in formula
     assert 'sha256 "' + "b" * 64 + '"' in formula
-    assert "OPENSHELL_DRIVERS" not in formula
+    assert 'OPENSHELL_DRIVERS: "vm"' in formula
     assert 'OPENSHELL_DRIVER_DIR: "#{opt_libexec}"' in formula
     assert "entitlements.atomic_write" in formula
     assert "brew services restart openshell" in formula

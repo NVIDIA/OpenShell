@@ -288,6 +288,7 @@ class Openshell < Formula
   service do
     run opt_bin/"openshell-gateway"
     environment_variables(
+      OPENSHELL_DRIVERS: "vm",
       OPENSHELL_BIND_ADDRESS: "127.0.0.1",
       OPENSHELL_SERVER_PORT: "{LOCAL_GATEWAY_PORT}",
       OPENSHELL_DISABLE_TLS: "true",
