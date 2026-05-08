@@ -204,7 +204,6 @@ jobs:
       - name: Set up buildx (local driver)
         uses: ./.github/actions/setup-buildx
         with:
-          driver: local
           buildkitd-config: /etc/buildkit/buildkitd.toml
 
       - name: Download Rust binary artifact

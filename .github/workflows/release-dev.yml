@@ -179,8 +179,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
-        with:
-          driver: local
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -349,8 +347,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
-        with:
-          driver: local
 
       - name: Build macOS binary via Docker
         run: |
@@ -498,8 +494,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
-        with:
-          driver: local
 
       - name: Build macOS binary via Docker
         run: |

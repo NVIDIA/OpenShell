@@ -151,8 +151,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
-        with:
-          driver: local
 
       - name: Install zstd
         run: apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*

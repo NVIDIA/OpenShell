@@ -1,23 +1,11 @@
 name: Setup Docker Buildx
 description: >
-  Create a Docker Buildx builder. Two modes:
-    * driver=remote (default) — multi-arch builder against in-cluster BuildKit
-      pods. Requires EKS connectivity. Behaviour unchanged from prior versions.
-    * driver=local — single-node buildx on the local docker-container driver.
-      Pair with cache-to/cache-from=type=gha on build steps for persistence.
-      Works on nv-gha-runners; no EKS needed.
+  Create a Docker Buildx builder on the local docker-container driver. Pair
+  with cache-to/cache-from=type=gha on build steps for persistence. Works on
+  nv-gha-runners; no EKS BuildKit service is required.
   Cleanup is automatic when the job finishes (docker/setup-buildx-action default).
 
 inputs:
-  driver:
-    description: "buildx driver: 'remote' or 'local'"
-    default: remote
-  amd64-endpoint:
-    description: BuildKit endpoint for linux/amd64 (remote driver only)
-    default: tcp://buildkit-amd64.buildkit:1234
-  arm64-endpoint:
-    description: BuildKit endpoint for linux/arm64 (remote driver only)
-    default: tcp://buildkit-arm64.buildkit:1234
   name:
     description: Builder instance name
     default: openshell
@@ -34,21 +22,7 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Set up Docker Buildx (remote)
-      if: inputs.driver == 'remote'
-      uses: docker/setup-buildx-action@v3
-      with:
-        name: ${{ inputs.name }}
-        driver: remote
-        endpoint: ${{ inputs.amd64-endpoint }}
-        platforms: linux/amd64
-        append: |
-          - endpoint: ${{ inputs.arm64-endpoint }}
-            platforms: linux/arm64
-        buildkitd-config: ${{ inputs.buildkitd-config }}
-
     - name: Set up Docker Buildx (local)
-      if: inputs.driver == 'local'
       uses: docker/setup-buildx-action@v3
       with:
         name: ${{ inputs.name }}

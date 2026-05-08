@@ -56,7 +56,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
         with:
-          driver: local
           buildkitd-config: ${{ steps.buildkit.outputs.config }}
 
       - name: Build and push CI image
