@@ -38,7 +38,7 @@ The supervisor must be available inside each sandbox workload:
 
 | Runtime | Delivery model |
 |---|---|
-| Docker | Bind-mounted or extracted supervisor binary configured by the gateway. |
+| Docker | Bind-mounted local supervisor binary, or a binary extracted from the configured supervisor image. |
 | Podman | Read-only OCI image volume containing the supervisor binary. |
 | Kubernetes | Sandbox pod image or pod template configuration. |
 | VM | Embedded in the guest rootfs bundle. |

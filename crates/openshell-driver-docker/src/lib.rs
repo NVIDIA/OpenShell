@@ -1759,7 +1759,7 @@ async fn extract_supervisor_binary_bytes(docker: &Docker, image: &str) -> CoreRe
             ),
             ContainerCreateBody {
                 image: Some(image.to_string()),
-                entrypoint: Some(vec!["/openshell-sandbox".to_string()]),
+                entrypoint: Some(vec![SUPERVISOR_IMAGE_BINARY_PATH.to_string()]),
                 cmd: Some(Vec::new()),
                 ..Default::default()
             },

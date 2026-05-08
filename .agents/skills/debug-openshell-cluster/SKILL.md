@@ -63,6 +63,7 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 docker info
 docker ps --filter name=openshell
 docker logs <container> --tail=200
+docker run --rm --entrypoint /openshell-sandbox "${OPENSHELL_DOCKER_SUPERVISOR_IMAGE:-ghcr.io/nvidia/openshell/supervisor:latest}" --version
 openshell status
 ```
 
@@ -71,6 +72,7 @@ Common findings:
 - Docker daemon unavailable: start Docker Desktop or Docker Engine.
 - Gateway process stopped: inspect exit status and logs.
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
+- Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify `OPENSHELL_DOCKER_SUPERVISOR_BIN`, the sibling binary next to `openshell-gateway`, or the configured supervisor image contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and supervisor callback endpoint.
 
 For source checkout development, restart the local gateway with:
