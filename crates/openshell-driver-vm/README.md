@@ -180,17 +180,17 @@ The VM guest's serial console is appended to `<state-dir>/<sandbox-id>/console.l
 - runtime tarballs: the rolling `vm-runtime` release, rebuilt on demand by
   `release-vm-kernel.yml`
 
-On Debian-family Linux amd64 and arm64 systems, `install-dev.sh` installs the
+On Debian-family Linux amd64 and arm64 systems, `install.sh` installs the
 Debian package from the selected `OPENSHELL_VERSION` release tag. That package
 includes `openshell-gateway` and `openshell-driver-vm`, but leaves
 `OPENSHELL_DRIVERS` unset so the gateway uses its normal runtime
 auto-detection. Set `OPENSHELL_DRIVERS=vm` to force the VM driver.
 
-On RPM-family Linux x86_64 and aarch64 systems, `install-dev.sh` installs the
+On RPM-family Linux x86_64 and aarch64 systems, `install.sh` installs the
 `openshell` and `openshell-gateway` RPM packages from the selected release tag.
 The RPM gateway package is configured for the Podman driver.
 
-On Apple Silicon macOS, `install-dev.sh` stages the generated `openshell.rb`
+On Apple Silicon macOS, `install.sh` stages the generated `openshell.rb`
 formula from the selected release in the `nvidia/openshell` Homebrew tap.
 Homebrew installs `openshell`, `openshell-gateway`, and
 `openshell-driver-vm`, ad-hoc signs the driver with the Hypervisor entitlement
