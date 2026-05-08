@@ -3,8 +3,8 @@
 
 name: Rust Native Build (openshell-gateway / openshell-sandbox)
 
-# OS-128 Phase 4: build Rust binaries natively per Linux architecture before
-# the Docker image build consumes them as prebuilt artifacts.
+# Build Rust binaries natively per Linux architecture before the Docker image
+# build consumes them as prebuilt artifacts.
 
 on:
   workflow_call:
@@ -47,55 +47,6 @@ on:
         required: false
         type: string
         default: ""
-  workflow_dispatch:
-    inputs:
-      component:
-        description: "Binary component to build"
-        required: true
-        type: choice
-        default: gateway
-        options:
-          - gateway
-          - sandbox
-      arch:
-        description: "Linux architecture to build"
-        required: true
-        type: choice
-        default: amd64
-        options:
-          - amd64
-          - arm64
-      cargo-version:
-        description: "Cargo version override"
-        required: false
-        type: string
-        default: ""
-      features:
-        description: "Cargo features to enable"
-        required: false
-        type: string
-        default: "openshell-core/dev-settings"
-      retention-days:
-        description: "Artifact retention period"
-        required: false
-        type: number
-        default: 5
-      artifact-name:
-        description: "Artifact name override"
-        required: false
-        type: string
-        default: ""
-      checkout-ref:
-        description: "Git ref to check out for build inputs (defaults to the workflow SHA)"
-        required: false
-        type: string
-        default: ""
-      image-tag:
-        description: "Supervisor image tag to bake into gateway binaries"
-        required: false
-        type: string
-        default: ""
-
 permissions:
   contents: read
   packages: read
@@ -123,7 +74,7 @@ jobs:
       FEATURES: ${{ inputs.features }}
       # Partition the GHA sccache cache per (component, arch). Without this,
       # concurrent jobs collide on the same cache key and later-starting
-      # writers hit 409 Conflict (PR #961 fix for shadow-shared-cpu-spike).
+      # writers hit 409 Conflict.
       SCCACHE_GHA_VERSION: ${{ inputs.component }}-${{ inputs.arch }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest

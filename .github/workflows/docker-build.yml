@@ -150,7 +150,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
-    uses: ./.github/workflows/shadow-rust-native-build.yml
+    uses: ./.github/workflows/rust-native-build.yml
     with:
       component: ${{ needs.resolve.outputs.binary_component }}
       arch: ${{ matrix.arch }}
