@@ -271,49 +271,6 @@ install_deb_package() {
   fi
 }
 
-ensure_local_gateway_env() {
-  _config_dir="${TARGET_HOME}/.config/openshell"
-  _env_file="${_config_dir}/gateway.env"
-
-  # shellcheck disable=SC2016
-  as_target_user sh -c '
-    env_file=$1
-    port=$2
-
-    mkdir -p "$(dirname "$env_file")"
-    touch "$env_file"
-    chmod 600 "$env_file"
-
-    add_var() {
-      key=$1
-      value=$2
-      if ! grep -Eq "^[[:space:]]*${key}=" "$env_file"; then
-        printf "%s=%s\n" "$key" "$value" >>"$env_file"
-      fi
-    }
-
-    if ! grep -Eq "^[[:space:]]*OPENSHELL_SSH_HANDSHAKE_SECRET=" "$env_file"; then
-      if command -v openssl >/dev/null 2>&1; then
-        secret="$(openssl rand -hex 32)"
-      elif command -v od >/dev/null 2>&1; then
-        secret="$(od -An -tx1 -N32 /dev/urandom | tr -d " \n")"
-      else
-        echo "openshell: error: openssl or od is required to generate OPENSHELL_SSH_HANDSHAKE_SECRET" >&2
-        exit 1
-      fi
-      printf "%s=%s\n" OPENSHELL_SSH_HANDSHAKE_SECRET "$secret" >>"$env_file"
-    fi
-
-    add_var OPENSHELL_BIND_ADDRESS 127.0.0.1
-    add_var OPENSHELL_SERVER_PORT "$port"
-    add_var OPENSHELL_DISABLE_TLS true
-    add_var OPENSHELL_DISABLE_GATEWAY_AUTH true
-    add_var OPENSHELL_GRPC_ENDPOINT "http://127.0.0.1:${port}"
-    add_var OPENSHELL_SSH_GATEWAY_HOST 127.0.0.1
-    add_var OPENSHELL_SSH_GATEWAY_PORT "$port"
-  ' sh "$_env_file" "$LOCAL_GATEWAY_PORT"
-}
-
 homebrew_formula_path() {
   _tap="$1"
   _formula="$2"
@@ -359,11 +316,9 @@ start_user_gateway() {
   info "restarting openshell-gateway user service as ${TARGET_USER}..."
 
   if ! as_target_user systemctl --user daemon-reload; then
-    warn "could not reach the user systemd manager for ${TARGET_USER}"
-    start_direct_gateway
-    info "registering local gateway as ${TARGET_USER}..."
-    register_local_gateway
-    wait_for_registered_gateway
+    info "could not reach the user systemd manager for ${TARGET_USER}"
+    info "restart the gateway later with: systemctl --user enable openshell-gateway && systemctl --user restart openshell-gateway"
+    info "then register it with: openshell gateway add http://127.0.0.1:17670 --local --name local"
     return 0
   fi
 
@@ -373,73 +328,6 @@ start_user_gateway() {
 
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
-  wait_for_registered_gateway
-}
-
-start_direct_gateway() {
-  _gateway_bin="${OPENSHELL_GATEWAY_BIN:-openshell-gateway}"
-  _config_dir="${TARGET_HOME}/.config/openshell"
-  _env_file="${_config_dir}/gateway.env"
-  _state_home="${XDG_STATE_HOME:-${TARGET_HOME}/.local/state}"
-  _state_dir="${_state_home}/openshell/gateway"
-  _pid_file="${_state_dir}/openshell-gateway.pid"
-  _log_file="${_state_dir}/openshell-gateway.log"
-
-  info "starting openshell-gateway directly as ${TARGET_USER}..."
-
-  # shellcheck disable=SC2016
-  as_target_user sh -c '
-    gateway_bin=$1
-    env_file=$2
-    state_dir=$3
-    pid_file=$4
-    log_file=$5
-    port=$6
-
-    if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
-      exit 0
-    fi
-
-    mkdir -p "$state_dir"
-
-    export OPENSHELL_BIND_ADDRESS="${OPENSHELL_BIND_ADDRESS:-127.0.0.1}"
-    export OPENSHELL_SERVER_PORT="${OPENSHELL_SERVER_PORT:-$port}"
-    export OPENSHELL_DISABLE_TLS="${OPENSHELL_DISABLE_TLS:-true}"
-    export OPENSHELL_DISABLE_GATEWAY_AUTH="${OPENSHELL_DISABLE_GATEWAY_AUTH:-true}"
-    export OPENSHELL_DB_URL="${OPENSHELL_DB_URL:-sqlite:${state_dir}/openshell.db?mode=rwc}"
-    export OPENSHELL_GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-http://127.0.0.1:${port}}"
-    export OPENSHELL_SSH_GATEWAY_HOST="${OPENSHELL_SSH_GATEWAY_HOST:-127.0.0.1}"
-    export OPENSHELL_SSH_GATEWAY_PORT="${OPENSHELL_SSH_GATEWAY_PORT:-$port}"
-
-    if [ -f "$env_file" ]; then
-      set -a
-      . "$env_file"
-      set +a
-    fi
-
-    nohup "$gateway_bin" >"$log_file" 2>&1 &
-    printf "%s\n" "$!" >"$pid_file"
-  ' sh "$_gateway_bin" "$_env_file" "$_state_dir" "$_pid_file" "$_log_file" "$LOCAL_GATEWAY_PORT"
-}
-
-wait_for_registered_gateway() {
-  _status_bin="${OPENSHELL_REGISTER_BIN:-openshell}"
-  _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
-  _elapsed=0
-  _last_output=""
-
-  info "waiting for local gateway to become reachable..."
-  while [ "$_elapsed" -lt "$_timeout" ]; do
-    if _last_output="$(as_target_user "$_status_bin" status 2>&1)"; then
-      info "local gateway is reachable"
-      return 0
-    fi
-    sleep 1
-    _elapsed=$((_elapsed + 1))
-  done
-
-  printf '%s\n' "$_last_output" >&2
-  error "local gateway did not become reachable within ${_timeout}s"
 }
 
 remove_local_gateway_registration() {
@@ -524,7 +412,6 @@ install_linux_deb() {
   info "installing ${_deb_file}..."
   install_deb_package "$_deb_path"
   info "installed ${APP_NAME} package from ${RELEASE_TAG}"
-  ensure_local_gateway_env
   start_user_gateway
 }
 
@@ -578,7 +465,6 @@ install_macos_homebrew() {
 
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
-  wait_for_registered_gateway
 }
 
 main() {
