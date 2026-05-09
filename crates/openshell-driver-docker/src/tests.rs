@@ -317,11 +317,11 @@ fn build_environment_keeps_path_driver_controlled() {
 }
 
 #[test]
-fn build_mounts_uses_docker_tls_directory() {
-    let mounts = build_mounts(&runtime_config());
-    let targets = mounts
+fn build_binds_uses_docker_tls_directory() {
+    let binds = build_binds(&runtime_config());
+    let targets = binds
         .iter()
-        .filter_map(|mount| mount.target.clone())
+        .filter_map(|bind| bind.split(':').nth(1).map(String::from))
         .collect::<Vec<_>>();
     assert!(targets.contains(&SUPERVISOR_MOUNT_PATH.to_string()));
     assert!(targets.contains(&TLS_CA_MOUNT_PATH.to_string()));
