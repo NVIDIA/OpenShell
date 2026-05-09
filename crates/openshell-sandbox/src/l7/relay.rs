@@ -1260,7 +1260,7 @@ mod tests {
     use super::*;
     use crate::opa::{NetworkInput, OpaEngine};
     use std::path::PathBuf;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
 
@@ -1443,6 +1443,161 @@ network_policies:
             .expect("client side should close without 101")
             .unwrap();
         assert_eq!(n, 0, "invalid response must not forward 101 headers");
+    }
+
+    #[tokio::test]
+    async fn route_selected_websocket_rewrites_text_credentials_after_upgrade() {
+        let data = r#"
+network_policies:
+  route_api:
+    name: route_api
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/ws"
+          - allow:
+              method: WEBSOCKET_TEXT
+              path: "/ws"
+        websocket_credential_rewrite: true
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let configs = vec![L7EndpointConfig {
+            protocol: L7Protocol::Websocket,
+            path: "/ws".into(),
+            tls: crate::l7::TlsMode::Auto,
+            enforcement: EnforcementMode::Enforce,
+            graphql_max_body_bytes: 0,
+            allow_encoded_slash: false,
+            websocket_credential_rewrite: true,
+        }];
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            std::iter::once(("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())).collect(),
+        );
+        let placeholder = child_env.get("DISCORD_BOT_TOKEN").expect("placeholder env");
+        let ctx = L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            policy_name: "route_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: resolver.map(Arc::new),
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /ws HTTP/1.1\r\nHost: gateway.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut forwarded = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut forwarded),
+        )
+        .await
+        .expect("upgrade request should reach upstream")
+        .unwrap();
+        let forwarded = String::from_utf8_lossy(&forwarded[..n]);
+        assert!(forwarded.contains("Upgrade: websocket\r\n"));
+
+        upstream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut response = [0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("client should receive upgrade response")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response[..n]).contains("101 Switching Protocols"));
+
+        let payload = format!(r#"{{"op":2,"d":{{"token":"{placeholder}"}}}}"#);
+        app.write_all(&masked_text_frame(payload.as_bytes()))
+            .await
+            .unwrap();
+
+        let (masked, rewritten) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_text_frame(&mut upstream),
+        )
+        .await
+        .expect("rewritten websocket text should reach upstream")
+        .unwrap();
+        assert!(masked, "client-to-server frame must remain masked");
+        assert_eq!(rewritten, r#"{"op":2,"d":{"token":"real-token"}}"#);
+        assert!(!rewritten.contains(placeholder));
+
+        drop(app);
+        drop(upstream);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), relay).await;
+    }
+
+    fn masked_text_frame(payload: &[u8]) -> Vec<u8> {
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        assert!(
+            payload.len() <= 125,
+            "test helper only supports small frames"
+        );
+        let payload_len = u8::try_from(payload.len()).expect("small frame length");
+        let mut frame = vec![0x81, 0x80 | payload_len];
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(idx, byte)| byte ^ mask[idx % 4]),
+        );
+        frame
+    }
+
+    async fn read_text_frame<R: AsyncRead + Unpin>(
+        reader: &mut R,
+    ) -> std::io::Result<(bool, String)> {
+        let mut header = [0u8; 2];
+        reader.read_exact(&mut header).await?;
+        assert_eq!(header[0] & 0x0f, 0x1, "expected text frame");
+        let masked = header[1] & 0x80 != 0;
+        let payload_len = usize::from(header[1] & 0x7f);
+        assert!(payload_len <= 125, "test helper only supports small frames");
+        let mut mask = [0u8; 4];
+        if masked {
+            reader.read_exact(&mut mask).await?;
+        }
+        let mut payload = vec![0u8; payload_len];
+        reader.read_exact(&mut payload).await?;
+        if masked {
+            for (idx, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[idx % 4];
+            }
+        }
+        Ok((masked, String::from_utf8(payload).expect("text payload")))
     }
 
     #[tokio::test]

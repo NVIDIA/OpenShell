@@ -183,6 +183,7 @@ The incremental update surface is split into endpoint-level operations and metho
 | `--add-allow <SPEC>` | Appends method/path allow rules to an existing REST or WebSocket endpoint. | Permit one additional REST method/path or WebSocket `WEBSOCKET_TEXT` path on an API that is already configured. |
 | `--add-deny <SPEC>` | Appends method/path deny rules to an existing REST or WebSocket endpoint. | Block a sensitive REST path or WebSocket text-message path under an endpoint that is otherwise allowed. |
 | `--binary <PATH>` | Adds binaries to every `--add-endpoint` rule in the same command. | Bind a new endpoint to one or more executables. |
+| `--websocket-credential-rewrite` | Enables WebSocket text-frame credential placeholder rewriting on every `--add-endpoint` in the same command. | Let sandbox code send `openshell:resolve:env:*` placeholders in client WebSocket text frames while OpenShell resolves them at the relay boundary. |
 | `--rule-name <NAME>` | Overrides the generated rule name. | Keep a stable human-chosen rule name when adding exactly one endpoint. |
 | `--dry-run` | Shows the merged policy locally and does not call the gateway. | Review the result before persisting it. |
 | `--wait` | Polls until the sandbox reports that the new revision loaded. | Confirm the change took effect before continuing. |
@@ -236,6 +237,8 @@ Examples:
 | `realtime.example.com:443:read-write:websocket:enforce` | Add a WebSocket endpoint with the `read-write` preset expanded by the policy engine into the upgrade `GET` and client `WEBSOCKET_TEXT` access. |
 
 If you set `protocol: rest` or `protocol: websocket`, you also need an allow shape. With incremental updates, that means you should provide an `access` preset on `--add-endpoint`, then use `--add-allow` or `--add-deny` to refine method/path rules later.
+
+Use `--websocket-credential-rewrite` with `protocol: websocket` when the sandbox should send credential placeholders in client text frames and have OpenShell resolve them after the allowed upgrade. The flag can also be used with `protocol: rest` compatibility endpoints that perform a WebSocket upgrade. It applies to every `--add-endpoint` in the same command and is rejected for plain L4 or `protocol: sql` endpoints.
 
 For example:
 
@@ -351,11 +354,12 @@ Use `--add-endpoint` with `protocol: websocket` when the destination is an RFC 6
 ```shell
 openshell policy update demo \
   --add-endpoint realtime.example.com:443:read-write:websocket:enforce \
+  --websocket-credential-rewrite \
   --binary /usr/bin/node \
   --wait
 ```
 
-This creates a WebSocket endpoint and sets its base allow behavior through the `read-write` access preset. For WebSocket endpoints, `read-write` expands to the upgrade `GET` and client `WEBSOCKET_TEXT` messages on the upgraded request path.
+This creates a WebSocket endpoint and sets its base allow behavior through the `read-write` access preset. For WebSocket endpoints, `read-write` expands to the upgrade `GET` and client `WEBSOCKET_TEXT` messages on the upgraded request path. The rewrite flag lets the sandbox send `openshell:resolve:env:*` placeholders in client text frames; OpenShell resolves them before forwarding to the upstream service.
 
 #### Add a WebSocket text-message deny rule
 

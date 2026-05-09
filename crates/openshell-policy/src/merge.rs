@@ -876,6 +876,51 @@ mod tests {
     }
 
     #[test]
+    fn add_rule_merges_websocket_credential_rewrite_flag() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "existing".to_string(),
+            NetworkPolicyRule {
+                name: "existing".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "realtime.example.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "websocket".to_string(),
+                    access: "read-write".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "incoming".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "realtime.example.com".to_string(),
+                port: 443,
+                ports: vec![443],
+                protocol: "websocket".to_string(),
+                websocket_credential_rewrite: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "allow_realtime_example_com_443".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("merge should succeed");
+
+        let endpoint = &result.policy.network_policies["existing"].endpoints[0];
+        assert!(endpoint.websocket_credential_rewrite);
+    }
+
+    #[test]
     fn add_allow_expands_access_preset() {
         let mut policy = restrictive_default_policy();
         policy.network_policies.insert(

@@ -4705,6 +4705,7 @@ pub async fn sandbox_policy_update(
     add_allow: &[String],
     remove_rules: &[String],
     binaries: &[String],
+    websocket_credential_rewrite: bool,
     rule_name: Option<&str>,
     dry_run: bool,
     wait: bool,
@@ -4722,6 +4723,7 @@ pub async fn sandbox_policy_update(
         add_allow,
         remove_rules,
         binaries,
+        websocket_credential_rewrite,
         rule_name,
     )?;
 

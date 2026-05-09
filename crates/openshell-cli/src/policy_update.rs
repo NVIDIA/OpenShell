@@ -18,6 +18,7 @@ pub struct PolicyUpdatePlan {
     pub preview_operations: Vec<PolicyMergeOp>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_policy_update_plan(
     add_endpoints: &[String],
     remove_endpoints: &[String],
@@ -25,6 +26,7 @@ pub fn build_policy_update_plan(
     add_allow: &[String],
     remove_rules: &[String],
     binaries: &[String],
+    websocket_credential_rewrite: bool,
     rule_name: Option<&str>,
 ) -> Result<PolicyUpdatePlan> {
     if binaries.iter().any(|binary| binary.trim().is_empty()) {
@@ -41,13 +43,22 @@ pub fn build_policy_update_plan(
             "--rule-name is only supported when exactly one --add-endpoint is provided"
         ));
     }
+    if websocket_credential_rewrite && add_endpoints.is_empty() {
+        return Err(miette!(
+            "--websocket-credential-rewrite can only be used with --add-endpoint"
+        ));
+    }
 
     let mut merge_operations = Vec::new();
     let mut preview_operations = Vec::new();
 
     let deduped_binaries = dedup_strings(binaries);
     for spec in add_endpoints {
-        let endpoint = parse_add_endpoint_spec(spec)?;
+        let mut endpoint = parse_add_endpoint_spec(spec)?;
+        if websocket_credential_rewrite {
+            ensure_websocket_credential_rewrite_protocol(spec, &endpoint)?;
+            endpoint.websocket_credential_rewrite = true;
+        }
         let target_rule_name = rule_name
             .map(str::trim)
             .filter(|name| !name.is_empty())
@@ -153,6 +164,23 @@ pub fn build_policy_update_plan(
         merge_operations,
         preview_operations,
     })
+}
+
+fn ensure_websocket_credential_rewrite_protocol(
+    spec: &str,
+    endpoint: &NetworkEndpoint,
+) -> Result<()> {
+    if matches!(endpoint.protocol.as_str(), "rest" | "websocket") {
+        return Ok(());
+    }
+    let protocol = if endpoint.protocol.is_empty() {
+        "<empty>"
+    } else {
+        endpoint.protocol.as_str()
+    };
+    Err(miette!(
+        "--websocket-credential-rewrite requires --add-endpoint protocol segment to be 'rest' or 'websocket'; got '{protocol}' in '{spec}'"
+    ))
 }
 
 fn group_allow_rules(specs: &[String]) -> Result<BTreeMap<(String, u32), Vec<L7Rule>>> {
@@ -352,8 +380,31 @@ fn dedup_strings(values: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_policy_update_plan;
+    use super::{
+        PolicyUpdatePlan, build_policy_update_plan as build_policy_update_plan_with_options,
+    };
     use openshell_policy::PolicyMergeOp;
+
+    fn build_policy_update_plan(
+        add_endpoints: &[String],
+        remove_endpoints: &[String],
+        add_deny: &[String],
+        add_allow: &[String],
+        remove_rules: &[String],
+        binaries: &[String],
+        rule_name: Option<&str>,
+    ) -> miette::Result<PolicyUpdatePlan> {
+        build_policy_update_plan_with_options(
+            add_endpoints,
+            remove_endpoints,
+            add_deny,
+            add_allow,
+            remove_rules,
+            binaries,
+            false,
+            rule_name,
+        )
+    }
 
     #[test]
     fn parse_add_endpoint_basic_l4() {
@@ -414,6 +465,49 @@ mod tests {
         assert_eq!(endpoint.protocol, "websocket");
         assert_eq!(endpoint.access, "read-write");
         assert_eq!(endpoint.enforcement, "enforce");
+    }
+
+    #[test]
+    fn parse_add_endpoint_enables_websocket_credential_rewrite() {
+        let plan = build_policy_update_plan_with_options(
+            &["realtime.example.com:443:read-write:websocket:enforce".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            true,
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        assert!(rule.endpoints[0].websocket_credential_rewrite);
+    }
+
+    #[test]
+    fn websocket_credential_rewrite_requires_add_endpoint() {
+        let error = build_policy_update_plan_with_options(&[], &[], &[], &[], &[], &[], true, None)
+            .expect_err("plan should fail");
+        assert!(error.to_string().contains("--websocket-credential-rewrite"));
+    }
+
+    #[test]
+    fn websocket_credential_rewrite_rejects_l4_endpoint() {
+        let error = build_policy_update_plan_with_options(
+            &["realtime.example.com:443".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            true,
+            None,
+        )
+        .expect_err("plan should fail");
+        assert!(error.to_string().contains("protocol segment"));
     }
 
     #[test]
