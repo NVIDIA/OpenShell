@@ -26,7 +26,6 @@ pub fn build_policy_update_plan(
     add_allow: &[String],
     remove_rules: &[String],
     binaries: &[String],
-    websocket_credential_rewrite: bool,
     rule_name: Option<&str>,
 ) -> Result<PolicyUpdatePlan> {
     if binaries.iter().any(|binary| binary.trim().is_empty()) {
@@ -43,22 +42,12 @@ pub fn build_policy_update_plan(
             "--rule-name is only supported when exactly one --add-endpoint is provided"
         ));
     }
-    if websocket_credential_rewrite && add_endpoints.is_empty() {
-        return Err(miette!(
-            "--websocket-credential-rewrite can only be used with --add-endpoint"
-        ));
-    }
-
     let mut merge_operations = Vec::new();
     let mut preview_operations = Vec::new();
 
     let deduped_binaries = dedup_strings(binaries);
     for spec in add_endpoints {
-        let mut endpoint = parse_add_endpoint_spec(spec)?;
-        if websocket_credential_rewrite {
-            ensure_websocket_credential_rewrite_protocol(spec, &endpoint)?;
-            endpoint.websocket_credential_rewrite = true;
-        }
+        let endpoint = parse_add_endpoint_spec(spec)?;
         let target_rule_name = rule_name
             .map(str::trim)
             .filter(|name| !name.is_empty())
@@ -179,7 +168,7 @@ fn ensure_websocket_credential_rewrite_protocol(
         endpoint.protocol.as_str()
     };
     Err(miette!(
-        "--websocket-credential-rewrite requires --add-endpoint protocol segment to be 'rest' or 'websocket'; got '{protocol}' in '{spec}'"
+        "websocket-credential-rewrite endpoint option requires --add-endpoint protocol segment to be 'rest' or 'websocket'; got '{protocol}' in '{spec}'"
     ))
 }
 
@@ -285,9 +274,9 @@ fn parse_remove_endpoint_spec(spec: &str) -> Result<(String, u32)> {
 
 fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
     let parts = spec.split(':').collect::<Vec<_>>();
-    if !(2..=5).contains(&parts.len()) {
+    if !(2..=6).contains(&parts.len()) {
         return Err(miette!(
-            "--add-endpoint expects host:port[:access[:protocol[:enforcement]]], got '{spec}'"
+            "--add-endpoint expects host:port[:access[:protocol[:enforcement[:options]]]], got '{spec}'"
         ));
     }
 
@@ -297,10 +286,16 @@ fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
     let access = parts.get(2).copied().unwrap_or("").trim();
     let protocol = parts.get(3).copied().unwrap_or("").trim();
     let enforcement = parts.get(4).copied().unwrap_or("").trim();
+    let options = parts.get(5).copied().unwrap_or("").trim();
 
     if parts.len() == 3 && access.is_empty() {
         return Err(miette!(
             "--add-endpoint has an empty access segment in '{spec}'; omit it entirely if you do not need access or protocol fields"
+        ));
+    }
+    if parts.len() == 6 && options.is_empty() {
+        return Err(miette!(
+            "--add-endpoint has an empty options segment in '{spec}'; omit it entirely if you do not need endpoint options"
         ));
     }
     if !enforcement.is_empty() && protocol.is_empty() {
@@ -324,7 +319,7 @@ fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
         ));
     }
 
-    Ok(NetworkEndpoint {
+    let mut endpoint = NetworkEndpoint {
         host,
         port,
         ports: vec![port],
@@ -332,7 +327,41 @@ fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
         enforcement: enforcement.to_string(),
         access: access.to_string(),
         ..Default::default()
-    })
+    };
+    apply_add_endpoint_options(spec, &mut endpoint, options)?;
+    Ok(endpoint)
+}
+
+fn apply_add_endpoint_options(
+    spec: &str,
+    endpoint: &mut NetworkEndpoint,
+    options: &str,
+) -> Result<()> {
+    if options.is_empty() {
+        return Ok(());
+    }
+
+    for option in options.split(',') {
+        let option = option.trim();
+        if option.is_empty() {
+            return Err(miette!(
+                "--add-endpoint options segment must not contain empty options in '{spec}'"
+            ));
+        }
+        match option {
+            "websocket-credential-rewrite" => {
+                ensure_websocket_credential_rewrite_protocol(spec, endpoint)?;
+                endpoint.websocket_credential_rewrite = true;
+            }
+            _ => {
+                return Err(miette!(
+                    "--add-endpoint options segment supports only 'websocket-credential-rewrite'; got '{option}' in '{spec}'"
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_host(flag: &str, spec: &str, host: &str) -> Result<String> {
@@ -401,7 +430,6 @@ mod tests {
             add_allow,
             remove_rules,
             binaries,
-            false,
             rule_name,
         )
     }
@@ -469,14 +497,14 @@ mod tests {
 
     #[test]
     fn parse_add_endpoint_enables_websocket_credential_rewrite() {
-        let plan = build_policy_update_plan_with_options(
-            &["realtime.example.com:443:read-write:websocket:enforce".to_string()],
+        let plan = build_policy_update_plan(
+            &["realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite"
+                .to_string()],
             &[],
             &[],
             &[],
             &[],
             &[],
-            true,
             None,
         )
         .expect("plan should build");
@@ -488,26 +516,55 @@ mod tests {
     }
 
     #[test]
-    fn websocket_credential_rewrite_requires_add_endpoint() {
-        let error = build_policy_update_plan_with_options(&[], &[], &[], &[], &[], &[], true, None)
-            .expect_err("plan should fail");
-        assert!(error.to_string().contains("--websocket-credential-rewrite"));
+    fn parse_add_endpoint_enables_websocket_credential_rewrite_on_rest_compat_endpoint() {
+        let plan = build_policy_update_plan(
+            &[
+                "realtime.example.com:443:read-write:rest:enforce:websocket-credential-rewrite"
+                    .to_string(),
+            ],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        assert!(rule.endpoints[0].websocket_credential_rewrite);
     }
 
     #[test]
     fn websocket_credential_rewrite_rejects_l4_endpoint() {
-        let error = build_policy_update_plan_with_options(
-            &["realtime.example.com:443".to_string()],
+        let error = build_policy_update_plan(
+            &["realtime.example.com:443::::websocket-credential-rewrite".to_string()],
             &[],
             &[],
             &[],
             &[],
             &[],
-            true,
             None,
         )
         .expect_err("plan should fail");
         assert!(error.to_string().contains("protocol segment"));
+    }
+
+    #[test]
+    fn parse_add_endpoint_rejects_unknown_options() {
+        let error = build_policy_update_plan(
+            &["realtime.example.com:443:read-write:websocket:enforce:future-option".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect_err("plan should fail");
+        assert!(error.to_string().contains("options segment"));
     }
 
     #[test]

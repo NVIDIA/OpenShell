@@ -287,7 +287,7 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   $ openshell policy get my-sandbox
   $ openshell policy set my-sandbox --policy policy.yaml
   $ openshell policy update my-sandbox --add-endpoint api.github.com:443:read-only:rest:enforce
-  $ openshell policy update my-sandbox --add-endpoint realtime.example.com:443:read-write:websocket:enforce --websocket-credential-rewrite
+  $ openshell policy update my-sandbox --add-endpoint realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite
   $ openshell policy update my-sandbox --add-allow 'api.github.com:443:GET:/repos/**'
   $ openshell policy set --global --policy policy.yaml
   $ openshell policy delete --global
@@ -1404,7 +1404,7 @@ enum PolicyCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement]]].
+        /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
         #[arg(long = "add-endpoint")]
         add_endpoints: Vec<String>,
 
@@ -1427,10 +1427,6 @@ enum PolicyCommands {
         /// Add binaries to each --add-endpoint rule.
         #[arg(long = "binary", value_hint = ValueHint::FilePath)]
         binaries: Vec<String>,
-
-        /// Rewrite credential placeholders in WebSocket client text frames for added REST/WebSocket endpoints.
-        #[arg(long = "websocket-credential-rewrite")]
-        websocket_credential_rewrite: bool,
 
         /// Override the generated rule name when exactly one --add-endpoint is provided.
         #[arg(long = "rule-name")]
@@ -1979,7 +1975,6 @@ async fn main() -> Result<()> {
                     add_deny,
                     remove_rules,
                     binaries,
-                    websocket_credential_rewrite,
                     rule_name,
                     dry_run,
                     wait,
@@ -1995,7 +1990,6 @@ async fn main() -> Result<()> {
                         &add_allow,
                         &remove_rules,
                         &binaries,
-                        websocket_credential_rewrite,
                         rule_name.as_deref(),
                         dry_run,
                         wait,
