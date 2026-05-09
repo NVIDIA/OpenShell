@@ -10,6 +10,7 @@
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
 use crate::secrets::{SecretResolver, rewrite_http_header_block};
+use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -398,8 +399,13 @@ where
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(req.raw_header.len(), |p| p + 4);
+    let websocket_rewrite_request = if options.strip_websocket_extensions {
+        validate_websocket_upgrade_request(&req.raw_header[..header_end])?
+    } else {
+        false
+    };
 
-    let header_bytes = if options.strip_websocket_extensions {
+    let header_bytes = if websocket_rewrite_request {
         strip_websocket_extensions_if_requested(&req.raw_header[..header_end])?
     } else {
         req.raw_header[..header_end].to_vec()
@@ -446,7 +452,15 @@ where
     }
     upstream.flush().await.into_diagnostic()?;
 
-    let outcome = relay_response(&req.action, upstream, client).await?;
+    let outcome = relay_response(
+        &req.action,
+        upstream,
+        client,
+        RelayResponseOptions {
+            reject_websocket_extensions: websocket_rewrite_request,
+        },
+    )
+    .await?;
 
     // Validate that the client actually requested an upgrade before accepting
     // a 101 from upstream. Per RFC 9110 Section 7.8, the server MUST NOT send
@@ -493,13 +507,13 @@ pub(crate) fn request_is_websocket_upgrade(raw_header: &[u8]) -> bool {
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(raw_header.len(), |p| p + 4);
-    std::str::from_utf8(&raw_header[..header_end]).is_ok_and(client_requested_websocket_upgrade)
+    validate_websocket_upgrade_request(&raw_header[..header_end]).unwrap_or(false)
 }
 
 fn strip_websocket_extensions_if_requested(raw_header: &[u8]) -> Result<Vec<u8>> {
     let header_str = std::str::from_utf8(raw_header)
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
-    if !client_requested_websocket_upgrade(header_str) {
+    if !validate_websocket_upgrade_request(raw_header)? {
         return Ok(raw_header.to_vec());
     }
 
@@ -515,6 +529,104 @@ fn strip_websocket_extensions_if_requested(raw_header: &[u8]) -> Result<Vec<u8>>
         out.extend_from_slice(line.as_bytes());
     }
     Ok(out)
+}
+
+fn validate_websocket_upgrade_request(raw_header: &[u8]) -> Result<bool> {
+    let header_str = std::str::from_utf8(raw_header)
+        .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    let mut lines = header_str.lines();
+    let Some(request_line) = lines.next() else {
+        return Ok(false);
+    };
+    let method = request_line.split_whitespace().next().unwrap_or_default();
+    let mut headers = WebSocketUpgradeHeaders::default();
+
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match name.as_str() {
+            "upgrade" if header_value_contains_token(value, "websocket") => {
+                headers.upgrade_websocket = true;
+            }
+            "connection" if header_value_contains_token(value, "upgrade") => {
+                headers.connection_upgrade = true;
+            }
+            "sec-websocket-key" => {
+                headers.sec_key_count += 1;
+                headers.sec_key = Some(value.to_string());
+            }
+            "sec-websocket-version" => {
+                headers.version_count += 1;
+                headers.version = Some(value.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    if !headers.is_attempt() {
+        return Ok(false);
+    }
+    if !method.eq_ignore_ascii_case("GET") {
+        return Err(miette!("websocket upgrade request must use GET"));
+    }
+    if !headers.upgrade_websocket {
+        return Err(miette!(
+            "websocket upgrade request missing Upgrade: websocket"
+        ));
+    }
+    if !headers.connection_upgrade {
+        return Err(miette!(
+            "websocket upgrade request missing Connection: Upgrade"
+        ));
+    }
+    if headers.sec_key_count != 1 {
+        return Err(miette!(
+            "websocket upgrade request must include exactly one Sec-WebSocket-Key"
+        ));
+    }
+    let key = headers.sec_key.as_deref().unwrap_or_default();
+    let decoded_key = base64::engine::general_purpose::STANDARD
+        .decode(key.as_bytes())
+        .map_err(|_| miette!("websocket upgrade request has invalid Sec-WebSocket-Key"))?;
+    if decoded_key.len() != 16 {
+        return Err(miette!(
+            "websocket upgrade request has invalid Sec-WebSocket-Key length"
+        ));
+    }
+    if headers.version_count != 1 || headers.version.as_deref() != Some("13") {
+        return Err(miette!(
+            "websocket upgrade request must use Sec-WebSocket-Version: 13"
+        ));
+    }
+    Ok(true)
+}
+
+fn header_value_contains_token(value: &str, expected: &str) -> bool {
+    value
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case(expected))
+}
+
+#[derive(Default)]
+struct WebSocketUpgradeHeaders {
+    upgrade_websocket: bool,
+    connection_upgrade: bool,
+    sec_key: Option<String>,
+    sec_key_count: usize,
+    version: Option<String>,
+    version_count: usize,
+}
+
+impl WebSocketUpgradeHeaders {
+    fn is_attempt(&self) -> bool {
+        self.upgrade_websocket || self.sec_key.is_some() || self.version.is_some()
+    }
 }
 
 /// Send a 403 Forbidden JSON deny response.
@@ -833,10 +945,16 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
+#[derive(Clone, Copy, Default)]
+struct RelayResponseOptions {
+    reject_websocket_extensions: bool,
+}
+
 async fn relay_response<U, C>(
     request_method: &str,
     upstream: &mut U,
     client: &mut C,
+    options: RelayResponseOptions,
 ) -> Result<RelayOutcome>
 where
     U: AsyncRead + Unpin,
@@ -890,6 +1008,17 @@ where
     // from upstream beyond the headers are overflow that belong to the
     // upgraded protocol and must be forwarded before switching.
     if status_code == 101 {
+        if options.reject_websocket_extensions
+            && header_str.lines().skip(1).any(|line| {
+                line.split_once(':').is_some_and(|(name, _)| {
+                    name.trim().eq_ignore_ascii_case("sec-websocket-extensions")
+                })
+            })
+        {
+            return Err(miette!(
+                "upstream negotiated unsupported WebSocket extensions"
+            ));
+        }
         client
             .write_all(&buf[..header_end])
             .await
@@ -1030,29 +1159,6 @@ fn client_requested_upgrade(headers: &str) -> bool {
     has_upgrade_header && connection_contains_upgrade
 }
 
-fn client_requested_websocket_upgrade(headers: &str) -> bool {
-    let mut upgrade_is_websocket = false;
-    let mut connection_contains_upgrade = false;
-
-    for line in headers.lines().skip(1) {
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("upgrade:") {
-            let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
-            if val == "websocket" {
-                upgrade_is_websocket = true;
-            }
-        }
-        if lower.starts_with("connection:") {
-            let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
-            if val.split(',').any(|tok| tok.trim() == "upgrade") {
-                connection_contains_upgrade = true;
-            }
-        }
-    }
-
-    upgrade_is_websocket && connection_contains_upgrade
-}
-
 /// Returns true for responses that MUST NOT contain a message body per RFC 7230 §3.3.3:
 /// HEAD responses, 1xx informational, 204 No Content, 304 Not Modified.
 fn is_bodiless_response(request_method: &str, status_code: u16) -> bool {
@@ -1134,9 +1240,9 @@ mod tests {
     use super::*;
     use crate::opa::OpaEngine;
     use crate::secrets::SecretResolver;
-    use base64::Engine as _;
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
+    const VALID_WS_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 
     #[test]
     fn deny_response_body_is_agent_readable_and_redacted() {
@@ -1799,7 +1905,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("relay_response should not deadlock");
@@ -1840,7 +1951,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("must not block when no Connection: close");
@@ -1876,7 +1992,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("HEAD", &mut upstream_read, &mut client_write),
+            relay_response(
+                "HEAD",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("HEAD relay must not deadlock waiting for body");
@@ -1909,7 +2030,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("204 relay must not deadlock");
@@ -1944,7 +2070,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("must not block when chunked body is complete in overflow");
@@ -1983,7 +2114,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("must not block when chunked response has trailers");
@@ -2021,7 +2157,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("normal relay must not deadlock");
@@ -2052,7 +2193,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("relay must not deadlock");
@@ -2093,7 +2239,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("relay_response should not deadlock");
@@ -2135,7 +2286,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("relay_response should not deadlock");
@@ -2267,6 +2423,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opted_in_websocket_relay_rejects_invalid_upgrade_before_upstream_write() {
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/ws".to_string(),
+            query_params: HashMap::new(),
+            raw_header: b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let result = relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            RelayRequestOptions {
+                strip_websocket_extensions: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "missing Sec-WebSocket-Key must fail closed"
+        );
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "invalid opted-in upgrade must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn opted_in_websocket_relay_strips_request_extensions_and_rejects_response_extensions() {
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/ws".to_string(),
+            query_params: HashMap::new(),
+            raw_header: format!(
+                "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Extensions: permessage-deflate\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            )
+            .into_bytes(),
+            body_length: BodyLength::None,
+        };
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut total = 0;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let forwarded = String::from_utf8_lossy(&buf[..total]);
+            assert!(
+                !forwarded
+                    .to_ascii_lowercase()
+                    .contains("sec-websocket-extensions"),
+                "opted-in request must strip extension negotiation"
+            );
+            upstream_side
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+        });
+
+        let result = relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            RelayRequestOptions {
+                strip_websocket_extensions: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let err = result.expect_err("upstream extension negotiation must fail closed");
+        assert!(err.to_string().contains("unsupported WebSocket extensions"));
+        upstream_task.await.expect("upstream task should complete");
+
+        drop(proxy_to_client);
+        let mut received = Vec::new();
+        app_side.read_to_end(&mut received).await.unwrap();
+        assert!(
+            received.is_empty(),
+            "rejected extension negotiation must not forward 101 headers"
+        );
+    }
+
+    #[tokio::test]
     async fn relay_request_guard_blocks_stale_generation_before_upstream_write() {
         let policy_data = "network_policies: {}\n";
         let engine = OpaEngine::from_strings(TEST_POLICY, policy_data).unwrap();
@@ -2333,18 +2595,63 @@ mod tests {
 
     #[test]
     fn request_is_websocket_upgrade_detects_websocket_upgrade() {
-        let raw = b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n";
-        assert!(request_is_websocket_upgrade(raw));
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        assert!(request_is_websocket_upgrade(raw.as_bytes()));
+    }
+
+    #[test]
+    fn request_is_websocket_upgrade_rejects_missing_key() {
+        let raw = b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        assert!(!request_is_websocket_upgrade(raw));
+        assert!(validate_websocket_upgrade_request(raw).is_err());
+    }
+
+    #[test]
+    fn request_is_websocket_upgrade_rejects_wrong_method() {
+        let raw = format!(
+            "POST /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        assert!(!request_is_websocket_upgrade(raw.as_bytes()));
+        assert!(validate_websocket_upgrade_request(raw.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn request_is_websocket_upgrade_rejects_wrong_version() {
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 12\r\n\r\n"
+        );
+        assert!(!request_is_websocket_upgrade(raw.as_bytes()));
+        assert!(validate_websocket_upgrade_request(raw.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn validate_websocket_upgrade_ignores_plain_rest_request() {
+        let raw = b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert!(!request_is_websocket_upgrade(raw));
+        assert!(!validate_websocket_upgrade_request(raw).expect("plain request should parse"));
+    }
+
+    #[test]
+    fn validate_websocket_upgrade_ignores_non_websocket_upgrade() {
+        let raw = b"GET /h2c HTTP/1.1\r\nHost: example.com\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n";
+        assert!(!request_is_websocket_upgrade(raw));
+        assert!(!validate_websocket_upgrade_request(raw).expect("h2c request should parse"));
     }
 
     #[test]
     fn strip_websocket_extensions_removes_extension_negotiation() {
-        let raw = b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
 
-        let stripped = strip_websocket_extensions_if_requested(raw).expect("strip should succeed");
+        let stripped =
+            strip_websocket_extensions_if_requested(raw.as_bytes()).expect("strip should succeed");
         let stripped = String::from_utf8(stripped).unwrap();
 
         assert!(stripped.contains("Upgrade: websocket\r\n"));
+        assert!(stripped.contains("Sec-WebSocket-Key: "));
         assert!(stripped.contains("Sec-WebSocket-Version: 13\r\n"));
         assert!(
             !stripped

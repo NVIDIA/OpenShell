@@ -16,6 +16,7 @@ use openshell_ocsf::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAX_TEXT_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_RAW_FRAME_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const COPY_BUF_SIZE: usize = 8192;
 const OPCODE_CONTINUATION: u8 = 0x0;
 const OPCODE_TEXT: u8 = 0x1;
@@ -81,10 +82,13 @@ where
         Ok::<(), miette::Report>(())
     };
 
-    tokio::select! {
+    let result = tokio::select! {
         result = client_to_server => result,
         result = server_to_client => result,
-    }
+    };
+    let _ = upstream_write.shutdown().await;
+    let _ = client_write.shutdown().await;
+    result
 }
 
 async fn relay_client_to_server<R, W>(
@@ -100,25 +104,32 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut fragments = FragmentState::None;
+    let mut close_seen = false;
 
     loop {
         let Some(frame) = read_frame_header(reader).await.inspect_err(|e| {
-            emit_protocol_failure(host, port, policy_name, &e.to_string());
+            emit_protocol_failure(host, port, policy_name, protocol_failure_class(e));
         })?
         else {
             writer.shutdown().await.into_diagnostic()?;
             return Ok(());
         };
 
+        if close_seen {
+            let e = miette!("websocket frame received after close frame");
+            emit_protocol_failure(host, port, policy_name, protocol_failure_class(&e));
+            return Err(e);
+        }
+
         if let Err(e) = validate_frame_header(&frame, &fragments) {
-            emit_protocol_failure(host, port, policy_name, &e.to_string());
+            emit_protocol_failure(host, port, policy_name, protocol_failure_class(&e));
             return Err(e);
         }
 
         match frame.opcode {
             OPCODE_TEXT => {
                 let payload = read_masked_payload(reader, &frame).await.inspect_err(|e| {
-                    emit_protocol_failure(host, port, policy_name, &e.to_string());
+                    emit_protocol_failure(host, port, policy_name, protocol_failure_class(e));
                 })?;
                 if frame.fin {
                     relay_text_payload(
@@ -133,7 +144,7 @@ where
                     )
                     .await
                     .inspect_err(|e| {
-                        emit_protocol_failure(host, port, policy_name, &e.to_string());
+                        emit_protocol_failure(host, port, policy_name, protocol_failure_class(e));
                     })?;
                 } else {
                     fragments = FragmentState::Text { payload };
@@ -142,10 +153,10 @@ where
             OPCODE_CONTINUATION => match &mut fragments {
                 FragmentState::Text { payload } => {
                     let next = read_masked_payload(reader, &frame).await.inspect_err(|e| {
-                        emit_protocol_failure(host, port, policy_name, &e.to_string());
+                        emit_protocol_failure(host, port, policy_name, protocol_failure_class(e));
                     })?;
                     if let Err(e) = append_text_fragment(payload, next) {
-                        emit_protocol_failure(host, port, policy_name, &e.to_string());
+                        emit_protocol_failure(host, port, policy_name, protocol_failure_class(&e));
                         return Err(e);
                     }
                     if frame.fin {
@@ -163,12 +174,26 @@ where
                         )
                         .await
                         .inspect_err(|e| {
-                            emit_protocol_failure(host, port, policy_name, &e.to_string());
+                            emit_protocol_failure(
+                                host,
+                                port,
+                                policy_name,
+                                protocol_failure_class(e),
+                            );
                         })?;
                     }
                 }
                 FragmentState::Binary => {
-                    copy_raw_frame_payload(reader, writer, &frame).await?;
+                    copy_raw_frame_payload(reader, writer, &frame)
+                        .await
+                        .inspect_err(|e| {
+                            emit_protocol_failure(
+                                host,
+                                port,
+                                policy_name,
+                                protocol_failure_class(e),
+                            );
+                        })?;
                     if frame.fin {
                         fragments = FragmentState::None;
                     }
@@ -176,7 +201,7 @@ where
                 FragmentState::None => {
                     let e =
                         miette!("websocket continuation frame without active fragmented message");
-                    emit_protocol_failure(host, port, policy_name, &e.to_string());
+                    emit_protocol_failure(host, port, policy_name, protocol_failure_class(&e));
                     return Err(e);
                 }
             },
@@ -184,10 +209,21 @@ where
                 if !frame.fin {
                     fragments = FragmentState::Binary;
                 }
-                copy_raw_frame_payload(reader, writer, &frame).await?;
+                copy_raw_frame_payload(reader, writer, &frame)
+                    .await
+                    .inspect_err(|e| {
+                        emit_protocol_failure(host, port, policy_name, protocol_failure_class(e));
+                    })?;
             }
             OPCODE_CLOSE | OPCODE_PING | OPCODE_PONG => {
-                copy_raw_frame_payload(reader, writer, &frame).await?;
+                relay_control_frame(reader, writer, &frame)
+                    .await
+                    .inspect_err(|e| {
+                        emit_protocol_failure(host, port, policy_name, protocol_failure_class(e));
+                    })?;
+                if frame.opcode == OPCODE_CLOSE {
+                    close_seen = true;
+                }
             }
             _ => unreachable!("validated opcode"),
         }
@@ -225,7 +261,13 @@ async fn read_frame_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Optio
                 .await
                 .map_err(|e| miette!("malformed websocket extended length: {e}"))?;
             raw_header.extend_from_slice(&bytes);
-            u64::from(u16::from_be_bytes(bytes))
+            let len = u64::from(u16::from_be_bytes(bytes));
+            if len < 126 {
+                return Err(miette!(
+                    "websocket frame uses non-minimal 16-bit extended length"
+                ));
+            }
+            len
         }
         127 => {
             let mut bytes = [0u8; 8];
@@ -237,7 +279,13 @@ async fn read_frame_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Optio
                 return Err(miette!("websocket frame uses non-canonical 64-bit length"));
             }
             raw_header.extend_from_slice(&bytes);
-            u64::from_be_bytes(bytes)
+            let len = u64::from_be_bytes(bytes);
+            if u16::try_from(len).is_ok() {
+                return Err(miette!(
+                    "websocket frame uses non-minimal 64-bit extended length"
+                ));
+            }
+            len
         }
         _ => unreachable!("7-bit length code"),
     };
@@ -306,6 +354,14 @@ fn validate_frame_header(frame: &FrameHeader, fragments: &FragmentState) -> Resu
             "websocket continuation frame without active fragmented message"
         ));
     }
+    if (frame.opcode == OPCODE_BINARY
+        || (frame.opcode == OPCODE_CONTINUATION && matches!(fragments, FragmentState::Binary)))
+        && frame.payload_len > MAX_RAW_FRAME_PAYLOAD_BYTES
+    {
+        return Err(miette!(
+            "websocket binary frame exceeds {MAX_RAW_FRAME_PAYLOAD_BYTES} byte relay limit"
+        ));
+    }
     Ok(())
 }
 
@@ -361,7 +417,7 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
         .map_err(|_| miette!("websocket text message is not valid UTF-8"))?;
     let replacements = resolver
         .rewrite_websocket_text_placeholders(&mut text)
-        .map_err(|e| miette!("{e}"))?;
+        .map_err(|_| miette!("websocket credential placeholder resolution failed"))?;
 
     if replacements == 0 && !force_reframe {
         writer
@@ -382,6 +438,65 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
         emit_rewrite_event(host, port, policy_name, replacements);
     }
     write_masked_frame(writer, OPCODE_TEXT, text.as_bytes()).await
+}
+
+async fn relay_control_frame<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    frame: &FrameHeader,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let raw_payload_len = usize::try_from(frame.payload_len)
+        .map_err(|_| miette!("websocket control frame payload length overflow"))?;
+    let mut raw_payload = vec![0u8; raw_payload_len];
+    reader
+        .read_exact(&mut raw_payload)
+        .await
+        .map_err(|e| miette!("malformed websocket control payload: {e}"))?;
+
+    if frame.opcode == OPCODE_CLOSE {
+        let mut payload = raw_payload.clone();
+        let mask_key = frame
+            .mask_key
+            .ok_or_else(|| miette!("websocket client frame is not masked"))?;
+        apply_mask(&mut payload, mask_key);
+        validate_close_payload(&payload)?;
+    }
+
+    writer
+        .write_all(&frame.raw_header)
+        .await
+        .into_diagnostic()?;
+    writer.write_all(&raw_payload).await.into_diagnostic()?;
+    writer.flush().await.into_diagnostic()?;
+    Ok(())
+}
+
+fn validate_close_payload(payload: &[u8]) -> Result<()> {
+    if payload.len() == 1 {
+        return Err(miette!(
+            "websocket close frame payload cannot be exactly one byte"
+        ));
+    }
+    if payload.len() < 2 {
+        return Ok(());
+    }
+
+    let code = u16::from_be_bytes([payload[0], payload[1]]);
+    if !valid_close_code(code) {
+        return Err(miette!("websocket close frame uses invalid close code"));
+    }
+    if std::str::from_utf8(&payload[2..]).is_err() {
+        return Err(miette!("websocket close frame reason is not valid UTF-8"));
+    }
+    Ok(())
+}
+
+fn valid_close_code(code: u16) -> bool {
+    (matches!(code, 1000..=1014) && !matches!(code, 1004..=1006)) || (3000..=4999).contains(&code)
 }
 
 async fn copy_raw_frame_payload<R, W>(
@@ -479,7 +594,38 @@ fn emit_rewrite_event(host: &str, port: u16, policy_name: &str, replacements: us
     ocsf_emit!(event);
 }
 
-fn emit_protocol_failure(host: &str, port: u16, policy_name: &str, detail: &str) {
+fn protocol_failure_class(error: &miette::Report) -> &'static str {
+    let msg = error.to_string().to_ascii_lowercase();
+    if msg.contains("credential") {
+        "credential_resolution_failed"
+    } else if msg.contains("utf-8") {
+        "invalid_utf8"
+    } else if msg.contains("close frame") || msg.contains("after close") {
+        "invalid_close_frame"
+    } else if msg.contains("control frame") {
+        "invalid_control_frame"
+    } else if msg.contains("length")
+        || msg.contains("too large")
+        || msg.contains("exceeds")
+        || msg.contains("overflow")
+    {
+        "invalid_length"
+    } else if msg.contains("continuation") || msg.contains("fragmented") {
+        "invalid_fragmentation"
+    } else if msg.contains("reserved opcode") {
+        "reserved_opcode"
+    } else if msg.contains("not masked") {
+        "unmasked_client_frame"
+    } else if msg.contains("rsv") {
+        "rsv_bits"
+    } else if msg.contains("malformed") {
+        "malformed_frame"
+    } else {
+        "protocol_error"
+    }
+}
+
+fn emit_protocol_failure(host: &str, port: u16, policy_name: &str, failure_class: &str) {
     let policy_name = if policy_name.is_empty() {
         "-"
     } else {
@@ -496,7 +642,7 @@ fn emit_protocol_failure(host: &str, port: u16, policy_name: &str, detail: &str)
         .message(format!(
             "WEBSOCKET_CREDENTIAL_REWRITE closed ambiguous client frame [host:{host} port:{port}]"
         ))
-        .status_detail(detail)
+        .status_detail(failure_class)
         .build();
     ocsf_emit!(event);
 }
@@ -546,6 +692,39 @@ mod tests {
         frame.push(u8::try_from(payload.len()).expect("test payload fits in one byte"));
         frame.extend_from_slice(payload);
         frame
+    }
+
+    fn masked_frame_with_declared_len(opcode: u8, declared_len: u64) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.push(0x80 | opcode);
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&declared_len.to_be_bytes());
+        frame.extend_from_slice(&[0x37, 0xfa, 0x21, 0x3d]);
+        frame
+    }
+
+    fn masked_frame_with_non_minimal_16_bit_len(opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mask_key = [0x37, 0xfa, 0x21, 0x3d];
+        let mut frame = Vec::new();
+        frame.push(0x80 | opcode);
+        frame.push(0x80 | 0x7e);
+        frame.extend_from_slice(
+            &u16::try_from(payload.len())
+                .expect("test payload fits u16")
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(&mask_key);
+        for (i, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask_key[i % 4]);
+        }
+        frame
+    }
+
+    fn close_payload(code: u16, reason: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(2 + reason.len());
+        payload.extend_from_slice(&code.to_be_bytes());
+        payload.extend_from_slice(reason);
+        payload
     }
 
     async fn run_client_to_server(input: Vec<u8>) -> Result<Vec<u8>> {
@@ -719,7 +898,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unresolved credential placeholder")
+                .contains("credential placeholder resolution")
         );
     }
 
@@ -780,5 +959,121 @@ mod tests {
             .expect_err("oversize text should fail");
 
         assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn fragmented_text_allows_interleaved_ping_pong_and_rewrites_at_completion() {
+        let (child_env, _) = resolver();
+        let placeholder = child_env.get("DISCORD_BOT_TOKEN").unwrap();
+        let first = format!(r#"{{"token":"{placeholder}"#);
+        let first_control_frame = masked_frame(true, OPCODE_PING, b"p");
+        let second_control_frame = masked_frame(true, OPCODE_PONG, b"q");
+        let mut input = masked_frame(false, OPCODE_TEXT, first.as_bytes());
+        input.extend_from_slice(&first_control_frame);
+        input.extend_from_slice(&second_control_frame);
+        input.extend(masked_frame(true, OPCODE_CONTINUATION, br#""}"#));
+
+        let output = run_client_to_server(input)
+            .await
+            .expect("relay should allow interleaved control frames");
+
+        assert!(output.starts_with(&first_control_frame));
+        assert_eq!(
+            &output
+                [first_control_frame.len()..first_control_frame.len() + second_control_frame.len()],
+            second_control_frame.as_slice()
+        );
+        assert_eq!(
+            decode_masked_text_frame(
+                &output[first_control_frame.len() + second_control_frame.len()..]
+            ),
+            r#"{"token":"real-token"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_frame_passes_through_unchanged() {
+        let frame = masked_frame(true, OPCODE_BINARY, &[0, 1, 2, 3, 255]);
+
+        let output = run_client_to_server(frame.clone())
+            .await
+            .expect("binary frame should pass through");
+
+        assert_eq!(output, frame);
+    }
+
+    #[tokio::test]
+    async fn rejects_reserved_opcode() {
+        let err = run_client_to_server(masked_frame(true, 0x3, b"reserved"))
+            .await
+            .expect_err("reserved opcode should fail");
+
+        assert!(err.to_string().contains("reserved opcode"));
+    }
+
+    #[tokio::test]
+    async fn rejects_non_minimal_extended_length() {
+        let err = run_client_to_server(masked_frame_with_non_minimal_16_bit_len(
+            OPCODE_TEXT,
+            b"hello",
+        ))
+        .await
+        .expect_err("non-minimal length should fail");
+
+        assert!(err.to_string().contains("non-minimal"));
+    }
+
+    #[tokio::test]
+    async fn rejects_oversize_binary_frame_before_payload_buffering() {
+        let err = run_client_to_server(masked_frame_with_declared_len(
+            OPCODE_BINARY,
+            MAX_RAW_FRAME_PAYLOAD_BYTES + 1,
+        ))
+        .await
+        .expect_err("oversize binary frame should fail");
+
+        assert!(err.to_string().contains("binary frame exceeds"));
+    }
+
+    #[tokio::test]
+    async fn validates_close_frame_payloads() {
+        let frame = masked_frame(true, OPCODE_CLOSE, &close_payload(1000, b"done"));
+
+        let output = run_client_to_server(frame.clone())
+            .await
+            .expect("valid close frame should pass through");
+
+        assert_eq!(output, frame);
+    }
+
+    #[tokio::test]
+    async fn rejects_close_frame_with_one_byte_payload() {
+        let err = run_client_to_server(masked_frame(true, OPCODE_CLOSE, &[0x03]))
+            .await
+            .expect_err("one-byte close frame should fail");
+
+        assert!(err.to_string().contains("exactly one byte"));
+    }
+
+    #[tokio::test]
+    async fn rejects_reserved_close_code() {
+        let err = run_client_to_server(masked_frame(true, OPCODE_CLOSE, &close_payload(1005, b"")))
+            .await
+            .expect_err("reserved close code should fail");
+
+        assert!(err.to_string().contains("invalid close code"));
+    }
+
+    #[tokio::test]
+    async fn rejects_close_reason_with_invalid_utf8() {
+        let err = run_client_to_server(masked_frame(
+            true,
+            OPCODE_CLOSE,
+            &close_payload(1000, &[0xff]),
+        ))
+        .await
+        .expect_err("invalid close reason should fail");
+
+        assert!(err.to_string().contains("valid UTF-8"));
     }
 }
