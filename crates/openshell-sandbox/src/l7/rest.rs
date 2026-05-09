@@ -1580,10 +1580,285 @@ mod tests {
     use super::*;
     use crate::opa::OpaEngine;
     use crate::secrets::SecretResolver;
+    use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+    use std::sync::Arc;
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
     const VALID_WS_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
     const VALID_WS_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+    const TEXT_OPCODE: u8 = 0x1;
+
+    #[derive(Debug)]
+    struct CapturedFrame {
+        fin_opcode: u8,
+        masked: bool,
+        payload: Vec<u8>,
+    }
+
+    async fn read_http_header_block<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut header = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                reader.read_exact(&mut byte).await.unwrap();
+                header.push(byte[0]);
+                if header.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            header
+        })
+        .await
+        .expect("HTTP header block should arrive")
+    }
+
+    async fn read_websocket_frame<R: AsyncRead + Unpin>(reader: &mut R) -> CapturedFrame {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut prefix = [0u8; 2];
+            reader.read_exact(&mut prefix).await.unwrap();
+            let masked = prefix[1] & 0x80 != 0;
+            let mut payload_len = u64::from(prefix[1] & 0x7f);
+            if payload_len == 126 {
+                let mut extended = [0u8; 2];
+                reader.read_exact(&mut extended).await.unwrap();
+                payload_len = u64::from(u16::from_be_bytes(extended));
+            } else if payload_len == 127 {
+                let mut extended = [0u8; 8];
+                reader.read_exact(&mut extended).await.unwrap();
+                payload_len = u64::from_be_bytes(extended);
+            }
+            let mut mask_key = [0u8; 4];
+            if masked {
+                reader.read_exact(&mut mask_key).await.unwrap();
+            }
+            let payload_len = usize::try_from(payload_len).unwrap();
+            let mut payload = vec![0u8; payload_len];
+            reader.read_exact(&mut payload).await.unwrap();
+            if masked {
+                apply_test_mask(&mut payload, mask_key);
+            }
+            CapturedFrame {
+                fin_opcode: prefix[0],
+                masked,
+                payload,
+            }
+        })
+        .await
+        .expect("WebSocket frame should arrive")
+    }
+
+    fn masked_frame_with_rsv(opcode: u8, rsv: u8, payload: &[u8]) -> Vec<u8> {
+        let mask_key = [0x37, 0xfa, 0x21, 0x3d];
+        let mut frame = Vec::new();
+        frame.push(0x80 | rsv | opcode);
+        write_test_payload_len(&mut frame, 0x80, payload.len());
+        frame.extend_from_slice(&mask_key);
+        let mut masked = payload.to_vec();
+        apply_test_mask(&mut masked, mask_key);
+        frame.extend_from_slice(&masked);
+        frame
+    }
+
+    fn unmasked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.push(0x80 | opcode);
+        write_test_payload_len(&mut frame, 0, payload.len());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn write_test_payload_len(frame: &mut Vec<u8>, mask_bit: u8, payload_len: usize) {
+        if payload_len < 126 {
+            frame.push(mask_bit | payload_len as u8);
+        } else if u16::try_from(payload_len).is_ok() {
+            frame.push(mask_bit | 0x7e);
+            frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
+        } else {
+            frame.push(mask_bit | 0x7f);
+            frame.extend_from_slice(&(payload_len as u64).to_be_bytes());
+        }
+    }
+
+    fn apply_test_mask(payload: &mut [u8], mask_key: [u8; 4]) {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask_key[index % 4];
+        }
+    }
+
+    fn compress_test_permessage_deflate(payload: &[u8]) -> Vec<u8> {
+        let mut compressor = Compress::new(Compression::fast(), false);
+        let mut out = Vec::with_capacity(payload.len().saturating_add(128));
+        loop {
+            let consumed = usize::try_from(compressor.total_in()).unwrap();
+            if consumed >= payload.len() {
+                break;
+            }
+            let before_in = compressor.total_in();
+            let before_out = compressor.total_out();
+            let status = compressor
+                .compress_vec(&payload[consumed..], &mut out, FlushCompress::None)
+                .unwrap();
+            if matches!(status, Status::BufError)
+                || (compressor.total_in() == before_in && compressor.total_out() == before_out)
+            {
+                out.reserve(out.capacity().max(1024));
+            }
+        }
+        loop {
+            out.reserve(64);
+            let before_out = compressor.total_out();
+            compressor
+                .compress_vec(&[], &mut out, FlushCompress::Sync)
+                .unwrap();
+            if out.ends_with(&[0x00, 0x00, 0xff, 0xff]) {
+                break;
+            }
+            if compressor.total_out() == before_out {
+                out.reserve(out.capacity().max(1024));
+            }
+        }
+        out.truncate(out.len() - 4);
+        out
+    }
+
+    fn decompress_test_permessage_deflate(payload: &[u8]) -> Vec<u8> {
+        let mut decoder = Decompress::new(false);
+        let mut input = Vec::with_capacity(payload.len() + 4);
+        input.extend_from_slice(payload);
+        input.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
+        let mut out = Vec::new();
+        let mut input_pos = 0usize;
+        let mut scratch = [0u8; RELAY_BUF_SIZE];
+        loop {
+            let before_in = decoder.total_in();
+            let before_out = decoder.total_out();
+            let status = decoder
+                .decompress(&input[input_pos..], &mut scratch, FlushDecompress::Sync)
+                .unwrap();
+            let read = usize::try_from(decoder.total_in() - before_in).unwrap();
+            let written = usize::try_from(decoder.total_out() - before_out).unwrap();
+            input_pos += read;
+            out.extend_from_slice(&scratch[..written]);
+            if matches!(status, Status::StreamEnd) {
+                break;
+            }
+            if input_pos >= input.len() && written < scratch.len() {
+                break;
+            }
+            assert!(
+                read != 0 || written != 0,
+                "test permessage-deflate decompression did not make progress"
+            );
+        }
+        out
+    }
+
+    fn websocket_request(extension: Option<&str>) -> L7Request {
+        let mut raw_header = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\n"
+        );
+        if let Some(extension) = extension {
+            raw_header.push_str("Sec-WebSocket-Extensions: ");
+            raw_header.push_str(extension);
+            raw_header.push_str("\r\n");
+        }
+        raw_header.push_str("Sec-WebSocket-Version: 13\r\n\r\n");
+        L7Request {
+            action: "GET".to_string(),
+            target: "/ws".to_string(),
+            query_params: HashMap::new(),
+            raw_header: raw_header.into_bytes(),
+            body_length: BodyLength::None,
+        }
+    }
+
+    async fn run_upgraded_websocket_case(
+        request_extension: Option<&'static str>,
+        response_extension: Option<&'static str>,
+        extension_mode: WebSocketExtensionMode,
+        resolver: Option<Arc<SecretResolver>>,
+        client_frame: Vec<u8>,
+    ) -> (String, CapturedFrame) {
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(16384);
+        let (mut client_app, mut proxy_to_client) = tokio::io::duplex(16384);
+        let req = websocket_request(request_extension);
+        let resolver_for_header = resolver.clone();
+        let resolver_for_upgrade = resolver.clone();
+
+        let upstream_task = tokio::spawn(async move {
+            let forwarded = read_http_header_block(&mut upstream_side).await;
+            let forwarded = String::from_utf8(forwarded).unwrap();
+            let mut response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {VALID_WS_ACCEPT}\r\n"
+            );
+            if let Some(extension) = response_extension {
+                response.push_str("Sec-WebSocket-Extensions: ");
+                response.push_str(extension);
+                response.push_str("\r\n");
+            }
+            response.push_str("\r\n");
+            upstream_side.write_all(response.as_bytes()).await.unwrap();
+            upstream_side.flush().await.unwrap();
+            let frame = read_websocket_frame(&mut upstream_side).await;
+            (forwarded, frame)
+        });
+
+        let relay_task = tokio::spawn(async move {
+            let outcome = relay_http_request_with_options_guarded(
+                &req,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                RelayRequestOptions {
+                    resolver: resolver_for_header.as_deref(),
+                    websocket_extensions: extension_mode,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("handshake relay should succeed");
+            let RelayOutcome::Upgraded {
+                overflow,
+                websocket_permessage_deflate,
+            } = outcome
+            else {
+                panic!("expected upgraded relay outcome");
+            };
+            let credential_rewrite = resolver_for_upgrade.is_some();
+            crate::l7::relay::handle_upgrade(
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                overflow,
+                "example.com",
+                443,
+                crate::l7::relay::UpgradeRelayOptions {
+                    websocket_request: true,
+                    websocket: crate::l7::relay::WebSocketUpgradeBehavior {
+                        credential_rewrite,
+                        permessage_deflate: websocket_permessage_deflate,
+                        ..Default::default()
+                    },
+                    secret_resolver: resolver_for_upgrade,
+                    target: "/ws".to_string(),
+                    policy_name: "test-policy".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+
+        let response = read_http_header_block(&mut client_app).await;
+        assert!(
+            String::from_utf8_lossy(&response).contains("101 Switching Protocols"),
+            "client must receive the upgrade before frame relay starts"
+        );
+        client_app.write_all(&client_frame).await.unwrap();
+        client_app.flush().await.unwrap();
+
+        let result = upstream_task.await.expect("upstream task should complete");
+        drop(client_app);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay_task).await;
+        result
+    }
 
     #[test]
     fn deny_response_body_is_agent_readable_and_redacted() {
@@ -2940,6 +3215,100 @@ mod tests {
             "safe permessage-deflate must be marked negotiated"
         );
         upstream_task.await.expect("upstream task should complete");
+    }
+
+    #[tokio::test]
+    async fn websocket_conformance_preserve_mode_relays_raw_frames_without_validation() {
+        let (forwarded, frame) = run_upgraded_websocket_case(
+            None,
+            None,
+            WebSocketExtensionMode::Preserve,
+            None,
+            unmasked_frame(TEXT_OPCODE, b"raw-unmasked"),
+        )
+        .await;
+
+        assert!(
+            forwarded.contains("Upgrade: websocket"),
+            "raw preserve path should still forward the upgrade request"
+        );
+        assert!(
+            !frame.masked,
+            "raw preserve path must not validate or rewrite client frame masking"
+        );
+        assert_eq!(frame.fin_opcode & 0x0f, TEXT_OPCODE);
+        assert_eq!(frame.payload, b"raw-unmasked");
+    }
+
+    #[tokio::test]
+    async fn websocket_conformance_rewrite_mode_rewrites_text_after_upgrade() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let placeholder = child_env.get("DISCORD_BOT_TOKEN").unwrap();
+        let payload = format!(r#"{{"op":2,"d":{{"token":"{placeholder}"}}}}"#);
+
+        let (forwarded, frame) = run_upgraded_websocket_case(
+            None,
+            None,
+            WebSocketExtensionMode::PermessageDeflate,
+            resolver.map(Arc::new),
+            masked_frame_with_rsv(TEXT_OPCODE, 0, payload.as_bytes()),
+        )
+        .await;
+
+        assert!(
+            !forwarded
+                .to_ascii_lowercase()
+                .contains("sec-websocket-extensions"),
+            "plain rewrite path should not offer compression when the client did not offer a safe subset"
+        );
+        assert!(frame.masked, "parsed relay must preserve client masking");
+        assert_eq!(frame.fin_opcode & 0x0f, TEXT_OPCODE);
+        assert_eq!(
+            String::from_utf8(frame.payload).unwrap(),
+            r#"{"op":2,"d":{"token":"real-token"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_conformance_deflate_rewrites_compressed_text_after_upgrade() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let placeholder = child_env.get("DISCORD_BOT_TOKEN").unwrap();
+        let payload = format!(r#"{{"op":2,"d":{{"token":"{placeholder}"}}}}"#);
+        let compressed = compress_test_permessage_deflate(payload.as_bytes());
+
+        let (forwarded, frame) = run_upgraded_websocket_case(
+            Some("permessage-deflate; server_no_context_takeover; client_no_context_takeover"),
+            Some("permessage-deflate; server_no_context_takeover; client_no_context_takeover"),
+            WebSocketExtensionMode::PermessageDeflate,
+            resolver.map(Arc::new),
+            masked_frame_with_rsv(TEXT_OPCODE, 0x40, &compressed),
+        )
+        .await;
+
+        assert!(
+            forwarded.to_ascii_lowercase().contains(
+                "sec-websocket-extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover"
+            ),
+            "safe extension offer should be canonicalized before forwarding"
+        );
+        assert!(frame.masked, "parsed relay must preserve client masking");
+        assert_eq!(frame.fin_opcode & 0x0f, TEXT_OPCODE);
+        assert!(
+            frame.fin_opcode & 0x40 != 0,
+            "rewritten compressed text must retain RSV1"
+        );
+        assert_eq!(
+            String::from_utf8(decompress_test_permessage_deflate(&frame.payload)).unwrap(),
+            r#"{"op":2,"d":{"token":"real-token"}}"#
+        );
     }
 
     #[tokio::test]
