@@ -42,6 +42,11 @@ path = "tests/gateway_resume.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
+name = "websocket_conformance"
+path = "tests/websocket_conformance.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "user_namespaces"
 path = "tests/user_namespaces.rs"
 required-features = ["e2e-kubernetes"]

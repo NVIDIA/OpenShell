@@ -34,6 +34,13 @@ run = [
   "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker",
 ]
 
+["e2e:websocket-conformance"]
+description = "Run focused WebSocket conformance e2e tests against a Docker-backed gateway"
+run = [
+  "cargo build -p openshell-cli --features openshell-core/dev-settings",
+  "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test websocket_conformance",
+]
+
 ["e2e:python"]
 description = "Run Python e2e tests against a Docker-backed gateway (E2E_PARALLEL=N or 'auto'; default 5)"
 depends = ["python:proto"]

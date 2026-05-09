@@ -1,0 +1,65 @@
+name: WebSocket Conformance
+
+on:
+  workflow_dispatch: {}
+  # Add `schedule:` here after this focused lane has burned in manually.
+
+permissions: {}
+
+jobs:
+  build-gateway:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: gateway
+      platform: linux/amd64
+
+  build-supervisor:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: supervisor
+      platform: linux/amd64
+
+  websocket-conformance:
+    name: WebSocket Conformance
+    needs: [build-gateway, build-supervisor]
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+        - /home/runner/_work:/home/runner/_work
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      IMAGE_TAG: ${{ github.sha }}
+      OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
+      OPENSHELL_REGISTRY_HOST: ghcr.io
+      OPENSHELL_REGISTRY_NAMESPACE: nvidia/openshell
+      OPENSHELL_REGISTRY_USERNAME: ${{ github.actor }}
+      OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install OS test dependencies
+        run: apt-get update && apt-get install -y openssh-client && rm -rf /var/lib/apt/lists/*
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Run WebSocket conformance e2e
+        env:
+          OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', github.sha) }}
+        run: mise run --no-deps --skip-deps e2e:websocket-conformance

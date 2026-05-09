@@ -155,7 +155,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `host` | string | Yes | Hostname or IP address. Supports wildcards: `*.example.com` matches any subdomain. |
 | `port` | integer | Yes | TCP port number. |
 | `path` | string | No | Optional HTTP path glob used to select between L7 endpoints that share the same host and port. Empty means all paths. Use this when REST and GraphQL live under the same host, such as `/repos/**` and `/graphql`. |
-| `protocol` | string | No | Set to `rest` for HTTP method/path inspection or `graphql` for GraphQL operation inspection. Omit for TCP passthrough. |
+| `protocol` | string | No | Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, or `graphql` for GraphQL operation inspection. Omit for TCP passthrough. |
 | `tls` | string | No | TLS handling mode. The proxy auto-detects TLS by peeking the first bytes of each connection and terminates it for inspected HTTPS traffic, so this field is optional in most cases. Set to `skip` to disable auto-detection for edge cases such as client-certificate mTLS or non-standard protocols. The values `terminate` and `passthrough` are deprecated and log a warning; they are still accepted for backward compatibility but have no effect on behavior. |
 | `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
 | `access` | string | No | Access preset. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. |
@@ -163,7 +163,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `deny_rules` | list of deny rule objects | No | L7 deny rules that block specific requests even when allowed by `access` or `rules`. Deny rules take precedence over allow rules. |
 | `allowed_ips` | list of string | No | CIDR or IP allowlist for SSRF override. Entries overlapping loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), or unspecified (`0.0.0.0`) are rejected at load time. |
 | `allow_encoded_slash` | bool | No | When `true`, L7 request parsing preserves `%2F` inside path segments instead of rejecting it. Use this for registries and APIs such as npm scoped packages (`/@scope%2Fname`). Defaults to `false`. |
-| `websocket_credential_rewrite` | bool | No | When `true` on a `protocol: rest` endpoint, OpenShell rewrites `openshell:resolve:env:*` placeholders in client-to-server WebSocket text messages after an allowed HTTP `101` upgrade. Defaults to `false`. |
+| `websocket_credential_rewrite` | bool | No | When `true` on a `protocol: rest` or `protocol: websocket` endpoint, OpenShell rewrites `openshell:resolve:env:*` placeholders in client-to-server WebSocket text messages after an allowed HTTP `101` upgrade. Binary frames are relayed but not rewritten. Defaults to `false`. |
 | `persisted_queries` | string | No | GraphQL hash-only behavior. Default is `deny`; use `allow_registered` only with `graphql_persisted_queries`. |
 | `graphql_persisted_queries` | map | No | Trusted GraphQL persisted-query registry keyed by hash or saved-query ID. Values contain `operation_type`, optional `operation_name`, and optional root `fields`. |
 | `graphql_max_body_bytes` | integer | No | Maximum GraphQL request body bytes buffered for inspection. Defaults to `65536`. |
@@ -172,11 +172,11 @@ Each endpoint defines a reachable destination and optional inspection rules.
 
 The `access` field accepts one of the following values:
 
-| Value | REST expansion | GraphQL expansion |
-|---|---|---|
-| `full` | All methods and paths. | All operation types. |
-| `read-only` | `GET`, `HEAD`, `OPTIONS`. | `query` operations. |
-| `read-write` | `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`. | `query` and `mutation` operations. |
+| Value | REST expansion | WebSocket expansion | GraphQL expansion |
+|---|---|---|---|
+| `full` | All methods and paths. | WebSocket upgrade and all inspected client text-message paths. | All operation types. |
+| `read-only` | `GET`, `HEAD`, `OPTIONS`. | WebSocket upgrade handshake only. | `query` operations. |
+| `read-write` | `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`. | WebSocket upgrade handshake and client text messages. | `query` and `mutation` operations. |
 
 #### Allow Rule Objects
 
@@ -207,6 +207,28 @@ rules:
       query:
         tag:
           any: ["v1.*", "v2.*"]
+```
+
+##### WebSocket Allow Rule (`protocol: websocket`)
+
+WebSocket allow rules match the RFC 6455 HTTP upgrade by path and match client-to-server text messages on the same upgraded connection with the synthetic `WEBSOCKET_TEXT` method. Binary frames are relayed but are not rewritten.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `method` | string | Yes | `GET` allows the upgrade handshake, `WEBSOCKET_TEXT` allows client text messages after upgrade, and `*` matches both inspected actions. |
+| `path` | string | Yes | URL path pattern from the original upgrade request. Supports `*` and `**` glob syntax. |
+| `query` | map | No | Query parameter matchers from the original upgrade request. Matcher syntax is the same as REST allow rules. |
+
+Example WebSocket allow rules:
+
+```yaml showLineNumbers={false}
+rules:
+  - allow:
+      method: GET
+      path: /v1/realtime/**
+  - allow:
+      method: WEBSOCKET_TEXT
+      path: /v1/realtime/**
 ```
 
 ##### GraphQL Allow Rule (`protocol: graphql`)
@@ -262,6 +284,30 @@ endpoints:
         path: "/repos/*/branches/*/protection"
       - method: "*"
         path: "/repos/*/rulesets"
+```
+
+##### WebSocket Deny Rule (`protocol: websocket`)
+
+WebSocket deny rules use the same field names as WebSocket allow rules, but they appear directly under each `deny_rules` entry instead of under an `allow` wrapper.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `method` | string | Yes | `GET` denies matching upgrade handshakes, `WEBSOCKET_TEXT` denies matching client text messages after upgrade, and `*` matches both inspected actions. |
+| `path` | string | Yes | URL path pattern from the original upgrade request. Same glob syntax as allow rules. |
+| `query` | map | No | Query parameter matchers from the original upgrade request. Same syntax as allow rule `query`. |
+
+Example WebSocket deny rules:
+
+```yaml showLineNumbers={false}
+endpoints:
+  - host: realtime.example.com
+    port: 443
+    protocol: websocket
+    enforcement: enforce
+    access: read-write
+    deny_rules:
+      - method: WEBSOCKET_TEXT
+        path: "/v1/admin/**"
 ```
 
 ##### GraphQL Deny Rule (`protocol: graphql`)
