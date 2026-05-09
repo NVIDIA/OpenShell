@@ -55,8 +55,26 @@ pub(crate) struct UpgradeRelayOptions<'a> {
 #[derive(Default)]
 pub(crate) struct WebSocketUpgradeBehavior {
     pub(crate) credential_rewrite: bool,
-    pub(crate) message_inspection: bool,
+    pub(crate) message_policy: WebSocketMessagePolicy,
     pub(crate) permessage_deflate: bool,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WebSocketMessagePolicy {
+    #[default]
+    None,
+    Transport,
+    Graphql,
+}
+
+impl WebSocketMessagePolicy {
+    fn inspects_messages(self) -> bool {
+        self != Self::None
+    }
+
+    fn is_graphql(self) -> bool {
+        self == Self::Graphql
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -448,7 +466,7 @@ where
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let use_websocket_relay = options.websocket_request
-        && (options.websocket.message_inspection
+        && (options.websocket.message_policy.inspects_messages()
             || options.websocket.permessage_deflate
             || (options.websocket.credential_rewrite && options.secret_resolver.is_some()));
     let relay_mode = if use_websocket_relay {
@@ -474,7 +492,7 @@ where
         } else {
             None
         };
-        let inspector = if options.websocket.message_inspection {
+        let inspector = if options.websocket.message_policy.inspects_messages() {
             match (options.engine, options.ctx) {
                 (Some(engine), Some(ctx)) => Some(crate::l7::websocket::InspectionOptions {
                     engine,
@@ -482,6 +500,7 @@ where
                     enforcement: options.enforcement,
                     target: options.target.clone(),
                     query_params: options.query_params.clone(),
+                    graphql_policy: options.websocket.message_policy.is_graphql(),
                 }),
                 _ => {
                     return Err(miette!(
@@ -533,12 +552,20 @@ fn upgrade_options<'a>(
     let websocket_credential_rewrite =
         matches!(config.protocol, L7Protocol::Rest | L7Protocol::Websocket)
             && config.websocket_credential_rewrite;
-    let websocket_message_inspection = config.protocol == L7Protocol::Websocket;
+    let websocket_message_policy = if config.protocol == L7Protocol::Websocket {
+        if config.websocket_graphql_policy {
+            WebSocketMessagePolicy::Graphql
+        } else {
+            WebSocketMessagePolicy::Transport
+        }
+    } else {
+        WebSocketMessagePolicy::None
+    };
     UpgradeRelayOptions {
         websocket_request,
         websocket: WebSocketUpgradeBehavior {
             credential_rewrite: websocket_credential_rewrite,
-            message_inspection: websocket_message_inspection,
+            message_policy: websocket_message_policy,
             permessage_deflate: false,
         },
         secret_resolver: if websocket_credential_rewrite {
@@ -1381,6 +1408,7 @@ network_policies:
             graphql_max_body_bytes: 0,
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
+            websocket_graphql_policy: false,
         }];
         let ctx = L7EvalContext {
             host: "gateway.example.test".into(),
@@ -1479,6 +1507,7 @@ network_policies:
             graphql_max_body_bytes: 0,
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
+            websocket_graphql_policy: false,
         }];
         let (child_env, resolver) = SecretResolver::from_provider_env(
             std::iter::once(("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())).collect(),
@@ -1552,6 +1581,128 @@ network_policies:
         .unwrap();
         assert!(masked, "client-to-server frame must remain masked");
         assert_eq!(rewritten, r#"{"op":2,"d":{"token":"real-token"}}"#);
+        assert!(!rewritten.contains(placeholder));
+
+        drop(app);
+        drop(upstream);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), relay).await;
+    }
+
+    #[tokio::test]
+    async fn route_selected_graphql_websocket_rewrites_connection_init_credentials_after_upgrade() {
+        let data = r#"
+network_policies:
+  route_api:
+    name: route_api
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        path: "/graphql"
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/graphql"
+          - allow:
+              operation_type: query
+              fields: [viewer]
+        websocket_credential_rewrite: true
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let configs = vec![L7EndpointConfig {
+            protocol: L7Protocol::Websocket,
+            path: "/graphql".into(),
+            tls: crate::l7::TlsMode::Auto,
+            enforcement: EnforcementMode::Enforce,
+            graphql_max_body_bytes: 0,
+            allow_encoded_slash: false,
+            websocket_credential_rewrite: true,
+            websocket_graphql_policy: true,
+        }];
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            std::iter::once(("T".to_string(), "real-token".to_string())).collect(),
+        );
+        let placeholder = child_env.get("T").expect("placeholder env");
+        let ctx = L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            policy_name: "route_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: resolver.map(Arc::new),
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /graphql HTTP/1.1\r\nHost: gateway.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut forwarded = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut forwarded),
+        )
+        .await
+        .expect("upgrade request should reach upstream")
+        .unwrap();
+        let forwarded = String::from_utf8_lossy(&forwarded[..n]);
+        assert!(forwarded.contains("GET /graphql HTTP/1.1"));
+        assert!(forwarded.contains("Upgrade: websocket\r\n"));
+
+        upstream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut response = [0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("client should receive upgrade response")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response[..n]).contains("101 Switching Protocols"));
+
+        let payload = format!(
+            r#"{{"type":"connection_init","payload":{{"authorization":"{placeholder}"}}}}"#
+        );
+        app.write_all(&masked_text_frame(payload.as_bytes()))
+            .await
+            .unwrap();
+
+        let (masked, rewritten) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_text_frame(&mut upstream),
+        )
+        .await
+        .expect("rewritten GraphQL WebSocket control message should reach upstream")
+        .unwrap();
+        assert!(masked, "client-to-server frame must remain masked");
+        assert_eq!(
+            rewritten,
+            r#"{"type":"connection_init","payload":{"authorization":"real-token"}}"#
+        );
         assert!(!rewritten.contains(placeholder));
 
         drop(app);

@@ -3354,6 +3354,7 @@ mod tests {
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
+                    websocket_graphql_policy: false,
                 },
             },
             L7ConfigSnapshot {
@@ -3365,6 +3366,7 @@ mod tests {
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
+                    websocket_graphql_policy: false,
                 },
             },
         ];

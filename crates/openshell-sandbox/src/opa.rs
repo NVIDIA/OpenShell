@@ -1814,6 +1814,28 @@ network_policies:
         access: read-only
     binaries:
       - { path: /usr/bin/curl }
+  graphql_ws:
+    name: graphql_ws
+    endpoints:
+      - host: realtime.graphql.com
+        ports: [443]
+        path: "/graphql"
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/graphql"
+          - allow:
+              operation_type: query
+              fields: [viewer]
+          - allow:
+              operation_type: subscription
+              fields: [messageAdded]
+        deny_rules:
+          - operation_type: mutation
+    binaries:
+      - { path: /usr/bin/curl }
   l4_only:
     name: l4_only
     endpoints:
@@ -1895,6 +1917,25 @@ process:
                 "graphql": {
                     "operations": [],
                     "error": error
+                }
+            }
+        })
+    }
+
+    fn l7_websocket_graphql_input(host: &str, operations: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "network": { "host": host, "port": 443 },
+            "exec": {
+                "path": "/usr/bin/curl",
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": "WEBSOCKET_TEXT",
+                "path": "/graphql",
+                "query_params": {},
+                "graphql": {
+                    "operations": operations
                 }
             }
         })
@@ -2135,6 +2176,97 @@ process:
             }]),
         );
         assert!(!eval_l7(&engine, &mutation));
+    }
+
+    #[test]
+    fn l7_websocket_graphql_subscription_allowed_by_field_rule() {
+        let engine = l7_engine();
+        let input = l7_websocket_graphql_input(
+            "realtime.graphql.com",
+            serde_json::json!([{
+                "operation_type": "subscription",
+                "operation_name": "NewMessages",
+                "fields": ["messageAdded"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_websocket_graphql_unlisted_field_denied() {
+        let engine = l7_engine();
+        let input = l7_websocket_graphql_input(
+            "realtime.graphql.com",
+            serde_json::json!([{
+                "operation_type": "query",
+                "fields": ["adminAuditLog"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_websocket_graphql_deny_rule_takes_precedence() {
+        let engine = l7_engine();
+        let input = l7_websocket_graphql_input(
+            "realtime.graphql.com",
+            serde_json::json!([{
+                "operation_type": "mutation",
+                "operation_name": "DeleteRepo",
+                "fields": ["deleteRepository"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_websocket_graphql_not_bypassed_by_generic_text_rule() {
+        let data = r#"
+network_policies:
+  graphql_ws:
+    name: graphql_ws
+    endpoints:
+      - host: realtime.graphql.com
+        ports: [443]
+        path: "/graphql"
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/graphql"
+          - allow:
+              method: WEBSOCKET_TEXT
+              path: "/graphql"
+          - allow:
+              operation_type: query
+              fields: [viewer]
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let data_json: serde_json::Value =
+            serde_yml::from_str(data).expect("fixture should parse as YAML");
+        let mut rego = regorus::Engine::new();
+        rego.add_policy("policy.rego".into(), TEST_POLICY.into())
+            .expect("policy should load");
+        rego.add_data_json(&data_json.to_string())
+            .expect("data should load");
+        let engine = OpaEngine {
+            engine: Mutex::new(rego),
+            generation: Arc::new(AtomicU64::new(0)),
+        };
+        let input = l7_websocket_graphql_input(
+            "realtime.graphql.com",
+            serde_json::json!([{
+                "operation_type": "query",
+                "fields": ["adminAuditLog"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(!eval_l7(&engine, &input));
     }
 
     #[test]

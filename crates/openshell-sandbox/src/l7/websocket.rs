@@ -59,6 +59,7 @@ pub(super) struct InspectionOptions<'a> {
     pub(super) enforcement: EnforcementMode,
     pub(super) target: String,
     pub(super) query_params: HashMap<String, Vec<String>>,
+    pub(super) graphql_policy: bool,
 }
 
 pub(super) struct RelayOptions<'a> {
@@ -500,7 +501,7 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     };
 
     if let Some(inspector) = options.inspector.as_ref() {
-        inspect_websocket_text_message(host, port, options.policy_name, inspector)?;
+        inspect_websocket_text_message(host, port, options.policy_name, inspector, &text)?;
     }
 
     if replacements == 0 && !force_reframe && !compressed {
@@ -533,7 +534,12 @@ fn inspect_websocket_text_message(
     port: u16,
     policy_name: &str,
     inspector: &InspectionOptions<'_>,
+    text: &str,
 ) -> Result<()> {
+    if inspector.graphql_policy {
+        return inspect_graphql_websocket_message(host, port, policy_name, inspector, text);
+    }
+
     let request_info = L7RequestInfo {
         action: "WEBSOCKET_TEXT".to_string(),
         target: inspector.target.clone(),
@@ -546,11 +552,173 @@ fn inspect_websocket_text_message(
         (false, EnforcementMode::Audit) => "audit",
         (false, EnforcementMode::Enforce) => "deny",
     };
-    emit_websocket_l7_event(host, port, policy_name, &request_info, decision, &reason);
+    emit_websocket_l7_event(
+        host,
+        port,
+        policy_name,
+        &request_info,
+        decision,
+        &reason,
+        None,
+    );
     if !allowed && inspector.enforcement == EnforcementMode::Enforce {
         return Err(miette!("websocket text message denied by policy"));
     }
     Ok(())
+}
+
+fn inspect_graphql_websocket_message(
+    host: &str,
+    port: u16,
+    policy_name: &str,
+    inspector: &InspectionOptions<'_>,
+    text: &str,
+) -> Result<()> {
+    match classify_graphql_websocket_message(text) {
+        GraphqlWebSocketMessage::Control { message_type } => {
+            let request_info = L7RequestInfo {
+                action: "WEBSOCKET_CONTROL".to_string(),
+                target: inspector.target.clone(),
+                query_params: inspector.query_params.clone(),
+                graphql: None,
+            };
+            emit_websocket_l7_event(
+                host,
+                port,
+                policy_name,
+                &request_info,
+                "allow",
+                &format!("GraphQL WebSocket control message {message_type}"),
+                None,
+            );
+            Ok(())
+        }
+        GraphqlWebSocketMessage::Operation {
+            message_type,
+            graphql,
+        } => {
+            let request_info = L7RequestInfo {
+                action: "WEBSOCKET_TEXT".to_string(),
+                target: inspector.target.clone(),
+                query_params: inspector.query_params.clone(),
+                graphql: Some(graphql.clone()),
+            };
+            let parse_error_reason = graphql
+                .error
+                .as_deref()
+                .map(|error| format!("GraphQL WebSocket message rejected: {error}"));
+            let force_deny = parse_error_reason.is_some();
+            let (allowed, reason) = if let Some(reason) = parse_error_reason {
+                (false, reason)
+            } else {
+                evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)?
+            };
+            let decision = match (allowed, inspector.enforcement) {
+                (_, _) if force_deny => "deny",
+                (true, _) => "allow",
+                (false, EnforcementMode::Audit) => "audit",
+                (false, EnforcementMode::Enforce) => "deny",
+            };
+            let reason = format!("graphql_ws_type={message_type} {reason}");
+            emit_websocket_l7_event(
+                host,
+                port,
+                policy_name,
+                &request_info,
+                decision,
+                &reason,
+                Some(&graphql),
+            );
+            if (!allowed && inspector.enforcement == EnforcementMode::Enforce) || force_deny {
+                return Err(miette!("websocket GraphQL message denied by policy"));
+            }
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+enum GraphqlWebSocketMessage {
+    Control {
+        message_type: String,
+    },
+    Operation {
+        message_type: String,
+        graphql: crate::l7::graphql::GraphqlRequestInfo,
+    },
+}
+
+fn classify_graphql_websocket_message(text: &str) -> GraphqlWebSocketMessage {
+    let value = match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value) => value,
+        Err(err) => {
+            return GraphqlWebSocketMessage::Operation {
+                message_type: "unknown".to_string(),
+                graphql: graphql_error(format!(
+                    "GraphQL WebSocket message is not valid JSON: {err}"
+                )),
+            };
+        }
+    };
+    let Some(obj) = value.as_object() else {
+        return GraphqlWebSocketMessage::Operation {
+            message_type: "unknown".to_string(),
+            graphql: graphql_error("GraphQL WebSocket message must be a JSON object"),
+        };
+    };
+    let Some(message_type) = obj.get("type").and_then(serde_json::Value::as_str) else {
+        return GraphqlWebSocketMessage::Operation {
+            message_type: "unknown".to_string(),
+            graphql: graphql_error("GraphQL WebSocket message missing string type"),
+        };
+    };
+
+    match message_type {
+        "subscribe" | "start" => {
+            if obj
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return GraphqlWebSocketMessage::Operation {
+                    message_type: message_type.to_string(),
+                    graphql: graphql_error(
+                        "GraphQL WebSocket operation message missing non-empty id",
+                    ),
+                };
+            }
+            let Some(payload) = obj.get("payload").filter(|value| value.is_object()) else {
+                return GraphqlWebSocketMessage::Operation {
+                    message_type: message_type.to_string(),
+                    graphql: graphql_error(
+                        "GraphQL WebSocket operation message missing object payload",
+                    ),
+                };
+            };
+            GraphqlWebSocketMessage::Operation {
+                message_type: message_type.to_string(),
+                graphql: crate::l7::graphql::classify_json_envelope_value(payload),
+            }
+        }
+        "connection_init" | "connection_terminate" | "ping" | "pong" | "complete" | "stop" => {
+            GraphqlWebSocketMessage::Control {
+                message_type: message_type.to_string(),
+            }
+        }
+        _ => GraphqlWebSocketMessage::Operation {
+            message_type: message_type.to_string(),
+            graphql: graphql_error(format!(
+                "unsupported GraphQL WebSocket client message type {message_type:?}"
+            )),
+        },
+    }
+}
+
+fn graphql_error(message: impl Into<String>) -> crate::l7::graphql::GraphqlRequestInfo {
+    crate::l7::graphql::GraphqlRequestInfo {
+        operations: Vec::new(),
+        error: Some(message.into()),
+    }
 }
 
 async fn relay_control_frame<R, W>(
@@ -812,6 +980,7 @@ fn emit_websocket_l7_event(
     request_info: &L7RequestInfo,
     decision: &str,
     reason: &str,
+    graphql: Option<&crate::l7::graphql::GraphqlRequestInfo>,
 ) {
     let policy_name = if policy_name.is_empty() {
         "-"
@@ -831,6 +1000,7 @@ fn emit_websocket_l7_event(
             SeverityId::Informational,
         ),
     };
+    let summary = graphql.map(graphql_log_summary).unwrap_or_default();
     let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
         .activity(ActivityId::Other)
         .action(action_id)
@@ -840,11 +1010,39 @@ fn emit_websocket_l7_event(
         .dst_endpoint(Endpoint::from_domain(host, port))
         .firewall_rule(policy_name, "l7-websocket")
         .message(format!(
-            "WEBSOCKET_L7_REQUEST {decision} {} {host}:{port}{} reason={reason}",
-            request_info.action, request_info.target
+            "WEBSOCKET_L7_REQUEST {decision} {} {host}:{port}{}{} reason={reason}",
+            request_info.action, request_info.target, summary
         ))
         .build();
     ocsf_emit!(event);
+}
+
+fn graphql_log_summary(info: &crate::l7::graphql::GraphqlRequestInfo) -> String {
+    if let Some(error) = info.error.as_deref() {
+        return format!(" graphql_error={error:?}");
+    }
+    let ops: Vec<String> = info
+        .operations
+        .iter()
+        .map(|op| {
+            let name = op.operation_name.as_deref().unwrap_or("-");
+            let fields = if op.fields.is_empty() {
+                "-".to_string()
+            } else {
+                op.fields.join(",")
+            };
+            let persisted = op
+                .persisted_query_hash
+                .as_deref()
+                .or(op.persisted_query_id.as_deref())
+                .unwrap_or("-");
+            format!(
+                "type={} name={} fields={} persisted={}",
+                op.operation_type, name, fields, persisted
+            )
+        })
+        .collect();
+    format!(" graphql_ops={}", ops.join(";"))
 }
 
 fn protocol_failure_class(error: &miette::Report) -> &'static str {
@@ -905,8 +1103,36 @@ fn protocol_failure_message(host: &str, port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::l7::relay::L7EvalContext;
+    use crate::opa::{NetworkInput, OpaEngine};
     use crate::secrets::SecretResolver;
+    use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
+    const GRAPHQL_WS_POLICY: &str = r#"
+network_policies:
+  graphql_ws:
+    name: graphql_ws
+    endpoints:
+      - host: realtime.graphql.test
+        port: 443
+        path: "/graphql"
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/graphql"
+          - allow:
+              operation_type: query
+              fields: [viewer]
+          - allow:
+              operation_type: subscription
+              fields: [messageAdded]
+    binaries:
+      - { path: /usr/bin/node }
+"#;
 
     fn resolver() -> (HashMap<String, String>, SecretResolver) {
         let (child_env, resolver) = SecretResolver::from_provider_env(
@@ -1004,6 +1230,70 @@ mod tests {
             &mut relay_read,
             &mut relay_write,
             "gateway.example.test",
+            443,
+            &options,
+        )
+        .await;
+        drop(relay_write);
+
+        let mut output = Vec::new();
+        upstream_read.read_to_end(&mut output).await.unwrap();
+        result.map(|()| output)
+    }
+
+    async fn run_client_to_server_with_graphql_policy(
+        input: Vec<u8>,
+        resolver: Option<&SecretResolver>,
+    ) -> Result<Vec<u8>> {
+        let engine = OpaEngine::from_strings(TEST_POLICY, GRAPHQL_WS_POLICY)
+            .expect("GraphQL WebSocket policy should load");
+        let network_input = NetworkInput {
+            host: "realtime.graphql.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let generation = engine
+            .evaluate_network_action_with_generation(&network_input)
+            .expect("network action should evaluate")
+            .1;
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(generation)
+            .expect("tunnel engine");
+        let ctx = L7EvalContext {
+            host: "realtime.graphql.test".into(),
+            port: 443,
+            policy_name: "graphql_ws".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+        };
+        let (mut client_write, mut relay_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);
+        let (mut relay_write, mut upstream_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);
+
+        client_write.write_all(&input).await.unwrap();
+        drop(client_write);
+
+        let options = RelayOptions {
+            policy_name: "graphql_ws",
+            resolver,
+            inspector: Some(InspectionOptions {
+                engine: &tunnel_engine,
+                ctx: &ctx,
+                enforcement: EnforcementMode::Enforce,
+                target: "/graphql".to_string(),
+                query_params: HashMap::new(),
+                graphql_policy: true,
+            }),
+            compression: WebSocketCompression::None,
+        };
+        let result = relay_client_to_server(
+            &mut relay_read,
+            &mut relay_write,
+            "realtime.graphql.test",
             443,
             &options,
         )
@@ -1117,6 +1407,113 @@ mod tests {
         frame
     }
 
+    #[test]
+    fn classifies_graphql_transport_ws_subscribe_operation() {
+        let message = r#"{"type":"subscribe","id":"1","payload":{"query":"subscription NewMessages { messageAdded }"}}"#;
+
+        match classify_graphql_websocket_message(message) {
+            GraphqlWebSocketMessage::Operation {
+                message_type,
+                graphql,
+            } => {
+                assert_eq!(message_type, "subscribe");
+                assert!(
+                    graphql.error.is_none(),
+                    "unexpected error: {:?}",
+                    graphql.error
+                );
+                assert_eq!(graphql.operations.len(), 1);
+                assert_eq!(graphql.operations[0].operation_type, "subscription");
+                assert_eq!(
+                    graphql.operations[0].operation_name.as_deref(),
+                    Some("NewMessages")
+                );
+                assert_eq!(graphql.operations[0].fields, vec!["messageAdded"]);
+            }
+            other @ GraphqlWebSocketMessage::Control { .. } => {
+                panic!("expected operation, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn classifies_legacy_graphql_ws_start_operation() {
+        let message = r#"{"type":"start","id":"1","payload":{"query":"query Viewer { viewer }"}}"#;
+
+        match classify_graphql_websocket_message(message) {
+            GraphqlWebSocketMessage::Operation {
+                message_type,
+                graphql,
+            } => {
+                assert_eq!(message_type, "start");
+                assert!(
+                    graphql.error.is_none(),
+                    "unexpected error: {:?}",
+                    graphql.error
+                );
+                assert_eq!(graphql.operations[0].operation_type, "query");
+                assert_eq!(graphql.operations[0].fields, vec!["viewer"]);
+            }
+            other @ GraphqlWebSocketMessage::Control { .. } => {
+                panic!("expected operation, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn classifies_graphql_websocket_control_message_without_payload_logging() {
+        match classify_graphql_websocket_message(
+            r#"{"type":"connection_init","payload":{"authorization":"secret"}}"#,
+        ) {
+            GraphqlWebSocketMessage::Control { message_type } => {
+                assert_eq!(message_type, "connection_init");
+            }
+            other @ GraphqlWebSocketMessage::Operation { .. } => {
+                panic!("expected control message, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_graphql_websocket_message_type_fails_closed() {
+        match classify_graphql_websocket_message(r#"{"type":"next","id":"1"}"#) {
+            GraphqlWebSocketMessage::Operation { graphql, .. } => {
+                assert!(
+                    graphql
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("unsupported"))
+                );
+            }
+            other @ GraphqlWebSocketMessage::Control { .. } => {
+                panic!("expected operation error, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn graphql_websocket_log_summary_excludes_payload_variables_and_secrets() {
+        let placeholder = "openshell:resolve:env:T";
+        let message = format!(
+            r#"{{"type":"subscribe","id":"1","payload":{{"query":"query Viewer {{ viewer }}","variables":{{"token":"{placeholder}"}}}}}}"#
+        );
+        let graphql = match classify_graphql_websocket_message(&message) {
+            GraphqlWebSocketMessage::Operation { graphql, .. } => graphql,
+            other @ GraphqlWebSocketMessage::Control { .. } => {
+                panic!("expected operation, got {other:?}")
+            }
+        };
+        let summary = graphql_log_summary(&graphql);
+
+        assert!(summary.contains("type=query"));
+        assert!(summary.contains("fields=viewer"));
+        assert!(!summary.contains(placeholder));
+        assert!(!summary.contains("real-token"));
+        assert!(!summary.contains("variables"));
+        assert!(!summary.contains("token"));
+        assert!(!summary.contains("secret_len"));
+    }
+
     #[tokio::test]
     async fn rewrites_discord_like_identify_text_payload() {
         let (child_env, _) = resolver();
@@ -1180,6 +1577,56 @@ mod tests {
         drop(client_app);
         drop(upstream_app);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay).await;
+    }
+
+    #[tokio::test]
+    async fn graphql_websocket_policy_allows_subscription_operation() {
+        let payload = r#"{"type":"subscribe","id":"1","payload":{"query":"subscription NewMessages { messageAdded }"}}"#;
+        let frame = masked_frame(true, OPCODE_TEXT, payload.as_bytes());
+
+        let output = run_client_to_server_with_graphql_policy(frame.clone(), None)
+            .await
+            .expect("allowed subscription should relay");
+
+        assert_eq!(output, frame);
+        assert_eq!(decode_masked_text_frame(&output), payload);
+    }
+
+    #[tokio::test]
+    async fn graphql_websocket_policy_denies_unlisted_operation_field() {
+        let payload =
+            r#"{"type":"subscribe","id":"1","payload":{"query":"query Admin { adminAuditLog }"}}"#;
+        let frame = masked_frame(true, OPCODE_TEXT, payload.as_bytes());
+
+        let err = run_client_to_server_with_graphql_policy(frame, None)
+            .await
+            .expect_err("unlisted field should be denied");
+
+        assert!(err.to_string().contains("websocket GraphQL message denied"));
+    }
+
+    #[tokio::test]
+    async fn graphql_websocket_control_message_rewrites_credentials_before_relay() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            std::iter::once(("T".to_string(), "real-token".to_string())).collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let placeholder = child_env.get("T").expect("placeholder env");
+        let payload = format!(
+            r#"{{"type":"connection_init","payload":{{"authorization":"{placeholder}"}}}}"#
+        );
+        let frame = masked_frame(true, OPCODE_TEXT, payload.as_bytes());
+
+        let output = run_client_to_server_with_graphql_policy(frame, Some(&resolver))
+            .await
+            .expect("control message should relay after credential rewrite");
+
+        let rewritten = decode_masked_text_frame(&output);
+        assert_eq!(
+            rewritten,
+            r#"{"type":"connection_init","payload":{"authorization":"real-token"}}"#
+        );
+        assert!(!rewritten.contains(placeholder));
     }
 
     #[tokio::test]

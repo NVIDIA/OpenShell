@@ -78,6 +78,9 @@ pub struct L7EndpointConfig {
     /// Opt-in rewrite of credential placeholders in client-to-server
     /// WebSocket text messages after an allowed HTTP 101 upgrade.
     pub websocket_credential_rewrite: bool,
+    /// When true, client-to-server GraphQL-over-WebSocket operation messages
+    /// are classified with the same operation policy used by GraphQL-over-HTTP.
+    pub websocket_graphql_policy: bool,
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -146,6 +149,8 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
     let websocket_credential_rewrite =
         get_object_bool(val, "websocket_credential_rewrite").unwrap_or(false);
+    let websocket_graphql_policy =
+        protocol == L7Protocol::Websocket && endpoint_has_graphql_policy(val);
     let graphql_max_body_bytes = get_object_u64(val, "graphql_max_body_bytes")
         .and_then(|v| usize::try_from(v).ok())
         .filter(|v| *v > 0)
@@ -159,6 +164,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         graphql_max_body_bytes,
         allow_encoded_slash,
         websocket_credential_rewrite,
+        websocket_graphql_policy,
     })
 }
 
@@ -236,6 +242,60 @@ fn get_object_str(val: &regorus::Value, key: &str) -> Option<String> {
             }
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn endpoint_has_graphql_policy(val: &regorus::Value) -> bool {
+    has_non_empty_object_field(val, "graphql_persisted_queries")
+        || has_graphql_persisted_query_mode(val)
+        || rules_have_graphql_policy(val, "rules", true)
+        || rules_have_graphql_policy(val, "deny_rules", false)
+}
+
+fn rules_have_graphql_policy(val: &regorus::Value, key: &str, allow_wrapped: bool) -> bool {
+    let Some(regorus::Value::Array(rules)) = get_object_value(val, key) else {
+        return false;
+    };
+    rules.iter().any(|rule| {
+        let rule = if allow_wrapped {
+            get_object_value(rule, "allow").unwrap_or(rule)
+        } else {
+            rule
+        };
+        has_graphql_rule_fields(rule)
+    })
+}
+
+fn has_graphql_rule_fields(val: &regorus::Value) -> bool {
+    has_non_empty_string_field(val, "operation_type")
+        || has_non_empty_string_field(val, "operation_name")
+        || has_non_empty_array_field(val, "fields")
+}
+
+fn has_non_empty_string_field(val: &regorus::Value, key: &str) -> bool {
+    matches!(get_object_value(val, key), Some(regorus::Value::String(s)) if !s.is_empty())
+}
+
+fn has_non_empty_array_field(val: &regorus::Value, key: &str) -> bool {
+    matches!(get_object_value(val, key), Some(regorus::Value::Array(values)) if !values.is_empty())
+}
+
+fn has_non_empty_object_field(val: &regorus::Value, key: &str) -> bool {
+    matches!(get_object_value(val, key), Some(regorus::Value::Object(values)) if !values.is_empty())
+}
+
+fn has_graphql_persisted_query_mode(val: &regorus::Value) -> bool {
+    matches!(
+        get_object_value(val, "persisted_queries"),
+        Some(regorus::Value::String(mode)) if !mode.is_empty() && mode.as_ref() != "deny"
+    )
+}
+
+fn get_object_value<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a regorus::Value> {
+    let key_val = regorus::Value::String(key.into());
+    match val {
+        regorus::Value::Object(map) => map.get(&key_val),
         _ => None,
     }
 }
@@ -362,6 +422,45 @@ fn validate_graphql_rule(
     validate_graphql_fields(errors, warnings, loc, rule.get("fields"));
 }
 
+fn json_rule_has_graphql_fields(rule: &serde_json::Value) -> bool {
+    rule.get("operation_type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| !v.is_empty())
+        || rule
+            .get("operation_name")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty())
+        || rule.get("fields").is_some()
+}
+
+fn json_rule_has_transport_fields(rule: &serde_json::Value) -> bool {
+    rule.get("method").is_some() || rule.get("path").is_some() || rule.get("query").is_some()
+}
+
+fn json_endpoint_has_graphql_policy(ep: &serde_json::Value) -> bool {
+    ep.get("graphql_persisted_queries")
+        .and_then(|v| v.as_object())
+        .is_some_and(|v| !v.is_empty())
+        || ep
+            .get("persisted_queries")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty() && v != "deny")
+        || ep
+            .get("rules")
+            .and_then(|v| v.as_array())
+            .is_some_and(|rules| {
+                rules.iter().any(|rule| {
+                    rule.get("allow")
+                        .or(Some(rule))
+                        .is_some_and(json_rule_has_graphql_fields)
+                })
+            })
+        || ep
+            .get("deny_rules")
+            .and_then(|v| v.as_array())
+            .is_some_and(|rules| rules.iter().any(json_rule_has_graphql_fields))
+}
+
 /// Validate L7 policy configuration in the loaded OPA data.
 ///
 /// Returns a list of errors and warnings. Errors should prevent sandbox startup;
@@ -391,6 +490,8 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 .get("rules")
                 .and_then(|v| v.as_array())
                 .is_some_and(|a| !a.is_empty());
+            let websocket_has_graphql_policy =
+                protocol == "websocket" && json_endpoint_has_graphql_policy(ep);
             let host = ep.get("host").and_then(|v| v.as_str()).unwrap_or("");
             let endpoint_path = ep.get("path").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -498,12 +599,13 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             }
 
             if protocol != "graphql"
+                && protocol != "websocket"
                 && (ep.get("persisted_queries").is_some()
                     || ep.get("graphql_persisted_queries").is_some()
                     || ep.get("graphql_max_body_bytes").is_some())
             {
                 warnings.push(format!(
-                    "{loc}: GraphQL-specific endpoint fields are ignored unless protocol is graphql"
+                    "{loc}: GraphQL-specific endpoint fields are ignored unless protocol is graphql or websocket"
                 ));
             }
 
@@ -721,7 +823,17 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                                 .push(format!("{deny_loc}: command is for SQL protocol, not REST"));
                         }
 
-                        if protocol == "graphql" {
+                        let deny_has_graphql = json_rule_has_graphql_fields(deny_rule);
+                        if protocol == "websocket"
+                            && deny_has_graphql
+                            && json_rule_has_transport_fields(deny_rule)
+                        {
+                            errors.push(format!(
+                                "{deny_loc}: WebSocket GraphQL deny rules must not combine method/path/query with operation_type/operation_name/fields"
+                            ));
+                        }
+
+                        if protocol == "graphql" || (protocol == "websocket" && deny_has_graphql) {
                             validate_graphql_rule(
                                 &mut errors,
                                 &mut warnings,
@@ -729,12 +841,9 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                                 deny_rule,
                                 true,
                             );
-                        } else if deny_rule.get("operation_type").is_some()
-                            || deny_rule.get("operation_name").is_some()
-                            || deny_rule.get("fields").is_some()
-                        {
+                        } else if deny_has_graphql {
                             warnings.push(format!(
-                                "{deny_loc}: GraphQL rule fields are ignored unless protocol is graphql"
+                                "{deny_loc}: GraphQL rule fields are ignored unless protocol is graphql or websocket"
                             ));
                         }
                     }
@@ -877,14 +986,36 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 }
             }
 
-            if has_rules
-                && protocol == "graphql"
-                && let Some(rules) = ep.get("rules").and_then(|v| v.as_array())
-            {
+            if has_rules && let Some(rules) = ep.get("rules").and_then(|v| v.as_array()) {
                 for (rule_idx, rule) in rules.iter().enumerate() {
                     let allow = rule.get("allow").unwrap_or(rule);
                     let rule_loc = format!("{loc}.rules[{rule_idx}].allow");
-                    validate_graphql_rule(&mut errors, &mut warnings, &rule_loc, allow, true);
+                    let allow_has_graphql = json_rule_has_graphql_fields(allow);
+                    if websocket_has_graphql_policy
+                        && allow
+                            .get("method")
+                            .and_then(|m| m.as_str())
+                            .is_some_and(|method| method.eq_ignore_ascii_case("WEBSOCKET_TEXT"))
+                    {
+                        errors.push(format!(
+                            "{rule_loc}: WebSocket endpoints with GraphQL operation policy must use operation_type/operation_name/fields rules for client messages instead of WEBSOCKET_TEXT"
+                        ));
+                    }
+                    if protocol == "websocket"
+                        && allow_has_graphql
+                        && json_rule_has_transport_fields(allow)
+                    {
+                        errors.push(format!(
+                            "{rule_loc}: WebSocket GraphQL allow rules must not combine method/path/query with operation_type/operation_name/fields"
+                        ));
+                    }
+                    if protocol == "graphql" || (protocol == "websocket" && allow_has_graphql) {
+                        validate_graphql_rule(&mut errors, &mut warnings, &rule_loc, allow, true);
+                    } else if allow_has_graphql {
+                        warnings.push(format!(
+                            "{rule_loc}: GraphQL rule fields are ignored unless protocol is graphql or websocket"
+                        ));
+                    }
                 }
             }
         }
@@ -1097,6 +1228,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_l7_config_websocket_graphql_policy_defaults_false() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "websocket", "host": "gateway.example.com", "port": 443, "rules": [{"allow": {"method": "GET", "path": "/graphql"}}, {"allow": {"method": "WEBSOCKET_TEXT", "path": "/graphql"}}]}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(!config.websocket_graphql_policy);
+    }
+
+    #[test]
+    fn parse_l7_config_websocket_graphql_policy_detects_operation_rules() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "websocket", "host": "gateway.example.com", "port": 443, "rules": [{"allow": {"method": "GET", "path": "/graphql"}}, {"allow": {"operation_type": "subscription", "fields": ["messageAdded"]}}]}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(config.websocket_graphql_policy);
+    }
+
+    #[test]
     fn validate_websocket_credential_rewrite_warns_unless_rest_or_websocket() {
         let data = serde_json::json!({
             "network_policies": {
@@ -1145,6 +1296,107 @@ mod tests {
             .collect();
         assert!(methods.contains(&"GET"));
         assert!(methods.contains(&"WEBSOCKET_TEXT"));
+    }
+
+    #[test]
+    fn validate_websocket_accepts_graphql_operation_rules() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "gateway.example.com",
+                        "port": 443,
+                        "protocol": "websocket",
+                        "rules": [
+                            {"allow": {"method": "GET", "path": "/graphql"}},
+                            {"allow": {"operation_type": "subscription", "fields": ["messageAdded"]}}
+                        ]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(errors.is_empty(), "expected no errors: {errors:?}");
+        assert!(warnings.is_empty(), "expected no warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn validate_websocket_graphql_rule_requires_operation_type() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "gateway.example.com",
+                        "port": 443,
+                        "protocol": "websocket",
+                        "rules": [
+                            {"allow": {"method": "GET", "path": "/graphql"}},
+                            {"allow": {"fields": ["messageAdded"]}}
+                        ]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("operation_type")),
+            "expected missing operation_type error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_websocket_graphql_rule_rejects_mixed_transport_fields() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "gateway.example.com",
+                        "port": 443,
+                        "protocol": "websocket",
+                        "rules": [
+                            {"allow": {"method": "GET", "path": "/graphql"}},
+                            {"allow": {"method": "WEBSOCKET_TEXT", "path": "/graphql", "operation_type": "subscription"}}
+                        ]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("must not combine")),
+            "expected mixed-field error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_websocket_graphql_policy_rejects_raw_text_message_rule() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "gateway.example.com",
+                        "port": 443,
+                        "protocol": "websocket",
+                        "rules": [
+                            {"allow": {"method": "GET", "path": "/graphql"}},
+                            {"allow": {"method": "WEBSOCKET_TEXT", "path": "/graphql"}},
+                            {"allow": {"operation_type": "query"}}
+                        ]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("instead of WEBSOCKET_TEXT")),
+            "expected raw WEBSOCKET_TEXT rejection: {errors:?}"
+        );
     }
 
     #[test]

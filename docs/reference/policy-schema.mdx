@@ -155,7 +155,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `host` | string | Yes | Hostname or IP address. Supports wildcards: `*.example.com` matches any subdomain. |
 | `port` | integer | Yes | TCP port number. |
 | `path` | string | No | Optional HTTP path glob used to select between L7 endpoints that share the same host and port. Empty means all paths. Use this when REST and GraphQL live under the same host, such as `/repos/**` and `/graphql`. |
-| `protocol` | string | No | Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, or `graphql` for GraphQL operation inspection. Omit for TCP passthrough. |
+| `protocol` | string | No | Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, or `graphql` for GraphQL-over-HTTP operation inspection. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket traffic. Omit for TCP passthrough. |
 | `tls` | string | No | TLS handling mode. The proxy auto-detects TLS by peeking the first bytes of each connection and terminates it for inspected HTTPS traffic, so this field is optional in most cases. Set to `skip` to disable auto-detection for edge cases such as client-certificate mTLS or non-standard protocols. The values `terminate` and `passthrough` are deprecated and log a warning; they are still accepted for backward compatibility but have no effect on behavior. |
 | `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
 | `access` | string | No | Access preset. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. |
@@ -164,9 +164,9 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `allowed_ips` | list of string | No | CIDR or IP allowlist for SSRF override. Entries overlapping loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), or unspecified (`0.0.0.0`) are rejected at load time. |
 | `allow_encoded_slash` | bool | No | When `true`, L7 request parsing preserves `%2F` inside path segments instead of rejecting it. Use this for registries and APIs such as npm scoped packages (`/@scope%2Fname`). Defaults to `false`. |
 | `websocket_credential_rewrite` | bool | No | When `true` on a `protocol: rest` or `protocol: websocket` endpoint, OpenShell rewrites `openshell:resolve:env:*` placeholders in client-to-server WebSocket text messages after an allowed HTTP `101` upgrade. Binary frames are relayed but not rewritten. Defaults to `false`. |
-| `persisted_queries` | string | No | GraphQL hash-only behavior. Default is `deny`; use `allow_registered` only with `graphql_persisted_queries`. |
+| `persisted_queries` | string | No | GraphQL hash-only behavior for `protocol: graphql` and GraphQL-over-WebSocket operation policy. Default is `deny`; use `allow_registered` only with `graphql_persisted_queries`. |
 | `graphql_persisted_queries` | map | No | Trusted GraphQL persisted-query registry keyed by hash or saved-query ID. Values contain `operation_type`, optional `operation_name`, and optional root `fields`. |
-| `graphql_max_body_bytes` | integer | No | Maximum GraphQL request body bytes buffered for inspection. Defaults to `65536`. |
+| `graphql_max_body_bytes` | integer | No | Maximum GraphQL-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
 
 #### Access Levels
 
@@ -231,9 +231,9 @@ rules:
       path: /v1/realtime/**
 ```
 
-##### GraphQL Allow Rule (`protocol: graphql`)
+##### GraphQL Allow Rule (`protocol: graphql` or GraphQL-over-WebSocket)
 
-GraphQL allow rules match parsed GraphQL operations by operation type, optional operation name, and optional root fields.
+GraphQL allow rules match parsed GraphQL operations by operation type, optional operation name, and optional root fields. On `protocol: graphql`, they apply to GraphQL-over-HTTP `GET` and `POST` requests. On `protocol: websocket`, include a separate `GET` allow rule for the RFC 6455 upgrade, then use GraphQL allow rules for client operation messages using the `graphql-transport-ws` `subscribe` message type or the legacy `graphql-ws` `start` message type.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -253,6 +253,23 @@ rules:
       operation_name: Issue*
       fields: [createIssue]
 ```
+
+Example GraphQL-over-WebSocket allow rules:
+
+```yaml showLineNumbers={false}
+rules:
+  - allow:
+      method: GET
+      path: /graphql
+  - allow:
+      operation_type: subscription
+      fields: [messageAdded]
+  - allow:
+      operation_type: query
+      fields: [viewer]
+```
+
+Do not combine `method`, `path`, or `query` with `operation_type`, `operation_name`, or `fields` inside the same WebSocket rule. When a WebSocket endpoint has GraphQL operation policy, use GraphQL rules for client messages instead of a raw `WEBSOCKET_TEXT` allow rule.
 
 #### Deny Rule Objects
 
@@ -310,9 +327,9 @@ endpoints:
         path: "/v1/admin/**"
 ```
 
-##### GraphQL Deny Rule (`protocol: graphql`)
+##### GraphQL Deny Rule (`protocol: graphql` or GraphQL-over-WebSocket)
 
-GraphQL deny rules use the same field names as GraphQL allow rules, but they appear directly under each `deny_rules` entry instead of under an `allow` wrapper.
+GraphQL deny rules use the same field names as GraphQL allow rules, but they appear directly under each `deny_rules` entry instead of under an `allow` wrapper. On WebSocket GraphQL endpoints, they apply only to classified GraphQL operation messages; protocol lifecycle messages such as `connection_init`, `ping`, `pong`, and `complete` are allowed as WebSocket control-plane messages and are not payload-logged.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
