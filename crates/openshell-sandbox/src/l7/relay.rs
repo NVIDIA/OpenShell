@@ -1352,6 +1352,100 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn route_selected_websocket_upgrade_rejects_invalid_accept_without_forwarding_101() {
+        let data = r#"
+network_policies:
+  route_api:
+    name: route_api
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/ws"
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let configs = vec![L7EndpointConfig {
+            protocol: L7Protocol::Rest,
+            path: "/ws".into(),
+            tls: crate::l7::TlsMode::Auto,
+            enforcement: EnforcementMode::Enforce,
+            graphql_max_body_bytes: 0,
+            allow_encoded_slash: false,
+            websocket_credential_rewrite: true,
+        }];
+        let ctx = L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            policy_name: "route_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /ws HTTP/1.1\r\nHost: gateway.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut forwarded = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut forwarded),
+        )
+        .await
+        .expect("upgrade request should reach upstream")
+        .unwrap();
+        let forwarded = String::from_utf8_lossy(&forwarded[..n]);
+        assert!(forwarded.contains("Upgrade: websocket\r\n"));
+        assert!(forwarded.contains("Connection: Upgrade\r\n"));
+
+        upstream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: invalid\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should fail closed on invalid accept")
+            .unwrap()
+            .expect_err("invalid accept must fail the route-selected relay");
+        assert!(err.to_string().contains("Sec-WebSocket-Accept"));
+
+        let mut response = [0u8; 1];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("client side should close without 101")
+            .unwrap();
+        assert_eq!(n, 0, "invalid response must not forward 101 headers");
+    }
+
+    #[tokio::test]
     async fn l7_relay_closes_keep_alive_tunnel_after_policy_generation_change() {
         let initial_data = r#"
 network_policies:
