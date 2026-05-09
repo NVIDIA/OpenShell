@@ -794,11 +794,15 @@ fn emit_rewrite_event(host: &str, port: u16, policy_name: &str, replacements: us
         .status(StatusId::Success)
         .dst_endpoint(Endpoint::from_domain(host, port))
         .firewall_rule(policy_name, "l7-websocket")
-        .message(format!(
-            "WEBSOCKET_CREDENTIAL_REWRITE rewrote client text message [host:{host} port:{port} replacements:{replacements}]"
-        ))
+        .message(rewrite_event_message(host, port, replacements))
         .build();
     ocsf_emit!(event);
+}
+
+fn rewrite_event_message(host: &str, port: u16, replacements: usize) -> String {
+    format!(
+        "WEBSOCKET_CREDENTIAL_REWRITE rewrote client text message [host:{host} port:{port} replacements:{replacements}]"
+    )
 }
 
 fn emit_websocket_l7_event(
@@ -888,12 +892,14 @@ fn emit_protocol_failure(host: &str, port: u16, policy_name: &str, failure_class
         .status(StatusId::Failure)
         .dst_endpoint(Endpoint::from_domain(host, port))
         .firewall_rule(policy_name, "l7-websocket")
-        .message(format!(
-            "WEBSOCKET_CREDENTIAL_REWRITE closed ambiguous client frame [host:{host} port:{port}]"
-        ))
+        .message(protocol_failure_message(host, port))
         .status_detail(failure_class)
         .build();
     ocsf_emit!(event);
+}
+
+fn protocol_failure_message(host: &str, port: u16) -> String {
+    format!("WEBSOCKET_CREDENTIAL_REWRITE closed ambiguous client frame [host:{host} port:{port}]")
 }
 
 #[cfg(test)]
@@ -1346,6 +1352,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_continuation_without_active_message() {
+        let err = run_client_to_server(masked_frame(true, OPCODE_CONTINUATION, b"orphan"))
+            .await
+            .expect_err("orphan continuation should fail");
+
+        assert!(err.to_string().contains("continuation"));
+    }
+
+    #[tokio::test]
+    async fn rejects_new_data_frame_before_fragment_completion() {
+        let mut input = masked_frame(false, OPCODE_TEXT, b"partial");
+        input.extend(masked_frame(true, OPCODE_TEXT, b"second"));
+
+        let err = run_client_to_server(input)
+            .await
+            .expect_err("new data frame during fragmentation should fail");
+
+        assert!(err.to_string().contains("previous fragmented message"));
+    }
+
+    #[tokio::test]
+    async fn rejects_fragmented_control_frame() {
+        let err = run_client_to_server(masked_frame(false, OPCODE_PING, b"ping"))
+            .await
+            .expect_err("fragmented control frame should fail");
+
+        assert!(err.to_string().contains("control frame is fragmented"));
+    }
+
+    #[tokio::test]
+    async fn rejects_control_frame_over_125_bytes() {
+        let payload = vec![b'a'; 126];
+        let err = run_client_to_server(masked_frame(true, OPCODE_PING, &payload))
+            .await
+            .expect_err("oversize control frame should fail");
+
+        assert!(err.to_string().contains("control frame exceeds"));
+    }
+
+    #[tokio::test]
     async fn rejects_non_minimal_extended_length() {
         let err = run_client_to_server(masked_frame_with_non_minimal_16_bit_len(
             OPCODE_TEXT,
@@ -1409,5 +1455,36 @@ mod tests {
         .expect_err("invalid close reason should fail");
 
         assert!(err.to_string().contains("valid UTF-8"));
+    }
+
+    #[tokio::test]
+    async fn rejects_frames_after_client_close_frame() {
+        let mut input = masked_frame(true, OPCODE_CLOSE, &close_payload(1000, b"done"));
+        input.extend(masked_frame(true, OPCODE_TEXT, b"late"));
+
+        let err = run_client_to_server(input)
+            .await
+            .expect_err("frames after close should fail");
+
+        assert!(err.to_string().contains("after close"));
+    }
+
+    #[test]
+    fn websocket_ocsf_messages_do_not_include_payload_or_secret_material() {
+        let placeholder = "openshell:resolve:env:DISCORD_BOT_TOKEN";
+        let secret = "real-token";
+        let payload = format!(r#"{{"op":2,"d":{{"token":"{placeholder}"}}}}"#);
+
+        let rewrite = rewrite_event_message("gateway.example.test", 443, 1);
+        let failure = protocol_failure_message("gateway.example.test", 443);
+        let messages = [rewrite, failure];
+
+        for message in messages {
+            assert!(!message.contains(placeholder));
+            assert!(!message.contains(secret));
+            assert!(!message.contains(&payload));
+            assert!(!message.contains("secret_len"));
+            assert!(!message.contains("payload_len"));
+        }
     }
 }

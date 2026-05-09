@@ -2282,6 +2282,7 @@ fn rewrite_forward_request(
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(used, |p| p + 4);
+    let websocket_upgrade = crate::l7::rest::request_is_websocket_upgrade(&raw[..header_end]);
 
     let header_str = String::from_utf8_lossy(&raw[..header_end]);
     let lines = header_str.split("\r\n").collect::<Vec<_>>();
@@ -2325,6 +2326,11 @@ fn rewrite_forward_request(
         // Replace Connection header
         if lower.starts_with("connection:") {
             has_connection = true;
+            if websocket_upgrade {
+                output.extend_from_slice(line.as_bytes());
+                output.extend_from_slice(b"\r\n");
+                continue;
+            }
             output.extend_from_slice(b"Connection: close\r\n");
             continue;
         }
@@ -2343,7 +2349,7 @@ fn rewrite_forward_request(
     }
 
     // Inject missing headers
-    if !has_connection {
+    if !has_connection && !websocket_upgrade {
         output.extend_from_slice(b"Connection: close\r\n");
     }
     if !has_via {
@@ -4401,6 +4407,28 @@ mod tests {
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Authorization: Bearer sk-test"));
         assert!(!result_str.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn test_forward_rewrite_preserves_websocket_upgrade_connection_header() {
+        let raw = "GET http://gateway.example.test/ws HTTP/1.1\r\n\
+                   Host: gateway.example.test\r\n\
+                   Upgrade: websocket\r\n\
+                   Connection: keep-alive, Upgrade\r\n\
+                   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                   Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\
+                   Sec-WebSocket-Version: 13\r\n\r\n";
+
+        let result = rewrite_forward_request(raw.as_bytes(), raw.len(), "/ws", None)
+            .expect("websocket forward rewrite should succeed");
+        let result_str = String::from_utf8_lossy(&result);
+
+        assert!(result_str.starts_with("GET /ws HTTP/1.1\r\n"));
+        assert!(result_str.contains("Connection: keep-alive, Upgrade\r\n"));
+        assert!(
+            !result_str.contains("Connection: close\r\n"),
+            "websocket forward proxy must not strip the upgrade token"
+        );
     }
 
     #[tokio::test]
