@@ -13,7 +13,7 @@ use crate::secrets::{SecretResolver, rewrite_http_header_block};
 use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
@@ -427,6 +427,7 @@ where
             .map(|request| WebSocketResponseValidation {
                 expected_accept: websocket_accept_for_key(&request.sec_key),
                 expected_extension: expected_websocket_extension.clone(),
+                offered_subprotocols: request.subprotocols.clone(),
             });
 
     let rewrite_result = rewrite_http_header_block(&header_bytes, options.resolver)
@@ -514,7 +515,7 @@ fn rewrite_websocket_extensions_for_permessage_deflate(
 ) -> Result<(Vec<u8>, Option<String>)> {
     let header_str = std::str::from_utf8(raw_header)
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
-    let safe_offer = supported_permessage_deflate_offer(header_str);
+    let safe_offer = supported_permessage_deflate_offer(header_str)?;
     let mut out = Vec::with_capacity(raw_header.len());
     let mut inserted = false;
 
@@ -539,22 +540,24 @@ fn rewrite_websocket_extensions_for_permessage_deflate(
     Ok((out, safe_offer))
 }
 
-fn supported_permessage_deflate_offer(header_str: &str) -> Option<String> {
-    for params in websocket_extension_offers(header_str) {
-        let Some((extension, rest)) = params.split_first() else {
-            continue;
-        };
-        if !extension.eq_ignore_ascii_case("permessage-deflate") {
+fn supported_permessage_deflate_offer(header_str: &str) -> Result<Option<String>> {
+    for offer in websocket_extension_offers(header_str)? {
+        if !offer.name.eq_ignore_ascii_case("permessage-deflate") {
             continue;
         }
         let mut client_no_context_takeover = false;
         let mut server_no_context_takeover = false;
         let mut unsupported = false;
-        for param in rest {
-            let (name, value) = param.split_once('=').unwrap_or((param, ""));
-            if name.eq_ignore_ascii_case("client_no_context_takeover") && value.is_empty() {
+        let mut seen = HashSet::new();
+        for param in &offer.params {
+            let name = param.name.to_ascii_lowercase();
+            if param.value.is_some() || !seen.insert(name.clone()) {
+                unsupported = true;
+                break;
+            }
+            if name == "client_no_context_takeover" {
                 client_no_context_takeover = true;
-            } else if name.eq_ignore_ascii_case("server_no_context_takeover") && value.is_empty() {
+            } else if name == "server_no_context_takeover" {
                 server_no_context_takeover = true;
             } else {
                 unsupported = true;
@@ -566,13 +569,25 @@ fn supported_permessage_deflate_offer(header_str: &str) -> Option<String> {
             if server_no_context_takeover {
                 offer.push_str("; server_no_context_takeover");
             }
-            return Some(offer);
+            return Ok(Some(offer));
         }
     }
-    None
+    Ok(None)
 }
 
-fn websocket_extension_offers(header_str: &str) -> Vec<Vec<String>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSocketExtensionOffer {
+    name: String,
+    params: Vec<WebSocketExtensionParam>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSocketExtensionParam {
+    name: String,
+    value: Option<String>,
+}
+
+fn websocket_extension_offers(header_str: &str) -> Result<Vec<WebSocketExtensionOffer>> {
     let mut offers = Vec::new();
     for line in header_str.lines().skip(1) {
         let Some((name, value)) = line.split_once(':') else {
@@ -582,29 +597,56 @@ fn websocket_extension_offers(header_str: &str) -> Vec<Vec<String>> {
             continue;
         }
         for extension in value.split(',') {
-            let params: Vec<String> = extension
-                .split(';')
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(ToOwned::to_owned)
-                .collect();
-            if !params.is_empty() {
-                offers.push(params);
+            let mut parts = extension.split(';').map(str::trim);
+            let Some(extension_name) = parts.next().filter(|name| !name.is_empty()) else {
+                return Err(miette!("invalid WebSocket extension offer"));
+            };
+            if !is_http_token(extension_name) {
+                return Err(miette!("invalid WebSocket extension token"));
             }
+            let mut params = Vec::new();
+            for param in parts {
+                if param.is_empty() {
+                    return Err(miette!("invalid WebSocket extension parameter"));
+                }
+                let (param_name, param_value) = match param.split_once('=') {
+                    Some((name, value)) => {
+                        let value = value.trim();
+                        if value.is_empty() || value.starts_with('"') || !is_http_token(value) {
+                            return Err(miette!("unsupported WebSocket extension parameter value"));
+                        }
+                        (name.trim(), Some(value.to_string()))
+                    }
+                    None => (param, None),
+                };
+                if param_name.is_empty() || !is_http_token(param_name) {
+                    return Err(miette!("invalid WebSocket extension parameter"));
+                }
+                params.push(WebSocketExtensionParam {
+                    name: param_name.to_string(),
+                    value: param_value,
+                });
+            }
+            offers.push(WebSocketExtensionOffer {
+                name: extension_name.to_string(),
+                params,
+            });
         }
     }
-    offers
+    Ok(offers)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebSocketUpgradeRequest {
     sec_key: String,
+    subprotocols: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebSocketResponseValidation {
     expected_accept: String,
     expected_extension: Option<String>,
+    offered_subprotocols: Vec<String>,
 }
 
 fn validate_websocket_upgrade_request(raw_header: &[u8]) -> Result<bool> {
@@ -644,6 +686,9 @@ fn parse_websocket_upgrade_request(raw_header: &[u8]) -> Result<Option<WebSocket
             "sec-websocket-version" => {
                 headers.version_count += 1;
                 headers.version = Some(value.to_string());
+            }
+            "sec-websocket-protocol" => {
+                headers.subprotocols.extend(parse_http_token_list(value)?);
             }
             _ => {}
         }
@@ -686,6 +731,7 @@ fn parse_websocket_upgrade_request(raw_header: &[u8]) -> Result<Option<WebSocket
     }
     Ok(Some(WebSocketUpgradeRequest {
         sec_key: key.to_string(),
+        subprotocols: headers.subprotocols,
     }))
 }
 
@@ -703,6 +749,44 @@ fn header_value_contains_token(value: &str, expected: &str) -> bool {
         .any(|token| token.trim().eq_ignore_ascii_case(expected))
 }
 
+fn parse_http_token_list(value: &str) -> Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    for token in value.split(',') {
+        let token = token.trim();
+        if token.is_empty() || !is_http_token(token) {
+            return Err(miette!("invalid HTTP token list"));
+        }
+        tokens.push(token.to_string());
+    }
+    Ok(tokens)
+}
+
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.as_bytes().iter().all(|byte| {
+            matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+            )
+        })
+}
+
 #[derive(Default)]
 struct WebSocketUpgradeHeaders {
     upgrade_websocket: bool,
@@ -711,6 +795,7 @@ struct WebSocketUpgradeHeaders {
     sec_key_count: usize,
     version: Option<String>,
     version_count: usize,
+    subprotocols: Vec<String>,
 }
 
 impl WebSocketUpgradeHeaders {
@@ -1247,6 +1332,8 @@ fn validate_websocket_response(
     let mut connection_upgrade = false;
     let mut accept_count = 0usize;
     let mut accept_matches = false;
+    let mut subprotocol_count = 0usize;
+    let mut selected_subprotocol = None;
 
     for line in headers.lines().skip(1) {
         let Some((name, value)) = line.split_once(':') else {
@@ -1264,6 +1351,15 @@ fn validate_websocket_response(
             "sec-websocket-accept" => {
                 accept_count += 1;
                 accept_matches = value == validation.expected_accept;
+            }
+            "sec-websocket-protocol" => {
+                subprotocol_count += 1;
+                if !is_http_token(value) {
+                    return Err(miette!(
+                        "websocket upgrade response has invalid Sec-WebSocket-Protocol"
+                    ));
+                }
+                selected_subprotocol = Some(value.to_string());
             }
             _ => {}
         }
@@ -1284,6 +1380,21 @@ fn validate_websocket_response(
             "websocket upgrade response has invalid Sec-WebSocket-Accept"
         ));
     }
+    if subprotocol_count > 1 {
+        return Err(miette!(
+            "websocket upgrade response has multiple Sec-WebSocket-Protocol headers"
+        ));
+    }
+    if let Some(protocol) = selected_subprotocol
+        && !validation
+            .offered_subprotocols
+            .iter()
+            .any(|offered| offered == &protocol)
+    {
+        return Err(miette!(
+            "upstream selected WebSocket subprotocol that was not offered"
+        ));
+    }
 
     let actual_extension = normalized_websocket_extension(headers)?;
     match (&validation.expected_extension, actual_extension.as_deref()) {
@@ -1302,52 +1413,61 @@ fn validate_websocket_response_extensions_preserved(
     headers: &str,
     mode: WebSocketExtensionMode,
 ) -> Result<bool> {
-    let offers = websocket_extension_offers(headers);
-    if offers.is_empty() {
-        return Ok(false);
-    }
-
     match mode {
         WebSocketExtensionMode::Preserve => Ok(false),
-        WebSocketExtensionMode::PermessageDeflate => Err(miette!(
-            "upstream negotiated WebSocket extension that was not offered"
-        )),
+        WebSocketExtensionMode::PermessageDeflate => {
+            let offers = websocket_extension_offers(headers)?;
+            if offers.is_empty() {
+                Ok(false)
+            } else {
+                Err(miette!(
+                    "upstream negotiated WebSocket extension that was not offered"
+                ))
+            }
+        }
     }
 }
 
 fn normalized_websocket_extension(headers: &str) -> Result<Option<String>> {
-    let offers = websocket_extension_offers(headers);
+    let offers = websocket_extension_offers(headers)?;
     if offers.is_empty() {
         return Ok(None);
     }
     if offers.len() != 1 {
         return Err(miette!("upstream negotiated multiple WebSocket extensions"));
     }
-    let params = &offers[0];
-    let Some((extension, rest)) = params.split_first() else {
-        return Ok(None);
-    };
-    if !extension.eq_ignore_ascii_case("permessage-deflate") {
+    let offer = &offers[0];
+    if !offer.name.eq_ignore_ascii_case("permessage-deflate") {
         return Err(miette!(
             "upstream negotiated unsupported WebSocket extension"
         ));
     }
+    let mut client_no_context_takeover = false;
+    let mut server_no_context_takeover = false;
+    let mut seen = HashSet::new();
+    for param in &offer.params {
+        let name = param.name.to_ascii_lowercase();
+        if param.value.is_some() || !seen.insert(name.clone()) {
+            return Err(miette!(
+                "upstream negotiated unsupported permessage-deflate parameter"
+            ));
+        }
+        if name == "client_no_context_takeover" {
+            client_no_context_takeover = true;
+        } else if name == "server_no_context_takeover" {
+            server_no_context_takeover = true;
+        } else {
+            return Err(miette!(
+                "upstream negotiated unsupported permessage-deflate parameter"
+            ));
+        }
+    }
     let mut normalized = String::from("permessage-deflate");
-    for param in rest {
-        let (name, value) = param.split_once('=').unwrap_or((param, ""));
-        if !value.is_empty() {
-            return Err(miette!(
-                "upstream negotiated unsupported permessage-deflate parameter"
-            ));
-        }
-        let name = name.to_ascii_lowercase();
-        if name != "client_no_context_takeover" && name != "server_no_context_takeover" {
-            return Err(miette!(
-                "upstream negotiated unsupported permessage-deflate parameter"
-            ));
-        }
-        normalized.push_str("; ");
-        normalized.push_str(&name);
+    if client_no_context_takeover {
+        normalized.push_str("; client_no_context_takeover");
+    }
+    if server_no_context_takeover {
+        normalized.push_str("; server_no_context_takeover");
     }
     Ok(Some(normalized))
 }
@@ -2894,6 +3014,7 @@ mod tests {
         let validation = WebSocketResponseValidation {
             expected_accept: VALID_WS_ACCEPT.to_string(),
             expected_extension: None,
+            offered_subprotocols: Vec::new(),
         };
 
         let err = validate_websocket_response(
@@ -2914,6 +3035,7 @@ mod tests {
                 "permessage-deflate; client_no_context_takeover; server_no_context_takeover"
                     .to_string(),
             ),
+            offered_subprotocols: Vec::new(),
         };
 
         let err = validate_websocket_response(
@@ -2931,7 +3053,167 @@ mod tests {
         let raw = format!(
             "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\nSec-WebSocket-Version: 13\r\n\r\n"
         );
-        assert!(supported_permessage_deflate_offer(&raw).is_none());
+        assert!(
+            supported_permessage_deflate_offer(&raw)
+                .expect("valid unsupported extension offer should parse")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn permessage_deflate_offer_canonicalizes_safe_params() {
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+
+        assert_eq!(
+            supported_permessage_deflate_offer(&raw)
+                .expect("safe extension offer should parse")
+                .as_deref(),
+            Some("permessage-deflate; client_no_context_takeover; server_no_context_takeover")
+        );
+    }
+
+    #[test]
+    fn permessage_deflate_offer_rejects_duplicate_safe_params() {
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; client_no_context_takeover\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+
+        assert!(
+            supported_permessage_deflate_offer(&raw)
+                .expect("duplicate safe param should parse but not be supported")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn permessage_deflate_offer_rejects_quoted_values() {
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover=\"true\"\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+
+        let err = supported_permessage_deflate_offer(&raw)
+            .expect_err("quoted permessage-deflate parameter values should fail closed");
+        assert!(err.to_string().contains("parameter value"));
+    }
+
+    #[test]
+    fn permessage_deflate_response_accepts_reordered_safe_params() {
+        let validation = WebSocketResponseValidation {
+            expected_accept: VALID_WS_ACCEPT.to_string(),
+            expected_extension: Some(
+                "permessage-deflate; client_no_context_takeover; server_no_context_takeover"
+                    .to_string(),
+            ),
+            offered_subprotocols: Vec::new(),
+        };
+
+        let negotiated = validate_websocket_response(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n",
+            WebSocketExtensionMode::PermessageDeflate,
+            Some(&validation),
+        )
+        .expect("reordered safe extension params should canonicalize");
+
+        assert!(negotiated);
+    }
+
+    #[test]
+    fn permessage_deflate_response_rejects_duplicate_safe_params() {
+        let validation = WebSocketResponseValidation {
+            expected_accept: VALID_WS_ACCEPT.to_string(),
+            expected_extension: Some("permessage-deflate; client_no_context_takeover".to_string()),
+            offered_subprotocols: Vec::new(),
+        };
+
+        let err = validate_websocket_response(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; client_no_context_takeover\r\n\r\n",
+            WebSocketExtensionMode::PermessageDeflate,
+            Some(&validation),
+        )
+        .expect_err("duplicate extension params should fail closed");
+
+        assert!(err.to_string().contains("unsupported permessage-deflate"));
+    }
+
+    #[test]
+    fn preserve_mode_leaves_malformed_extension_response_raw() {
+        let negotiated = validate_websocket_response(
+            "HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover=\"true\"\r\n\r\n",
+            WebSocketExtensionMode::Preserve,
+            None,
+        )
+        .expect("preserve mode should not parse or reject raw extension negotiation");
+
+        assert!(!negotiated);
+    }
+
+    #[test]
+    fn parse_websocket_upgrade_request_tracks_subprotocols() {
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Protocol: chat, superchat\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+
+        let request = parse_websocket_upgrade_request(raw.as_bytes())
+            .expect("request should parse")
+            .expect("request should be websocket");
+
+        assert_eq!(request.subprotocols, ["chat", "superchat"]);
+    }
+
+    #[test]
+    fn strict_response_validation_allows_offered_subprotocol() {
+        let validation = WebSocketResponseValidation {
+            expected_accept: VALID_WS_ACCEPT.to_string(),
+            expected_extension: None,
+            offered_subprotocols: vec!["chat".to_string(), "superchat".to_string()],
+        };
+
+        let negotiated = validate_websocket_response(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: superchat\r\n\r\n",
+            WebSocketExtensionMode::PermessageDeflate,
+            Some(&validation),
+        )
+        .expect("offered subprotocol should validate");
+
+        assert!(!negotiated);
+    }
+
+    #[test]
+    fn strict_response_validation_rejects_unoffered_subprotocol() {
+        let validation = WebSocketResponseValidation {
+            expected_accept: VALID_WS_ACCEPT.to_string(),
+            expected_extension: None,
+            offered_subprotocols: vec!["chat".to_string()],
+        };
+
+        let err = validate_websocket_response(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: admin\r\n\r\n",
+            WebSocketExtensionMode::PermessageDeflate,
+            Some(&validation),
+        )
+        .expect_err("unoffered subprotocol should fail closed");
+
+        assert!(err.to_string().contains("subprotocol"));
+    }
+
+    #[test]
+    fn strict_response_validation_rejects_multiple_subprotocol_headers() {
+        let validation = WebSocketResponseValidation {
+            expected_accept: VALID_WS_ACCEPT.to_string(),
+            expected_extension: None,
+            offered_subprotocols: vec!["chat".to_string(), "superchat".to_string()],
+        };
+
+        let err = validate_websocket_response(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: chat\r\nSec-WebSocket-Protocol: superchat\r\n\r\n",
+            WebSocketExtensionMode::PermessageDeflate,
+            Some(&validation),
+        )
+        .expect_err("multiple selected subprotocols should fail closed");
+
+        assert!(err.to_string().contains("Sec-WebSocket-Protocol"));
     }
 
     #[tokio::test]
