@@ -177,7 +177,7 @@ ensure_podman_supervisor_image() {
 
   echo "Building Podman supervisor sideload image (${supervisor_image})..."
   require_mise
-  CONTAINER_ENGINE=podman IMAGE_TAG=dev mise run build:docker:supervisor-sideload
+  CONTAINER_ENGINE=podman IMAGE_TAG=dev mise run build:docker:supervisor
 
   if ! podman image exists "${supervisor_image}" >/dev/null 2>&1; then
     echo "ERROR: expected supervisor image '${supervisor_image}' after build" >&2

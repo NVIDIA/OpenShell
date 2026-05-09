@@ -152,6 +152,10 @@ cargo build -p openshell-prover --features bundled-z3
 # One-time trust
 mise trust
 
+# Podman and Kubernetes drivers require an SSH handshake secret.
+# Set any value for local development:
+export OPENSHELL_SSH_HANDSHAKE_SECRET=dev-secret
+
 # Run a standalone gateway for local development
 mise run gateway
 ```
