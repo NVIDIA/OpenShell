@@ -1411,11 +1411,11 @@ enum PolicyCommands {
         #[arg(long = "remove-endpoint")]
         remove_endpoints: Vec<String>,
 
-        /// Add a REST allow rule: `host:port:METHOD:path_glob`.
+        /// Add a REST or WebSocket method/path allow rule: `host:port:METHOD:path_glob`.
         #[arg(long = "add-allow")]
         add_allow: Vec<String>,
 
-        /// Add a REST deny rule: `host:port:METHOD:path_glob`.
+        /// Add a REST or WebSocket method/path deny rule: `host:port:METHOD:path_glob`.
         #[arg(long = "add-deny")]
         add_deny: Vec<String>,
 

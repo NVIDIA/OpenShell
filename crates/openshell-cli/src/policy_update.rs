@@ -285,9 +285,9 @@ fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
             "--add-endpoint access segment must be one of read-only, read-write, or full; got '{access}' in '{spec}'"
         ));
     }
-    if !protocol.is_empty() && !matches!(protocol, "rest" | "sql") {
+    if !protocol.is_empty() && !matches!(protocol, "rest" | "websocket" | "sql") {
         return Err(miette!(
-            "--add-endpoint protocol segment must be 'rest' or 'sql'; got '{protocol}' in '{spec}'"
+            "--add-endpoint protocol segment must be 'rest', 'websocket', or 'sql'; got '{protocol}' in '{spec}'"
         ));
     }
     if !enforcement.is_empty() && !matches!(enforcement, "enforce" | "audit") {
@@ -353,6 +353,7 @@ fn dedup_strings(values: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::build_policy_update_plan;
+    use openshell_policy::PolicyMergeOp;
 
     #[test]
     fn parse_add_endpoint_basic_l4() {
@@ -390,6 +391,52 @@ mod tests {
             None,
         )
         .expect("plan should build");
+    }
+
+    #[test]
+    fn parse_add_endpoint_accepts_websocket_protocol() {
+        let plan = build_policy_update_plan(
+            &["realtime.example.com:443:read-write:websocket:enforce".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        let endpoint = &rule.endpoints[0];
+        assert_eq!(endpoint.host, "realtime.example.com");
+        assert_eq!(endpoint.protocol, "websocket");
+        assert_eq!(endpoint.access, "read-write");
+        assert_eq!(endpoint.enforcement, "enforce");
+    }
+
+    #[test]
+    fn parse_add_allow_accepts_websocket_text_method() {
+        let plan = build_policy_update_plan(
+            &[],
+            &[],
+            &[],
+            &["realtime.example.com:443:websocket_text:/v1/messages/**".to_string()],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddAllowRules { host, port, rules } = &plan.preview_operations[0] else {
+            panic!("expected add-allow preview");
+        };
+        assert_eq!(host, "realtime.example.com");
+        assert_eq!(*port, 443);
+        let allow = rules[0].allow.as_ref().expect("allow rule");
+        assert_eq!(allow.method, "WEBSOCKET_TEXT");
+        assert_eq!(allow.path, "/v1/messages/**");
     }
 
     #[test]
