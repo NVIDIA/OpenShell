@@ -15,6 +15,7 @@ pub mod provider;
 pub mod relay;
 pub mod rest;
 pub mod tls;
+pub(crate) mod websocket;
 
 /// Application-layer protocol for L7 inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +73,9 @@ pub struct L7EndpointConfig {
     /// rather than rejected at the parser. Needed by upstreams like GitLab
     /// that embed `%2F` in namespaced project paths. Defaults to false.
     pub allow_encoded_slash: bool,
+    /// Opt-in rewrite of credential placeholders in client-to-server
+    /// WebSocket text messages after an allowed HTTP 101 upgrade.
+    pub websocket_credential_rewrite: bool,
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -138,6 +142,8 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     };
 
     let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
+    let websocket_credential_rewrite =
+        get_object_bool(val, "websocket_credential_rewrite").unwrap_or(false);
     let graphql_max_body_bytes = get_object_u64(val, "graphql_max_body_bytes")
         .and_then(|v| usize::try_from(v).ok())
         .filter(|v| *v > 0)
@@ -150,6 +156,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         enforcement,
         graphql_max_body_bytes,
         allow_encoded_slash,
+        websocket_credential_rewrite,
     })
 }
 
@@ -495,6 +502,17 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             {
                 warnings.push(format!(
                     "{loc}: GraphQL-specific endpoint fields are ignored unless protocol is graphql"
+                ));
+            }
+
+            if ep
+                .get("websocket_credential_rewrite")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                && protocol != "rest"
+            {
+                warnings.push(format!(
+                    "{loc}: websocket_credential_rewrite is ignored unless protocol is rest"
                 ));
             }
 
@@ -1029,6 +1047,49 @@ mod tests {
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
         assert!(config.allow_encoded_slash);
+    }
+
+    #[test]
+    fn parse_l7_config_websocket_credential_rewrite_defaults_false() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "host": "gateway.example.com", "port": 443}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(!config.websocket_credential_rewrite);
+    }
+
+    #[test]
+    fn parse_l7_config_websocket_credential_rewrite_opt_in() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "host": "gateway.example.com", "port": 443, "websocket_credential_rewrite": true}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(config.websocket_credential_rewrite);
+    }
+
+    #[test]
+    fn validate_websocket_credential_rewrite_warns_unless_rest() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "gateway.example.com",
+                        "port": 443,
+                        "websocket_credential_rewrite": true
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (_errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("websocket_credential_rewrite is ignored")),
+            "expected websocket_credential_rewrite warning: {warnings:?}"
+        );
     }
 
     #[test]

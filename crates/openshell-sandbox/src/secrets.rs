@@ -155,6 +155,58 @@ impl SecretResolver {
         Some(format!("{prefix} {secret}"))
     }
 
+    /// Rewrite credential placeholders inside a WebSocket text message.
+    ///
+    /// The message is mutated only after all placeholders resolve
+    /// successfully. The return value is the number of replacements; callers
+    /// must not log the rewritten text.
+    pub(crate) fn rewrite_websocket_text_placeholders(
+        &self,
+        text: &mut String,
+    ) -> Result<usize, UnresolvedPlaceholderError> {
+        if !text.contains(PLACEHOLDER_PREFIX) {
+            return Ok(0);
+        }
+
+        let mut rewritten = String::with_capacity(text.len());
+        let mut pos = 0;
+        let mut replacements = 0;
+
+        while pos < text.len() {
+            let Some(start) = text[pos..].find(PLACEHOLDER_PREFIX) else {
+                rewritten.push_str(&text[pos..]);
+                break;
+            };
+            let abs_start = pos + start;
+            rewritten.push_str(&text[pos..abs_start]);
+
+            let key_start = abs_start + PLACEHOLDER_PREFIX.len();
+            let key_end = text[key_start..]
+                .bytes()
+                .position(|b| !is_env_key_char(b))
+                .map_or(text.len(), |p| key_start + p);
+
+            if key_end == key_start {
+                return Err(UnresolvedPlaceholderError {
+                    location: "websocket",
+                });
+            }
+
+            let full_placeholder = &text[abs_start..key_end];
+            let Some(secret) = self.resolve_placeholder(full_placeholder) else {
+                return Err(UnresolvedPlaceholderError {
+                    location: "websocket",
+                });
+            };
+            rewritten.push_str(secret);
+            replacements += 1;
+            pos = key_end;
+        }
+
+        *text = rewritten;
+        Ok(replacements)
+    }
+
     /// Decode a Base64-encoded Basic auth token, resolve any placeholders in
     /// the decoded `username:password` string, and re-encode.
     ///
@@ -1442,6 +1494,69 @@ mod tests {
         let raw = b"GET /api/openshell:resolve:env:KEY HTTP/1.1\r\nHost: x\r\n\r\n";
         let result = rewrite_http_header_block(raw, None).expect("should succeed");
         assert_eq!(raw.as_slice(), result.rewritten.as_slice());
+    }
+
+    #[test]
+    fn rewrite_websocket_text_replaces_placeholders_and_returns_count() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [
+                ("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string()),
+                ("APP_ID".to_string(), "app-123".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let token = child_env.get("DISCORD_BOT_TOKEN").unwrap();
+        let app_id = child_env.get("APP_ID").unwrap();
+        let mut payload =
+            format!(r#"{{"op":2,"d":{{"token":"{token}","properties":{{"app":"{app_id}"}}}}}}"#);
+
+        let count = resolver
+            .rewrite_websocket_text_placeholders(&mut payload)
+            .expect("rewrite should succeed");
+
+        assert_eq!(count, 2);
+        assert!(payload.contains(r#""token":"real-token""#));
+        assert!(payload.contains(r#""app":"app-123""#));
+        assert!(!payload.contains(PLACEHOLDER_PREFIX));
+    }
+
+    #[test]
+    fn rewrite_websocket_text_without_placeholder_is_unchanged() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("KEY".to_string(), "secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let mut payload = r#"{"op":1,"d":42}"#.to_string();
+
+        let count = resolver
+            .rewrite_websocket_text_placeholders(&mut payload)
+            .expect("rewrite should succeed");
+
+        assert_eq!(count, 0);
+        assert_eq!(payload, r#"{"op":1,"d":42}"#);
+    }
+
+    #[test]
+    fn rewrite_websocket_text_unknown_placeholder_fails_closed_without_mutating() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("KEY".to_string(), "secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let original = r#"{"token":"openshell:resolve:env:UNKNOWN"}"#.to_string();
+        let mut payload = original.clone();
+
+        let err = resolver
+            .rewrite_websocket_text_placeholders(&mut payload)
+            .expect_err("unknown placeholder should fail");
+
+        assert_eq!(err.location, "websocket");
+        assert_eq!(payload, original);
     }
 
     // === Redaction tests ===

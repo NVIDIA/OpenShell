@@ -43,9 +43,13 @@ with the sandbox's ephemeral CA and inspect method/path or protocol-specific
 metadata before forwarding. The proxy also supports credential injection on
 terminated HTTP streams when policy allows the endpoint.
 
-Raw streams, HTTP upgrades, and long-lived response bodies are connection
-scoped. Policy reloads affect the next connection or the next parsed HTTP
-request; they do not rewrite bytes already being relayed.
+Raw streams and long-lived response bodies are connection scoped. Policy
+reloads affect the next connection or the next parsed HTTP request; they do not
+rewrite bytes already being relayed. HTTP upgrades switch to raw relay by
+default. A `protocol: rest` endpoint can opt in to
+`websocket_credential_rewrite` for client-to-server WebSocket text messages
+after an allowed `101` upgrade; server-to-client traffic and all other upgraded
+protocols remain raw passthrough.
 
 ## Live Updates
 

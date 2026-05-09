@@ -116,6 +116,10 @@ message NetworkEndpoint {
   // protocol "rest" when both surfaces live under api.example.com:443.
   // Empty means all paths.
   string path = 15;
+  // When true on a "rest" endpoint, OpenShell rewrites credential placeholders
+  // inside client-to-server WebSocket text messages after an allowed HTTP 101
+  // upgrade. Defaults to false.
+  bool websocket_credential_rewrite = 16;
 }
 
 // Trusted GraphQL operation classification.

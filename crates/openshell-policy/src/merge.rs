@@ -462,6 +462,8 @@ fn merge_endpoint(
 
     append_unique_deny_rules(&mut existing.deny_rules, &incoming.deny_rules);
     append_unique_strings(&mut existing.allowed_ips, &incoming.allowed_ips);
+    existing.allow_encoded_slash |= incoming.allow_encoded_slash;
+    existing.websocket_credential_rewrite |= incoming.websocket_credential_rewrite;
     normalize_endpoint(existing);
     Ok(())
 }

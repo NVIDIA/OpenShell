@@ -2376,6 +2376,7 @@ async fn relay_rewritten_forward_request<C, U>(
     client: &mut C,
     upstream: &mut U,
     generation_guard: &PolicyGenerationGuard,
+    strip_websocket_extensions: bool,
 ) -> Result<crate::l7::provider::RelayOutcome>
 where
     C: TokioAsyncRead + TokioAsyncWrite + Unpin,
@@ -2396,12 +2397,15 @@ where
         body_length,
     };
 
-    crate::l7::rest::relay_http_request_with_resolver_guarded(
+    crate::l7::rest::relay_http_request_with_options_guarded(
         &req,
         client,
         upstream,
-        None,
-        Some(generation_guard),
+        crate::l7::rest::RelayRequestOptions {
+            resolver: None,
+            generation_guard: Some(generation_guard),
+            strip_websocket_extensions,
+        },
     )
     .await
 }
@@ -2623,6 +2627,8 @@ async fn handle_forward_proxy(
     };
     let mut forward_request_bytes = buf[..used].to_vec();
     let mut upstream_target = path.clone();
+    let mut strip_websocket_extensions = false;
+    let mut upgrade_options = crate::l7::relay::UpgradeRelayOptions::default();
 
     // 4b. If the endpoint has L7 config, evaluate the request against
     //     L7 policy.  The forward proxy handles exactly one request per
@@ -2760,6 +2766,19 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         };
+        let websocket_request =
+            crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
+        if l7_config.config.protocol == crate::l7::L7Protocol::Rest
+            && l7_config.config.websocket_credential_rewrite
+        {
+            strip_websocket_extensions = true;
+            upgrade_options = crate::l7::relay::UpgradeRelayOptions {
+                websocket_request,
+                websocket_credential_rewrite: true,
+                secret_resolver: secret_resolver.clone(),
+                policy_name: matched_policy.clone().unwrap_or_default(),
+            };
+        }
         let graphql = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
             let header_end = forward_request_bytes
                 .windows(4)
@@ -3223,10 +3242,19 @@ async fn handle_forward_proxy(
         client,
         &mut upstream,
         &forward_generation_guard,
+        strip_websocket_extensions,
     )
     .await?;
     if let crate::l7::provider::RelayOutcome::Upgraded { overflow } = outcome {
-        crate::l7::relay::handle_upgrade(client, &mut upstream, overflow, &host_lc, port).await?;
+        crate::l7::relay::handle_upgrade(
+            client,
+            &mut upstream,
+            overflow,
+            &host_lc,
+            port,
+            upgrade_options,
+        )
+        .await?;
     }
 
     Ok(())
@@ -3310,6 +3338,7 @@ mod tests {
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     allow_encoded_slash: false,
+                    websocket_credential_rewrite: false,
                 },
             },
             L7ConfigSnapshot {
@@ -3320,6 +3349,7 @@ mod tests {
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     allow_encoded_slash: false,
+                    websocket_credential_rewrite: false,
                 },
             },
         ];
@@ -4387,6 +4417,7 @@ mod tests {
             &mut proxy_to_client,
             &mut proxy_to_upstream,
             &guard,
+            false,
         )
         .await;
         assert!(
@@ -4425,6 +4456,7 @@ mod tests {
             &mut proxy_to_client,
             &mut proxy_to_upstream,
             &guard,
+            false,
         )
         .await;
         assert!(result.is_err(), "forward relay must reject CL/TE ambiguity");

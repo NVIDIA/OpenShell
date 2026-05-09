@@ -163,6 +163,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `deny_rules` | list of deny rule objects | No | L7 deny rules that block specific requests even when allowed by `access` or `rules`. Deny rules take precedence over allow rules. |
 | `allowed_ips` | list of string | No | CIDR or IP allowlist for SSRF override. Entries overlapping loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), or unspecified (`0.0.0.0`) are rejected at load time. |
 | `allow_encoded_slash` | bool | No | When `true`, L7 request parsing preserves `%2F` inside path segments instead of rejecting it. Use this for registries and APIs such as npm scoped packages (`/@scope%2Fname`). Defaults to `false`. |
+| `websocket_credential_rewrite` | bool | No | When `true` on a `protocol: rest` endpoint, OpenShell rewrites `openshell:resolve:env:*` placeholders in client-to-server WebSocket text messages after an allowed HTTP `101` upgrade. Defaults to `false`. |
 | `persisted_queries` | string | No | GraphQL hash-only behavior. Default is `deny`; use `allow_registered` only with `graphql_persisted_queries`. |
 | `graphql_persisted_queries` | map | No | Trusted GraphQL persisted-query registry keyed by hash or saved-query ID. Values contain `operation_type`, optional `operation_name`, and optional root `fields`. |
 | `graphql_max_body_bytes` | integer | No | Maximum GraphQL request body bytes buffered for inspection. Defaults to `65536`. |

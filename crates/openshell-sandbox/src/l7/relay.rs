@@ -38,6 +38,14 @@ pub struct L7EvalContext {
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct UpgradeRelayOptions {
+    pub(crate) websocket_request: bool,
+    pub(crate) websocket_credential_rewrite: bool,
+    pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
+    pub(crate) policy_name: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ParseRejectionMode {
     L7Endpoint,
@@ -282,19 +290,32 @@ where
         let _ = &eval_target;
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
-            let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+            let websocket_request = crate::l7::rest::request_is_websocket_upgrade(&req.raw_header);
+            let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req,
                 client,
                 upstream,
-                ctx.secret_resolver.as_deref(),
-                Some(engine.generation_guard()),
+                crate::l7::rest::RelayRequestOptions {
+                    resolver: ctx.secret_resolver.as_deref(),
+                    generation_guard: Some(engine.generation_guard()),
+                    strip_websocket_extensions: config.protocol == L7Protocol::Rest
+                        && config.websocket_credential_rewrite,
+                },
             )
             .await?;
             match outcome {
                 RelayOutcome::Reusable => {}
                 RelayOutcome::Consumed => return Ok(()),
                 RelayOutcome::Upgraded { overflow } => {
-                    return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+                    return handle_upgrade(
+                        client,
+                        upstream,
+                        overflow,
+                        &ctx.host,
+                        ctx.port,
+                        upgrade_options(config, ctx, websocket_request),
+                    )
+                    .await;
                 }
             }
         } else {
@@ -383,11 +404,20 @@ pub(crate) async fn handle_upgrade<C, U>(
     overflow: Vec<u8>,
     host: &str,
     port: u16,
+    options: UpgradeRelayOptions,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let use_websocket_rewrite = options.websocket_request
+        && options.websocket_credential_rewrite
+        && options.secret_resolver.is_some();
+    let relay_mode = if use_websocket_rewrite {
+        "websocket credential rewrite relay"
+    } else {
+        "raw bidirectional relay (L7 enforcement no longer active)"
+    };
     ocsf_emit!(
         NetworkActivityBuilder::new(crate::ocsf_ctx())
             .activity(ActivityId::Other)
@@ -395,12 +425,23 @@ where
             .severity(SeverityId::Informational)
             .dst_endpoint(Endpoint::from_domain(host, port))
             .message(format!(
-                "101 Switching Protocols — raw bidirectional relay (L7 enforcement no longer active) \
-                 [host:{host} port:{port} overflow_bytes:{}]",
+                "101 Switching Protocols — {relay_mode} [host:{host} port:{port} overflow_bytes:{}]",
                 overflow.len()
             ))
             .build()
     );
+    if use_websocket_rewrite && let Some(resolver) = options.secret_resolver.as_deref() {
+        return crate::l7::websocket::relay_with_credential_rewrite(
+            client,
+            upstream,
+            overflow,
+            host,
+            port,
+            &options.policy_name,
+            resolver,
+        )
+        .await;
+    }
     if !overflow.is_empty() {
         client.write_all(&overflow).await.into_diagnostic()?;
         client.flush().await.into_diagnostic()?;
@@ -409,6 +450,25 @@ where
         .await
         .into_diagnostic()?;
     Ok(())
+}
+
+fn upgrade_options(
+    config: &L7EndpointConfig,
+    ctx: &L7EvalContext,
+    websocket_request: bool,
+) -> UpgradeRelayOptions {
+    let websocket_credential_rewrite =
+        config.protocol == L7Protocol::Rest && config.websocket_credential_rewrite;
+    UpgradeRelayOptions {
+        websocket_request,
+        websocket_credential_rewrite,
+        secret_resolver: if websocket_credential_rewrite {
+            ctx.secret_resolver.clone()
+        } else {
+            None
+        },
+        policy_name: ctx.policy_name.clone(),
+    }
 }
 
 /// REST relay loop: parse request -> evaluate -> allow/deny -> relay response -> repeat.
@@ -558,12 +618,17 @@ where
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             // Forward request to upstream and relay response
-            let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+            let websocket_request = crate::l7::rest::request_is_websocket_upgrade(&req.raw_header);
+            let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req,
                 client,
                 upstream,
-                ctx.secret_resolver.as_deref(),
-                Some(engine.generation_guard()),
+                crate::l7::rest::RelayRequestOptions {
+                    resolver: ctx.secret_resolver.as_deref(),
+                    generation_guard: Some(engine.generation_guard()),
+                    strip_websocket_extensions: config.protocol == L7Protocol::Rest
+                        && config.websocket_credential_rewrite,
+                },
             )
             .await?;
             match outcome {
@@ -577,7 +642,15 @@ where
                     return Ok(());
                 }
                 RelayOutcome::Upgraded { overflow } => {
-                    return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+                    return handle_upgrade(
+                        client,
+                        upstream,
+                        overflow,
+                        &ctx.host,
+                        ctx.port,
+                        upgrade_options(config, ctx, websocket_request),
+                    )
+                    .await;
                 }
             }
         } else {
@@ -788,7 +861,15 @@ where
                     return Ok(());
                 }
                 RelayOutcome::Upgraded { overflow } => {
-                    return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+                    return handle_upgrade(
+                        client,
+                        upstream,
+                        overflow,
+                        &ctx.host,
+                        ctx.port,
+                        UpgradeRelayOptions::default(),
+                    )
+                    .await;
                 }
             }
         } else {
@@ -1029,7 +1110,15 @@ where
             RelayOutcome::Reusable => {} // continue loop
             RelayOutcome::Consumed => break,
             RelayOutcome::Upgraded { overflow } => {
-                return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+                return handle_upgrade(
+                    client,
+                    upstream,
+                    overflow,
+                    &ctx.host,
+                    ctx.port,
+                    UpgradeRelayOptions::default(),
+                )
+                .await;
             }
         }
     }

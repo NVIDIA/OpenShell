@@ -9,7 +9,7 @@
 
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
-use crate::secrets::rewrite_http_header_block;
+use crate::secrets::{SecretResolver, rewrite_http_header_block};
 use miette::{IntoDiagnostic, Result, miette};
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -343,7 +343,7 @@ pub(crate) async fn relay_http_request_with_resolver<C, U>(
     req: &L7Request,
     client: &mut C,
     upstream: &mut U,
-    resolver: Option<&crate::secrets::SecretResolver>,
+    resolver: Option<&SecretResolver>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -356,8 +356,38 @@ pub(crate) async fn relay_http_request_with_resolver_guarded<C, U>(
     req: &L7Request,
     client: &mut C,
     upstream: &mut U,
-    resolver: Option<&crate::secrets::SecretResolver>,
+    resolver: Option<&SecretResolver>,
     generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    relay_http_request_with_options_guarded(
+        req,
+        client,
+        upstream,
+        RelayRequestOptions {
+            resolver,
+            generation_guard,
+            strip_websocket_extensions: false,
+        },
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RelayRequestOptions<'a> {
+    pub(crate) resolver: Option<&'a SecretResolver>,
+    pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
+    pub(crate) strip_websocket_extensions: bool,
+}
+
+pub(crate) async fn relay_http_request_with_options_guarded<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    options: RelayRequestOptions<'_>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -369,10 +399,16 @@ where
         .position(|w| w == b"\r\n\r\n")
         .map_or(req.raw_header.len(), |p| p + 4);
 
-    let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
+    let header_bytes = if options.strip_websocket_extensions {
+        strip_websocket_extensions_if_requested(&req.raw_header[..header_end])?
+    } else {
+        req.raw_header[..header_end].to_vec()
+    };
+
+    let rewrite_result = rewrite_http_header_block(&header_bytes, options.resolver)
         .map_err(|e| miette!("credential injection failed: {e}"))?;
 
-    if let Some(guard) = generation_guard {
+    if let Some(guard) = options.generation_guard {
         guard.ensure_current()?;
     }
 
@@ -383,7 +419,7 @@ where
 
     let overflow = &req.raw_header[header_end..];
     if !overflow.is_empty() {
-        if let Some(guard) = generation_guard {
+        if let Some(guard) = options.generation_guard {
             guard.ensure_current()?;
         }
         upstream.write_all(overflow).await.into_diagnostic()?;
@@ -394,7 +430,7 @@ where
         BodyLength::ContentLength(len) => {
             let remaining = len.saturating_sub(overflow_len);
             if remaining > 0 {
-                relay_fixed(client, upstream, remaining, generation_guard).await?;
+                relay_fixed(client, upstream, remaining, options.generation_guard).await?;
             }
         }
         BodyLength::Chunked => {
@@ -402,7 +438,7 @@ where
                 client,
                 upstream,
                 &req.raw_header[header_end..],
-                generation_guard,
+                options.generation_guard,
             )
             .await?;
         }
@@ -450,6 +486,35 @@ where
     }
 
     Ok(outcome)
+}
+
+pub(crate) fn request_is_websocket_upgrade(raw_header: &[u8]) -> bool {
+    let header_end = raw_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(raw_header.len(), |p| p + 4);
+    std::str::from_utf8(&raw_header[..header_end]).is_ok_and(client_requested_websocket_upgrade)
+}
+
+fn strip_websocket_extensions_if_requested(raw_header: &[u8]) -> Result<Vec<u8>> {
+    let header_str = std::str::from_utf8(raw_header)
+        .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    if !client_requested_websocket_upgrade(header_str) {
+        return Ok(raw_header.to_vec());
+    }
+
+    let mut out = Vec::with_capacity(raw_header.len());
+    for line in header_str.split_inclusive("\r\n") {
+        let bare = line.strip_suffix("\r\n").unwrap_or(line);
+        if bare
+            .to_ascii_lowercase()
+            .starts_with("sec-websocket-extensions:")
+        {
+            continue;
+        }
+        out.extend_from_slice(line.as_bytes());
+    }
+    Ok(out)
 }
 
 /// Send a 403 Forbidden JSON deny response.
@@ -963,6 +1028,29 @@ fn client_requested_upgrade(headers: &str) -> bool {
     }
 
     has_upgrade_header && connection_contains_upgrade
+}
+
+fn client_requested_websocket_upgrade(headers: &str) -> bool {
+    let mut upgrade_is_websocket = false;
+    let mut connection_contains_upgrade = false;
+
+    for line in headers.lines().skip(1) {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("upgrade:") {
+            let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
+            if val == "websocket" {
+                upgrade_is_websocket = true;
+            }
+        }
+        if lower.starts_with("connection:") {
+            let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
+            if val.split(',').any(|tok| tok.trim() == "upgrade") {
+                connection_contains_upgrade = true;
+            }
+        }
+    }
+
+    upgrade_is_websocket && connection_contains_upgrade
 }
 
 /// Returns true for responses that MUST NOT contain a message body per RFC 7230 §3.3.3:
@@ -2241,6 +2329,38 @@ mod tests {
     fn client_requested_upgrade_handles_comma_separated_connection() {
         let headers = "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n";
         assert!(client_requested_upgrade(headers));
+    }
+
+    #[test]
+    fn request_is_websocket_upgrade_detects_websocket_upgrade() {
+        let raw = b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n";
+        assert!(request_is_websocket_upgrade(raw));
+    }
+
+    #[test]
+    fn strip_websocket_extensions_removes_extension_negotiation() {
+        let raw = b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+        let stripped = strip_websocket_extensions_if_requested(raw).expect("strip should succeed");
+        let stripped = String::from_utf8(stripped).unwrap();
+
+        assert!(stripped.contains("Upgrade: websocket\r\n"));
+        assert!(stripped.contains("Sec-WebSocket-Version: 13\r\n"));
+        assert!(
+            !stripped
+                .to_ascii_lowercase()
+                .contains("sec-websocket-extensions")
+        );
+        assert!(stripped.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn strip_websocket_extensions_leaves_non_websocket_request_unchanged() {
+        let raw = b"GET /api HTTP/1.1\r\nHost: example.com\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+
+        let stripped = strip_websocket_extensions_if_requested(raw).expect("strip should succeed");
+
+        assert_eq!(stripped, raw);
     }
 
     #[test]

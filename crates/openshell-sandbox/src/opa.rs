@@ -1061,6 +1061,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if e.allow_encoded_slash {
                         ep["allow_encoded_slash"] = true.into();
                     }
+                    if e.websocket_credential_rewrite {
+                        ep["websocket_credential_rewrite"] = true.into();
+                    }
                     if !e.persisted_queries.is_empty() {
                         ep["persisted_queries"] = e.persisted_queries.clone().into();
                     }
@@ -2461,6 +2464,63 @@ network_policies:
             .expect("endpoint config");
         let l7 = crate::l7::parse_l7_config(&config).unwrap();
         assert!(l7.allow_encoded_slash);
+    }
+
+    #[test]
+    fn l7_endpoint_config_preserves_proto_websocket_credential_rewrite() {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "gateway".to_string(),
+            NetworkPolicyRule {
+                name: "gateway".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "gateway.example.com".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    enforcement: "enforce".to_string(),
+                    access: "full".to_string(),
+                    websocket_credential_rewrite: true,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/node".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+
+        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
+        let input = NetworkInput {
+            host: "gateway.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let config = engine
+            .query_endpoint_config(&input)
+            .unwrap()
+            .expect("endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).unwrap();
+        assert!(l7.websocket_credential_rewrite);
     }
 
     #[test]
