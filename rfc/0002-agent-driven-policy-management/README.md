@@ -7,7 +7,7 @@ links:
   - https://github.com/NVIDIA/OpenShell/blob/main/architecture/policy-advisor.md
 ---
 
-# RFC 0001 - Agent-Driven Policy Management
+# RFC 0002 - Agent-Driven Policy Management
 
 <!--
 See rfc/README.md for the full RFC process and state definitions.
