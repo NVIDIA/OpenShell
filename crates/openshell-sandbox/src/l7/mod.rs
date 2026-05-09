@@ -21,6 +21,7 @@ pub(crate) mod websocket;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L7Protocol {
     Rest,
+    Websocket,
     Graphql,
     Sql,
 }
@@ -29,6 +30,7 @@ impl L7Protocol {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "rest" => Some(Self::Rest),
+            "websocket" => Some(Self::Websocket),
             "graphql" => Some(Self::Graphql),
             "sql" => Some(Self::Sql),
             _ => None,
@@ -469,7 +471,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
 
             if !protocol.is_empty() && L7Protocol::parse(protocol).is_none() {
                 errors.push(format!(
-                    "{loc}: unknown protocol '{protocol}' (expected rest, graphql, or sql)"
+                    "{loc}: unknown protocol '{protocol}' (expected rest, websocket, graphql, or sql)"
                 ));
             }
 
@@ -510,9 +512,10 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
                 && protocol != "rest"
+                && protocol != "websocket"
             {
                 warnings.push(format!(
-                    "{loc}: websocket_credential_rewrite is ignored unless protocol is rest"
+                    "{loc}: websocket_credential_rewrite is ignored unless protocol is rest or websocket"
                 ));
             }
 
@@ -592,14 +595,13 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                         // Validate method
                         if let Some(method) = deny_rule.get("method").and_then(|m| m.as_str())
                             && !method.is_empty()
-                            && protocol == "rest"
+                            && (protocol == "rest" || protocol == "websocket")
                         {
-                            let valid_methods = [
-                                "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "*",
-                            ];
+                            let valid_methods = valid_methods_for_protocol(protocol);
                             if !valid_methods.contains(&method.to_ascii_uppercase().as_str()) {
                                 warnings.push(format!(
-                                    "{deny_loc}: Unknown HTTP method '{method}'. Standard methods: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS."
+                                    "{deny_loc}: Unknown HTTP/WebSocket method '{method}'. Standard methods: {}."
+                                    , valid_methods.join(", ")
                                 ));
                             }
                         }
@@ -751,10 +753,8 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             }
 
             // Validate HTTP methods in rules
-            if has_rules && protocol == "rest" {
-                let valid_methods = [
-                    "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "*",
-                ];
+            if has_rules && (protocol == "rest" || protocol == "websocket") {
+                let valid_methods = valid_methods_for_protocol(protocol);
                 if let Some(rules) = ep.get("rules").and_then(|v| v.as_array()) {
                     for (rule_idx, rule) in rules.iter().enumerate() {
                         if let Some(method) = rule
@@ -765,7 +765,8 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                             && !valid_methods.contains(&method.to_ascii_uppercase().as_str())
                         {
                             warnings.push(format!(
-                                    "{loc}: Unknown HTTP method '{method}'. Standard methods: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS."
+                                    "{loc}: Unknown HTTP/WebSocket method '{method}'. Standard methods: {}."
+                                    , valid_methods.join(", ")
                                 ));
                         }
 
@@ -939,6 +940,13 @@ pub fn expand_access_presets(data: &mut serde_json::Value) {
                     "full" => vec![graphql_rule_json("*")],
                     _ => continue,
                 }
+            } else if protocol == "websocket" {
+                match access.as_str() {
+                    "read-only" => vec![rule_json("GET", "**")],
+                    "read-write" => vec![rule_json("GET", "**"), rule_json("WEBSOCKET_TEXT", "**")],
+                    "full" => vec![rule_json("*", "**")],
+                    _ => continue,
+                }
             } else {
                 match access.as_str() {
                     "read-only" => vec![
@@ -973,6 +981,15 @@ fn rule_json(method: &str, path: &str) -> serde_json::Value {
             "path": path
         }
     })
+}
+
+fn valid_methods_for_protocol(protocol: &str) -> &'static [&'static str] {
+    match protocol {
+        "websocket" => &["GET", "WEBSOCKET_TEXT", "*"],
+        _ => &[
+            "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "*",
+        ],
+    }
 }
 
 fn graphql_rule_json(operation_type: &str) -> serde_json::Value {
@@ -1010,6 +1027,16 @@ mod tests {
         assert_eq!(config.protocol, L7Protocol::Rest);
         assert_eq!(config.tls, TlsMode::Auto);
         assert_eq!(config.enforcement, EnforcementMode::Audit);
+    }
+
+    #[test]
+    fn parse_l7_config_websocket_protocol() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "websocket", "host": "gateway.example.com", "port": 443}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert_eq!(config.protocol, L7Protocol::Websocket);
     }
 
     #[test]
@@ -1070,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_websocket_credential_rewrite_warns_unless_rest() {
+    fn validate_websocket_credential_rewrite_warns_unless_rest_or_websocket() {
         let data = serde_json::json!({
             "network_policies": {
                 "test": {
@@ -1090,6 +1117,34 @@ mod tests {
                 .any(|w| w.contains("websocket_credential_rewrite is ignored")),
             "expected websocket_credential_rewrite warning: {warnings:?}"
         );
+    }
+
+    #[test]
+    fn expand_websocket_read_write_access_includes_text_messages() {
+        let mut data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "gateway.example.com",
+                        "port": 443,
+                        "protocol": "websocket",
+                        "access": "read-write"
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+
+        expand_access_presets(&mut data);
+        let rules = data["network_policies"]["test"]["endpoints"][0]["rules"]
+            .as_array()
+            .unwrap();
+        let methods: Vec<&str> = rules
+            .iter()
+            .map(|r| r["allow"]["method"].as_str().unwrap())
+            .collect();
+        assert!(methods.contains(&"GET"));
+        assert!(methods.contains(&"WEBSOCKET_TEXT"));
     }
 
     #[test]

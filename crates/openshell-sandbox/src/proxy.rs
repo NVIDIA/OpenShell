@@ -2376,7 +2376,7 @@ async fn relay_rewritten_forward_request<C, U>(
     client: &mut C,
     upstream: &mut U,
     generation_guard: &PolicyGenerationGuard,
-    strip_websocket_extensions: bool,
+    websocket_extensions: crate::l7::rest::WebSocketExtensionMode,
 ) -> Result<crate::l7::provider::RelayOutcome>
 where
     C: TokioAsyncRead + TokioAsyncWrite + Unpin,
@@ -2404,7 +2404,7 @@ where
         crate::l7::rest::RelayRequestOptions {
             resolver: None,
             generation_guard: Some(generation_guard),
-            strip_websocket_extensions,
+            websocket_extensions,
         },
     )
     .await
@@ -2627,7 +2627,7 @@ async fn handle_forward_proxy(
     };
     let mut forward_request_bytes = buf[..used].to_vec();
     let mut upstream_target = path.clone();
-    let mut strip_websocket_extensions = false;
+    let mut websocket_extensions = crate::l7::rest::WebSocketExtensionMode::Preserve;
     let mut upgrade_options = crate::l7::relay::UpgradeRelayOptions::default();
 
     // 4b. If the endpoint has L7 config, evaluate the request against
@@ -2771,12 +2771,16 @@ async fn handle_forward_proxy(
         if l7_config.config.protocol == crate::l7::L7Protocol::Rest
             && l7_config.config.websocket_credential_rewrite
         {
-            strip_websocket_extensions = true;
+            websocket_extensions = crate::l7::rest::WebSocketExtensionMode::PermessageDeflate;
             upgrade_options = crate::l7::relay::UpgradeRelayOptions {
                 websocket_request,
-                websocket_credential_rewrite: true,
+                websocket: crate::l7::relay::WebSocketUpgradeBehavior {
+                    credential_rewrite: true,
+                    ..Default::default()
+                },
                 secret_resolver: secret_resolver.clone(),
                 policy_name: matched_policy.clone().unwrap_or_default(),
+                ..Default::default()
             };
         }
         let graphql = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
@@ -3242,10 +3246,15 @@ async fn handle_forward_proxy(
         client,
         &mut upstream,
         &forward_generation_guard,
-        strip_websocket_extensions,
+        websocket_extensions,
     )
     .await?;
-    if let crate::l7::provider::RelayOutcome::Upgraded { overflow } = outcome {
+    if let crate::l7::provider::RelayOutcome::Upgraded {
+        overflow,
+        websocket_permessage_deflate,
+    } = outcome
+    {
+        upgrade_options.websocket.permessage_deflate = websocket_permessage_deflate;
         crate::l7::relay::handle_upgrade(
             client,
             &mut upstream,
@@ -4417,7 +4426,7 @@ mod tests {
             &mut proxy_to_client,
             &mut proxy_to_upstream,
             &guard,
-            false,
+            crate::l7::rest::WebSocketExtensionMode::Preserve,
         )
         .await;
         assert!(
@@ -4456,7 +4465,7 @@ mod tests {
             &mut proxy_to_client,
             &mut proxy_to_upstream,
             &guard,
-            false,
+            crate::l7::rest::WebSocketExtensionMode::Preserve,
         )
         .await;
         assert!(result.is_err(), "forward relay must reject CL/TE ambiguity");

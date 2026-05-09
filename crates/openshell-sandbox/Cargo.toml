@@ -58,6 +58,7 @@ uuid = { workspace = true }
 
 # Encoding
 base64 = { workspace = true }
+flate2 = "1"
 
 # IP network / CIDR parsing
 ipnet = "2"

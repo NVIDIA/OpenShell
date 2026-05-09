@@ -70,7 +70,7 @@ message NetworkEndpoint {
   // Single port (backwards compat). Use `ports` for multiple ports.
   // Mutually exclusive with `ports` — if both are set, `ports` takes precedence.
   uint32 port = 2;
-  // Application protocol for L7 inspection: "rest", "graphql", "sql", or "" (L4-only).
+  // Application protocol for L7 inspection: "rest", "websocket", "graphql", "sql", or "" (L4-only).
   string protocol = 3;
   // TLS handling: "terminate" or "passthrough" (default).
   string tls = 4;

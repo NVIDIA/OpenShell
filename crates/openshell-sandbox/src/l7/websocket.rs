@@ -1,18 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Minimal WebSocket relay for opt-in credential placeholder rewriting.
+//! WebSocket relay for opt-in credential placeholder rewriting and message policy.
 //!
 //! The relay parses only client-to-server frames. Server-to-client bytes stay
-//! raw passthrough so this remains a narrow post-upgrade credential boundary,
-//! not a general WebSocket inspection engine.
+//! raw passthrough so inspection and rewriting cannot expose response payloads.
 
+use crate::l7::relay::{L7EvalContext, evaluate_l7_request};
+use crate::l7::{EnforcementMode, L7RequestInfo};
+use crate::opa::TunnelPolicyEngine;
 use crate::secrets::SecretResolver;
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SeverityId, StatusId,
     ocsf_emit,
 };
+use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAX_TEXT_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -39,20 +43,40 @@ struct FrameHeader {
 #[derive(Debug)]
 enum FragmentState {
     None,
-    Text { payload: Vec<u8> },
+    Text { payload: Vec<u8>, compressed: bool },
     Binary,
 }
 
-/// Relay an upgraded WebSocket connection, rewriting credential placeholders
-/// in client-to-server UTF-8 text messages.
-pub(super) async fn relay_with_credential_rewrite<C, U>(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WebSocketCompression {
+    None,
+    PermessageDeflate,
+}
+
+pub(super) struct InspectionOptions<'a> {
+    pub(super) engine: &'a TunnelPolicyEngine,
+    pub(super) ctx: &'a L7EvalContext,
+    pub(super) enforcement: EnforcementMode,
+    pub(super) target: String,
+    pub(super) query_params: HashMap<String, Vec<String>>,
+}
+
+pub(super) struct RelayOptions<'a> {
+    pub(super) policy_name: &'a str,
+    pub(super) resolver: Option<&'a SecretResolver>,
+    pub(super) inspector: Option<InspectionOptions<'a>>,
+    pub(super) compression: WebSocketCompression,
+}
+
+/// Relay an upgraded WebSocket connection with optional client text inspection,
+/// credential rewriting, and strict permessage-deflate handling.
+pub(super) async fn relay_with_options<C, U>(
     client: &mut C,
     upstream: &mut U,
     overflow: Vec<u8>,
     host: &str,
     port: u16,
-    policy_name: &str,
-    resolver: &SecretResolver,
+    options: RelayOptions<'_>,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -66,14 +90,8 @@ where
         client_write.flush().await.into_diagnostic()?;
     }
 
-    let client_to_server = relay_client_to_server(
-        &mut client_read,
-        &mut upstream_write,
-        host,
-        port,
-        policy_name,
-        resolver,
-    );
+    let client_to_server =
+        relay_client_to_server(&mut client_read, &mut upstream_write, host, port, &options);
     let server_to_client = async {
         tokio::io::copy(&mut upstream_read, &mut client_write)
             .await
@@ -96,8 +114,7 @@ async fn relay_client_to_server<R, W>(
     writer: &mut W,
     host: &str,
     port: u16,
-    policy_name: &str,
-    resolver: &SecretResolver,
+    options: &RelayOptions<'_>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -108,7 +125,7 @@ where
 
     loop {
         let Some(frame) = read_frame_header(reader).await.inspect_err(|e| {
-            emit_protocol_failure(host, port, policy_name, protocol_failure_class(e));
+            emit_protocol_failure(host, port, options.policy_name, protocol_failure_class(e));
         })?
         else {
             writer.shutdown().await.into_diagnostic()?;
@@ -117,67 +134,88 @@ where
 
         if close_seen {
             let e = miette!("websocket frame received after close frame");
-            emit_protocol_failure(host, port, policy_name, protocol_failure_class(&e));
+            emit_protocol_failure(host, port, options.policy_name, protocol_failure_class(&e));
             return Err(e);
         }
 
-        if let Err(e) = validate_frame_header(&frame, &fragments) {
-            emit_protocol_failure(host, port, policy_name, protocol_failure_class(&e));
+        if let Err(e) = validate_frame_header(&frame, &fragments, options.compression) {
+            emit_protocol_failure(host, port, options.policy_name, protocol_failure_class(&e));
             return Err(e);
         }
 
         match frame.opcode {
             OPCODE_TEXT => {
                 let payload = read_masked_payload(reader, &frame).await.inspect_err(|e| {
-                    emit_protocol_failure(host, port, policy_name, protocol_failure_class(e));
-                })?;
-                if frame.fin {
-                    relay_text_payload(
-                        writer,
-                        &frame,
-                        payload,
-                        false,
+                    emit_protocol_failure(
                         host,
                         port,
-                        policy_name,
-                        resolver,
+                        options.policy_name,
+                        protocol_failure_class(e),
+                    );
+                })?;
+                let compressed = frame.rsv == 0x40;
+                if frame.fin {
+                    relay_text_payload(
+                        writer, &frame, payload, false, compressed, host, port, options,
                     )
                     .await
                     .inspect_err(|e| {
-                        emit_protocol_failure(host, port, policy_name, protocol_failure_class(e));
+                        emit_protocol_failure(
+                            host,
+                            port,
+                            options.policy_name,
+                            protocol_failure_class(e),
+                        );
                     })?;
                 } else {
-                    fragments = FragmentState::Text { payload };
+                    fragments = FragmentState::Text {
+                        payload,
+                        compressed,
+                    };
                 }
             }
             OPCODE_CONTINUATION => match &mut fragments {
-                FragmentState::Text { payload } => {
+                FragmentState::Text {
+                    payload,
+                    compressed,
+                } => {
                     let next = read_masked_payload(reader, &frame).await.inspect_err(|e| {
-                        emit_protocol_failure(host, port, policy_name, protocol_failure_class(e));
+                        emit_protocol_failure(
+                            host,
+                            port,
+                            options.policy_name,
+                            protocol_failure_class(e),
+                        );
                     })?;
                     if let Err(e) = append_text_fragment(payload, next) {
-                        emit_protocol_failure(host, port, policy_name, protocol_failure_class(&e));
+                        emit_protocol_failure(
+                            host,
+                            port,
+                            options.policy_name,
+                            protocol_failure_class(&e),
+                        );
                         return Err(e);
                     }
                     if frame.fin {
                         let complete = std::mem::take(payload);
+                        let was_compressed = *compressed;
                         fragments = FragmentState::None;
                         relay_text_payload(
                             writer,
                             &frame,
                             complete,
                             true,
+                            was_compressed,
                             host,
                             port,
-                            policy_name,
-                            resolver,
+                            options,
                         )
                         .await
                         .inspect_err(|e| {
                             emit_protocol_failure(
                                 host,
                                 port,
-                                policy_name,
+                                options.policy_name,
                                 protocol_failure_class(e),
                             );
                         })?;
@@ -190,7 +228,7 @@ where
                             emit_protocol_failure(
                                 host,
                                 port,
-                                policy_name,
+                                options.policy_name,
                                 protocol_failure_class(e),
                             );
                         })?;
@@ -201,7 +239,12 @@ where
                 FragmentState::None => {
                     let e =
                         miette!("websocket continuation frame without active fragmented message");
-                    emit_protocol_failure(host, port, policy_name, protocol_failure_class(&e));
+                    emit_protocol_failure(
+                        host,
+                        port,
+                        options.policy_name,
+                        protocol_failure_class(&e),
+                    );
                     return Err(e);
                 }
             },
@@ -212,14 +255,24 @@ where
                 copy_raw_frame_payload(reader, writer, &frame)
                     .await
                     .inspect_err(|e| {
-                        emit_protocol_failure(host, port, policy_name, protocol_failure_class(e));
+                        emit_protocol_failure(
+                            host,
+                            port,
+                            options.policy_name,
+                            protocol_failure_class(e),
+                        );
                     })?;
             }
             OPCODE_CLOSE | OPCODE_PING | OPCODE_PONG => {
                 relay_control_frame(reader, writer, &frame)
                     .await
                     .inspect_err(|e| {
-                        emit_protocol_failure(host, port, policy_name, protocol_failure_class(e));
+                        emit_protocol_failure(
+                            host,
+                            port,
+                            options.policy_name,
+                            protocol_failure_class(e),
+                        );
                     })?;
                 if frame.opcode == OPCODE_CLOSE {
                     close_seen = true;
@@ -314,10 +367,14 @@ async fn read_frame_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Optio
     }))
 }
 
-fn validate_frame_header(frame: &FrameHeader, fragments: &FragmentState) -> Result<()> {
-    if frame.rsv != 0 {
+fn validate_frame_header(
+    frame: &FrameHeader,
+    fragments: &FragmentState,
+    compression: WebSocketCompression,
+) -> Result<()> {
+    if !valid_rsv_bits(frame, fragments, compression) {
         return Err(miette!(
-            "websocket frame has RSV bits set; compression/extensions are not supported"
+            "websocket frame has unsupported RSV bits or extension state"
         ));
     }
     if !frame.masked {
@@ -365,6 +422,20 @@ fn validate_frame_header(frame: &FrameHeader, fragments: &FragmentState) -> Resu
     Ok(())
 }
 
+fn valid_rsv_bits(
+    frame: &FrameHeader,
+    fragments: &FragmentState,
+    compression: WebSocketCompression,
+) -> bool {
+    if frame.rsv == 0 {
+        return true;
+    }
+    if compression != WebSocketCompression::PermessageDeflate || frame.rsv != 0x40 {
+        return false;
+    }
+    matches!(fragments, FragmentState::None) && matches!(frame.opcode, OPCODE_TEXT | OPCODE_BINARY)
+}
+
 async fn read_masked_payload<R: AsyncRead + Unpin>(
     reader: &mut R,
     frame: &FrameHeader,
@@ -408,18 +479,31 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     frame: &FrameHeader,
     payload: Vec<u8>,
     force_reframe: bool,
+    compressed: bool,
     host: &str,
     port: u16,
-    policy_name: &str,
-    resolver: &SecretResolver,
+    options: &RelayOptions<'_>,
 ) -> Result<()> {
-    let mut text = String::from_utf8(payload)
+    let message_payload = if compressed {
+        decompress_permessage_deflate(&payload)?
+    } else {
+        payload
+    };
+    let mut text = String::from_utf8(message_payload)
         .map_err(|_| miette!("websocket text message is not valid UTF-8"))?;
-    let replacements = resolver
-        .rewrite_websocket_text_placeholders(&mut text)
-        .map_err(|_| miette!("websocket credential placeholder resolution failed"))?;
+    let replacements = if let Some(resolver) = options.resolver {
+        resolver
+            .rewrite_websocket_text_placeholders(&mut text)
+            .map_err(|_| miette!("websocket credential placeholder resolution failed"))?
+    } else {
+        0
+    };
 
-    if replacements == 0 && !force_reframe {
+    if let Some(inspector) = options.inspector.as_ref() {
+        inspect_websocket_text_message(host, port, options.policy_name, inspector)?;
+    }
+
+    if replacements == 0 && !force_reframe && !compressed {
         writer
             .write_all(&frame.raw_header)
             .await
@@ -435,9 +519,38 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     }
 
     if replacements > 0 {
-        emit_rewrite_event(host, port, policy_name, replacements);
+        emit_rewrite_event(host, port, options.policy_name, replacements);
+    }
+    if compressed {
+        let compressed_payload = compress_permessage_deflate(text.as_bytes())?;
+        return write_masked_frame_with_rsv(writer, OPCODE_TEXT, 0x40, &compressed_payload).await;
     }
     write_masked_frame(writer, OPCODE_TEXT, text.as_bytes()).await
+}
+
+fn inspect_websocket_text_message(
+    host: &str,
+    port: u16,
+    policy_name: &str,
+    inspector: &InspectionOptions<'_>,
+) -> Result<()> {
+    let request_info = L7RequestInfo {
+        action: "WEBSOCKET_TEXT".to_string(),
+        target: inspector.target.clone(),
+        query_params: inspector.query_params.clone(),
+        graphql: None,
+    };
+    let (allowed, reason) = evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)?;
+    let decision = match (allowed, inspector.enforcement) {
+        (true, _) => "allow",
+        (false, EnforcementMode::Audit) => "audit",
+        (false, EnforcementMode::Enforce) => "deny",
+    };
+    emit_websocket_l7_event(host, port, policy_name, &request_info, decision, &reason);
+    if !allowed && inspector.enforcement == EnforcementMode::Enforce {
+        return Err(miette!("websocket text message denied by policy"));
+    }
+    Ok(())
 }
 
 async fn relay_control_frame<R, W>(
@@ -534,8 +647,17 @@ async fn write_masked_frame<W: AsyncWrite + Unpin>(
     opcode: u8,
     payload: &[u8],
 ) -> Result<()> {
+    write_masked_frame_with_rsv(writer, opcode, 0, payload).await
+}
+
+async fn write_masked_frame_with_rsv<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    opcode: u8,
+    rsv: u8,
+    payload: &[u8],
+) -> Result<()> {
     let mut header = Vec::with_capacity(14);
-    header.push(0x80 | opcode);
+    header.push(0x80 | rsv | opcode);
     match payload.len() {
         0..=125 => header.push(0x80 | u8::try_from(payload.len()).expect("payload <= 125")),
         126..=65_535 => {
@@ -560,6 +682,91 @@ async fn write_masked_frame<W: AsyncWrite + Unpin>(
     writer.write_all(&masked).await.into_diagnostic()?;
     writer.flush().await.into_diagnostic()?;
     Ok(())
+}
+
+fn decompress_permessage_deflate(payload: &[u8]) -> Result<Vec<u8>> {
+    let mut decoder = Decompress::new(false);
+    let mut input = Vec::with_capacity(payload.len() + 4);
+    input.extend_from_slice(payload);
+    input.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
+    let mut out = Vec::with_capacity(payload.len().saturating_mul(2).min(MAX_TEXT_MESSAGE_BYTES));
+    let mut input_pos = 0usize;
+    let mut scratch = [0u8; COPY_BUF_SIZE];
+    loop {
+        let before_in = decoder.total_in();
+        let before_out = decoder.total_out();
+        let status = decoder
+            .decompress(&input[input_pos..], &mut scratch, FlushDecompress::Sync)
+            .map_err(|e| miette!("websocket permessage-deflate decompression failed: {e}"))?;
+        let read = usize::try_from(decoder.total_in() - before_in)
+            .map_err(|_| miette!("websocket permessage-deflate input length overflow"))?;
+        let written = usize::try_from(decoder.total_out() - before_out)
+            .map_err(|_| miette!("websocket permessage-deflate output length overflow"))?;
+        input_pos = input_pos
+            .checked_add(read)
+            .ok_or_else(|| miette!("websocket permessage-deflate input length overflow"))?;
+        if out.len().saturating_add(written) > MAX_TEXT_MESSAGE_BYTES {
+            return Err(miette!(
+                "websocket text message exceeds {MAX_TEXT_MESSAGE_BYTES} byte limit"
+            ));
+        }
+        out.extend_from_slice(&scratch[..written]);
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+        if input_pos >= input.len() && written < scratch.len() {
+            break;
+        }
+        if read == 0 && written == 0 {
+            return Err(miette!(
+                "websocket permessage-deflate decompression did not make progress"
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn compress_permessage_deflate(payload: &[u8]) -> Result<Vec<u8>> {
+    let mut compressor = Compress::new(Compression::fast(), false);
+    let expansion = payload.len() / 16;
+    let mut out = Vec::with_capacity(payload.len().saturating_add(expansion).saturating_add(128));
+    loop {
+        let consumed = usize::try_from(compressor.total_in())
+            .map_err(|_| miette!("websocket permessage-deflate input length overflow"))?;
+        if consumed >= payload.len() {
+            break;
+        }
+        let before_in = compressor.total_in();
+        let before_out = compressor.total_out();
+        let status = compressor
+            .compress_vec(&payload[consumed..], &mut out, FlushCompress::None)
+            .map_err(|e| miette!("websocket permessage-deflate compression failed: {e}"))?;
+        if matches!(status, Status::BufError)
+            || (compressor.total_in() == before_in && compressor.total_out() == before_out)
+        {
+            out.reserve(out.capacity().max(1024));
+        }
+    }
+    loop {
+        out.reserve(64);
+        let before_out = compressor.total_out();
+        compressor
+            .compress_vec(&[], &mut out, FlushCompress::Sync)
+            .map_err(|e| miette!("websocket permessage-deflate compression failed: {e}"))?;
+        if out.ends_with(&[0x00, 0x00, 0xff, 0xff]) {
+            break;
+        }
+        if compressor.total_out() == before_out {
+            out.reserve(out.capacity().max(1024));
+        }
+    }
+    if !out.ends_with(&[0x00, 0x00, 0xff, 0xff]) {
+        return Err(miette!(
+            "websocket permessage-deflate compression missing sync marker"
+        ));
+    }
+    out.truncate(out.len() - 4);
+    Ok(out)
 }
 
 fn new_mask_key() -> [u8; 4] {
@@ -589,6 +796,48 @@ fn emit_rewrite_event(host: &str, port: u16, policy_name: &str, replacements: us
         .firewall_rule(policy_name, "l7-websocket")
         .message(format!(
             "WEBSOCKET_CREDENTIAL_REWRITE rewrote client text message [host:{host} port:{port} replacements:{replacements}]"
+        ))
+        .build();
+    ocsf_emit!(event);
+}
+
+fn emit_websocket_l7_event(
+    host: &str,
+    port: u16,
+    policy_name: &str,
+    request_info: &L7RequestInfo,
+    decision: &str,
+    reason: &str,
+) {
+    let policy_name = if policy_name.is_empty() {
+        "-"
+    } else {
+        policy_name
+    };
+    let (action_id, disposition_id, severity) = match decision {
+        "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
+        "allow" | "audit" => (
+            ActionId::Allowed,
+            DispositionId::Allowed,
+            SeverityId::Informational,
+        ),
+        _ => (
+            ActionId::Other,
+            DispositionId::Other,
+            SeverityId::Informational,
+        ),
+    };
+    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+        .activity(ActivityId::Other)
+        .action(action_id)
+        .disposition(disposition_id)
+        .severity(severity)
+        .status(StatusId::Success)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .firewall_rule(policy_name, "l7-websocket")
+        .message(format!(
+            "WEBSOCKET_L7_REQUEST {decision} {} {host}:{port}{} reason={reason}",
+            request_info.action, request_info.target
         ))
         .build();
     ocsf_emit!(event);
@@ -653,7 +902,7 @@ mod tests {
     use crate::secrets::SecretResolver;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn resolver() -> (std::collections::HashMap<String, String>, SecretResolver) {
+    fn resolver() -> (HashMap<String, String>, SecretResolver) {
         let (child_env, resolver) = SecretResolver::from_provider_env(
             std::iter::once(("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())).collect(),
         );
@@ -661,9 +910,13 @@ mod tests {
     }
 
     fn masked_frame(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
+        masked_frame_with_rsv(fin, opcode, 0, payload)
+    }
+
+    fn masked_frame_with_rsv(fin: bool, opcode: u8, rsv: u8, payload: &[u8]) -> Vec<u8> {
         let mask_key = [0x37, 0xfa, 0x21, 0x3d];
         let mut frame = Vec::new();
-        frame.push(if fin { 0x80 | opcode } else { opcode });
+        frame.push((if fin { 0x80 } else { 0 }) | rsv | opcode);
         match payload.len() {
             0..=125 => frame.push(0x80 | u8::try_from(payload.len()).expect("payload <= 125")),
             126..=65_535 => {
@@ -735,13 +988,47 @@ mod tests {
         client_write.write_all(&input).await.unwrap();
         drop(client_write);
 
+        let options = RelayOptions {
+            policy_name: "test-policy",
+            resolver: Some(&resolver),
+            inspector: None,
+            compression: WebSocketCompression::None,
+        };
         let result = relay_client_to_server(
             &mut relay_read,
             &mut relay_write,
             "gateway.example.test",
             443,
-            "test-policy",
-            &resolver,
+            &options,
+        )
+        .await;
+        drop(relay_write);
+
+        let mut output = Vec::new();
+        upstream_read.read_to_end(&mut output).await.unwrap();
+        result.map(|()| output)
+    }
+
+    async fn run_client_to_server_compressed(input: Vec<u8>) -> Result<Vec<u8>> {
+        let (_, resolver) = resolver();
+        let (mut client_write, mut relay_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);
+        let (mut relay_write, mut upstream_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);
+
+        client_write.write_all(&input).await.unwrap();
+        drop(client_write);
+
+        let options = RelayOptions {
+            policy_name: "test-policy",
+            resolver: Some(&resolver),
+            inspector: None,
+            compression: WebSocketCompression::PermessageDeflate,
+        };
+        let result = relay_client_to_server(
+            &mut relay_read,
+            &mut relay_write,
+            "gateway.example.test",
+            443,
+            &options,
         )
         .await;
         drop(relay_write);
@@ -753,6 +1040,11 @@ mod tests {
 
     fn decode_masked_text_frame(frame: &[u8]) -> String {
         assert_eq!(frame[0] & 0x0F, OPCODE_TEXT);
+        assert_ne!(frame[1] & 0x80, 0);
+        String::from_utf8(decode_masked_payload(frame)).unwrap()
+    }
+
+    fn decode_masked_payload(frame: &[u8]) -> Vec<u8> {
         assert_ne!(frame[1] & 0x80, 0);
         let len_code = frame[1] & 0x7F;
         let (payload_len, mask_offset) = match len_code {
@@ -767,7 +1059,14 @@ mod tests {
         let mask_key: [u8; 4] = frame[mask_offset..mask_offset + 4].try_into().unwrap();
         let mut payload = frame[mask_offset + 4..mask_offset + 4 + payload_len].to_vec();
         apply_mask(&mut payload, mask_key);
-        String::from_utf8(payload).unwrap()
+        payload
+    }
+
+    fn decode_compressed_masked_text_frame(frame: &[u8]) -> String {
+        assert_eq!(frame[0] & 0x0F, OPCODE_TEXT);
+        assert_eq!(frame[0] & 0x40, 0x40);
+        let payload = decode_masked_payload(frame);
+        String::from_utf8(decompress_permessage_deflate(&payload).unwrap()).unwrap()
     }
 
     async fn read_one_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
@@ -842,14 +1141,18 @@ mod tests {
         let (mut client_app, mut relay_client) = tokio::io::duplex(4096);
         let (mut relay_upstream, mut upstream_app) = tokio::io::duplex(4096);
         let relay = tokio::spawn(async move {
-            relay_with_credential_rewrite(
+            relay_with_options(
                 &mut relay_client,
                 &mut relay_upstream,
                 Vec::new(),
                 "gateway.example.test",
                 443,
-                "test-policy",
-                &resolver,
+                RelayOptions {
+                    policy_name: "test-policy",
+                    resolver: Some(&resolver),
+                    inspector: None,
+                    compression: WebSocketCompression::None,
+                },
             )
             .await
         });
@@ -989,6 +1292,37 @@ mod tests {
             ),
             r#"{"token":"real-token"}"#
         );
+    }
+
+    #[tokio::test]
+    async fn compressed_text_rewrites_with_permessage_deflate() {
+        let (child_env, _) = resolver();
+        let placeholder = child_env.get("DISCORD_BOT_TOKEN").unwrap();
+        let payload = format!(r#"{{"token":"{placeholder}"}}"#);
+        let compressed = compress_permessage_deflate(payload.as_bytes()).unwrap();
+        let input = masked_frame_with_rsv(true, OPCODE_TEXT, 0x40, &compressed);
+
+        let output = run_client_to_server_compressed(input)
+            .await
+            .expect("compressed text should relay");
+
+        assert_eq!(
+            decode_compressed_masked_text_frame(&output),
+            r#"{"token":"real-token"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn compressed_text_rejects_decompressed_oversize_message() {
+        let payload = vec![b'a'; MAX_TEXT_MESSAGE_BYTES + 1];
+        let compressed = compress_permessage_deflate(&payload).unwrap();
+        let input = masked_frame_with_rsv(true, OPCODE_TEXT, 0x40, &compressed);
+
+        let err = run_client_to_server_compressed(input)
+            .await
+            .expect_err("oversize decompressed text should fail");
+
+        assert!(err.to_string().contains("exceeds"));
     }
 
     #[tokio::test]
