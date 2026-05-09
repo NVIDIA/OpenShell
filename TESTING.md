@@ -4,7 +4,7 @@
 
 ```bash
 mise run test          # Rust + Python unit tests
-mise run e2e           # End-to-end tests (requires a running cluster)
+mise run e2e           # End-to-end tests (starts a Docker-backed gateway)
 mise run ci            # Everything: lint, compile checks, and tests
 ```
 
@@ -72,8 +72,17 @@ mise run test:python   # uv run pytest python/
 
 ## E2E Tests
 
-E2E tests run against a live cluster. `mise run e2e` deploys changed components
-before running the suite.
+E2E tests run against a live gateway. By default, `mise run e2e` starts an
+ephemeral standalone gateway with the Docker compute driver, runs the suite,
+and cleans it up afterward. To run the suite against an existing plaintext
+gateway, set `OPENSHELL_GATEWAY_ENDPOINT`:
+
+```bash
+OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:18080 mise run e2e
+```
+
+Raw endpoint mode is HTTP-only. Use a named gateway config when a gateway
+requires mTLS.
 
 ### Python E2E (`e2e/python/`)
 
@@ -125,7 +134,7 @@ def test_multiply(sandbox):
 
 | Fixture | Scope | Purpose |
 |---|---|---|
-| `sandbox_client` | session | gRPC client connected to the active cluster |
+| `sandbox_client` | session | gRPC client connected to the active gateway |
 | `sandbox` | function | Factory returning a `Sandbox` context manager |
 | `inference_client` | session | Client for managing inference routes |
 | `mock_inference_route` | session | Creates a mock OpenAI-protocol route for tests |
@@ -136,22 +145,34 @@ Rust-based e2e tests that exercise the `openshell` CLI binary as a subprocess.
 They live in the `openshell-e2e` crate and use a shared harness for sandbox
 lifecycle management, output parsing, and cleanup.
 
-Tests:
+Suites:
 
-- `tests/custom_image.rs` — custom Docker image build and sandbox run
-- `tests/sync.rs` — bidirectional file sync round-trip (including large files)
-- `tests/port_forward.rs` — TCP port forwarding through a sandbox
+- Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
+- Docker suite (`--features e2e-docker`) - common suite plus Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway resume.
+- Docker GPU suite (`--features e2e-docker-gpu`) - Docker suite plus GPU sandbox smoke coverage.
 
-Run all CLI e2e tests:
+Run the Docker-backed Rust CLI e2e suite:
 
-```bash
+```shell
 mise run e2e:rust
+```
+
+Run the Podman-backed Rust CLI e2e suite:
+
+```shell
+mise run e2e:podman
 ```
 
 Run a single test directly with cargo:
 
-```bash
+```shell
 cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test sync
+```
+
+Run a single Docker-only test directly with cargo:
+
+```shell
+cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test custom_image
 ```
 
 The harness (`e2e/rust/src/harness/`) provides:
@@ -159,6 +180,8 @@ The harness (`e2e/rust/src/harness/`) provides:
 | Module | Purpose |
 |---|---|
 | `binary` | Builds and resolves the `openshell` binary from the workspace |
+| `container` | Container-engine selection and support containers for proxy tests |
+| `gateway` | Managed gateway restart controls for gateway-owned e2e runs |
 | `sandbox` | `SandboxGuard` RAII type — creates sandboxes and deletes them on drop |
 | `output` | ANSI stripping and field extraction from CLI output |
 | `port` | `wait_for_port()` and `find_free_port()` for TCP testing |
@@ -168,3 +191,5 @@ The harness (`e2e/rust/src/harness/`) provides:
 | Variable | Purpose |
 |---|---|
 | `OPENSHELL_GATEWAY` | Override active gateway name for E2E tests |
+| `OPENSHELL_GATEWAY_ENDPOINT` | Run E2E tests against an existing plaintext HTTP gateway endpoint |
+| `OPENSHELL_E2E_DRIVER` | Driver name exported by the e2e gateway wrapper (`docker`, `podman`, or `vm`) |

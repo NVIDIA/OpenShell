@@ -5,7 +5,7 @@
 # Package VM runtime artifacts into a release tarball.
 #
 # Used by CI (release-vm-kernel.yml) to bundle libkrun, libkrunfw, and gvproxy
-# into a platform-specific tarball for the vm-dev GitHub Release. Handles
+# into a platform-specific tarball for the vm-runtime GitHub Release. Handles
 # gvproxy download, provenance metadata generation, and tarball creation.
 #
 # Usage:
@@ -28,8 +28,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
 
-# Source pins for gvproxy version
-source "${ROOT}/crates/openshell-vm/pins.env" 2>/dev/null || true
+# Source pins for gvproxy version.
+source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
 GVPROXY_VERSION="${GVPROXY_VERSION:-v0.8.8}"
 
 PLATFORM=""

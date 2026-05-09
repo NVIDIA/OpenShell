@@ -8,6 +8,7 @@
 //! and chunked transfer encoding for body framing.
 
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
+use crate::opa::PolicyGenerationGuard;
 use crate::secrets::rewrite_http_header_block;
 use miette::{IntoDiagnostic, Result, miette};
 use std::collections::HashMap;
@@ -71,8 +72,17 @@ impl L7Provider for RestProvider {
         reason: &str,
         client: &mut C,
     ) -> Result<()> {
-        send_deny_response(req, policy_name, reason, client, None).await
+        send_deny_response(req, policy_name, reason, client, None, None).await
     }
+}
+
+/// Extra sandbox-side context included in agent-readable deny responses when
+/// the relay has it available.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DenyResponseContext<'a> {
+    pub(crate) host: Option<&'a str>,
+    pub(crate) port: Option<u16>,
+    pub(crate) binary: Option<&'a str>,
 }
 
 impl RestProvider {
@@ -84,8 +94,9 @@ impl RestProvider {
         reason: &str,
         client: &mut C,
         redacted_target: Option<&str>,
+        context: Option<DenyResponseContext<'_>>,
     ) -> Result<()> {
-        send_deny_response(req, policy_name, reason, client, redacted_target).await
+        send_deny_response(req, policy_name, reason, client, redacted_target, context).await
     }
 }
 
@@ -233,8 +244,6 @@ fn rewrite_request_line_target(
     Ok(out)
 }
 
-// Used only in tests; kept as a `pub(crate)` helper for clarity.
-#[allow(dead_code)]
 pub(crate) fn parse_target_query(target: &str) -> Result<(String, HashMap<String, Vec<String>>)> {
     match target.split_once('?') {
         Some((path, query)) => Ok((path.to_string(), parse_query_params(query)?)),
@@ -340,6 +349,20 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    relay_http_request_with_resolver_guarded(req, client, upstream, resolver, None).await
+}
+
+pub(crate) async fn relay_http_request_with_resolver_guarded<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    resolver: Option<&crate::secrets::SecretResolver>,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
     let header_end = req
         .raw_header
         .windows(4)
@@ -349,6 +372,10 @@ where
     let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
         .map_err(|e| miette!("credential injection failed: {e}"))?;
 
+    if let Some(guard) = generation_guard {
+        guard.ensure_current()?;
+    }
+
     upstream
         .write_all(&rewrite_result.rewritten)
         .await
@@ -356,6 +383,9 @@ where
 
     let overflow = &req.raw_header[header_end..];
     if !overflow.is_empty() {
+        if let Some(guard) = generation_guard {
+            guard.ensure_current()?;
+        }
         upstream.write_all(overflow).await.into_diagnostic()?;
     }
     let overflow_len = overflow.len() as u64;
@@ -364,11 +394,17 @@ where
         BodyLength::ContentLength(len) => {
             let remaining = len.saturating_sub(overflow_len);
             if remaining > 0 {
-                relay_fixed(client, upstream, remaining).await?;
+                relay_fixed(client, upstream, remaining, generation_guard).await?;
             }
         }
         BodyLength::Chunked => {
-            relay_chunked(client, upstream, &req.raw_header[header_end..]).await?;
+            relay_chunked(
+                client,
+                upstream,
+                &req.raw_header[header_end..],
+                generation_guard,
+            )
+            .await?;
         }
         BodyLength::None => {}
     }
@@ -426,14 +462,9 @@ async fn send_deny_response<C: AsyncWrite + Unpin>(
     reason: &str,
     client: &mut C,
     redacted_target: Option<&str>,
+    context: Option<DenyResponseContext<'_>>,
 ) -> Result<()> {
-    let target = redacted_target.unwrap_or(&req.target);
-    let body = serde_json::json!({
-        "error": "policy_denied",
-        "policy": policy_name,
-        "rule": format!("{} {}", req.action, target),
-        "detail": reason
-    });
+    let body = deny_response_body(req, policy_name, reason, redacted_target, context);
     let body_bytes = body.to_string();
     let response = format!(
         "HTTP/1.1 403 Forbidden\r\n\
@@ -455,12 +486,80 @@ async fn send_deny_response<C: AsyncWrite + Unpin>(
     Ok(())
 }
 
+fn deny_response_body(
+    req: &L7Request,
+    policy_name: &str,
+    reason: &str,
+    redacted_target: Option<&str>,
+    context: Option<DenyResponseContext<'_>>,
+) -> serde_json::Value {
+    let target = redacted_target.unwrap_or(&req.target);
+    let context = context.unwrap_or_default();
+    let host = non_empty(context.host);
+    let binary = non_empty(context.binary);
+
+    let mut rule_missing = serde_json::Map::new();
+    rule_missing.insert("type".to_string(), serde_json::json!("rest_allow"));
+    rule_missing.insert("layer".to_string(), serde_json::json!("l7"));
+    rule_missing.insert("method".to_string(), serde_json::json!(req.action));
+    rule_missing.insert("path".to_string(), serde_json::json!(target));
+    if let Some(host) = host {
+        rule_missing.insert("host".to_string(), serde_json::json!(host));
+    }
+    if let Some(port) = context.port {
+        rule_missing.insert("port".to_string(), serde_json::json!(port));
+    }
+    if let Some(binary) = binary {
+        rule_missing.insert("binary".to_string(), serde_json::json!(binary));
+    }
+
+    let mut body = serde_json::Map::new();
+    body.insert("error".to_string(), serde_json::json!("policy_denied"));
+    body.insert("policy".to_string(), serde_json::json!(policy_name));
+    body.insert(
+        "rule".to_string(),
+        serde_json::json!(format!("{} {}", req.action, target)),
+    );
+    body.insert("detail".to_string(), serde_json::json!(reason));
+    body.insert("layer".to_string(), serde_json::json!("l7"));
+    body.insert("protocol".to_string(), serde_json::json!("rest"));
+    body.insert("method".to_string(), serde_json::json!(req.action));
+    body.insert("path".to_string(), serde_json::json!(target));
+    if let Some(host) = host {
+        body.insert("host".to_string(), serde_json::json!(host));
+    }
+    if let Some(port) = context.port {
+        body.insert("port".to_string(), serde_json::json!(port));
+    }
+    if let Some(binary) = binary {
+        body.insert("binary".to_string(), serde_json::json!(binary));
+    }
+    body.insert(
+        "rule_missing".to_string(),
+        serde_json::Value::Object(rule_missing),
+    );
+    // `next_steps` is generated by the policy_local module so the wire URLs
+    // and the on-disk skill path stay in sync with the route table. Adding
+    // or renaming a route only requires touching the constants in that
+    // module; this side picks up the change automatically.
+    body.insert(
+        "next_steps".to_string(),
+        crate::policy_local::agent_next_steps(),
+    );
+
+    serde_json::Value::Object(body)
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 /// Parse Content-Length or Transfer-Encoding from HTTP headers.
 ///
 /// Per RFC 7230 Section 3.3.3, rejects requests containing both
 /// `Content-Length` and `Transfer-Encoding` headers to prevent request
 /// smuggling via CL/TE ambiguity.
-fn parse_body_length(headers: &str) -> Result<BodyLength> {
+pub(crate) fn parse_body_length(headers: &str) -> Result<BodyLength> {
     let mut has_te_chunked = false;
     let mut cl_value: Option<u64> = None;
 
@@ -504,7 +603,12 @@ fn parse_body_length(headers: &str) -> Result<BodyLength> {
 }
 
 /// Relay exactly `len` bytes from reader to writer.
-async fn relay_fixed<R, W>(reader: &mut R, writer: &mut W, len: u64) -> Result<()>
+async fn relay_fixed<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    len: u64,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -521,6 +625,9 @@ where
                 "Connection closed with {remaining} bytes remaining"
             ));
         }
+        if let Some(guard) = generation_guard {
+            guard.ensure_current()?;
+        }
         writer.write_all(&buf[..n]).await.into_diagnostic()?;
         remaining -= n as u64;
     }
@@ -536,7 +643,12 @@ where
 /// `already_forwarded` are overflow bytes that were already written to the
 /// writer during header parsing. They are seeded into the parser buffer so
 /// termination can still be detected when boundaries span reads.
-async fn relay_chunked<R, W>(reader: &mut R, writer: &mut W, already_forwarded: &[u8]) -> Result<()>
+async fn relay_chunked<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    already_forwarded: &[u8],
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -559,6 +671,9 @@ where
             let n = reader.read(&mut read_buf).await.into_diagnostic()?;
             if n == 0 {
                 return Err(miette!("Chunked body ended before chunk-size line"));
+            }
+            if let Some(guard) = generation_guard {
+                guard.ensure_current()?;
             }
             writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
             parse_buf.extend_from_slice(&read_buf[..n]);
@@ -588,6 +703,9 @@ where
                     let n = reader.read(&mut read_buf).await.into_diagnostic()?;
                     if n == 0 {
                         return Err(miette!("Chunked body ended before trailer terminator"));
+                    }
+                    if let Some(guard) = generation_guard {
+                        guard.ensure_current()?;
                     }
                     writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
                     parse_buf.extend_from_slice(&read_buf[..n]);
@@ -622,6 +740,9 @@ where
             if n == 0 {
                 return Err(miette!("Chunked body ended mid-chunk"));
             }
+            if let Some(guard) = generation_guard {
+                guard.ensure_current()?;
+            }
             writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
             parse_buf.extend_from_slice(&read_buf[..n]);
         }
@@ -645,28 +766,6 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
         .windows(2)
         .position(|w| w == b"\r\n")
         .map(|offset| start + offset)
-}
-
-/// Read and relay a full HTTP response (headers + body) from upstream to client.
-///
-/// Returns a [`RelayOutcome`] indicating whether the connection is reusable,
-/// consumed, or has been upgraded (101 Switching Protocols).
-///
-/// Note: callers that receive `Upgraded` are responsible for switching to
-/// raw bidirectional relay and forwarding the overflow bytes.
-// Public helper retained as part of the relay API surface; internal callers
-// currently use `relay_response` directly.
-#[allow(dead_code)]
-pub(crate) async fn relay_response_to_client<U, C>(
-    upstream: &mut U,
-    client: &mut C,
-    request_method: &str,
-) -> Result<RelayOutcome>
-where
-    U: AsyncRead + Unpin,
-    C: AsyncWrite + Unpin,
-{
-    relay_response(request_method, upstream, client).await
 }
 
 async fn relay_response<U, C>(
@@ -794,11 +893,11 @@ where
         BodyLength::ContentLength(len) => {
             let remaining = len.saturating_sub(overflow_len);
             if remaining > 0 {
-                relay_fixed(upstream, client, remaining).await?;
+                relay_fixed(upstream, client, remaining, None).await?;
             }
         }
         BodyLength::Chunked => {
-            relay_chunked(upstream, client, &buf[header_end..]).await?;
+            relay_chunked(upstream, client, &buf[header_end..], None).await?;
         }
         BodyLength::None => unreachable!(),
     }
@@ -945,8 +1044,118 @@ fn is_benign_close(err: &std::io::Error) -> bool {
 )]
 mod tests {
     use super::*;
+    use crate::opa::OpaEngine;
     use crate::secrets::SecretResolver;
     use base64::Engine as _;
+
+    const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
+
+    #[test]
+    fn deny_response_body_is_agent_readable_and_redacted() {
+        // Agent-readable next_steps is gated on the proposals feature flag.
+        let _proposals = crate::test_helpers::ProposalsFlagGuard::set_blocking(true);
+        let req = L7Request {
+            action: "PUT".to_string(),
+            target: "/repos/NVIDIA/OpenShell/contents/README.md?access_token=secret-token"
+                .to_string(),
+            query_params: HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: BodyLength::ContentLength(128),
+        };
+
+        let body = deny_response_body(
+            &req,
+            "github-readonly",
+            "no matching L7 allow rule",
+            Some("/repos/NVIDIA/OpenShell/contents/README.md"),
+            Some(DenyResponseContext {
+                host: Some("api.github.com"),
+                port: Some(443),
+                binary: Some("/usr/bin/gh"),
+            }),
+        );
+
+        assert_eq!(body["error"], "policy_denied");
+        assert_eq!(body["policy"], "github-readonly");
+        assert_eq!(body["layer"], "l7");
+        assert_eq!(body["protocol"], "rest");
+        assert_eq!(body["method"], "PUT");
+        assert_eq!(body["host"], "api.github.com");
+        assert_eq!(body["port"], 443);
+        assert_eq!(body["binary"], "/usr/bin/gh");
+        assert_eq!(body["path"], "/repos/NVIDIA/OpenShell/contents/README.md");
+        assert_eq!(
+            body["rule"],
+            "PUT /repos/NVIDIA/OpenShell/contents/README.md"
+        );
+        assert_eq!(body["rule_missing"]["type"], "rest_allow");
+        assert_eq!(body["rule_missing"]["layer"], "l7");
+        assert_eq!(body["rule_missing"]["method"], "PUT");
+        assert_eq!(
+            body["rule_missing"]["path"],
+            "/repos/NVIDIA/OpenShell/contents/README.md"
+        );
+        assert_eq!(body["rule_missing"]["host"], "api.github.com");
+        assert_eq!(body["rule_missing"]["port"], 443);
+        assert_eq!(body["rule_missing"]["binary"], "/usr/bin/gh");
+        assert_eq!(body["next_steps"][0]["action"], "read_skill");
+        assert_eq!(
+            body["next_steps"][0]["path"],
+            "/etc/openshell/skills/policy_advisor.md"
+        );
+        assert_eq!(body["next_steps"][3]["body_type"], "PolicyMergeOperation");
+        assert!(
+            !body.to_string().contains("secret-token"),
+            "deny body must not leak query params or credential values"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_deny_response_writes_structured_json_403() {
+        // Agent-readable next_steps is gated on the proposals feature flag.
+        let _proposals = crate::test_helpers::ProposalsFlagGuard::set(true).await;
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let send = tokio::spawn(async move {
+            let req = L7Request {
+                action: "POST".to_string(),
+                target: "/user/repos".to_string(),
+                query_params: HashMap::new(),
+                raw_header: Vec::new(),
+                body_length: BodyLength::ContentLength(64),
+            };
+            send_deny_response(
+                &req,
+                "github-readonly",
+                "no matching L7 allow rule",
+                &mut server,
+                None,
+                Some(DenyResponseContext {
+                    host: Some("api.github.com"),
+                    port: Some(443),
+                    binary: Some("/usr/bin/gh"),
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        send.await.unwrap();
+
+        let response = String::from_utf8(received).unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(response.contains("Content-Type: application/json"));
+        assert!(response.contains("X-OpenShell-Policy: github-readonly"));
+
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["error"], "policy_denied");
+        assert_eq!(body["method"], "POST");
+        assert_eq!(body["path"], "/user/repos");
+        assert_eq!(body["rule_missing"]["host"], "api.github.com");
+        assert_eq!(body["next_steps"][2]["action"], "inspect_recent_denials");
+    }
 
     #[test]
     fn parse_content_length() {
@@ -1967,6 +2176,47 @@ mod tests {
         );
 
         upstream_task.await.expect("upstream task should complete");
+    }
+
+    #[tokio::test]
+    async fn relay_request_guard_blocks_stale_generation_before_upstream_write() {
+        let policy_data = "network_policies: {}\n";
+        let engine = OpaEngine::from_strings(TEST_POLICY, policy_data).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        engine.reload(TEST_POLICY, policy_data).unwrap();
+
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/api".to_string(),
+            query_params: HashMap::new(),
+            raw_header: b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let result = relay_http_request_with_resolver_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            None,
+            Some(&guard),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "stale generation must stop relay before upstream write"
+        );
+
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "stale request bytes must not reach upstream"
+        );
     }
 
     #[test]

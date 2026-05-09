@@ -185,7 +185,7 @@ gh issue comment <id> --body "$(cat <<'EOF'
 - <risk or unknown that may need human input>
 
 ### Documentation Impact
-- <which architecture/ docs will need updating, or "None expected">
+- <docs expected per AGENTS.md, or "None expected">
 
 ---
 *Revision 1 — initial plan*
@@ -402,29 +402,24 @@ git diff --name-only main -- e2e/
 
 If there are no changes under `e2e/`, skip this phase entirely.
 
-If E2E files were modified, deploy to the local cluster and run the E2E test suite:
+If E2E files were modified, run the relevant E2E lane for the driver touched by the change:
 
 ```bash
-# Deploy all changes to the local k3s cluster
-mise run cluster:deploy
-
-# Run the E2E sandbox tests
-mise run test:e2e:sandbox
+# Docker-backed gateway smoke E2E
+mise run e2e:docker
 ```
 
-`mise run test:e2e:sandbox` depends on `cluster:deploy` and `python:proto`, then runs `uv run pytest -o python_files='test_*.py' e2e/python`. However, since the cluster may need explicit deploy for code changes beyond just E2E test files, always run `mise run cluster:deploy` first as a separate step to ensure all sandbox/proxy/policy changes are live on the cluster before running E2E tests.
+Use `mise run e2e:podman`, `mise run e2e:vm`, or a Helm-backed Kubernetes E2E lane when the change targets those drivers.
 
 **E2E retry loop** (up to 3 attempts):
 
-1. Run `mise run cluster:deploy` (only on the first attempt, or if code was changed between attempts).
-2. Run `mise run test:e2e:sandbox`.
-3. If tests fail:
+1. Run the selected E2E lane.
+2. If tests fail:
    - Read the pytest output carefully — identify which tests failed and why.
    - Distinguish between **test bugs** (the test itself is wrong) and **implementation bugs** (the code under test is wrong).
    - Fix the failing code or tests.
-   - If code changes were made (not just test fixes), re-run `mise run cluster:deploy` before retrying.
    - Decrement the retry counter and try again.
-4. If tests pass, Phase 2 is green.
+3. If tests pass, Phase 2 is green.
 
 **If all 3 E2E attempts fail**, stop and report to the user:
 - Which E2E tests are failing
@@ -436,18 +431,9 @@ Do not proceed to PR creation if E2E verification is not green.
 
 ### Step 11: Update Documentation
 
-Use the `arch-doc-writer` sub-agent to update architecture documentation. Use the Task tool:
-
-```
-Task tool with subagent_type="arch-doc-writer"
-```
-
-In the prompt, provide:
-- Which files were changed and why (from the plan + any deviations)
-- The issue context (what was built/fixed)
-- Which architecture docs in `architecture/` are likely affected
-
-Launch one `arch-doc-writer` instance per documentation file that needs updating. If no documentation changes are needed, the `arch-doc-writer` will make that determination.
+Review the documentation requirements in `AGENTS.md` and update any affected
+docs as part of the implementation. Keep documentation changes scoped to the
+behavior or subsystem that changed.
 
 ### Step 12: Commit and Push
 
@@ -507,10 +493,9 @@ Closes #<issue-id>
 ## Checklist
 - [x] Follows Conventional Commits
 - [x] Commits are signed off (DCO)
-- [x] Architecture docs updated (if applicable)
 
 **Documentation updated:**
-- `<architecture/doc.md>`: <what was updated>
+- `<doc path>`: <what was updated, or "None needed">
 EOF
 )"
 ```
@@ -542,7 +527,7 @@ PR: [#<pr-number>](https://github.com/OWNER/REPO/pull/<pr-number>)
 - E2E: <count or N/A>
 
 ### Docs updated
-- <list of updated architecture docs, or "None needed">
+- <list of updated docs, or "None needed">
 
 The issue will auto-close when the PR is merged.
 EOF
@@ -576,8 +561,8 @@ Local E2E tests passed. CI does not currently run E2E tests, so this comment ser
 | Field | Value |
 |-------|-------|
 | **Commit** | `<commit-sha>` |
-| **Command** | `mise run test:e2e:sandbox` |
-| **Cluster deploy** | `mise run cluster:deploy` (completed before test run) |
+| **Command** | `<selected e2e command>` |
+| **Gateway mode** | `<docker / podman / vm / helm>` |
 | **Result** | ✅ All passed |
 
 ### Test Summary
@@ -645,8 +630,9 @@ If the `state:in-progress` label is present, the skill was previously started bu
 | `gh pr create --title "..." --body "..."` | Create a pull request |
 | `gh api user --jq '.login'` | Get current GitHub username |
 | `mise run pre-commit` | Run pre-commit checks (includes unit tests, lint, format) |
-| `mise run cluster:deploy` | Deploy all changes to local k3s cluster |
-| `mise run test:e2e:sandbox` | Run E2E sandbox tests (depends on cluster:deploy) |
+| `mise run e2e:docker` | Run smoke E2E against a standalone Docker-backed gateway |
+| `mise run e2e:podman` | Run smoke E2E against a Podman-backed gateway |
+| `mise run e2e:vm` | Run smoke E2E against the VM compute driver |
 
 ## Example Usage
 
@@ -695,7 +681,6 @@ User says: "Build issue #42"
 7. Add unit tests for pagination logic, integration tests for both endpoints
 8. `mise run pre-commit` passes on first attempt
 9. E2E tests skipped (no changes under `e2e/`)
-10. `arch-doc-writer` updates `architecture/gateway.md` with pagination details
 10. Commit, push, create PR with `Closes #42`
 11. Post summary comment on issue with PR link
 12. Update labels: remove `state:in-progress` + `state:review-ready`, add `state:pr-opened`

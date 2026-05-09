@@ -6,7 +6,7 @@
 #
 # This script collects libkrun, libkrunfw, and gvproxy from local sources
 # (Homebrew on macOS, built from source on Linux) and compresses them with
-# zstd for embedding into the openshell-vm binary.
+# zstd for embedding into the openshell-driver-vm binary.
 #
 # Usage:
 #   ./compress-vm-runtime.sh
@@ -26,8 +26,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
 
-# Source pins for gvproxy version
-source "${ROOT}/crates/openshell-vm/pins.env" 2>/dev/null || true
+# Source pins for gvproxy version.
+source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
 GVPROXY_VERSION="${GVPROXY_VERSION:-v0.8.8}"
 
 # ── macOS dylib portability helpers ─────────────────────────────────────
@@ -83,7 +83,7 @@ if [ -z "${VM_RUNTIME_TARBALL:-}" ] && _check_compressed_artifacts "$OUTPUT_DIR"
     echo "==> Compressed artifacts already present in ${OUTPUT_DIR} — skipping compression."
     ls -lah "$OUTPUT_DIR"
 
-    # Decompress artifacts into WORK_DIR so bundle-vm-runtime.sh can find them.
+    # Decompress artifacts into WORK_DIR for local inspection.
     echo ""
     echo "==> Decompressing artifacts into ${WORK_DIR} for runtime bundle..."
     rm -rf "$WORK_DIR"
@@ -100,7 +100,7 @@ if [ -z "${VM_RUNTIME_TARBALL:-}" ] && _check_compressed_artifacts "$OUTPUT_DIR"
     ls -lah "$WORK_DIR"
 
     echo ""
-    echo "Next step: cargo build -p openshell-vm"
+    echo "Next step: mise run vm:supervisor && cargo build -p openshell-driver-vm"
     exit 0
 fi
 
@@ -133,7 +133,7 @@ if [ -n "${VM_RUNTIME_TARBALL:-}" ]; then
     else
         echo ""
         echo "Note: rootfs.tar.zst not found."
-        echo "      To build one, run: mise run vm:rootfs -- --base"
+        echo "      openshell-driver-vm does not embed a standalone rootfs."
     fi
 
     echo ""
@@ -143,7 +143,7 @@ if [ -n "${VM_RUNTIME_TARBALL:-}" ]; then
     echo ""
     echo "==> Total compressed size: ${TOTAL}"
     echo ""
-    echo "Next step: mise run vm:build"
+    echo "Next step: mise run vm:supervisor && cargo build -p openshell-driver-vm"
     exit 0
 fi
 
@@ -279,9 +279,7 @@ if [ -f "$ROOTFS_TARBALL" ]; then
 else
     echo ""
     echo "Note: rootfs.tar.zst not found."
-      echo "      To build one, run: mise run vm:rootfs -- --base"
-      echo "      Without it, the binary will still work but require the rootfs"
-      echo "      to be built separately on first run."
+      echo "      openshell-driver-vm does not embed a standalone rootfs."
 fi
 
 echo ""
@@ -292,4 +290,4 @@ TOTAL=$(du -sh "$OUTPUT_DIR" | cut -f1)
 echo ""
 echo "==> Total compressed size: ${TOTAL}"
 echo ""
-echo "Next step: mise run vm:build"
+echo "Next step: mise run vm:supervisor && cargo build -p openshell-driver-vm"

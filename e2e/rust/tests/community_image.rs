@@ -11,7 +11,7 @@
 //! 3. Basic command execution works inside the community sandbox
 //!
 //! Prerequisites:
-//! - A running openshell gateway (`openshell gateway start`)
+//! - A running openshell gateway (`mise run gateway:docker`)
 //! - Network access to ghcr.io/nvidia/openshell-community/sandboxes/
 
 use openshell_e2e::harness::output::strip_ansi;

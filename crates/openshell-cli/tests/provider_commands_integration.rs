@@ -5,16 +5,18 @@ use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
-    CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
-    ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
-    Provider, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
-    WatchSandboxRequest,
+    AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
+    CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
+    DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
+    ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest, GetGatewayConfigResponse,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
+    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
+    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
+    ListSandboxesResponse, Provider, ProviderProfile, ProviderResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, ServiceStatus,
+    SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
 };
 use openshell_core::{ObjectId, ObjectName};
 use rcgen::{
@@ -63,6 +65,24 @@ impl Drop for EnvVarGuard {
 #[derive(Clone, Default)]
 struct ProviderState {
     providers: Arc<Mutex<HashMap<String, Provider>>>,
+    profiles: Arc<Mutex<HashMap<String, ProviderProfile>>>,
+    sandbox_providers: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    sandbox_provider_requests: Arc<Mutex<Vec<SandboxProviderRequestLog>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SandboxProviderRequestLog {
+    List {
+        sandbox_name: String,
+    },
+    Attach {
+        sandbox_name: String,
+        provider_name: String,
+    },
+    Detach {
+        sandbox_name: String,
+        provider_name: String,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -101,6 +121,120 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         Ok(Response::new(ListSandboxesResponse::default()))
+    }
+
+    async fn list_sandbox_providers(
+        &self,
+        request: tonic::Request<ListSandboxProvidersRequest>,
+    ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
+        let sandbox_name = request.into_inner().sandbox_name;
+        self.state
+            .sandbox_provider_requests
+            .lock()
+            .await
+            .push(SandboxProviderRequestLog::List {
+                sandbox_name: sandbox_name.clone(),
+            });
+        let provider_names = self
+            .state
+            .sandbox_providers
+            .lock()
+            .await
+            .get(&sandbox_name)
+            .cloned()
+            .unwrap_or_default();
+        let providers_by_name = self.state.providers.lock().await;
+        let providers = provider_names
+            .iter()
+            .filter_map(|name| providers_by_name.get(name).cloned())
+            .collect();
+        Ok(Response::new(ListSandboxProvidersResponse { providers }))
+    }
+
+    async fn attach_sandbox_provider(
+        &self,
+        request: tonic::Request<AttachSandboxProviderRequest>,
+    ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .sandbox_provider_requests
+            .lock()
+            .await
+            .push(SandboxProviderRequestLog::Attach {
+                sandbox_name: request.sandbox_name.clone(),
+                provider_name: request.provider_name.clone(),
+            });
+        if !self
+            .state
+            .providers
+            .lock()
+            .await
+            .contains_key(&request.provider_name)
+        {
+            return Err(Status::failed_precondition("provider not found"));
+        }
+        let mut sandbox_providers = self.state.sandbox_providers.lock().await;
+        let providers = sandbox_providers
+            .entry(request.sandbox_name.clone())
+            .or_default();
+        let attached = if providers.contains(&request.provider_name) {
+            false
+        } else {
+            providers.push(request.provider_name.clone());
+            true
+        };
+        let sandbox = openshell_core::proto::Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                name: request.sandbox_name,
+                ..Default::default()
+            }),
+            spec: Some(openshell_core::proto::SandboxSpec {
+                providers: providers.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok(Response::new(AttachSandboxProviderResponse {
+            sandbox: Some(sandbox),
+            attached,
+        }))
+    }
+
+    async fn detach_sandbox_provider(
+        &self,
+        request: tonic::Request<DetachSandboxProviderRequest>,
+    ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .sandbox_provider_requests
+            .lock()
+            .await
+            .push(SandboxProviderRequestLog::Detach {
+                sandbox_name: request.sandbox_name.clone(),
+                provider_name: request.provider_name.clone(),
+            });
+        let mut sandbox_providers = self.state.sandbox_providers.lock().await;
+        let providers = sandbox_providers
+            .entry(request.sandbox_name.clone())
+            .or_default();
+        let before_len = providers.len();
+        providers.retain(|name| name != &request.provider_name);
+        let detached = providers.len() != before_len;
+        let sandbox = openshell_core::proto::Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                name: request.sandbox_name,
+                ..Default::default()
+            }),
+            spec: Some(openshell_core::proto::SandboxSpec {
+                providers: providers.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok(Response::new(DetachSandboxProviderResponse {
+            sandbox: Some(sandbox),
+            detached,
+        }))
     }
 
     async fn delete_sandbox(
@@ -201,6 +335,78 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(ListProvidersResponse { providers }))
     }
 
+    async fn list_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        let mut profiles = openshell_providers::default_profiles()
+            .iter()
+            .map(openshell_providers::ProviderTypeProfile::to_proto)
+            .collect::<Vec<_>>();
+        profiles.extend(self.state.profiles.lock().await.values().cloned());
+        Ok(Response::new(
+            openshell_core::proto::ListProviderProfilesResponse { profiles },
+        ))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
+        let id = request.into_inner().id;
+        let profile = if let Some(profile) = openshell_providers::get_default_profile(&id) {
+            profile.to_proto()
+        } else {
+            self.state
+                .profiles
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| Status::not_found("provider profile not found"))?
+        };
+        Ok(Response::new(
+            openshell_core::proto::ProviderProfileResponse {
+                profile: Some(profile),
+            },
+        ))
+    }
+
+    async fn import_provider_profiles(
+        &self,
+        request: tonic::Request<openshell_core::proto::ImportProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ImportProviderProfilesResponse>, Status> {
+        let mut profiles = self.state.profiles.lock().await;
+        let imported = request
+            .into_inner()
+            .profiles
+            .into_iter()
+            .filter_map(|item| item.profile)
+            .inspect(|profile| {
+                profiles.insert(profile.id.clone(), profile.clone());
+            })
+            .collect::<Vec<_>>();
+        Ok(Response::new(
+            openshell_core::proto::ImportProviderProfilesResponse {
+                diagnostics: Vec::new(),
+                profiles: imported,
+                imported: true,
+            },
+        ))
+    }
+
+    async fn lint_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::LintProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::LintProviderProfilesResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::LintProviderProfilesResponse {
+                diagnostics: Vec::new(),
+                valid: true,
+            },
+        ))
+    }
+
     async fn update_provider(
         &self,
         request: tonic::Request<UpdateProviderRequest>,
@@ -263,6 +469,17 @@ impl OpenShell for TestOpenShell {
         let name = request.into_inner().name;
         let deleted = self.state.providers.lock().await.remove(&name).is_some();
         Ok(Response::new(DeleteProviderResponse { deleted }))
+    }
+
+    async fn delete_provider_profile(
+        &self,
+        request: tonic::Request<openshell_core::proto::DeleteProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
+        let id = request.into_inner().id;
+        let deleted = self.state.profiles.lock().await.remove(&id).is_some();
+        Ok(Response::new(
+            openshell_core::proto::DeleteProviderProfileResponse { deleted },
+        ))
     }
 
     type WatchSandboxStream =
@@ -447,6 +664,7 @@ fn build_client_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
 struct TestServer {
     endpoint: String,
     tls: TlsOptions,
+    state: ProviderState,
     _dir: TempDir,
 }
 
@@ -467,11 +685,15 @@ async fn run_server() -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = TcpListenerStream::new(listener);
+    let state = ProviderState::default();
+    let service = TestOpenShell {
+        state: state.clone(),
+    };
     tokio::spawn(async move {
         Server::builder()
             .tls_config(tls_config)
             .unwrap()
-            .add_service(OpenShellServer::new(TestOpenShell::default()))
+            .add_service(OpenShellServer::new(service))
             .serve_with_incoming(incoming)
             .await
             .unwrap();
@@ -491,6 +713,7 @@ async fn run_server() -> TestServer {
     TestServer {
         endpoint,
         tls,
+        state,
         _dir: dir,
     }
 }
@@ -534,6 +757,335 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     run::provider_delete(&ts.endpoint, &["my-claude".to_string()], &ts.tls)
         .await
         .expect("provider delete");
+}
+
+#[tokio::test]
+async fn provider_list_profiles_cli_uses_profile_browsing_rpc() {
+    let ts = run_server().await;
+
+    run::provider_list_profiles(&ts.endpoint, "table", &ts.tls)
+        .await
+        .expect("provider list-profiles");
+}
+
+#[tokio::test]
+async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results() {
+    let ts = run_server().await;
+
+    run::provider_create(
+        &ts.endpoint,
+        "work-github",
+        "github",
+        false,
+        &["GITHUB_TOKEN=ghp-test".to_string()],
+        &[],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
+        .await
+        .expect("sandbox provider attach");
+    run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
+        .await
+        .expect("sandbox provider attach is idempotent");
+    run::sandbox_provider_list(&ts.endpoint, "dev-sandbox", &ts.tls)
+        .await
+        .expect("sandbox provider list");
+    run::sandbox_provider_detach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
+        .await
+        .expect("sandbox provider detach");
+    run::sandbox_provider_detach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
+        .await
+        .expect("sandbox provider detach is idempotent");
+
+    let requests = ts.state.sandbox_provider_requests.lock().await.clone();
+    assert_eq!(
+        requests,
+        vec![
+            SandboxProviderRequestLog::Attach {
+                sandbox_name: "dev-sandbox".to_string(),
+                provider_name: "work-github".to_string(),
+            },
+            SandboxProviderRequestLog::Attach {
+                sandbox_name: "dev-sandbox".to_string(),
+                provider_name: "work-github".to_string(),
+            },
+            SandboxProviderRequestLog::List {
+                sandbox_name: "dev-sandbox".to_string(),
+            },
+            SandboxProviderRequestLog::Detach {
+                sandbox_name: "dev-sandbox".to_string(),
+                provider_name: "work-github".to_string(),
+            },
+            SandboxProviderRequestLog::Detach {
+                sandbox_name: "dev-sandbox".to_string(),
+                provider_name: "work-github".to_string(),
+            },
+        ]
+    );
+
+    let providers = ts.state.sandbox_providers.lock().await;
+    assert!(providers.get("dev-sandbox").is_none_or(Vec::is_empty));
+}
+
+#[tokio::test]
+async fn sandbox_provider_attach_cli_surfaces_server_errors() {
+    let ts = run_server().await;
+
+    let err =
+        run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "missing-provider", &ts.tls)
+            .await
+            .expect_err("missing provider should fail");
+
+    assert!(
+        err.to_string().contains("provider not found"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        ts.state.sandbox_provider_requests.lock().await.as_slice(),
+        [SandboxProviderRequestLog::Attach {
+            sandbox_name: "dev-sandbox".to_string(),
+            provider_name: "missing-provider".to_string(),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn provider_profile_cli_run_functions_support_custom_profiles() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile_path = dir.path().join("custom-api.yaml");
+    std::fs::write(
+        &profile_path,
+        r"
+id: custom-api
+display_name: Custom API
+category: other
+credentials:
+  - name: api_key
+    env_vars: [CUSTOM_API_KEY]
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: api.custom.example
+    port: 443
+binaries: [/usr/bin/custom]
+",
+    )
+    .unwrap();
+
+    run::provider_profile_lint(&ts.endpoint, Some(&profile_path), None, &ts.tls)
+        .await
+        .expect("profile lint");
+    run::provider_profile_import(&ts.endpoint, Some(&profile_path), None, &ts.tls)
+        .await
+        .expect("profile import");
+    run::provider_profile_export(&ts.endpoint, "custom-api", "yaml", &ts.tls)
+        .await
+        .expect("profile export");
+    run::provider_list_profiles(&ts.endpoint, "json", &ts.tls)
+        .await
+        .expect("provider list-profiles json");
+    run::provider_create(
+        &ts.endpoint,
+        "custom-provider",
+        "custom-api",
+        false,
+        &["CUSTOM_API_KEY=abc".to_string()],
+        &[],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("custom profile provider create");
+
+    let provider = ts
+        .state
+        .providers
+        .lock()
+        .await
+        .get("custom-provider")
+        .cloned()
+        .expect("custom provider should be stored");
+    assert_eq!(provider.r#type, "custom-api");
+
+    run::provider_delete(&ts.endpoint, &["custom-provider".to_string()], &ts.tls)
+        .await
+        .expect("custom provider delete");
+    run::provider_profile_delete(&ts.endpoint, "custom-api", &ts.tls)
+        .await
+        .expect("profile delete");
+}
+
+#[tokio::test]
+async fn provider_profile_import_from_directory_imports_supported_profile_files() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("custom-yaml.yaml"),
+        r"
+id: custom-yaml
+display_name: Custom YAML
+category: other
+endpoints:
+  - host: api.yaml.example
+    port: 443
+binaries: [/usr/bin/yaml-client]
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("custom-json.json"),
+        r#"{
+  "id": "custom-json",
+  "display_name": "Custom JSON",
+  "description": "",
+  "category": "other",
+  "credentials": [],
+  "endpoints": [{"host": "api.json.example", "port": 443}],
+  "binaries": ["/usr/bin/json-client"],
+  "inference_capable": false
+}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "ignored").unwrap();
+
+    run::provider_profile_import(&ts.endpoint, None, Some(dir.path()), &ts.tls)
+        .await
+        .expect("profile import --from");
+
+    run::provider_profile_export(&ts.endpoint, "custom-yaml", "yaml", &ts.tls)
+        .await
+        .expect("custom-yaml should be imported");
+    run::provider_profile_export(&ts.endpoint, "custom-json", "json", &ts.tls)
+        .await
+        .expect("custom-json should be imported");
+}
+
+#[tokio::test]
+#[allow(deprecated)]
+async fn provider_profile_import_preserves_advanced_network_policy_fields() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile_path = dir.path().join("advanced-api.yaml");
+    std::fs::write(
+        &profile_path,
+        r"
+id: advanced-api
+display_name: Advanced API
+category: other
+endpoints:
+  - host: api.advanced.example
+    ports: [443, 8443]
+    protocol: rest
+    tls: terminate
+    enforcement: enforce
+    rules:
+      - allow:
+          method: GET
+          path: /v1/**
+    allowed_ips: [10.0.0.0/24]
+    deny_rules:
+      - method: POST
+        path: /admin/**
+    allow_encoded_slash: true
+    path: /v1
+binaries:
+  - path: /usr/bin/advanced
+    harness: true
+",
+    )
+    .unwrap();
+
+    run::provider_profile_import(&ts.endpoint, Some(&profile_path), None, &ts.tls)
+        .await
+        .expect("profile import");
+
+    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+        .await
+        .expect("grpc client should connect");
+    let profile = client
+        .get_provider_profile(openshell_core::proto::GetProviderProfileRequest {
+            id: "advanced-api".to_string(),
+        })
+        .await
+        .expect("get provider profile")
+        .into_inner()
+        .profile
+        .expect("profile should exist");
+    let endpoint = profile.endpoints.first().expect("endpoint should exist");
+    assert_eq!(endpoint.ports, vec![443, 8443]);
+    assert_eq!(endpoint.rules.len(), 1);
+    assert_eq!(endpoint.deny_rules.len(), 1);
+    assert_eq!(endpoint.allowed_ips, vec!["10.0.0.0/24"]);
+    assert!(endpoint.allow_encoded_slash);
+    assert_eq!(endpoint.path, "/v1");
+    assert!(profile.binaries[0].harness);
+}
+
+#[tokio::test]
+async fn provider_profile_import_from_directory_parse_error_prevents_partial_import() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("custom-good.yaml"),
+        r"
+id: custom-good
+display_name: Custom Good
+category: other
+endpoints:
+  - host: api.good.example
+    port: 443
+",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("broken.yaml"), "id: [\n").unwrap();
+
+    let err = run::provider_profile_import(&ts.endpoint, None, Some(dir.path()), &ts.tls)
+        .await
+        .expect_err("profile import --from should fail on parse errors");
+    assert!(
+        err.to_string().contains("provider profile import failed"),
+        "unexpected error: {err}"
+    );
+
+    run::provider_profile_export(&ts.endpoint, "custom-good", "yaml", &ts.tls)
+        .await
+        .expect_err("valid profiles should not be partially imported after local parse errors");
+}
+
+#[tokio::test]
+async fn provider_profile_lint_from_directory_reports_parse_errors_without_importing() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("custom-good.yaml"),
+        r"
+id: custom-good
+display_name: Custom Good
+category: other
+endpoints:
+  - host: api.good.example
+    port: 443
+",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("broken.yaml"), "id: [\n").unwrap();
+
+    let err = run::provider_profile_lint(&ts.endpoint, None, Some(dir.path()), &ts.tls)
+        .await
+        .expect_err("profile lint --from should fail on parse errors");
+    assert!(
+        err.to_string().contains("provider profile lint failed"),
+        "unexpected error: {err}"
+    );
+
+    run::provider_profile_export(&ts.endpoint, "custom-good", "yaml", &ts.tls)
+        .await
+        .expect_err("lint should not import valid profiles");
 }
 
 #[tokio::test]

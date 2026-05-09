@@ -21,6 +21,7 @@ async fn run_isolated(args: &[&str]) -> (String, i32) {
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
         .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
         // Suppress browser popup during auth flow.
         .env("OPENSHELL_NO_BROWSER", "1")
         // Use a closed stdin so auth prompts don't hang the test.
@@ -44,6 +45,7 @@ async fn run_with_config(tmpdir: &std::path::Path, args: &[&str]) -> (String, i3
         .env("XDG_CONFIG_HOME", tmpdir)
         .env("HOME", tmpdir)
         .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
         // Suppress browser popup during auth flow.
         .env("OPENSHELL_NO_BROWSER", "1")
         // Use a closed stdin so auth prompts don't hang the test.
@@ -60,20 +62,22 @@ async fn run_with_config(tmpdir: &std::path::Path, args: &[&str]) -> (String, i3
 }
 
 // -------------------------------------------------------------------
-// Test 8: `--plaintext` flag is recognized
+// Test 8: gateway lifecycle commands are not exposed through the CLI
 // -------------------------------------------------------------------
 
-/// `openshell gateway start --help` must show `--plaintext`.
+/// `openshell gateway --help` must not show removed lifecycle commands.
 #[tokio::test]
-async fn gateway_start_help_shows_plaintext() {
-    let (output, code) = run_isolated(&["gateway", "start", "--help"]).await;
-    assert_eq!(code, 0, "gateway start --help should exit 0:\n{output}");
+async fn gateway_help_omits_lifecycle_commands() {
+    let (output, code) = run_isolated(&["gateway", "--help"]).await;
+    assert_eq!(code, 0, "gateway --help should exit 0:\n{output}");
 
     let clean = strip_ansi(&output);
-    assert!(
-        clean.contains("--plaintext"),
-        "expected '--plaintext' in gateway start --help output:\n{clean}"
-    );
+    for removed in ["start", "stop", "destroy"] {
+        assert!(
+            !clean.contains(removed),
+            "did not expect removed gateway lifecycle command '{removed}' in gateway help:\n{clean}"
+        );
+    }
 }
 
 // -------------------------------------------------------------------
@@ -111,10 +115,6 @@ async fn gateway_add_help_shows_flags() {
     assert!(
         clean.contains("--remote"),
         "expected '--remote' in gateway add --help:\n{clean}"
-    );
-    assert!(
-        clean.contains("--ssh-key"),
-        "expected '--ssh-key' in gateway add --help:\n{clean}"
     );
     assert!(
         clean.contains("--local"),
@@ -291,9 +291,9 @@ async fn gateway_add_remote_and_local_conflict() {
     );
 }
 
-/// `--ssh-key` requires `--remote`.
+/// `--ssh-key` was removed from `gateway add`.
 #[tokio::test]
-async fn gateway_add_ssh_key_requires_remote() {
+async fn gateway_add_rejects_removed_ssh_key_flag() {
     let (output, code) = run_isolated(&[
         "gateway",
         "add",
@@ -305,7 +305,7 @@ async fn gateway_add_ssh_key_requires_remote() {
 
     assert_ne!(
         code, 0,
-        "--ssh-key without --remote should fail:\n{output}"
+        "--ssh-key should fail after gateway lifecycle bootstrap removal:\n{output}"
     );
 }
 
@@ -416,4 +416,3 @@ async fn gateway_add_ssh_url_requires_port() {
         "error should mention port:\n{clean}"
     );
 }
-

@@ -8,6 +8,7 @@
 //! doing a raw `copy_bidirectional`. Each request within the tunnel is parsed,
 //! evaluated against OPA policy, and either forwarded or denied.
 
+pub mod graphql;
 pub mod inference;
 pub mod path;
 pub mod provider;
@@ -19,6 +20,7 @@ pub mod tls;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L7Protocol {
     Rest,
+    Graphql,
     Sql,
 }
 
@@ -26,6 +28,7 @@ impl L7Protocol {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "rest" => Some(Self::Rest),
+            "graphql" => Some(Self::Graphql),
             "sql" => Some(Self::Sql),
             _ => None,
         }
@@ -58,8 +61,13 @@ pub enum EnforcementMode {
 #[derive(Debug, Clone)]
 pub struct L7EndpointConfig {
     pub protocol: L7Protocol,
+    /// Optional endpoint-level HTTP path glob used to select between L7
+    /// protocols that share the same host:port.
+    pub path: String,
     pub tls: TlsMode,
     pub enforcement: EnforcementMode,
+    /// Maximum GraphQL request body bytes to buffer for inspection.
+    pub graphql_max_body_bytes: usize,
     /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
     /// rather than rejected at the parser. Needed by upstreams like GitLab
     /// that embed `%2F` in namespaced project paths. Defaults to false.
@@ -83,6 +91,8 @@ pub struct L7RequestInfo {
     pub target: String,
     /// Decoded query parameter multimap for REST requests.
     pub query_params: std::collections::HashMap<String, Vec<String>>,
+    /// Parsed GraphQL operation metadata for GraphQL endpoints.
+    pub graphql: Option<graphql::GraphqlRequestInfo>,
 }
 
 /// Parse an L7 endpoint config from a regorus Value (returned by Rego query).
@@ -128,13 +138,46 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     };
 
     let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
+    let graphql_max_body_bytes = get_object_u64(val, "graphql_max_body_bytes")
+        .and_then(|v| usize::try_from(v).ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(graphql::DEFAULT_MAX_BODY_BYTES);
 
     Some(L7EndpointConfig {
         protocol,
+        path: get_object_str(val, "path").unwrap_or_default(),
         tls,
         enforcement,
+        graphql_max_body_bytes,
         allow_encoded_slash,
     })
+}
+
+impl L7EndpointConfig {
+    pub fn matches_path(&self, path: &str) -> bool {
+        endpoint_path_matches(&self.path, path)
+    }
+
+    pub fn path_specificity(&self) -> usize {
+        if self.path.is_empty() {
+            0
+        } else {
+            self.path.chars().filter(|c| *c != '*').count()
+        }
+    }
+}
+
+pub fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
+    if pattern.is_empty() || pattern == "**" || pattern == "/**" {
+        return true;
+    }
+    if pattern == path {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return path == prefix || path.starts_with(&format!("{prefix}/"));
+    }
+    glob::Pattern::new(pattern).is_ok_and(|glob| glob.matches(path))
 }
 
 /// Parse the `tls` field from an endpoint config, independent of L7 protocol.
@@ -156,6 +199,17 @@ fn get_object_bool(val: &regorus::Value, key: &str) -> Option<bool> {
     match val {
         regorus::Value::Object(map) => match map.get(&key_val) {
             Some(regorus::Value::Bool(b)) => Some(*b),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn get_object_u64(val: &regorus::Value, key: &str) -> Option<u64> {
+    let key_val = regorus::Value::String(key.into());
+    match val {
+        regorus::Value::Object(map) => match map.get(&key_val) {
+            Some(regorus::Value::Number(n)) => n.as_u64(),
             _ => None,
         },
         _ => None,
@@ -220,6 +274,85 @@ fn check_glob_syntax(pattern: &str) -> Option<String> {
     None
 }
 
+fn validate_graphql_operation_type(
+    errors: &mut Vec<String>,
+    loc: &str,
+    value: Option<&str>,
+    required: bool,
+) {
+    let Some(value) = value.filter(|v| !v.is_empty()) else {
+        if required {
+            errors.push(format!(
+                "{loc}.operation_type: required for GraphQL L7 rules"
+            ));
+        }
+        return;
+    };
+
+    let valid = ["query", "mutation", "subscription", "*"];
+    if !valid.contains(&value.to_ascii_lowercase().as_str()) {
+        errors.push(format!(
+            "{loc}.operation_type: expected query, mutation, subscription, or *, got '{value}'"
+        ));
+    }
+}
+
+fn validate_graphql_fields(
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    loc: &str,
+    fields: Option<&serde_json::Value>,
+) {
+    let Some(fields) = fields else {
+        return;
+    };
+    let Some(items) = fields.as_array() else {
+        errors.push(format!(
+            "{loc}.fields: expected array of GraphQL root field globs"
+        ));
+        return;
+    };
+    if items.is_empty() {
+        errors.push(format!(
+            "{loc}.fields: list must not be empty; omit fields to match all root fields"
+        ));
+        return;
+    }
+    for item in items {
+        let Some(field) = item.as_str() else {
+            errors.push(format!("{loc}.fields: all values must be strings"));
+            continue;
+        };
+        if field.is_empty() {
+            errors.push(format!("{loc}.fields: field glob must not be empty"));
+        } else if let Some(warning) = check_glob_syntax(field) {
+            warnings.push(format!("{loc}.fields: {warning}"));
+        }
+    }
+}
+
+fn validate_graphql_rule(
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    loc: &str,
+    rule: &serde_json::Value,
+    required: bool,
+) {
+    validate_graphql_operation_type(
+        errors,
+        loc,
+        rule.get("operation_type").and_then(|v| v.as_str()),
+        required,
+    );
+    if let Some(name) = rule.get("operation_name").and_then(|v| v.as_str())
+        && !name.is_empty()
+        && let Some(warning) = check_glob_syntax(name)
+    {
+        warnings.push(format!("{loc}.operation_name: {warning}"));
+    }
+    validate_graphql_fields(errors, warnings, loc, rule.get("fields"));
+}
+
 /// Validate L7 policy configuration in the loaded OPA data.
 ///
 /// Returns a list of errors and warnings. Errors should prevent sandbox startup;
@@ -250,6 +383,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 .and_then(|v| v.as_array())
                 .is_some_and(|a| !a.is_empty());
             let host = ep.get("host").and_then(|v| v.as_str()).unwrap_or("");
+            let endpoint_path = ep.get("path").and_then(|v| v.as_str()).unwrap_or("");
 
             // Read ports from either "ports" array or scalar "port".
             let ports: Vec<u64> = ep.get("ports").and_then(|v| v.as_array()).map_or_else(
@@ -263,6 +397,17 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 |arr| arr.iter().filter_map(serde_json::Value::as_u64).collect(),
             );
             let loc = format!("{name}.endpoints[{i}]");
+
+            if !endpoint_path.is_empty() {
+                if !endpoint_path.starts_with('/') && endpoint_path != "**" {
+                    errors.push(format!(
+                        "{loc}: endpoint path must start with '/' or be '**', got '{endpoint_path}'"
+                    ));
+                }
+                if let Some(warning) = check_glob_syntax(endpoint_path) {
+                    warnings.push(format!("{loc}.path: {warning}"));
+                }
+            }
 
             // Validate host wildcard patterns.
             if host.contains('*') {
@@ -313,6 +458,57 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 errors.push(format!(
                     "{loc}: protocol requires rules or access to define allowed traffic"
                 ));
+            }
+
+            if !protocol.is_empty() && L7Protocol::parse(protocol).is_none() {
+                errors.push(format!(
+                    "{loc}: unknown protocol '{protocol}' (expected rest, graphql, or sql)"
+                ));
+            }
+
+            if let Some(mode) = ep.get("persisted_queries").and_then(|v| v.as_str())
+                && !mode.is_empty()
+                && mode != "deny"
+                && mode != "allow_registered"
+            {
+                errors.push(format!(
+                    "{loc}: persisted_queries must be 'deny' or 'allow_registered', got '{mode}'"
+                ));
+            }
+
+            if ep.get("graphql_max_body_bytes").is_some() {
+                let valid_max = ep
+                    .get("graphql_max_body_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|v| v > 0);
+                if !valid_max {
+                    errors.push(format!(
+                        "{loc}: graphql_max_body_bytes must be a positive integer"
+                    ));
+                }
+            }
+
+            if protocol != "graphql"
+                && (ep.get("persisted_queries").is_some()
+                    || ep.get("graphql_persisted_queries").is_some()
+                    || ep.get("graphql_max_body_bytes").is_some())
+            {
+                warnings.push(format!(
+                    "{loc}: GraphQL-specific endpoint fields are ignored unless protocol is graphql"
+                ));
+            }
+
+            if let Some(registry_value) = ep.get("graphql_persisted_queries") {
+                let Some(registry) = registry_value.as_object() else {
+                    errors.push(format!(
+                        "{loc}: graphql_persisted_queries must be a map keyed by hash or saved-query id"
+                    ));
+                    continue;
+                };
+                for (key, op) in registry {
+                    let registry_loc = format!("{loc}.graphql_persisted_queries[{key}]");
+                    validate_graphql_rule(&mut errors, &mut warnings, &registry_loc, op, true);
+                }
             }
 
             // Deprecated tls values: warn but don't error
@@ -504,6 +700,23 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                             warnings
                                 .push(format!("{deny_loc}: command is for SQL protocol, not REST"));
                         }
+
+                        if protocol == "graphql" {
+                            validate_graphql_rule(
+                                &mut errors,
+                                &mut warnings,
+                                &deny_loc,
+                                deny_rule,
+                                true,
+                            );
+                        } else if deny_rule.get("operation_type").is_some()
+                            || deny_rule.get("operation_name").is_some()
+                            || deny_rule.get("fields").is_some()
+                        {
+                            warnings.push(format!(
+                                "{deny_loc}: GraphQL rule fields are ignored unless protocol is graphql"
+                            ));
+                        }
                     }
                 }
             }
@@ -644,6 +857,17 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                     }
                 }
             }
+
+            if has_rules
+                && protocol == "graphql"
+                && let Some(rules) = ep.get("rules").and_then(|v| v.as_array())
+            {
+                for (rule_idx, rule) in rules.iter().enumerate() {
+                    let allow = rule.get("allow").unwrap_or(rule);
+                    let rule_loc = format!("{loc}.rules[{rule_idx}].allow");
+                    validate_graphql_rule(&mut errors, &mut warnings, &rule_loc, allow, true);
+                }
+            }
         }
     }
 
@@ -686,22 +910,35 @@ pub fn expand_access_presets(data: &mut serde_json::Value) {
                 continue;
             }
 
-            let rules = match access.as_str() {
-                "read-only" => vec![
-                    rule_json("GET", "**"),
-                    rule_json("HEAD", "**"),
-                    rule_json("OPTIONS", "**"),
-                ],
-                "read-write" => vec![
-                    rule_json("GET", "**"),
-                    rule_json("HEAD", "**"),
-                    rule_json("OPTIONS", "**"),
-                    rule_json("POST", "**"),
-                    rule_json("PUT", "**"),
-                    rule_json("PATCH", "**"),
-                ],
-                "full" => vec![rule_json("*", "**")],
-                _ => continue,
+            let protocol = ep
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("rest");
+            let rules = if protocol == "graphql" {
+                match access.as_str() {
+                    "read-only" => vec![graphql_rule_json("query")],
+                    "read-write" => vec![graphql_rule_json("query"), graphql_rule_json("mutation")],
+                    "full" => vec![graphql_rule_json("*")],
+                    _ => continue,
+                }
+            } else {
+                match access.as_str() {
+                    "read-only" => vec![
+                        rule_json("GET", "**"),
+                        rule_json("HEAD", "**"),
+                        rule_json("OPTIONS", "**"),
+                    ],
+                    "read-write" => vec![
+                        rule_json("GET", "**"),
+                        rule_json("HEAD", "**"),
+                        rule_json("OPTIONS", "**"),
+                        rule_json("POST", "**"),
+                        rule_json("PUT", "**"),
+                        rule_json("PATCH", "**"),
+                    ],
+                    "full" => vec![rule_json("*", "**")],
+                    _ => continue,
+                }
             };
 
             ep.as_object_mut()
@@ -716,6 +953,14 @@ fn rule_json(method: &str, path: &str) -> serde_json::Value {
         "allow": {
             "method": method,
             "path": path
+        }
+    })
+}
+
+fn graphql_rule_json(operation_type: &str) -> serde_json::Value {
+    serde_json::json!({
+        "allow": {
+            "operation_type": operation_type
         }
     })
 }
@@ -974,6 +1219,81 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0]["allow"]["method"].as_str().unwrap(), "*");
         assert_eq!(rules[0]["allow"]["path"].as_str().unwrap(), "**");
+    }
+
+    #[test]
+    fn expand_graphql_readonly_preset() {
+        let mut data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "graphql",
+                        "access": "read-only"
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        expand_access_presets(&mut data);
+        let rules = data["network_policies"]["test"]["endpoints"][0]["rules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0]["allow"]["operation_type"].as_str().unwrap(),
+            "query"
+        );
+    }
+
+    #[test]
+    fn validate_graphql_rule_requires_operation_type() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "graphql",
+                        "rules": [{
+                            "allow": {
+                                "fields": ["viewer"]
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("operation_type")),
+            "GraphQL rules should require operation_type: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_graphql_persisted_query_mode() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "graphql",
+                        "access": "full",
+                        "persisted_queries": "allow_all"
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("persisted_queries")),
+            "invalid persisted query mode should be rejected: {errors:?}"
+        );
     }
 
     #[test]

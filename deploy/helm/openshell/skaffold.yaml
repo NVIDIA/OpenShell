@@ -1,0 +1,104 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Local dev: builds gateway + supervisor images using Dockerfile.images with
+# BUILD_FROM_SOURCE=1, which compiles Rust binaries inside Docker without
+# requiring pre-staged artifacts.
+#
+# Run from repo root:
+#   skaffold dev -f deploy/helm/openshell/skaffold.yaml
+#
+# See https://skaffold.dev/docs/deployers/helm/ (setValueTemplates, IMAGE_* fields).
+apiVersion: skaffold/v4beta14
+kind: Config
+metadata:
+  name: openshell
+build:
+  local:
+    push: false
+  tagPolicy:
+    gitCommit: {}
+  artifacts:
+    - image: openshell/gateway
+      context: ../../..
+      custom:
+        buildCommand: |
+          docker buildx build \
+            --build-arg BUILD_FROM_SOURCE=1 \
+            --target gateway \
+            --tag "$IMAGE" \
+            --load \
+            --file deploy/docker/Dockerfile.images \
+            .
+        dependencies:
+          paths:
+            - Cargo.toml
+            - Cargo.lock
+            - crates/**
+            - proto/**
+            - deploy/docker/Dockerfile.images
+            - crates/openshell-server/migrations/**
+    - image: openshell/supervisor
+      context: ../../..
+      custom:
+        buildCommand: |
+          docker buildx build \
+            --build-arg BUILD_FROM_SOURCE=1 \
+            --target supervisor \
+            --tag "$IMAGE" \
+            --load \
+            --file deploy/docker/Dockerfile.images \
+            .
+        dependencies:
+          paths:
+            - Cargo.toml
+            - Cargo.lock
+            - crates/**
+            - proto/**
+            - deploy/docker/Dockerfile.images
+deploy:
+  helm:
+    releases:
+      # cert-manager — comment this in and add values-cert-manager.yaml below
+      # when you want cert-manager to manage the PKI instead of pkiInitJob.
+      # Requires cert-manager CRDs to be installed in the cluster first.
+      #- name: cert-manager
+      #  repo: https://charts.jetstack.io
+      #  remoteChart: cert-manager
+      #  version: v1.20.2
+      #  namespace: cert-manager
+      #  createNamespace: true
+      #  setValues:
+      #    crds.enabled: true
+      # Envoy Gateway — Kubernetes Gateway API implementation.
+      # Installs the Gateway API CRDs and the "eg" GatewayClass.
+      # Required when grpcRoute.enabled is true in the openshell release.
+      #- name: envoy-gateway
+      #  remoteChart: oci://docker.io/envoyproxy/gateway-helm
+      #  version: v1.7.2
+      #  namespace: envoy-gateway-system
+      #  createNamespace: true
+      #  # wait ensures Gateway API CRDs are registered before the openshell
+      #  # release attempts to create Gateway and HTTPRoute resources.
+      #  wait: true
+      - name: openshell
+        chartPath: .
+        namespace: openshell
+        createNamespace: true
+        valuesFiles:
+          - values.yaml
+          - ci/values-skaffold.yaml
+          # Add ci/values-cert-manager.yaml here (and uncomment the cert-manager
+          # release above) to switch from pkiInitJob to cert-manager for PKI.
+          #- ci/values-cert-manager.yaml
+          # To enable OIDC with a local Keycloak instance, run the one-time
+          # setup task first, then uncomment the line below:
+          #   mise run keycloak:k8s:setup
+          #- ci/values-keycloak.yaml
+          # To enable the Gateway API HTTPRoute (requires Envoy Gateway above):
+          #- ci/values-gateway.yaml
+        setValueTemplates:
+          image.repository: '{{.IMAGE_REPO_openshell_gateway}}'
+          image.tag: '{{.IMAGE_TAG_openshell_gateway}}'
+          supervisor.image.repository: '{{.IMAGE_REPO_openshell_supervisor}}'
+          supervisor.image.tag: '{{.IMAGE_TAG_openshell_supervisor}}'

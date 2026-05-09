@@ -112,8 +112,8 @@ HOST_OS="$(uname -s)"
 HOST_ARCH="$(normalize_arch "$(uname -m)")"
 SUPERVISOR_TARGET="$(linux_target_triple "${DAEMON_ARCH}")"
 # Cache the supervisor binary alongside the gateway state. Reuses the same
-# Docker pipeline that builds the cluster supervisor image, so the cross-
-# compile happens inside Linux containers — sidestepping macOS's per-process
+# Docker pipeline used for the supervisor image, so the cross-compile happens
+# inside Linux containers — sidestepping macOS's per-process
 # file-descriptor cap that breaks zig/ld for this many rlibs.
 SUPERVISOR_OUT_DIR="${STATE_DIR}/supervisor/${DAEMON_ARCH}"
 SUPERVISOR_BIN="${SUPERVISOR_OUT_DIR}/openshell-sandbox"
@@ -137,7 +137,7 @@ if [[ "${HOST_OS}" == "Linux" && "${HOST_ARCH}" == "${DAEMON_ARCH}" ]]; then
   cp "${ROOT}/target/${SUPERVISOR_TARGET}/debug/openshell-sandbox" "${SUPERVISOR_BIN}"
 else
   # Cross-compile through the prebuilt-binary staging helper, then use the
-  # supervisor-output stage to extract just the openshell-sandbox binary.
+  # supervisor stage to extract just the openshell-sandbox binary.
   #
   # This task is gated on a working Docker daemon above, so pin the
   # container-engine helper to docker — otherwise it auto-detects podman

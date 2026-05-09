@@ -69,7 +69,7 @@ stays the same (tokens arrive incrementally).
 
 ## Standalone (no cluster)
 
-Run the sandbox binary directly with a route file — no OpenShell cluster needed:
+Run the sandbox binary directly with a route file — no gateway needed:
 
 ```bash
 # 1. Edit routes.yaml to point at your local LLM (e.g. LM Studio on :1234)
@@ -85,16 +85,16 @@ openshell-sandbox \
 The sandbox loads routes from the YAML file at startup and routes inference
 requests locally — no gRPC server or cluster required.
 
-### With a cluster
+### With a gateway
 
-#### 1. Start a OpenShell cluster
+#### 1. Start an OpenShell gateway
 
 ```bash
-mise run cluster
+mise run gateway:docker
 openshell status
 ```
 
-#### 2. Configure cluster inference
+#### 2. Configure gateway inference
 
 First make sure a provider record exists for the backend you want to use:
 
@@ -102,11 +102,11 @@ First make sure a provider record exists for the backend you want to use:
 openshell provider list
 ```
 
-Then configure the cluster-managed `inference.local` route:
+Then configure the gateway-managed `inference.local` route:
 
 ```bash
 # Example: use an existing provider record
-openshell cluster inference set \
+openshell inference set \
   --provider openai-prod \
   --model nvidia/nemotron-3-nano-30b-a3b
 ```
@@ -114,7 +114,7 @@ openshell cluster inference set \
 Verify the active config:
 
 ```bash
-openshell cluster inference get
+openshell inference get
 ```
 
 #### 3. Run the example inside a sandbox
@@ -127,8 +127,8 @@ openshell sandbox create \
 ```
 
 The script targets `https://inference.local/v1` directly. OpenShell
-intercepts that connection and routes it to whatever backend cluster
-inference is configured to use.
+intercepts that connection and routes it to whatever backend gateway inference
+is configured to use.
 
 Expected output:
 
@@ -154,7 +154,7 @@ openshell sandbox delete inference-demo
 ## Customizing Routes
 
 Edit `routes.yaml` to change which backend endpoint/model standalone mode uses.
-In cluster mode, use `openshell cluster inference set` instead.
+In gateway mode, use `openshell inference set` instead.
 
 ## Supported Protocols
 

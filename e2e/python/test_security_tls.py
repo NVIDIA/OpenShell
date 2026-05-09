@@ -36,6 +36,8 @@ def _xdg_config_home() -> pathlib.Path:
 
 
 def _resolve_cluster_name() -> str:
+    if os.environ.get("OPENSHELL_GATEWAY_ENDPOINT"):
+        return os.environ.get("OPENSHELL_GATEWAY", "openshell-e2e-endpoint")
     env_cluster = os.environ.get("OPENSHELL_GATEWAY")
     if env_cluster:
         return env_cluster
@@ -44,6 +46,13 @@ def _resolve_cluster_name() -> str:
 
 
 def _cluster_metadata(cluster_name: str) -> dict:
+    endpoint = os.environ.get("OPENSHELL_GATEWAY_ENDPOINT")
+    if endpoint:
+        return {
+            "name": cluster_name,
+            "gateway_endpoint": endpoint,
+            "auth_mode": "plaintext",
+        }
     metadata_path = (
         _xdg_config_home() / "openshell" / "gateways" / cluster_name / "metadata.json"
     )

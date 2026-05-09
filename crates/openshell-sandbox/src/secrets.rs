@@ -71,19 +71,19 @@ pub struct SecretResolver {
 
 impl SecretResolver {
     /// Test helper: build a `SecretResolver` from the provider env map with no
-    /// passthrough keys. Equivalent to
-    /// [`Self::from_provider_env_with_passthrough`] with an empty passthrough
-    /// list. Production callers must use `from_provider_env_with_passthrough`
-    /// directly so the supervisor honours operator-configured passthrough.
-    #[cfg(test)]
+    /// passthrough keys and revision 0. Production callers must use
+    /// [`Self::from_provider_env_for_revision`] so passthrough and rotation
+    /// metadata are honoured.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_provider_env(
         provider_env: HashMap<String, String>,
     ) -> (HashMap<String, String>, Option<Self>) {
-        Self::from_provider_env_with_passthrough(provider_env, &[])
+        Self::from_provider_env_for_revision(provider_env, &[], 0)
     }
 
     /// Build a `SecretResolver` and the corresponding child-process environment
-    /// from the provider env map and the set of passthrough keys.
+    /// from the provider env map, the set of passthrough keys, and the
+    /// credential revision.
     ///
     /// For each entry in `provider_env`:
     /// - If the key appears in `passthrough_keys`, the child environment receives
@@ -92,16 +92,17 @@ impl SecretResolver {
     ///   never sees the real secret" invariant for that key — required for
     ///   credentials consumed by SDKs that validate format in-process or by
     ///   transports the proxy cannot rewrite.
-    /// - Otherwise the child environment receives the canonical placeholder
-    ///   (`openshell:resolve:env:KEY`) and the resolver maps that placeholder
-    ///   back to the real value for on-the-wire substitution.
+    /// - Otherwise the child environment receives a revisioned placeholder
+    ///   (`openshell:resolve:env:[v<rev>_]KEY`) and the resolver maps that
+    ///   placeholder back to the real value for on-the-wire substitution.
     ///
     /// Returns `(child_env, resolver)`. The resolver is `None` only when there
     /// are no canonical placeholders to register (every key was passthrough or
     /// `provider_env` was empty).
-    pub(crate) fn from_provider_env_with_passthrough(
+    pub(crate) fn from_provider_env_for_revision(
         provider_env: HashMap<String, String>,
         passthrough_keys: &[String],
+        revision: u64,
     ) -> (HashMap<String, String>, Option<Self>) {
         if provider_env.is_empty() {
             return (HashMap::new(), None);
@@ -117,7 +118,7 @@ impl SecretResolver {
             if passthrough.contains(key.as_str()) {
                 child_env.insert(key, value);
             } else {
-                let placeholder = placeholder_for_env_key(&key);
+                let placeholder = placeholder_for_env_key_for_revision(&key, revision);
                 child_env.insert(key, placeholder.clone());
                 by_placeholder.insert(placeholder, value);
             }
@@ -129,6 +130,18 @@ impl SecretResolver {
             Some(Self { by_placeholder })
         };
         (child_env, resolver)
+    }
+
+    pub(crate) fn merge<'a>(resolvers: impl IntoIterator<Item = &'a Self>) -> Option<Self> {
+        let mut by_placeholder = HashMap::new();
+        for resolver in resolvers {
+            by_placeholder.extend(resolver.by_placeholder.clone());
+        }
+        if by_placeholder.is_empty() {
+            None
+        } else {
+            Some(Self { by_placeholder })
+        }
     }
 
     /// Resolve a placeholder string to the real secret value.
@@ -218,6 +231,14 @@ impl SecretResolver {
 
 pub fn placeholder_for_env_key(key: &str) -> String {
     format!("{PLACEHOLDER_PREFIX}{key}")
+}
+
+pub fn placeholder_for_env_key_for_revision(key: &str, revision: u64) -> String {
+    if revision == 0 {
+        placeholder_for_env_key(key)
+    } else {
+        format!("{PLACEHOLDER_PREFIX}v{revision}_{key}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -768,9 +789,10 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let (child_env, resolver) = SecretResolver::from_provider_env_with_passthrough(
+        let (child_env, resolver) = SecretResolver::from_provider_env_for_revision(
             provider_env,
             &["SLACK_BOT_TOKEN".to_string()],
+            0,
         );
 
         // Passthrough key: real value in child env.
@@ -778,7 +800,8 @@ mod tests {
             child_env.get("SLACK_BOT_TOKEN"),
             Some(&"xoxb-real".to_string())
         );
-        // Non-passthrough key: canonical placeholder in child env.
+        // Non-passthrough key: canonical placeholder in child env (revision 0
+        // collapses to the unrevisioned form).
         assert_eq!(
             child_env.get("CLAUDE_API_KEY"),
             Some(&"openshell:resolve:env:CLAUDE_API_KEY".to_string())
@@ -805,12 +828,13 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let (child_env, resolver) = SecretResolver::from_provider_env_with_passthrough(
+        let (child_env, resolver) = SecretResolver::from_provider_env_for_revision(
             provider_env,
             &[
                 "SLACK_BOT_TOKEN".to_string(),
                 "SLACK_SIGNING_SECRET".to_string(),
             ],
+            0,
         );
 
         assert_eq!(
@@ -835,9 +859,10 @@ mod tests {
         let provider_env: HashMap<String, String> = [("API_KEY".to_string(), "real".to_string())]
             .into_iter()
             .collect();
-        let (child_env, resolver) = SecretResolver::from_provider_env_with_passthrough(
+        let (child_env, resolver) = SecretResolver::from_provider_env_for_revision(
             provider_env,
             &["UNRELATED_KEY".to_string()],
+            0,
         );
 
         assert_eq!(

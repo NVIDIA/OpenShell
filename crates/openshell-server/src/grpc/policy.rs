@@ -10,7 +10,7 @@
 #![allow(clippy::cast_precision_loss)] // f64->f32 for confidence scores
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
-use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, PolicyRecord, Store};
+use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store};
 use crate::policy_store::PolicyStoreExt;
 use crate::{ServerState, auth::oidc};
 use openshell_core::proto::policy_merge_operation;
@@ -33,7 +33,7 @@ use openshell_core::proto::{
     UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
 };
 use openshell_core::proto::{
-    L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Sandbox,
+    L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
     SandboxPolicy as ProtoSandboxPolicy,
 };
 use openshell_core::{
@@ -43,7 +43,10 @@ use openshell_core::{
 use openshell_ocsf::{
     ConfigStateChangeBuilder, OCSF_TARGET, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
 };
-use openshell_policy::{PolicyMergeOp, merge_policy};
+use openshell_policy::{
+    PolicyMergeOp, ProviderPolicyLayer, compose_effective_policy, merge_policy,
+};
+use openshell_providers::{get_default_profile, normalize_provider_type};
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -351,6 +354,11 @@ pub(super) async fn handle_get_sandbox_config(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox_provider_names = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.clone())
+        .unwrap_or_default();
 
     // Try to get the latest policy from the policy history table.
     let latest = state
@@ -428,6 +436,8 @@ pub(super) async fn handle_get_sandbox_config(
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let sandbox_settings =
         load_sandbox_settings(state.store.as_ref(), sandbox.object_name()).await?;
+    let providers_v2_enabled =
+        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
 
     let mut global_policy_version: u32 = 0;
 
@@ -447,8 +457,23 @@ pub(super) async fn handle_get_sandbox_config(
         }
     }
 
+    if providers_v2_enabled
+        && !matches!(policy_source, PolicySource::Global)
+        && let Some(source_policy) = policy.as_ref()
+    {
+        let provider_layers =
+            profile_provider_policy_layers(state.store.as_ref(), &sandbox_provider_names).await?;
+        if !provider_layers.is_empty() {
+            let effective_policy = compose_effective_policy(source_policy, &provider_layers);
+            policy_hash = deterministic_policy_hash(&effective_policy);
+            policy = Some(effective_policy);
+        }
+    }
+
     let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
     let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
+    let provider_env_revision =
+        compute_provider_env_revision(state.store.as_ref(), &sandbox_provider_names).await?;
 
     Ok(Response::new(GetSandboxConfigResponse {
         policy,
@@ -458,7 +483,108 @@ pub(super) async fn handle_get_sandbox_config(
         config_revision,
         policy_source: policy_source.into(),
         global_policy_version,
+        provider_env_revision,
     }))
+}
+
+pub(super) async fn compute_provider_env_revision(
+    store: &Store,
+    provider_names: &[String],
+) -> Result<u64, Status> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openshell-provider-env-revision-v1");
+
+    for provider_name in provider_names {
+        hasher.update(provider_name.as_bytes());
+        match store
+            .get_by_name(Provider::object_type(), provider_name)
+            .await
+            .map_err(|e| {
+                Status::internal(format!("fetch provider '{provider_name}' failed: {e}"))
+            })? {
+            Some(record) => {
+                hasher.update(record.id.as_bytes());
+                hasher.update(record.updated_at_ms.to_le_bytes());
+
+                let provider = Provider::decode(record.payload.as_slice()).map_err(|e| {
+                    Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
+                })?;
+                hasher.update(provider.r#type.as_bytes());
+
+                let mut credential_keys: Vec<_> = provider.credentials.keys().collect();
+                credential_keys.sort();
+                for key in credential_keys {
+                    hasher.update(key.as_bytes());
+                }
+            }
+            None => {
+                hasher.update(b"missing");
+            }
+        }
+    }
+
+    let digest = hasher.finalize();
+    Ok(u64::from_le_bytes(digest[..8].try_into().map_err(
+        |_| Status::internal("provider env revision digest too short"),
+    )?))
+}
+
+async fn profile_provider_policy_layers(
+    store: &Store,
+    provider_names: &[String],
+) -> Result<Vec<ProviderPolicyLayer>, Status> {
+    let mut layers = Vec::new();
+
+    for name in provider_names {
+        let provider = store
+            .get_message_by_name::<Provider>(name)
+            .await
+            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
+            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
+
+        let provider_type = provider.r#type.trim();
+        let profile = if let Some(canonical_type) = normalize_provider_type(provider_type) {
+            let Some(profile) = get_default_profile(canonical_type) else {
+                warn!(
+                    provider_name = %name,
+                    provider_type,
+                    "legacy provider type has no profile; skipping provider policy layer"
+                );
+                continue;
+            };
+            profile.clone()
+        } else {
+            let Some(profile) =
+                super::provider::get_provider_type_profile(store, provider_type).await?
+            else {
+                warn!(
+                    provider_name = %name,
+                    provider_type,
+                    "provider type has no profile; skipping provider policy layer"
+                );
+                continue;
+            };
+            profile
+        };
+
+        let rule_name = openshell_policy::provider_rule_name(provider.object_name());
+        layers.push(ProviderPolicyLayer {
+            rule_name: rule_name.clone(),
+            rule: profile.network_policy_rule(&rule_name),
+        });
+    }
+
+    Ok(layers)
+}
+
+fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
+    match settings.settings.get(key) {
+        None => Ok(false),
+        Some(StoredSettingValue::Bool(value)) => Ok(*value),
+        Some(_) => Err(Status::internal(format!(
+            "setting '{key}' has invalid value type; expected bool"
+        ))),
+    }
 }
 
 pub(super) async fn handle_get_gateway_config(
@@ -490,21 +616,26 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .spec
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
+    let provider_names = spec.providers;
+    let provider_env_revision =
+        compute_provider_env_revision(state.store.as_ref(), &provider_names).await?;
     let resolved =
-        super::provider::resolve_provider_environment(state.store.as_ref(), &spec.providers)
+        super::provider::resolve_provider_environment(state.store.as_ref(), &provider_names)
             .await?;
 
     info!(
         sandbox_id = %sandbox_id,
-        provider_count = spec.providers.len(),
+        provider_count = provider_names.len(),
         env_count = resolved.environment.len(),
         passthrough_count = resolved.passthrough_keys.len(),
+        provider_env_revision,
         "GetSandboxProviderEnvironment request completed successfully"
     );
 
     Ok(Response::new(GetSandboxProviderEnvironmentResponse {
         environment: resolved.environment,
         passthrough_keys: resolved.passthrough_keys,
+        provider_env_revision,
     }))
 }
 
@@ -871,19 +1002,32 @@ pub(super) async fn handle_update_config(
         validate_static_fields_unchanged(baseline_policy, &new_policy)?;
         validate_policy_safety(&new_policy)?;
     } else {
-        let mut sandbox = sandbox;
-        if let Some(ref mut spec) = sandbox.spec {
-            spec.policy = Some(new_policy.clone());
-        }
-        state
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+        let mut sandbox = state
             .store
-            .put_message(&sandbox)
+            .get_message::<Sandbox>(&sandbox_id)
             .await
-            .map_err(|e| Status::internal(format!("backfill spec.policy failed: {e}")))?;
-        info!(
-            sandbox_id = %sandbox_id,
-            "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
-        );
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let spec = sandbox
+            .spec
+            .as_mut()
+            .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+        if let Some(baseline_policy) = spec.policy.as_ref() {
+            validate_static_fields_unchanged(baseline_policy, &new_policy)?;
+            validate_policy_safety(&new_policy)?;
+        } else {
+            spec.policy = Some(new_policy.clone());
+            state
+                .store
+                .put_message(&sandbox)
+                .await
+                .map_err(|e| Status::internal(format!("backfill spec.policy failed: {e}")))?;
+            info!(
+                sandbox_id = %sandbox_id,
+                "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
+            );
+        }
     }
 
     let latest = state
@@ -1080,6 +1224,7 @@ pub(super) async fn handle_report_policy_status(
             .store
             .supersede_older_policies(&req.sandbox_id, version)
             .await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
         if let Ok(Some(mut sandbox)) = state.store.get_message::<Sandbox>(&req.sandbox_id).await {
             sandbox.current_policy_version = req.version;
             let _ = state.store.put_message(&sandbox).await;
@@ -2702,6 +2847,986 @@ mod tests {
         assert!(loaded.spec.unwrap().policy.is_none());
     }
 
+    fn test_provider(name: &str, provider_type: &str) -> Provider {
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("provider-{name}"),
+                name: name.to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+            }),
+            r#type: provider_type.to_string(),
+            credentials: std::iter::once(("GITHUB_TOKEN".to_string(), "ghp-test".to_string()))
+                .collect(),
+            config: HashMap::new(),
+            passthrough_credentials: Vec::new(),
+        }
+    }
+
+    fn test_policy_with_rule(rule_name: &str, host: &str) -> ProtoSandboxPolicy {
+        ProtoSandboxPolicy {
+            network_policies: std::iter::once((
+                rule_name.to_string(),
+                NetworkPolicyRule {
+                    name: rule_name.to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: host.to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn test_sandbox(
+        id: &str,
+        name: &str,
+        policy: ProtoSandboxPolicy,
+        providers: Vec<String>,
+    ) -> Sandbox {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: id.to_string(),
+                name: name.to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(policy),
+                providers,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        }
+    }
+
+    async fn enable_providers_v2(state: &Arc<ServerState>) {
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                StoredSettingValue::Bool(true),
+            ))
+            .collect(),
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+    }
+
+    async fn get_sandbox_policy(state: &Arc<ServerState>, sandbox_id: &str) -> ProtoSandboxPolicy {
+        handle_get_sandbox_config(
+            state,
+            Request::new(GetSandboxConfigRequest {
+                sandbox_id: sandbox_id.to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .policy
+        .expect("sandbox config should include policy")
+    }
+
+    #[tokio::test]
+    async fn provider_policy_layers_skip_unknown_provider_types() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        store
+            .put_message(&test_provider("custom-provider", "custom"))
+            .await
+            .unwrap();
+
+        let layers = profile_provider_policy_layers(&store, &["custom-provider".to_string()])
+            .await
+            .unwrap();
+
+        assert!(layers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_policy_layers_skip_custom_profile_for_legacy_provider_type() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        store
+            .put_message(&test_provider("custom-provider", "generic"))
+            .await
+            .unwrap();
+        store
+            .put_message(&openshell_core::proto::StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-generic".to_string(),
+                    name: "generic".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                }),
+                profile: Some(openshell_core::proto::ProviderProfile {
+                    id: "generic".to_string(),
+                    display_name: "Generic Override".to_string(),
+                    description: String::new(),
+                    category: openshell_core::proto::ProviderProfileCategory::Other as i32,
+                    credentials: Vec::new(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "backdoor.example".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: Vec::new(),
+                    inference_capable: false,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let layers = profile_provider_policy_layers(&store, &["custom-provider".to_string()])
+            .await
+            .unwrap();
+
+        assert!(layers.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn provider_policy_layers_include_custom_provider_profiles() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        store
+            .put_message(&test_provider("work-custom", "custom-api"))
+            .await
+            .unwrap();
+        store
+            .put_message(&openshell_core::proto::StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-custom-api".to_string(),
+                    name: "custom-api".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                }),
+                profile: Some(openshell_core::proto::ProviderProfile {
+                    id: "custom-api".to_string(),
+                    display_name: "Custom API".to_string(),
+                    description: String::new(),
+                    category: openshell_core::proto::ProviderProfileCategory::Other as i32,
+                    credentials: Vec::new(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.custom.example".to_string(),
+                        protocol: "rest".to_string(),
+                        ports: vec![443, 8443],
+                        allowed_ips: vec!["10.0.0.0/24".to_string()],
+                        rules: vec![L7Rule {
+                            allow: Some(openshell_core::proto::L7Allow {
+                                method: "GET".to_string(),
+                                path: "/v1/**".to_string(),
+                                ..Default::default()
+                            }),
+                        }],
+                        allow_encoded_slash: true,
+                        path: "/v1".to_string(),
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/custom".to_string(),
+                        harness: true,
+                    }],
+                    inference_capable: false,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let layers = profile_provider_policy_layers(&store, &["work-custom".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].rule_name, "_provider_work_custom");
+        assert_eq!(layers[0].rule.endpoints[0].host, "api.custom.example");
+        assert_eq!(layers[0].rule.endpoints[0].ports, vec![443, 8443]);
+        assert_eq!(layers[0].rule.endpoints[0].rules.len(), 1);
+        assert_eq!(layers[0].rule.endpoints[0].allowed_ips, vec!["10.0.0.0/24"]);
+        assert!(layers[0].rule.endpoints[0].allow_encoded_slash);
+        assert_eq!(layers[0].rule.endpoints[0].path, "/v1");
+        assert!(layers[0].rule.binaries[0].harness);
+    }
+
+    #[tokio::test]
+    async fn provider_policy_layers_normalize_custom_provider_type_ids() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        store
+            .put_message(&test_provider("work-custom", " Custom-API "))
+            .await
+            .unwrap();
+        store
+            .put_message(&openshell_core::proto::StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-custom-api".to_string(),
+                    name: "custom-api".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                }),
+                profile: Some(openshell_core::proto::ProviderProfile {
+                    id: "custom-api".to_string(),
+                    display_name: "Custom API".to_string(),
+                    description: String::new(),
+                    category: openshell_core::proto::ProviderProfileCategory::Other as i32,
+                    credentials: Vec::new(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.custom.example".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: Vec::new(),
+                    inference_capable: false,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let layers = profile_provider_policy_layers(&store, &["work-custom".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].rule.endpoints[0].host, "api.custom.example");
+    }
+
+    #[tokio::test]
+    async fn provider_policy_layers_include_known_provider_profiles() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+
+        let layers = profile_provider_policy_layers(&store, &["work-github".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].rule_name, "_provider_work_github");
+        assert_eq!(layers[0].rule.endpoints.len(), 2);
+        assert!(
+            layers[0]
+                .rule
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.github.com")
+        );
+    }
+
+    #[test]
+    fn providers_v2_enabled_defaults_false_when_unset() {
+        assert!(
+            !bool_setting_enabled(
+                &StoredSettings::default(),
+                settings::PROVIDERS_V2_ENABLED_KEY
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn providers_v2_enabled_reads_global_bool_setting() {
+        let mut settings = StoredSettings::default();
+        settings.settings.insert(
+            settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+            StoredSettingValue::Bool(true),
+        );
+
+        assert!(bool_setting_enabled(&settings, settings::PROVIDERS_V2_ENABLED_KEY).unwrap());
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_omits_provider_layers_when_v2_disabled() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-v2-disabled",
+                "v2-disabled",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-v2-disabled").await;
+
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("sandbox_only")
+        );
+        assert!(
+            !effective_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_composes_provider_layers_when_v2_enabled() {
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-v2-enabled",
+                "v2-enabled",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-v2-enabled").await;
+
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("sandbox_only")
+        );
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+        assert!(
+            effective_policy
+                .network_policies
+                .get("_provider_work_github")
+                .unwrap()
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.github.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_skips_profileless_provider_types_when_v2_enabled() {
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&test_provider("legacy-generic", "generic"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider("custom-provider", "custom"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-profileless",
+                "profileless",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["legacy-generic".to_string(), "custom-provider".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-profileless").await;
+
+        assert_eq!(effective_policy.network_policies.len(), 1);
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("sandbox_only")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_composition_is_jit_and_does_not_persist_provider_layers() {
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-jit",
+                "jit",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-jit").await;
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+
+        let persisted = state
+            .store
+            .get_latest_policy("sb-jit")
+            .await
+            .unwrap()
+            .expect("sandbox policy should be lazily backfilled");
+        let persisted_policy = ProtoSandboxPolicy::decode(persisted.policy_payload.as_slice())
+            .expect("persisted sandbox policy should decode");
+        assert!(
+            persisted_policy
+                .network_policies
+                .contains_key("sandbox_only")
+        );
+        assert!(
+            !persisted_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_preserves_overlapping_user_and_provider_rules() {
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-overlap",
+                "overlap",
+                test_policy_with_rule("_provider_work_github", "api.github.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-overlap").await;
+
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("_provider_work_github_2")
+        );
+        assert_eq!(
+            effective_policy
+                .network_policies
+                .get("_provider_work_github")
+                .unwrap()
+                .endpoints[0]
+                .host,
+            "api.github.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_environment_resolution_is_unchanged_by_providers_v2_setting() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-provider-env",
+                "provider-env",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let legacy_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-provider-env".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .environment;
+
+        enable_providers_v2(&state).await;
+        let v2_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-provider-env".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .environment;
+
+        assert_eq!(legacy_env, v2_env);
+        assert_eq!(v2_env.get("GITHUB_TOKEN"), Some(&"ghp-test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn provider_env_revision_changes_when_attached_provider_record_changes() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
+        use std::time::Duration;
+
+        let state = test_server_state().await;
+        let mut provider = test_provider("work-github", "github");
+        state.store.put_message(&provider).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-provider-revision",
+                "provider-revision",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let first = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-provider-revision".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        provider
+            .credentials
+            .insert("GITHUB_TOKEN".to_string(), "rotated".to_string());
+        state.store.put_message(&provider).await.unwrap();
+
+        let second = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-provider-revision".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_ne!(
+            first.provider_env_revision, second.provider_env_revision,
+            "provider object updates must trigger sandbox credential refresh"
+        );
+        assert_eq!(
+            second.environment.get("GITHUB_TOKEN"),
+            Some(&"rotated".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_and_provider_env_follow_attached_provider_lifecycle() {
+        use crate::grpc::sandbox::{
+            handle_attach_sandbox_provider, handle_detach_sandbox_provider,
+        };
+        use openshell_core::proto::{
+            AttachSandboxProviderRequest, DetachSandboxProviderRequest,
+            GetSandboxProviderEnvironmentRequest,
+        };
+
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-attach-lifecycle",
+                "attach-lifecycle",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let baseline_policy = get_sandbox_policy(&state, "sb-attach-lifecycle").await;
+        assert!(
+            !baseline_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+        let baseline_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-attach-lifecycle".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "attach-lifecycle".to_string(),
+                provider_name: "work-github".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let attached_policy = get_sandbox_policy(&state, "sb-attach-lifecycle").await;
+        assert!(
+            attached_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+
+        let attached_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-attach-lifecycle".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_ne!(
+            baseline_env.provider_env_revision,
+            attached_env.provider_env_revision
+        );
+        assert_eq!(
+            attached_env.environment.get("GITHUB_TOKEN"),
+            Some(&"ghp-test".to_string())
+        );
+
+        handle_detach_sandbox_provider(
+            &state,
+            Request::new(DetachSandboxProviderRequest {
+                sandbox_name: "attach-lifecycle".to_string(),
+                provider_name: "work-github".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let detached_policy = get_sandbox_policy(&state, "sb-attach-lifecycle").await;
+        assert!(
+            !detached_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+
+        let detached_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-attach-lifecycle".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_ne!(
+            attached_env.provider_env_revision,
+            detached_env.provider_env_revision
+        );
+        assert!(!detached_env.environment.contains_key("GITHUB_TOKEN"));
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn custom_imported_profile_policy_and_env_follow_attach_detach_lifecycle() {
+        use crate::grpc::provider::handle_import_provider_profiles;
+        use crate::grpc::sandbox::{
+            handle_attach_sandbox_provider, handle_detach_sandbox_provider,
+        };
+        use openshell_core::proto::{
+            AttachSandboxProviderRequest, DetachSandboxProviderRequest,
+            GetSandboxProviderEnvironmentRequest, ImportProviderProfilesRequest, NetworkBinary,
+            ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
+            ProviderProfileImportItem,
+        };
+
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    source: "custom-api.yaml".to_string(),
+                    profile: Some(ProviderProfile {
+                        id: "custom-api".to_string(),
+                        display_name: "Custom API".to_string(),
+                        description: String::new(),
+                        category: ProviderProfileCategory::Other as i32,
+                        credentials: vec![ProviderProfileCredential {
+                            name: "api_key".to_string(),
+                            env_vars: vec!["CUSTOM_API_KEY".to_string()],
+                            auth_style: "bearer".to_string(),
+                            header_name: "authorization".to_string(),
+                            required: true,
+                            ..Default::default()
+                        }],
+                        endpoints: vec![NetworkEndpoint {
+                            host: "api.custom.example".to_string(),
+                            port: 443,
+                            protocol: "rest".to_string(),
+                            rules: vec![L7Rule {
+                                allow: Some(openshell_core::proto::L7Allow {
+                                    method: "GET".to_string(),
+                                    path: "/v1/**".to_string(),
+                                    ..Default::default()
+                                }),
+                            }],
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/custom".to_string(),
+                            harness: true,
+                        }],
+                        inference_capable: false,
+                    }),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut provider = test_provider("work-custom", "custom-api");
+        provider.credentials =
+            std::iter::once(("CUSTOM_API_KEY".to_string(), "custom-secret".to_string())).collect();
+        state.store.put_message(&provider).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-custom-attach-lifecycle",
+                "custom-attach-lifecycle",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let baseline_policy = get_sandbox_policy(&state, "sb-custom-attach-lifecycle").await;
+        assert!(
+            !baseline_policy
+                .network_policies
+                .contains_key("_provider_work_custom")
+        );
+        let baseline_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-custom-attach-lifecycle".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "custom-attach-lifecycle".to_string(),
+                provider_name: "work-custom".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let attached_policy = get_sandbox_policy(&state, "sb-custom-attach-lifecycle").await;
+        let custom_rule = attached_policy
+            .network_policies
+            .get("_provider_work_custom")
+            .expect("custom provider rule should be composed after attach");
+        assert_eq!(custom_rule.endpoints[0].host, "api.custom.example");
+        assert_eq!(custom_rule.endpoints[0].protocol, "rest");
+        assert_eq!(custom_rule.endpoints[0].rules.len(), 1);
+        assert_eq!(custom_rule.binaries[0].path, "/usr/bin/custom");
+
+        let attached_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-custom-attach-lifecycle".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_ne!(
+            baseline_env.provider_env_revision,
+            attached_env.provider_env_revision
+        );
+        assert_eq!(
+            attached_env.environment.get("CUSTOM_API_KEY"),
+            Some(&"custom-secret".to_string())
+        );
+
+        handle_detach_sandbox_provider(
+            &state,
+            Request::new(DetachSandboxProviderRequest {
+                sandbox_name: "custom-attach-lifecycle".to_string(),
+                provider_name: "work-custom".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let detached_policy = get_sandbox_policy(&state, "sb-custom-attach-lifecycle").await;
+        assert!(
+            !detached_policy
+                .network_policies
+                .contains_key("_provider_work_custom")
+        );
+        let detached_env = handle_get_sandbox_provider_environment(
+            &state,
+            Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-custom-attach-lifecycle".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_ne!(
+            attached_env.provider_env_revision,
+            detached_env.provider_env_revision
+        );
+        assert!(!detached_env.environment.contains_key("CUSTOM_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn global_policy_suppresses_provider_profile_layers_when_v2_enabled() {
+        use openshell_core::proto::{
+            GetSandboxConfigRequest, NetworkEndpoint, NetworkPolicyRule, SandboxPhase,
+            SandboxPolicy, SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+
+        let sandbox_policy = SandboxPolicy {
+            network_policies: std::iter::once((
+                "sandbox_only".to_string(),
+                NetworkPolicyRule {
+                    name: "sandbox_only".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "sandbox.example.com".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-global-profile".to_string(),
+                name: "global-profile-sandbox".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(sandbox_policy),
+                providers: vec!["work-github".to_string()],
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let global_policy = SandboxPolicy {
+            network_policies: std::iter::once((
+                "global_only".to_string(),
+                NetworkPolicyRule {
+                    name: "global_only".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "global.example.com".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: [
+                (
+                    settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                    StoredSettingValue::Bool(true),
+                ),
+                (
+                    POLICY_SETTING_KEY.to_string(),
+                    StoredSettingValue::Bytes(hex::encode(global_policy.encode_to_vec())),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_config(
+            &state,
+            Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-global-profile".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let effective_policy = response.policy.expect("global policy should be returned");
+        assert_eq!(response.policy_source, PolicySource::Global as i32);
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("global_only")
+        );
+        assert!(
+            !effective_policy
+                .network_policies
+                .contains_key("sandbox_only")
+        );
+        assert!(
+            !effective_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+    }
+
     #[tokio::test]
     async fn sandbox_policy_backfill_on_update_when_no_baseline() {
         use openshell_core::proto::{FilesystemPolicy, LandlockPolicy, SandboxPhase, SandboxSpec};
@@ -3156,6 +4281,9 @@ mod tests {
                     path: "/repos/*/issues".to_string(),
                     command: String::new(),
                     query: HashMap::new(),
+                    operation_type: String::new(),
+                    operation_name: String::new(),
+                    fields: Vec::new(),
                 }),
             }],
         };
@@ -3486,6 +4614,9 @@ mod tests {
                     path: "/repos/*/issues".to_string(),
                     command: String::new(),
                     query: HashMap::new(),
+                    operation_type: String::new(),
+                    operation_name: String::new(),
+                    fields: Vec::new(),
                 }),
             }],
         }];

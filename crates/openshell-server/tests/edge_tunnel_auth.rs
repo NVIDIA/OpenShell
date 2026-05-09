@@ -106,6 +106,33 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(ListSandboxesResponse::default()))
     }
 
+    async fn list_sandbox_providers(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListSandboxProvidersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxProvidersResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ListSandboxProvidersResponse::default(),
+        ))
+    }
+
+    async fn attach_sandbox_provider(
+        &self,
+        _request: tonic::Request<openshell_core::proto::AttachSandboxProviderRequest>,
+    ) -> Result<Response<openshell_core::proto::AttachSandboxProviderResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::AttachSandboxProviderResponse::default(),
+        ))
+    }
+
+    async fn detach_sandbox_provider(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DetachSandboxProviderRequest>,
+    ) -> Result<Response<openshell_core::proto::DetachSandboxProviderResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::DetachSandboxProviderResponse::default(),
+        ))
+    }
+
     async fn delete_sandbox(
         &self,
         _request: tonic::Request<DeleteSandboxRequest>,
@@ -168,6 +195,41 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<ListProvidersRequest>,
     ) -> Result<Response<ListProvidersResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn import_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ImportProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ImportProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn lint_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::LintProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::LintProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 

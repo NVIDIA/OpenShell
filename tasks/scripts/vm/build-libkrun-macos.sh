@@ -276,7 +276,7 @@ if $ALL_GOOD; then
     echo ""
     echo "All libraries are portable!"
     echo ""
-    echo "Next step: mise run vm:build"
+    echo "Next step: mise run vm:supervisor && cargo build -p openshell-driver-vm"
 else
     echo ""
     echo "Warning: Some libraries have non-portable paths"

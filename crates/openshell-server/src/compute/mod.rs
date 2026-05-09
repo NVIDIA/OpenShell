@@ -36,6 +36,7 @@ use openshell_driver_podman::{
 };
 use prost::Message;
 use std::fmt;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -228,6 +229,7 @@ pub struct ComputeRuntime {
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
     sync_lock: Arc<Mutex<()>>,
+    gateway_bind_addresses: Vec<SocketAddr>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -249,6 +251,7 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
         _allows_loopback_endpoints: bool,
+        gateway_bind_addresses: Vec<SocketAddr>,
     ) -> Result<Self, ComputeError> {
         let default_image = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
@@ -268,7 +271,18 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
             sync_lock: Arc::new(Mutex::new(())),
+            gateway_bind_addresses,
         })
+    }
+
+    /// Serializes sandbox object read-modify-write operations within this
+    /// gateway process.
+    ///
+    /// This is a temporary single-gateway guard for full-object sandbox writes.
+    /// It is not HA-safe; replace it with DB-backed CAS/resource-version writes
+    /// tracked by #1255 before enabling multiple gateway writers.
+    pub(crate) async fn sandbox_sync_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.sync_lock.clone().lock_owned().await
     }
 
     pub async fn new_docker(
@@ -285,6 +299,7 @@ impl ComputeRuntime {
                 .await
                 .map_err(|err| ComputeError::Message(err.to_string()))?,
         );
+        let gateway_bind_addresses = driver.gateway_bind_addresses();
         let shutdown_cleanup: Arc<dyn ShutdownCleanup> = driver.clone();
         let startup_resume: Arc<dyn StartupResume> = driver.clone();
         let driver: SharedComputeDriver = driver;
@@ -299,6 +314,7 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
             true,
+            gateway_bind_addresses,
         )
         .await
     }
@@ -326,6 +342,7 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
             false,
+            Vec::new(),
         )
         .await
     }
@@ -351,6 +368,7 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
             true,
+            Vec::new(),
         )
         .await
     }
@@ -378,6 +396,7 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
             true,
+            Vec::new(),
         )
         .await
     }
@@ -385,6 +404,11 @@ impl ComputeRuntime {
     #[must_use]
     pub fn default_image(&self) -> &str {
         &self.default_image
+    }
+
+    #[must_use]
+    pub fn gateway_bind_addresses(&self) -> &[SocketAddr] {
+        &self.gateway_bind_addresses
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
@@ -1216,6 +1240,19 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
         );
     }
 
+    // Invert: the public API uses `user_namespaces: true` (positive sense)
+    // while the K8s driver expects `host_users: false` (K8s convention).
+    // The driver inverts this back via `!host_users` to resolve the final
+    // pod-level `hostUsers` field.
+    if let Some(user_ns) = template.user_namespaces {
+        fields.insert(
+            "host_users".to_string(),
+            Value {
+                kind: Some(Kind::BoolValue(!user_ns)),
+            },
+        );
+    }
+
     // Pass through any resource fields that do not map to the typed
     // DriverResourceRequirements so platform-specific drivers can still see
     // custom resources such as GPU limits.
@@ -1604,6 +1641,7 @@ pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
         tracing_log_bus: TracingLogBus::new(),
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
         sync_lock: Arc::new(Mutex::new(())),
+        gateway_bind_addresses: Vec::new(),
     }
 }
 
@@ -1770,6 +1808,7 @@ mod tests {
             tracing_log_bus: TracingLogBus::new(),
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
             sync_lock: Arc::new(Mutex::new(())),
+            gateway_bind_addresses: Vec::new(),
         }
     }
 
@@ -2674,6 +2713,48 @@ mod tests {
         assert_eq!(
             SandboxPhase::try_from(stored.phase).unwrap(),
             SandboxPhase::Ready
+        );
+    }
+
+    #[test]
+    fn build_platform_config_inverts_user_namespaces_to_host_users() {
+        use prost_types::value::Kind;
+
+        // user_namespaces: true  → host_users: false
+        let mut template = SandboxTemplate {
+            user_namespaces: Some(true),
+            ..SandboxTemplate::default()
+        };
+        let config = build_platform_config(&template).expect("config should be Some");
+        let host_users = config
+            .fields
+            .get("host_users")
+            .expect("host_users must exist");
+        assert_eq!(
+            host_users.kind,
+            Some(Kind::BoolValue(false)),
+            "user_namespaces: true must produce host_users: false"
+        );
+
+        // user_namespaces: false → host_users: true
+        template.user_namespaces = Some(false);
+        let config = build_platform_config(&template).expect("config should be Some");
+        let host_users = config
+            .fields
+            .get("host_users")
+            .expect("host_users must exist");
+        assert_eq!(
+            host_users.kind,
+            Some(Kind::BoolValue(true)),
+            "user_namespaces: false must produce host_users: true"
+        );
+
+        // user_namespaces: None → host_users absent
+        template.user_namespaces = None;
+        let config = build_platform_config(&template);
+        assert!(
+            config.is_none() || !config.as_ref().unwrap().fields.contains_key("host_users"),
+            "unset user_namespaces must not produce host_users"
         );
     }
 }

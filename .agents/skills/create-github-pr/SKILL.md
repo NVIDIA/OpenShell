@@ -158,7 +158,6 @@ PR descriptions must follow the project's [PR template](.github/PULL_REQUEST_TEM
 ## Checklist
 - [ ] Follows Conventional Commits
 - [ ] Commits are signed off (DCO)
-- [ ] Architecture docs updated (if applicable)
 ```
 
 Populate the testing checklist based on what was actually run. Check boxes for steps that were completed.
@@ -193,7 +192,6 @@ Closes #456
 
 - [x] Follows Conventional Commits
 - [x] Commits are signed off (DCO)
-- [ ] Architecture docs updated (if applicable)
 EOF
 )"
 ```

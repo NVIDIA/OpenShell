@@ -7,11 +7,20 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/nvidia/openshell/gateway
-  pullPolicy: Always
-  tag: "latest"
+  pullPolicy: IfNotPresent
+  tag: ""
+
+# Supervisor image — provides the openshell-sandbox binary that is copied into
+# sandbox pods via an init container. tag defaults to appVersion (same as the
+# gateway image) so both stay in sync when the chart is released.
+supervisor:
+  image:
+    repository: ghcr.io/nvidia/openshell/supervisor
+    pullPolicy: ""
+    tag: ""
 
 imagePullSecrets: []
-nameOverride: ""
+nameOverride: "openshell"
 fullnameOverride: ""
 
 serviceAccount:
@@ -34,9 +43,8 @@ securityContext:
       - ALL
 
 service:
-  type: NodePort
+  type: ClusterIP
   port: 8080
-  nodePort: 30051
   healthPort: 8081
   metricsPort: 9090
 
@@ -71,15 +79,21 @@ affinity: {}
 # Server configuration
 server:
   logLevel: info
-  sandboxNamespace: openshell
+  # Namespace where sandbox pods are created. Defaults to the Helm release
+  # namespace (.Release.Namespace) when left empty.
+  sandboxNamespace: ""
   dbUrl: "sqlite:/var/openshell/openshell.db"
   sandboxImage: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
   # Kubernetes imagePullPolicy for sandbox pods.  Empty = Kubernetes default
   # (Always for :latest, IfNotPresent otherwise).  Set to "Always" for dev
   # clusters so new images are picked up without manual eviction.
   sandboxImagePullPolicy: ""
-  # gRPC endpoint for sandboxes to callback to OpenShell (must be reachable from pods)
-  grpcEndpoint: "https://openshell.openshell.svc.cluster.local:8080"
+  # gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
+  # it from the chart fullname, release namespace, service port, and
+  # disableTls flag (i.e. <scheme>://<fullname>.<namespace>.svc.cluster.local:<port>).
+  # Override only when sandboxes must reach the gateway via a different
+  # hostname (e.g. an external ingress or a host alias).
+  grpcEndpoint: ""
   # Public host/port returned to CLI clients for SSH proxy CONNECT requests.
   # For local clusters the default 127.0.0.1:8080 is correct; for remote
   # clusters these should be set to the externally reachable host and port.
@@ -89,13 +103,19 @@ server:
   # directly and requires client certificates.
   # Name of the Kubernetes Secret holding the NSSH1 HMAC handshake key.
   # The secret must contain a `secret` key with the hex-encoded HMAC key.
-  # For cluster deployments this is auto-created by the bootstrap process.
+  # By default a pre-install/pre-upgrade hook creates it when missing (see sshHandshake).
   sshHandshakeSecretName: "openshell-ssh-handshake"
   # Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get
   # hostAliases entries mapping host.docker.internal and host.openshell.internal
   # to this IP, allowing them to reach services running on the Docker host.
   # Auto-detected by the cluster entrypoint script.
   hostGatewayIP: ""
+  # Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox
+  # pods. Requires Kubernetes 1.33+ with user namespace support available
+  # (beta through 1.35, GA in 1.36+), plus a supporting container runtime and
+  # Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host
+  # UID and capabilities become namespaced.
+  enableUserNamespaces: false
   # Disable gateway authentication (mTLS client certificate requirement).
   # Set to true when the gateway sits behind a reverse proxy (e.g.
   # Cloudflare Tunnel) that terminates TLS.
@@ -134,3 +154,80 @@ server:
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
   enabled: true
+
+# NSSH1 SSH gateway handshake Secret (`server.sshHandshakeSecretName`).
+# Helm hook creates it only when the Secret does not already exist (safe upgrades).
+# Set sshHandshake.value from a gitignored values file for a stable dev secret.
+sshHandshake:
+  hook:
+    enabled: true
+  # 64 hex chars (32 bytes), matching openshell-bootstrap. If empty, Helm generates
+  # a random value at install template time (two UUIDs, dashes stripped).
+  value: ""
+
+# PKI bootstrap via a pre-install/pre-upgrade hook Job.
+# Runs `openshell-gateway generate-certs` to create the server and client TLS
+# Secrets in-cluster. Key material is written directly to K8s Secrets and
+# never appears in Helm release history. Idempotent: existing secrets are
+# left untouched on upgrade. Reuses the gateway image — no extra image to
+# mirror in air-gapped environments.
+#
+# The server certificate already includes the built-in cluster SANs
+# (`openshell`, `openshell.openshell.svc`, the cluster.local FQDN, `localhost`,
+# `host.docker.internal`, and `127.0.0.1`) baked into the gateway binary. The
+# lists below are *additional* SANs appended on top — typically a public
+# hostname or load-balancer IP for remote deployments.
+pkiInitJob:
+  enabled: true
+  # Extra DNS SANs to append to the server certificate.
+  serverDnsNames: []
+  # Extra IP SANs to append to the server certificate.
+  serverIpAddresses: []
+
+# cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
+# Uses namespaced Issuers only (no ClusterIssuer). Does not install cert-manager itself.
+certManager:
+  enabled: false
+  # Secret created for the intermediate CA (Certificate with isCA: true).
+  caSecretName: openshell-ca-tls
+  # Mount gateway client CA from the server TLS secret's ca.crt (populated by
+  # cert-manager for certs issued by a CA Issuer). Avoids a separate
+  # openshell-server-client-ca Secret.
+  clientCaFromServerTlsSecret: true
+  certificateDuration: 8760h
+  certificateRenewBefore: 720h
+  serverDnsNames:
+    - openshell
+    - openshell.openshell.svc
+    - openshell.openshell.svc.cluster.local
+    - localhost
+    - host.docker.internal
+  serverIpAddresses:
+    - 127.0.0.1
+
+# Kubernetes Gateway API — HTTPRoute and Gateway resources.
+# Requires a Gateway API controller in the cluster. Install Envoy Gateway via
+# the skaffold.yaml releases or independently:
+#   helm install eg oci://docker.io/envoyproxy/gateway-helm \
+#     --version v1.4.1 -n envoy-gateway-system --create-namespace
+grpcRoute:
+  enabled: false
+  # Hostnames the GRPCRoute matches on. Leave empty to match all hosts.
+  hostnames: []
+  gateway:
+    # When true, a Gateway resource is created in the release namespace.
+    # Set to false and provide name/namespace to attach to a pre-existing Gateway.
+    create: false
+    # GatewayClass to reference. Envoy Gateway installs one named "eg".
+    className: "eg"
+    # Name of the Gateway resource. Defaults to the chart fullname.
+    name: ""
+    # Namespace of the Gateway referenced by the GRPCRoute parentRef.
+    # Defaults to the release namespace.
+    namespace: ""
+    # Listener settings (only used when gateway.create is true).
+    listener:
+      port: 80
+      protocol: HTTP
+      # "Same" restricts attached routes to the release namespace; "All" allows any namespace.
+      allowedRoutes: Same

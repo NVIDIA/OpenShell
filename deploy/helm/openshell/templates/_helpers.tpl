@@ -58,3 +58,51 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Gateway image reference. Uses image.tag when set; falls back to .Chart.AppVersion
+so a released chart automatically pulls the matching image without extra overrides.
+*/}}
+{{- define "openshell.image" -}}
+{{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
+{{- end }}
+
+{{/*
+Supervisor image reference. Same appVersion fallback as openshell.image so
+the supervisor and gateway images stay in sync across releases.
+*/}}
+{{- define "openshell.supervisorImage" -}}
+{{- printf "%s:%s" .Values.supervisor.image.repository (.Values.supervisor.image.tag | default .Chart.AppVersion) }}
+{{- end }}
+
+{{/*
+Namespaced Issuer (selfSigned) for cert-manager CA bootstrap.
+*/}}
+{{- define "openshell.issuerSelfSigned" -}}
+{{- printf "%s-selfsigned" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Namespace where sandbox pods are created. An explicit
+.Values.server.sandboxNamespace is used verbatim. Otherwise it defaults to
+.Release.Namespace so `helm install -n my-ns` works without extra overrides.
+*/}}
+{{- define "openshell.sandboxNamespace" -}}
+{{- .Values.server.sandboxNamespace | default .Release.Namespace -}}
+{{- end }}
+
+{{/*
+gRPC endpoint sandbox pods use to call back into the gateway. An explicit
+.Values.server.grpcEndpoint is used verbatim. Otherwise it is derived from
+the in-cluster Service DNS, release namespace, service port, and disableTls
+flag — so the default value works for any release name or namespace without
+override.
+*/}}
+{{- define "openshell.grpcEndpoint" -}}
+{{- if .Values.server.grpcEndpoint -}}
+{{- .Values.server.grpcEndpoint -}}
+{{- else -}}
+{{- $scheme := ternary "http" "https" (default false .Values.server.disableTls) -}}
+{{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int .Values.service.port) -}}
+{{- end -}}
+{{- end }}

@@ -352,6 +352,9 @@ fn build_l7_rules(samples: &HashMap<(String, String), u32>) -> Vec<L7Rule> {
                 path: generalised,
                 command: String::new(),
                 query: HashMap::new(),
+                operation_type: String::new(),
+                operation_name: String::new(),
+                fields: Vec::new(),
             }),
         });
     }

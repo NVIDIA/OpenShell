@@ -16,3 +16,7 @@
 .idea/
 *.tmproj
 .vscode/
+
+# Ignore development files
+skaffold.yaml
+ci/

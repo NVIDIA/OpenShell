@@ -36,7 +36,7 @@ OpenShell applies defense in depth across the following policy domains.
 | Process | Blocks privilege escalation and dangerous syscalls. | Locked at sandbox creation. |
 | Inference | Reroutes model API calls to controlled backends. | Hot-reloadable at runtime. |
 
-For details, refer to [Sandbox Policies](/sandboxes/about#sandbox-policies) and [Customize Sandbox Policies](/sandboxes/policies).
+For details, refer to [Customize Sandbox Policies](/sandboxes/policies) and [Default Policy](/reference/default-policy).
 
 ## Common Use Cases
 
@@ -49,12 +49,10 @@ OpenShell supports a range of agent deployment patterns.
 | Compliance and audit        | Treat policy YAML as version-controlled security controls that can be reviewed and audited.              |
 | Reusable environments       | Use community sandbox images or bring your own containerized runtime.                                    |
 
----
-
 ## Next Steps
 
 Explore these topics to go deeper:
 
-- To understand the components that make up the OpenShell runtime, refer to the [Architecture Overview](/about/architecture).
+- To understand the runtime architecture, refer to [How OpenShell Works](/about/how-it-works).
 - To install the CLI and create your first sandbox, refer to the [Quickstart](/get-started/quickstart).
-- To learn how OpenShell enforces isolation across all protection layers, refer to [Sandboxes](/sandboxes/about).
+- To learn how OpenShell enforces policy controls across protection layers, refer to [Customize Sandbox Policies](/sandboxes/policies).

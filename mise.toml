@@ -26,6 +26,8 @@ kubectl = "1.35.4"
 uv = "0.10.12"
 protoc = "29.6"
 helm = "4.1.4"
+skaffold = "2.19.0"
+k3d = "5.8.3"
 "github:anchore/syft" = { version = "1.43.0" }
 "github:EmbarkStudios/cargo-about" = { version = "0.8.4", version_prefix = "" }
 zig = "0.14.1"

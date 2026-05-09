@@ -10,10 +10,31 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+/// Returns `true` when `SELinux` is enabled (enforcing or permissive).
+///
+/// Checks whether selinuxfs is mounted, matching Podman's own detection
+/// logic. Bind-mount relabeling (the `z` mount option) is needed in both
+/// enforcing and permissive modes: enforcing blocks access outright, while
+/// permissive floods the audit log with AVC denials that mask real issues.
+///
+/// On non-`SELinux` systems (Ubuntu, macOS, Alpine) the directory does not
+/// exist and this returns `false`, leaving mount options unchanged.
+#[cfg(target_os = "linux")]
+fn is_selinux_enabled() -> bool {
+    std::path::Path::new("/sys/fs/selinux").is_dir()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_selinux_enabled() -> bool {
+    false
+}
+
 /// Label key for the sandbox ID.
 pub const LABEL_SANDBOX_ID: &str = "openshell.sandbox-id";
 /// Label key for the sandbox name.
 pub const LABEL_SANDBOX_NAME: &str = "openshell.sandbox-name";
+/// Label key for the sandbox namespace.
+pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.sandbox-namespace";
 /// Label applied to all managed containers.
 pub const LABEL_MANAGED: &str = "openshell.managed";
 /// Label filter string for list/event queries.
@@ -24,6 +45,11 @@ const CONTAINER_PREFIX: &str = "openshell-sandbox-";
 
 /// Volume name prefix.
 const VOLUME_PREFIX: &str = "openshell-sandbox-";
+
+/// Container-side mount paths for client TLS materials.
+const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
+const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
+const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 
 /// Build a Podman container name from the sandbox name.
 #[must_use]
@@ -246,10 +272,6 @@ fn build_env(
         "OPENSHELL_SSH_SOCKET_PATH".into(),
         config.sandbox_ssh_socket_path.clone(),
     );
-    env.insert(
-        "OPENSHELL_SSH_LISTEN_ADDR".into(),
-        config.ssh_listen_addr.clone(),
-    );
     // NOTE: The SSH handshake secret is injected via a Podman secret
     // (see the "secrets" field below) rather than a plaintext env var.
     // This prevents exposure through `podman inspect`.
@@ -259,6 +281,15 @@ fn build_env(
     );
     env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
     env.insert("OPENSHELL_SANDBOX_COMMAND".into(), "sleep infinity".into());
+
+    // 3. TLS client cert paths (when mTLS is enabled). These point to
+    //    the container-side mount paths where the cert files are
+    //    bind-mounted from the host.
+    if config.tls_enabled() {
+        env.insert("OPENSHELL_TLS_CA".into(), TLS_CA_MOUNT_PATH.into());
+        env.insert("OPENSHELL_TLS_CERT".into(), TLS_CERT_MOUNT_PATH.into());
+        env.insert("OPENSHELL_TLS_KEY".into(), TLS_KEY_MOUNT_PATH.into());
+    }
 
     env
 }
@@ -279,6 +310,7 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
     // Managed labels (highest priority -- always overwrite).
     labels.insert(LABEL_SANDBOX_ID.into(), sandbox.id.clone());
     labels.insert(LABEL_SANDBOX_NAME.into(), sandbox.name.clone());
+    labels.insert(LABEL_SANDBOX_NAMESPACE.into(), sandbox.namespace.clone());
     labels.insert(LABEL_MANAGED.into(), "true".into());
 
     labels
@@ -377,36 +409,61 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
         // proxy, and configure Landlock/seccomp. This matches the K8s
         // driver's runAsUser: 0.
         user: "0:0".into(),
-        // The sandbox supervisor needs these capabilities during startup:
-        //   SYS_ADMIN       – seccomp filter installation, namespace creation, Landlock
-        //   NET_ADMIN       – network namespace veth setup, IP/route configuration
-        //   SYS_PTRACE      – reading /proc/<pid>/exe and ancestor walk for policy
-        //   SYSLOG          – reading /dev/kmsg for bypass-detection diagnostics
-        //   SETUID          – drop_privileges(): setuid() to the sandbox user
-        //   SETGID          – drop_privileges(): setgid() + initgroups() to the sandbox group
-        //   DAC_READ_SEARCH – reading /proc/<pid>/fd/ across UIDs for process
-        //                     identity resolution. In rootless Podman the supervisor
-        //                     runs as UID 0 inside a user namespace while sandbox
-        //                     processes run as the sandbox user. The kernel's
-        //                     proc_fd_permission() calls generic_permission() which
-        //                     denies cross-UID access to the dr-x------ fd directory
-        //                     unless CAP_DAC_READ_SEARCH is present. Without it the
-        //                     proxy cannot determine which binary made each outbound
-        //                     connection and all traffic is denied.
-        // SETUID/SETGID are needed in rootless Podman: cap_drop:ALL removes them from
-        // the bounding set even though uid=0 owns the user namespace. Without them,
-        // setuid/setgid fail EPERM and the supervisor cannot drop to the sandbox user.
-        cap_drop: vec!["ALL".into()],
+        // Podman's default container capability set is already restricted:
+        //   CHOWN DAC_OVERRIDE FOWNER FSETID KILL SETGID SETUID SETPCAP
+        //   NET_BIND_SERVICE SYS_CHROOT SETFCAP
+        // We add what the supervisor needs and drop what it doesn't.
+        cap_drop: vec![
+            // Not needed: standard file permission bits are sufficient; dropping
+            // prevents the supervisor from bypassing DAC checks it shouldn't need.
+            "DAC_OVERRIDE".into(),
+            // Not needed: the supervisor does not create setuid/setgid executables.
+            "FSETID".into(),
+            // Not needed: the supervisor does not send signals to arbitrary processes.
+            "KILL".into(),
+            // Not needed: the supervisor does not bind privileged ports (<1024).
+            "NET_BIND_SERVICE".into(),
+            // Not in Podman's default set but explicitly denied in case the image
+            // or runtime adds it; raw sockets are not required.
+            "NET_RAW".into(),
+            // Not needed: the supervisor does not manipulate file capabilities.
+            "SETFCAP".into(),
+            // Not needed: the supervisor does not manage its own capability bounding set.
+            "SETPCAP".into(),
+            // Not needed: the supervisor does not call chroot().
+            "SYS_CHROOT".into(),
+        ],
         cap_add: vec![
+            // seccomp filter installation, namespace creation, Landlock setup.
             "SYS_ADMIN".into(),
+            // Network namespace veth setup, IP/route configuration.
             "NET_ADMIN".into(),
+            // Reading /proc/<pid>/exe and ancestor walk for process identity in policy.
             "SYS_PTRACE".into(),
+            // Reading /dev/kmsg for bypass-detection diagnostics.
             "SYSLOG".into(),
-            "SETUID".into(),
-            "SETGID".into(),
+            // Reading /proc/<pid>/fd/ across UIDs for process identity resolution.
+            // In rootless Podman the supervisor runs as UID 0 inside a user namespace
+            // while sandbox processes run as the sandbox user. The kernel's
+            // proc_fd_permission() calls generic_permission() which denies cross-UID
+            // access to the dr-x------ fd directory unless this cap is present.
+            // Without it the proxy cannot determine which binary made each outbound
+            // connection and all traffic is denied.
             "DAC_READ_SEARCH".into(),
         ],
-        // Disable the container-level seccomp profile. The sandbox supervisor
+        // SETUID, SETGID, CHOWN, and FOWNER are intentionally kept from Podman's
+        // default set and not dropped:
+        //   SETUID/SETGID – drop_privileges(): setuid()/setgid()/initgroups() to the
+        //                   sandbox user. In rootless Podman cap_drop:ALL removes them
+        //                   from the bounding set even though uid=0 owns the user
+        //                   namespace — so we keep them by not dropping them explicitly.
+        //   CHOWN         – prepare_filesystem(): chown(path, uid, gid) on newly
+        //                   created read_write directories so the sandbox user can
+        //                   write to them.
+        //   FOWNER        – chown on files where the supervisor is not the owner
+        //                   (e.g. pre-existing directories owned by another user).
+        //
+        // Disable the container-level seccomp profile. The sandbox supervisor The sandbox supervisor
         // installs its own policy-aware BPF seccomp filter at runtime via
         // seccompiler (two-phase: clone3 blocker + main filter). The runtime
         // filter is more restrictive than Podman's default — it blocks 20+
@@ -445,12 +502,13 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
             secret_name(&sandbox.id),
         )]),
         stop_timeout: config.stop_timeout_secs,
-        // Inject host.containers.internal into /etc/hosts so sandbox
-        // containers can reach the gateway server on the host. The
-        // "host-gateway" magic value tells Podman to resolve to the
-        // host's actual IP (pasta uses 169.254.1.2 in rootless mode).
-        // This is the Podman equivalent of Docker's host.docker.internal.
-        hostadd: vec!["host.containers.internal:host-gateway".into()],
+        // Inject stable host aliases into /etc/hosts so sandbox containers can
+        // reach services on the host. `host.openshell.internal` is the driver-
+        // neutral alias used by policies and e2e tests.
+        hostadd: vec![
+            "host.containers.internal:host-gateway".into(),
+            "host.openshell.internal:host-gateway".into(),
+        ],
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
@@ -462,12 +520,51 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
         // directory does not exist on the host, so the mkdir inside the container
         // fails with EPERM. A private tmpfs gives the supervisor its own writable
         // /run/netns without needing host filesystem access.
-        mounts: vec![Mount {
-            kind: "tmpfs".into(),
-            source: "tmpfs".into(),
-            destination: "/run/netns".into(),
-            options: vec!["rw".into(), "nosuid".into(), "nodev".into()],
-        }],
+        mounts: {
+            let mut m = vec![Mount {
+                kind: "tmpfs".into(),
+                source: "tmpfs".into(),
+                destination: "/run/netns".into(),
+                options: vec!["rw".into(), "nosuid".into(), "nodev".into()],
+            }];
+            // Bind-mount client TLS materials into the container when mTLS
+            // is enabled. The supervisor reads these via OPENSHELL_TLS_CA,
+            // OPENSHELL_TLS_CERT, and OPENSHELL_TLS_KEY env vars (set in
+            // build_env above) to establish an mTLS connection back to the
+            // gateway.
+            if let (Some(ca), Some(cert), Some(key)) = (
+                &config.guest_tls_ca,
+                &config.guest_tls_cert,
+                &config.guest_tls_key,
+            ) {
+                let mut ro = vec!["ro".into(), "rbind".into()];
+                // On SELinux-enabled systems (Fedora, RHEL), bind-mounted
+                // files need the shared relabel option so the container
+                // process can read them through the SELinux MAC policy.
+                if is_selinux_enabled() {
+                    ro.push("z".into());
+                }
+                m.push(Mount {
+                    kind: "bind".into(),
+                    source: ca.display().to_string(),
+                    destination: TLS_CA_MOUNT_PATH.into(),
+                    options: ro.clone(),
+                });
+                m.push(Mount {
+                    kind: "bind".into(),
+                    source: cert.display().to_string(),
+                    destination: TLS_CERT_MOUNT_PATH.into(),
+                    options: ro.clone(),
+                });
+                m.push(Mount {
+                    kind: "bind".into(),
+                    source: key.display().to_string(),
+                    destination: TLS_KEY_MOUNT_PATH.into(),
+                    options: ro,
+                });
+            }
+            m
+        },
         // Publish the SSH port with host_port=0 to get an ephemeral host port.
         // In rootless Podman the bridge network (10.89.x.x) is not routable from
         // the host, so we must use the published host port on 127.0.0.1 instead.
@@ -596,17 +693,46 @@ mod tests {
         let config = test_config();
         let spec = build_container_spec(&sandbox, &config);
 
-        let cap_add = spec["cap_add"]
+        let added: Vec<&str> = spec["cap_add"]
             .as_array()
-            .expect("cap_add should be an array");
-        let caps: Vec<&str> = cap_add.iter().filter_map(|v| v.as_str()).collect();
-        assert!(caps.contains(&"SYS_ADMIN"), "missing SYS_ADMIN");
-        assert!(caps.contains(&"NET_ADMIN"), "missing NET_ADMIN");
-        assert!(caps.contains(&"SYS_PTRACE"), "missing SYS_PTRACE");
-        assert!(caps.contains(&"SYSLOG"), "missing SYSLOG");
-        assert!(caps.contains(&"SETUID"), "missing SETUID");
-        assert!(caps.contains(&"SETGID"), "missing SETGID");
-        assert!(caps.contains(&"DAC_READ_SEARCH"), "missing DAC_READ_SEARCH");
+            .expect("cap_add should be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(added.contains(&"SYS_ADMIN"), "missing SYS_ADMIN");
+        assert!(added.contains(&"NET_ADMIN"), "missing NET_ADMIN");
+        assert!(added.contains(&"SYS_PTRACE"), "missing SYS_PTRACE");
+        assert!(added.contains(&"SYSLOG"), "missing SYSLOG");
+        assert!(
+            added.contains(&"DAC_READ_SEARCH"),
+            "missing DAC_READ_SEARCH"
+        );
+
+        // SETUID and SETGID are NOT in cap_add — they remain available from the
+        // default bounding set because we no longer use cap_drop:ALL. Verify they
+        // are also not explicitly dropped. Similarly CHOWN and FOWNER must not be
+        // dropped because prepare_filesystem() calls chown() on newly created
+        // read_write directories before the supervisor drops privileges.
+        let dropped: Vec<&str> = spec["cap_drop"]
+            .as_array()
+            .expect("cap_drop should be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(!dropped.contains(&"SETUID"), "SETUID must not be dropped");
+        assert!(!dropped.contains(&"SETGID"), "SETGID must not be dropped");
+        assert!(
+            !dropped.contains(&"CHOWN"),
+            "CHOWN must not be dropped (needed for prepare_filesystem chown)"
+        );
+        assert!(
+            !dropped.contains(&"FOWNER"),
+            "FOWNER must not be dropped (needed for chown on non-owned files)"
+        );
+        assert!(
+            !dropped.contains(&"ALL"),
+            "must not use cap_drop:ALL in rootless Podman"
+        );
     }
 
     #[test]
@@ -734,11 +860,16 @@ mod tests {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("real-id", "real-name");
+        sandbox.namespace = "real-namespace".to_string();
         let mut label_overrides = std::collections::HashMap::new();
         label_overrides.insert("openshell.sandbox-id".to_string(), "spoofed-id".to_string());
         label_overrides.insert(
             "openshell.sandbox-name".to_string(),
             "spoofed-name".to_string(),
+        );
+        label_overrides.insert(
+            "openshell.sandbox-namespace".to_string(),
+            "spoofed-namespace".to_string(),
         );
         sandbox.spec = Some(DriverSandboxSpec {
             template: Some(DriverSandboxTemplate {
@@ -765,6 +896,40 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("real-name"),
             "openshell.sandbox-name must not be overridden by template labels"
+        );
+        assert_eq!(
+            labels
+                .get("openshell.sandbox-namespace")
+                .and_then(|v| v.as_str()),
+            Some("real-namespace"),
+            "openshell.sandbox-namespace must not be overridden by template labels"
+        );
+    }
+
+    #[test]
+    fn container_spec_injects_host_aliases() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let hostadd: Vec<&str> = spec["hostadd"]
+            .as_array()
+            .expect("hostadd should be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        assert!(
+            hostadd.contains(&"host.containers.internal:host-gateway"),
+            "missing Podman host alias"
+        );
+        assert!(
+            hostadd.contains(&"host.openshell.internal:host-gateway"),
+            "missing OpenShell stable host alias"
+        );
+        assert!(
+            !hostadd.contains(&"host.docker.internal:host-gateway"),
+            "Podman should not inject Docker's host alias"
         );
     }
 
@@ -796,7 +961,6 @@ mod tests {
             default_image: "test-image:latest".to_string(),
             grpc_endpoint: "http://localhost:50051".to_string(),
             sandbox_ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
-            ssh_listen_addr: "0.0.0.0:2222".to_string(),
             ssh_handshake_secret: "test-secret-value".to_string(),
             ..PodmanComputeConfig::default()
         }
@@ -833,5 +997,92 @@ mod tests {
             Some(false),
             "image volume should be read-only"
         );
+    }
+
+    #[test]
+    fn container_spec_includes_tls_mounts_when_configured() {
+        let sandbox = test_sandbox("tls-id", "tls-name");
+        let mut config = test_config();
+        config.guest_tls_ca = Some(std::path::PathBuf::from("/host/ca.crt"));
+        config.guest_tls_cert = Some(std::path::PathBuf::from("/host/tls.crt"));
+        config.guest_tls_key = Some(std::path::PathBuf::from("/host/tls.key"));
+
+        let spec = build_container_spec(&sandbox, &config);
+
+        // Verify TLS env vars are set.
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        assert_eq!(
+            env_map.get("OPENSHELL_TLS_CA").and_then(|v| v.as_str()),
+            Some("/etc/openshell/tls/client/ca.crt"),
+        );
+        assert_eq!(
+            env_map.get("OPENSHELL_TLS_CERT").and_then(|v| v.as_str()),
+            Some("/etc/openshell/tls/client/tls.crt"),
+        );
+        assert_eq!(
+            env_map.get("OPENSHELL_TLS_KEY").and_then(|v| v.as_str()),
+            Some("/etc/openshell/tls/client/tls.key"),
+        );
+
+        // Verify bind mounts exist for all three cert files.
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        let bind_dests: Vec<&str> = mounts
+            .iter()
+            .filter(|m| m["type"].as_str() == Some("bind"))
+            .filter_map(|m| m["destination"].as_str())
+            .collect();
+        assert!(
+            bind_dests.contains(&"/etc/openshell/tls/client/ca.crt"),
+            "should bind-mount CA cert"
+        );
+        assert!(
+            bind_dests.contains(&"/etc/openshell/tls/client/tls.crt"),
+            "should bind-mount client cert"
+        );
+        assert!(
+            bind_dests.contains(&"/etc/openshell/tls/client/tls.key"),
+            "should bind-mount client key"
+        );
+
+        // Verify SELinux relabel option is present iff SELinux is enabled.
+        let tls_binds: Vec<&Value> = mounts
+            .iter()
+            .filter(|m| m["type"].as_str() == Some("bind"))
+            .collect();
+        let has_z = tls_binds.iter().all(|m| {
+            m["options"]
+                .as_array()
+                .is_some_and(|opts| opts.iter().any(|o| o.as_str() == Some("z")))
+        });
+        assert_eq!(
+            has_z,
+            is_selinux_enabled(),
+            "TLS bind mounts should include 'z' option iff SELinux is enabled"
+        );
+    }
+
+    #[test]
+    fn container_spec_omits_tls_without_config() {
+        let sandbox = test_sandbox("notls-id", "notls-name");
+        let config = test_config();
+
+        let spec = build_container_spec(&sandbox, &config);
+
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        assert!(
+            env_map.get("OPENSHELL_TLS_CA").is_none(),
+            "TLS env vars should not be set without TLS config"
+        );
+
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        let bind_count = mounts
+            .iter()
+            .filter(|m| m["type"].as_str() == Some("bind"))
+            .count();
+        assert_eq!(bind_count, 0, "no bind mounts without TLS config");
     }
 }

@@ -4,7 +4,7 @@
 # Sandbox tasks
 
 [sandbox]
-description = "Create or reconnect to the dev sandbox (redeploys cluster if dirty)"
+description = "Create or reconnect to the dev sandbox using the active gateway"
 raw = true
 usage = """
 arg "[command]" var=#true help="Command to run in the sandbox (default: claude)"

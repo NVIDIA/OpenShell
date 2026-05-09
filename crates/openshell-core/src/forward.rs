@@ -1019,12 +1019,28 @@ mod tests {
     #[test]
     fn check_port_available_free_port() {
         // Bind to port 0 to get an OS-assigned free port, then drop the
-        // listener so the port is released before we test it.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        // listener so the port is released before we test it. On busy CI
+        // hosts, another process can claim that single ephemeral port before
+        // we re-bind it, so retry with fresh OS-assigned ports.
+        let mut last_error = None;
+        for _ in 0..20 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
 
-        assert!(check_port_available(&ForwardSpec::new(port)).is_ok());
+            match check_port_available(&ForwardSpec::new(port)) {
+                Ok(()) => return,
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+
+        panic!(
+            "expected an OS-assigned port to be available; last error: {}",
+            last_error.unwrap_or_else(|| "none".to_string())
+        );
     }
 
     #[test]

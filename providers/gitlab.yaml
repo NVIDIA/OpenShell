@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: gitlab
+display_name: GitLab
+description: GitLab API and Git operations
+category: source_control
+credentials:
+  - name: api_token
+    description: GitLab token
+    env_vars: [GITLAB_TOKEN, GLAB_TOKEN, CI_JOB_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: gitlab.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: api.gitlab.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/bin/glab, /usr/local/bin/glab, /usr/bin/git, /usr/local/bin/git]

@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Helm Lint
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+    paths:
+      - "deploy/helm/**"
+  workflow_dispatch:
+
+env:
+  MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr_metadata:
+    name: Resolve PR metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: gate
+        uses: ./.github/actions/pr-gate
+
+  helm-lint:
+    name: Helm Lint
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Lint Helm chart
+        run: mise run helm:lint

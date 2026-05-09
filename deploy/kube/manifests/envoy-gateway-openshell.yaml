@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Envoy GatewayClass for OpenShell.
+#
+# Apply after a successful Skaffold deploy when gateway routing is enabled:
+#   mise run helm:gateway:apply
+
+---
+# The Envoy Gateway Helm chart does not create a GatewayClass — we manage it here.
+# The proxy Service defaults to LoadBalancer, which klipper-lb handles in k3d.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller

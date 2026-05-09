@@ -1,0 +1,83 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Ingress"
+sidebar-title: "Ingress"
+description: "Expose the OpenShell gateway externally using the Kubernetes Gateway API and a GRPCRoute."
+keywords: "Generative AI, Cybersecurity, Kubernetes, Gateway API, Envoy Gateway, GRPCRoute, Ingress, External Access"
+position: 3
+---
+
+By default, the OpenShell gateway is only reachable inside the cluster. To let CLI clients connect without a `kubectl port-forward`, expose the gateway through an ingress.
+
+OpenShell uses the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) for ingress. The chart creates a `GRPCRoute` that routes inbound gRPC traffic to the gateway pod. You need a Gateway API implementation installed on your cluster to fulfill the `GRPCRoute`. This page uses [Envoy Gateway](https://gateway.envoyproxy.io), which the chart is tested with.
+
+## Install Envoy Gateway
+
+Envoy Gateway installs the Gateway API CRDs and registers the `eg` GatewayClass:
+
+```shell
+helm install eg \
+  oci://docker.io/envoyproxy/gateway-helm \
+  --version v1.7.2 \
+  --namespace envoy-gateway-system \
+  --create-namespace \
+  --wait
+```
+
+Verify the GatewayClass is accepted:
+
+```shell
+kubectl get gatewayclass eg
+```
+
+The `ACCEPTED` column should show `True`.
+
+## Install OpenShell with Gateway API enabled
+
+Enable the GRPCRoute and let the chart create a Gateway resource in the `openshell` namespace:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set grpcRoute.enabled=true \
+  --set grpcRoute.gateway.create=true \
+  --set grpcRoute.gateway.className=eg
+```
+
+## Get the external address
+
+After the Gateway is provisioned, Envoy Gateway creates a LoadBalancer service in the `openshell` namespace. Wait for it to get an external address:
+
+```shell
+kubectl -n openshell get svc -l gateway.envoyproxy.io/owning-gateway-name=openshell
+```
+
+Once the `EXTERNAL-IP` is assigned, register the gateway with the CLI:
+
+```shell
+openshell gateway add http://<external-ip> --name production
+openshell status
+```
+
+## Configure SSH relay
+
+For sandbox SSH connections to work through the external address, set `server.sshGatewayHost` and `server.sshGatewayPort` to the hostname and port that CLI clients can reach:
+
+```shell
+helm upgrade openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set grpcRoute.enabled=true \
+  --set grpcRoute.gateway.create=true \
+  --set grpcRoute.gateway.className=eg \
+  --set server.sshGatewayHost=<external-hostname> \
+  --set server.sshGatewayPort=<ssh-port>
+```
+
+## Next Steps
+
+Return to [Setup](/kubernetes/setup) to complete the installation.

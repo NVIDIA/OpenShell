@@ -5,7 +5,7 @@ title: "Customize Sandbox Policies"
 sidebar-title: "Policies"
 description: "Apply, iterate, and debug sandbox network policies with hot-reload on running OpenShell sandboxes."
 keywords: "Generative AI, Cybersecurity, Policy, Network Policy, Sandbox, Security, Hot Reload"
-position: 5
+position: 4
 ---
 
 Use this page to apply and iterate policy changes on running sandboxes. For a full field-by-field YAML definition, use the [Policy Schema Reference](/reference/policy-schema).
@@ -48,13 +48,15 @@ network_policies:
 
 Static sections are locked at sandbox creation. Changing them requires destroying and recreating the sandbox.
 Dynamic sections can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
+When a hot reload changes rules on an active HTTP L7 endpoint, existing keep-alive tunnels are closed before forwarding another parsed request. Credential-injection-only HTTP passthrough tunnels use the same reload boundary. Most HTTP clients reconnect automatically, and the next request is evaluated against the current policy.
+Raw streams are connection-scoped and outside L7 live-reload guarantees. This includes `tls: skip`, non-HTTP TCP payloads, HTTP upgrades such as WebSocket, and long-lived response streams such as SSE. A reload applies to the next connection or next parsed HTTP request; it does not interrupt an already-forwarded raw stream.
 
 | Section | Type | Description |
 |---|---|---|
 | `filesystem_policy` | Static | Controls which directories the agent can access on disk. Paths are split into `read_only` and `read_write` lists. Any path not listed in either list is inaccessible. Set `include_workdir: true` to automatically add the agent's working directory to `read_write`. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level. |
 | `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (skip individual inaccessible paths while applying remaining rules) or `hard_requirement` (fail if any path is inaccessible or the required kernel ABI is unavailable). See the [Policy Schema Reference](/reference/policy-schema#landlock) for the full behavior table. |
 | `process` | Static | Sets the OS-level identity for the agent process. `run_as_user` and `run_as_group` default to `sandbox`. Root (`root` or `0`) is rejected. The agent also runs with seccomp filters that block dangerous system calls. |
-| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br />Every outbound connection except `https://inference.local` goes through the proxy, which queries the [policy engine](/about/architecture) with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br />For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request is checked against that endpoint's `rules` (method and path). <br />Endpoints without `protocol` allow the TCP stream through without inspecting payloads. <br />If no endpoint matches, the connection is denied. Configure managed inference separately through [Configure](/inference/configure). |
+| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br />Every outbound connection except `https://inference.local` goes through the proxy, which queries the [policy engine](/about/how-it-works#core-components) with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br />For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request can be checked against that endpoint's `rules` (method and path). <br />Endpoints without `protocol` allow the TCP stream through without inspecting payloads. <br />If no endpoint matches, the connection is denied. Configure managed inference separately through [Inference Routing](/sandboxes/inference-routing). |
 
 ## Baseline Filesystem Paths
 
@@ -220,8 +222,8 @@ Each segment has a fixed meaning:
 |---|---|---|
 | `host` | Yes | Destination hostname. |
 | `port` | Yes | Destination port, `1` through `65535`. |
-| `access` | No | Access preset for REST endpoints: `read-only`, `read-write`, or `full`. |
-| `protocol` | No | L7 inspection mode: `rest` or `sql`. In practice, incremental updates are designed around `rest`. `sql` is audit-only and not a recommended workflow today. |
+| `access` | No | Access preset for L7 endpoints: `read-only`, `read-write`, or `full`. Incremental updates currently expand presets for REST-shaped access. |
+| `protocol` | No | L7 inspection mode: `rest` or `sql`. `sql` is audit-only and not a recommended workflow today. |
 | `enforcement` | No | Enforcement mode for inspected traffic: `enforce` or `audit`. |
 
 Examples:
@@ -231,12 +233,12 @@ Examples:
 | `pypi.org:443` | Add a plain L4 endpoint. The proxy allows the TCP stream and does not inspect HTTP requests. |
 | `api.github.com:443:read-only:rest:enforce` | Add a REST endpoint with the `read-only` preset expanded by the policy engine into GET, HEAD, and OPTIONS access. |
 
-If you set `protocol: rest`, you also need an allow shape. With incremental updates, that means you should provide an `access` preset on `--add-endpoint`, then use `--add-allow` or `--add-deny` to refine it later.
+If you set `protocol: rest`, you also need an allow shape. With incremental updates, that means you should provide an `access` preset on `--add-endpoint`, then use `--add-allow` or `--add-deny` to refine REST endpoints later.
 
 For example:
 
 - `api.github.com:443:read-only:rest` is valid.
-- `api.github.com:443::rest` is invalid. It does not mean "allow all traffic." A REST endpoint with `protocol` but no `access` or `rules` is rejected when the policy loads.
+- `api.github.com:443::rest` is invalid. It does not mean "allow all traffic." An L7 endpoint with `protocol` but no `access` or `rules` is rejected when the policy loads.
 
 When you pass multiple `--add-endpoint` flags in one command, every `--binary` value applies to every added endpoint in that command. If different endpoints need different binaries, use separate `policy update` commands.
 
@@ -425,7 +427,7 @@ openshell policy update <name> --add-allow 'api.github.com:443:GET:/repos/**' --
 
 ## Examples
 
-Add these blocks to the `network_policies` section of your sandbox policy. Apply with `openshell policy update` for incremental additions or `openshell policy set <name> --policy <file> --wait` for full replacement.
+Add these blocks to the `network_policies` section of your sandbox policy. Apply simple endpoints and REST rule additions with `openshell policy update`, or apply any complete YAML block with `openshell policy set <name> --policy <file> --wait`.
 Use **Simple endpoint** for host-level allowlists and **Granular rules** for method/path control.
 
 <Tabs>
@@ -445,14 +447,14 @@ Allow `pip install` and `uv pip install` to reach PyPI:
       - { path: /usr/local/bin/uv }
 ```
 
-Endpoints without `protocol` use TCP passthrough, where the proxy allows the stream without inspecting payloads.
+Endpoints without `protocol` use TCP passthrough, where the proxy allows the stream without inspecting payloads. If the stream is HTTP and TLS is auto-terminated, the proxy can still rewrite configured credential placeholders and closes keep-alive passthrough tunnels on policy reload before forwarding another request.
 </Tab>
 
 <Tab title="Granular rules">
-Allow Claude and the GitHub CLI to reach `api.github.com` with per-path rules: read-only (GET, HEAD, OPTIONS) and GraphQL (POST) for all paths; full write access for `alpha-repo`; and create/edit issues only for `bravo-repo`. Replace `<org_name>` with your GitHub org or username.
+Allow Claude and the GitHub CLI to reach `api.github.com` with separate REST and GraphQL endpoint scopes: read-only REST for general API paths, GraphQL operation inspection on `/graphql`, full REST write access for `alpha-repo`, and create/edit issues only for `bravo-repo`. Replace `<org_name>` with your GitHub org or username.
 
 <Tip>
-For an end-to-end walkthrough that combines this policy with a GitHub credential provider and sandbox creation, refer to [Github Sandbox](/tutorials/github-sandbox).
+For an end-to-end walkthrough that combines this policy with a GitHub credential provider and sandbox creation, refer to [GitHub Sandbox](/get-started/tutorials/github-sandbox).
 
 </Tip>
 
@@ -462,6 +464,7 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
     endpoints:
       - host: api.github.com
         port: 443
+        path: "/**"
         protocol: rest
         enforcement: enforce
         rules:
@@ -475,9 +478,6 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
               method: OPTIONS
               path: "/**"
           - allow:
-              method: POST
-              path: "/graphql"
-          - allow:
               method: "*"
               path: "/repos/<org_name>/alpha-repo/**"
           - allow:
@@ -486,12 +486,26 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
           - allow:
               method: PATCH
               path: "/repos/<org_name>/bravo-repo/issues/*"
+      - host: api.github.com
+        port: 443
+        path: "/graphql"
+        protocol: graphql
+        enforcement: enforce
+        rules:
+          - allow:
+              operation_type: query
+          - allow:
+              operation_type: mutation
+              fields: [createIssue, updateIssue, addComment]
+        deny_rules:
+          - operation_type: mutation
+            fields: [deleteRepository, deleteRef, updateBranchProtectionRule]
     binaries:
       - { path: /usr/local/bin/claude }
       - { path: /usr/bin/gh }
 ```
 
-Endpoints with `protocol: rest` enable HTTP request inspection. The proxy auto-detects TLS on HTTPS endpoints, terminates it, and checks each HTTP request against the `rules` list.
+Endpoints with `protocol: rest` enable HTTP request inspection. Endpoints with `protocol: graphql` parse GraphQL-over-HTTP payloads before evaluating rules. The endpoint-level `path` field lets both protocols share `api.github.com:443` without treating GraphQL payloads as plain REST `POST /graphql` requests.
 </Tab>
 
 </Tabs>
@@ -522,10 +536,59 @@ REST rules can also constrain query parameter values:
 
 `query` matchers are case-sensitive and run on decoded values. If a request has duplicate keys (for example, `tag=a&tag=b`), every value for that key must match the configured glob(s).
 
+### GraphQL matching
+
+GraphQL endpoints use `protocol: graphql`. The proxy parses GraphQL-over-HTTP `GET` and `POST` requests, classifies each operation, and evaluates rules against the operation type, optional operation name, and selected root fields.
+
+GraphQL endpoint policies currently require full policy YAML applied with `openshell policy set`; the incremental `openshell policy update --add-endpoint` parser does not accept `graphql` as a protocol.
+
+```yaml showLineNumbers={false}
+  github_graphql:
+    name: github_graphql
+    endpoints:
+      - host: api.github.com
+        port: 443
+        path: "/graphql"
+        protocol: graphql
+        enforcement: enforce
+        rules:
+          - allow:
+              operation_type: query
+              fields: [viewer, repository]
+          - allow:
+              operation_type: mutation
+              operation_name: Issue*
+              fields: [createIssue]
+        deny_rules:
+          - operation_type: mutation
+            fields: [deleteRepository]
+    binaries:
+      - { path: /usr/bin/gh }
+```
+
+For allow rules, every selected root field in an operation must match one of the configured `fields` globs. For deny rules, one matching root field blocks the request. Batched GraphQL requests are fail-closed: if any operation is malformed, denied, or unregistered, the whole HTTP request is denied.
+
+Hash-only persisted queries cannot be classified from the request alone. OpenShell denies them unless the endpoint uses `persisted_queries: allow_registered` and provides a trusted `graphql_persisted_queries` entry keyed by hash or saved-query ID.
+
+### GraphQL service policy shapes
+
+GraphQL field names are application-specific, so treat these as starting shapes to review against the actual app schema:
+
+| Service | Endpoint shape | Starting policy |
+|---|---|---|
+| Railway | `backboard.railway.app/graphql/v2` | Allow `query`; allow only reviewed deployment mutations; deny `volumeDelete`, `projectDelete`, `*Delete`, `*Destroy`. |
+| GitHub | `api.github.com/graphql` | Allow `query`; optionally allow low-risk mutations such as reactions; deny broad destructive/admin roots like `deleteRef`, `deleteRepository`, `updateBranchProtectionRule`, and `delete*`. |
+| GitLab | `/api/graphql` | Prefer read-only token scopes where possible; allow `query`; deny mutations by default or allow only reviewed workflow roots. |
+| Shopify Admin | `*.myshopify.com/admin/api/**/graphql.json` | Allow `query`; allow app-specific mutations only; deny `*Delete`, `bulkOperationRunMutation`, and high-impact inventory/order/customer roots unless approved. |
+| monday.com | `api.monday.com/v2` | Allow board/item reads; allow tightly scoped create/update mutations only where needed; deny delete/archive roots. |
+| Salesforce GraphQL | Salesforce GraphQL endpoint | Allow `query`; deny record create/update/delete mutations unless the sandbox is intended to modify CRM data. |
+| Hygraph | Project content API endpoint | Allow content reads; deny generated destructive content roots such as `delete*`, `deleteMany*`, `unpublish*`, and batch mutations unless a publishing workflow requires them. |
+| Atlassian GraphQL Gateway | `api.atlassian.com/graphql` | Allow reads by default; require explicit mutation allowlists because the gateway spans Jira, Confluence, Bitbucket, and admin surfaces. |
+
 ## Next Steps
 
 Explore related topics:
 
-- To learn about network access rules and sandbox isolation layers, refer to [Index](/sandboxes/about).
+- To learn about the built-in sandbox policy, refer to [Default Policy](/reference/default-policy).
 - To view the full field-by-field YAML definition, refer to the [Policy Schema Reference](/reference/policy-schema).
 - To review the default policy breakdown, refer to [Default Policy](/reference/default-policy).

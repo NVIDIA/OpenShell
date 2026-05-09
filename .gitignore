@@ -206,5 +206,11 @@ rfc.md
 .worktrees
 .z3-trace
 
+# RPM build artifacts
+*.src.rpm
+*.tar.gz
+*.tar.xz
+*.tar.bz2
+
 # Markdown/mermaid lint tooling deps
 scripts/lint-mermaid/node_modules/

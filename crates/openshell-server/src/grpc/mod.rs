@@ -10,18 +10,24 @@ mod validation;
 
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
-    ApproveDraftChunkResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
-    CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxRequest,
-    GatewayMessage, GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest,
-    GetDraftPolicyResponse, GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest,
+    ApproveDraftChunkResponse, AttachSandboxProviderRequest, AttachSandboxProviderResponse,
+    ClearDraftChunksRequest, ClearDraftChunksResponse, CreateProviderRequest, CreateSandboxRequest,
+    CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderProfileRequest,
+    DeleteProviderProfileResponse, DeleteProviderRequest, DeleteProviderResponse,
+    DeleteSandboxRequest, DeleteSandboxResponse, DetachSandboxProviderRequest,
+    DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent,
+    ExecSandboxRequest, GatewayMessage, GetDraftHistoryRequest, GetDraftHistoryResponse,
+    GetDraftPolicyRequest, GetDraftPolicyResponse, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetProviderProfileRequest, GetProviderRequest,
     GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
     GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxesRequest,
-    ListSandboxesResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
+    HealthRequest, HealthResponse, ImportProviderProfilesRequest, ImportProviderProfilesResponse,
+    LintProviderProfilesRequest, LintProviderProfilesResponse, ListProviderProfilesRequest,
+    ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
+    ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame, ReportPolicyStatusRequest,
     ReportPolicyStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
     SandboxStreamEvent, ServiceStatus, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
@@ -195,6 +201,27 @@ impl OpenShell for OpenShellService {
         sandbox::handle_list_sandboxes(&self.state, request).await
     }
 
+    async fn list_sandbox_providers(
+        &self,
+        request: Request<ListSandboxProvidersRequest>,
+    ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
+        sandbox::handle_list_sandbox_providers(&self.state, request).await
+    }
+
+    async fn attach_sandbox_provider(
+        &self,
+        request: Request<AttachSandboxProviderRequest>,
+    ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
+        sandbox::handle_attach_sandbox_provider(&self.state, request).await
+    }
+
+    async fn detach_sandbox_provider(
+        &self,
+        request: Request<DetachSandboxProviderRequest>,
+    ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
+        sandbox::handle_detach_sandbox_provider(&self.state, request).await
+    }
+
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
@@ -252,6 +279,34 @@ impl OpenShell for OpenShellService {
         provider::handle_list_providers(&self.state, request).await
     }
 
+    async fn list_provider_profiles(
+        &self,
+        request: Request<ListProviderProfilesRequest>,
+    ) -> Result<Response<ListProviderProfilesResponse>, Status> {
+        provider::handle_list_provider_profiles(&self.state, request).await
+    }
+
+    async fn get_provider_profile(
+        &self,
+        request: Request<GetProviderProfileRequest>,
+    ) -> Result<Response<ProviderProfileResponse>, Status> {
+        provider::handle_get_provider_profile(&self.state, request).await
+    }
+
+    async fn import_provider_profiles(
+        &self,
+        request: Request<ImportProviderProfilesRequest>,
+    ) -> Result<Response<ImportProviderProfilesResponse>, Status> {
+        provider::handle_import_provider_profiles(&self.state, request).await
+    }
+
+    async fn lint_provider_profiles(
+        &self,
+        request: Request<LintProviderProfilesRequest>,
+    ) -> Result<Response<LintProviderProfilesResponse>, Status> {
+        provider::handle_lint_provider_profiles(&self.state, request).await
+    }
+
     async fn update_provider(
         &self,
         request: Request<UpdateProviderRequest>,
@@ -264,6 +319,13 @@ impl OpenShell for OpenShellService {
         request: Request<DeleteProviderRequest>,
     ) -> Result<Response<DeleteProviderResponse>, Status> {
         provider::handle_delete_provider(&self.state, request).await
+    }
+
+    async fn delete_provider_profile(
+        &self,
+        request: Request<DeleteProviderProfileRequest>,
+    ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
+        provider::handle_delete_provider_profile(&self.state, request).await
     }
 
     // --- Config / Policy ---

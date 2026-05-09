@@ -174,7 +174,7 @@ openshell sandbox create -- curl https://inference.local/v1/chat/completions --j
 
 Interpretation:
 
-- **`cluster inference is not configured`**: set the managed route with `openshell inference set`
+- **`cluster inference is not configured`**: set the managed gateway route with `openshell inference set`
 - **`connection not allowed by policy`** on `inference.local`: unsupported method or path
 - **`no compatible route`**: provider type and client API shape do not match
 - **Connection refused / upstream unavailable / verification failures**: base URL, bind address, topology, or credentials are wrong
@@ -232,7 +232,7 @@ In this case, OpenShell routing is usually working correctly. The failing hop is
 
 This is not the same issue as the Colima CoreDNS fix.
 
-OpenShell injects `host.docker.internal` and `host.openshell.internal` into sandbox pods with `hostAliases`. That path bypasses cluster DNS lookup. If the request still times out, the usual cause is host firewall or network policy, not CoreDNS.
+OpenShell injects `host.docker.internal` and `host.openshell.internal` into sandbox workloads when the selected compute platform supports it. That path bypasses runtime DNS lookup. If the request still times out, the usual cause is host firewall or network policy, not DNS.
 
 ### Verify the Problem
 
@@ -248,40 +248,41 @@ OpenShell injects `host.docker.internal` and `host.openshell.internal` into sand
    curl -sS http://172.17.0.1:11434/v1/models
    ```
 
-3. Test the same endpoint from the OpenShell cluster container:
+3. Test the same endpoint from a gateway or sandbox container on the Docker network:
 
    ```bash
-   docker exec openshell-cluster-<gateway> wget -qO- -T 5 http://host.docker.internal:11434/v1/models
+   docker ps --filter name=openshell --format '{{.Names}}'
+   docker exec <container-name> wget -qO- -T 5 http://host.docker.internal:11434/v1/models
    ```
 
 If steps 1 and 2 succeed but step 3 times out, the host firewall or network configuration is blocking the container-to-host path.
 
 ### Fix
 
-Allow the Docker bridge network used by the OpenShell cluster to reach the host-local inference port. The exact command depends on your firewall tooling (iptables, nftables, firewalld, UFW, etc.), but the rule should allow:
+Allow the Docker bridge network used by the OpenShell gateway and sandbox containers to reach the host-local inference port. The exact command depends on your firewall tooling (iptables, nftables, firewalld, UFW, etc.), but the rule should allow:
 
-- **Source**: the Docker bridge subnet used by the OpenShell cluster container (commonly `172.18.0.0/16`)
-- **Destination**: the host gateway IP injected into sandbox pods for `host.docker.internal` (commonly `172.17.0.1`)
+- **Source**: the Docker bridge subnet used by OpenShell containers (commonly `172.18.0.0/16`)
+- **Destination**: the host gateway IP injected into sandbox workloads for `host.docker.internal` (commonly `172.17.0.1`)
 - **Port**: the inference server port (e.g. `11434/tcp` for Ollama)
 
 To find the actual values on your system:
 
 ```bash
-# Docker bridge subnet for the OpenShell cluster network
+# Docker bridge subnet for the OpenShell network
 docker network inspect $(docker network ls --filter name=openshell -q) --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
 
 # Host gateway IP visible from inside the container
-docker exec openshell-cluster-<gateway> cat /etc/hosts | grep host.docker.internal
+docker exec <container-name> cat /etc/hosts | grep host.docker.internal
 ```
 
 Adjust the source subnet, destination IP, or port to match your local Docker network layout.
 
 ### Verify the Fix
 
-1. Re-run the cluster container check:
+1. Re-run the container network check:
 
    ```bash
-   docker exec openshell-cluster-<gateway> wget -qO- -T 5 http://host.docker.internal:11434/v1/models
+   docker exec <container-name> wget -qO- -T 5 http://host.docker.internal:11434/v1/models
    ```
 
 2. Re-test from a sandbox:

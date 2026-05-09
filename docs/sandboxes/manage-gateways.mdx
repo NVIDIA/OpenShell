@@ -1,11 +1,11 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Deploy and Manage Gateways"
+title: "Manage Gateways"
 sidebar-title: "Gateways"
-description: "Deploy local and remote gateways, register cloud gateways, and manage multiple gateway environments."
-keywords: "Generative AI, Cybersecurity, Gateway, Deployment, Remote Gateway, CLI"
-position: 3
+description: "Register OpenShell gateways, switch between environments, inspect gateway status, and troubleshoot gateway access."
+keywords: "Generative AI, Cybersecurity, Gateway, Docker, Podman, Kubernetes, MicroVM, CLI"
+position: 2
 ---
 
 The gateway is the control plane for OpenShell. All control-plane traffic between the CLI and running sandboxes flows through the gateway.
@@ -13,180 +13,98 @@ The gateway is the control plane for OpenShell. All control-plane traffic betwee
 The gateway is responsible for:
 
 - Provisioning and managing sandboxes, including creation, deletion, and status monitoring.
-- Storing provider credentials (API keys, tokens) and delivering them to sandboxes at startup.
+- Storing provider credentials and delivering them to sandboxes at startup.
 - Delivering network and filesystem policies to sandboxes. Policy enforcement itself happens inside each sandbox through the proxy, OPA, Landlock, and seccomp.
 - Managing inference configuration and serving inference bundles so sandboxes can route requests to the correct backend.
 - Providing the SSH tunnel endpoint so you can connect to sandboxes without exposing them directly.
 
-The gateway runs inside a Docker container and exposes a single port (gRPC and HTTP multiplexed), secured by mTLS by default. No separate Kubernetes installation is required. It can be deployed locally, on a remote host via SSH, or behind a cloud reverse proxy.
+OpenShell separates gateway access from the compute driver that runs sandboxes. Use [Installation](/about/installation) to install OpenShell, choose a compute driver, and start a gateway. This page covers working with gateway entries after a gateway exists.
 
-## Deploy a Local Gateway
+## Gateway Compute Drivers
 
-Deploy a gateway on your workstation. The only prerequisite is a running Docker daemon.
+A gateway provisions sandboxes through the compute driver configured for that gateway.
 
-```shell
-openshell gateway start
-```
+| Compute Driver | Where sandboxes run | Best for |
+|---|---|---|
+| Docker | Containers on the gateway host. | Solo development, quick iteration, and single-machine gateways. |
+| Podman | Rootless containers on the gateway host. | Workstations that avoid a rootful Docker daemon. |
+| Kubernetes | Pods in an operator-managed cluster. | Shared clusters and cloud environments. |
+| MicroVM | VM-backed sandboxes. | Workflows that need VM-backed isolation. |
 
-The gateway becomes reachable at `https://127.0.0.1:8080`. Verify it is healthy:
-
-```shell
-openshell status
-```
+All compute drivers expose the same gateway API surface. Sandboxes, policies, and providers work the same after the CLI registers the gateway endpoint. The difference is how the gateway creates sandbox workloads and how operators expose the gateway to users.
 
 <Tip>
-You do not need to deploy a gateway manually. If you run `openshell sandbox create` without a gateway, the CLI auto-bootstraps a local gateway for you.
+For driver setup, including Docker, Podman, MicroVM, and Kubernetes paths, refer to [Installation](/about/installation).
 
 </Tip>
 
-To use a different port or name:
-
-```shell
-openshell gateway start --port 9090
-openshell gateway start --name dev-local
-```
-
-## Deploy a Remote Gateway
-
-Deploy a gateway on a remote machine accessible via SSH. The only dependency on the remote host is Docker.
-
-```shell
-openshell gateway start --remote user@hostname
-```
-
-The gateway is reachable at `https://<hostname>:8080`.
-
-To specify an SSH key:
-
-```shell
-openshell gateway start --remote user@hostname --ssh-key ~/.ssh/my_key
-```
-
-<Note>
-For DGX Spark, use your Spark's mDNS hostname:
-
-```shell
-openshell gateway start --remote <username>@<spark-ssid>.local
-```
-
-</Note>
-
 ## Register an Existing Gateway
 
-Use `openshell gateway add` to register a gateway that is already running.
+Use `openshell gateway add` to register any reachable gateway endpoint so the CLI can target it.
 
-### Cloud Gateway
-
-Register a gateway behind a reverse proxy such as Cloudflare Access:
+Register a plaintext local endpoint, such as a trusted port-forward:
 
 ```shell
-openshell gateway add https://gateway.example.com
+openshell gateway add http://127.0.0.1:8080 --local --name local
 ```
 
-This opens your browser for the proxy's login flow. After authentication, the CLI stores a bearer token and sets the gateway as active.
-
-To give the gateway a specific name instead of deriving it from the hostname, use `--name`:
+Register a gateway behind an authenticated reverse proxy:
 
 ```shell
 openshell gateway add https://gateway.example.com --name production
 ```
 
-If the token expires later, re-authenticate with:
+This opens your browser for the proxy's login flow when the gateway uses edge authentication. If the token expires later, re-authenticate with:
 
 ```shell
-openshell gateway login
+openshell gateway login production
 ```
 
-### Remote Gateway
-
-Register a gateway on a remote host you have SSH access to:
-
-```shell
-openshell gateway add https://remote-host:8080 --remote user@remote-host
-```
-
-Or use the `ssh://` scheme to combine the SSH destination and gateway port:
-
-```shell
-openshell gateway add ssh://user@remote-host:8080
-```
-
-### Local Gateway
-
-Register a local mTLS gateway:
-
-```shell
-openshell gateway add https://127.0.0.1:8080 --local
-```
-
-Register a local plaintext gateway with no auth:
-
-```shell
-openshell gateway add http://127.0.0.1:8080 --local
-```
-
-When the endpoint uses `http://`, the CLI stores a direct plaintext registration. It does not extract mTLS certificates and it does not open the browser auth flow.
+For direct mTLS endpoints, place the CLI client certificate bundle in the gateway credential directory described in [Gateway Authentication](/reference/gateway-auth), then register or select that gateway name.
 
 ## Manage Multiple Gateways
 
-One gateway is always the active gateway. All CLI commands target it by default. Both `gateway start` and `gateway add` automatically set the new gateway as active.
+One gateway is always the active gateway. All CLI commands target it by default. `gateway add` sets the new gateway as active.
+
+The active gateway is the persisted default. The `-g` flag and the `OPENSHELL_GATEWAY` environment variable override it when commands resolve a gateway. If `OPENSHELL_GATEWAY` is set to a different gateway, `openshell gateway select <name>` still saves the new default and warns that the current shell will keep using the environment value until you unset or update it.
 
 List all registered gateways:
 
 ```shell
-openshell gateway select
+openshell gateway list
 ```
 
 Switch the active gateway:
 
 ```shell
-openshell gateway select my-remote-cluster
+openshell gateway select production
 ```
 
 Override the active gateway for a single command with `-g`:
 
 ```shell
-openshell status -g my-other-cluster
+openshell status -g staging
 ```
 
-Show deployment details for a gateway, including endpoint, auth mode, and port:
+## Inspect Gateway Status
+
+Use `openshell status` for a quick health check:
+
+```shell
+openshell status
+```
+
+Use `openshell gateway info` when you need the registered endpoint, gateway metadata, or compute driver details:
 
 ```shell
 openshell gateway info
-openshell gateway info --name my-remote-cluster
+openshell gateway info --name production
 ```
 
-## Advanced Start Options
-
-| Flag | Purpose |
-|---|---|
-| `--gpu` | Enable NVIDIA GPU passthrough. Requires NVIDIA drivers and the Container Toolkit on the host. OpenShell auto-selects CDI when enabled on the daemon and falls back to Docker's NVIDIA GPU request path (`--gpus all`) otherwise. |
-| `--plaintext` | Listen on HTTP instead of mTLS. Use behind a TLS-terminating reverse proxy. |
-| `--disable-gateway-auth` | Skip mTLS client certificate checks. Use when a reverse proxy cannot forward client certs. |
-| `--registry-username` | Username for registry authentication. Defaults to `__token__` when `--registry-token` is set. Only needed for private registries. Also configurable with `OPENSHELL_REGISTRY_USERNAME`. |
-| `--registry-token` | Authentication token for pulling container images. For GHCR, a GitHub PAT with `read:packages` scope. Only needed for private registries. Also configurable with `OPENSHELL_REGISTRY_TOKEN`. |
-
-## Stop and Destroy
-
-Stop a gateway while preserving its state for later restart:
+Remove a local CLI registration without stopping the gateway service:
 
 ```shell
-openshell gateway stop
-```
-
-Permanently destroy a gateway and all its state:
-
-```shell
-openshell gateway destroy
-```
-
-For cloud gateways, `gateway destroy` removes only the local registration. It does not affect the remote deployment.
-
-Target a specific gateway with `--name`:
-
-```shell
-openshell gateway stop --name my-gateway
-openshell gateway destroy --name my-gateway
+openshell gateway remove production
 ```
 
 ## Troubleshoot
@@ -195,30 +113,41 @@ Check gateway health:
 
 ```shell
 openshell status
+openshell gateway info
 ```
 
-View gateway logs:
+For Docker-backed local gateways, inspect Docker and the gateway process or container started by your local workflow:
 
 ```shell
-openshell doctor logs
-openshell doctor logs --tail              # stream live
-openshell doctor logs --lines 50          # last 50 lines
+openshell doctor check
+openshell gateway info
 ```
 
-Run a command inside the gateway container for deeper inspection:
+For Kubernetes gateways, inspect the gateway workload and cluster events:
 
 ```shell
-openshell doctor exec -- kubectl get pods -A
-openshell doctor exec -- sh
+kubectl -n openshell get pods
+kubectl -n openshell logs statefulset/openshell
+kubectl -n openshell get events --sort-by=.lastTimestamp
 ```
 
-If the gateway is in a bad state, recreate it:
+For Podman or MicroVM gateways managed by systemd, inspect the user service and logs:
 
 ```shell
-openshell gateway start --recreate
+systemctl --user status openshell-gateway
+journalctl --user -u openshell-gateway --no-pager -n 50
 ```
+
+For sandbox startup failures, inspect the selected compute driver:
+
+| Compute Driver | What to check |
+|---|---|
+| Docker | Docker daemon health, image availability, gateway logs, and sandbox container state. |
+| Podman | Podman socket availability, rootless networking, image availability, and sandbox container state. |
+| Kubernetes | Events and sandbox pods in the namespace configured by `server.sandboxNamespace`. |
+| MicroVM | VM driver logs, rootfs availability, and gateway logs. |
 
 ## Next Steps
 
+- To install OpenShell and choose a compute driver, refer to [Installation](/about/installation).
 - To create a sandbox using the gateway, refer to [Manage Sandboxes](/sandboxes/manage-sandboxes).
-- To install the CLI and get started quickly, refer to the [Quickstart](/get-started/quickstart).

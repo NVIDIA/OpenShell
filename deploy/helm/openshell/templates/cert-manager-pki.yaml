@@ -1,0 +1,98 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if .Values.certManager.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "openshell.issuerSelfSigned" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "openshell.fullname" . }}-ca
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+spec:
+  isCA: true
+  commonName: openshell-ca
+  secretName: {{ .Values.certManager.caSecretName | quote }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: {{ include "openshell.issuerSelfSigned" . }}
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "openshell.fullname" . }}-ca-issuer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+spec:
+  ca:
+    secretName: {{ .Values.certManager.caSecretName | quote }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "openshell.fullname" . }}-server
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+spec:
+  secretName: {{ .Values.server.tls.certSecretName | quote }}
+  duration: {{ .Values.certManager.certificateDuration | quote }}
+  renewBefore: {{ .Values.certManager.certificateRenewBefore | quote }}
+  commonName: openshell-server
+  dnsNames:
+    {{- toYaml .Values.certManager.serverDnsNames | nindent 4 }}
+  {{- if .Values.certManager.serverIpAddresses }}
+  ipAddresses:
+    {{- toYaml .Values.certManager.serverIpAddresses | nindent 4 }}
+  {{- end }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  issuerRef:
+    name: {{ include "openshell.fullname" . }}-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "openshell.fullname" . }}-client
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+spec:
+  secretName: {{ .Values.server.tls.clientTlsSecretName | quote }}
+  duration: {{ .Values.certManager.certificateDuration | quote }}
+  renewBefore: {{ .Values.certManager.certificateRenewBefore | quote }}
+  commonName: openshell-client
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - client auth
+    - digital signature
+    - key encipherment
+  issuerRef:
+    name: {{ include "openshell.fullname" . }}-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+{{- end }}

@@ -34,9 +34,8 @@ jobs:
     with:
       component: gateway
       platform: linux/arm64
-      runner: build-arm64
 
-  build-cluster:
+  build-supervisor:
     needs: [pr_metadata]
     if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:
@@ -44,12 +43,11 @@ jobs:
       packages: write
     uses: ./.github/workflows/docker-build.yml
     with:
-      component: cluster
+      component: supervisor
       platform: linux/arm64
-      runner: build-arm64
 
   e2e:
-    needs: [pr_metadata, build-gateway, build-cluster]
+    needs: [pr_metadata, build-gateway, build-supervisor]
     if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:
       contents: read
@@ -57,4 +55,4 @@ jobs:
     uses: ./.github/workflows/e2e-test.yml
     with:
       image-tag: ${{ github.sha }}
-      runner: build-arm64
+      runner: linux-arm64-cpu8

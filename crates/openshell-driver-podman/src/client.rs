@@ -234,6 +234,18 @@ pub struct HostInfo {
     pub cgroup_version: String,
     #[serde(default)]
     pub network_backend: String,
+    #[serde(default)]
+    pub security: SecurityInfo,
+}
+
+/// Security-related fields from the Podman system info response.
+///
+/// Podman returns `host.security.rootless: true` when the daemon is
+/// running without root privileges (rootless mode).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct SecurityInfo {
+    #[serde(default)]
+    pub rootless: bool,
 }
 
 // ── Client ───────────────────────────────────────────────────────────────

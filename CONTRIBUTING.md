@@ -41,7 +41,7 @@ All open issues are actionable — if it's in the issue tracker, it's ready to b
 This project ships with [agent skills](#agent-skills-for-contributors) that can diagnose problems, explore the codebase, generate policies, and walk you through common workflows. Before filing an issue:
 
 1. Clone the repo and point your coding agent at it.
-2. Load the relevant skill - `debug-openshell-cluster` for cluster problems, `debug-inference` for inference setup problems, `openshell-cli` for usage questions, `generate-sandbox-policy` for policy help.
+2. Load the relevant skill - `debug-openshell-cluster` for gateway or deployment problems, `debug-inference` for inference setup problems, `openshell-cli` for usage questions, `generate-sandbox-policy` for policy help.
 3. Have your agent investigate. Let it run diagnostics, read the architecture docs, and attempt a fix.
 4. If the agent cannot resolve it, open an issue **with the agent's diagnostic output attached**. The issue template requires this.
 
@@ -49,7 +49,7 @@ This project ships with [agent skills](#agent-skills-for-contributors) that can 
 
 - A real bug that your agent confirmed and could not fix.
 - A feature proposal with a design — not a "please build this" request.
-- An infrastructure problem that the `debug-openshell-cluster` skill could not resolve.
+- An infrastructure problem that the gateway deployment troubleshooting skill could not resolve.
 - An inference setup problem that the `debug-inference` skill could not resolve.
 - Security vulnerabilities must follow [SECURITY.md](SECURITY.md) — **not** GitHub issues.
 
@@ -66,7 +66,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Category        | Skill                     | Purpose                                                                                             |
 | --------------- | ------------------------- | --------------------------------------------------------------------------------------------------- |
 | Getting Started | `openshell-cli`           | CLI usage, sandbox lifecycle, provider management, BYOC workflows                                   |
-| Getting Started | `debug-openshell-cluster` | Diagnose cluster startup failures and health issues                                                 |
+| Getting Started | `debug-openshell-cluster` | Diagnose gateway deployment and health issues                                                       |
 | Getting Started | `debug-inference`         | Diagnose `inference.local`, host-backed local inference, and direct external inference setup issues |
 | Contributing    | `create-spike`            | Investigate a problem, produce a structured GitHub issue                                            |
 | Contributing    | `build-from-issue`        | Plan and implement work from a GitHub issue (maintainer workflow)                                   |
@@ -92,7 +92,7 @@ Skills connect into pipelines. Individual skill files don't describe these relat
 - **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
 
 Workflow state labels use the `state:*` prefix, and security work uses `topic:security`. GitHub issue templates assign built-in issue types where applicable, and agent-created issues should use issue types or manual follow-up rather than type labels.
-New issues opened by members of the `mon-maintainers` GitHub team are automatically labeled `state:triage-needed` by the issue triage workflow.
+New issues opened by users without `write`, `maintain`, or `admin` repository permission are automatically labeled `state:triage-needed` by the issue triage workflow.
 
 ## Prerequisites
 
@@ -152,8 +152,8 @@ cargo build -p openshell-prover --features bundled-z3
 # One-time trust
 mise trust
 
-# Launch a sandbox (deploys a cluster if one isn't running)
-mise run sandbox
+# Run a standalone gateway for local development
+mise run gateway
 ```
 
 ## Building the `openshell` CLI
@@ -170,32 +170,14 @@ openshell --help
 openshell sandbox create -- codex
 ```
 
-### Cluster debugging helpers
-
-Two additional scripts in `scripts/bin/` provide gateway-aware wrappers for cluster debugging:
-
-| Script    | What it does                                                                         |
-| --------- | ------------------------------------------------------------------------------------ |
-| `kubectl` | Runs `kubectl` inside the active gateway's k3s container via `openshell doctor exec` |
-| `k9s`     | Runs `k9s` inside the active gateway's k3s container via `openshell doctor exec`     |
-
-These work for both local and remote gateways (SSH is handled automatically). Examples:
-
-```bash
-kubectl get pods -A
-kubectl logs -n openshell statefulset/openshell
-k9s
-k9s -n openshell
-```
-
 ## Main Tasks
 
 These are the primary `mise` tasks for day-to-day development:
 
 | Task               | Purpose                                                 |
 | ------------------ | ------------------------------------------------------- |
-| `mise run cluster` | Bootstrap or incremental deploy                         |
-| `mise run sandbox` | Create a sandbox on the running cluster                 |
+| `mise run gateway` | Run a standalone gateway for local development          |
+| `mise run sandbox` | Create or reconnect to the dev sandbox                  |
 | `mise run test`    | Default test suite                                      |
 | `mise run e2e`     | Default end-to-end test lane                            |
 | `mise run ci`      | Full local CI checks (lint, compile/type checks, tests) |
@@ -289,7 +271,7 @@ chore(deps): bump tokio to 1.40
 
 ### DCO
 
-All contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. See the [Developer Certificate of Origin](https://developercertificate.org/).
+All human contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. See the [Developer Certificate of Origin](https://developercertificate.org/). Dependabot-authored dependency update PRs are allowlisted because the bot cannot sign commits.
 
 ```bash
 git commit -s -m "feat(sandbox): add new capability"

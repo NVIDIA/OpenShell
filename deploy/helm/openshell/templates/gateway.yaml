@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if and .Values.grpcRoute.enabled .Values.grpcRoute.gateway.create }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ default (include "openshell.fullname" .) .Values.grpcRoute.gateway.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+spec:
+  gatewayClassName: {{ .Values.grpcRoute.gateway.className }}
+  listeners:
+    - name: http
+      port: {{ .Values.grpcRoute.gateway.listener.port }}
+      protocol: {{ .Values.grpcRoute.gateway.listener.protocol }}
+      allowedRoutes:
+        namespaces:
+          from: {{ .Values.grpcRoute.gateway.listener.allowedRoutes }}
+{{- end }}

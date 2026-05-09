@@ -389,6 +389,9 @@ fn merge_endpoint(
     if existing.host.is_empty() {
         existing.host.clone_from(&incoming.host);
     }
+    if existing.path.is_empty() {
+        existing.path.clone_from(&incoming.path);
+    }
 
     merge_endpoint_ports(existing, incoming);
     let existing_protocol = existing.protocol.clone();
@@ -506,6 +509,9 @@ fn rules_share_endpoint(
 
 fn endpoints_overlap(left: &NetworkEndpoint, right: &NetworkEndpoint) -> bool {
     if !left.host.eq_ignore_ascii_case(&right.host) {
+        return false;
+    }
+    if left.path != right.path {
         return false;
     }
 
@@ -627,6 +633,9 @@ fn expand_access_preset(access: &str) -> Option<Vec<L7Rule>> {
                     path: "**".to_string(),
                     command: String::new(),
                     query: HashMap::default(),
+                    operation_type: String::new(),
+                    operation_name: String::new(),
+                    fields: Vec::new(),
                 }),
             })
             .collect(),
@@ -797,6 +806,9 @@ mod tests {
                 path: path.to_string(),
                 command: String::new(),
                 query: HashMap::new(),
+                operation_type: String::new(),
+                operation_name: String::new(),
+                fields: Vec::new(),
             }),
         }
     }

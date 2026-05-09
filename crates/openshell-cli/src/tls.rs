@@ -6,9 +6,11 @@ use openshell_core::proto::inference_client::InferenceClient;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use rustls::{
     RootCertStore,
-    pki_types::{CertificateDer, PrivateKeyDer},
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
 };
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -37,6 +39,8 @@ pub struct TlsOptions {
     /// OIDC bearer token — when set, injects `authorization: Bearer <token>`
     /// on every gRPC request. Takes precedence over `edge_token`.
     pub oidc_token: Option<String>,
+    /// Skip TLS certificate verification for gateway connections.
+    pub gateway_insecure: bool,
 }
 
 impl TlsOptions {
@@ -48,6 +52,7 @@ impl TlsOptions {
             gateway_name: None,
             edge_token: None,
             oidc_token: None,
+            gateway_insecure: false,
         }
     }
 
@@ -224,6 +229,86 @@ pub fn build_tonic_tls_config(materials: &TlsMaterials) -> ClientTlsConfig {
         .identity(identity)
 }
 
+#[derive(Debug)]
+struct InsecureServerCertVerifier;
+
+impl ServerCertVerifier for InsecureServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[derive(Clone)]
+struct InsecureTlsConnector {
+    tls_connector: tokio_rustls::TlsConnector,
+}
+
+impl tower::Service<hyper::Uri> for InsecureTlsConnector {
+    type Response = hyper_util::rt::TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future =
+        std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: hyper::Uri) -> Self::Future {
+        let tls_connector = self.tls_connector.clone();
+        Box::pin(async move {
+            let host = uri.host().unwrap_or("localhost").to_string();
+            let port = uri.port_u16().unwrap_or(443);
+            let addr = format!("{host}:{port}");
+            let tcp = tokio::net::TcpStream::connect(addr).await?;
+            let server_name = ServerName::try_from(host)?;
+            let tls_stream = tls_connector.connect(server_name, tcp).await?;
+            Ok(hyper_util::rt::TokioIo::new(tls_stream))
+        })
+    }
+}
+
+pub fn build_insecure_rustls_config() -> Result<rustls::ClientConfig> {
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(InsecureServerCertVerifier))
+        .with_no_client_auth();
+    Ok(config)
+}
+
 /// Tunnel proxy addresses keyed by upstream endpoint + token.
 ///
 /// Each distinct edge-authenticated gateway gets its own local proxy instead of
@@ -280,6 +365,25 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
             .http2_keep_alive_interval(Duration::from_secs(10))
             .keep_alive_while_idle(true);
         return endpoint.connect().await.into_diagnostic();
+    }
+
+    if tls.gateway_insecure && server.starts_with("https://") {
+        tracing::warn!("TLS certificate verification is disabled — do not use in production");
+        let rustls_config = build_insecure_rustls_config()?;
+        let tls_connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(rustls_config));
+        let connector = InsecureTlsConnector { tls_connector };
+        // Use http:// so tonic does not layer its own TLS on top — our
+        // connector performs TLS with the insecure config.
+        let http_uri = server.replacen("https://", "http://", 1);
+        let endpoint = Endpoint::from_shared(http_uri)
+            .into_diagnostic()?
+            .connect_timeout(Duration::from_secs(10))
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .keep_alive_while_idle(true);
+        return endpoint
+            .connect_with_connector(connector)
+            .await
+            .into_diagnostic();
     }
 
     let mut endpoint = Endpoint::from_shared(server.to_string())

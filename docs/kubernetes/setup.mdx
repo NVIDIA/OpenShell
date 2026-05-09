@@ -1,0 +1,155 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Get Started on Kubernetes"
+sidebar-title: "Setup"
+description: "Deploy the OpenShell gateway to a Kubernetes cluster using the official Helm chart from GHCR."
+keywords: "Generative AI, Cybersecurity, Kubernetes, Helm, Gateway, Deployment, OCI, GHCR, Installation"
+position: 1
+---
+
+<Warning>
+The OpenShell Helm chart is experimental and under active development. Templates, values, and defaults may change between releases. Do not use it in production.
+</Warning>
+
+Use the Kubernetes deployment when the gateway should run on a shared cluster, in a cloud environment, or as part of team infrastructure. The Helm chart deploys the gateway as a StatefulSet and handles PKI bootstrap, RBAC, and sandbox namespace setup automatically.
+
+## Prerequisites
+
+Make sure the following are in place before you install.
+
+| Prerequisite | Required | Notes |
+|---|---|---|
+| Kubernetes 1.29+ with RBAC enabled | Yes | — |
+| Helm 3.x | Yes | — |
+| Agent Sandbox controller and CRDs | Yes | Install before the OpenShell chart — see [Install Agent Sandbox](#install-agent-sandbox) below |
+| cert-manager | No | See [Managing Certificates](/kubernetes/managing-certificates) — only needed if you prefer cert-manager over the built-in PKI job |
+| Kubernetes Gateway API | No | See [Ingress](/kubernetes/ingress) — only needed for external access without port-forwarding |
+
+## Install Agent Sandbox
+
+OpenShell uses the [Agent Sandbox](https://agent-sandbox.sigs.k8s.io) Kubernetes SIG project to provision sandbox pods. Install the Agent Sandbox controller and its CRDs on your cluster before installing the OpenShell Helm chart.
+
+Fetch the latest release tag and apply the manifest:
+
+```shell
+VERSION=$(curl -s https://api.github.com/repos/kubernetes-sigs/agent-sandbox/releases/latest | jq -r '.tag_name')
+kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/manifest.yaml
+```
+
+This creates the `agent-sandbox-system` namespace, installs the CRDs, and starts the controller.
+
+Confirm the controller pod is running before proceeding:
+
+```shell
+kubectl -n agent-sandbox-system get pods
+```
+
+The controller pod should reach `Running` status within a few seconds. For cluster-specific setup instructions, including KinD and GKE walkthroughs, refer to the [Agent Sandbox getting started guide](https://agent-sandbox.sigs.k8s.io/docs/getting_started/).
+
+## Install OpenShell
+
+<Steps>
+
+## Create the namespace
+
+```shell
+kubectl create namespace openshell
+```
+
+## Install the chart
+
+Install from the OCI registry on GHCR. Replace `<version>` with the chart version you want to install.
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell
+```
+
+To use the latest development build instead of a stable release:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version 0.0.0-dev \
+  --namespace openshell
+```
+
+The chart automatically generates PKI secrets and an SSH handshake secret on first install using pre-install Helm hooks. No manual secret creation is required.
+
+## Wait for the gateway to be ready
+
+```shell
+kubectl -n openshell rollout status statefulset/openshell
+```
+
+## Connect to the gateway
+
+For local evaluation, use a port-forward:
+
+```shell
+kubectl -n openshell port-forward svc/openshell 8080:8080
+```
+
+<Warning>
+The port-forward is for local evaluation only. For shared environments, expose the gateway through your ingress controller or access proxy. See [Ingress](/kubernetes/ingress) for an external access option.
+</Warning>
+
+## Install the client mTLS certificate
+
+The default installation runs with mTLS enabled by default. The CLI needs the client certificate, key, and CA that the chart's PKI hook generated. Extract them from the `openshell-client-tls` secret and place them where the CLI expects them for a gateway named `k8s`:
+
+```shell
+mkdir -p ~/.config/openshell/gateways/k8s/mtls
+kubectl -n openshell get secret openshell-client-tls \
+  -o jsonpath='{.data.ca\.crt}'  | base64 -d > ~/.config/openshell/gateways/k8s/mtls/ca.crt
+kubectl -n openshell get secret openshell-client-tls \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d > ~/.config/openshell/gateways/k8s/mtls/tls.crt
+kubectl -n openshell get secret openshell-client-tls \
+  -o jsonpath='{.data.tls\.key}' | base64 -d > ~/.config/openshell/gateways/k8s/mtls/tls.key
+```
+
+The server certificate SANs include `localhost` and `127.0.0.1`, so hostname verification passes over the port-forward without extra flags.
+
+## Register with the CLI
+
+In another terminal, register the gateway and verify it is reachable:
+
+```shell
+openshell gateway add https://127.0.0.1:8080 --local --name k8s
+openshell status
+```
+
+</Steps>
+
+## Configure Chart Values
+
+The most commonly changed values are:
+
+| Value | Purpose |
+|---|---|
+| `image.repository` / `image.tag` | Gateway container image. Defaults to `ghcr.io/nvidia/openshell/gateway:latest`. |
+| `server.sandboxNamespace` | Namespace where sandbox pods are created. |
+| `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |
+| `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
+| `server.sshGatewayHost` / `server.sshGatewayPort` | Public host and port returned to CLI clients for SSH proxy connections. Required when the gateway is exposed externally. |
+| `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
+
+Use a values file for repeatable deployments:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --values my-values.yaml
+```
+
+## Next Steps
+
+- To enable automatic certificate rotation with cert-manager, see [Managing Certificates](/kubernetes/managing-certificates).
+- To expose the gateway externally without port-forwarding, see [Ingress](/kubernetes/ingress).
+- To configure OIDC or reverse-proxy authentication, see [Access Control](/kubernetes/access-control).
+- To create your first sandbox, see [Manage Sandboxes](/sandboxes/manage-sandboxes).

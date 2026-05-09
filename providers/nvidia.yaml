@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: nvidia
+display_name: NVIDIA
+description: NVIDIA inference endpoints
+category: inference
+inference_capable: true
+credentials:
+  - name: api_key
+    description: NVIDIA API key
+    env_vars: [NVIDIA_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: integrate.api.nvidia.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/bin/curl, /usr/local/bin/curl]

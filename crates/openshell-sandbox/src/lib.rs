@@ -15,11 +15,14 @@ pub mod log_push;
 pub mod mechanistic_mapper;
 pub mod opa;
 mod policy;
+mod policy_local;
 mod process;
 pub mod procfs;
+mod provider_credentials;
 pub mod proxy;
 mod sandbox;
 mod secrets;
+mod skills;
 mod ssh;
 mod supervisor_session;
 
@@ -87,6 +90,83 @@ pub(crate) fn ocsf_ctx() -> &'static SandboxContext {
     OCSF_CTX.get().unwrap_or(&OCSF_CTX_FALLBACK)
 }
 
+/// Process-wide flag for the agent-driven policy proposal surface.
+/// Set once during `run_sandbox()` startup and updated by the settings poll
+/// loop when `agent_policy_proposals_enabled` changes. Read by the
+/// `policy.local` route handler and the L7 deny body's `next_steps` builder
+/// to gate the agent-controlled mutation surface. Exposed `pub(crate)` so
+/// unit tests in sibling modules can flip the flag through a serialized
+/// guard (see `policy_local::tests::ProposalsFlagGuard`).
+pub(crate) static AGENT_PROPOSALS_ENABLED: OnceLock<Arc<std::sync::atomic::AtomicBool>> =
+    OnceLock::new();
+
+/// Read the current value of the agent proposals feature flag.
+///
+/// Returns `false` if `run_sandbox()` has not initialized the flag (e.g.
+/// during unit tests), matching the documented default for the setting.
+pub(crate) fn agent_proposals_enabled() -> bool {
+    AGENT_PROPOSALS_ENABLED
+        .get()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+/// Test-only helpers shared across sibling test modules.
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    #![allow(
+        clippy::redundant_pub_crate,
+        reason = "intentional crate-private module"
+    )]
+    use std::sync::Arc;
+    use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::MutexGuard;
+
+    static PROPOSALS_FLAG_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// Guard for tests that toggle the process-wide
+    /// `AGENT_PROPOSALS_ENABLED` flag. Acquires a process-wide async mutex,
+    /// swaps in the requested value, and restores the previous value on drop.
+    /// Hold the guard for the duration of any code that reads
+    /// `agent_proposals_enabled()`.
+    pub(crate) struct ProposalsFlagGuard {
+        prev: bool,
+        flag: Arc<AtomicBool>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl ProposalsFlagGuard {
+        pub(crate) async fn set(enabled: bool) -> Self {
+            let lock = PROPOSALS_FLAG_LOCK.lock().await;
+            Self::with_lock(enabled, lock)
+        }
+
+        pub(crate) fn set_blocking(enabled: bool) -> Self {
+            let lock = PROPOSALS_FLAG_LOCK.blocking_lock();
+            Self::with_lock(enabled, lock)
+        }
+
+        fn with_lock(enabled: bool, lock: MutexGuard<'static, ()>) -> Self {
+            let flag = super::AGENT_PROPOSALS_ENABLED
+                .get_or_init(|| Arc::new(AtomicBool::new(false)))
+                .clone();
+            let prev = flag.swap(enabled, Ordering::Relaxed);
+            Self {
+                prev,
+                flag,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ProposalsFlagGuard {
+        fn drop(&mut self) {
+            self.flag.store(self.prev, Ordering::Relaxed);
+        }
+    }
+}
+
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
@@ -97,7 +177,6 @@ use crate::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
-use crate::secrets::SecretResolver;
 pub use process::{ProcessHandle, ProcessStatus};
 pub use sandbox::apply_supervisor_startup_hardening;
 
@@ -260,6 +339,11 @@ pub async fn run_sandbox(
         policy_data,
     )
     .await?;
+    let policy_local_ctx = Arc::new(policy_local::PolicyLocalContext::new(
+        retained_proto.clone(),
+        openshell_endpoint.clone(),
+        sandbox_name_for_agg.clone().or_else(|| sandbox_id.clone()),
+    ));
 
     // Validate that the required "sandbox" user exists in this image.
     // All sandbox images must include this user for privilege dropping.
@@ -304,11 +388,12 @@ pub async fn run_sandbox(
         grpc_client::ProviderEnvironment::default()
     };
 
-    let (provider_env, secret_resolver) = SecretResolver::from_provider_env_with_passthrough(
+    let provider_credentials = provider_credentials::ProviderCredentialState::from_environment(
+        resolved.provider_env_revision,
         resolved.environment,
         &resolved.passthrough_keys,
     );
-    let secret_resolver = secret_resolver.map(Arc::new);
+    let provider_env = provider_credentials.snapshot().child_env.clone();
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
@@ -317,6 +402,49 @@ pub async fn run_sandbox(
 
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
+
+    // Initialize the agent-proposals feature flag. Default false until the
+    // initial settings fetch (or the poll loop) tells us otherwise. The flag
+    // gates the skill install, the policy.local route handler, and the L7
+    // deny body's `next_steps` field — see `agent_proposals_enabled()`.
+    let proposals_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if AGENT_PROPOSALS_ENABLED
+        .set(proposals_enabled.clone())
+        .is_err()
+    {
+        debug!("agent proposals flag already initialized, keeping existing");
+    }
+
+    // Eagerly fetch the initial settings so skill install can honor the flag
+    // at startup rather than waiting for the poll loop's first tick. In
+    // offline/file-mode there is no gateway, so the flag stays false.
+    if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint)
+        && let Ok(client) = grpc_client::CachedOpenShellClient::connect(endpoint).await
+        && let Ok(result) = client.poll_settings(id).await
+    {
+        let initial = extract_bool_setting(
+            &result.settings,
+            openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY,
+        )
+        .unwrap_or(false);
+        proposals_enabled.store(initial, Ordering::Relaxed);
+    }
+
+    if agent_proposals_enabled() {
+        match skills::install_static_skills() {
+            Ok(installed) => {
+                info!(
+                    path = %installed.policy_advisor.display(),
+                    "Installed sandbox agent skill"
+                );
+            }
+            Err(error) => {
+                warn!(error = %error, "Failed to install sandbox agent skill");
+            }
+        }
+    } else {
+        debug!("agent_policy_proposals_enabled is false at startup; skipping skill install");
+    }
 
     // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
     // The CA cert is written to disk so sandbox processes can trust it.
@@ -484,7 +612,8 @@ pub async fn run_sandbox(
             entrypoint_pid.clone(),
             tls_state,
             inference_ctx,
-            secret_resolver.clone(),
+            Some(provider_credentials.clone()),
+            Some(policy_local_ctx.clone()),
             denial_tx,
         )
         .await?;
@@ -623,7 +752,7 @@ pub async fn run_sandbox(
         let proxy_url = ssh_proxy_url;
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
-        let provider_env_clone = provider_env.clone();
+        let provider_credentials_clone = provider_credentials.clone();
 
         let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
 
@@ -636,7 +765,7 @@ pub async fn run_sandbox(
                 netns_fd,
                 proxy_url,
                 ca_paths,
-                provider_env_clone,
+                provider_credentials_clone,
             )
             .await
             {
@@ -800,22 +929,25 @@ pub async fn run_sandbox(
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_enabled.clone();
         let poll_pid = entrypoint_pid.clone();
+        let poll_provider_credentials = provider_credentials.clone();
+        let poll_policy_local = policy_local_ctx.clone();
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
+        let poll_ctx = PolicyPollLoopContext {
+            endpoint: poll_endpoint,
+            sandbox_id: poll_id,
+            opa_engine: poll_engine,
+            entrypoint_pid: poll_pid,
+            interval_secs: poll_interval_secs,
+            ocsf_enabled: poll_ocsf_enabled,
+            provider_credentials: poll_provider_credentials,
+            policy_local_ctx: Some(poll_policy_local),
+        };
 
         tokio::spawn(async move {
-            if let Err(e) = run_policy_poll_loop(
-                &poll_endpoint,
-                &poll_id,
-                &poll_engine,
-                &poll_pid,
-                poll_interval_secs,
-                &poll_ocsf_enabled,
-            )
-            .await
-            {
+            if let Err(e) = run_policy_poll_loop(poll_ctx).await {
                 ocsf_emit!(
                     AppLifecycleBuilder::new(ocsf_ctx())
                         .activity(ActivityId::Fail)
@@ -1241,14 +1373,31 @@ const PROXY_BASELINE_READ_WRITE: &[&str] = &["/sandbox", "/tmp"];
 /// socket at init time.  If the directory exists but Landlock denies traversal
 /// (EACCES vs ECONNREFUSED), NVML returns `NVML_ERROR_INSUFFICIENT_PERMISSIONS`
 /// even though the daemon is optional.  Only read/traversal access is needed.
-const GPU_BASELINE_READ_ONLY: &[&str] = &["/run/nvidia-persistenced"];
+///
+/// `/usr/lib/wsl`: On WSL2, CDI bind-mounts GPU libraries (libdxcore.so,
+/// libcuda.so.1.1, etc.) into paths under `/usr/lib/wsl/`.  Although `/usr`
+/// is already in `PROXY_BASELINE_READ_ONLY`, individual file bind-mounts may
+/// not be covered by the parent-directory Landlock rule when the mount crosses
+/// a filesystem boundary.  Listing `/usr/lib/wsl` explicitly ensures traversal
+/// is permitted regardless of Landlock's cross-mount behaviour.
+const GPU_BASELINE_READ_ONLY: &[&str] = &[
+    "/run/nvidia-persistenced",
+    "/usr/lib/wsl", // WSL2: CDI-injected GPU library directory
+];
 
 /// GPU read-write paths (static).
 ///
 /// `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`,
-/// `/dev/nvidia-modeset`: control and UVM devices injected by CDI.
-/// Landlock restricts `open(2)` on device files even when DAC allows it;
-/// these need read-write because NVML/CUDA opens them with `O_RDWR`.
+/// `/dev/nvidia-modeset`: control and UVM devices injected by CDI on native
+/// Linux.  Landlock restricts `open(2)` on device files even when DAC allows
+/// it; these need read-write because NVML/CUDA opens them with `O_RDWR`.
+/// These devices do not exist on WSL2 and will be skipped by the existence
+/// check in `enrich_proto_baseline_paths()`.
+///
+/// `/dev/dxg`: On WSL2, NVIDIA GPUs are exposed through the DXG kernel driver
+/// (DirectX Graphics) rather than the native nvidia* devices.  CDI injects
+/// `/dev/dxg` as the sole GPU device node; it does not exist on native Linux
+/// and will be skipped there by the existence check.
 ///
 /// `/proc`: CUDA writes to `/proc/<pid>/task/<tid>/comm` during `cuInit()`
 /// to set thread names.  Without write access, `cuInit()` returns error 304.
@@ -1262,12 +1411,17 @@ const GPU_BASELINE_READ_WRITE: &[&str] = &[
     "/dev/nvidia-uvm",
     "/dev/nvidia-uvm-tools",
     "/dev/nvidia-modeset",
+    "/dev/dxg", // WSL2: DXG device (GPU via DirectX kernel driver, injected by CDI)
     "/proc",
 ];
 
 /// Returns true if GPU devices are present in the container.
+///
+/// Checks both the native Linux NVIDIA control device (`/dev/nvidiactl`) and
+/// the WSL2 DXG device (`/dev/dxg`).  CDI injects exactly one of these
+/// depending on the host kernel; the other will not exist.
 fn has_gpu_devices() -> bool {
-    std::path::Path::new("/dev/nvidiactl").exists()
+    std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/dxg").exists()
 }
 
 /// Enumerate per-GPU device nodes (`/dev/nvidia0`, `/dev/nvidia1`, …).
@@ -1547,6 +1701,17 @@ mod baseline_tests {
     }
 
     #[test]
+    fn gpu_baseline_read_write_contains_dxg() {
+        // /dev/dxg must be present so WSL2 sandboxes get the Landlock
+        // read-write rule for the CDI-injected DXG device.  The existence
+        // check in enrich_proto_baseline_paths() skips it on native Linux.
+        assert!(
+            GPU_BASELINE_READ_WRITE.contains(&"/dev/dxg"),
+            "/dev/dxg must be in GPU_BASELINE_READ_WRITE for WSL2 support"
+        );
+    }
+
+    #[test]
     fn local_enrichment_preserves_explicit_read_only_for_baseline_read_write_paths() {
         let mut policy = SandboxPolicy {
             version: 1,
@@ -1578,6 +1743,29 @@ mod baseline_tests {
                 .read_write
                 .contains(&std::path::PathBuf::from("/tmp")),
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
+        );
+    }
+
+    #[test]
+    fn gpu_baseline_read_only_contains_usr_lib_wsl() {
+        // /usr/lib/wsl must be present so CDI-injected WSL2 GPU library
+        // bind-mounts are accessible under Landlock.  Skipped on native Linux.
+        assert!(
+            GPU_BASELINE_READ_ONLY.contains(&"/usr/lib/wsl"),
+            "/usr/lib/wsl must be in GPU_BASELINE_READ_ONLY for WSL2 CDI library paths"
+        );
+    }
+
+    #[test]
+    fn has_gpu_devices_reflects_dxg_or_nvidiactl() {
+        // Verify the OR logic: result must match the manual disjunction of
+        // the two path checks.  Passes in all environments.
+        let nvidiactl = std::path::Path::new("/dev/nvidiactl").exists();
+        let dxg = std::path::Path::new("/dev/dxg").exists();
+        assert_eq!(
+            has_gpu_devices(),
+            nvidiactl || dxg,
+            "has_gpu_devices() should be true iff /dev/nvidiactl or /dev/dxg exists"
         );
     }
 }
@@ -2093,20 +2281,25 @@ async fn flush_proposals_to_gateway(
 ///
 /// When the entrypoint PID is available, policy reloads include symlink
 /// resolution for binary paths via the container filesystem.
-async fn run_policy_poll_loop(
-    endpoint: &str,
-    sandbox_id: &str,
-    opa_engine: &Arc<OpaEngine>,
-    entrypoint_pid: &Arc<AtomicU32>,
+struct PolicyPollLoopContext {
+    endpoint: String,
+    sandbox_id: String,
+    opa_engine: Arc<OpaEngine>,
+    entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
-    ocsf_enabled: &std::sync::atomic::AtomicBool,
-) -> Result<()> {
+    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
+    provider_credentials: provider_credentials::ProviderCredentialState,
+    policy_local_ctx: Option<Arc<policy_local::PolicyLocalContext>>,
+}
+
+async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     use crate::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::PolicySource;
     use std::sync::atomic::Ordering;
 
-    let client = CachedOpenShellClient::connect(endpoint).await?;
+    let client = CachedOpenShellClient::connect(&ctx.endpoint).await?;
     let mut current_config_revision: u64 = 0;
+    let mut current_provider_env_revision: u64 = ctx.provider_credentials.snapshot().revision;
     let mut current_policy_hash = String::new();
     let mut current_settings: std::collections::HashMap<
         String,
@@ -2114,7 +2307,7 @@ async fn run_policy_poll_loop(
     > = std::collections::HashMap::new();
 
     // Initialize revision from the first poll.
-    match client.poll_settings(sandbox_id).await {
+    match client.poll_settings(&ctx.sandbox_id).await {
         Ok(result) => {
             current_config_revision = result.config_revision;
             current_policy_hash = result.policy_hash.clone();
@@ -2129,11 +2322,11 @@ async fn run_policy_poll_loop(
         }
     }
 
-    let interval = Duration::from_secs(interval_secs);
+    let interval = Duration::from_secs(ctx.interval_secs);
     loop {
         tokio::time::sleep(interval).await;
 
-        let result = match client.poll_settings(sandbox_id).await {
+        let result = match client.poll_settings(&ctx.sandbox_id).await {
             Ok(r) => r,
             Err(e) => {
                 debug!(error = %e, "Settings poll: server unreachable, will retry");
@@ -2141,7 +2334,8 @@ async fn run_policy_poll_loop(
             }
         };
 
-        if result.config_revision == current_config_revision {
+        let provider_env_changed = result.provider_env_revision != current_provider_env_revision;
+        if result.config_revision == current_config_revision && !provider_env_changed {
             continue;
         }
 
@@ -2157,11 +2351,46 @@ async fn run_policy_poll_loop(
             .unmapped("old_config_revision", serde_json::json!(current_config_revision))
             .unmapped("new_config_revision", serde_json::json!(result.config_revision))
             .unmapped("policy_changed", serde_json::json!(policy_changed))
+            .unmapped("provider_env_changed", serde_json::json!(provider_env_changed))
             .message(format!(
-                "Settings poll: config change detected [old_revision:{current_config_revision} new_revision:{} policy_changed:{policy_changed}]",
+                "Settings poll: config change detected [old_revision:{current_config_revision} new_revision:{} policy_changed:{policy_changed} provider_env_changed:{provider_env_changed}]",
                 result.config_revision
             ))
             .build());
+
+        if provider_env_changed {
+            match grpc_client::fetch_provider_environment(&ctx.endpoint, &ctx.sandbox_id).await {
+                Ok(env_result) => {
+                    let env_count = ctx.provider_credentials.install_environment(
+                        env_result.provider_env_revision,
+                        env_result.environment,
+                        &env_result.passthrough_keys,
+                    );
+                    current_provider_env_revision = env_result.provider_env_revision;
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .unmapped(
+                                "provider_env_revision",
+                                serde_json::json!(current_provider_env_revision)
+                            )
+                            .message(format!(
+                                "Provider environment refreshed [revision:{current_provider_env_revision} env_count:{env_count}]"
+                            ))
+                            .build()
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        provider_env_revision = result.provider_env_revision,
+                        "Settings poll: failed to refresh provider environment"
+                    );
+                }
+            }
+        }
 
         // Only reload OPA when the policy payload actually changed.
         if policy_changed {
@@ -2178,9 +2407,12 @@ async fn run_policy_poll_loop(
                 continue;
             };
 
-            let pid = entrypoint_pid.load(Ordering::Acquire);
-            match opa_engine.reload_from_proto_with_pid(policy, pid) {
+            let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
+            match ctx.opa_engine.reload_from_proto_with_pid(policy, pid) {
                 Ok(()) => {
+                    if let Some(policy_local_ctx) = ctx.policy_local_ctx.as_ref() {
+                        policy_local_ctx.set_current_policy(policy.clone()).await;
+                    }
                     if result.global_policy_version > 0 {
                         ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Informational)
@@ -2211,7 +2443,7 @@ async fn run_policy_poll_loop(
                     if result.version > 0
                         && result.policy_source == PolicySource::Sandbox
                         && let Err(e) = client
-                            .report_policy_status(sandbox_id, result.version, true, "")
+                            .report_policy_status(&ctx.sandbox_id, result.version, true, "")
                             .await
                     {
                         warn!(error = %e, "Failed to report policy load success");
@@ -2232,7 +2464,12 @@ async fn run_policy_poll_loop(
                     if result.version > 0
                         && result.policy_source == PolicySource::Sandbox
                         && let Err(report_err) = client
-                            .report_policy_status(sandbox_id, result.version, false, &e.to_string())
+                            .report_policy_status(
+                                &ctx.sandbox_id,
+                                result.version,
+                                false,
+                                &e.to_string(),
+                            )
                             .await
                     {
                         warn!(error = %report_err, "Failed to report policy load failure");
@@ -2243,9 +2480,43 @@ async fn run_policy_poll_loop(
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
         let new_ocsf = extract_bool_setting(&result.settings, "ocsf_json_enabled").unwrap_or(false);
-        let prev_ocsf = ocsf_enabled.swap(new_ocsf, Ordering::Relaxed);
+        let prev_ocsf = ctx.ocsf_enabled.swap(new_ocsf, Ordering::Relaxed);
         if new_ocsf != prev_ocsf {
             info!(ocsf_json_enabled = new_ocsf, "OCSF JSONL logging toggled");
+        }
+
+        // Apply the agent-proposals feature toggle. On a false→true transition
+        // we lazily install the skill so a sandbox that started with the flag
+        // off picks up the surface without a recreate. We never uninstall on
+        // a true→false transition: stale skill content on disk is harmless
+        // because route_request and agent_next_steps both gate on the live
+        // atomic, so the agent that reads the skill will see 404s and an
+        // empty `next_steps` array regardless.
+        if let Some(flag) = AGENT_PROPOSALS_ENABLED.get() {
+            let new_proposals = extract_bool_setting(
+                &result.settings,
+                openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY,
+            )
+            .unwrap_or(false);
+            let prev_proposals = flag.swap(new_proposals, Ordering::Relaxed);
+            if new_proposals != prev_proposals {
+                info!(
+                    agent_policy_proposals_enabled = new_proposals,
+                    "agent-driven policy proposals toggled"
+                );
+                if new_proposals && !prev_proposals {
+                    match skills::install_static_skills() {
+                        Ok(installed) => info!(
+                            path = %installed.policy_advisor.display(),
+                            "Installed sandbox agent skill on toggle-on"
+                        ),
+                        Err(error) => warn!(
+                            error = %error,
+                            "Failed to install sandbox agent skill on toggle-on"
+                        ),
+                    }
+                }
+            }
         }
 
         current_config_revision = result.config_revision;

@@ -44,9 +44,11 @@ spec:
         - name: {{ .Chart.Name }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "openshell.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
+            - --bind-address
+            - "0.0.0.0"
             - --port
             - {{ .Values.service.port | quote }}
             - --health-port
@@ -61,15 +63,21 @@ spec:
             - {{ .Values.server.dbUrl | quote }}
           env:
             - name: OPENSHELL_SANDBOX_NAMESPACE
-              value: {{ .Values.server.sandboxNamespace | quote }}
+              value: {{ include "openshell.sandboxNamespace" . | quote }}
             - name: OPENSHELL_SANDBOX_IMAGE
               value: {{ .Values.server.sandboxImage | quote }}
             {{- if .Values.server.sandboxImagePullPolicy }}
             - name: OPENSHELL_SANDBOX_IMAGE_PULL_POLICY
               value: {{ .Values.server.sandboxImagePullPolicy | quote }}
             {{- end }}
+            - name: OPENSHELL_SUPERVISOR_IMAGE
+              value: {{ include "openshell.supervisorImage" . | quote }}
+            {{- if .Values.supervisor.image.pullPolicy }}
+            - name: OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY
+              value: {{ .Values.supervisor.image.pullPolicy | quote }}
+            {{- end }}
             - name: OPENSHELL_GRPC_ENDPOINT
-              value: {{ if .Values.server.disableTls }}{{ .Values.server.grpcEndpoint | replace "https://" "http://" | quote }}{{ else }}{{ .Values.server.grpcEndpoint | quote }}{{ end }}
+              value: {{ include "openshell.grpcEndpoint" . | quote }}
             {{- if .Values.server.sshGatewayHost }}
             - name: OPENSHELL_SSH_GATEWAY_HOST
               value: {{ .Values.server.sshGatewayHost | quote }}
@@ -81,6 +89,10 @@ spec:
             {{- if .Values.server.hostGatewayIP }}
             - name: OPENSHELL_HOST_GATEWAY_IP
               value: {{ .Values.server.hostGatewayIP | quote }}
+            {{- end }}
+            {{- if .Values.server.enableUserNamespaces }}
+            - name: OPENSHELL_ENABLE_USER_NAMESPACES
+              value: "true"
             {{- end }}
             - name: OPENSHELL_SSH_HANDSHAKE_SECRET
               valueFrom:
@@ -183,7 +195,14 @@ spec:
             secretName: {{ .Values.server.tls.certSecretName }}
         - name: tls-client-ca
           secret:
+            {{- if or .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+            secretName: {{ .Values.server.tls.certSecretName }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+            {{- else }}
             secretName: {{ .Values.server.tls.clientCaSecretName }}
+            {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

@@ -247,17 +247,29 @@ network_policies:
     endpoints:
       - host: api.github.com
         port: 443
+        path: "/repos/<org>/<repo>/**"
         protocol: rest
         enforcement: enforce
         rules:
-          # GraphQL API (used by gh CLI)
-          - allow:
-              method: POST
-              path: "/graphql"
           # Full read-write access to the repository
           - allow:
               method: "*"
               path: "/repos/<org>/<repo>/**"
+      - host: api.github.com
+        port: 443
+        path: "/graphql"
+        protocol: graphql
+        enforcement: enforce
+        rules:
+          # GitHub GraphQL API (used by gh CLI)
+          - allow:
+              operation_type: query
+          - allow:
+              operation_type: mutation
+              fields: [createIssue, updateIssue, addComment]
+        deny_rules:
+          - operation_type: mutation
+            fields: [deleteRepository, deleteRef, updateBranchProtectionRule]
     binaries:
       - { path: /usr/local/bin/claude }
       - { path: /usr/local/bin/opencode }
@@ -334,7 +346,7 @@ The push completes successfully. The `openshell term` dashboard now shows `l7_de
 
 ## Clean Up
 
-When you are finished, delete the sandbox to free cluster resources:
+When you are finished, delete the sandbox to free gateway compute resources:
 
 ```shell
 openshell sandbox delete <sandbox-name>
@@ -348,4 +360,4 @@ The following resources cover related topics in greater depth:
 
 - To add per-repository access levels (read-write vs read-only) or restrict to specific API methods, refer to the [Policy Schema Reference](/reference/policy-schema).
 - To learn the full policy iteration workflow (pull, edit, push, verify), refer to [Policies](/sandboxes/policies).
-- To inject credentials automatically instead of pasting tokens, refer to [Manage Providers](/sandboxes/manage-providers
+- To inject credentials automatically instead of pasting tokens, refer to [Manage Providers](/sandboxes/manage-providers)

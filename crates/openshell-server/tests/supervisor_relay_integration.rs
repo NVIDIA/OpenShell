@@ -111,6 +111,24 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::ListSandboxesResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn list_sandbox_providers(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListSandboxProvidersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxProvidersResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn attach_sandbox_provider(
+        &self,
+        _: tonic::Request<openshell_core::proto::AttachSandboxProviderRequest>,
+    ) -> Result<Response<openshell_core::proto::AttachSandboxProviderResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn detach_sandbox_provider(
+        &self,
+        _: tonic::Request<openshell_core::proto::DetachSandboxProviderRequest>,
+    ) -> Result<Response<openshell_core::proto::DetachSandboxProviderResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
     async fn delete_sandbox(
         &self,
         _: tonic::Request<openshell_core::proto::DeleteSandboxRequest>,
@@ -172,6 +190,42 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::ListProvidersResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+
+    async fn list_provider_profiles(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn import_provider_profiles(
+        &self,
+        _: tonic::Request<openshell_core::proto::ImportProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ImportProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn lint_provider_profiles(
+        &self,
+        _: tonic::Request<openshell_core::proto::LintProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::LintProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_provider_profile(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn delete_provider(
         &self,
         _: tonic::Request<openshell_core::proto::DeleteProviderRequest>,

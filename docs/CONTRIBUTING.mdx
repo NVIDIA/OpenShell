@@ -126,7 +126,7 @@ These patterns are common in LLM-generated text and erode trust with technical r
 - Use `shell` code blocks for copyable CLI examples. Do not prefix commands with `$`:
 
   ```shell
-  openshell gateway start
+  openshell gateway add http://127.0.0.1:18080 --local --name local
   ```
 
 - Use `text` code blocks for transcripts, log output, and examples that should not be copied verbatim.
@@ -168,7 +168,7 @@ docs: update gateway deployment instructions
 If your doc change accompanies a code change, include both in the same PR and use the code change's commit type:
 
 ```text
-feat(cli): add --gpu flag to gateway start
+feat(cli): add gateway registration flag
 ```
 
 ## Reviewing Doc PRs

@@ -43,7 +43,7 @@ required_prebuilt_binaries() {
 		gateway)
 			echo "openshell-gateway"
 			;;
-		supervisor|cluster|supervisor-output)
+		supervisor|supervisor-sideload|supervisor-output)
 			echo "openshell-sandbox"
 			;;
 	esac
@@ -90,7 +90,7 @@ ensure_prebuilt_binaries() {
 	fi
 }
 
-TARGET=${1:?"Usage: docker-build-image.sh <gateway|supervisor|cluster|supervisor-output> [extra-args...]"}
+TARGET=${1:?"Usage: docker-build-image.sh <gateway|supervisor|supervisor-output> [extra-args...]"}
 shift
 
 DOCKERFILE="deploy/docker/Dockerfile.images"
@@ -113,15 +113,11 @@ case "${TARGET}" in
     IMAGE_NAME="openshell/supervisor"
     DOCKER_TARGET="supervisor"
     ;;
-  cluster)
-    IS_FINAL_IMAGE=1
-    IMAGE_NAME="openshell/cluster"
-    DOCKER_TARGET="cluster"
-    ;;
   supervisor-output)
+    # Backward-compat alias: same as "supervisor".
     IS_FINAL_IMAGE=1
     IMAGE_NAME="openshell/supervisor"
-    DOCKER_TARGET="supervisor-output"
+    DOCKER_TARGET="supervisor"
     ;;
   *)
     echo "Error: unsupported target '${TARGET}'" >&2
@@ -160,17 +156,6 @@ if [[ -z "${CI:-}" ]]; then
 	fi
 fi
 
-# The cluster image embeds the packaged Helm chart.
-if [[ "${TARGET}" == "cluster" ]]; then
-	mkdir -p deploy/docker/.build/charts
-	helm package deploy/helm/openshell -d deploy/docker/.build/charts/ >/dev/null
-fi
-
-K3S_ARGS=()
-if [[ "${TARGET}" == "cluster" && -n "${K3S_VERSION:-}" ]]; then
-	K3S_ARGS=(--build-arg "K3S_VERSION=${K3S_VERSION}")
-fi
-
 ensure_prebuilt_binaries "${TARGET}"
 
 TAG_ARGS=()
@@ -198,7 +183,6 @@ ce_build \
 	${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} \
 	${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
 	${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
-	${K3S_ARGS[@]+"${K3S_ARGS[@]}"} \
 	-f "${DOCKERFILE}" \
 	--target "${DOCKER_TARGET}" \
 	${TAG_ARGS[@]+"${TAG_ARGS[@]}"} \
