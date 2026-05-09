@@ -204,7 +204,7 @@ After cleanup, rerun this installer or follow the installation guide:
 
 If you have already backed up and cleaned up the old runtime, rerun with:
 
-    OPENSHELL_ACK_BREAKING_UPGRADE=1 sh install.sh
+    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_ACK_BREAKING_UPGRADE=1 sh
 
 EOF
 }
