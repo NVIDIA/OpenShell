@@ -2,16 +2,16 @@
 
 Substantial changes to OpenShell should be proposed in writing before implementation begins. An RFC provides a consistent way to propose an idea, collect feedback from the community, build consensus, and document the decision for future contributors. Not every change needs an RFC — bug fixes, small features, and routine maintenance go through normal pull requests. RFCs are for the changes that are cross-cutting, potentially controversial, or significant enough that stakeholders should weigh in before code is written.
 
-## Start with a GitHub Discussion
+## Start with a GitHub issue
 
-Before writing an RFC, consider opening a [GitHub Discussion](https://github.com/NVIDIA/OpenShell/discussions) to gauge interest and get early feedback. This helps:
+Before writing an RFC, consider opening a [GitHub issue](https://github.com/NVIDIA/OpenShell/issues/new/choose) to scope the problem, gauge interest, and get early feedback. This helps:
 
 - Validate that the problem is worth solving
 - Surface potential concerns early
 - Build consensus before investing in a detailed proposal
 - Identify the right reviewers and stakeholders
 
-If the discussion shows sufficient interest and the idea has merit, then it's time to write an RFC to detail the plan and technical approach.
+If the ticket shows sufficient interest and the idea has merit, then it's time to write an RFC to detail the plan and technical approach.
 
 ## RFCs vs other artifacts
 
@@ -19,7 +19,7 @@ OpenShell has several places where design information lives. Use this guide to p
 
 | Artifact | Purpose | When to use |
 |----------|---------|-------------|
-| **GitHub Discussion** | Gauge interest in a rough idea | You have a thought but aren't sure it's worth a proposal yet |
+| **GitHub issue** | Track and scope a rough idea | You have a thought but aren't sure it's worth a proposal yet |
 | **Spike issue** (`create-spike`) | Investigate implementation feasibility for a scoped change | You need to explore the codebase and produce a buildable issue for a specific component or feature |
 | **RFC** | Propose a cross-cutting decision that needs broad consensus | Architectural changes, API contracts, process changes, or anything that spans multiple components or teams |
 | **Architecture doc** (`architecture/`) | Document how things work today | Living reference material — updated as the system evolves |
@@ -61,7 +61,7 @@ authors:
 state: draft
 links:
   - https://github.com/NVIDIA/OpenShell/pull/123
-  - https://github.com/NVIDIA/OpenShell/discussions/456
+  - https://github.com/NVIDIA/OpenShell/issues/456
 ---
 ```
 
@@ -69,7 +69,7 @@ We track the following metadata:
 
 - **authors**: The authors (and therefore owners) of an RFC. Listed as GitHub usernames.
 - **state**: Must be one of the states discussed below.
-- **links**: Related PRs, discussions, or issues. Add entries as the RFC progresses.
+- **links**: Related PRs or issues. Add entries as the RFC progresses.
 - **superseded_by**: *(optional)* For RFCs in the `superseded` state, the RFC number that replaces this one (e.g., `0005`).
 
 An RFC can be in one of the following states:

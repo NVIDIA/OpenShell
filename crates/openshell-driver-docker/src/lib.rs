@@ -9,8 +9,8 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, DeviceRequest,
-    EndpointSettings, HostConfig, Mount, MountTypeEnum, NetworkCreateRequest, NetworkingConfig,
-    RestartPolicy, RestartPolicyNameEnum, SystemInfo,
+    EndpointSettings, HostConfig, NetworkCreateRequest, NetworkingConfig, RestartPolicy,
+    RestartPolicyNameEnum, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -865,28 +865,22 @@ impl ComputeDriver for DockerComputeDriver {
     }
 }
 
-fn build_mounts(config: &DockerDriverRuntimeConfig) -> Vec<Mount> {
-    let mut mounts = vec![bind_mount(
-        &config.supervisor_bin,
-        SUPERVISOR_MOUNT_PATH,
-        true,
+fn build_binds(config: &DockerDriverRuntimeConfig) -> Vec<String> {
+    let mut binds = vec![format!(
+        "{}:{}:ro,z",
+        config.supervisor_bin.display(),
+        SUPERVISOR_MOUNT_PATH
     )];
     if let Some(tls) = &config.guest_tls {
-        mounts.push(bind_mount(&tls.ca, TLS_CA_MOUNT_PATH, true));
-        mounts.push(bind_mount(&tls.cert, TLS_CERT_MOUNT_PATH, true));
-        mounts.push(bind_mount(&tls.key, TLS_KEY_MOUNT_PATH, true));
+        binds.push(format!("{}:{}:ro,z", tls.ca.display(), TLS_CA_MOUNT_PATH));
+        binds.push(format!(
+            "{}:{}:ro,z",
+            tls.cert.display(),
+            TLS_CERT_MOUNT_PATH
+        ));
+        binds.push(format!("{}:{}:ro,z", tls.key.display(), TLS_KEY_MOUNT_PATH));
     }
-    mounts
-}
-
-fn bind_mount(source: &Path, target: &str, read_only: bool) -> Mount {
-    Mount {
-        target: Some(target.to_string()),
-        source: Some(source.display().to_string()),
-        typ: Some(MountTypeEnum::BIND),
-        read_only: Some(read_only),
-        ..Default::default()
-    }
+    binds
 }
 
 fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) -> Vec<String> {
@@ -999,7 +993,7 @@ fn build_container_create_body(
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
             device_requests: docker_gpu_device_requests(spec.gpu),
-            mounts: Some(build_mounts(config)),
+            binds: Some(build_binds(config)),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,

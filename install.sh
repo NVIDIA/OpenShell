@@ -18,6 +18,8 @@ CHECKSUMS_NAME="openshell-checksums-sha256.txt"
 LOCAL_GATEWAY_PORT="17670"
 HOMEBREW_TAP="nvidia/openshell"
 HOMEBREW_FORMULA_NAME="openshell"
+BREAKING_RELEASE_VERSION="0.0.37"
+UPGRADE_NOTICE_ACK="${OPENSHELL_ACK_BREAKING_UPGRADE:-}"
 
 info() {
   printf '%s: %s\n' "$APP_NAME" "$*" >&2
@@ -48,6 +50,9 @@ OPTIONS:
 ENVIRONMENT VARIABLES:
     OPENSHELL_VERSION   Release tag to install (default: latest tagged release).
                         Set OPENSHELL_VERSION=dev to install the rolling dev build.
+    OPENSHELL_ACK_BREAKING_UPGRADE
+                        Set to 1 only after backing up and cleaning up a
+                        pre-v0.0.37 installation.
 
 NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
@@ -74,6 +79,153 @@ download() {
   _url="$1"
   _output="$2"
   curl -fLsS --retry 3 --max-redirs 5 -o "$_output" "$_url"
+}
+
+semver_core() {
+  _version="${1#v}"
+  _version="${_version%%[-+]*}"
+  printf '%s\n' "$_version"
+}
+
+semver_at_least() {
+  _version="$(semver_core "$1")"
+  _minimum="$(semver_core "$2")"
+
+  _major="${_version%%.*}"
+  _rest="${_version#*.}"
+  [ "$_rest" != "$_version" ] || return 1
+  _minor="${_rest%%.*}"
+  _patch="${_rest#*.}"
+  _patch="${_patch%%.*}"
+
+  _min_major="${_minimum%%.*}"
+  _min_rest="${_minimum#*.}"
+  [ "$_min_rest" != "$_minimum" ] || return 1
+  _min_minor="${_min_rest%%.*}"
+  _min_patch="${_min_rest#*.}"
+  _min_patch="${_min_patch%%.*}"
+
+  case "$_major:$_minor:$_patch:$_min_major:$_min_minor:$_min_patch" in
+    *[!0-9:]* | *::*)
+      return 1
+      ;;
+  esac
+
+  [ "$_major" -gt "$_min_major" ] && return 0
+  [ "$_major" -lt "$_min_major" ] && return 1
+  [ "$_minor" -gt "$_min_minor" ] && return 0
+  [ "$_minor" -lt "$_min_minor" ] && return 1
+  [ "$_patch" -ge "$_min_patch" ]
+}
+
+target_uses_breaking_gateway_model() {
+  case "$RELEASE_TAG" in
+    dev)
+      return 0
+      ;;
+  esac
+
+  semver_at_least "$RELEASE_TAG" "$BREAKING_RELEASE_VERSION"
+}
+
+installed_version_needs_breaking_upgrade_notice() {
+  _version="$1"
+
+  if [ -z "$_version" ]; then
+    return 0
+  fi
+
+  ! semver_at_least "$_version" "$BREAKING_RELEASE_VERSION"
+}
+
+find_existing_openshell_bin() {
+  _path="$(command -v openshell 2>/dev/null || true)"
+  if [ -n "$_path" ] && [ -x "$_path" ]; then
+    printf '%s\n' "$_path"
+    return 0
+  fi
+
+  for _candidate in \
+    "${TARGET_HOME:-}/.local/bin/openshell" \
+    /usr/local/bin/openshell \
+    /usr/bin/openshell \
+    /opt/homebrew/bin/openshell; do
+    if [ -n "$_candidate" ] && [ -x "$_candidate" ]; then
+      printf '%s\n' "$_candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+existing_openshell_version() {
+  _bin="$1"
+  _output="$("$_bin" --version 2>/dev/null | sed -n '1p' || true)"
+  printf '%s\n' "$_output" | awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^v?[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.+~-]+)?$/) {
+          print $i
+          exit
+        }
+      }
+    }
+  '
+}
+
+print_breaking_upgrade_notice() {
+  _bin="$1"
+  _version="$2"
+
+  if [ -n "$_version" ]; then
+    warn "detected existing OpenShell ${_version} at ${_bin}"
+  else
+    warn "detected an existing OpenShell installation at ${_bin}"
+  fi
+
+  cat >&2 <<EOF
+
+OpenShell ${BREAKING_RELEASE_VERSION} and later are incompatible with gateway
+state created by earlier releases. Before installing ${RELEASE_TAG}, back up
+any files, artifacts, and configuration you need from existing sandboxes.
+
+Then clean up the old runtime with the currently installed CLI:
+
+    openshell sandbox delete --all
+    openshell gateway destroy
+
+Run these commands before upgrading because 'openshell gateway destroy' is not
+available in OpenShell ${BREAKING_RELEASE_VERSION} and later.
+
+After cleanup, rerun this installer or follow the installation guide:
+
+    https://docs.nvidia.com/openshell/latest/about/installation
+
+If you have already backed up and cleaned up the old runtime, rerun with:
+
+    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_ACK_BREAKING_UPGRADE=1 sh
+
+EOF
+}
+
+guard_breaking_upgrade() {
+  target_uses_breaking_gateway_model || return 0
+
+  _bin="$(find_existing_openshell_bin || true)"
+  [ -n "$_bin" ] || return 0
+
+  _version="$(existing_openshell_version "$_bin")"
+  installed_version_needs_breaking_upgrade_notice "$_version" || return 0
+
+  print_breaking_upgrade_notice "$_bin" "$_version"
+
+  if [ "$UPGRADE_NOTICE_ACK" = "1" ]; then
+    warn "continuing because OPENSHELL_ACK_BREAKING_UPGRADE=1 is set"
+    return 0
+  fi
+
+  error "manual cleanup is required before upgrading from this OpenShell installation"
 }
 
 resolve_release_tag() {
@@ -717,6 +869,8 @@ main() {
   TARGET_UID="$(id -u "$TARGET_USER" 2>/dev/null || true)"
   [ -n "$TARGET_UID" ] || error "cannot resolve uid for ${TARGET_USER}"
   TARGET_HOME="$(user_home "$TARGET_USER")"
+
+  guard_breaking_upgrade
 
   case "$PLATFORM" in
     linux)

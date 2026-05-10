@@ -1064,6 +1064,13 @@ fn sandbox_template_to_k8s(
         }
     }
 
+    // Disable service account token auto-mounting for security hardening.
+    // Sandbox pods should not have access to the Kubernetes API by default.
+    spec.insert(
+        "automountServiceAccountToken".to_string(),
+        serde_json::json!(false),
+    );
+
     let mut container = serde_json::Map::new();
     container.insert("name".to_string(), serde_json::json!("agent"));
     // Use template image if provided, otherwise fall back to default
@@ -2113,6 +2120,26 @@ mod tests {
             caps.len(),
             4,
             "extra capabilities must not be added when user namespaces are disabled"
+        );
+    }
+
+    #[test]
+    fn automount_service_account_token_is_disabled() {
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &SandboxTemplate::default(),
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["automountServiceAccountToken"],
+            serde_json::json!(false),
+            "service account token auto-mounting must be disabled for security hardening"
         );
     }
 
