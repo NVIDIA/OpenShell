@@ -2416,6 +2416,44 @@ where
     .await
 }
 
+fn forward_websocket_upgrade_settings(
+    config: &crate::l7::L7EndpointConfig,
+    websocket_request: bool,
+    secret_resolver: Option<Arc<SecretResolver>>,
+) -> (
+    crate::l7::rest::WebSocketExtensionMode,
+    crate::l7::relay::UpgradeRelayOptions<'static>,
+) {
+    let websocket_credential_rewrite = matches!(
+        config.protocol,
+        crate::l7::L7Protocol::Rest | crate::l7::L7Protocol::Websocket
+    ) && config.websocket_credential_rewrite;
+    let websocket_extensions = if config.protocol == crate::l7::L7Protocol::Websocket
+        || (config.protocol == crate::l7::L7Protocol::Rest && websocket_credential_rewrite)
+    {
+        crate::l7::rest::WebSocketExtensionMode::PermessageDeflate
+    } else {
+        crate::l7::rest::WebSocketExtensionMode::Preserve
+    };
+
+    let upgrade_options = crate::l7::relay::UpgradeRelayOptions {
+        websocket_request,
+        websocket: crate::l7::relay::WebSocketUpgradeBehavior {
+            credential_rewrite: websocket_credential_rewrite,
+            ..Default::default()
+        },
+        secret_resolver: if websocket_credential_rewrite {
+            secret_resolver
+        } else {
+            None
+        },
+        enforcement: config.enforcement,
+        ..Default::default()
+    };
+
+    (websocket_extensions, upgrade_options)
+}
+
 /// Handle a plain HTTP forward proxy request (non-CONNECT).
 ///
 /// Public IPs are allowed through when the endpoint passes OPA evaluation.
@@ -2774,21 +2812,12 @@ async fn handle_forward_proxy(
         };
         let websocket_request =
             crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
-        if l7_config.config.protocol == crate::l7::L7Protocol::Rest
-            && l7_config.config.websocket_credential_rewrite
-        {
-            websocket_extensions = crate::l7::rest::WebSocketExtensionMode::PermessageDeflate;
-            upgrade_options = crate::l7::relay::UpgradeRelayOptions {
-                websocket_request,
-                websocket: crate::l7::relay::WebSocketUpgradeBehavior {
-                    credential_rewrite: true,
-                    ..Default::default()
-                },
-                secret_resolver: secret_resolver.clone(),
-                policy_name: matched_policy.clone().unwrap_or_default(),
-                ..Default::default()
-            };
-        }
+        (websocket_extensions, upgrade_options) = forward_websocket_upgrade_settings(
+            &l7_config.config,
+            websocket_request,
+            secret_resolver.clone(),
+        );
+        upgrade_options.policy_name = matched_policy.clone().unwrap_or_default();
         let graphql = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
             let header_end = forward_request_bytes
                 .windows(4)
@@ -3341,6 +3370,61 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::sync::Arc;
+
+    fn websocket_l7_config(
+        protocol: crate::l7::L7Protocol,
+        websocket_credential_rewrite: bool,
+    ) -> crate::l7::L7EndpointConfig {
+        crate::l7::L7EndpointConfig {
+            protocol,
+            path: "/**".to_string(),
+            tls: crate::l7::TlsMode::Auto,
+            enforcement: crate::l7::EnforcementMode::Enforce,
+            graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+            allow_encoded_slash: false,
+            websocket_credential_rewrite,
+            websocket_graphql_policy: false,
+        }
+    }
+
+    #[test]
+    fn forward_websocket_upgrade_enables_rewrite_for_native_websocket_endpoint() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("DISCORD_BOT_TOKEN".to_string(), "discord-real".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        let (extensions, options) = forward_websocket_upgrade_settings(
+            &websocket_l7_config(crate::l7::L7Protocol::Websocket, true),
+            true,
+            resolver.map(Arc::new),
+        );
+
+        assert_eq!(
+            extensions,
+            crate::l7::rest::WebSocketExtensionMode::PermessageDeflate
+        );
+        assert!(options.websocket.credential_rewrite);
+        assert!(options.secret_resolver.is_some());
+    }
+
+    #[test]
+    fn forward_websocket_upgrade_preserves_rest_without_rewrite() {
+        let (extensions, options) = forward_websocket_upgrade_settings(
+            &websocket_l7_config(crate::l7::L7Protocol::Rest, false),
+            true,
+            None,
+        );
+
+        assert_eq!(
+            extensions,
+            crate::l7::rest::WebSocketExtensionMode::Preserve
+        );
+        assert!(!options.websocket.credential_rewrite);
+        assert!(options.secret_resolver.is_none());
+    }
 
     #[test]
     fn l7_route_selection_prefers_path_specific_graphql_endpoint() {

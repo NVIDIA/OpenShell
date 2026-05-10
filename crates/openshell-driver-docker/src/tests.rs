@@ -160,7 +160,36 @@ fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
     );
     assert_eq!(
         docker_extra_hosts(&DockerGatewayRoute::HostGateway),
-        vec!["host.openshell.internal:host-gateway".to_string()]
+        vec![
+            "host.docker.internal:host-gateway".to_string(),
+            "host.openshell.internal:host-gateway".to_string()
+        ]
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_for_colima() {
+    let info = SystemInfo {
+        name: Some("colima".to_string()),
+        operating_system: Some("Ubuntu 24.04.4 LTS".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 20, 0, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+        ),
+        DockerGatewayRoute::HostGateway
+    );
+    assert_eq!(
+        docker_extra_hosts(&DockerGatewayRoute::HostGateway),
+        vec![
+            "host.docker.internal:host-gateway".to_string(),
+            "host.openshell.internal:host-gateway".to_string()
+        ]
     );
 }
 

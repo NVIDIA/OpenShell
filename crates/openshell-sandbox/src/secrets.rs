@@ -90,8 +90,12 @@ impl SecretResolver {
 
         for (key, value) in provider_env {
             let placeholder = placeholder_for_env_key_for_revision(&key, revision);
+            let canonical_placeholder = (revision != 0).then(|| placeholder_for_env_key(&key));
             child_env.insert(key, placeholder.clone());
-            by_placeholder.insert(placeholder, value);
+            by_placeholder.insert(placeholder, value.clone());
+            if let Some(canonical_placeholder) = canonical_placeholder {
+                by_placeholder.insert(canonical_placeholder, value);
+            }
         }
 
         (child_env, Some(Self { by_placeholder }))

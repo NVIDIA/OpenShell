@@ -1099,7 +1099,7 @@ fn docker_gateway_route(
         };
     }
 
-    if is_docker_desktop(info) {
+    if uses_host_gateway_alias(info) {
         DockerGatewayRoute::HostGateway
     } else {
         DockerGatewayRoute::Bridge {
@@ -1109,13 +1109,22 @@ fn docker_gateway_route(
     }
 }
 
-fn is_docker_desktop(info: &SystemInfo) -> bool {
+fn uses_host_gateway_alias(info: &SystemInfo) -> bool {
     let operating_system = info
         .operating_system
         .as_deref()
         .unwrap_or_default()
         .to_ascii_lowercase();
     if operating_system.contains("docker desktop") {
+        return true;
+    }
+
+    let name = info
+        .name
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name == "colima" {
         return true;
     }
 
@@ -1132,9 +1141,10 @@ fn docker_extra_hosts(route: &DockerGatewayRoute) -> Vec<String> {
             format!("{HOST_DOCKER_INTERNAL}:{host_alias_ip}"),
             format!("{HOST_OPENSHELL_INTERNAL}:{host_alias_ip}"),
         ],
-        DockerGatewayRoute::HostGateway => {
-            vec![format!("{HOST_OPENSHELL_INTERNAL}:host-gateway")]
-        }
+        DockerGatewayRoute::HostGateway => vec![
+            format!("{HOST_DOCKER_INTERNAL}:host-gateway"),
+            format!("{HOST_OPENSHELL_INTERNAL}:host-gateway"),
+        ],
     }
 }
 

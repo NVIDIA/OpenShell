@@ -354,9 +354,29 @@ fn apply_add_endpoint_options(
                 endpoint.websocket_credential_rewrite = true;
             }
             _ => {
-                return Err(miette!(
-                    "--add-endpoint options segment supports only 'websocket-credential-rewrite'; got '{option}' in '{spec}'"
-                ));
+                let Some(allowed_ip) = option.strip_prefix("allowed-ip=") else {
+                    return Err(miette!(
+                        "--add-endpoint options segment supports only 'websocket-credential-rewrite' and 'allowed-ip=<CIDR-or-IP>'; got '{option}' in '{spec}'"
+                    ));
+                };
+                let allowed_ip = allowed_ip.trim();
+                if allowed_ip.is_empty() {
+                    return Err(miette!(
+                        "--add-endpoint allowed-ip option must include a CIDR or IP value in '{spec}'"
+                    ));
+                }
+                if allowed_ip.contains(char::is_whitespace) {
+                    return Err(miette!(
+                        "--add-endpoint allowed-ip option must not contain whitespace in '{spec}'"
+                    ));
+                }
+                if !endpoint
+                    .allowed_ips
+                    .iter()
+                    .any(|existing| existing == allowed_ip)
+                {
+                    endpoint.allowed_ips.push(allowed_ip.to_string());
+                }
             }
         }
     }
@@ -535,6 +555,67 @@ mod tests {
             panic!("expected add-rule preview");
         };
         assert!(rule.endpoints[0].websocket_credential_rewrite);
+    }
+
+    #[test]
+    fn parse_add_endpoint_merges_allowed_ips_with_websocket_options() {
+        let plan = build_policy_update_plan(
+            &[
+                "realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite,allowed-ip=10.0.0.0/8,allowed-ip=172.16.0.0/12,allowed-ip=10.0.0.0/8"
+                    .to_string(),
+            ],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        let endpoint = &rule.endpoints[0];
+        assert!(endpoint.websocket_credential_rewrite);
+        assert_eq!(
+            endpoint.allowed_ips,
+            vec!["10.0.0.0/8".to_string(), "172.16.0.0/12".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_add_endpoint_accepts_allowed_ip_on_rest_endpoint() {
+        let plan = build_policy_update_plan(
+            &["api.example.com:443:read-write:rest:enforce:allowed-ip=192.168.0.0/16".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        assert_eq!(rule.endpoints[0].allowed_ips, vec!["192.168.0.0/16"]);
+    }
+
+    #[test]
+    fn parse_add_endpoint_rejects_empty_allowed_ip() {
+        let error = build_policy_update_plan(
+            &["api.example.com:443:read-write:rest:enforce:allowed-ip=".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect_err("plan should fail");
+        assert!(error.to_string().contains("allowed-ip option"));
     }
 
     #[test]

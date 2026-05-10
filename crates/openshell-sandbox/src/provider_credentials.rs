@@ -122,6 +122,10 @@ mod tests {
             resolver.resolve_placeholder("openshell:resolve:env:v11_GITHUB_TOKEN"),
             Some("new")
         );
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:GITHUB_TOKEN"),
+            Some("new")
+        );
     }
 
     #[test]
