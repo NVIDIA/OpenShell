@@ -98,6 +98,24 @@ the in-cluster Service DNS, release namespace, service port, and disableTls
 flag — so the default value works for any release name or namespace without
 override.
 */}}
+{{/*
+Supervisor sideload method. When supervisor.sideloadMethod is set, use it
+verbatim. Otherwise auto-detect from the cluster version: K8s >= v1.33
+supports ImageVolumeSource (beta; GA in v1.36), older clusters fall back to
+the init-container pattern.
+*/}}
+{{- define "openshell.supervisorSideloadMethod" -}}
+{{- if .Values.supervisor.sideloadMethod -}}
+{{- .Values.supervisor.sideloadMethod -}}
+{{- else -}}
+{{- if semverCompare ">=1.33-0" .Capabilities.KubeVersion.Version -}}
+image-volume
+{{- else -}}
+init-container
+{{- end -}}
+{{- end -}}
+{{- end }}
+
 {{- define "openshell.grpcEndpoint" -}}
 {{- if .Values.server.grpcEndpoint -}}
 {{- .Values.server.grpcEndpoint -}}
