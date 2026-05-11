@@ -117,11 +117,11 @@ cleanup() {
     # before this run.
     if [[ -n "${PRIOR_PROPOSALS_FLAG:-}" ]]; then
         if [[ "$PRIOR_PROPOSALS_FLAG" == "(unset)" ]]; then
-            "$OPENSHELL_BIN" settings delete --global --key agent_policy_proposals_enabled \
+            "$OPENSHELL_BIN" settings delete --global --key agent_policy_proposals_enabled --yes \
                 >/dev/null 2>&1 || true
         else
             "$OPENSHELL_BIN" settings set --global --key agent_policy_proposals_enabled \
-                --value "$PRIOR_PROPOSALS_FLAG" >/dev/null 2>&1 || true
+                --value "$PRIOR_PROPOSALS_FLAG" --yes >/dev/null 2>&1 || true
         fi
     fi
 
@@ -433,7 +433,7 @@ enable_agent_proposals() {
         | grep -o 'true\|false' | head -1)"
     PRIOR_PROPOSALS_FLAG="${prior:-(unset)}"
     "$OPENSHELL_BIN" settings set --global \
-        --key agent_policy_proposals_enabled --value true >/dev/null \
+        --key agent_policy_proposals_enabled --value true --yes >/dev/null \
         || fail "could not enable agent_policy_proposals_enabled globally"
 }
 
