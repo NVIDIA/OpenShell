@@ -981,6 +981,14 @@ struct SandboxPodParams<'a> {
     enable_user_namespaces: bool,
 }
 
+fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String, String> {
+    let mut env = spec.map_or_else(Default::default, |s| s.environment.clone());
+    if let Some(s) = spec.filter(|s| !s.log_level.is_empty()) {
+        env.insert("OPENSHELL_LOG_LEVEL".to_string(), s.log_level.clone());
+    }
+    env
+}
+
 fn sandbox_to_k8s_spec(
     spec: Option<&SandboxSpec>,
     params: &SandboxPodParams<'_>,
@@ -999,25 +1007,11 @@ fn sandbox_to_k8s_spec(
     let inject_workspace = !user_has_vct;
 
     if let Some(spec) = spec {
-        if !spec.log_level.is_empty() {
-            root.insert("logLevel".to_string(), serde_json::json!(spec.log_level));
-        }
-        if !spec.environment.is_empty() {
-            root.insert(
-                "environment".to_string(),
-                serde_json::json!(spec.environment),
-            );
-        }
+        let pod_env = spec_pod_env(Some(spec));
         if let Some(template) = spec.template.as_ref() {
             root.insert(
                 "podTemplate".to_string(),
-                sandbox_template_to_k8s(
-                    template,
-                    spec.gpu,
-                    &spec.environment,
-                    inject_workspace,
-                    params,
-                ),
+                sandbox_template_to_k8s(template, spec.gpu, &pod_env, inject_workspace, params),
             );
             if !template.agent_socket_path.is_empty() {
                 root.insert(
@@ -1044,14 +1038,13 @@ fn sandbox_to_k8s_spec(
 
     // podTemplate is required by the Kubernetes CRD - ensure it's always present
     if !root.contains_key("podTemplate") {
-        let empty_env = std::collections::HashMap::new();
-        let spec_env = spec.as_ref().map_or(&empty_env, |s| &s.environment);
+        let pod_env = spec_pod_env(spec);
         root.insert(
             "podTemplate".to_string(),
             sandbox_template_to_k8s(
                 &SandboxTemplate::default(),
-                spec.as_ref().is_some_and(|s| s.gpu),
-                spec_env,
+                spec.is_some_and(|s| s.gpu),
+                &pod_env,
                 inject_workspace,
                 params,
             ),
@@ -2311,5 +2304,14 @@ mod tests {
         };
 
         assert_eq!(platform_config_bool(&template, "a_string"), None);
+    }
+
+    #[test]
+    fn log_level_propagates_as_env_var_to_sandbox_pod() {
+        let spec = SandboxSpec { log_level: "debug".to_string(), ..SandboxSpec::default() };
+        let cr = sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default());
+        let env = cr["spec"]["podTemplate"]["spec"]["containers"][0]["env"].as_array().unwrap();
+        assert!(env.iter().any(|e| e["name"] == "OPENSHELL_LOG_LEVEL" && e["value"] == "debug"));
+        assert!(cr["spec"].get("logLevel").is_none());
     }
 }
