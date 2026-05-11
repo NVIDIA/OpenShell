@@ -21,9 +21,22 @@ normalize_arch() {
 }
 
 target_triple() {
+  local libc=${2:-gnu}
   case "$1" in
-    amd64) echo "x86_64-unknown-linux-gnu" ;;
-    arm64) echo "aarch64-unknown-linux-gnu" ;;
+    amd64)
+      if [[ "$libc" == "musl" ]]; then
+        echo "x86_64-unknown-linux-musl"
+      else
+        echo "x86_64-unknown-linux-gnu"
+      fi
+      ;;
+    arm64)
+      if [[ "$libc" == "musl" ]]; then
+        echo "aarch64-unknown-linux-musl"
+      else
+        echo "aarch64-unknown-linux-gnu"
+      fi
+      ;;
     *)
       echo "unsupported architecture: $1" >&2
       exit 1
@@ -71,10 +84,10 @@ components_for_target() {
       echo "gateway"
       ;;
     sandbox|supervisor|supervisor-output)
-      echo "sandbox"
+      echo "supervisor"
       ;;
     all)
-      echo "gateway sandbox"
+      echo "gateway supervisor"
       ;;
     *)
       usage
@@ -88,10 +101,12 @@ resolve_component() {
     gateway)
       crate=openshell-server
       binary=openshell-gateway
+      target_libc=gnu
       ;;
-    sandbox)
+    supervisor)
       crate=openshell-sandbox
       binary=openshell-sandbox
+      target_libc=musl
       ;;
     *)
       echo "unsupported binary component: $1" >&2
@@ -130,7 +145,7 @@ build_component_for_arch() {
   local current_host_arch
 
   resolve_component "$component"
-  target="$(target_triple "$arch")"
+  target="$(target_triple "$arch" "$target_libc")"
   stage="${ROOT}/deploy/docker/.build/prebuilt-binaries/${arch}"
   features="${EXTRA_CARGO_FEATURES:-openshell-core/dev-settings}"
   current_host_os="$(host_os)"

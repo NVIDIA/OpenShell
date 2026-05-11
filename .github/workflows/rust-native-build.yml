@@ -1,10 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Rust Native Build (openshell-gateway / openshell-sandbox)
+name: Rust Image Binary Build (openshell-gateway / openshell-sandbox)
 
-# Build Rust binaries natively per Linux architecture before the Docker image
-# build consumes them as prebuilt artifacts.
+# Build Rust binaries per Linux architecture before the Docker image build
+# consumes them as prebuilt artifacts. Gateway images use GNU-linked binaries
+# for the NVIDIA distroless C/C++ runtime; supervisor images use musl/static
+# binaries so the final image can remain scratch.
 
 on:
   workflow_call:
@@ -105,10 +107,12 @@ jobs:
             gateway)
               crate=openshell-server
               binary=openshell-gateway
+              zig_target=
               ;;
             sandbox)
               crate=openshell-sandbox
               binary=openshell-sandbox
+              zig_target=
               ;;
             *)
               echo "unsupported component: $COMPONENT" >&2
@@ -118,10 +122,20 @@ jobs:
 
           case "$ARCH" in
             amd64)
-              target=x86_64-unknown-linux-gnu
+              if [[ "$COMPONENT" == "sandbox" ]]; then
+                target=x86_64-unknown-linux-musl
+                zig_target=x86_64-linux-musl
+              else
+                target=x86_64-unknown-linux-gnu
+              fi
               ;;
             arm64)
-              target=aarch64-unknown-linux-gnu
+              if [[ "$COMPONENT" == "sandbox" ]]; then
+                target=aarch64-unknown-linux-musl
+                zig_target=aarch64-linux-musl
+              else
+                target=aarch64-unknown-linux-gnu
+              fi
               ;;
             *)
               echo "unsupported arch: $ARCH" >&2
@@ -133,6 +147,7 @@ jobs:
             echo "crate=$crate"
             echo "binary=$binary"
             echo "target=$target"
+            echo "zig_target=$zig_target"
           } >> "$GITHUB_OUTPUT"
 
       - name: Configure GHA sccache backend
@@ -163,6 +178,30 @@ jobs:
           set -euo pipefail
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ steps.version.outputs.cargo_version }}"'"/}' Cargo.toml
 
+      - name: Set up zig musl wrappers
+        if: contains(steps.target.outputs.target, 'musl')
+        run: |
+          set -euo pipefail
+          ZIG="$(mise which zig)"
+          ZIG_TARGET="${{ steps.target.outputs.zig_target }}"
+          mkdir -p /tmp/zig-musl
+
+          # cc-rs injects --target=<rust-triple>, which zig does not parse.
+          # Strip caller-provided --target and use the wrapper's zig target.
+          for tool in cc c++; do
+            printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    --target=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec "%s" %s --target=%s "${args[@]}"\n' \
+              "$ZIG" "$tool" "$ZIG_TARGET" > "/tmp/zig-musl/${tool}"
+            chmod +x "/tmp/zig-musl/${tool}"
+          done
+
+          TARGET_ENV=$(echo "${{ steps.target.outputs.target }}" | tr '-' '_')
+          TARGET_ENV_UPPER=${TARGET_ENV^^}
+
+          echo "CC_${TARGET_ENV}=/tmp/zig-musl/cc" >> "$GITHUB_ENV"
+          echo "CXX_${TARGET_ENV}=/tmp/zig-musl/c++" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=/tmp/zig-musl/cc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${TARGET_ENV_UPPER}_RUSTFLAGS=-Clink-self-contained=no" >> "$GITHUB_ENV"
+
       - name: Build ${{ steps.target.outputs.binary }} (${{ steps.target.outputs.target }})
         env:
           # Preserve the release-codegen setting used by the old Dockerfile
@@ -171,6 +210,7 @@ jobs:
           OPENSHELL_IMAGE_TAG: ${{ inputs['image-tag'] }}
         run: |
           set -euo pipefail
+          mise x -- rustup target add "${{ steps.target.outputs.target }}"
           args=(
             --release
             --target "${{ steps.target.outputs.target }}"
@@ -192,8 +232,7 @@ jobs:
           OUTPUT="$("$BIN" --version)"
           echo "$OUTPUT"
           grep -q "^${{ steps.target.outputs.binary }} " <<<"$OUTPUT"
-          # Record glibc linkage so drift from the Ubuntu noble runtime base
-          # image is visible in logs.
+          # Record linkage so image runtime drift is visible in logs.
           ldd --version
           ldd "$BIN" || true
 

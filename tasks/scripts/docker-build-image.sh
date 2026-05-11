@@ -93,37 +93,40 @@ ensure_prebuilt_binaries() {
 TARGET=${1:?"Usage: docker-build-image.sh <gateway|supervisor|supervisor-output> [extra-args...]"}
 shift
 
-DOCKERFILE="deploy/docker/Dockerfile.images"
-if [[ ! -f "${DOCKERFILE}" ]]; then
-	echo "Error: Dockerfile not found: ${DOCKERFILE}" >&2
-	exit 1
-fi
-
 IS_FINAL_IMAGE=0
 IMAGE_NAME=""
 DOCKER_TARGET=""
+DOCKERFILE=""
 case "${TARGET}" in
   gateway)
     IS_FINAL_IMAGE=1
     IMAGE_NAME="openshell/gateway"
     DOCKER_TARGET="gateway"
+    DOCKERFILE="deploy/docker/Dockerfile.gateway"
     ;;
   supervisor)
     IS_FINAL_IMAGE=1
     IMAGE_NAME="openshell/supervisor"
     DOCKER_TARGET="supervisor"
+    DOCKERFILE="deploy/docker/Dockerfile.supervisor"
     ;;
   supervisor-output)
     # Backward-compat alias: same as "supervisor".
     IS_FINAL_IMAGE=1
     IMAGE_NAME="openshell/supervisor"
     DOCKER_TARGET="supervisor"
+    DOCKERFILE="deploy/docker/Dockerfile.supervisor"
     ;;
   *)
     echo "Error: unsupported target '${TARGET}'" >&2
     exit 1
     ;;
 esac
+
+if [[ ! -f "${DOCKERFILE}" ]]; then
+	echo "Error: Dockerfile not found: ${DOCKERFILE}" >&2
+	exit 1
+fi
 
 if [[ -n "${IMAGE_REGISTRY:-}" && "${IS_FINAL_IMAGE}" == "1" ]]; then
 	IMAGE_NAME="${IMAGE_REGISTRY}/${IMAGE_NAME#openshell/}"
