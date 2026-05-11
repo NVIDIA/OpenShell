@@ -153,6 +153,10 @@ service OpenShell {
   rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
       returns (GetSandboxProviderEnvironmentResponse);
 
+  // Mint a short-lived provider-backed token for a running sandbox.
+  rpc MintSandboxProviderToken(MintSandboxProviderTokenRequest)
+      returns (MintSandboxProviderTokenResponse);
+
   // Fetch recent sandbox logs (one-shot).
   rpc GetSandboxLogs(GetSandboxLogsRequest) returns (GetSandboxLogsResponse);
 
@@ -1077,6 +1081,28 @@ message GetSandboxProviderEnvironmentResponse {
   uint64 provider_env_revision = 2;
   // Expiration timestamps for returned environment variables.
   map<string, int64> credential_expires_at_ms = 3;
+}
+
+// Mint a short-lived provider-backed token for a running sandbox.
+message MintSandboxProviderTokenRequest {
+  // The sandbox ID.
+  string sandbox_id = 1;
+  // The attached provider name.
+  string provider_name = 2;
+  // The requested resource audience.
+  string audience = 3;
+}
+
+// Brokered provider token response.
+message MintSandboxProviderTokenResponse {
+  // The access token value.
+  string access_token = 1;
+  // Token type, typically "Bearer".
+  string token_type = 2;
+  // Expiry as Unix epoch seconds.
+  uint64 expires_at_unix = 3;
+  // True when the broker cache served the token without a mint call.
+  bool cache_hit = 4;
 }
 
 // ---------------------------------------------------------------------------

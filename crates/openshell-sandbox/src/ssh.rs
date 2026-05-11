@@ -107,6 +107,7 @@ pub async fn run_ssh_server(
     proxy_url: Option<String>,
     ca_file_paths: Option<(PathBuf, PathBuf)>,
     provider_credentials: ProviderCredentialState,
+    provider_runtime_env: HashMap<String, String>,
 ) -> Result<()> {
     let (listener, config, ca_paths) = match ssh_server_init(&listen_path, &ca_file_paths) {
         Ok(v) => {
@@ -131,6 +132,7 @@ pub async fn run_ssh_server(
         let proxy_url = proxy_url.clone();
         let ca_paths = ca_paths.clone();
         let provider_credentials = provider_credentials.clone();
+        let provider_runtime_env = provider_runtime_env.clone();
 
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
@@ -142,6 +144,7 @@ pub async fn run_ssh_server(
                 proxy_url,
                 ca_paths,
                 provider_credentials,
+                provider_runtime_env,
             )
             .await
             {
@@ -168,6 +171,7 @@ async fn handle_connection(
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_credentials: ProviderCredentialState,
+    provider_runtime_env: HashMap<String, String>,
 ) -> Result<()> {
     // Access is gated by the Unix-socket filesystem permissions (root-only),
     // not by an application-level preface. The supervisor bridges the
@@ -190,6 +194,7 @@ async fn handle_connection(
         proxy_url,
         ca_file_paths,
         provider_credentials,
+        provider_runtime_env,
     );
     russh::server::run_stream(config, stream, handler)
         .await
@@ -217,6 +222,7 @@ struct SshHandler {
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_credentials: ProviderCredentialState,
+    provider_runtime_env: HashMap<String, String>,
     channels: HashMap<ChannelId, ChannelState>,
 }
 
@@ -228,6 +234,7 @@ impl SshHandler {
         proxy_url: Option<String>,
         ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
         provider_credentials: ProviderCredentialState,
+        provider_runtime_env: HashMap<String, String>,
     ) -> Self {
         Self {
             policy,
@@ -236,6 +243,7 @@ impl SshHandler {
             proxy_url,
             ca_file_paths,
             provider_credentials,
+            provider_runtime_env,
             channels: HashMap::new(),
         }
     }
@@ -535,6 +543,8 @@ impl SshHandler {
         command: Option<String>,
     ) -> anyhow::Result<()> {
         let provider_snapshot = self.provider_credentials.snapshot();
+        let mut provider_env = provider_snapshot.child_env.clone();
+        provider_env.extend(self.provider_runtime_env.clone());
         let state = self
             .channels
             .get_mut(&channel)
@@ -552,7 +562,7 @@ impl SshHandler {
                 self.netns_fd,
                 self.proxy_url.clone(),
                 self.ca_file_paths.clone(),
-                &provider_snapshot.child_env,
+                &provider_env,
             )?;
             state.pty_master = Some(pty_master);
             state.input_sender = Some(input_sender);
@@ -569,7 +579,7 @@ impl SshHandler {
                 self.netns_fd,
                 self.proxy_url.clone(),
                 self.ca_file_paths.clone(),
-                &provider_snapshot.child_env,
+                &provider_env,
             )?;
             state.input_sender = Some(input_sender);
         }

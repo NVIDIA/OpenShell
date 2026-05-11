@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 use base64::Engine as _;
+use openshell_core::proto::Provider;
 use reqwest::StatusCode;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -33,6 +34,17 @@ pub enum MicrosoftS2sError {
     MissingAccessToken,
     #[error("Microsoft token claim validation failed: {0}")]
     ClaimValidation(String),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BrokerRegistry {
+    inner: Arc<Mutex<HashMap<String, BrokerRegistryEntry>>>,
+}
+
+#[derive(Debug, Clone)]
+struct BrokerRegistryEntry {
+    fingerprint: String,
+    broker: MicrosoftS2sBroker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +124,15 @@ impl MicrosoftS2sConfig {
             }
         }
         allowed
+    }
+
+    pub fn default_audience(&self) -> Option<String> {
+        self.observability_resource
+            .clone()
+            .or_else(|| match self.allowed_audiences.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            })
     }
 }
 
@@ -216,6 +237,10 @@ impl MicrosoftS2sBroker {
             expires_at_unix: cached.expires_at_unix,
             cache_hit: false,
         })
+    }
+
+    pub fn default_audience(&self) -> Option<String> {
+        self.config.default_audience()
     }
 
     pub async fn evict(&self, audience: &str) {
@@ -334,6 +359,66 @@ impl MicrosoftS2sBroker {
         claims.expect_not_expired()?;
         Ok(())
     }
+}
+
+impl BrokerRegistry {
+    pub async fn broker_for_provider(
+        &self,
+        provider_name: &str,
+        provider: &Provider,
+    ) -> Result<MicrosoftS2sBroker, MicrosoftS2sError> {
+        let fingerprint = provider_fingerprint(provider);
+
+        {
+            let inner = self.inner.lock().await;
+            if let Some(entry) = inner.get(provider_name)
+                && entry.fingerprint == fingerprint
+            {
+                return Ok(entry.broker.clone());
+            }
+        }
+
+        let config =
+            MicrosoftS2sConfig::from_provider_maps(&provider.credentials, &provider.config)?;
+        let broker = MicrosoftS2sBroker::new(config)?;
+
+        let mut inner = self.inner.lock().await;
+        inner.insert(
+            provider_name.to_string(),
+            BrokerRegistryEntry {
+                fingerprint,
+                broker: broker.clone(),
+            },
+        );
+        Ok(broker)
+    }
+}
+
+fn provider_fingerprint(provider: &Provider) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(provider.r#type.as_bytes());
+
+    let mut credential_items: Vec<_> = provider.credentials.iter().collect();
+    credential_items.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (key, value) in credential_items {
+        hasher.update(key.as_bytes());
+        hasher.update([0]);
+        hasher.update(value.as_bytes());
+        hasher.update([0xff]);
+    }
+
+    let mut config_items: Vec<_> = provider.config.iter().collect();
+    config_items.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (key, value) in config_items {
+        hasher.update(key.as_bytes());
+        hasher.update([0]);
+        hasher.update(value.as_bytes());
+        hasher.update([0xff]);
+    }
+
+    hex::encode(hasher.finalize())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -638,6 +723,28 @@ mod tests {
             "nbf": now.saturating_sub(30),
             "exp": now + 3600
         }))
+    }
+
+    #[test]
+    fn default_audience_prefers_observability_resource() {
+        let cfg = MicrosoftS2sConfig {
+            observability_resource: Some("api://observability".to_string()),
+            ..config()
+        };
+        assert_eq!(
+            cfg.default_audience().as_deref(),
+            Some("api://observability")
+        );
+    }
+
+    #[test]
+    fn default_audience_uses_only_allowed_audience() {
+        let cfg = MicrosoftS2sConfig {
+            allowed_audiences: vec![RESOURCE.to_string()],
+            observability_resource: None,
+            ..config()
+        };
+        assert_eq!(cfg.default_audience().as_deref(), Some(RESOURCE));
     }
 
     #[test]

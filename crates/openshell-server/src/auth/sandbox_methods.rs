@@ -16,6 +16,7 @@ const ALLOWED_SANDBOX_METHODS: &[&str] = &[
     "/openshell.v1.OpenShell/RelayStream",
     "/openshell.v1.OpenShell/GetSandboxConfig",
     "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
+    "/openshell.v1.OpenShell/MintSandboxProviderToken",
     "/openshell.v1.OpenShell/UpdateConfig",
     "/openshell.v1.OpenShell/ReportPolicyStatus",
     "/openshell.v1.OpenShell/PushSandboxLogs",

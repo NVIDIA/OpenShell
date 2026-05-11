@@ -467,6 +467,65 @@ pub(super) async fn resolve_provider_environment(
                 );
             }
         }
+
+        if provider.r#type.trim() == "microsoft-agent-s2s" {
+            insert_supervisor_env(
+                &mut env,
+                name,
+                "OPENSHELL_MICROSOFT_AGENT_S2S_PROVIDER_NAME",
+                name,
+            );
+            for key in [
+                "AZURE_TENANT_ID",
+                "A365_BLUEPRINT_CLIENT_ID",
+                "A365_BLUEPRINT_CLIENT_SECRET",
+                "A365_RUNTIME_AGENT_ID",
+                "A365_ALLOWED_AUDIENCES",
+                "A365_OBSERVABILITY_RESOURCE",
+                "A365_REQUIRED_ROLES",
+            ] {
+                if let Some(value) = provider
+                    .credentials
+                    .get(key)
+                    .or_else(|| provider.config.get(key))
+                {
+                    insert_supervisor_env(&mut env, name, key, value);
+                }
+            }
+        }
+
+        for state in
+            crate::provider_refresh::list_refresh_states_for_provider(store, provider.object_id())
+                .await?
+        {
+            let expires_at_ms = state.expires_at_ms;
+            if expires_at_ms > 0 && expires_at_ms <= now_ms {
+                warn!(
+                    provider_name = %name,
+                    key = %state.credential_key,
+                    expires_at_ms,
+                    "skipping expired refreshed provider credential"
+                );
+                continue;
+            }
+            if is_valid_env_key(&state.credential_key) {
+                if expires_at_ms > 0 {
+                    expires
+                        .entry(state.credential_key.clone())
+                        .or_insert(expires_at_ms);
+                }
+                if let Some(value) = state.material.get("access_token") {
+                    env.entry(state.credential_key.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            } else {
+                warn!(
+                    provider_name = %name,
+                    key = %state.credential_key,
+                    "skipping refreshed credential with invalid env var key"
+                );
+            }
+        }
     }
 
     Ok(ProviderEnvironment {
@@ -596,6 +655,24 @@ fn active_provider_credential_keys(provider: &Provider, now_ms: i64) -> Vec<Stri
         })
         .cloned()
         .collect()
+}
+
+fn insert_supervisor_env(
+    env: &mut std::collections::HashMap<String, String>,
+    provider_name: &str,
+    key: &str,
+    value: &str,
+) {
+    if is_valid_env_key(key) {
+        env.entry(key.to_string())
+            .or_insert_with(|| value.to_string());
+    } else {
+        warn!(
+            provider_name = %provider_name,
+            key = %key,
+            "skipping credential with invalid env var key"
+        );
+    }
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {

@@ -259,7 +259,7 @@ impl NetworkNamespace {
     /// Degrades gracefully if `nft` is not available — the namespace
     /// still provides isolation via routing, just without fast-fail and
     /// diagnostic logging.
-    pub fn install_bypass_rules(&self, proxy_port: u16) -> Result<()> {
+    pub fn install_bypass_rules(&self, proxy_port: u16, extra_allowed_ports: &[u16]) -> Result<()> {
         let Some(nft_path) = find_nft() else {
             openshell_ocsf::ocsf_emit!(
                 openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
@@ -290,6 +290,7 @@ impl NetworkNamespace {
         let ruleset_with_log = super::nft_ruleset::generate_bypass_ruleset(
             &host_ip_str,
             proxy_port,
+            extra_allowed_ports,
             Some(&log_prefix),
         );
 
@@ -306,8 +307,12 @@ impl NetworkNamespace {
                     .build()
             );
 
-            let ruleset_no_log =
-                super::nft_ruleset::generate_bypass_ruleset(&host_ip_str, proxy_port, None);
+            let ruleset_no_log = super::nft_ruleset::generate_bypass_ruleset(
+                &host_ip_str,
+                proxy_port,
+                extra_allowed_ports,
+                None,
+            );
 
             if let Err(e) = run_nft_netns(&self.name, &nft_path, &ruleset_no_log) {
                 openshell_ocsf::ocsf_emit!(

@@ -30,8 +30,8 @@ mod http;
 mod inference;
 mod multiplex;
 mod persistence;
-mod provider_auth;
 pub(crate) mod policy_store;
+mod provider_auth;
 mod provider_refresh;
 mod sandbox_index;
 mod sandbox_watch;
@@ -128,6 +128,9 @@ pub struct ServerState {
     /// `IssueSandboxToken` bootstrap path. Only present when the gateway
     /// runs in-cluster.
     pub k8s_sa_authenticator: Option<Arc<auth::k8s_sa::K8sServiceAccountAuthenticator>>,
+
+    /// Gateway-owned Microsoft S2S broker registry keyed by provider record.
+    pub microsoft_s2s_brokers: provider_auth::microsoft_s2s::BrokerRegistry,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -175,6 +178,7 @@ impl ServerState {
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
             k8s_sa_authenticator: None,
+            microsoft_s2s_brokers: provider_auth::microsoft_s2s::BrokerRegistry::default(),
         }
     }
 }

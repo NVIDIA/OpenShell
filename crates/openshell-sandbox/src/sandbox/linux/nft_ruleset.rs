@@ -19,7 +19,16 @@
 /// so that bypass attempts are recorded in the kernel ring buffer before being
 /// rejected. The `log` expression requires kernel `nft_log` module support;
 /// pass `None` for `log_prefix` as a fallback when that module is unavailable.
-pub fn generate_bypass_ruleset(host_ip: &str, proxy_port: u16, log_prefix: Option<&str>) -> String {
+pub fn generate_bypass_ruleset(
+    host_ip: &str,
+    proxy_port: u16,
+    extra_allowed_ports: &[u16],
+    log_prefix: Option<&str>,
+) -> String {
+    let extra_accept_rules = extra_allowed_ports
+        .iter()
+        .map(|port| format!("        ip daddr {host_ip} tcp dport {port} accept\n"))
+        .collect::<String>();
     let log_tcp = log_prefix
         .map(|p| {
             format!(
@@ -41,6 +50,7 @@ pub fn generate_bypass_ruleset(host_ip: &str, proxy_port: u16, log_prefix: Optio
         type filter hook output priority 0; policy accept;
 
         ip daddr {host_ip} tcp dport {proxy_port} accept
+{extra_accept_rules}\
         oifname "lo" accept
         ct state established,related accept{log_tcp}
         meta nfproto ipv4 meta l4proto tcp reject with icmp type port-unreachable
@@ -59,7 +69,7 @@ mod tests {
 
     #[test]
     fn generates_bypass_ruleset_with_proxy_rule() {
-        let ruleset = generate_bypass_ruleset("10.0.2.2", 8080, None);
+        let ruleset = generate_bypass_ruleset("10.0.2.2", 8080, &[], None);
         assert!(ruleset.contains("table inet openshell_bypass"));
         assert!(ruleset.contains("chain output"));
         assert!(ruleset.contains("ip daddr 10.0.2.2 tcp dport 8080 accept"));
@@ -67,20 +77,20 @@ mod tests {
 
     #[test]
     fn ruleset_has_inet_family_table_and_output_chain() {
-        let ruleset = generate_bypass_ruleset("192.168.1.1", 3128, None);
+        let ruleset = generate_bypass_ruleset("192.168.1.1", 3128, &[], None);
         assert!(ruleset.contains("table inet openshell_bypass"));
         assert!(ruleset.contains("type filter hook output priority 0; policy accept;"));
     }
 
     #[test]
     fn proxy_accept_rule_uses_provided_ip_and_port() {
-        let ruleset = generate_bypass_ruleset("172.16.0.1", 9999, None);
+        let ruleset = generate_bypass_ruleset("172.16.0.1", 9999, &[], None);
         assert!(ruleset.contains("ip daddr 172.16.0.1 tcp dport 9999 accept"));
     }
 
     #[test]
     fn rules_are_ordered_accept_then_reject() {
-        let ruleset = generate_bypass_ruleset("10.0.2.2", 8080, None);
+        let ruleset = generate_bypass_ruleset("10.0.2.2", 8080, &[], None);
         let proxy_pos = ruleset.find("ip daddr").unwrap();
         let lo_pos = ruleset.find("oifname \"lo\"").unwrap();
         let ct_pos = ruleset.find("ct state established,related").unwrap();
@@ -93,7 +103,7 @@ mod tests {
 
     #[test]
     fn both_ipv4_and_ipv6_reject_types_are_present() {
-        let ruleset = generate_bypass_ruleset("10.0.2.2", 8080, None);
+        let ruleset = generate_bypass_ruleset("10.0.2.2", 8080, &[], None);
         let icmp_count = ruleset
             .matches("reject with icmp type port-unreachable")
             .count();
@@ -106,7 +116,7 @@ mod tests {
 
     #[test]
     fn no_log_ruleset_omits_log_rules() {
-        let ruleset = generate_bypass_ruleset("10.0.2.2", 8080, None);
+        let ruleset = generate_bypass_ruleset("10.0.2.2", 8080, &[], None);
         assert!(
             !ruleset.contains("log prefix"),
             "no-log ruleset must not contain log rules"
@@ -115,7 +125,8 @@ mod tests {
 
     #[test]
     fn log_ruleset_contains_prefix_for_tcp_and_udp() {
-        let ruleset = generate_bypass_ruleset("10.0.2.2", 8080, Some("openshell:bypass:test:"));
+        let ruleset =
+            generate_bypass_ruleset("10.0.2.2", 8080, &[], Some("openshell:bypass:test:"));
         let count = ruleset
             .matches("log prefix \"openshell:bypass:test:\"")
             .count();
@@ -126,7 +137,8 @@ mod tests {
 
     #[test]
     fn log_rules_appear_before_reject_rules() {
-        let ruleset = generate_bypass_ruleset("10.0.2.2", 8080, Some("openshell:bypass:test:"));
+        let ruleset =
+            generate_bypass_ruleset("10.0.2.2", 8080, &[], Some("openshell:bypass:test:"));
         let tcp_log_pos = ruleset.find("tcp flags syn").unwrap();
         let tcp_reject_pos = ruleset
             .find("meta nfproto ipv4 meta l4proto tcp reject")
@@ -144,5 +156,12 @@ mod tests {
             udp_log_pos < udp_reject_pos,
             "UDP log rule must come before UDP reject rule"
         );
+    }
+
+    #[test]
+    fn extra_allowed_ports_are_included() {
+        let ruleset = generate_bypass_ruleset("10.0.2.2", 8080, &[3130, 4242], None);
+        assert!(ruleset.contains("ip daddr 10.0.2.2 tcp dport 3130 accept"));
+        assert!(ruleset.contains("ip daddr 10.0.2.2 tcp dport 4242 accept"));
     }
 }
