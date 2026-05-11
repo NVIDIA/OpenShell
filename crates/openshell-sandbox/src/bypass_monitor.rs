@@ -22,7 +22,7 @@ use openshell_ocsf::{
     FindingInfo, NetworkActivityBuilder, Process, SeverityId, ocsf_emit,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -117,6 +117,7 @@ fn hint_for_event(event: &BypassEvent) -> &'static str {
 pub fn spawn(
     namespace_name: String,
     entrypoint_pid: Arc<AtomicU32>,
+    sandbox_netns_inode: Arc<AtomicU64>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     use std::io::BufRead;
@@ -196,9 +197,10 @@ pub fn spawn(
 
             // Attempt process identity resolution (best-effort, TCP only).
             let pid = entrypoint_pid.load(Ordering::Acquire);
+            let netns_ino = sandbox_netns_inode.load(Ordering::Acquire);
             let (binary, binary_pid, ancestors) =
                 if event.proto == "tcp" && event.src_port > 0 && pid > 0 {
-                    resolve_process_identity(pid, event.src_port)
+                    resolve_process_identity(pid, event.src_port, event.dst_port, netns_ino)
                 } else {
                     ("-".to_string(), "-".to_string(), "-".to_string())
                 };
@@ -292,12 +294,22 @@ pub fn spawn(
 ///
 /// Returns `(binary_path, pid, ancestors)` as display strings.
 /// Falls back to `("-", "-", "-")` on any failure (race condition, etc.).
-fn resolve_process_identity(entrypoint_pid: u32, src_port: u16) -> (String, String, String) {
+fn resolve_process_identity(
+    entrypoint_pid: u32,
+    src_port: u16,
+    dst_port: u16,
+    sandbox_netns_inode: u64,
+) -> (String, String, String) {
     #[cfg(target_os = "linux")]
     {
         use crate::procfs;
 
-        match procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, src_port) {
+        match procfs::resolve_tcp_peer_socket_owners(
+            entrypoint_pid,
+            src_port,
+            dst_port,
+            sandbox_netns_inode,
+        ) {
             Ok(socket_owners) => {
                 let mut identities = Vec::new();
                 for owner in &socket_owners.owners {
@@ -371,7 +383,7 @@ fn resolve_process_identity(entrypoint_pid: u32, src_port: u16) -> (String, Stri
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (entrypoint_pid, src_port);
+        let _ = (entrypoint_pid, src_port, dst_port, sandbox_netns_inode);
         ("-".to_string(), "-".to_string(), "-".to_string())
     }
 }
@@ -559,7 +571,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let (binary, pid, ancestors) = resolve_process_identity(std::process::id(), peer_port);
+        let test_netns_ino = std::fs::metadata("/proc/self/ns/net")
+            .map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                m.ino()
+            })
+            .expect("stat /proc/self/ns/net");
+        let (binary, pid, ancestors) =
+            resolve_process_identity(std::process::id(), peer_port, listener_port, test_netns_ino);
 
         // libc/syscall FFI requires unsafe
         #[allow(unsafe_code)]
