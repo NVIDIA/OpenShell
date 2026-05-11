@@ -4,7 +4,7 @@ authors:
 state: review
 ---
 
-# RFC 0002 - Gateway Configuration File
+# RFC 0003 - Gateway Configuration File
 
 ## Summary
 
