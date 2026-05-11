@@ -5,9 +5,8 @@ use crate::gpu::{
     GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
 };
 use crate::rootfs::{
-    copy_rootfs_image_to, create_rootfs_image_from_dir, extract_rootfs_archive_to,
-    prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path, set_rootfs_image_file_mode,
-    write_rootfs_image_file,
+    create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir, extract_rootfs_archive_to,
+    prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
 };
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
@@ -56,6 +55,7 @@ const DRIVER_NAME: &str = "openshell-driver-vm";
 const WATCH_BUFFER: usize = 256;
 const DEFAULT_VCPUS: u8 = 2;
 const DEFAULT_MEM_MIB: u32 = 2048;
+const DEFAULT_OVERLAY_DISK_MIB: u64 = 4096;
 /// gvproxy host-loopback IP — gvproxy's TCP/UDP/ICMP forwarder NAT-rewrites
 /// this destination to the host's `127.0.0.1` and dials out from the host
 /// process. This is the only address that transparently reaches host-bound
@@ -89,8 +89,9 @@ const GUEST_TLS_CERT_PATH: &str = "/opt/openshell/tls/tls.crt";
 const GUEST_TLS_KEY_PATH: &str = "/opt/openshell/tls/tls.key";
 const IMAGE_CACHE_ROOT_DIR: &str = "images";
 const IMAGE_CACHE_ROOTFS_IMAGE: &str = "rootfs.ext4";
+const SANDBOX_OVERLAY_IMAGE: &str = "overlay.ext4";
 const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
-const IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-rootfs-ext4-v1";
+const IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-rootfs-ext4-overlay-v1";
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
 static IMAGE_CACHE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -112,6 +113,7 @@ pub struct VmDriverConfig {
     pub krun_log_level: u32,
     pub vcpus: u8,
     pub mem_mib: u32,
+    pub overlay_disk_mib: u64,
     pub guest_tls_ca: Option<PathBuf>,
     pub guest_tls_cert: Option<PathBuf>,
     pub guest_tls_key: Option<PathBuf>,
@@ -131,6 +133,7 @@ impl Default for VmDriverConfig {
             krun_log_level: 1,
             vcpus: DEFAULT_VCPUS,
             mem_mib: DEFAULT_MEM_MIB,
+            overlay_disk_mib: DEFAULT_OVERLAY_DISK_MIB,
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
@@ -359,7 +362,6 @@ impl VmDriver {
         let gpu_device = spec.map_or("", |s| s.gpu_device.as_str());
 
         let state_dir = sandbox_state_dir(&self.config.state_dir, &sandbox.id)?;
-        let root_disk = state_dir.join(IMAGE_CACHE_ROOTFS_IMAGE);
         let image_ref = self.resolved_sandbox_image(sandbox).ok_or_else(|| {
             Status::failed_precondition(
                 "vm sandboxes require template.image or a configured default sandbox image",
@@ -369,7 +371,7 @@ impl VmDriver {
             sandbox_id = %sandbox.id,
             image_ref = %image_ref,
             state_dir = %state_dir.display(),
-            "vm driver: resolved image ref, preparing root disk"
+            "vm driver: resolved image ref, preparing disks"
         );
 
         tokio::fs::create_dir_all(&state_dir)
@@ -393,15 +395,12 @@ impl VmDriver {
             ),
         );
 
-        let image_identity = match self
-            .prepare_runtime_rootfs(&sandbox.id, &image_ref, &root_disk)
-            .await
-        {
+        let image_identity = match self.prepare_runtime_rootfs(&sandbox.id, &image_ref).await {
             Ok(image_identity) => {
                 info!(
                     sandbox_id = %sandbox.id,
                     image_identity = %image_identity,
-                    "vm driver: root disk prepared"
+                    "vm driver: cached root disk resolved"
                 );
                 image_identity
             }
@@ -415,12 +414,18 @@ impl VmDriver {
                 return Err(err);
             }
         };
-        if let Some(tls_paths) = tls_paths.as_ref()
-            && let Err(err) = prepare_guest_tls_materials(&root_disk, tls_paths).await
+        let disk_paths =
+            sandbox_runtime_disk_paths(&self.config.state_dir, &state_dir, &image_identity);
+        let root_disk = disk_paths.root_disk;
+        let overlay_disk = disk_paths.overlay_disk;
+
+        if let Err(err) = self
+            .prepare_runtime_overlay(&overlay_disk, tls_paths.as_ref())
+            .await
         {
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
             return Err(Status::internal(format!(
-                "prepare guest TLS materials failed: {err}"
+                "prepare guest overlay disk failed: {err}"
             )));
         }
 
@@ -471,6 +476,7 @@ impl VmDriver {
         command.stderr(Stdio::inherit());
         command.arg("--internal-run-vm");
         command.arg("--vm-root-disk").arg(&root_disk);
+        command.arg("--vm-overlay-disk").arg(&overlay_disk);
         command.arg("--vm-exec").arg(sandbox_guest_init_path());
         command.arg("--vm-workdir").arg("/");
         command.arg("--vm-console-output").arg(&console_output);
@@ -729,19 +735,37 @@ impl VmDriver {
         &self,
         sandbox_id: &str,
         image_ref: &str,
-        root_disk: &Path,
     ) -> Result<String, Status> {
-        let image_identity = self
-            .ensure_cached_image_rootfs_image(sandbox_id, image_ref)
-            .await?;
-        let cached_image = image_cache_rootfs_image(&self.config.state_dir, &image_identity);
-        let root_disk_dest = root_disk.to_path_buf();
-        tokio::task::spawn_blocking(move || copy_rootfs_image_to(&cached_image, &root_disk_dest))
+        self.ensure_cached_image_rootfs_image(sandbox_id, image_ref)
             .await
-            .map_err(|err| Status::internal(format!("sandbox root disk copy panicked: {err}")))?
-            .map_err(|err| Status::internal(format!("copy sandbox root disk failed: {err}")))?;
+    }
 
-        Ok(image_identity)
+    async fn prepare_runtime_overlay(
+        &self,
+        overlay_disk: &Path,
+        tls_paths: Option<&VmDriverTlsPaths>,
+    ) -> Result<(), String> {
+        let tls_materials = match tls_paths {
+            Some(paths) => Some(read_guest_tls_materials(paths).await?),
+            None => None,
+        };
+        let overlay_disk = overlay_disk.to_path_buf();
+        let overlay_size_bytes = self
+            .config
+            .overlay_disk_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| {
+                format!(
+                    "overlay disk size {} MiB is too large",
+                    self.config.overlay_disk_mib
+                )
+            })?;
+
+        tokio::task::spawn_blocking(move || {
+            create_sandbox_overlay_image(&overlay_disk, overlay_size_bytes, tls_materials.as_ref())
+        })
+        .await
+        .map_err(|err| format!("overlay image preparation panicked: {err}"))?
     }
 
     fn resolved_sandbox_image(&self, sandbox: &Sandbox) -> Option<String> {
@@ -2306,6 +2330,27 @@ fn sandbox_state_dir(root: &Path, sandbox_id: &str) -> Result<PathBuf, Status> {
     Ok(sandboxes_root_dir(root).join(sandbox_id))
 }
 
+fn sandbox_overlay_image(state_dir: &Path) -> PathBuf {
+    state_dir.join(SANDBOX_OVERLAY_IMAGE)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SandboxRuntimeDiskPaths {
+    root_disk: PathBuf,
+    overlay_disk: PathBuf,
+}
+
+fn sandbox_runtime_disk_paths(
+    driver_state_root: &Path,
+    state_dir: &Path,
+    image_identity: &str,
+) -> SandboxRuntimeDiskPaths {
+    SandboxRuntimeDiskPaths {
+        root_disk: image_cache_rootfs_image(driver_state_root, image_identity),
+        overlay_disk: sandbox_overlay_image(state_dir),
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn validate_sandbox_state_dir(root: &Path, state_dir: &Path) -> Result<(), Status> {
     let sandboxes_root = sandboxes_root_dir(root);
@@ -2428,10 +2473,14 @@ async fn write_sandbox_image_metadata(
     Ok(())
 }
 
-async fn prepare_guest_tls_materials(
-    root_disk: &Path,
-    paths: &VmDriverTlsPaths,
-) -> Result<(), String> {
+#[derive(Debug, Clone)]
+struct GuestTlsMaterials {
+    ca: Vec<u8>,
+    cert: Vec<u8>,
+    key: Vec<u8>,
+}
+
+async fn read_guest_tls_materials(paths: &VmDriverTlsPaths) -> Result<GuestTlsMaterials, String> {
     let ca = tokio::fs::read(&paths.ca)
         .await
         .map_err(|err| format!("read {}: {err}", paths.ca.display()))?;
@@ -2441,16 +2490,86 @@ async fn prepare_guest_tls_materials(
     let key = tokio::fs::read(&paths.key)
         .await
         .map_err(|err| format!("read {}: {err}", paths.key.display()))?;
-    let root_disk = root_disk.to_path_buf();
+    Ok(GuestTlsMaterials { ca, cert, key })
+}
 
-    tokio::task::spawn_blocking(move || {
-        write_rootfs_image_file(&root_disk, GUEST_TLS_CA_PATH, &ca)?;
-        write_rootfs_image_file(&root_disk, GUEST_TLS_CERT_PATH, &cert)?;
-        write_rootfs_image_file(&root_disk, GUEST_TLS_KEY_PATH, &key)?;
-        set_rootfs_image_file_mode(&root_disk, GUEST_TLS_KEY_PATH, 0o100_600)
-    })
-    .await
-    .map_err(|err| format!("guest TLS material injection panicked: {err}"))?
+fn create_sandbox_overlay_image(
+    overlay_disk: &Path,
+    size_bytes: u64,
+    tls_materials: Option<&GuestTlsMaterials>,
+) -> Result<(), String> {
+    let staging_dir = overlay_staging_dir(overlay_disk);
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir)
+            .map_err(|err| format!("remove stale overlay staging dir: {err}"))?;
+    }
+
+    let result = (|| {
+        fs::create_dir_all(staging_dir.join("upper"))
+            .map_err(|err| format!("create overlay upper dir: {err}"))?;
+        fs::create_dir_all(staging_dir.join("work"))
+            .map_err(|err| format!("create overlay work dir: {err}"))?;
+        fs::create_dir_all(staging_dir.join("config"))
+            .map_err(|err| format!("create overlay config dir: {err}"))?;
+
+        if let Some(tls) = tls_materials {
+            stage_guest_tls_materials(&staging_dir, tls)?;
+        }
+
+        create_ext4_image_from_dir_with_size(&staging_dir, overlay_disk, size_bytes)
+    })();
+
+    let _ = fs::remove_dir_all(&staging_dir);
+    result
+}
+
+fn stage_guest_tls_materials(
+    staging_dir: &Path,
+    materials: &GuestTlsMaterials,
+) -> Result<(), String> {
+    let tls_dir = staging_dir
+        .join("upper")
+        .join(GUEST_TLS_CA_PATH.trim_start_matches('/'))
+        .parent()
+        .ok_or_else(|| "guest TLS CA path has no parent".to_string())?
+        .to_path_buf();
+    fs::create_dir_all(&tls_dir)
+        .map_err(|err| format!("create guest TLS dir {}: {err}", tls_dir.display()))?;
+
+    let ca_path = staging_dir
+        .join("upper")
+        .join(GUEST_TLS_CA_PATH.trim_start_matches('/'));
+    let cert_path = staging_dir
+        .join("upper")
+        .join(GUEST_TLS_CERT_PATH.trim_start_matches('/'));
+    let key_path = staging_dir
+        .join("upper")
+        .join(GUEST_TLS_KEY_PATH.trim_start_matches('/'));
+    fs::write(&ca_path, &materials.ca)
+        .map_err(|err| format!("write guest TLS CA {}: {err}", ca_path.display()))?;
+    fs::write(&cert_path, &materials.cert)
+        .map_err(|err| format!("write guest TLS cert {}: {err}", cert_path.display()))?;
+    fs::write(&key_path, &materials.key)
+        .map_err(|err| format!("write guest TLS key {}: {err}", key_path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("chmod guest TLS key {}: {err}", key_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn overlay_staging_dir(overlay_disk: &Path) -> PathBuf {
+    let parent = overlay_disk.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        ".openshell-overlay-staging-{}-{}",
+        std::process::id(),
+        current_time_ms()
+    ))
 }
 
 async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
@@ -2715,6 +2834,22 @@ mod tests {
         let err = sandbox_state_dir(Path::new("/tmp/openshell-vm"), "../escape")
             .expect_err("path traversal should be rejected");
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn sandbox_runtime_disk_paths_use_cached_root_and_per_sandbox_overlay() {
+        let driver_state = Path::new("/tmp/openshell-vm");
+        let state_dir = driver_state.join("sandboxes").join("sandbox-123");
+        let image_identity = prepared_image_cache_identity("sha256:abc");
+
+        let disks = sandbox_runtime_disk_paths(driver_state, &state_dir, &image_identity);
+
+        assert_eq!(
+            disks.root_disk,
+            image_cache_rootfs_image(driver_state, &image_identity)
+        );
+        assert_eq!(disks.overlay_disk, state_dir.join(SANDBOX_OVERLAY_IMAGE));
+        assert_ne!(disks.root_disk.parent(), Some(state_dir.as_path()));
     }
 
     #[test]
@@ -3252,22 +3387,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_guest_tls_materials_reports_missing_input() {
+    async fn read_guest_tls_materials_reports_missing_input() {
         let base = unique_temp_dir();
         let source_dir = base.join("missing-source");
 
-        let err = prepare_guest_tls_materials(
-            &base.join("rootfs.ext4"),
-            &VmDriverTlsPaths {
-                ca: source_dir.join("ca.crt"),
-                cert: source_dir.join("tls.crt"),
-                key: source_dir.join("tls.key"),
-            },
-        )
+        let err = read_guest_tls_materials(&VmDriverTlsPaths {
+            ca: source_dir.join("ca.crt"),
+            cert: source_dir.join("tls.crt"),
+            key: source_dir.join("tls.key"),
+        })
         .await
         .expect_err("missing TLS materials should fail before image injection");
 
         assert!(err.contains("ca.crt"));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_guest_tls_materials_places_files_in_overlay_upper_with_private_key_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = unique_temp_dir();
+        let materials = GuestTlsMaterials {
+            ca: b"ca".to_vec(),
+            cert: b"cert".to_vec(),
+            key: b"key".to_vec(),
+        };
+
+        stage_guest_tls_materials(&base, &materials).expect("stage TLS materials");
+
+        assert_eq!(
+            fs::read(
+                base.join("upper")
+                    .join(GUEST_TLS_CA_PATH.trim_start_matches('/'))
+            )
+            .unwrap(),
+            b"ca"
+        );
+        assert_eq!(
+            fs::read(
+                base.join("upper")
+                    .join(GUEST_TLS_CERT_PATH.trim_start_matches('/'))
+            )
+            .unwrap(),
+            b"cert"
+        );
+        let key_path = base
+            .join("upper")
+            .join(GUEST_TLS_KEY_PATH.trim_start_matches('/'));
+        assert_eq!(fs::read(&key_path).unwrap(), b"key");
+        assert_eq!(
+            fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         let _ = std::fs::remove_dir_all(base);
     }

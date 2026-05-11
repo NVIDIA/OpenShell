@@ -30,6 +30,9 @@ struct Args {
     #[arg(long = "vm-root-disk", hide = true, alias = "vm-rootfs")]
     vm_root_disk: Option<PathBuf>,
 
+    #[arg(long = "vm-overlay-disk", hide = true)]
+    vm_overlay_disk: Option<PathBuf>,
+
     #[arg(long, hide = true)]
     vm_exec: Option<String>,
 
@@ -107,6 +110,9 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_VM_DRIVER_MEM_MIB", default_value_t = 2048)]
     mem_mib: u32,
+
+    #[arg(long, env = "OPENSHELL_VM_OVERLAY_DISK_MIB", default_value_t = 4096)]
+    overlay_disk_mib: u64,
 
     #[arg(long, env = "OPENSHELL_VM_GPU")]
     gpu: bool,
@@ -191,6 +197,7 @@ async fn main() -> Result<()> {
         krun_log_level: args.krun_log_level,
         vcpus: args.vcpus,
         mem_mib: args.mem_mib,
+        overlay_disk_mib: args.overlay_disk_mib,
         guest_tls_ca: args.guest_tls_ca.clone(),
         guest_tls_cert: args.guest_tls_cert.clone(),
         guest_tls_key: args.guest_tls_key.clone(),
@@ -444,6 +451,10 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         .vm_root_disk
         .clone()
         .ok_or_else(|| "--vm-root-disk is required in internal VM mode".to_string())?;
+    let overlay_disk = args
+        .vm_overlay_disk
+        .clone()
+        .ok_or_else(|| "--vm-overlay-disk is required in internal VM mode".to_string())?;
     let exec_path = args
         .vm_exec
         .clone()
@@ -461,6 +472,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
 
     Ok(VmLaunchConfig {
         root_disk,
+        overlay_disk,
         vcpus: args.vm_vcpus,
         mem_mib: args.vm_mem_mib,
         exec_path,

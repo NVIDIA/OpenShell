@@ -104,7 +104,7 @@ s.close()')"
 
 # Per-run state dir so concurrent e2e runs don't collide on the UDS or
 # sandbox state. The VM driver creates `<state_dir>/compute-driver.sock`
-# and `<state_dir>/sandboxes/<id>/rootfs.ext4` under here. Keep the
+# and `<state_dir>/sandboxes/<id>/overlay.ext4` under here. Keep the
 # basename short — see the SUN_LEN comment above.
 RUN_STATE_DIR="${STATE_DIR_ROOT}/os-vm-e2e-${HOST_PORT}-$$"
 mkdir -p "${RUN_STATE_DIR}"
@@ -215,11 +215,12 @@ echo "==> Gateway ready after ${elapsed}s"
 # metadata lookup needed when TLS is disabled.
 
 export OPENSHELL_GATEWAY_ENDPOINT="http://127.0.0.1:${HOST_PORT}"
+export OPENSHELL_E2E_EXPECT_VM_OVERLAY=1
 
-# The VM driver creates each sandbox VM from a copied ext4 root disk, and the
-# guest's sandbox supervisor then initializes policy, netns, Landlock, and sshd.
-# On a cold host this is ~15s after image preparation; allow 180s for slower CI
-# runners.
+# The VM driver creates each sandbox VM from a cached read-only ext4 root disk
+# plus a writable overlay disk. The guest's sandbox supervisor then initializes
+# policy, netns, Landlock, and sshd. On a cold host this is ~15s after image
+# preparation; allow 180s for slower CI runners.
 export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
 echo "==> Running e2e smoke test (endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})"

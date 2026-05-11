@@ -5,7 +5,7 @@ use std::fs;
 use std::fs::File;
 #[cfg(test)]
 use std::io::BufWriter;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +16,7 @@ const SANDBOX_GUEST_INIT_PATH: &str = "/srv/openshell-vm-sandbox-init.sh";
 const SANDBOX_SUPERVISOR_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
 const ROOTFS_IMAGE_MIN_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const ROOTFS_IMAGE_MIN_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
+const EXT4_IMAGE_MIN_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
 static INJECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const fn sandbox_guest_init_path() -> &'static str {
@@ -74,6 +75,15 @@ pub fn create_rootfs_archive_from_dir(source: &Path, archive_path: &Path) -> Res
 }
 
 pub fn create_rootfs_image_from_dir(source: &Path, image_path: &Path) -> Result<(), String> {
+    let image_size = rootfs_image_size_bytes(source)?;
+    create_ext4_image_from_dir_with_size(source, image_path, image_size)
+}
+
+pub fn create_ext4_image_from_dir_with_size(
+    source: &Path,
+    image_path: &Path,
+    image_size: u64,
+) -> Result<(), String> {
     if let Some(parent) = image_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
@@ -82,7 +92,16 @@ pub fn create_rootfs_image_from_dir(source: &Path, image_path: &Path) -> Result<
             .map_err(|e| format!("remove old rootfs image {}: {e}", image_path.display()))?;
     }
 
-    let image_size = rootfs_image_size_bytes(source)?;
+    let required_size = ext4_image_min_size_bytes(source)?;
+    if image_size < required_size {
+        return Err(format!(
+            "ext4 image size {} bytes is too small for {} (requires at least {} bytes)",
+            image_size,
+            source.display(),
+            required_size
+        ));
+    }
+
     let image = File::create(image_path)
         .map_err(|e| format!("create rootfs image {}: {e}", image_path.display()))?;
     image
@@ -96,52 +115,6 @@ pub fn create_rootfs_image_from_dir(source: &Path, image_path: &Path) -> Result<
     }
 
     Ok(())
-}
-
-pub fn copy_rootfs_image_to(source: &Path, dest: &Path) -> Result<(), String> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    if dest.exists() {
-        fs::remove_file(dest)
-            .map_err(|e| format!("remove old rootfs image {}: {e}", dest.display()))?;
-    }
-
-    let mut input = File::open(source)
-        .map_err(|e| format!("open cached rootfs image {}: {e}", source.display()))?;
-    let mut output =
-        File::create(dest).map_err(|e| format!("create rootfs image {}: {e}", dest.display()))?;
-    let mut buf = vec![0; 1024 * 1024];
-    let mut total = 0_u64;
-
-    loop {
-        let len = input
-            .read(&mut buf)
-            .map_err(|e| format!("read rootfs image {}: {e}", source.display()))?;
-        if len == 0 {
-            break;
-        }
-        total += len as u64;
-        if buf[..len].iter().all(|byte| *byte == 0) {
-            let offset = i64::try_from(len).map_err(|e| {
-                format!(
-                    "convert sparse rootfs image seek offset for {}: {e}",
-                    dest.display()
-                )
-            })?;
-            output
-                .seek(SeekFrom::Current(offset))
-                .map_err(|e| format!("seek sparse rootfs image {}: {e}", dest.display()))?;
-        } else {
-            output
-                .write_all(&buf[..len])
-                .map_err(|e| format!("write rootfs image {}: {e}", dest.display()))?;
-        }
-    }
-
-    output
-        .set_len(total)
-        .map_err(|e| format!("finalize rootfs image {}: {e}", dest.display()))
 }
 
 pub fn write_rootfs_image_file(
@@ -160,14 +133,6 @@ pub fn write_rootfs_image_file(
     );
     let _ = fs::remove_file(&tmp_path);
     result
-}
-
-pub fn set_rootfs_image_file_mode(
-    image_path: &Path,
-    guest_path: &str,
-    mode: u32,
-) -> Result<(), String> {
-    run_debugfs(image_path, &format!("sif {guest_path} mode {mode:o}"))
 }
 
 #[cfg(test)]
@@ -273,6 +238,9 @@ fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
         .map_err(|e| format!("write sandbox rootfs marker: {e}"))?;
     ensure_sandbox_guest_user(rootfs)?;
     create_sandbox_mountpoint(&rootfs.join("sandbox"))?;
+    create_sandbox_mountpoint(&rootfs.join("lower"))?;
+    create_sandbox_mountpoint(&rootfs.join("overlay"))?;
+    create_sandbox_mountpoint(&rootfs.join("newroot"))?;
 
     Ok(())
 }
@@ -282,6 +250,15 @@ pub fn validate_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
     require_rootfs_path(rootfs, "/opt/openshell/bin/openshell-sandbox")?;
     require_any_rootfs_path(rootfs, &["/bin/bash"])?;
     require_any_rootfs_path(rootfs, &["/bin/mount", "/usr/bin/mount"])?;
+    require_any_rootfs_path(
+        rootfs,
+        &[
+            "/usr/sbin/chroot",
+            "/usr/bin/chroot",
+            "/sbin/chroot",
+            "/bin/chroot",
+        ],
+    )?;
     require_any_rootfs_path(
         rootfs,
         &["/sbin/ip", "/usr/sbin/ip", "/bin/ip", "/usr/bin/ip"],
@@ -307,6 +284,11 @@ fn rootfs_image_size_bytes(source: &Path) -> Result<u64, String> {
     let headroom = (used / 4).max(ROOTFS_IMAGE_MIN_HEADROOM_BYTES);
     let size = (used + headroom).max(ROOTFS_IMAGE_MIN_SIZE_BYTES);
     Ok(round_up_to_mib(size))
+}
+
+fn ext4_image_min_size_bytes(source: &Path) -> Result<u64, String> {
+    let used = directory_size_bytes(source)?;
+    Ok(round_up_to_mib(used + EXT4_IMAGE_MIN_HEADROOM_BYTES))
 }
 
 fn directory_size_bytes(path: &Path) -> Result<u64, String> {
@@ -597,6 +579,7 @@ mod tests {
         fs::create_dir_all(rootfs.join("sbin")).expect("create sbin");
         fs::write(rootfs.join("bin/bash"), b"bash").expect("write bash");
         fs::write(rootfs.join("bin/mount"), b"mount").expect("write mount");
+        fs::write(rootfs.join("bin/chroot"), b"chroot").expect("write chroot");
         fs::write(rootfs.join("bin/sed"), b"sed").expect("write sed");
         fs::write(rootfs.join("sbin/ip"), b"ip").expect("write ip");
 
@@ -605,6 +588,9 @@ mod tests {
 
         assert!(rootfs.join("srv/openshell-vm-sandbox-init.sh").is_file());
         assert!(rootfs.join("sandbox").is_dir());
+        assert!(rootfs.join("lower").is_dir());
+        assert!(rootfs.join("overlay").is_dir());
+        assert!(rootfs.join("newroot").is_dir());
         assert!(
             fs::read_dir(rootfs.join("sandbox"))
                 .expect("read sandbox")

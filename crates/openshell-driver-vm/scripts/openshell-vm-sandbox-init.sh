@@ -9,12 +9,6 @@
 
 set -euo pipefail
 
-# Source QEMU-injected environment variables if present.
-if [ -f /srv/openshell-env.sh ]; then
-    # shellcheck source=/dev/null
-    source /srv/openshell-env.sh
-fi
-
 BOOT_START=$(date +%s%3N 2>/dev/null || date +%s)
 # gvisor-tap-vsock subnet layout:
 #   192.168.127.1   — gateway: gvproxy's DNS / DHCP / HTTP API. Does NOT
@@ -43,6 +37,73 @@ ts() {
     local elapsed=$((now - BOOT_START))
     printf "[%d.%03ds] %s\n" $((elapsed / 1000)) $((elapsed % 1000)) "$*"
 }
+
+mount_initial_fs() {
+    mount -t proc proc /proc 2>/dev/null || true
+    mount -t sysfs sysfs /sys 2>/dev/null || true
+    mount -t tmpfs tmpfs /run 2>/dev/null || true
+    mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+}
+
+move_mount_if_possible() {
+    local source="$1"
+    local target="/newroot${source}"
+
+    mkdir -p "$target" 2>/dev/null || true
+    mount --move "$source" "$target" 2>/dev/null || true
+}
+
+exec_chroot_overlay_root() {
+    local chroot_bin
+    for chroot_bin in /usr/sbin/chroot /usr/bin/chroot /sbin/chroot /bin/chroot; do
+        if [ -x "$chroot_bin" ]; then
+            exec "$chroot_bin" /newroot /srv/openshell-vm-sandbox-init.sh --post-overlay
+        fi
+    done
+
+    ts "FATAL: chroot not found in guest rootfs"
+    exit 1
+}
+
+setup_overlay_root() {
+    ts "setting up writable overlay root"
+    mount_initial_fs
+
+    if [ ! -b /dev/vdb ]; then
+        ts "FATAL: writable overlay disk /dev/vdb not found"
+        exit 1
+    fi
+
+    mount -o remount,ro / 2>/dev/null || true
+    mount --bind / /lower
+    mount -o remount,bind,ro /lower 2>/dev/null || true
+
+    mount -t ext4 -o rw /dev/vdb /overlay
+    mkdir -p /overlay/upper /overlay/work
+    mount -t overlay overlay \
+        -o lowerdir=/lower,upperdir=/overlay/upper,workdir=/overlay/work \
+        /newroot
+
+    move_mount_if_possible /proc
+    move_mount_if_possible /sys
+    move_mount_if_possible /dev
+    move_mount_if_possible /run
+
+    exec_chroot_overlay_root
+}
+
+if [ "${1:-}" != "--post-overlay" ]; then
+    setup_overlay_root
+fi
+
+shift || true
+
+# Source QEMU-injected environment variables if present. The file lives in the
+# overlay upperdir so the cached base rootfs remains immutable.
+if [ -f /srv/openshell-env.sh ]; then
+    # shellcheck source=/dev/null
+    source /srv/openshell-env.sh
+fi
 
 parse_endpoint() {
     local endpoint="$1"

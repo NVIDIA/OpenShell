@@ -85,6 +85,9 @@ pub struct VmComputeConfig {
     /// Default memory allocation for VM sandboxes, in MiB.
     pub mem_mib: u32,
 
+    /// Writable overlay disk size for each VM sandbox, in MiB.
+    pub overlay_disk_mib: u64,
+
     /// Host-side CA certificate for the guest's mTLS client bundle.
     pub guest_tls_ca: Option<PathBuf>,
 
@@ -120,6 +123,12 @@ impl VmComputeConfig {
         2048
     }
 
+    /// Default writable overlay disk size, in MiB.
+    #[must_use]
+    pub const fn default_overlay_disk_mib() -> u64 {
+        4096
+    }
+
     #[must_use]
     fn default_driver_search_dirs(home: Option<PathBuf>) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
@@ -143,6 +152,7 @@ impl Default for VmComputeConfig {
             krun_log_level: Self::default_krun_log_level(),
             vcpus: Self::default_vcpus(),
             mem_mib: Self::default_mem_mib(),
+            overlay_disk_mib: Self::default_overlay_disk_mib(),
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
@@ -457,6 +467,9 @@ pub async fn spawn(
         .arg(vm_config.krun_log_level.to_string());
     command.arg("--vcpus").arg(vm_config.vcpus.to_string());
     command.arg("--mem-mib").arg(vm_config.mem_mib.to_string());
+    command
+        .arg("--overlay-disk-mib")
+        .arg(vm_config.overlay_disk_mib.to_string());
     if let Some(tls) = guest_tls_paths {
         command.arg("--guest-tls-ca").arg(tls.ca);
         command.arg("--guest-tls-cert").arg(tls.cert);

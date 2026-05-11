@@ -46,6 +46,7 @@ const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
 
 pub struct VmLaunchConfig {
     pub root_disk: PathBuf,
+    pub overlay_disk: PathBuf,
     pub vcpus: u8,
     pub mem_mib: u32,
     pub exec_path: String,
@@ -102,6 +103,12 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
             config.root_disk.display()
         ));
     }
+    if !config.overlay_disk.is_file() {
+        return Err(format!(
+            "overlay disk image not found: {}",
+            config.overlay_disk.display()
+        ));
+    }
 
     if let Err(err) = procguard::die_with_parent_cleanup(procguard_kill_children) {
         return Err(format!("procguard arm failed: {err}"));
@@ -111,7 +118,7 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     check_kvm_access()?;
 
     let guest_env = qemu_guest_env_vars(config, host_dns_server());
-    write_guest_env_file(&config.root_disk, &guest_env)?;
+    write_guest_env_file(&config.overlay_disk, &guest_env)?;
 
     let runtime_dir = qemu_runtime_dir()?;
     let gw_port = config.gateway_port.unwrap_or(0);
@@ -141,13 +148,7 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .arg(&vmlinux)
         .arg("-append")
         .arg(&kernel_cmdline)
-        .arg("-drive")
-        .arg(format!(
-            "file={},if=none,format=raw,id=rootfs",
-            config.root_disk.display()
-        ))
-        .arg("-device")
-        .arg("virtio-blk-pci,drive=rootfs")
+        .args(qemu_disk_args(config))
         .arg("-netdev")
         .arg(format!(
             "tap,id=net0,ifname={tap_device},script=no,downscript=no"
@@ -209,11 +210,30 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     }
 }
 
-/// Write environment variables into the root disk so the guest init script can
-/// source them. QEMU does not provide a `krun_set_exec` equivalent, so the
-/// launcher injects this small per-sandbox file into the copied root image
-/// before boot.
-fn write_guest_env_file(root_disk: &Path, env_vars: &[String]) -> Result<(), String> {
+fn qemu_disk_args(config: &VmLaunchConfig) -> Vec<String> {
+    vec![
+        "-drive".to_string(),
+        format!(
+            "file={},if=none,format=raw,id=rootfs,readonly=on",
+            config.root_disk.display()
+        ),
+        "-device".to_string(),
+        "virtio-blk-pci,drive=rootfs".to_string(),
+        "-drive".to_string(),
+        format!(
+            "file={},if=none,format=raw,id=overlay",
+            config.overlay_disk.display()
+        ),
+        "-device".to_string(),
+        "virtio-blk-pci,drive=overlay".to_string(),
+    ]
+}
+
+/// Write environment variables into the overlay disk so the guest init script
+/// can source them after the overlay root is mounted. QEMU does not provide a
+/// `krun_set_exec` equivalent, so the launcher injects this small per-sandbox
+/// file into the overlay upperdir before boot.
+fn write_guest_env_file(overlay_disk: &Path, env_vars: &[String]) -> Result<(), String> {
     let mut content = String::new();
     for var in env_vars {
         if let Some((key, value)) = var.split_once('=') {
@@ -221,7 +241,11 @@ fn write_guest_env_file(root_disk: &Path, env_vars: &[String]) -> Result<(), Str
             let _ = writeln!(content, "export {key}=\"{}\"", shell_escape(value));
         }
     }
-    rootfs::write_rootfs_image_file(root_disk, "/srv/openshell-env.sh", content.as_bytes())
+    rootfs::write_rootfs_image_file(
+        overlay_disk,
+        "/upper/srv/openshell-env.sh",
+        content.as_bytes(),
+    )
 }
 
 fn qemu_guest_env_vars(config: &VmLaunchConfig, dns_server: Option<String>) -> Vec<String> {
@@ -260,7 +284,7 @@ fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
         "console=ttyS0".to_string(),
         "root=/dev/vda".to_string(),
         "rootfstype=ext4".to_string(),
-        "rw".to_string(),
+        "ro".to_string(),
         "panic=-1".to_string(),
         format!("init={}", config.exec_path),
     ];
@@ -607,6 +631,12 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
             config.root_disk.display()
         ));
     }
+    if !config.overlay_disk.is_file() {
+        return Err(format!(
+            "overlay disk image not found: {}",
+            config.overlay_disk.display()
+        ));
+    }
 
     // Arm procguard first, BEFORE we spawn gvproxy or fork libkrun, so
     // that the launcher can't be orphaned during setup. The cleanup
@@ -629,7 +659,7 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
 
     let vm = VmContext::create(&runtime_dir, config.log_level)?;
     vm.set_vm_config(config.vcpus, config.mem_mib)?;
-    vm.set_root_disk(&config.root_disk)?;
+    vm.set_disks(&config.root_disk, &config.overlay_disk)?;
     vm.set_workdir(&config.workdir)?;
 
     // Run gvproxy strictly as the guest's virtual NIC / DHCP / router.
@@ -940,7 +970,7 @@ impl VmContext {
         )
     }
 
-    fn set_root_disk(&self, root_disk: &Path) -> Result<(), String> {
+    fn set_disks(&self, root_disk: &Path, overlay_disk: &Path) -> Result<(), String> {
         let root_disk_c = path_to_cstring(root_disk)?;
         let block_id_c = CString::new("root").map_err(|e| format!("invalid block id: {e}"))?;
         check(
@@ -949,6 +979,21 @@ impl VmContext {
                     self.ctx_id,
                     block_id_c.as_ptr(),
                     root_disk_c.as_ptr(),
+                    true,
+                )
+            },
+            "krun_add_disk",
+        )?;
+
+        let overlay_disk_c = path_to_cstring(overlay_disk)?;
+        let overlay_block_id_c =
+            CString::new("overlay").map_err(|e| format!("invalid block id: {e}"))?;
+        check(
+            unsafe {
+                (self.krun.krun_add_disk)(
+                    self.ctx_id,
+                    overlay_block_id_c.as_ptr(),
+                    overlay_disk_c.as_ptr(),
                     false,
                 )
             },
@@ -960,7 +1005,7 @@ impl VmContext {
         let fstype_c =
             CString::new("ext4").map_err(|e| format!("invalid root disk fstype: {e}"))?;
         let options_c =
-            CString::new("rw").map_err(|e| format!("invalid root disk options: {e}"))?;
+            CString::new("ro").map_err(|e| format!("invalid root disk options: {e}"))?;
         check(
             unsafe {
                 (self.krun.krun_set_root_disk_remount)(
@@ -1296,6 +1341,7 @@ mod tests {
     fn qemu_config() -> VmLaunchConfig {
         VmLaunchConfig {
             root_disk: PathBuf::from("/rootfs.ext4"),
+            overlay_disk: PathBuf::from("/overlay.ext4"),
             vcpus: 2,
             mem_mib: 2048,
             exec_path: "/srv/openshell-vm-sandbox-init.sh".to_string(),
@@ -1332,11 +1378,32 @@ mod tests {
 
         assert!(cmdline.contains("root=/dev/vda"));
         assert!(cmdline.contains("rootfstype=ext4"));
+        assert!(cmdline.contains(" ro"));
         assert!(cmdline.contains("ip=10.0.128.2::10.0.128.1:255.255.255.252:sandbox::off"));
         assert!(cmdline.contains("firmware_class.path=/lib/firmware"));
         assert!(!cmdline.contains("VM_NET_IP="));
         assert!(!cmdline.contains("VM_NET_GW="));
         assert!(!cmdline.contains("VM_NET_DNS="));
         assert!(!cmdline.contains("GPU_ENABLED="));
+    }
+
+    #[test]
+    fn qemu_disk_args_attach_base_readonly_and_overlay_readwrite() {
+        let args = qemu_disk_args(&qemu_config());
+
+        assert!(args.contains(&"-drive".to_string()));
+        assert!(
+            args.contains(
+                &"file=/rootfs.ext4,if=none,format=raw,id=rootfs,readonly=on".to_string()
+            )
+        );
+        assert!(args.contains(&"virtio-blk-pci,drive=rootfs".to_string()));
+        assert!(args.contains(&"file=/overlay.ext4,if=none,format=raw,id=overlay".to_string()));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("id=overlay,readonly=on"))
+        );
+        assert!(args.contains(&"virtio-blk-pci,drive=overlay".to_string()));
     }
 }
