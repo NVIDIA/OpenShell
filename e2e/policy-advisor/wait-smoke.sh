@@ -70,8 +70,21 @@ preflight() {
     command -v ssh >/dev/null || fail "ssh is required"
     [[ -f "$RUNNER_SOURCE" ]] || fail "missing $RUNNER_SOURCE"
 
+    # Capture stderr so a CLI failure (gateway unreachable, no current
+    # gateway configured, etc.) surfaces a real error instead of an empty
+    # pipeline that `set -euo pipefail` silently exits on.
+    local raw_settings
+    if ! raw_settings="$("$OPENSHELL_BIN" settings get --global 2>&1)"; then
+        fail "openshell could not reach the gateway. CLI output:
+${raw_settings}
+
+If you just deployed via skaffold, you probably still need:
+  KUBECONFIG=kubeconfig kubectl -n openshell port-forward svc/openshell 8090:8080 &
+  $OPENSHELL_BIN gateway add local --endpoint http://localhost:8090 --skip-verify
+  $OPENSHELL_BIN gateway select local"
+    fi
     local enabled
-    enabled="$("$OPENSHELL_BIN" settings get --global 2>/dev/null \
+    enabled="$(printf '%s' "$raw_settings" \
         | jq -r '.settings.agent_policy_proposals_enabled // "<unset>"')"
     if [[ "$enabled" != "true" ]]; then
         fail "agent_policy_proposals_enabled must be true. Run:
