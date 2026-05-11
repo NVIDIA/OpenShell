@@ -74,14 +74,15 @@ preflight() {
     # gateway configured, etc.) surfaces a real error instead of an empty
     # pipeline that `set -euo pipefail` silently exits on.
     local raw_settings
-    if ! raw_settings="$("$OPENSHELL_BIN" settings get --global 2>&1)"; then
+    if ! raw_settings="$("$OPENSHELL_BIN" settings get --global --json 2>&1)"; then
         fail "openshell could not reach the gateway. CLI output:
 ${raw_settings}
 
 If you just deployed via skaffold, you probably still need:
   KUBECONFIG=kubeconfig kubectl -n openshell port-forward svc/openshell 8090:8080 &
-  $OPENSHELL_BIN gateway add local --endpoint http://localhost:8090 --skip-verify
-  $OPENSHELL_BIN gateway select local"
+  $OPENSHELL_BIN gateway add http://localhost:8090 --name local
+  $OPENSHELL_BIN gateway select local
+  unset OPENSHELL_GATEWAY  # if the CLI warns about it overriding"
     fi
     local enabled
     enabled="$(printf '%s' "$raw_settings" \
