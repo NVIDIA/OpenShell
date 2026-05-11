@@ -20,9 +20,10 @@ supervisor:
     tag: ""
   # How the supervisor binary is delivered into sandbox pods.
   # Empty (default) = auto-detect from cluster version:
-  #   K8s >= v1.33 → "image-volume" (mounts OCI image directly, GA in v1.36)
-  #   K8s <  v1.33 → "init-container" (copies via init container + emptyDir)
-  # Set explicitly to override auto-detection.
+  #   K8s >= v1.35 → "image-volume" (ImageVolume enabled by default; GA in v1.36)
+  #   K8s <  v1.35 → "init-container" (copies via init container + emptyDir)
+  # On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled,
+  # set this to "image-volume" explicitly.
   sideloadMethod: ""
 
 imagePullSecrets: []

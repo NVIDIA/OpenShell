@@ -100,15 +100,16 @@ override.
 */}}
 {{/*
 Supervisor sideload method. When supervisor.sideloadMethod is set, use it
-verbatim. Otherwise auto-detect from the cluster version: K8s >= v1.33
-supports ImageVolumeSource (beta; GA in v1.36), older clusters fall back to
-the init-container pattern.
+verbatim. Otherwise auto-detect from the cluster version: the ImageVolume
+feature gate is enabled by default starting in K8s v1.35 (GA in v1.36).
+Clusters on v1.33-v1.34 can opt in by setting sideloadMethod explicitly
+after enabling the feature gate.
 */}}
 {{- define "openshell.supervisorSideloadMethod" -}}
 {{- if .Values.supervisor.sideloadMethod -}}
 {{- .Values.supervisor.sideloadMethod -}}
 {{- else -}}
-{{- if semverCompare ">=1.33-0" .Capabilities.KubeVersion.Version -}}
+{{- if semverCompare ">=1.35-0" .Capabilities.KubeVersion.Version -}}
 image-volume
 {{- else -}}
 init-container
