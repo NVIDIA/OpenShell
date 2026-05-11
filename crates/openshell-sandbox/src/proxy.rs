@@ -2277,6 +2277,7 @@ fn rewrite_forward_request(
     used: usize,
     path: &str,
     secret_resolver: Option<&SecretResolver>,
+    request_body_credential_rewrite: bool,
 ) -> Result<Vec<u8>, crate::secrets::UnresolvedPlaceholderError> {
     let header_end = raw[..used]
         .windows(4)
@@ -2362,6 +2363,7 @@ fn rewrite_forward_request(
 
     // End of headers
     output.extend_from_slice(b"\r\n");
+    let rewritten_header_end = output.len();
 
     // Append any overflow body bytes from the original buffer
     if header_end < used {
@@ -2370,7 +2372,12 @@ fn rewrite_forward_request(
 
     // Fail-closed: scan for any remaining unresolved placeholders
     if secret_resolver.is_some() {
-        let output_str = String::from_utf8_lossy(&output);
+        let scan_end = if request_body_credential_rewrite {
+            rewritten_header_end
+        } else {
+            output.len()
+        };
+        let output_str = String::from_utf8_lossy(&output[..scan_end]);
         if output_str.contains(crate::secrets::PLACEHOLDER_PREFIX_PUBLIC)
             || output_str.contains(crate::secrets::PROVIDER_ALIAS_MARKER_PUBLIC)
         {
@@ -3254,6 +3261,7 @@ async fn handle_forward_proxy(
         forward_request_bytes.len(),
         &upstream_target,
         secret_resolver.as_deref(),
+        request_body_credential_rewrite,
     ) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -3407,6 +3415,92 @@ mod tests {
             request_body_credential_rewrite: false,
             websocket_graphql_policy: false,
         }
+    }
+
+    fn forward_test_guard() -> PolicyGenerationGuard {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let policy_data = "network_policies: {}\n";
+        let engine = OpaEngine::from_strings(policy, policy_data).unwrap();
+        engine
+            .generation_guard(engine.current_generation())
+            .unwrap()
+    }
+
+    async fn relay_forward_request_and_capture(
+        method: &str,
+        path: &str,
+        raw: &[u8],
+        resolver: Option<&SecretResolver>,
+        request_body_credential_rewrite: bool,
+    ) -> Result<String> {
+        let guard = forward_test_guard();
+        let rewritten = rewrite_forward_request(
+            raw,
+            raw.len(),
+            path,
+            resolver,
+            request_body_credential_rewrite,
+        )
+        .map_err(|e| miette::miette!("{e}"))?;
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let mut total = 0usize;
+            let mut expected_total = None;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if expected_total.is_none()
+                    && let Some(end) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let header_end = end + 4;
+                    let headers = String::from_utf8_lossy(&buf[..header_end]);
+                    let len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    expected_total = Some(header_end + len);
+                }
+                if expected_total.is_some_and(|expected| total >= expected) {
+                    break;
+                }
+            }
+            upstream_side
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+            String::from_utf8_lossy(&buf[..total]).to_string()
+        });
+
+        relay_rewritten_forward_request(
+            method,
+            path,
+            rewritten,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            ForwardRelayOptions {
+                generation_guard: &guard,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: resolver,
+                request_body_credential_rewrite,
+            },
+        )
+        .await?;
+
+        upstream_task
+            .await
+            .map_err(|e| miette::miette!("upstream task failed: {e}"))
     }
 
     #[test]
@@ -4400,7 +4494,8 @@ mod tests {
     fn test_rewrite_get_request() {
         let raw =
             b"GET http://10.0.0.1:8000/api HTTP/1.1\r\nHost: 10.0.0.1:8000\r\nAccept: */*\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/api", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/api", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.starts_with("GET /api HTTP/1.1\r\n"));
         assert!(result_str.contains("Host: 10.0.0.1:8000"));
@@ -4411,7 +4506,8 @@ mod tests {
     #[test]
     fn test_rewrite_strips_proxy_headers() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nProxy-Authorization: Basic abc\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(
             !result_str
@@ -4425,7 +4521,8 @@ mod tests {
     #[test]
     fn test_rewrite_replaces_connection_header() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nConnection: keep-alive\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Connection: close"));
         assert!(!result_str.contains("keep-alive"));
@@ -4434,7 +4531,8 @@ mod tests {
     #[test]
     fn test_rewrite_preserves_body_overflow() {
         let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 13\r\n\r\n{\"key\":\"val\"}";
-        let result = rewrite_forward_request(raw, raw.len(), "/api", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/api", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("{\"key\":\"val\"}"));
         assert!(result_str.contains("POST /api HTTP/1.1"));
@@ -4443,7 +4541,8 @@ mod tests {
     #[test]
     fn test_rewrite_preserves_existing_via() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nVia: 1.0 upstream\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Via: 1.0 upstream"));
         // Should not add a second Via header
@@ -4466,7 +4565,7 @@ mod tests {
         .expect("canonicalization should succeed for the attack payload");
         assert_eq!(canon.path, "/secret");
 
-        let rewritten = rewrite_forward_request(raw, raw.len(), &canon.path, None)
+        let rewritten = rewrite_forward_request(raw, raw.len(), &canon.path, None, false)
             .expect("rewrite_forward_request should succeed");
         let rewritten_str = String::from_utf8_lossy(&rewritten);
         assert!(
@@ -4492,7 +4591,7 @@ mod tests {
             _ => canon.path,
         };
 
-        let rewritten = rewrite_forward_request(raw, raw.len(), &upstream_target, None)
+        let rewritten = rewrite_forward_request(raw, raw.len(), &upstream_target, None, false)
             .expect("rewrite_forward_request should succeed");
         let rewritten_str = String::from_utf8_lossy(&rewritten);
         assert!(
@@ -4511,11 +4610,145 @@ mod tests {
                 .collect(),
         );
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nAuthorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", resolver.as_ref())
+        let result = rewrite_forward_request(raw, raw.len(), "/p", resolver.as_ref(), false)
             .expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Authorization: Bearer sk-test"));
         assert!(!result_str.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn forward_relay_rewrites_urlencoded_body_alias_from_initial_read() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let alias = "provider-OPENSHELL-RESOLVE-ENV-API_TOKEN";
+        let body = format!("token={alias}&channel=C123");
+        let raw = format!(
+            "POST http://api.example.com/api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Authorization: Bearer {alias}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let forwarded = relay_forward_request_and_capture(
+            "POST",
+            "/api/messages",
+            raw.as_bytes(),
+            Some(&resolver),
+            true,
+        )
+        .await
+        .expect("forward relay should rewrite credentials");
+
+        let expected_body = "token=provider-real-token&channel=C123";
+        assert!(forwarded.starts_with("POST /api/messages HTTP/1.1\r\n"));
+        assert!(forwarded.contains("Authorization: Bearer provider-real-token\r\n"));
+        assert!(forwarded.contains(&format!("Content-Length: {}\r\n", expected_body.len())));
+        assert!(forwarded.ends_with(expected_body));
+        assert!(!forwarded.contains("OPENSHELL-RESOLVE-ENV"));
+    }
+
+    #[tokio::test]
+    async fn forward_relay_rewrites_urlencoded_canonical_body_from_initial_read() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let alias = "provider-OPENSHELL-RESOLVE-ENV-API_TOKEN";
+        let body = "token=openshell%3Aresolve%3Aenv%3AAPI_TOKEN&channel=C123";
+        let raw = format!(
+            "POST http://api.example.com/api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Authorization: Bearer {alias}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let forwarded = relay_forward_request_and_capture(
+            "POST",
+            "/api/messages",
+            raw.as_bytes(),
+            Some(&resolver),
+            true,
+        )
+        .await
+        .expect("forward relay should rewrite credentials");
+
+        let expected_body = "token=provider-real-token&channel=C123";
+        assert!(forwarded.contains("Authorization: Bearer provider-real-token\r\n"));
+        assert!(forwarded.contains(&format!("Content-Length: {}\r\n", expected_body.len())));
+        assert!(forwarded.ends_with(expected_body));
+        assert!(!forwarded.contains("openshell%3Aresolve%3Aenv%3AAPI_TOKEN"));
+        assert!(!forwarded.contains("openshell:resolve:env:API_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn forward_relay_unresolved_body_placeholder_fails_before_upstream_write() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let alias = "provider-OPENSHELL-RESOLVE-ENV-API_TOKEN";
+        let body = "token=provider-OPENSHELL-RESOLVE-ENV-MISSING_TOKEN";
+        let raw = format!(
+            "POST http://api.example.com/api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Authorization: Bearer {alias}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let guard = forward_test_guard();
+        let rewritten = rewrite_forward_request(
+            raw.as_bytes(),
+            raw.len(),
+            "/api/messages",
+            Some(&resolver),
+            true,
+        )
+        .expect("header rewrite should defer body overflow to body rewriter");
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let err = relay_rewritten_forward_request(
+            "POST",
+            "/api/messages",
+            rewritten,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            ForwardRelayOptions {
+                generation_guard: &guard,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: Some(&resolver),
+                request_body_credential_rewrite: true,
+            },
+        )
+        .await
+        .expect_err("unresolved body placeholder should fail closed");
+
+        assert!(!err.to_string().contains("provider-real-token"));
+        assert!(!err.to_string().contains("MISSING_TOKEN"));
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "failed forward body rewrite must not reach upstream"
+        );
     }
 
     #[test]
@@ -4528,7 +4761,7 @@ mod tests {
                    Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\
                    Sec-WebSocket-Version: 13\r\n\r\n";
 
-        let result = rewrite_forward_request(raw.as_bytes(), raw.len(), "/ws", None)
+        let result = rewrite_forward_request(raw.as_bytes(), raw.len(), "/ws", None, false)
             .expect("websocket forward rewrite should succeed");
         let result_str = String::from_utf8_lossy(&result);
 
@@ -4551,8 +4784,8 @@ mod tests {
         engine.reload(policy, policy_data).unwrap();
 
         let raw = b"GET http://host/api HTTP/1.1\r\nHost: host\r\n\r\n";
-        let rewritten =
-            rewrite_forward_request(raw, raw.len(), "/api", None).expect("rewrite should succeed");
+        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", None, false)
+            .expect("rewrite should succeed");
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
 
@@ -4594,8 +4827,8 @@ mod tests {
             .unwrap();
 
         let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
-        let rewritten =
-            rewrite_forward_request(raw, raw.len(), "/api", None).expect("rewrite should succeed");
+        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", None, false)
+            .expect("rewrite should succeed");
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
 

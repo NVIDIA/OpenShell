@@ -611,9 +611,16 @@ fn rewrite_buffered_body(
             "request body credential rewrite found placeholders but no resolver is available"
         ));
     };
-    let replacements = resolver
-        .rewrite_text_placeholders(&mut text, "request_body")
-        .map_err(|e| miette!("credential injection failed: {e}"))?;
+
+    let replacements = if content_type.as_deref() == Some("application/x-www-form-urlencoded") {
+        let (rewritten, replacements) = rewrite_form_urlencoded_body(&text, resolver)?;
+        text = rewritten;
+        replacements
+    } else {
+        resolver
+            .rewrite_text_placeholders(&mut text, "request_body")
+            .map_err(|e| miette!("credential injection failed: {e}"))?
+    };
     if replacements == 0 || contains_reserved_credential_marker(&text) {
         return Err(miette!(
             "request body credential rewrite left unresolved credential placeholders"
@@ -623,6 +630,112 @@ fn rewrite_buffered_body(
     let body = text.into_bytes();
     let headers = set_content_length(headers, body.len())?;
     Ok((headers, body))
+}
+
+fn rewrite_form_urlencoded_body(body: &str, resolver: &SecretResolver) -> Result<(String, usize)> {
+    let mut rewritten = String::with_capacity(body.len());
+    let mut replacements = 0usize;
+
+    for (idx, field) in body.split('&').enumerate() {
+        if idx > 0 {
+            rewritten.push('&');
+        }
+
+        let (name, value) = field
+            .split_once('=')
+            .map_or((field, None), |(name, value)| (name, Some(value)));
+        let decoded_name = form_url_decode(name)?;
+        if contains_reserved_credential_marker(&decoded_name) {
+            return Err(miette!(
+                "request body credential rewrite does not support placeholders in form field names"
+            ));
+        }
+
+        rewritten.push_str(name);
+        let Some(value) = value else {
+            continue;
+        };
+
+        rewritten.push('=');
+        let decoded_value = form_url_decode(value)?;
+        if !contains_reserved_credential_marker(&decoded_value) {
+            rewritten.push_str(value);
+            continue;
+        }
+
+        let mut rewritten_value = decoded_value;
+        let field_replacements = resolver
+            .rewrite_text_placeholders(&mut rewritten_value, "request_body")
+            .map_err(|e| miette!("credential injection failed: {e}"))?;
+        if field_replacements == 0 || contains_reserved_credential_marker(&rewritten_value) {
+            return Err(miette!(
+                "request body credential rewrite left unresolved credential placeholders"
+            ));
+        }
+        replacements += field_replacements;
+        rewritten.push_str(&form_url_encode(&rewritten_value));
+    }
+
+    Ok((rewritten, replacements))
+}
+
+fn form_url_decode(input: &str) -> Result<String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut pos = 0usize;
+
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'+' => {
+                decoded.push(b' ');
+                pos += 1;
+            }
+            b'%' if pos + 2 < bytes.len() => {
+                if let (Some(hi), Some(lo)) = (hex_value(bytes[pos + 1]), hex_value(bytes[pos + 2]))
+                {
+                    decoded.push((hi << 4) | lo);
+                    pos += 3;
+                } else {
+                    decoded.push(bytes[pos]);
+                    pos += 1;
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                pos += 1;
+            }
+        }
+    }
+
+    String::from_utf8(decoded).map_err(|_| {
+        miette!("request body credential rewrite requires UTF-8 form-url-encoded fields")
+    })
+}
+
+fn form_url_encode(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'*' => {
+                encoded.push(byte as char);
+            }
+            b' ' => encoded.push('+'),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 async fn collect_chunked_body<C: AsyncRead + Unpin>(
@@ -4432,6 +4545,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_request_body_rewrites_percent_encoded_canonical_urlencoded_token() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let body = "token=openshell%3Aresolve%3Aenv%3AAPI_TOKEN&note=hello+world";
+        let raw = format!(
+            "POST /api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let forwarded = relay_and_capture_with_options(
+            raw.into_bytes(),
+            BodyLength::ContentLength(body.len() as u64),
+            Some(&resolver),
+            true,
+        )
+        .await
+        .expect("relay should succeed");
+
+        let expected_body = "token=provider-real-token&note=hello+world";
+        assert!(forwarded.contains(&format!("Content-Length: {}\r\n", expected_body.len())));
+        assert!(forwarded.ends_with(expected_body));
+        assert!(!forwarded.contains("openshell%3Aresolve%3Aenv%3AAPI_TOKEN"));
+        assert!(!forwarded.contains("openshell:resolve:env:API_TOKEN"));
+    }
+
+    #[tokio::test]
     async fn relay_request_body_unresolved_alias_fails_before_upstream_write() {
         let (_, resolver) = SecretResolver::from_provider_env(
             [("API_TOKEN".to_string(), "provider-real-token".to_string())]
@@ -4472,6 +4619,57 @@ mod tests {
         .expect_err("unknown body alias should fail closed");
 
         assert!(!err.to_string().contains("provider-real-token"));
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "failed body rewrite must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_request_body_unresolved_encoded_canonical_fails_before_upstream_write() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let body = "token=openshell%3Aresolve%3Aenv%3AMISSING_TOKEN";
+        let raw = format!(
+            "POST /api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let req = L7Request {
+            action: "POST".to_string(),
+            target: "/api/messages".to_string(),
+            query_params: HashMap::new(),
+            raw_header: raw.into_bytes(),
+            body_length: BodyLength::ContentLength(body.len() as u64),
+        };
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let err = relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            RelayRequestOptions {
+                resolver: Some(&resolver),
+                request_body_credential_rewrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("unknown encoded body placeholder should fail closed");
+
+        assert!(!err.to_string().contains("provider-real-token"));
+        assert!(!err.to_string().contains("MISSING_TOKEN"));
         drop(proxy_to_upstream);
         let mut forwarded = Vec::new();
         upstream_side.read_to_end(&mut forwarded).await.unwrap();
