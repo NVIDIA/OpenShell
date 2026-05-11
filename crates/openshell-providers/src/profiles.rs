@@ -21,6 +21,7 @@ const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/copilot.yaml"),
     include_str!("../../../providers/github.yaml"),
     include_str!("../../../providers/gitlab.yaml"),
+    include_str!("../../../providers/model-runner.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
     include_str!("../../../providers/openai.yaml"),
     include_str!("../../../providers/opencode.yaml"),

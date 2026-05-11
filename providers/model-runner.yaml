@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: model-runner
+display_name: Docker Model Runner
+description: Local AI inference via Docker Model Runner
+category: inference
+inference_capable: true
+endpoints:
+  - host: model-runner.docker.internal
+    port: 80
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/local/bin/docker]
