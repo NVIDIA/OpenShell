@@ -259,7 +259,7 @@ impl NetworkNamespace {
     /// Degrades gracefully if `iptables` is not available — the namespace
     /// still provides isolation via routing, just without fast-fail and
     /// diagnostic logging.
-    pub fn install_bypass_rules(&self, proxy_port: u16) -> Result<()> {
+    pub fn install_bypass_rules(&self, proxy_port: u16, extra_allowed_ports: &[u16]) -> Result<()> {
         // Check if iptables is available before attempting to install rules.
         let Some(iptables_path) = find_iptables() else {
             openshell_ocsf::ocsf_emit!(
@@ -289,6 +289,7 @@ impl NetworkNamespace {
             &host_ip_str,
             &proxy_port_str,
             &log_prefix,
+            extra_allowed_ports,
         ) {
             openshell_ocsf::ocsf_emit!(
                 openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
@@ -344,6 +345,7 @@ impl NetworkNamespace {
         host_ip: &str,
         proxy_port: &str,
         log_prefix: &str,
+        extra_allowed_ports: &[u16],
     ) -> Result<()> {
         // Rule 1: ACCEPT traffic to the proxy
         run_iptables_netns(
@@ -362,6 +364,25 @@ impl NetworkNamespace {
                 "ACCEPT",
             ],
         )?;
+
+        for port in extra_allowed_ports {
+            run_iptables_netns(
+                &self.name,
+                iptables_cmd,
+                &[
+                    "-A",
+                    "OUTPUT",
+                    "-d",
+                    &format!("{host_ip}/32"),
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    &port.to_string(),
+                    "-j",
+                    "ACCEPT",
+                ],
+            )?;
+        }
 
         // Rule 2: ACCEPT loopback traffic
         run_iptables_netns(

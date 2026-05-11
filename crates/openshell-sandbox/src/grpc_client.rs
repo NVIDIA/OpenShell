@@ -10,7 +10,8 @@ use std::time::Duration;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
-    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, PolicyChunk, PolicySource,
+    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, MintSandboxProviderTokenRequest,
+    PolicyChunk, PolicySource,
     PolicyStatus, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
     SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
     inference_client::InferenceClient, open_shell_client::OpenShellClient,
@@ -230,6 +231,39 @@ pub async fn fetch_provider_environment(
     })
 }
 
+pub async fn mint_provider_token(
+    endpoint: &str,
+    sandbox_id: &str,
+    provider_name: &str,
+    audience: &str,
+) -> Result<MintedProviderToken> {
+    debug!(
+        endpoint = %endpoint,
+        sandbox_id = %sandbox_id,
+        provider_name = %provider_name,
+        audience = %audience,
+        "Minting sandbox provider token"
+    );
+
+    let mut client = connect(endpoint).await?;
+    let response = client
+        .mint_sandbox_provider_token(MintSandboxProviderTokenRequest {
+            sandbox_id: sandbox_id.to_string(),
+            provider_name: provider_name.to_string(),
+            audience: audience.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let inner = response.into_inner();
+    Ok(MintedProviderToken {
+        access_token: inner.access_token,
+        token_type: inner.token_type,
+        expires_at_unix: inner.expires_at_unix,
+        cache_hit: inner.cache_hit,
+    })
+}
+
 /// A reusable gRPC client for the `OpenShell` service.
 ///
 /// Wraps a tonic channel connected once and reused for policy polling
@@ -256,6 +290,13 @@ pub struct SettingsPollResult {
 pub struct ProviderEnvironmentResult {
     pub environment: HashMap<String, String>,
     pub provider_env_revision: u64,
+}
+
+pub struct MintedProviderToken {
+    pub access_token: String,
+    pub token_type: String,
+    pub expires_at_unix: u64,
+    pub cache_hit: bool,
 }
 
 impl CachedOpenShellClient {

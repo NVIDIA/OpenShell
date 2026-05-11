@@ -29,7 +29,8 @@ use openshell_core::proto::{
     ListProviderProfilesRequest, ListProviderProfilesResponse, ListProvidersRequest,
     ListProvidersResponse, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, ListServicesRequest, ListServicesResponse, ProviderProfileResponse,
+    ListSandboxesResponse, ListServicesRequest, ListServicesResponse,
+    MintSandboxProviderTokenRequest, MintSandboxProviderTokenResponse, ProviderProfileResponse,
     ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
     RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent,
@@ -399,6 +400,13 @@ impl OpenShell for OpenShellService {
         request: Request<GetSandboxProviderEnvironmentRequest>,
     ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
         policy::handle_get_sandbox_provider_environment(&self.state, request).await
+    }
+
+    async fn mint_sandbox_provider_token(
+        &self,
+        request: Request<MintSandboxProviderTokenRequest>,
+    ) -> Result<Response<MintSandboxProviderTokenResponse>, Status> {
+        policy::handle_mint_sandbox_provider_token(&self.state, request).await
     }
 
     async fn update_config(

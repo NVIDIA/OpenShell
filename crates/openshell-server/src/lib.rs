@@ -29,8 +29,8 @@ mod http;
 mod inference;
 mod multiplex;
 mod persistence;
-mod provider_auth;
 pub(crate) mod policy_store;
+mod provider_auth;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
@@ -104,6 +104,9 @@ pub struct ServerState {
 
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
+
+    /// Gateway-owned Microsoft S2S broker registry keyed by provider record.
+    pub microsoft_s2s_brokers: provider_auth::microsoft_s2s::BrokerRegistry,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -148,6 +151,7 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             oidc_cache,
+            microsoft_s2s_brokers: provider_auth::microsoft_s2s::BrokerRegistry::default(),
         }
     }
 }
