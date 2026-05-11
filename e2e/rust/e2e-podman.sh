@@ -9,10 +9,19 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+E2E_TEST="${OPENSHELL_E2E_PODMAN_TEST:-}"
+E2E_FEATURES="${OPENSHELL_E2E_PODMAN_FEATURES:-e2e}"
 
 cargo build -p openshell-cli --features openshell-core/dev-settings
 
+TEST_ARGS=(
+  cargo test --manifest-path "${ROOT}/e2e/rust/Cargo.toml"
+  --features "${E2E_FEATURES}"
+)
+if [ -n "${E2E_TEST}" ]; then
+  TEST_ARGS+=(--test "${E2E_TEST}")
+fi
+TEST_ARGS+=(-- --nocapture)
+
 exec "${ROOT}/e2e/with-podman-gateway.sh" \
-  cargo test --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \
-    --features e2e \
-    -- --nocapture
+  "${TEST_ARGS[@]}"

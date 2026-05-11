@@ -3,7 +3,7 @@
 
 //! Kubernetes compute driver.
 
-use crate::config::KubernetesComputeConfig;
+use crate::config::{KubernetesComputeConfig, SupervisorSideloadMethod};
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
@@ -313,6 +313,7 @@ impl KubernetesComputeDriver {
             image_pull_policy: &self.config.image_pull_policy,
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
+            supervisor_sideload_method: self.config.supervisor_sideload_method,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
             grpc_endpoint: &self.config.grpc_endpoint,
@@ -694,6 +695,27 @@ fn supervisor_volume_mount() -> serde_json::Value {
 /// resolution inside the image.
 const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
 
+/// Build an image volume that mounts the supervisor OCI image directly.
+///
+/// Requires Kubernetes >= v1.33 (`ImageVolume` beta) or >= v1.36 (GA).
+/// The entire image filesystem is mounted read-only, making the binary
+/// available at `{SUPERVISOR_MOUNT_PATH}/openshell-sandbox`.
+fn supervisor_image_volume(
+    supervisor_image: &str,
+    supervisor_image_pull_policy: &str,
+) -> serde_json::Value {
+    let mut image_spec = serde_json::json!({
+        "reference": supervisor_image,
+    });
+    if !supervisor_image_pull_policy.is_empty() {
+        image_spec["pullPolicy"] = serde_json::json!(supervisor_image_pull_policy);
+    }
+    serde_json::json!({
+        "name": SUPERVISOR_VOLUME_NAME,
+        "image": image_spec
+    })
+}
+
 /// Build the init container that copies the supervisor binary into the emptyDir.
 ///
 /// The supervisor image contains the supervisor binary at `/openshell-sandbox`.
@@ -730,43 +752,56 @@ fn supervisor_init_container(
 
 /// Apply supervisor side-load transforms to an already-built pod template JSON.
 ///
-/// Injects an emptyDir volume, an init container that copies the supervisor
-/// binary from the supervisor image into that volume, and a read-only volume
-/// mount + command override on the agent container.
+/// Depending on the sideload method:
+/// - **`ImageVolume`**: mounts the supervisor OCI image directly as a read-only
+///   volume (no init container needed, requires K8s >= v1.33).
+/// - **`InitContainer`**: injects an emptyDir volume and an init container that
+///   copies the supervisor binary from the supervisor image into that volume.
 ///
-/// The `runAsUser: 0` override ensures the supervisor binary runs as root
-/// regardless of the image's `USER` directive. The supervisor needs root for
-/// network namespace creation, proxy setup, and Landlock/seccomp configuration.
-/// It drops to the appropriate non-root user for child processes via the
-/// policy's `run_as_user`/`run_as_group`.
+/// In both cases, the agent container gets a command override to run the
+/// side-loaded binary and `runAsUser: 0` so it can create network namespaces,
+/// set up the proxy, and configure Landlock/seccomp.
 fn apply_supervisor_sideload(
     pod_template: &mut serde_json::Value,
     supervisor_image: &str,
     supervisor_image_pull_policy: &str,
+    method: SupervisorSideloadMethod,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
     };
 
-    // 1. Add the emptyDir volume to spec.volumes
+    // 1. Add the volume (image source or emptyDir depending on method)
     let volumes = spec
         .entry("volumes")
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut();
     if let Some(volumes) = volumes {
-        volumes.push(supervisor_volume());
+        match method {
+            SupervisorSideloadMethod::ImageVolume => {
+                volumes.push(supervisor_image_volume(
+                    supervisor_image,
+                    supervisor_image_pull_policy,
+                ));
+            }
+            SupervisorSideloadMethod::InitContainer => {
+                volumes.push(supervisor_volume());
+            }
+        }
     }
 
-    // 2. Add the init container that copies the binary into the emptyDir
-    let init_containers = spec
-        .entry("initContainers")
-        .or_insert_with(|| serde_json::json!([]))
-        .as_array_mut();
-    if let Some(init_containers) = init_containers {
-        init_containers.push(supervisor_init_container(
-            supervisor_image,
-            supervisor_image_pull_policy,
-        ));
+    // 2. Add the init container only for the init-container method
+    if method == SupervisorSideloadMethod::InitContainer {
+        let init_containers = spec
+            .entry("initContainers")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(init_containers) = init_containers {
+            init_containers.push(supervisor_init_container(
+                supervisor_image,
+                supervisor_image_pull_policy,
+            ));
+        }
     }
 
     // 3. Find the agent container and add volume mount + command override
@@ -934,6 +969,7 @@ struct SandboxPodParams<'a> {
     image_pull_policy: &'a str,
     supervisor_image: &'a str,
     supervisor_image_pull_policy: &'a str,
+    supervisor_sideload_method: SupervisorSideloadMethod,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
     grpc_endpoint: &'a str,
@@ -1173,12 +1209,11 @@ fn sandbox_template_to_k8s(
 
     let mut result = serde_json::Value::Object(template_value);
 
-    // Side-load the supervisor binary via an init container that copies it
-    // from the supervisor image into a shared emptyDir volume.
     apply_supervisor_sideload(
         &mut result,
         params.supervisor_image,
         params.supervisor_image_pull_policy,
+        params.supervisor_sideload_method,
     );
 
     // Inject workspace persistence (init container + PVC volume mount) so
@@ -1502,7 +1537,12 @@ mod tests {
             }
         });
 
-        apply_supervisor_sideload(&mut pod_template, "custom-image:latest", "IfNotPresent");
+        apply_supervisor_sideload(
+            &mut pod_template,
+            "custom-image:latest",
+            "IfNotPresent",
+            SupervisorSideloadMethod::InitContainer,
+        );
 
         let sc = &pod_template["spec"]["containers"][0]["securityContext"];
         assert_eq!(sc["runAsUser"], 0, "runAsUser must be 0 for supervisor");
@@ -1526,7 +1566,12 @@ mod tests {
             }
         });
 
-        apply_supervisor_sideload(&mut pod_template, "supervisor-image:latest", "IfNotPresent");
+        apply_supervisor_sideload(
+            &mut pod_template,
+            "supervisor-image:latest",
+            "IfNotPresent",
+            SupervisorSideloadMethod::InitContainer,
+        );
 
         let sc = &pod_template["spec"]["containers"][0]["securityContext"];
         assert_eq!(
@@ -1546,7 +1591,12 @@ mod tests {
             }
         });
 
-        apply_supervisor_sideload(&mut pod_template, "supervisor-image:latest", "IfNotPresent");
+        apply_supervisor_sideload(
+            &mut pod_template,
+            "supervisor-image:latest",
+            "IfNotPresent",
+            SupervisorSideloadMethod::InitContainer,
+        );
 
         // Volume should be an emptyDir
         let volumes = pod_template["spec"]["volumes"]
@@ -1602,6 +1652,86 @@ mod tests {
         assert_eq!(mounts[0]["name"], SUPERVISOR_VOLUME_NAME);
         assert_eq!(mounts[0]["mountPath"], SUPERVISOR_MOUNT_PATH);
         assert_eq!(mounts[0]["readOnly"], true);
+    }
+
+    #[test]
+    fn supervisor_sideload_image_volume_injects_image_source_without_init_container() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "custom-image:latest"
+                }]
+            }
+        });
+
+        apply_supervisor_sideload(
+            &mut pod_template,
+            "supervisor-image:latest",
+            "IfNotPresent",
+            SupervisorSideloadMethod::ImageVolume,
+        );
+
+        let volumes = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should exist");
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0]["name"], SUPERVISOR_VOLUME_NAME);
+        assert_eq!(volumes[0]["image"]["reference"], "supervisor-image:latest");
+        assert_eq!(volumes[0]["image"]["pullPolicy"], "IfNotPresent");
+        assert!(
+            volumes[0]["emptyDir"].is_null(),
+            "image volume method must not use emptyDir"
+        );
+
+        assert!(
+            pod_template["spec"]["initContainers"].is_null(),
+            "image volume method must not inject init containers"
+        );
+
+        let command = pod_template["spec"]["containers"][0]["command"]
+            .as_array()
+            .expect("command should be set");
+        assert_eq!(
+            command[0].as_str().unwrap(),
+            format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox")
+        );
+
+        let sc = &pod_template["spec"]["containers"][0]["securityContext"];
+        assert_eq!(sc["runAsUser"], 0);
+
+        let mounts = pod_template["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts should exist");
+        assert_eq!(mounts[0]["name"], SUPERVISOR_VOLUME_NAME);
+        assert_eq!(mounts[0]["mountPath"], SUPERVISOR_MOUNT_PATH);
+        assert_eq!(mounts[0]["readOnly"], true);
+    }
+
+    #[test]
+    fn supervisor_image_volume_omits_pull_policy_when_empty() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "custom-image:latest"
+                }]
+            }
+        });
+
+        apply_supervisor_sideload(
+            &mut pod_template,
+            "supervisor-image:latest",
+            "",
+            SupervisorSideloadMethod::ImageVolume,
+        );
+
+        let volume = &pod_template["spec"]["volumes"][0];
+        assert_eq!(volume["image"]["reference"], "supervisor-image:latest");
+        assert!(
+            volume["image"].get("pullPolicy").is_none(),
+            "pullPolicy should be omitted when empty"
+        );
     }
 
     /// Regression test: TLS mount path must match env var paths.
@@ -1959,7 +2089,10 @@ mod tests {
 
     #[test]
     fn workspace_persistence_skipped_when_inject_workspace_false() {
-        let params = SandboxPodParams::default();
+        let params = SandboxPodParams {
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            ..SandboxPodParams::default()
+        };
         let pod_template = sandbox_template_to_k8s(
             &SandboxTemplate::default(),
             false,

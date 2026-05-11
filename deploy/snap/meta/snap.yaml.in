@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: openshell
+title: OpenShell
+version: "@VERSION@"
+summary: Safe, sandboxed runtimes for autonomous AI agents
+description: |
+  OpenShell provides safe, sandboxed runtimes for autonomous AI agents.
+  It offers a CLI for managing gateways, sandboxes, and providers with
+  policy-enforced egress routing, credential proxying, and privacy-aware
+  LLM inference routing.
+
+base: "@BASE@"
+grade: "@GRADE@"
+confinement: strict
+license: Apache-2.0
+website: https://docs.nvidia.com/openshell/latest/index.html
+source-code: https://github.com/NVIDIA/OpenShell
+issues: https://github.com/NVIDIA/OpenShell/issues
+contact: https://github.com/NVIDIA/OpenShell/security/policy
+architectures:
+  - "@ARCH@"
+
+apps:
+  openshell:
+    command: bin/openshell
+    plugs:
+      - home
+      - network
+      - ssh-keys
+      - system-observe
+  gateway:
+    command: bin/openshell-gateway
+    daemon: simple
+    refresh-mode: endure
+    environment:
+      OPENSHELL_BIND_ADDRESS: 127.0.0.1
+      OPENSHELL_SERVER_PORT: 17670
+      OPENSHELL_DB_URL: "sqlite:$SNAP_COMMON/gateway.db?mode=rwc"
+      OPENSHELL_GRPC_ENDPOINT: http://host.openshell.internal:17670
+      OPENSHELL_DISABLE_TLS: true
+      OPENSHELL_DRIVERS: docker
+      OPENSHELL_DOCKER_SUPERVISOR_BIN: "$SNAP/bin/openshell-sandbox"
+      OPENSHELL_DOCKER_NETWORK_NAME: openshell-snap
+      OPENSHELL_SANDBOX_IMAGE: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+      OPENSHELL_SANDBOX_IMAGE_PULL_POLICY: IfNotPresent
+      OPENSHELL_SANDBOX_SSH_PORT: 2222
+      OPENSHELL_SSH_GATEWAY_HOST: 127.0.0.1
+      OPENSHELL_SSH_GATEWAY_PORT: 8080
+      XDG_DATA_HOME: "$SNAP_COMMON"
+      # Used for creating and locating certain sockets.
+      XDG_RUNTIME_DIR: "$SNAP_COMMON"
+
+    plugs:
+      - docker
+      - log-observe
+      - network
+      - network-bind
+      - ssh-keys
+      - system-observe
+
+plugs:
+  docker:
+    interface: docker
+    default-provider: docker

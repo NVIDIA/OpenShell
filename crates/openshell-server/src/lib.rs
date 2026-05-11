@@ -487,6 +487,13 @@ async fn build_compute_runtime(
                     image_pull_policy: config.sandbox_image_pull_policy.clone(),
                     supervisor_image,
                     supervisor_image_pull_policy,
+                    supervisor_sideload_method: std::env::var(
+                        "OPENSHELL_SUPERVISOR_SIDELOAD_METHOD",
+                    )
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_default(),
                     grpc_endpoint: config.grpc_endpoint.clone(),
                     ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
                     ssh_handshake_secret: config.ssh_handshake_secret.clone(),

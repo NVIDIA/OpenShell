@@ -4,7 +4,7 @@
 //! Container spec construction for the Podman driver.
 
 use crate::config::PodmanComputeConfig;
-use openshell_core::config::CDI_GPU_DEVICE_ALL;
+use openshell_core::gpu::cdi_gpu_device_ids;
 use openshell_core::proto::compute::v1::DriverSandbox;
 use serde::Serialize;
 use serde_json::Value;
@@ -345,13 +345,13 @@ fn build_resource_limits(sandbox: &DriverSandbox) -> ResourceLimits {
 
 /// Build CDI GPU device list if GPU is requested.
 fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
-    if sandbox.spec.as_ref().is_some_and(|s| s.gpu) {
-        Some(vec![LinuxDevice {
-            path: CDI_GPU_DEVICE_ALL.into(),
-        }])
-    } else {
-        None
-    }
+    let spec = sandbox.spec.as_ref()?;
+    cdi_gpu_device_ids(spec.gpu, &spec.gpu_device).map(|device_ids| {
+        device_ids
+            .into_iter()
+            .map(|path| LinuxDevice { path })
+            .collect()
+    })
 }
 
 /// Build the Podman container creation JSON spec.
@@ -685,6 +685,53 @@ mod tests {
     fn short_id_truncates() {
         assert_eq!(short_id("abc123def456789"), "abc123def456");
         assert_eq!(short_id("short"), "short");
+    }
+
+    #[test]
+    fn container_spec_omits_devices_without_gpu_request() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert!(spec.get("devices").is_none());
+    }
+
+    #[test]
+    fn container_spec_maps_empty_gpu_request_to_all_cdi_device() {
+        use openshell_core::config::CDI_GPU_DEVICE_ALL;
+        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            gpu: true,
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert_eq!(
+            spec["devices"][0]["path"].as_str(),
+            Some(CDI_GPU_DEVICE_ALL)
+        );
+    }
+
+    #[test]
+    fn container_spec_passes_explicit_cdi_device_id_through() {
+        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            gpu: true,
+            gpu_device: "nvidia.com/gpu=0".to_string(),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert_eq!(
+            spec["devices"][0]["path"].as_str(),
+            Some("nvidia.com/gpu=0")
+        );
     }
 
     #[test]

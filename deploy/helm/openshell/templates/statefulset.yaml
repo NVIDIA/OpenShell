@@ -76,6 +76,8 @@ spec:
             - name: OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY
               value: {{ .Values.supervisor.image.pullPolicy | quote }}
             {{- end }}
+            - name: OPENSHELL_SUPERVISOR_SIDELOAD_METHOD
+              value: {{ include "openshell.supervisorSideloadMethod" . | quote }}
             - name: OPENSHELL_GRPC_ENDPOINT
               value: {{ include "openshell.grpcEndpoint" . | quote }}
             {{- if .Values.server.sshGatewayHost }}

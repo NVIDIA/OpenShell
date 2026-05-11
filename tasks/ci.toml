@@ -27,6 +27,14 @@ description = "Build all Rust crates in release mode"
 run = "cargo build --workspace --release"
 hide = true
 
+["build:rust:snap"]
+description = "Build release Rust binaries consumed by the hand-staged snap"
+run = [
+  "cargo build --release -p openshell-cli --features bundled-z3",
+  "cargo build --release -p openshell-server",
+  "cargo build --release -p openshell-sandbox",
+]
+
 [check]
 description = "Run fast compile and type checks"
 depends = ["rust:check", "python:typecheck"]

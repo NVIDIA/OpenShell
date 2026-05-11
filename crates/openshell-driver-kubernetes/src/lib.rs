@@ -5,6 +5,6 @@ pub mod config;
 pub mod driver;
 pub mod grpc;
 
-pub use config::KubernetesComputeConfig;
+pub use config::{KubernetesComputeConfig, SupervisorSideloadMethod};
 pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;

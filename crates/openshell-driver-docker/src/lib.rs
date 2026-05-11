@@ -18,9 +18,8 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use openshell_core::config::{
-    CDI_GPU_DEVICE_ALL, DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_STOP_TIMEOUT_SECS,
-};
+use openshell_core::config::{DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_STOP_TIMEOUT_SECS};
+use openshell_core::gpu::cdi_gpu_device_ids;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
@@ -311,11 +310,7 @@ impl DockerComputeDriver {
                 "docker sandboxes require a template image",
             ));
         }
-        if spec.gpu && !config.supports_gpu {
-            return Err(Status::failed_precondition(
-                "docker GPU sandboxes require Docker CDI support. Enable CDI on the Docker daemon, then restart the OpenShell gateway/server so GPU capability is detected.",
-            ));
-        }
+        Self::validate_gpu_request(spec.gpu, config.supports_gpu)?;
         if !template.agent_socket_path.trim().is_empty() {
             return Err(Status::failed_precondition(
                 "docker compute driver does not support template.agent_socket_path",
@@ -332,6 +327,15 @@ impl DockerComputeDriver {
         }
 
         let _ = docker_resource_limits(template)?;
+        Ok(())
+    }
+
+    fn validate_gpu_request(gpu: bool, supports_gpu: bool) -> Result<(), Status> {
+        if gpu && !supports_gpu {
+            return Err(Status::failed_precondition(
+                "docker GPU sandboxes require Docker CDI support. Enable CDI on the Docker daemon, then restart the OpenShell gateway/server so GPU capability is detected.",
+            ));
+        }
         Ok(())
     }
 
@@ -941,11 +945,11 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         .collect()
 }
 
-fn docker_gpu_device_requests(gpu: bool) -> Option<Vec<DeviceRequest>> {
-    gpu.then(|| {
+fn docker_gpu_device_requests(gpu: bool, gpu_device: &str) -> Option<Vec<DeviceRequest>> {
+    cdi_gpu_device_ids(gpu, gpu_device).map(|device_ids| {
         vec![DeviceRequest {
             driver: Some("cdi".to_string()),
-            device_ids: Some(vec![CDI_GPU_DEVICE_ALL.to_string()]),
+            device_ids: Some(device_ids),
             ..Default::default()
         }]
     })
@@ -992,7 +996,7 @@ fn build_container_create_body(
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
-            device_requests: docker_gpu_device_requests(spec.gpu),
+            device_requests: docker_gpu_device_requests(spec.gpu, &spec.gpu_device),
             binds: Some(build_binds(config)),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
@@ -1109,6 +1113,14 @@ fn docker_gateway_route(
     }
 }
 
+/// Detect Docker Desktop and behaviourally compatible runtimes - Colima,
+/// Lima, Rancher Desktop, and `OrbStack` - that share Docker Desktop's routing
+/// constraint: the bridge gateway IP is reachable from inside containers but
+/// not from the `OpenShell` server process running on the host, so callbacks
+/// must traverse `host-gateway`.
+///
+/// Each runtime is detected via the daemon's reported OS string or hostname,
+/// supplemented by labels where the runtime publishes them.
 fn uses_host_gateway_alias(info: &SystemInfo) -> bool {
     let operating_system = info
         .operating_system
@@ -1124,14 +1136,20 @@ fn uses_host_gateway_alias(info: &SystemInfo) -> bool {
         .as_deref()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if name == "colima" {
+    if name.starts_with("colima")
+        || name.starts_with("lima-")
+        || name.starts_with("rancher-desktop")
+        || name.starts_with("orbstack")
+    {
         return true;
     }
 
     info.labels.as_ref().is_some_and(|labels| {
-        labels
-            .iter()
-            .any(|label| label.starts_with("com.docker.desktop."))
+        labels.iter().any(|label| {
+            label.starts_with("com.docker.desktop.")
+                || label.starts_with("dev.rancherdesktop.")
+                || label.starts_with("dev.orbstack.")
+        })
     })
 }
 

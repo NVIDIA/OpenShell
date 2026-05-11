@@ -10,14 +10,21 @@ image:
   pullPolicy: IfNotPresent
   tag: ""
 
-# Supervisor image — provides the openshell-sandbox binary that is copied into
-# sandbox pods via an init container. tag defaults to appVersion (same as the
-# gateway image) so both stay in sync when the chart is released.
+# Supervisor image — provides the openshell-sandbox binary injected into sandbox
+# pods. tag defaults to appVersion (same as the gateway image) so both stay in
+# sync when the chart is released.
 supervisor:
   image:
     repository: ghcr.io/nvidia/openshell/supervisor
     pullPolicy: ""
     tag: ""
+  # How the supervisor binary is delivered into sandbox pods.
+  # Empty (default) = auto-detect from cluster version:
+  #   K8s >= v1.35 → "image-volume" (ImageVolume enabled by default; GA in v1.36)
+  #   K8s <  v1.35 → "init-container" (copies via init container + emptyDir)
+  # On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled,
+  # set this to "image-volume" explicitly.
+  sideloadMethod: ""
 
 imagePullSecrets: []
 nameOverride: "openshell"

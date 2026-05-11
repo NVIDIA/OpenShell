@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   e2e-gpu:
-    name: "E2E GPU (${{ matrix.name }})"
+    name: "E2E Docker GPU (${{ matrix.name }})"
     runs-on: ${{ matrix.runner }}
     continue-on-error: ${{ matrix.experimental }}
     timeout-minutes: 30
@@ -55,8 +55,12 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Install Python dependencies and generate protobuf stubs
-        run: uv sync --frozen && mise run --no-deps python:proto
+      - name: Check Docker GPU prerequisites
+        run: |
+          docker info --format '{{json .CDISpecDirs}}'
+          GPU_PROBE_IMAGE="$(awk '$1 == "FROM" && $3 == "AS" && $4 == "gateway" { print $2; exit }' deploy/docker/Dockerfile.images)"
+          test -n "${GPU_PROBE_IMAGE}"
+          docker run --rm --device nvidia.com/gpu=all "${GPU_PROBE_IMAGE}" nvidia-smi -L
 
       - name: Run tests
-        run: mise run --no-deps --skip-deps e2e:python:gpu
+        run: mise run --no-deps --skip-deps e2e:docker:gpu
