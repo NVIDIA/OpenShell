@@ -133,14 +133,31 @@ run_supervisor_build() {
         cargo_prefix=(env -u RUSTC_WRAPPER)
     fi
 
-    if command -v cargo-zigbuild >/dev/null 2>&1; then
-        "${cargo_prefix[@]}" cargo zigbuild --release -p openshell-sandbox --target "${RUST_TARGET}" \
-            --manifest-path "${ROOT}/Cargo.toml"
-    else
-        echo "    cargo-zigbuild not found, falling back to cargo build..."
-        "${cargo_prefix[@]}" cargo build --release -p openshell-sandbox --target "${RUST_TARGET}" \
-            --manifest-path "${ROOT}/Cargo.toml"
+    # When running under sudo, de-escalate the build to the original user.
+    # The target/ dir is owned by that user and root may lack write access
+    # (e.g. NFS root_squash). Only the final gateway execution needs root.
+    # Pass PATH explicitly so cargo/rustc/sccache remain reachable.
+    # Also reclaim any root-owned artifacts left by prior sudo builds.
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        if [ -d "${ROOT}/target" ]; then
+            chown -R "${SUDO_USER}" "${ROOT}/target" 2>/dev/null || true
+        fi
+        cargo_prefix=(sudo -u "${SUDO_USER}" env "PATH=${PATH}" "${cargo_prefix[@]}")
     fi
+
+    local host_arch
+    host_arch="$(uname -m)"
+    local cargo_build_cmd="build"
+    local cargo_bin="cargo"
+
+    if [ "${host_arch}" != "${GUEST_ARCH}" ] && command -v cargo-zigbuild >/dev/null 2>&1; then
+        cargo_build_cmd="zigbuild"
+    elif [ "${host_arch}" != "${GUEST_ARCH}" ]; then
+        echo "    cargo-zigbuild not found, falling back to cargo build..."
+    fi
+
+    "${cargo_prefix[@]}" ${cargo_bin} ${cargo_build_cmd} --release -p openshell-sandbox \
+        --target "${RUST_TARGET}" --manifest-path "${ROOT}/Cargo.toml"
 }
 
 print_build_failure() {

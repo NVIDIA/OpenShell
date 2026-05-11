@@ -24,6 +24,18 @@ run = "tasks/scripts/vm/vm-setup.sh"
 description = "Build the bundled openshell-sandbox supervisor for openshell-driver-vm"
 run = "tasks/scripts/vm/build-supervisor-bundle.sh"
 
+["vm:rootfs"]
+description = "Build the VM rootfs tarball (use -- --base for lightweight)"
+run = "tasks/scripts/vm/build-rootfs-tarball.sh"
+
+["vm:nvidia-modules"]
+description = "Build NVIDIA kernel modules for the guest VM kernel"
+run = "tasks/scripts/vm/build-nvidia-modules.sh"
+
+["vm:clean"]
+description = "Remove all VM cached artifacts (runtime, rootfs, builds)"
+run = "tasks/scripts/vm/vm-clean.sh"
+
 ["vm:smoke:orphan-cleanup"]
 description = "Smoke test: start gateway+driver, create a sandbox, signal the gateway, assert no orphaned processes survive"
 run = "tasks/scripts/vm/smoke-orphan-cleanup.sh"
