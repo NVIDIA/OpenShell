@@ -12,8 +12,8 @@ OpenShell builds these main artifacts:
 |---|---|
 | Gateway binary | `crates/openshell-server` |
 | CLI package and Python SDK | `python/openshell` plus Rust binaries where packaged |
-| Gateway container image | `deploy/docker/Dockerfile.gateway` |
-| Supervisor container image | `deploy/docker/Dockerfile.supervisor` |
+| Gateway container image | `deploy/container/Dockerfile.gateway` |
+| Supervisor container image | `deploy/container/Dockerfile.supervisor` |
 | Helm chart | `deploy/helm/openshell` |
 | VM driver/runtime assets | `crates/openshell-driver-vm` |
 | Published docs site | `docs/` rendered by Fern config in `fern/` |
@@ -31,19 +31,19 @@ glibc 2.31 floor.
 
 ## Container Builds
 
-The Docker image pipeline is a two-step flow: build the Rust binary natively
+The container image pipeline is a two-step flow: build the Rust binary natively
 for the target architecture, then assemble the container image from the
-prebuilt binary. The gateway image is built from `deploy/docker/Dockerfile.gateway`
-and the supervisor image from `deploy/docker/Dockerfile.supervisor`. Neither
-Dockerfile compiles Rust — both copy a staged binary out of
-`deploy/docker/.build/prebuilt-binaries/<arch>/` into the final image.
+prebuilt binary. The gateway image is built from `deploy/container/Dockerfile.gateway`
+and the supervisor image from `deploy/container/Dockerfile.supervisor`. Neither
+Containerfile compiles Rust — both copy a staged binary out of
+`deploy/container/.build/prebuilt-binaries/<arch>/` into the final image.
 
 Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Gateway
 binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.31, including
 native-architecture builds, so the gateway image, standalone tarballs, and Linux
 packages share the same host portability floor. Supervisor binaries remain
-static musl. Local Docker image tasks infer the target architecture from
-`DOCKER_PLATFORM` when set, otherwise from the container engine host metadata
+static musl. Local container image tasks infer the target architecture from
+`CONTAINER_PLATFORM` when set, otherwise from the container engine host metadata
 with the kernel architecture as the fallback. CI invokes the same staging step
 via the `rust-native-build.yml` workflow (per-architecture, per-component) and
 uploads the result as an artifact that the image build job downloads back into

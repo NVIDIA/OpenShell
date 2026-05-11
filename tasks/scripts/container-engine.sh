@@ -342,7 +342,7 @@ ce_imagetools_create() {
 # Dockerfile.{suffix} (Docker convention).  Returns the first match.
 #
 # Usage: ce_resolve_containerfile <dir> <suffix>
-#   dir    — directory containing the build file (e.g. deploy/docker)
+#   dir    — directory containing the build file (e.g. deploy/container)
 #   suffix — file suffix (e.g. images, ci, python-wheels-macos)
 #
 # Prints the resolved path on stdout.  Returns 1 if neither file exists.

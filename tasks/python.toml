@@ -174,7 +174,7 @@ CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "$CACHE_SCOPE_INPUT" | sha256_16_stdin)
 
 mkdir -p target/wheels
 
-CONTAINERFILE=$(ce_resolve_containerfile deploy/docker python-wheels-macos)
+CONTAINERFILE=$(ce_resolve_containerfile deploy/container python-wheels-macos)
 
 ce build \
   -f "${CONTAINERFILE}" \

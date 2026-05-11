@@ -222,7 +222,7 @@ jobs:
           set -euo pipefail
           binary="${{ needs.resolve.outputs.binary_name }}"
           download_dir="prebuilt-rust-binary"
-          stage="deploy/docker/.build/prebuilt-binaries/${{ matrix.arch }}"
+          stage="deploy/container/.build/prebuilt-binaries/${{ matrix.arch }}"
           found="$(find "$download_dir" -type f -name "$binary" -print -quit)"
           if [[ -z "$found" ]]; then
             echo "missing downloaded artifact file: $binary" >&2

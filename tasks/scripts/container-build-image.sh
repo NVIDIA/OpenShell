@@ -68,7 +68,7 @@ missing_prebuilt_paths() {
 
 	for arch in "${arches[@]}"; do
 		for binary in "${binaries[@]}"; do
-			path="deploy/docker/.build/prebuilt-binaries/${arch}/${binary}"
+			path="deploy/container/.build/prebuilt-binaries/${arch}/${binary}"
 			if [[ ! -f "${path}" ]]; then
 				echo "${path}"
 			fi
@@ -94,7 +94,7 @@ ensure_prebuilt_binaries() {
 	if [[ -n "${missing}" ]]; then
 		echo "Error: missing prebuilt Rust binaries required by container target '${target}':" >&2
 		printf '  %s\n' ${missing} >&2
-		echo "Stage binaries at deploy/docker/.build/prebuilt-binaries/<arch>/ before building." >&2
+		echo "Stage binaries at deploy/container/.build/prebuilt-binaries/<arch>/ before building." >&2
 		exit 1
 	fi
 }
@@ -111,20 +111,20 @@ case "${TARGET}" in
     IS_FINAL_IMAGE=1
     IMAGE_NAME="openshell/gateway"
     CONTAINER_TARGET="gateway"
-    CONTAINERFILE=$(ce_resolve_containerfile deploy/docker gateway)
+    CONTAINERFILE=$(ce_resolve_containerfile deploy/container gateway)
     ;;
   supervisor)
     IS_FINAL_IMAGE=1
     IMAGE_NAME="openshell/supervisor"
     CONTAINER_TARGET="supervisor"
-    CONTAINERFILE=$(ce_resolve_containerfile deploy/docker supervisor)
+    CONTAINERFILE=$(ce_resolve_containerfile deploy/container supervisor)
     ;;
   supervisor-output)
     # Backward-compat alias: same as "supervisor".
     IS_FINAL_IMAGE=1
     IMAGE_NAME="openshell/supervisor"
     CONTAINER_TARGET="supervisor"
-    CONTAINERFILE=$(ce_resolve_containerfile deploy/docker supervisor)
+    CONTAINERFILE=$(ce_resolve_containerfile deploy/container supervisor)
     ;;
   *)
     echo "Error: unsupported target '${TARGET}'" >&2

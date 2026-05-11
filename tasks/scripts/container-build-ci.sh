@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Build the CI container image (deploy/docker/Dockerfile.ci or Containerfile.ci).
+# Build the CI container image (deploy/container/Dockerfile.ci or Containerfile.ci).
 # This is a standalone build, separate from the main image build graph.
 
 set -euo pipefail
@@ -16,7 +16,7 @@ CONTAINER_BUILDER="${CONTAINER_BUILDER:-${DOCKER_BUILDER:-}}"
 CONTAINER_PLATFORM="${CONTAINER_PLATFORM:-${DOCKER_PLATFORM:-}}"
 CONTAINER_PUSH="${CONTAINER_PUSH:-${DOCKER_PUSH:-}}"
 
-CONTAINERFILE=$(ce_resolve_containerfile deploy/docker ci)
+CONTAINERFILE=$(ce_resolve_containerfile deploy/container ci)
 
 OUTPUT_ARGS=(--load)
 if [[ "${CONTAINER_PUSH}" == "1" ]]; then
