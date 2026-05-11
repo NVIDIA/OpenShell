@@ -30,6 +30,7 @@ mod http;
 mod inference;
 mod multiplex;
 mod persistence;
+mod provider_auth;
 pub(crate) mod policy_store;
 mod provider_refresh;
 mod sandbox_index;
