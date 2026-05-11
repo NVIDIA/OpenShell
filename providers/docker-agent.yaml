@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: docker-agent
+display_name: Docker Agent
+description: Docker AI agent runner (docker agent)
+category: agent
+inference_capable: false
+credentials:
+  - name: hub_token
+    description: Docker Hub token for pulling agent images from OCI registries
+    env_vars: [DOCKER_ACCESS_TOKEN]
+    required: false
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: registry-1.docker.io
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+  - host: auth.docker.io
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+  - host: hub.docker.com
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+  - host: model-runner.docker.internal
+    port: 80
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/bin/docker, /usr/local/bin/docker, /usr/bin/docker-agent, /usr/local/bin/docker-agent]

@@ -5,6 +5,7 @@ pub mod anthropic;
 pub mod claude;
 pub mod codex;
 pub mod copilot;
+pub mod docker_agent;
 pub mod generic;
 pub mod github;
 pub mod gitlab;

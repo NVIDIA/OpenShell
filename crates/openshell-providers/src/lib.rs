@@ -84,6 +84,7 @@ impl ProviderRegistry {
         registry.register(providers::claude::ClaudeProvider);
         registry.register(providers::codex::CodexProvider);
         registry.register(providers::copilot::CopilotProvider);
+        registry.register(providers::docker_agent::DockerAgentProvider);
         registry.register(providers::opencode::OpencodeProvider);
         registry.register(providers::generic::GenericProvider);
         registry.register(providers::openai::OpenaiProvider);
@@ -146,6 +147,7 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
         "claude" => Some("claude"),
         "codex" => Some("codex"),
         "copilot" => Some("copilot"),
+        "docker-agent" | "docker_agent" => Some("docker-agent"),
         "opencode" => Some("opencode"),
         "generic" => Some("generic"),
         "openai" => Some("openai"),
@@ -160,6 +162,18 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
 
 #[must_use]
 pub fn detect_provider_from_command(command: &[String]) -> Option<&'static str> {
+    // Special case: `docker agent [...]` maps to the docker-agent provider.
+    // The binary name alone is just `docker`, which would not match.
+    if let (Some(first), Some(second)) = (command.first(), command.get(1)) {
+        let first_base = Path::new(first.as_str())
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(first.as_str());
+        if first_base.eq_ignore_ascii_case("docker") && second.eq_ignore_ascii_case("agent") {
+            return Some("docker-agent");
+        }
+    }
+
     let first = command.first()?;
     let basename = Path::new(first)
         .file_name()
@@ -214,5 +228,20 @@ mod tests {
             detect_provider_from_command(&["gh".to_string()]),
             Some("github")
         );
+        // `docker agent` sub-command maps to docker-agent
+        assert_eq!(
+            detect_provider_from_command(&["docker".to_string(), "agent".to_string()]),
+            Some("docker-agent")
+        );
+        assert_eq!(
+            detect_provider_from_command(&[
+                "/usr/bin/docker".to_string(),
+                "agent".to_string(),
+                "run".to_string(),
+            ]),
+            Some("docker-agent")
+        );
+        // plain `docker` without `agent` sub-command does not match docker-agent
+        assert_eq!(detect_provider_from_command(&["docker".to_string()]), None);
     }
 }

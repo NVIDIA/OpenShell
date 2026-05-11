@@ -19,6 +19,7 @@ const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/claude.yaml"),
     include_str!("../../../providers/codex.yaml"),
     include_str!("../../../providers/copilot.yaml"),
+    include_str!("../../../providers/docker-agent.yaml"),
     include_str!("../../../providers/github.yaml"),
     include_str!("../../../providers/gitlab.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
