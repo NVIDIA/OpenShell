@@ -45,7 +45,7 @@ The file path is provided via:
 
 ```
 --config /path/to/gateway.toml
-OPENSHELL_CONFIG=/path/to/gateway.toml
+OPENSHELL_GATEWAY_CONFIG=/path/to/gateway.toml
 ```
 
 The file must have a `.toml` extension. A missing path is a hard error; an empty existing file is treated as "no configuration" — the gateway falls back to defaults and to whatever the CLI/env supply.
