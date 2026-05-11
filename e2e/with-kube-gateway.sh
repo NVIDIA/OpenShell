@@ -188,9 +188,11 @@ if [ -z "${HOST_GATEWAY_IP}" ] && command -v docker >/dev/null 2>&1; then
   fi
   for net in "${candidate_networks[@]}"; do
     [ -n "${net}" ] || continue
+    # Prefer the IPv4 gateway — kind dual-stacks its network and the IPv6 entry
+    # is unreachable for the typical test-host listener (0.0.0.0 bind).
     detected="$(docker network inspect "${net}" \
       -f '{{range .IPAM.Config}}{{.Gateway}}{{"\n"}}{{end}}' 2>/dev/null \
-      | awk 'NF { print; exit }')"
+      | awk '/^[0-9.]+$/ { print; exit }')"
     if [ -n "${detected}" ]; then
       HOST_GATEWAY_IP="${detected}"
       echo "Detected host gateway IP ${HOST_GATEWAY_IP} from docker network '${net}'."
