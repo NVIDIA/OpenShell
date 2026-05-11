@@ -451,6 +451,7 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
             "accepted_chunks": response.accepted_chunks,
             "rejected_chunks": response.rejected_chunks,
             "rejection_reasons": response.rejection_reasons,
+            "accepted_chunk_ids": response.accepted_chunk_ids,
         }),
     )
 }
@@ -521,6 +522,8 @@ fn policy_chunk_from_add_rule(
         first_seen_ms: 0,
         last_seen_ms: 0,
         binary,
+        validation_result: String::new(),
+        rejection_reason: String::new(),
     })
 }
 

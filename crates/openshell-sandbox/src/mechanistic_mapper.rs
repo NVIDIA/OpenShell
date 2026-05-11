@@ -230,6 +230,8 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
             first_seen_ms,
             last_seen_ms,
             binary: binary.clone(),
+            validation_result: String::new(),
+            rejection_reason: String::new(),
         });
     }
 

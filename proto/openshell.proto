@@ -1296,6 +1296,15 @@ message PolicyChunk {
   int64 last_seen_ms = 15;
   // Binary path that triggered the denial (denormalized for display convenience).
   string binary = 16;
+  // Validation verdict from gateway-side static checks (prover output).
+  // Free-form summary string for human consumption in the inbox card.
+  // Empty until the prover has run for this chunk.
+  string validation_result = 17;
+  // Operator-supplied free-form text accompanying a rejection. Populated
+  // when the reviewer rejects via `RejectDraftChunkRequest.reason`; surfaced
+  // back to the in-sandbox agent so it can revise the proposal.
+  // Empty for non-rejected chunks.
+  string rejection_reason = 18;
 }
 
 // Notification that the draft policy was updated.
@@ -1329,6 +1338,10 @@ message SubmitPolicyAnalysisResponse {
   uint32 rejected_chunks = 2;
   // Reasons for each rejected chunk.
   repeated string rejection_reasons = 3;
+  // Server-assigned chunk IDs for the accepted chunks, in submission order.
+  // Agents use these to watch proposal state via policy.local's
+  // GET /v1/proposals/{id} and /wait endpoints.
+  repeated string accepted_chunk_ids = 4;
 }
 
 // Get draft policy for a sandbox.
@@ -1491,6 +1504,12 @@ message DraftChunkPayload {
   string binary = 9;
   // Current draft version for the owning sandbox.
   int64 draft_version = 10;
+  // Gateway prover verdict for this chunk; empty until prover runs.
+  // Mirrors PolicyChunk.validation_result.
+  string validation_result = 11;
+  // Operator-supplied free-form rejection text; empty for non-rejected
+  // chunks. Mirrors PolicyChunk.rejection_reason.
+  string rejection_reason = 12;
 }
 
 // Internal stored policy revision row materialized from the generic objects table.
@@ -1525,4 +1544,8 @@ message StoredDraftChunk {
   int32 hit_count = 15;
   int64 first_seen_ms = 16;
   int64 last_seen_ms = 17;
+  // Gateway prover verdict; empty until the prover runs. See PolicyChunk.
+  string validation_result = 18;
+  // Operator-supplied free-form rejection text. See PolicyChunk.
+  string rejection_reason = 19;
 }

@@ -509,6 +509,7 @@ ORDER BY "created_at_ms" DESC
         id: &str,
         status: &str,
         decided_at_ms: Option<i64>,
+        rejection_reason: Option<&str>,
     ) -> PersistenceResult<bool> {
         let Some(mut record) = self.get_draft_chunk(id).await? else {
             return Ok(false);
@@ -517,6 +518,9 @@ ORDER BY "created_at_ms" DESC
         record.status = status.to_string();
         record.decided_at_ms = decided_at_ms;
         record.last_seen_ms = current_time_ms()?;
+        if let Some(reason) = rejection_reason {
+            record.rejection_reason = reason.to_string();
+        }
         let payload = draft_chunk_payload_from_record(&record)?;
 
         let result = sqlx::query(

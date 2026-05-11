@@ -332,8 +332,9 @@ impl CachedOpenShellClient {
     /// Submit denial summaries and/or agent-authored proposals for policy analysis.
     ///
     /// Returns the gateway response so callers can surface accepted/rejected
-    /// counts and rejection reasons (e.g., the `policy.local` API forwards
-    /// these to the in-sandbox agent).
+    /// counts, rejection reasons, and server-assigned `accepted_chunk_ids`
+    /// (e.g., the `policy.local` API forwards these to the in-sandbox agent
+    /// so it can watch proposal state via `GET /v1/proposals/{id}`).
     pub async fn submit_policy_analysis(
         &self,
         sandbox_name: &str,

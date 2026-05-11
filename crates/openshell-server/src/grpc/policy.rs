@@ -1358,6 +1358,7 @@ pub(super) async fn handle_submit_policy_analysis(
     let mut accepted: u32 = 0;
     let mut rejected: u32 = 0;
     let mut rejection_reasons: Vec<String> = Vec::new();
+    let mut accepted_chunk_ids: Vec<String> = Vec::new();
 
     for chunk in &req.proposed_chunks {
         if chunk.rule_name.is_empty() {
@@ -1391,7 +1392,7 @@ pub(super) async fn handle_submit_policy_analysis(
             .unwrap_or_default();
 
         let record = DraftChunkRecord {
-            id: chunk_id,
+            id: chunk_id.clone(),
             sandbox_id: sandbox_id.clone(),
             draft_version,
             status: "pending".to_string(),
@@ -1419,6 +1420,8 @@ pub(super) async fn handle_submit_policy_analysis(
             } else {
                 now_ms
             },
+            validation_result: String::new(),
+            rejection_reason: String::new(),
         };
         state
             .store
@@ -1426,6 +1429,7 @@ pub(super) async fn handle_submit_policy_analysis(
             .await
             .map_err(|e| Status::internal(format!("persist draft chunk failed: {e}")))?;
         accepted += 1;
+        accepted_chunk_ids.push(chunk_id);
     }
 
     state.sandbox_watch_bus.notify(&sandbox_id);
@@ -1443,6 +1447,7 @@ pub(super) async fn handle_submit_policy_analysis(
         accepted_chunks: accepted,
         rejected_chunks: rejected,
         rejection_reasons,
+        accepted_chunk_ids,
     }))
 }
 
@@ -1559,7 +1564,7 @@ pub(super) async fn handle_approve_draft_chunk(
         current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
     state
         .store
-        .update_draft_chunk_status(&req.chunk_id, "approved", Some(now_ms))
+        .update_draft_chunk_status(&req.chunk_id, "approved", Some(now_ms), None)
         .await
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
@@ -1657,9 +1662,17 @@ pub(super) async fn handle_reject_draft_chunk(
 
     let now_ms =
         current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+    // Persist the reviewer's free-form `reason` into the chunk's
+    // `rejection_reason` field so the in-sandbox agent can read it back via
+    // GetDraftPolicy / policy.local and revise the proposal.
+    let persisted_reason = if req.reason.is_empty() {
+        None
+    } else {
+        Some(req.reason.as_str())
+    };
     state
         .store
-        .update_draft_chunk_status(&req.chunk_id, "rejected", Some(now_ms))
+        .update_draft_chunk_status(&req.chunk_id, "rejected", Some(now_ms), persisted_reason)
         .await
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
@@ -1741,7 +1754,7 @@ pub(super) async fn handle_approve_all_draft_chunks(
             current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
         state
             .store
-            .update_draft_chunk_status(&chunk.id, "approved", Some(now_ms))
+            .update_draft_chunk_status(&chunk.id, "approved", Some(now_ms), None)
             .await
             .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
@@ -1884,9 +1897,12 @@ pub(super) async fn handle_undo_draft_chunk(
 
     let (version, hash) = remove_chunk_from_policy(state, &sandbox_id, &chunk).await?;
 
+    // Clear any prior rejection_reason on the way back to "pending" so an
+    // agent reading the chunk via policy.local cannot see a stale guidance
+    // string left over from a previous reject → undo round.
     state
         .store
-        .update_draft_chunk_status(&req.chunk_id, "pending", None)
+        .update_draft_chunk_status(&req.chunk_id, "pending", None, Some(""))
         .await
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
@@ -2108,6 +2124,8 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
         first_seen_ms: record.first_seen_ms,
         last_seen_ms: record.last_seen_ms,
         binary: record.binary.clone(),
+        validation_result: record.validation_result.clone(),
+        rejection_reason: record.rejection_reason.clone(),
         ..Default::default()
     })
 }
@@ -3971,6 +3989,8 @@ mod tests {
         .into_inner();
         assert_eq!(submit.accepted_chunks, 1);
         assert_eq!(submit.rejected_chunks, 0);
+        assert_eq!(submit.accepted_chunk_ids.len(), 1);
+        assert!(!submit.accepted_chunk_ids[0].is_empty());
 
         let draft_policy = handle_get_draft_policy(
             &state,
@@ -4114,6 +4134,211 @@ mod tests {
         .unwrap()
         .into_inner();
         assert!(history_after_clear.entries.is_empty());
+    }
+
+    /// A reviewer's free-form rejection reason must round-trip through
+    /// persistence and surface on the chunk via `GetDraftPolicy`, so the
+    /// in-sandbox agent can read the guidance and redraft. The MVP-v2 agent
+    /// feedback loop hangs off this guarantee.
+    #[tokio::test]
+    async fn reject_with_reason_persists_into_chunk_for_agent_readback() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let sandbox_name = "agent-feedback-loop".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-feedback".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "allow_example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let submit = handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "allow_example".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "agent intent".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = submit.accepted_chunk_ids[0].clone();
+
+        let guidance = "scope to docs/ paths only, not all repo contents";
+        handle_reject_draft_chunk(
+            &state,
+            Request::new(RejectDraftChunkRequest {
+                name: sandbox_name.clone(),
+                chunk_id: chunk_id.clone(),
+                reason: guidance.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let rejected = draft
+            .chunks
+            .iter()
+            .find(|c| c.id == chunk_id)
+            .expect("rejected chunk should still be visible");
+        assert_eq!(rejected.status, "rejected");
+        assert_eq!(
+            rejected.rejection_reason, guidance,
+            "reviewer's free-form reason must round-trip into the chunk for agent readback"
+        );
+        // validation_result is unpopulated until the prover runs (#1097).
+        assert!(rejected.validation_result.is_empty());
+    }
+
+    /// Undo of an approve must clear any `rejection_reason` left over from a
+    /// prior reject. Without this, the in-sandbox agent reading chunks via
+    /// `policy.local` cannot tell "pending and never rejected" from "pending
+    /// but previously rejected with this stale guidance." The only path that
+    /// lands a non-empty reason on a pending chunk is reject → re-approve →
+    /// undo, so the test walks that sequence.
+    #[tokio::test]
+    async fn undo_after_reject_clears_stale_rejection_reason() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let sandbox_name = "undo-clears-reason".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-undo-clears".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "allow_example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let submit = handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "allow_example".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = submit.accepted_chunk_ids[0].clone();
+
+        handle_reject_draft_chunk(
+            &state,
+            Request::new(RejectDraftChunkRequest {
+                name: sandbox_name.clone(),
+                chunk_id: chunk_id.clone(),
+                reason: "scope too broad".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        handle_approve_draft_chunk(
+            &state,
+            Request::new(ApproveDraftChunkRequest {
+                name: sandbox_name.clone(),
+                chunk_id: chunk_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        handle_undo_draft_chunk(
+            &state,
+            Request::new(UndoDraftChunkRequest {
+                name: sandbox_name.clone(),
+                chunk_id: chunk_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let restored = draft
+            .chunks
+            .iter()
+            .find(|c| c.id == chunk_id)
+            .expect("chunk should still be present after undo");
+        assert_eq!(restored.status, "pending");
+        assert!(
+            restored.rejection_reason.is_empty(),
+            "undo must clear stale rejection_reason; got: {:?}",
+            restored.rejection_reason
+        );
     }
 
     #[tokio::test]
@@ -4417,6 +4642,8 @@ mod tests {
             hit_count: 1,
             first_seen_ms: 0,
             last_seen_ms: 0,
+            validation_result: String::new(),
+            rejection_reason: String::new(),
         };
 
         let (version, _) = merge_chunk_into_policy(&store, &chunk.sandbox_id, &chunk)
@@ -4511,6 +4738,8 @@ mod tests {
             hit_count: 1,
             first_seen_ms: 0,
             last_seen_ms: 0,
+            validation_result: String::new(),
+            rejection_reason: String::new(),
         };
 
         let (version, _) = merge_chunk_into_policy(&store, sandbox_id, &chunk)
@@ -4610,6 +4839,8 @@ mod tests {
             hit_count: 1,
             first_seen_ms: 0,
             last_seen_ms: 0,
+            validation_result: String::new(),
+            rejection_reason: String::new(),
         };
 
         let (version, _) = merge_chunk_into_policy(&store, sandbox_id, &chunk)
