@@ -135,6 +135,77 @@ PY
         json_status_response "$status" "$body"
         ;;
 
+    submit-test-proposal)
+        # Synthetic proposal for the wait-loop smoke. No GitHub creds needed
+        # — we never make outbound calls, the gateway just persists the
+        # chunk and the reviewer decides on it.
+        rule_id="$1"
+        body="$(mktemp)"
+        payload="$(mktemp)"
+
+        python3 - "$rule_id" > "$payload" <<'PY'
+import json
+import sys
+
+rule_id = sys.argv[1]
+payload = {
+    "intent_summary": f"Smoke test proposal {rule_id}",
+    "operations": [{
+        "addRule": {
+            "ruleName": f"smoke_{rule_id}",
+            "rule": {
+                "name": f"smoke_{rule_id}",
+                "endpoints": [{
+                    "host": "example.invalid",
+                    "port": 443,
+                    "protocol": "rest",
+                    "enforcement": "enforce",
+                    "rules": [{
+                        "allow": {"method": "GET", "path": f"/{rule_id}"}
+                    }],
+                }],
+                "binaries": [{"path": "/usr/bin/curl"}],
+            },
+        }
+    }],
+}
+print(json.dumps(payload))
+PY
+
+        status="$(curl -sS \
+            -o "$body" \
+            -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data-binary "@${payload}" \
+            http://policy.local/v1/proposals)"
+        json_status_response "$status" "$body"
+        ;;
+
+    proposal-status)
+        chunk_id="$1"
+        body="$(mktemp)"
+        status="$(curl -sS \
+            -o "$body" \
+            -w "%{http_code}" \
+            "http://policy.local/v1/proposals/${chunk_id}")"
+        json_status_response "$status" "$body"
+        ;;
+
+    proposal-wait)
+        chunk_id="$1"
+        timeout="${2:-60}"
+        body="$(mktemp)"
+        # No --max-time on curl: the server bounds the wait at `timeout`,
+        # which is already clamped to [1, 300] by policy.local. Let the
+        # request return naturally.
+        status="$(curl -sS \
+            -o "$body" \
+            -w "%{http_code}" \
+            "http://policy.local/v1/proposals/${chunk_id}/wait?timeout=${timeout}")"
+        json_status_response "$status" "$body"
+        ;;
+
     *)
         echo "unknown command: $cmd" >&2
         exit 64
