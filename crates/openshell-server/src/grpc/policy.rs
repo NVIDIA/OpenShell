@@ -1372,7 +1372,6 @@ pub(super) async fn handle_submit_policy_analysis(
             continue;
         }
 
-        let chunk_id = uuid::Uuid::new_v4().to_string();
         let now_ms =
             current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
         let proposed_rule_bytes = chunk
@@ -1392,7 +1391,10 @@ pub(super) async fn handle_submit_policy_analysis(
             .unwrap_or_default();
 
         let record = DraftChunkRecord {
-            id: chunk_id.clone(),
+            // The handler proposes an id; the store may swap it for an
+            // existing row's id on dedup. Always trust `effective_id` for
+            // anything user-facing.
+            id: uuid::Uuid::new_v4().to_string(),
             sandbox_id: sandbox_id.clone(),
             draft_version,
             status: "pending".to_string(),
@@ -1423,13 +1425,20 @@ pub(super) async fn handle_submit_policy_analysis(
             validation_result: String::new(),
             rejection_reason: String::new(),
         };
-        state
+        // Mechanistic mode dedups N denials targeting the same endpoint
+        // into one chunk. All other modes (agent-authored proposals, future
+        // modes) submit each chunk as a distinct row — the redraft loop
+        // relies on it, and the conservative default for an unknown mode
+        // is to keep the proposal rather than silently fold it away.
+        let dedup_key = matches!(req.analysis_mode.as_str(), "mechanistic")
+            .then(|| crate::policy_store::observation_dedup_key(&record));
+        let effective_id = state
             .store
-            .put_draft_chunk(&record)
+            .put_draft_chunk(&record, dedup_key.as_deref())
             .await
             .map_err(|e| Status::internal(format!("persist draft chunk failed: {e}")))?;
         accepted += 1;
-        accepted_chunk_ids.push(chunk_id);
+        accepted_chunk_ids.push(effective_id);
     }
 
     state.sandbox_watch_bus.notify(&sandbox_id);
@@ -4227,6 +4236,220 @@ mod tests {
         );
         // validation_result is unpopulated until the prover runs (#1097).
         assert!(rejected.validation_result.is_empty());
+    }
+
+    /// Two agent-authored proposals targeting the same host/port/binary must
+    /// each persist as a distinct chunk. The mechanistic-mode dedup
+    /// (`host|port|binary`) is wrong for agent intent: the redraft loop
+    /// relies on the second submission landing as its own chunk so the
+    /// reviewer can decide on it independently. Regression test for the bug
+    /// where Flow B of `e2e/policy-advisor/wait-smoke.sh` saw a fresh
+    /// `chunk_id` returned from submit but `RejectDraftChunk` could not
+    /// find it because the SQL ON CONFLICT had silently kept the prior row.
+    #[tokio::test]
+    async fn agent_authored_submits_for_same_endpoint_do_not_dedup() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let sandbox_name = "redraft-loop".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-redraft".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // Two proposals with the same host|port|binary (so the mechanistic
+        // dedup_key would collide) but distinct rule names and L7 paths —
+        // proves the gateway distinguishes them by intentional act and not
+        // by payload hash. If a future dedup-by-payload-hash regression
+        // landed, this test would still fail because the chunk_ids would
+        // still need to be distinct.
+        let make_rule = |rule_name: &str| NetworkPolicyRule {
+            name: rule_name.to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let submit_one = |rule_name: &str, rule: NetworkPolicyRule| {
+            let state = state.clone();
+            let sandbox_name = sandbox_name.clone();
+            let rule_name = rule_name.to_string();
+            async move {
+                handle_submit_policy_analysis(
+                    &state,
+                    Request::new(SubmitPolicyAnalysisRequest {
+                        name: sandbox_name,
+                        analysis_mode: "agent_authored".to_string(),
+                        proposed_chunks: vec![PolicyChunk {
+                            rule_name,
+                            proposed_rule: Some(rule),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap()
+                .into_inner()
+            }
+        };
+
+        let first = submit_one("allow_first", make_rule("allow_first")).await;
+        let second = submit_one("allow_second", make_rule("allow_second")).await;
+
+        assert_eq!(first.accepted_chunk_ids.len(), 1);
+        assert_eq!(second.accepted_chunk_ids.len(), 1);
+        assert_ne!(
+            first.accepted_chunk_ids[0], second.accepted_chunk_ids[0],
+            "second agent-authored proposal for the same endpoint must get its own chunk_id, not dedup"
+        );
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.clone(),
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let ids: Vec<_> = draft.chunks.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            ids.contains(&first.accepted_chunk_ids[0].as_str())
+                && ids.contains(&second.accepted_chunk_ids[0].as_str()),
+            "both reported chunk_ids must be persisted; got: {ids:?}"
+        );
+
+        // Reject the second by id to prove the gateway can actually find
+        // what the submit response claimed to have created — this is the
+        // exact path the smoke test exercises end-to-end.
+        handle_reject_draft_chunk(
+            &state,
+            Request::new(RejectDraftChunkRequest {
+                name: sandbox_name,
+                chunk_id: second.accepted_chunk_ids[0].clone(),
+                reason: "redraft test".to_string(),
+            }),
+        )
+        .await
+        .expect("reject must find the chunk_id the submit response just promised");
+    }
+
+    /// Complement to the agent-authored test above: mechanistic-mode
+    /// submissions for the same endpoint must STILL dedup. The
+    /// observation-driven path relies on N denials folding into one chunk
+    /// instead of N near-identical chunks. Lock the behavior in so a future
+    /// change to the dedup branch doesn't accidentally also turn off
+    /// mechanistic dedup.
+    #[tokio::test]
+    async fn mechanistic_submits_for_same_endpoint_dedup_into_one_chunk() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let sandbox_name = "mechanistic-dedup".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-mech-dedup".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "allow_example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let submit_one = || {
+            let state = state.clone();
+            let sandbox_name = sandbox_name.clone();
+            let rule = proposed_rule.clone();
+            async move {
+                handle_submit_policy_analysis(
+                    &state,
+                    Request::new(SubmitPolicyAnalysisRequest {
+                        name: sandbox_name,
+                        analysis_mode: "mechanistic".to_string(),
+                        proposed_chunks: vec![PolicyChunk {
+                            rule_name: "allow_example".to_string(),
+                            proposed_rule: Some(rule),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap()
+                .into_inner()
+            }
+        };
+        let first = submit_one().await;
+        let second = submit_one().await;
+        assert_eq!(first.accepted_chunk_ids.len(), 1);
+        assert_eq!(second.accepted_chunk_ids.len(), 1);
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            draft.chunks.len(),
+            1,
+            "two mechanistic submits for the same host|port|binary must dedup; got {} chunks",
+            draft.chunks.len()
+        );
+        // Both submits must report the same effective id — the id of the
+        // one row that actually exists in the DB. Before the dedup fix the
+        // second submit would return a freshly-generated UUID that was
+        // never persisted; this assertion locks the contract down.
+        let stored_id = &draft.chunks[0].id;
+        assert_eq!(
+            &first.accepted_chunk_ids[0], stored_id,
+            "first submit's reported id must match the stored chunk"
+        );
+        assert_eq!(
+            &second.accepted_chunk_ids[0], stored_id,
+            "second submit must report the same id as the first (dedup fold-in), not a fresh UUID"
+        );
     }
 
     /// Undo of an approve must clear any `rejection_reason` left over from a

@@ -1325,7 +1325,13 @@ message SubmitPolicyAnalysisRequest {
   repeated DenialSummary summaries = 1;
   // Proposed policy chunks (validated by sandbox OPA engine).
   repeated PolicyChunk proposed_chunks = 2;
-  // Analysis mode: "mechanistic" or "llm".
+  // Analysis mode. `mechanistic` is the observation-driven path from the
+  // denial aggregator — chunks targeting the same host|port|binary fold
+  // into one row with hit_count incremented. `agent_authored` is an
+  // intentional proposal from an in-sandbox agent — each submission lands
+  // as its own chunk so the redraft-after-rejection loop has a stable id
+  // to watch. Other values are treated as agent-style (no dedup) so a new
+  // mode does not silently collapse proposals.
   string analysis_mode = 3;
   // Sandbox name.
   string name = 4;
