@@ -17,11 +17,17 @@ publish = false
 
 [features]
 e2e = []
-e2e-docker = ["e2e"]
+# Selects tests that rely on `host.openshell.internal` (the sandbox's stable
+# alias to the host running test fixtures). docker and podman wire the alias
+# unconditionally; the kube driver only does so when the chart's
+# `server.hostGatewayIP` is set, so `e2e-kubernetes` does NOT imply this and
+# the helm wrapper opts in explicitly when it has resolved an IP.
+e2e-host-gateway = ["e2e"]
+e2e-docker = ["e2e", "e2e-host-gateway"]
 e2e-gpu = ["e2e"]
 e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
-e2e-podman = ["e2e"]
+e2e-podman = ["e2e", "e2e-host-gateway"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
 
 [[test]]
@@ -43,6 +49,21 @@ required-features = ["e2e-docker"]
 name = "user_namespaces"
 path = "tests/user_namespaces.rs"
 required-features = ["e2e-kubernetes"]
+
+[[test]]
+name = "host_gateway_alias"
+path = "tests/host_gateway_alias.rs"
+required-features = ["e2e-host-gateway"]
+
+[[test]]
+name = "forward_proxy_l7_bypass"
+path = "tests/forward_proxy_l7_bypass.rs"
+required-features = ["e2e-host-gateway"]
+
+[[test]]
+name = "forward_proxy_graphql_l7"
+path = "tests/forward_proxy_graphql_l7.rs"
+required-features = ["e2e-host-gateway"]
 
 [[test]]
 name = "gpu_device_selection"

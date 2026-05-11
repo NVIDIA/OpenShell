@@ -5,7 +5,6 @@
 
 pub mod binary;
 pub mod container;
-pub mod driver;
 pub mod gateway;
 pub mod output;
 pub mod port;

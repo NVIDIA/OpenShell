@@ -7,10 +7,19 @@
 # ephemeral k3d cluster is created and torn down by with-kube-gateway.sh.
 # Set OPENSHELL_E2E_KUBE_TEST to scope to a single integration test
 # (e.g. smoke) for local debugging.
+#
+# Features: the default set includes `e2e-host-gateway` so tests that rely on
+# the sandbox-side `host.openshell.internal` alias compile and run. The Helm
+# wrapper detects the cluster's host-routable IP and wires it into the chart
+# via `server.hostGatewayIP`. Targeting a cluster where the test host is
+# unreachable from pods? Set OPENSHELL_E2E_HELM_FEATURES=e2e to drop the
+# alias-dependent tests entirely.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+E2E_FEATURES="${OPENSHELL_E2E_HELM_FEATURES:-e2e,e2e-host-gateway}"
 
 cargo build -p openshell-cli --features openshell-core/dev-settings
 
@@ -21,7 +30,7 @@ fi
 
 exec "${ROOT}/e2e/with-kube-gateway.sh" \
   cargo test --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \
-    --features e2e \
+    --features "${E2E_FEATURES}" \
     --no-fail-fast \
     ${test_filter[@]+"${test_filter[@]}"} \
     -- --nocapture

@@ -91,7 +91,9 @@ cleanup() {
         --timeout 60s >/dev/null 2>&1 || true
     fi
     if command -v kubectl >/dev/null 2>&1; then
-      kctl delete namespace "${NAMESPACE}" --wait=false \
+      # Wait for the namespace to fully delete so back-to-back runs don't hit
+      # "namespace is being terminated" when helm install creates it again.
+      kctl delete namespace "${NAMESPACE}" --wait=true --timeout=60s \
         --ignore-not-found >/dev/null 2>&1 || true
     fi
   fi
@@ -142,16 +144,87 @@ IMAGE_TAG_VALUE="${IMAGE_TAG:-latest}"
 REGISTRY_VALUE="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
 REGISTRY_VALUE="${REGISTRY_VALUE%/}"
 
-# When this script created the cluster, import locally-available gateway and
-# supervisor images so devs without a registry login can iterate. Best-effort:
-# missing images fall through to the cluster's pull behavior at install time.
+# Resolve a host-gateway IP that sandbox pods can dial to reach test fixtures
+# running on the developer/CI host (HTTP fixtures bound to 0.0.0.0 plus sibling
+# Docker containers with published ports). The Helm chart wires this into pod
+# hostAliases for host.openshell.internal / host.docker.internal — without it,
+# every test that relies on the alias has to skip on the kube driver.
+#
+# Preference order:
+#   1. OPENSHELL_E2E_HOST_GATEWAY_IP — operator override (remote clusters where
+#      auto-detection has no signal).
+#   2. Gateway of the cluster's Docker network (k3d-<cluster> for ephemeral
+#      clusters, `kind` for kind clusters used in CI). Pods SNAT through their
+#      node to this IP, which lands on the host's bridge interface and reaches
+#      any 0.0.0.0-bound listener / published container port.
+HOST_GATEWAY_IP="${OPENSHELL_E2E_HOST_GATEWAY_IP:-}"
+
+# k3d primes CoreDNS with `host.k3d.internal` pointing at the IP that pods can
+# use to reach the host (Docker Desktop's gvisor-net loopback on macOS/Windows,
+# the docker bridge gateway on Linux). That mapping handles Docker Desktop
+# correctly; the docker network gateway alone does not.
+if [ -z "${HOST_GATEWAY_IP}" ] && command -v kubectl >/dev/null 2>&1; then
+  detected="$(kctl -n kube-system get configmap coredns -o jsonpath='{.data.NodeHosts}' 2>/dev/null \
+    | awk '$2 == "host.k3d.internal" { print $1; exit }')"
+  if [ -n "${detected}" ]; then
+    HOST_GATEWAY_IP="${detected}"
+    echo "Detected host gateway IP ${HOST_GATEWAY_IP} from CoreDNS host.k3d.internal entry."
+  fi
+fi
+
+# Fallback for non-k3d clusters (kind in CI, etc.): use the docker network
+# gateway IP. Works on Linux where the bridge is reachable from pods; on macOS
+# Docker Desktop without k3d, this will likely not route to the host.
+if [ -z "${HOST_GATEWAY_IP}" ] && command -v docker >/dev/null 2>&1; then
+  candidate_networks=()
+  if [ "${CLUSTER_CREATED_BY_US}" = "1" ]; then
+    candidate_networks+=("k3d-${CLUSTER_NAME}")
+  elif [[ "${KUBE_CONTEXT}" == k3d-* ]]; then
+    candidate_networks+=("k3d-${KUBE_CONTEXT#k3d-}")
+  elif [[ "${KUBE_CONTEXT}" == kind-* ]]; then
+    candidate_networks+=("kind")
+  else
+    candidate_networks+=("kind" "k3d-${KUBE_CONTEXT#k3d-}")
+  fi
+  for net in "${candidate_networks[@]}"; do
+    [ -n "${net}" ] || continue
+    detected="$(docker network inspect "${net}" \
+      -f '{{range .IPAM.Config}}{{.Gateway}}{{"\n"}}{{end}}' 2>/dev/null \
+      | awk 'NF { print; exit }')"
+    if [ -n "${detected}" ]; then
+      HOST_GATEWAY_IP="${detected}"
+      echo "Detected host gateway IP ${HOST_GATEWAY_IP} from docker network '${net}'."
+      break
+    fi
+  done
+fi
+if [ -z "${HOST_GATEWAY_IP}" ]; then
+  echo "WARNING: could not resolve a host gateway IP for the active cluster." >&2
+  echo "         Tests that require host.openshell.internal will be skipped." >&2
+  echo "         Set OPENSHELL_E2E_HOST_GATEWAY_IP to override." >&2
+fi
+
+# Import locally-available gateway/supervisor images into the k3d cluster so
+# devs working off local builds don't depend on the configured registry. For
+# kind clusters (used by CI), images must be loaded before this script runs —
+# the workflow handles that via `kind load docker-image`. Best-effort: when an
+# image isn't present locally, the cluster falls back to its pull behavior.
+import_cluster_name=""
 if [ "${CLUSTER_CREATED_BY_US}" = "1" ]; then
+  import_cluster_name="${CLUSTER_NAME}"
+elif [[ "${KUBE_CONTEXT}" == k3d-* ]] && command -v k3d >/dev/null 2>&1; then
+  candidate="${KUBE_CONTEXT#k3d-}"
+  if k3d cluster list "${candidate}" >/dev/null 2>&1; then
+    import_cluster_name="${candidate}"
+  fi
+fi
+if [ -n "${import_cluster_name}" ]; then
   for image in \
     "${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}" \
     "${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"; do
     if docker image inspect "${image}" >/dev/null 2>&1; then
-      echo "Importing ${image} into k3d cluster ${CLUSTER_NAME}..."
-      k3d image import "${image}" --cluster "${CLUSTER_NAME}" \
+      echo "Importing ${image} into k3d cluster ${import_cluster_name}..."
+      k3d image import "${image}" --cluster "${import_cluster_name}" \
         --mode direct >/dev/null
     fi
   done
@@ -165,6 +238,11 @@ kctl apply -f "${ROOT}/deploy/kube/manifests/agent-sandbox.yaml"
 kctl wait --for=condition=Established crd/sandboxes.agents.x-k8s.io --timeout=120s
 kctl -n agent-sandbox-system rollout status statefulset/agent-sandbox-controller --timeout=300s
 
+helm_extra_args=()
+if [ -n "${HOST_GATEWAY_IP}" ]; then
+  helm_extra_args+=(--set "server.hostGatewayIP=${HOST_GATEWAY_IP}")
+fi
+
 echo "Installing Helm chart (release=${RELEASE_NAME}, namespace=${NAMESPACE}, tag=${IMAGE_TAG_VALUE})..."
 helmctl install "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
   --namespace "${NAMESPACE}" --create-namespace \
@@ -174,6 +252,7 @@ helmctl install "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
   --set "image.tag=${IMAGE_TAG_VALUE}" \
   --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
   --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+  "${helm_extra_args[@]}" \
   --wait --timeout 5m
 HELM_INSTALLED=1
 
