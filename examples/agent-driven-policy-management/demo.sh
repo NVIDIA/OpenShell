@@ -5,9 +5,25 @@
 
 # Agent-driven policy management demo.
 #
-# Runs the full loop: a Codex agent inside a sandbox hits an OpenShell policy
-# block, reads the policy advisor skill, drafts a narrow rule via policy.local,
-# the developer approves from the host, and the agent retries successfully.
+# Runs the full loop end-to-end:
+#
+#   1. A Codex agent inside an OpenShell sandbox attempts a PUT that the L7
+#      proxy denies with a structured policy_denied 403.
+#   2. The agent reads /etc/openshell/skills/policy_advisor.md.
+#   3. The agent submits a narrow proposal (exact host, port, method, path)
+#      to policy.local and saves the returned chunk_id.
+#   4. The agent blocks on `GET /v1/proposals/{chunk_id}/wait` — one HTTP
+#      call that sleeps on a socket. THE AGENT BURNS ZERO LLM TOKENS WHILE
+#      IT WAITS; this is the load-bearing UX win over polling.
+#   5. The developer (this script, simulating the host side) sees the pending
+#      proposal in `openshell rule get` and approves it.
+#   6. The agent's /wait returns approved within ~1 second of the approval,
+#      retries the original PUT once against the hot-reloaded policy, and
+#      exits.
+#
+# The whole loop is feature-flagged behind agent_policy_proposals_enabled and
+# requires no GitHub credentials beyond the repo write token already used by
+# the existing demo flow.
 
 set -euo pipefail
 
@@ -315,9 +331,9 @@ summarize_pending() {
 narrate_sandbox_workflow() {
     info "Inside the sandbox right now:"
     info ""
-    info "  ${BOLD}[1]${RESET} agent: ${DIM}curl -X PUT https://api.github.com/repos/${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO}/contents/...${RESET}"
-    info "  ${BOLD}[2]${RESET} L7 proxy denies the write and returns a structured 403 the"
-    info "      agent can parse and act on:"
+    info "  • agent: ${DIM}curl -X PUT https://api.github.com/repos/${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO}/contents/...${RESET}"
+    info "  • L7 proxy denies the write and returns a structured 403 the"
+    info "    agent can parse and act on:"
     cat <<EOF
 ${DIM}        {
           "error":      "policy_denied",
@@ -331,11 +347,14 @@ ${DIM}        {
           ]
         }${RESET}
 EOF
-    info "  ${BOLD}[3]${RESET} agent reads the skill, drafts a narrow ${DIM}addRule${RESET} for exactly that path"
-    info "  ${BOLD}[4]${RESET} agent POSTs the proposal to ${DIM}http://policy.local/v1/proposals${RESET}"
-    info "  ${BOLD}[5]${RESET} supervisor forwards it to the gateway as a pending draft"
+    info "  • agent reads the skill, drafts a narrow ${DIM}addRule${RESET} for exactly that path"
+    info "  • agent POSTs to ${DIM}http://policy.local/v1/proposals${RESET}, saves the"
+    info "    returned ${DIM}accepted_chunk_ids[0]${RESET}"
+    info "  • agent calls ${DIM}GET /v1/proposals/{chunk_id}/wait?timeout=300${RESET}"
+    info "    — one HTTP call that sleeps on a socket until the developer decides."
+    info "    ${BOLD}Zero LLM tokens burn during this wait.${RESET}"
     info ""
-    info "${DIM}Polling for the pending draft...${RESET}"
+    info "${DIM}Watching for the pending draft on the gateway...${RESET}"
 }
 
 approve_when_pending() {
@@ -359,7 +378,7 @@ approve_when_pending() {
             info "${GREEN}proposal received:${RESET}"
             summarize_pending "$pending"
 
-            step "Approving and waiting for the agent to retry"
+            step "Approving — the agent's /wait will return within ~1s"
             "$OPENSHELL_BIN" rule approve-all "$DEMO_SANDBOX_NAME" \
                 | awk '/approved/ { print "  " $0 }'
             return
@@ -379,7 +398,7 @@ wait_for_agent() {
         fail "agent run failed"
     fi
     AGENT_PID=""
-    info "agent retried after policy hot-reload — write succeeded"
+    info "agent's /wait returned approved — single PUT retry succeeded"
 }
 
 verify_github_write() {

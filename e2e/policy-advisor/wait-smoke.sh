@@ -3,20 +3,41 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# End-to-end smoke for the agent feedback loop (#1092 + #1094 + #1096).
+# Wire-contract regression for policy.local's /wait endpoint.
 #
-# Exercises both halves of the new policy.local /wait endpoint:
-#   Flow A — approve-and-retry: agent submits, /wait blocks, host approves,
-#            /wait returns approved.
-#   Flow B — reject-with-guidance: agent submits, /wait blocks, host rejects
-#            with --reason, /wait returns rejected + rejection_reason text.
+# This is NOT a tutorial — read examples/agent-driven-policy-management/demo.sh
+# (and its README) for the narrated end-to-end story with a real LLM agent.
+# This script is the cheap, deterministic, no-LLM check that the underlying
+# contract still holds. Pair this with a unit test diff to catch regressions
+# in the gateway+supervisor integration path that the unit tests can't reach.
+#
+# What it pins down:
+#   - Flow A — submit → /wait blocks → host approves → /wait returns
+#              status=approved within seconds. Proves the wait-and-wake
+#              path of the agent feedback loop.
+#   - Flow B — submit → /wait blocks → host rejects with --reason "..."
+#              → /wait returns status=rejected AND the reviewer's exact
+#              free-form text comes back in rejection_reason. Proves the
+#              revise-and-resubmit path's wire contract.
+#
+# What it deliberately doesn't do:
+#   - No LLM (Codex) — proposals are synthetic JSON crafted by curl. The
+#     real agent's prompt-following is the demo's concern, not this one.
+#   - No outbound traffic — host is `example.invalid`. We never make a real
+#     GitHub or HTTP call. Only policy.local and the gateway gRPC.
+#   - No prover badge / TUI assertions (out of scope for this regression;
+#     see the prover-validation and TUI-inbox work).
 #
 # Prereqs:
 #   - A running gateway and the openshell CLI built from this branch.
-#   - Global setting agent_policy_proposals_enabled=true.
+#     The simplest local path is `mise run helm:skaffold:run`, then
+#     `kubectl -n openshell port-forward svc/openshell 8090:8080 &` and
+#     `cargo build -p openshell-cli`.
+#   - The agent-proposals feature flag enabled. Run once:
+#       openshell settings set --global \
+#           --key agent_policy_proposals_enabled --value true --yes
 #
-# No GitHub credentials needed — proposals are synthetic and never trigger
-# outbound traffic.
+# Runs in ~10s on a warm cluster (most of which is sandbox SSH bring-up).
 
 set -euo pipefail
 
