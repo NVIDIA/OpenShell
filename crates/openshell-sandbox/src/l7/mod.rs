@@ -274,6 +274,43 @@ fn check_glob_syntax(pattern: &str) -> Option<String> {
     None
 }
 
+fn validate_host_wildcard(errors: &mut Vec<String>, loc: &str, host: &str) {
+    if !host.contains('*') {
+        return;
+    }
+
+    if host == "*" || host == "**" {
+        errors.push(format!(
+            "{loc}: host wildcard '{host}' matches all hosts; use specific patterns like '*.example.com'"
+        ));
+        return;
+    }
+
+    let labels: Vec<&str> = host.split('.').collect();
+    let first_label = labels.first().copied().unwrap_or_default();
+    if labels.iter().skip(1).any(|label| label.contains('*')) {
+        errors.push(format!(
+            "{loc}: host wildcard may only appear in the first DNS label, got '{host}'"
+        ));
+        return;
+    }
+    if first_label.contains("**") && first_label != "**" {
+        errors.push(format!(
+            "{loc}: recursive host wildcard '**' is only allowed as the entire first DNS label, got '{host}'"
+        ));
+        return;
+    }
+
+    // Reject TLD or single-label wildcards. They are accepted by the policy
+    // engine but silently fail at the proxy layer (see #787).
+    if labels.len() <= 2 {
+        errors.push(format!(
+            "{loc}: TLD wildcard '{host}' is not allowed; \
+             use subdomain wildcards like '*.example.com' instead"
+        ));
+    }
+}
+
 fn validate_graphql_operation_type(
     errors: &mut Vec<String>,
     loc: &str,
@@ -409,29 +446,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 }
             }
 
-            // Validate host wildcard patterns.
-            if host.contains('*') {
-                if host == "*" || host == "**" {
-                    errors.push(format!(
-                        "{loc}: host wildcard '{host}' matches all hosts; use specific patterns like '*.example.com'"
-                    ));
-                } else if !host.starts_with("*.") && !host.starts_with("**.") {
-                    errors.push(format!(
-                        "{loc}: host wildcard must start with '*.' or '**.' (e.g., '*.example.com'), got '{host}'"
-                    ));
-                } else {
-                    // Reject TLD wildcards like *.com (2 labels) — they are
-                    // accepted by the policy engine but silently fail at the
-                    // proxy layer (see #787).
-                    let label_count = host.split('.').count();
-                    if label_count <= 2 {
-                        errors.push(format!(
-                            "{loc}: TLD wildcard '{host}' is not allowed; \
-                             use subdomain wildcards like '*.example.com' instead"
-                        ));
-                    }
-                }
-            }
+            validate_host_wildcard(&mut errors, &loc, host);
 
             // port + ports mutual exclusion
             let has_scalar_port = ep
@@ -1360,7 +1375,27 @@ mod tests {
     }
 
     #[test]
-    fn validate_wildcard_host_no_star_dot_error() {
+    fn validate_wildcard_host_mid_label_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "foo.*.example.com",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("first DNS label")),
+            "Mid-label wildcard should be rejected, got errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_single_label_error() {
         let data = serde_json::json!({
             "network_policies": {
                 "test": {
@@ -1374,8 +1409,28 @@ mod tests {
         });
         let (errors, _warnings) = validate_l7_policies(&data);
         assert!(
-            errors.iter().any(|e| e.contains("must start with")),
-            "Malformed wildcard should be rejected, got errors: {errors:?}"
+            errors.iter().any(|e| e.contains("TLD wildcard")),
+            "Single-label wildcard should be rejected, got errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_recursive_intra_label_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "foo**.example.com",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("recursive host wildcard")),
+            "Recursive intra-label wildcard should be rejected, got errors: {errors:?}"
         );
     }
 
@@ -1440,6 +1495,54 @@ mod tests {
         assert!(
             warnings.is_empty(),
             "*.example.com should not warn, got warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_double_star_valid_no_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "**.example.com",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "**.example.com should be valid, got errors: {errors:?}"
+        );
+        assert!(
+            warnings.is_empty(),
+            "**.example.com should not warn, got warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_intra_label_valid_no_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "*-aiplatform.googleapis.com",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "*-aiplatform.googleapis.com should be valid, got errors: {errors:?}"
+        );
+        assert!(
+            warnings.is_empty(),
+            "*-aiplatform.googleapis.com should not warn, got warnings: {warnings:?}"
         );
     }
 
