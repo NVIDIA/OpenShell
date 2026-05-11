@@ -134,11 +134,11 @@ run_supervisor_build() {
     fi
 
     if command -v cargo-zigbuild >/dev/null 2>&1; then
-        "${cargo_prefix[@]}" cargo zigbuild --release -p openshell-sandbox --target "${RUST_TARGET}" \
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p openshell-sandbox --target "${RUST_TARGET}" \
             --manifest-path "${ROOT}/Cargo.toml"
     else
         echo "    cargo-zigbuild not found, falling back to cargo build..."
-        "${cargo_prefix[@]}" cargo build --release -p openshell-sandbox --target "${RUST_TARGET}" \
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-sandbox --target "${RUST_TARGET}" \
             --manifest-path "${ROOT}/Cargo.toml"
     fi
 }
