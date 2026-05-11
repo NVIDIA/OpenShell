@@ -165,6 +165,88 @@ fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
 }
 
 #[test]
+fn docker_gateway_route_uses_host_gateway_for_colima() {
+    let info = SystemInfo {
+        operating_system: Some("Ubuntu 24.04 LTS".to_string()),
+        name: Some("colima".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+        ),
+        DockerGatewayRoute::HostGateway
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_for_colima_named_profile() {
+    let info = SystemInfo {
+        operating_system: Some("Ubuntu 24.04 LTS".to_string()),
+        // `colima start --profile <name>` sets the daemon hostname to
+        // `colima-<name>`; the prefix match still catches it.
+        name: Some("colima-default".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+        ),
+        DockerGatewayRoute::HostGateway
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_for_rancher_desktop() {
+    let info = SystemInfo {
+        operating_system: Some("Alpine Linux v3.20".to_string()),
+        name: Some("lima-rancher-desktop".to_string()),
+        labels: Some(vec![
+            "dev.rancherdesktop.profile=Rancher Desktop".to_string(),
+        ]),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+        ),
+        DockerGatewayRoute::HostGateway
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_for_orbstack() {
+    let info = SystemInfo {
+        operating_system: Some("OrbStack".to_string()),
+        name: Some("orbstack".to_string()),
+        labels: Some(vec!["dev.orbstack.machine_type=docker".to_string()]),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+        ),
+        DockerGatewayRoute::HostGateway
+    );
+}
+
+#[test]
 fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
     let info = SystemInfo {
         operating_system: Some("Ubuntu 24.04 LTS".to_string()),

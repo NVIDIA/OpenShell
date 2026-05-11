@@ -1099,7 +1099,7 @@ fn docker_gateway_route(
         };
     }
 
-    if is_docker_desktop(info) {
+    if is_compat_docker_runtime(info) {
         DockerGatewayRoute::HostGateway
     } else {
         DockerGatewayRoute::Bridge {
@@ -1109,7 +1109,15 @@ fn docker_gateway_route(
     }
 }
 
-fn is_docker_desktop(info: &SystemInfo) -> bool {
+/// Detect Docker Desktop and behaviourally compatible runtimes — Colima,
+/// Lima, Rancher Desktop, and `OrbStack` — that share Docker Desktop's
+/// routing constraint: the bridge gateway IP is reachable from inside
+/// containers but not from the `OpenShell` server process running on the
+/// host, so callbacks must traverse `host-gateway`.
+///
+/// Each runtime is detected via the daemon's reported OS string or hostname,
+/// supplemented by labels where the runtime publishes them.
+fn is_compat_docker_runtime(info: &SystemInfo) -> bool {
     let operating_system = info
         .operating_system
         .as_deref()
@@ -1119,10 +1127,25 @@ fn is_docker_desktop(info: &SystemInfo) -> bool {
         return true;
     }
 
+    let name = info
+        .name
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name.starts_with("colima")
+        || name.starts_with("lima-")
+        || name.starts_with("rancher-desktop")
+        || name.starts_with("orbstack")
+    {
+        return true;
+    }
+
     info.labels.as_ref().is_some_and(|labels| {
-        labels
-            .iter()
-            .any(|label| label.starts_with("com.docker.desktop."))
+        labels.iter().any(|label| {
+            label.starts_with("com.docker.desktop.")
+                || label.starts_with("dev.rancherdesktop.")
+                || label.starts_with("dev.orbstack.")
+        })
     })
 }
 
