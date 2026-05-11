@@ -12,7 +12,8 @@ OpenShell builds these main artifacts:
 |---|---|
 | Gateway binary | `crates/openshell-server` |
 | CLI package and Python SDK | `python/openshell` plus Rust binaries where packaged |
-| Gateway and supervisor container images | `deploy/docker/Dockerfile.images` |
+| Gateway container image | `deploy/docker/Dockerfile.gateway` |
+| Supervisor container image | `deploy/docker/Dockerfile.supervisor` |
 | Helm chart | `deploy/helm/openshell` |
 | VM driver/runtime assets | `crates/openshell-driver-vm` |
 | Published docs site | `docs/` rendered by Fern config in `fern/` |
@@ -21,10 +22,14 @@ Sandbox community images are built outside this repository.
 
 ## Container Builds
 
-The Docker image pipeline stages prebuilt Rust binaries, then builds container
-images from `deploy/docker/Dockerfile.images`. CI builds native artifacts on the
-target architecture, stages them under `deploy/docker/.build/`, and then uses
-Buildx to publish per-architecture images and multi-architecture tags.
+The Docker image pipeline stages prebuilt Rust binaries, then builds the gateway
+image from `deploy/docker/Dockerfile.gateway` and the supervisor image from
+`deploy/docker/Dockerfile.supervisor`. CI builds native artifacts on the target
+architecture, stages them under `deploy/docker/.build/`, and then uses Buildx to
+publish per-architecture images and multi-architecture tags. The gateway image
+uses the NVIDIA distroless C/C++ runtime. The supervisor image remains
+`scratch`, so the staged `openshell-sandbox` image binary is built as a static
+musl binary.
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.
 Package formulas also pin Docker supervisor extraction to the matching release

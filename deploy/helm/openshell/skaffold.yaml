@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Local dev: builds gateway + supervisor images using Dockerfile.images with
+# Local dev: builds gateway + supervisor images using split Dockerfiles with
 # BUILD_FROM_SOURCE=1, which compiles Rust binaries inside Docker without
 # requiring pre-staged artifacts.
 #
@@ -28,7 +28,7 @@ build:
             --target gateway \
             --tag "$IMAGE" \
             --load \
-            --file deploy/docker/Dockerfile.images \
+            --file deploy/docker/Dockerfile.gateway \
             .
         dependencies:
           paths:
@@ -36,7 +36,7 @@ build:
             - Cargo.lock
             - crates/**
             - proto/**
-            - deploy/docker/Dockerfile.images
+            - deploy/docker/Dockerfile.gateway
             - crates/openshell-server/migrations/**
     - image: openshell/supervisor
       context: ../../..
@@ -47,7 +47,7 @@ build:
             --target supervisor \
             --tag "$IMAGE" \
             --load \
-            --file deploy/docker/Dockerfile.images \
+            --file deploy/docker/Dockerfile.supervisor \
             .
         dependencies:
           paths:
@@ -55,7 +55,8 @@ build:
             - Cargo.lock
             - crates/**
             - proto/**
-            - deploy/docker/Dockerfile.images
+            - deploy/docker/Dockerfile.supervisor
+            - deploy/docker/cross-build.sh
 deploy:
   helm:
     releases:
