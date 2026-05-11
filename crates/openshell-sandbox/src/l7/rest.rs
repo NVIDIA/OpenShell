@@ -9,7 +9,9 @@
 
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
-use crate::secrets::{SecretResolver, rewrite_http_header_block};
+use crate::secrets::{
+    SecretResolver, contains_reserved_credential_marker, rewrite_http_header_block,
+};
 use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
 use sha1::{Digest, Sha1};
@@ -18,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
 const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
+const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
 const RELAY_BUF_SIZE: usize = 8192;
 /// Idle timeout for `relay_until_eof`.  If no data arrives within this window
 /// the body is considered complete.  Prevents blocking on servers that keep
@@ -373,6 +376,7 @@ where
             resolver,
             generation_guard,
             websocket_extensions: WebSocketExtensionMode::Preserve,
+            request_body_credential_rewrite: false,
         },
     )
     .await
@@ -390,6 +394,7 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) resolver: Option<&'a SecretResolver>,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) websocket_extensions: WebSocketExtensionMode,
+    pub(crate) request_body_credential_rewrite: bool,
 }
 
 pub(crate) async fn relay_http_request_with_options_guarded<C, U>(
@@ -437,37 +442,54 @@ where
         guard.ensure_current()?;
     }
 
-    upstream
-        .write_all(&rewrite_result.rewritten)
-        .await
-        .into_diagnostic()?;
-
-    let overflow = &req.raw_header[header_end..];
-    if !overflow.is_empty() {
-        if let Some(guard) = options.generation_guard {
-            guard.ensure_current()?;
+    if options.request_body_credential_rewrite {
+        let body = collect_and_rewrite_request_body(
+            req,
+            client,
+            &rewrite_result.rewritten,
+            header_str,
+            &req.raw_header[header_end..],
+            options.resolver,
+            options.generation_guard,
+        )
+        .await?;
+        upstream.write_all(&body.headers).await.into_diagnostic()?;
+        if !body.body.is_empty() {
+            upstream.write_all(&body.body).await.into_diagnostic()?;
         }
-        upstream.write_all(overflow).await.into_diagnostic()?;
-    }
-    let overflow_len = overflow.len() as u64;
+    } else {
+        upstream
+            .write_all(&rewrite_result.rewritten)
+            .await
+            .into_diagnostic()?;
 
-    match req.body_length {
-        BodyLength::ContentLength(len) => {
-            let remaining = len.saturating_sub(overflow_len);
-            if remaining > 0 {
-                relay_fixed(client, upstream, remaining, options.generation_guard).await?;
+        let overflow = &req.raw_header[header_end..];
+        if !overflow.is_empty() {
+            if let Some(guard) = options.generation_guard {
+                guard.ensure_current()?;
             }
+            upstream.write_all(overflow).await.into_diagnostic()?;
         }
-        BodyLength::Chunked => {
-            relay_chunked(
-                client,
-                upstream,
-                &req.raw_header[header_end..],
-                options.generation_guard,
-            )
-            .await?;
+        let overflow_len = overflow.len() as u64;
+
+        match req.body_length {
+            BodyLength::ContentLength(len) => {
+                let remaining = len.saturating_sub(overflow_len);
+                if remaining > 0 {
+                    relay_fixed(client, upstream, remaining, options.generation_guard).await?;
+                }
+            }
+            BodyLength::Chunked => {
+                relay_chunked(
+                    client,
+                    upstream,
+                    &req.raw_header[header_end..],
+                    options.generation_guard,
+                )
+                .await?;
+            }
+            BodyLength::None => {}
         }
-        BodyLength::None => {}
     }
     upstream.flush().await.into_diagnostic()?;
 
@@ -484,6 +506,290 @@ where
     .await?;
 
     Ok(outcome)
+}
+
+struct PreparedRequestBody {
+    headers: Vec<u8>,
+    body: Vec<u8>,
+}
+
+async fn collect_and_rewrite_request_body<C: AsyncRead + Unpin>(
+    req: &L7Request,
+    client: &mut C,
+    rewritten_headers: &[u8],
+    original_header_str: &str,
+    already_read: &[u8],
+    resolver: Option<&SecretResolver>,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<PreparedRequestBody> {
+    match req.body_length {
+        BodyLength::None => {
+            if body_bytes_contain_reserved_marker(already_read) {
+                return Err(miette!(
+                    "request body credential rewrite cannot resolve placeholders without explicit body framing"
+                ));
+            }
+            Ok(PreparedRequestBody {
+                headers: rewritten_headers.to_vec(),
+                body: already_read.to_vec(),
+            })
+        }
+        BodyLength::ContentLength(len) => {
+            let len = usize::try_from(len)
+                .map_err(|_| miette!("request body is too large for credential rewrite"))?;
+            if len > MAX_REWRITE_BODY_BYTES {
+                return Err(miette!(
+                    "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
+                ));
+            }
+            let mut body = Vec::with_capacity(len);
+            let initial_len = already_read.len().min(len);
+            body.extend_from_slice(&already_read[..initial_len]);
+            let mut remaining = len.saturating_sub(initial_len);
+            let mut buf = [0u8; RELAY_BUF_SIZE];
+            while remaining > 0 {
+                let to_read = remaining.min(buf.len());
+                let n = client.read(&mut buf[..to_read]).await.into_diagnostic()?;
+                if n == 0 {
+                    return Err(miette!(
+                        "Connection closed with {remaining} body bytes remaining"
+                    ));
+                }
+                if let Some(guard) = generation_guard {
+                    guard.ensure_current()?;
+                }
+                body.extend_from_slice(&buf[..n]);
+                remaining -= n;
+            }
+            let (headers, body) =
+                rewrite_buffered_body(rewritten_headers, original_header_str, body, resolver)?;
+            Ok(PreparedRequestBody { headers, body })
+        }
+        BodyLength::Chunked => {
+            let body = collect_chunked_body(client, already_read, generation_guard).await?;
+            if body_bytes_contain_reserved_marker(&body) {
+                return Err(miette!(
+                    "request body credential rewrite does not support chunked bodies containing credential placeholders"
+                ));
+            }
+            Ok(PreparedRequestBody {
+                headers: rewritten_headers.to_vec(),
+                body,
+            })
+        }
+    }
+}
+
+fn rewrite_buffered_body(
+    headers: &[u8],
+    original_header_str: &str,
+    body: Vec<u8>,
+    resolver: Option<&SecretResolver>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    if body.is_empty() {
+        return Ok((headers.to_vec(), body));
+    }
+
+    let content_type = content_type(original_header_str);
+    if !is_rewritable_content_type(content_type.as_deref()) {
+        if body_bytes_contain_reserved_marker(&body) {
+            return Err(miette!(
+                "request body credential rewrite found placeholders in an unsupported content type"
+            ));
+        }
+        return Ok((headers.to_vec(), body));
+    }
+
+    let mut text = String::from_utf8(body)
+        .map_err(|_| miette!("request body credential rewrite requires UTF-8 text bodies"))?;
+    if !contains_reserved_credential_marker(&text) {
+        return Ok((headers.to_vec(), text.into_bytes()));
+    }
+
+    let Some(resolver) = resolver else {
+        return Err(miette!(
+            "request body credential rewrite found placeholders but no resolver is available"
+        ));
+    };
+    let replacements = resolver
+        .rewrite_text_placeholders(&mut text, "request_body")
+        .map_err(|e| miette!("credential injection failed: {e}"))?;
+    if replacements == 0 || contains_reserved_credential_marker(&text) {
+        return Err(miette!(
+            "request body credential rewrite left unresolved credential placeholders"
+        ));
+    }
+
+    let body = text.into_bytes();
+    let headers = set_content_length(headers, body.len())?;
+    Ok((headers, body))
+}
+
+async fn collect_chunked_body<C: AsyncRead + Unpin>(
+    client: &mut C,
+    already_read: &[u8],
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<Vec<u8>> {
+    let mut read_buf = [0u8; RELAY_BUF_SIZE];
+    let mut parse_buf = Vec::from(already_read);
+    let mut pos = 0usize;
+
+    loop {
+        if parse_buf.len() > MAX_REWRITE_BODY_BYTES {
+            return Err(miette!(
+                "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
+            ));
+        }
+
+        let size_line_end = loop {
+            if let Some(end) = find_crlf(&parse_buf, pos) {
+                break end;
+            }
+            let n = client.read(&mut read_buf).await.into_diagnostic()?;
+            if n == 0 {
+                return Err(miette!("Chunked body ended before chunk-size line"));
+            }
+            if let Some(guard) = generation_guard {
+                guard.ensure_current()?;
+            }
+            parse_buf.extend_from_slice(&read_buf[..n]);
+            if parse_buf.len() > MAX_REWRITE_BODY_BYTES {
+                return Err(miette!(
+                    "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
+                ));
+            }
+        };
+
+        let size_line = std::str::from_utf8(&parse_buf[pos..size_line_end])
+            .into_diagnostic()
+            .map_err(|_| miette!("Invalid UTF-8 in chunk-size line"))?;
+        let size_token = size_line
+            .split(';')
+            .next()
+            .map(str::trim)
+            .unwrap_or_default();
+        let chunk_size = usize::from_str_radix(size_token, 16)
+            .into_diagnostic()
+            .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
+        pos = size_line_end + 2;
+
+        if chunk_size == 0 {
+            loop {
+                let trailer_end = loop {
+                    if let Some(end) = find_crlf(&parse_buf, pos) {
+                        break end;
+                    }
+                    let n = client.read(&mut read_buf).await.into_diagnostic()?;
+                    if n == 0 {
+                        return Err(miette!("Chunked body ended before trailer terminator"));
+                    }
+                    if let Some(guard) = generation_guard {
+                        guard.ensure_current()?;
+                    }
+                    parse_buf.extend_from_slice(&read_buf[..n]);
+                    if parse_buf.len() > MAX_REWRITE_BODY_BYTES {
+                        return Err(miette!(
+                            "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
+                        ));
+                    }
+                };
+                let trailer_line = &parse_buf[pos..trailer_end];
+                pos = trailer_end + 2;
+                if trailer_line.is_empty() {
+                    return Ok(parse_buf);
+                }
+            }
+        }
+
+        let chunk_end = pos
+            .checked_add(chunk_size)
+            .ok_or_else(|| miette!("Chunk size overflow"))?;
+        let chunk_with_crlf_end = chunk_end
+            .checked_add(2)
+            .ok_or_else(|| miette!("Chunk size overflow"))?;
+        while parse_buf.len() < chunk_with_crlf_end {
+            let n = client.read(&mut read_buf).await.into_diagnostic()?;
+            if n == 0 {
+                return Err(miette!("Chunked body ended mid-chunk"));
+            }
+            if let Some(guard) = generation_guard {
+                guard.ensure_current()?;
+            }
+            parse_buf.extend_from_slice(&read_buf[..n]);
+            if parse_buf.len() > MAX_REWRITE_BODY_BYTES {
+                return Err(miette!(
+                    "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
+                ));
+            }
+        }
+        if &parse_buf[chunk_end..chunk_with_crlf_end] != b"\r\n" {
+            return Err(miette!("Chunk missing terminating CRLF"));
+        }
+        pos = chunk_with_crlf_end;
+    }
+}
+
+fn content_type(headers: &str) -> Option<String> {
+    headers.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim().eq_ignore_ascii_case("content-type").then(|| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+    })
+}
+
+fn is_rewritable_content_type(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return false;
+    };
+    content_type == "application/json"
+        || content_type == "application/x-www-form-urlencoded"
+        || content_type.starts_with("text/")
+}
+
+fn body_bytes_contain_reserved_marker(body: &[u8]) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    String::from_utf8_lossy(body)
+        .split('\0')
+        .any(contains_reserved_credential_marker)
+}
+
+fn set_content_length(headers: &[u8], len: usize) -> Result<Vec<u8>> {
+    use std::fmt::Write as _;
+
+    let header_str =
+        std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    let mut out = String::with_capacity(header_str.len() + 32);
+    let mut inserted = false;
+    for line in header_str.split("\r\n") {
+        if line.is_empty() {
+            if !inserted {
+                let _ = write!(out, "Content-Length: {len}\r\n");
+            }
+            out.push_str("\r\n");
+            break;
+        }
+        if line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+        {
+            if !inserted {
+                let _ = write!(out, "Content-Length: {len}\r\n");
+                inserted = true;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    Ok(out.into_bytes())
 }
 
 pub(crate) fn request_is_websocket_upgrade(raw_header: &[u8]) -> bool {
@@ -4007,6 +4313,178 @@ mod tests {
             .await
             .map_err(|e| miette!("upstream task failed: {e}"))?;
         Ok(forwarded)
+    }
+
+    async fn relay_and_capture_with_options(
+        raw_header: Vec<u8>,
+        body_length: BodyLength,
+        resolver: Option<&SecretResolver>,
+        request_body_credential_rewrite: bool,
+    ) -> Result<String> {
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let header_str = String::from_utf8_lossy(&raw_header);
+        let first_line = header_str.lines().next().unwrap_or("");
+        let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
+        let action = parts.first().unwrap_or(&"GET").to_string();
+        let target = parts.get(1).unwrap_or(&"/").to_string();
+
+        let req = L7Request {
+            action,
+            target,
+            query_params: HashMap::new(),
+            raw_header,
+            body_length,
+        };
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let mut total = 0usize;
+            let mut header_end = None;
+            let mut expected_total = None;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if header_end.is_none()
+                    && let Some(end) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let end = end + 4;
+                    let headers = String::from_utf8_lossy(&buf[..end]);
+                    let len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    header_end = Some(end);
+                    expected_total = Some(end + len);
+                }
+                if expected_total.is_some_and(|expected| total >= expected) {
+                    break;
+                }
+            }
+            upstream_side
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+            String::from_utf8_lossy(&buf[..total]).to_string()
+        });
+
+        relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            RelayRequestOptions {
+                resolver,
+                request_body_credential_rewrite,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        upstream_task
+            .await
+            .map_err(|e| miette!("upstream task failed: {e}"))
+    }
+
+    #[tokio::test]
+    async fn relay_request_body_rewrites_slack_header_and_urlencoded_token() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [(
+                "SLACK_BOT_TOKEN".to_string(),
+                "xoxb-real-bot-token".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let alias = "xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN";
+        let body = format!("token={alias}&channel=C123");
+        let raw = format!(
+            "POST /api/chat.postMessage HTTP/1.1\r\n\
+             Host: slack.com\r\n\
+             Authorization: Bearer {alias}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let forwarded = relay_and_capture_with_options(
+            raw.into_bytes(),
+            BodyLength::ContentLength(body.len() as u64),
+            Some(&resolver),
+            true,
+        )
+        .await
+        .expect("relay should succeed");
+
+        let expected_body = "token=xoxb-real-bot-token&channel=C123";
+        assert!(forwarded.contains("Authorization: Bearer xoxb-real-bot-token\r\n"));
+        assert!(forwarded.contains(&format!("Content-Length: {}\r\n", expected_body.len())));
+        assert!(forwarded.ends_with(expected_body));
+        assert!(!forwarded.contains("OPENSHELL-RESOLVE-ENV"));
+    }
+
+    #[tokio::test]
+    async fn relay_request_body_unresolved_alias_fails_before_upstream_write() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [(
+                "SLACK_BOT_TOKEN".to_string(),
+                "xoxb-real-bot-token".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let body = "token=xapp-OPENSHELL-RESOLVE-ENV-SLACK_APP_TOKEN";
+        let raw = format!(
+            "POST /api/apps.connections.open HTTP/1.1\r\n\
+             Host: slack.com\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let req = L7Request {
+            action: "POST".to_string(),
+            target: "/api/apps.connections.open".to_string(),
+            query_params: HashMap::new(),
+            raw_header: raw.into_bytes(),
+            body_length: BodyLength::ContentLength(body.len() as u64),
+        };
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let err = relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            RelayRequestOptions {
+                resolver: Some(&resolver),
+                request_body_credential_rewrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("unknown body alias should fail closed");
+
+        assert!(!err.to_string().contains("xoxb-real-bot-token"));
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "failed body rewrite must not reach upstream"
+        );
     }
 
     #[tokio::test]

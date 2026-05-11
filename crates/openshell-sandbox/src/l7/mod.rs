@@ -61,6 +61,10 @@ pub enum EnforcementMode {
 }
 
 /// L7 configuration for an endpoint, extracted from policy data.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Endpoint config mirrors independent policy schema toggles."
+)]
 #[derive(Debug, Clone)]
 pub struct L7EndpointConfig {
     pub protocol: L7Protocol,
@@ -78,6 +82,9 @@ pub struct L7EndpointConfig {
     /// Opt-in rewrite of credential placeholders in client-to-server
     /// WebSocket text messages after an allowed HTTP 101 upgrade.
     pub websocket_credential_rewrite: bool,
+    /// Opt-in rewrite of credential placeholders in supported textual REST
+    /// request bodies before forwarding upstream.
+    pub request_body_credential_rewrite: bool,
     /// When true, client-to-server GraphQL-over-WebSocket operation messages
     /// are classified with the same operation policy used by GraphQL-over-HTTP.
     pub websocket_graphql_policy: bool,
@@ -149,6 +156,8 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
     let websocket_credential_rewrite =
         get_object_bool(val, "websocket_credential_rewrite").unwrap_or(false);
+    let request_body_credential_rewrite =
+        get_object_bool(val, "request_body_credential_rewrite").unwrap_or(false);
     let websocket_graphql_policy =
         protocol == L7Protocol::Websocket && endpoint_has_graphql_policy(val);
     let graphql_max_body_bytes = get_object_u64(val, "graphql_max_body_bytes")
@@ -164,6 +173,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         graphql_max_body_bytes,
         allow_encoded_slash,
         websocket_credential_rewrite,
+        request_body_credential_rewrite,
         websocket_graphql_policy,
     })
 }
@@ -618,6 +628,17 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             {
                 warnings.push(format!(
                     "{loc}: websocket_credential_rewrite is ignored unless protocol is rest or websocket"
+                ));
+            }
+
+            if ep
+                .get("request_body_credential_rewrite")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                && protocol != "rest"
+            {
+                warnings.push(format!(
+                    "{loc}: request_body_credential_rewrite is ignored unless protocol is rest"
                 ));
             }
 
@@ -1228,6 +1249,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_l7_config_request_body_credential_rewrite_defaults_false() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "host": "slack.com", "port": 443}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(!config.request_body_credential_rewrite);
+    }
+
+    #[test]
+    fn parse_l7_config_request_body_credential_rewrite_opt_in() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "host": "slack.com", "port": 443, "request_body_credential_rewrite": true}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(config.request_body_credential_rewrite);
+    }
+
+    #[test]
     fn parse_l7_config_websocket_graphql_policy_defaults_false() {
         let val = regorus::Value::from_json_str(
             r#"{"protocol": "websocket", "host": "gateway.example.com", "port": 443, "rules": [{"allow": {"method": "GET", "path": "/graphql"}}, {"allow": {"method": "WEBSOCKET_TEXT", "path": "/graphql"}}]}"#,
@@ -1267,6 +1308,30 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("websocket_credential_rewrite is ignored")),
             "expected websocket_credential_rewrite warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_request_body_credential_rewrite_warns_unless_rest() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "gateway.example.com",
+                        "port": 443,
+                        "protocol": "websocket",
+                        "request_body_credential_rewrite": true
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (_errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("request_body_credential_rewrite is ignored")),
+            "expected request_body_credential_rewrite warning: {warnings:?}"
         );
     }
 

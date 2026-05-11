@@ -464,6 +464,7 @@ fn merge_endpoint(
     append_unique_strings(&mut existing.allowed_ips, &incoming.allowed_ips);
     existing.allow_encoded_slash |= incoming.allow_encoded_slash;
     existing.websocket_credential_rewrite |= incoming.websocket_credential_rewrite;
+    existing.request_body_credential_rewrite |= incoming.request_body_credential_rewrite;
     normalize_endpoint(existing);
     Ok(())
 }
@@ -918,6 +919,51 @@ mod tests {
 
         let endpoint = &result.policy.network_policies["existing"].endpoints[0];
         assert!(endpoint.websocket_credential_rewrite);
+    }
+
+    #[test]
+    fn add_rule_merges_request_body_credential_rewrite_flag() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "existing".to_string(),
+            NetworkPolicyRule {
+                name: "existing".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "slack.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "rest".to_string(),
+                    access: "read-write".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "incoming".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "slack.com".to_string(),
+                port: 443,
+                ports: vec![443],
+                protocol: "rest".to_string(),
+                request_body_credential_rewrite: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "allow_slack_com_443".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("merge should succeed");
+
+        let endpoint = &result.policy.network_policies["existing"].endpoints[0];
+        assert!(endpoint.request_body_credential_rewrite);
     }
 
     #[test]

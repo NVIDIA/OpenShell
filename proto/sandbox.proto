@@ -120,6 +120,10 @@ message NetworkEndpoint {
   // inside client-to-server WebSocket text messages after an allowed HTTP 101
   // upgrade. Defaults to false.
   bool websocket_credential_rewrite = 16;
+  // When true on a "rest" endpoint, OpenShell rewrites credential placeholders
+  // inside supported textual HTTP request bodies before forwarding upstream.
+  // Defaults to false.
+  bool request_body_credential_rewrite = 17;
 }
 
 // Trusted GraphQL operation classification.

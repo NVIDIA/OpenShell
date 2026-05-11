@@ -116,6 +116,8 @@ pub struct EndpointProfile {
     pub allow_encoded_slash: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub websocket_credential_rewrite: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub request_body_credential_rewrite: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub persisted_queries: String,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -417,6 +419,7 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         deny_rules: endpoint.deny_rules.iter().map(deny_rule_to_proto).collect(),
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
+        request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
         persisted_queries: endpoint.persisted_queries.clone(),
         graphql_persisted_queries: endpoint
             .graphql_persisted_queries
@@ -446,6 +449,7 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
             .collect(),
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
+        request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
         persisted_queries: endpoint.persisted_queries.clone(),
         graphql_persisted_queries: endpoint
             .graphql_persisted_queries

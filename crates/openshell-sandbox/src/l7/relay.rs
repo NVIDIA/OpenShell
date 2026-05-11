@@ -349,6 +349,8 @@ where
                     resolver: ctx.secret_resolver.as_deref(),
                     generation_guard: Some(engine.generation_guard()),
                     websocket_extensions: websocket_extension_mode(config),
+                    request_body_credential_rewrite: config.protocol == L7Protocol::Rest
+                        && config.request_body_credential_rewrite,
                 },
             )
             .await?;
@@ -765,6 +767,8 @@ where
                     resolver: ctx.secret_resolver.as_deref(),
                     generation_guard: Some(engine.generation_guard()),
                     websocket_extensions: websocket_extension_mode(config),
+                    request_body_credential_rewrite: config.protocol == L7Protocol::Rest
+                        && config.request_body_credential_rewrite,
                 },
             )
             .await?;
@@ -1246,12 +1250,15 @@ where
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends
         // the request upstream and reads the response back to the client.
-        let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+        let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
             &req,
             client,
             upstream,
-            resolver,
-            Some(generation_guard),
+            crate::l7::rest::RelayRequestOptions {
+                resolver,
+                generation_guard: Some(generation_guard),
+                ..Default::default()
+            },
         )
         .await?;
 
@@ -1408,6 +1415,7 @@ network_policies:
             graphql_max_body_bytes: 0,
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
+            request_body_credential_rewrite: false,
             websocket_graphql_policy: false,
         }];
         let ctx = L7EvalContext {
@@ -1507,6 +1515,7 @@ network_policies:
             graphql_max_body_bytes: 0,
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
+            request_body_credential_rewrite: false,
             websocket_graphql_policy: false,
         }];
         let (child_env, resolver) = SecretResolver::from_provider_env(
@@ -1623,6 +1632,7 @@ network_policies:
             graphql_max_body_bytes: 0,
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
+            request_body_credential_rewrite: false,
             websocket_graphql_policy: true,
         }];
         let (child_env, resolver) = SecretResolver::from_provider_env(

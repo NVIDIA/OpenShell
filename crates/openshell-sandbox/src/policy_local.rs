@@ -620,6 +620,7 @@ fn network_endpoint_from_json(
         deny_rules,
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: false,
+        request_body_credential_rewrite: false,
         // GraphQL persisted-query knobs and path scoping default empty —
         // agent proposals don't author them today.
         persisted_queries: String::new(),

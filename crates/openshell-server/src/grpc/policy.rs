@@ -219,6 +219,9 @@ fn summarize_endpoint(endpoint: &NetworkEndpoint) -> String {
     if endpoint.websocket_credential_rewrite {
         parts.push("websocket_credential_rewrite=true".to_string());
     }
+    if endpoint.request_body_credential_rewrite {
+        parts.push("request_body_credential_rewrite=true".to_string());
+    }
     if !endpoint.allowed_ips.is_empty() {
         parts.push(format!("allowed_ips={}", endpoint.allowed_ips.len()));
     }
@@ -4346,6 +4349,34 @@ mod tests {
         assert_eq!(
             summarize_cli_policy_merge_op(&operation),
             "add-endpoint realtime_api endpoints=[realtime.example.com:443 protocol=websocket access=read-write enforcement=enforce websocket_credential_rewrite=true] binaries=[/usr/bin/node]"
+        );
+    }
+
+    #[test]
+    fn summarize_cli_policy_merge_op_formats_request_body_credential_rewrite() {
+        let operation = PolicyMergeOp::AddRule {
+            rule_name: "slack_api".to_string(),
+            rule: NetworkPolicyRule {
+                name: "slack_api".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "slack.com".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    access: "read-write".to_string(),
+                    enforcement: "enforce".to_string(),
+                    request_body_credential_rewrite: true,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/node".to_string(),
+                    ..Default::default()
+                }],
+            },
+        };
+
+        assert_eq!(
+            summarize_cli_policy_merge_op(&operation),
+            "add-endpoint slack_api endpoints=[slack.com:443 protocol=rest access=read-write enforcement=enforce request_body_credential_rewrite=true] binaries=[/usr/bin/node]"
         );
     }
 

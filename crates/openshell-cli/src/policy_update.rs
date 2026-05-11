@@ -172,6 +172,23 @@ fn ensure_websocket_credential_rewrite_protocol(
     ))
 }
 
+fn ensure_request_body_credential_rewrite_protocol(
+    spec: &str,
+    endpoint: &NetworkEndpoint,
+) -> Result<()> {
+    if endpoint.protocol == "rest" {
+        return Ok(());
+    }
+    let protocol = if endpoint.protocol.is_empty() {
+        "<empty>"
+    } else {
+        endpoint.protocol.as_str()
+    };
+    Err(miette!(
+        "request-body-credential-rewrite endpoint option requires --add-endpoint protocol segment to be 'rest'; got '{protocol}' in '{spec}'"
+    ))
+}
+
 fn group_allow_rules(specs: &[String]) -> Result<BTreeMap<(String, u32), Vec<L7Rule>>> {
     let mut grouped = BTreeMap::new();
     for spec in specs {
@@ -353,10 +370,14 @@ fn apply_add_endpoint_options(
                 ensure_websocket_credential_rewrite_protocol(spec, endpoint)?;
                 endpoint.websocket_credential_rewrite = true;
             }
+            "request-body-credential-rewrite" => {
+                ensure_request_body_credential_rewrite_protocol(spec, endpoint)?;
+                endpoint.request_body_credential_rewrite = true;
+            }
             _ => {
                 let Some(allowed_ip) = option.strip_prefix("allowed-ip=") else {
                     return Err(miette!(
-                        "--add-endpoint options segment supports only 'websocket-credential-rewrite' and 'allowed-ip=<CIDR-or-IP>'; got '{option}' in '{spec}'"
+                        "--add-endpoint options segment supports only 'websocket-credential-rewrite', 'request-body-credential-rewrite', and 'allowed-ip=<CIDR-or-IP>'; got '{option}' in '{spec}'"
                     ));
                 };
                 let allowed_ip = allowed_ip.trim();
@@ -558,6 +579,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_add_endpoint_enables_request_body_credential_rewrite_on_rest_endpoint() {
+        let plan = build_policy_update_plan(
+            &["slack.com:443:read-write:rest:enforce:request-body-credential-rewrite".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        let endpoint = &rule.endpoints[0];
+        assert_eq!(endpoint.protocol, "rest");
+        assert!(endpoint.request_body_credential_rewrite);
+    }
+
+    #[test]
     fn parse_add_endpoint_merges_allowed_ips_with_websocket_options() {
         let plan = build_policy_update_plan(
             &[
@@ -631,6 +673,26 @@ mod tests {
         )
         .expect_err("plan should fail");
         assert!(error.to_string().contains("protocol segment"));
+    }
+
+    #[test]
+    fn request_body_credential_rewrite_rejects_non_rest_endpoint() {
+        let error = build_policy_update_plan(
+            &[
+                "realtime.example.com:443:read-write:websocket:enforce:request-body-credential-rewrite"
+                    .to_string(),
+            ],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect_err("plan should fail");
+
+        assert!(error.to_string().contains("protocol segment"));
+        assert!(error.to_string().contains("'rest'"));
     }
 
     #[test]

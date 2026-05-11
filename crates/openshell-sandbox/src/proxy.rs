@@ -10,7 +10,7 @@ use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy::ProxyPolicy;
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::provider_credentials::ProviderCredentialState;
-use crate::secrets::{SecretResolver, rewrite_header_line};
+use crate::secrets::{SecretResolver, rewrite_header_line_checked};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use openshell_ocsf::{
@@ -2283,6 +2283,10 @@ fn rewrite_forward_request(
         .position(|w| w == b"\r\n\r\n")
         .map_or(used, |p| p + 4);
     let websocket_upgrade = crate::l7::rest::request_is_websocket_upgrade(&raw[..header_end]);
+    let upstream_path = match secret_resolver {
+        Some(resolver) => crate::secrets::rewrite_target_for_eval(path, resolver)?.resolved,
+        None => path.to_string(),
+    };
 
     let header_str = String::from_utf8_lossy(&raw[..header_end]);
     let lines = header_str.split("\r\n").collect::<Vec<_>>();
@@ -2299,7 +2303,7 @@ fn rewrite_forward_request(
             if parts.len() == 3 {
                 output.extend_from_slice(parts[0].as_bytes());
                 output.push(b' ');
-                output.extend_from_slice(path.as_bytes());
+                output.extend_from_slice(upstream_path.as_bytes());
                 output.push(b' ');
                 output.extend_from_slice(parts[2].as_bytes());
             } else {
@@ -2335,10 +2339,10 @@ fn rewrite_forward_request(
             continue;
         }
 
-        let rewritten_line = secret_resolver.map_or_else(
-            || line.to_string(),
-            |resolver| rewrite_header_line(line, resolver),
-        );
+        let rewritten_line = match secret_resolver {
+            Some(resolver) => rewrite_header_line_checked(line, resolver)?,
+            None => line.to_string(),
+        };
 
         output.extend_from_slice(rewritten_line.as_bytes());
         output.extend_from_slice(b"\r\n");
@@ -2367,12 +2371,21 @@ fn rewrite_forward_request(
     // Fail-closed: scan for any remaining unresolved placeholders
     if secret_resolver.is_some() {
         let output_str = String::from_utf8_lossy(&output);
-        if output_str.contains(crate::secrets::PLACEHOLDER_PREFIX_PUBLIC) {
+        if output_str.contains(crate::secrets::PLACEHOLDER_PREFIX_PUBLIC)
+            || output_str.contains(crate::secrets::PROVIDER_ALIAS_MARKER_PUBLIC)
+        {
             return Err(crate::secrets::UnresolvedPlaceholderError { location: "header" });
         }
     }
 
     Ok(output)
+}
+
+struct ForwardRelayOptions<'a> {
+    generation_guard: &'a PolicyGenerationGuard,
+    websocket_extensions: crate::l7::rest::WebSocketExtensionMode,
+    secret_resolver: Option<&'a SecretResolver>,
+    request_body_credential_rewrite: bool,
 }
 
 async fn relay_rewritten_forward_request<C, U>(
@@ -2381,8 +2394,7 @@ async fn relay_rewritten_forward_request<C, U>(
     rewritten: Vec<u8>,
     client: &mut C,
     upstream: &mut U,
-    generation_guard: &PolicyGenerationGuard,
-    websocket_extensions: crate::l7::rest::WebSocketExtensionMode,
+    options: ForwardRelayOptions<'_>,
 ) -> Result<crate::l7::provider::RelayOutcome>
 where
     C: TokioAsyncRead + TokioAsyncWrite + Unpin,
@@ -2408,9 +2420,10 @@ where
         client,
         upstream,
         crate::l7::rest::RelayRequestOptions {
-            resolver: None,
-            generation_guard: Some(generation_guard),
-            websocket_extensions,
+            resolver: options.secret_resolver,
+            generation_guard: Some(options.generation_guard),
+            websocket_extensions: options.websocket_extensions,
+            request_body_credential_rewrite: options.request_body_credential_rewrite,
         },
     )
     .await
@@ -2673,6 +2686,7 @@ async fn handle_forward_proxy(
     let mut upstream_target = path.clone();
     let mut websocket_extensions = crate::l7::rest::WebSocketExtensionMode::Preserve;
     let mut upgrade_options = crate::l7::relay::UpgradeRelayOptions::default();
+    let mut request_body_credential_rewrite = false;
 
     // 4b. If the endpoint has L7 config, evaluate the request against
     //     L7 policy.  The forward proxy handles exactly one request per
@@ -2817,6 +2831,8 @@ async fn handle_forward_proxy(
             websocket_request,
             secret_resolver.clone(),
         );
+        request_body_credential_rewrite = l7_config.config.protocol == crate::l7::L7Protocol::Rest
+            && l7_config.config.request_body_credential_rewrite;
         upgrade_options.policy_name = matched_policy.clone().unwrap_or_default();
         let graphql = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
             let header_end = forward_request_bytes
@@ -3280,8 +3296,12 @@ async fn handle_forward_proxy(
         rewritten,
         client,
         &mut upstream,
-        &forward_generation_guard,
-        websocket_extensions,
+        ForwardRelayOptions {
+            generation_guard: &forward_generation_guard,
+            websocket_extensions,
+            secret_resolver: secret_resolver.as_deref(),
+            request_body_credential_rewrite,
+        },
     )
     .await?;
     if let crate::l7::provider::RelayOutcome::Upgraded {
@@ -3384,6 +3404,7 @@ mod tests {
             graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
             allow_encoded_slash: false,
             websocket_credential_rewrite,
+            request_body_credential_rewrite: false,
             websocket_graphql_policy: false,
         }
     }
@@ -3438,6 +3459,7 @@ mod tests {
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
+                    request_body_credential_rewrite: false,
                     websocket_graphql_policy: false,
                 },
             },
@@ -3450,6 +3472,7 @@ mod tests {
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
+                    request_body_credential_rewrite: false,
                     websocket_graphql_policy: false,
                 },
             },
@@ -4539,8 +4562,12 @@ mod tests {
             rewritten,
             &mut proxy_to_client,
             &mut proxy_to_upstream,
-            &guard,
-            crate::l7::rest::WebSocketExtensionMode::Preserve,
+            ForwardRelayOptions {
+                generation_guard: &guard,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: None,
+                request_body_credential_rewrite: false,
+            },
         )
         .await;
         assert!(
@@ -4578,8 +4605,12 @@ mod tests {
             rewritten,
             &mut proxy_to_client,
             &mut proxy_to_upstream,
-            &guard,
-            crate::l7::rest::WebSocketExtensionMode::Preserve,
+            ForwardRelayOptions {
+                generation_guard: &guard,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: None,
+                request_body_credential_rewrite: false,
+            },
         )
         .await;
         assert!(result.is_err(), "forward relay must reject CL/TE ambiguity");
