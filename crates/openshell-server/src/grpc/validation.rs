@@ -267,6 +267,44 @@ pub(super) fn validate_provider_fields(provider: &Provider) -> Result<(), Status
         MAX_MAP_VALUE_LEN,
         "provider.config",
     )?;
+    validate_passthrough_credentials(provider)?;
+    Ok(())
+}
+
+/// Validate the `passthrough_credentials` field: each entry must be a valid
+/// environment variable name, must reference a key present in `credentials`,
+/// and the list must not contain duplicates.
+fn validate_passthrough_credentials(provider: &Provider) -> Result<(), Status> {
+    if provider.passthrough_credentials.len() > MAX_PROVIDER_CREDENTIALS_ENTRIES {
+        return Err(Status::invalid_argument(format!(
+            "provider.passthrough_credentials exceeds maximum entries ({} > {MAX_PROVIDER_CREDENTIALS_ENTRIES})",
+            provider.passthrough_credentials.len()
+        )));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(provider.passthrough_credentials.len());
+    for key in &provider.passthrough_credentials {
+        if key.len() > MAX_MAP_KEY_LEN {
+            return Err(Status::invalid_argument(format!(
+                "provider.passthrough_credentials key exceeds maximum length ({} > {MAX_MAP_KEY_LEN})",
+                key.len()
+            )));
+        }
+        if !super::provider::is_valid_env_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "provider.passthrough_credentials contains invalid env var name: '{key}'"
+            )));
+        }
+        if !provider.credentials.contains_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "provider.passthrough_credentials key '{key}' is not present in credentials"
+            )));
+        }
+        if !seen.insert(key.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "provider.passthrough_credentials contains duplicate entry: '{key}'"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -878,6 +916,7 @@ mod tests {
             r#type: provider_type.to_string(),
             credentials,
             config,
+            passthrough_credentials: Vec::new(),
         }
     }
 
@@ -959,6 +998,54 @@ mod tests {
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("key"));
+    }
+
+    #[test]
+    fn validate_provider_fields_accepts_passthrough_subset_of_credentials() {
+        let creds: HashMap<String, String> = [
+            ("API_KEY".to_string(), "v1".to_string()),
+            ("SIGNING_SECRET".to_string(), "v2".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let mut provider = make_test_provider("ok", "claude", creds, HashMap::new());
+        provider.passthrough_credentials = vec!["SIGNING_SECRET".to_string()];
+        assert!(validate_provider_fields(&provider).is_ok());
+    }
+
+    #[test]
+    fn validate_provider_fields_accepts_empty_passthrough() {
+        let provider = make_test_provider("ok", "claude", one_credential(), HashMap::new());
+        assert!(validate_provider_fields(&provider).is_ok());
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_passthrough_key_absent_from_credentials() {
+        let mut provider = make_test_provider("ok", "claude", one_credential(), HashMap::new());
+        provider.passthrough_credentials = vec!["MISSING".to_string()];
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("not present in credentials"));
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_invalid_passthrough_env_var_name() {
+        let mut creds = one_credential();
+        creds.insert("bad-key".to_string(), "v".to_string());
+        let mut provider = make_test_provider("ok", "claude", creds, HashMap::new());
+        provider.passthrough_credentials = vec!["bad-key".to_string()];
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("invalid env var name"));
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_duplicate_passthrough_entries() {
+        let mut provider = make_test_provider("ok", "claude", one_credential(), HashMap::new());
+        provider.passthrough_credentials = vec!["KEY".to_string(), "KEY".to_string()];
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("duplicate"));
     }
 
     #[test]

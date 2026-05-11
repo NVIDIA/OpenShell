@@ -28,8 +28,13 @@ pub struct ProviderCredentialState {
 }
 
 impl ProviderCredentialState {
-    pub fn from_environment(revision: u64, env: HashMap<String, String>) -> Self {
-        let (child_env, resolver) = SecretResolver::from_provider_env_for_revision(env, revision);
+    pub fn from_environment(
+        revision: u64,
+        env: HashMap<String, String>,
+        passthrough_keys: &[String],
+    ) -> Self {
+        let (child_env, resolver) =
+            SecretResolver::from_provider_env_for_revision(env, passthrough_keys, revision);
         let snapshot = Arc::new(ProviderCredentialSnapshot {
             revision,
             child_env,
@@ -63,8 +68,14 @@ impl ProviderCredentialState {
             .clone()
     }
 
-    pub fn install_environment(&self, revision: u64, env: HashMap<String, String>) -> usize {
-        let (child_env, resolver) = SecretResolver::from_provider_env_for_revision(env, revision);
+    pub fn install_environment(
+        &self,
+        revision: u64,
+        env: HashMap<String, String>,
+        passthrough_keys: &[String],
+    ) -> usize {
+        let (child_env, resolver) =
+            SecretResolver::from_provider_env_for_revision(env, passthrough_keys, revision);
         let mut inner = self
             .inner
             .write()
@@ -96,6 +107,7 @@ mod tests {
         let state = ProviderCredentialState::from_environment(
             10,
             HashMap::from([("GITHUB_TOKEN".to_string(), "old".to_string())]),
+            &[],
         );
         let first = state.snapshot();
         assert_eq!(
@@ -106,6 +118,7 @@ mod tests {
         state.install_environment(
             11,
             HashMap::from([("GITHUB_TOKEN".to_string(), "new".to_string())]),
+            &[],
         );
         let second = state.snapshot();
         assert_eq!(
@@ -129,9 +142,10 @@ mod tests {
         let state = ProviderCredentialState::from_environment(
             10,
             HashMap::from([("GITHUB_TOKEN".to_string(), "old".to_string())]),
+            &[],
         );
 
-        state.install_environment(11, HashMap::new());
+        state.install_environment(11, HashMap::new(), &[]);
 
         assert!(state.snapshot().child_env.is_empty());
         let resolver = state.resolver().expect("old resolver retained");
@@ -139,5 +153,33 @@ mod tests {
             resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
             Some("old")
         );
+    }
+
+    #[test]
+    fn passthrough_keys_skip_placeholder_substitution() {
+        let state = ProviderCredentialState::from_environment(
+            7,
+            HashMap::from([
+                ("GITHUB_TOKEN".to_string(), "tok".to_string()),
+                ("CUSTOM_RAW_KEY".to_string(), "raw-value".to_string()),
+            ]),
+            &["CUSTOM_RAW_KEY".to_string()],
+        );
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.child_env.get("GITHUB_TOKEN").map(String::as_str),
+            Some("openshell:resolve:env:v7_GITHUB_TOKEN")
+        );
+        assert_eq!(
+            snap.child_env.get("CUSTOM_RAW_KEY").map(String::as_str),
+            Some("raw-value")
+        );
+
+        let resolver = state.resolver().expect("resolver");
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:v7_GITHUB_TOKEN"),
+            Some("tok")
+        );
+        assert_eq!(resolver.resolve_placeholder("raw-value"), None);
     }
 }

@@ -619,20 +619,22 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     let provider_names = spec.providers;
     let provider_env_revision =
         compute_provider_env_revision(state.store.as_ref(), &provider_names).await?;
-    let environment =
+    let resolved =
         super::provider::resolve_provider_environment(state.store.as_ref(), &provider_names)
             .await?;
 
     info!(
         sandbox_id = %sandbox_id,
         provider_count = provider_names.len(),
-        env_count = environment.len(),
+        env_count = resolved.environment.len(),
+        passthrough_count = resolved.passthrough_keys.len(),
         provider_env_revision,
         "GetSandboxProviderEnvironment request completed successfully"
     );
 
     Ok(Response::new(GetSandboxProviderEnvironmentResponse {
-        environment,
+        environment: resolved.environment,
+        passthrough_keys: resolved.passthrough_keys,
         provider_env_revision,
     }))
 }
@@ -2857,6 +2859,7 @@ mod tests {
             credentials: std::iter::once(("GITHUB_TOKEN".to_string(), "ghp-test".to_string()))
                 .collect(),
             config: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         }
     }
 

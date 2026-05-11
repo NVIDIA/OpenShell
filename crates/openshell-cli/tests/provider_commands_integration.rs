@@ -449,6 +449,11 @@ impl OpenShell for TestOpenShell {
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
             config: merge(existing.config, provider.config),
+            passthrough_credentials: if provider.passthrough_credentials.is_empty() {
+                existing.passthrough_credentials
+            } else {
+                provider.passthrough_credentials
+            },
         };
         let updated_name = updated.object_name().to_string();
         providers.insert(updated_name, updated.clone());
@@ -724,6 +729,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         false,
         &["API_KEY=abc".to_string()],
         &["profile=dev".to_string()],
+        &[],
         &ts.tls,
     )
     .await
@@ -742,6 +748,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         false,
         &["API_KEY=rotated".to_string()],
         &["profile=prod".to_string()],
+        &[],
         &ts.tls,
     )
     .await
@@ -771,6 +778,7 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
         "github",
         false,
         &["GITHUB_TOKEN=ghp-test".to_string()],
+        &[],
         &[],
         &ts.tls,
     )
@@ -887,6 +895,7 @@ binaries: [/usr/bin/custom]
         "custom-api",
         false,
         &["CUSTOM_API_KEY=abc".to_string()],
+        &[],
         &[],
         &ts.tls,
     )
@@ -1090,6 +1099,7 @@ async fn provider_create_rejects_key_only_credentials_without_local_env_value() 
         false,
         &["INVALID_PAIR".to_string()],
         &[],
+        &[],
         &ts.tls,
     )
     .await
@@ -1113,6 +1123,7 @@ async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
         "generic",
         false,
         &["NAV_GENERIC_TEST_KEY".to_string()],
+        &[],
         &[],
         &ts.tls,
     )
@@ -1148,6 +1159,7 @@ async fn provider_create_rejects_combined_from_existing_and_credentials() {
         true,
         &["API_KEY=abc".to_string()],
         &[],
+        &[],
         &ts.tls,
     )
     .await
@@ -1172,6 +1184,7 @@ async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
         false,
         &["NAV_EMPTY_ENV_KEY".to_string()],
         &[],
+        &[],
         &ts.tls,
     )
     .await
@@ -1195,6 +1208,7 @@ async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
         "nvidia",
         false,
         &["NVIDIA_API_KEY".to_string()],
+        &[],
         &[],
         &ts.tls,
     )

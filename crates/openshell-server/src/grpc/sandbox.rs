@@ -1280,6 +1280,7 @@ mod tests {
             r#type: provider_type.to_string(),
             credentials: std::iter::once(("TOKEN".to_string(), "secret".to_string())).collect(),
             config: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         }
     }
 

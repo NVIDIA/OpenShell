@@ -511,6 +511,7 @@ mod tests {
             r#type: provider_type.to_string(),
             credentials: std::iter::once((key_name.to_string(), key_value.to_string())).collect(),
             config: std::collections::HashMap::new(),
+            passthrough_credentials: Vec::new(),
         }
     }
 
@@ -675,6 +676,7 @@ mod tests {
                 "https://station.example.com/v1".to_string(),
             ))
             .collect(),
+            passthrough_credentials: Vec::new(),
         };
         store
             .put_message(&provider)
@@ -749,6 +751,7 @@ mod tests {
             credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-rotated".to_string()))
                 .collect(),
             config: provider.config.clone(),
+            passthrough_credentials: provider.passthrough_credentials.clone(),
         };
         store
             .put_message(&rotated_provider)

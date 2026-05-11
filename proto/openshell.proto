@@ -768,6 +768,11 @@ message GetSandboxProviderEnvironmentResponse {
   map<string, string> environment = 1;
   // Fingerprint for the provider credential inputs that produced environment.
   uint64 provider_env_revision = 2;
+  // Subset of keys in `environment` whose value is the real credential and
+  // must be injected directly into the agent process — bypassing the
+  // canonical placeholder substitution and L7 proxy rewriting. Sourced from
+  // each provider's `passthrough_credentials` list.
+  repeated string passthrough_keys = 3;
 }
 
 // ---------------------------------------------------------------------------

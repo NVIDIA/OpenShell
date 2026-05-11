@@ -74,6 +74,30 @@ Credential placeholders in proxied HTTP requests can be resolved by the proxy
 when policy allows the target endpoint. Secrets must not be logged in OCSF or
 plain tracing output.
 
+### Selective Passthrough
+
+The canonical placeholder model breaks for credentials that an SDK validates
+in-process before any network call (Slack `xoxb-`/`xapp-`, JWT structure,
+AWS access-key format), are sent over transports the L7 proxy cannot rewrite
+(WebSocket payloads after `101 Switching Protocols`), or are consumed by
+in-process crypto (HMAC signing, signature verification).
+
+For these cases an operator can opt specific credential keys into passthrough
+via `Provider.passthrough_credentials`. The supervisor injects the real value
+into the agent's environment instead of the canonical
+`openshell:resolve:env:<KEY>` placeholder, and the resolver does not register
+that key, so the L7 proxy performs no substitution for it. Each entry must be
+a valid env-var name, present in `Provider.credentials`, and unique. On update,
+an empty incoming list preserves the existing list while auto-pruning entries
+whose credential was deleted in the same update; a non-empty list replaces the
+stored list verbatim. When two providers declare the same credential key, the
+first provider's value wins and the passthrough flag follows the winning value.
+
+Passthrough drops the "agent never sees the real secret" invariant for the
+listed keys: the real value is at rest in `/proc/<agent-pid>/environ` and any
+descendant inherits it. Prefer canonical placeholders; only opt in keys whose
+consumer demonstrably fails with the placeholder.
+
 ## Connect and Logs
 
 The supervisor runs an SSH server on a Unix socket inside the sandbox. The
