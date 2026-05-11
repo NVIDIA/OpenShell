@@ -3683,6 +3683,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "futures",
@@ -3738,6 +3739,7 @@ dependencies = [
  "tower-http 0.6.8",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "wiremock",
  "x509-parser",
