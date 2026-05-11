@@ -19,6 +19,7 @@ pub struct ProviderCredentialSnapshot {
 struct ProviderCredentialStateInner {
     current: Arc<ProviderCredentialSnapshot>,
     generations: VecDeque<Arc<SecretResolver>>,
+    current_resolver: Option<Arc<SecretResolver>>,
     combined_resolver: Option<Arc<SecretResolver>>,
 }
 
@@ -29,19 +30,21 @@ pub struct ProviderCredentialState {
 
 impl ProviderCredentialState {
     pub fn from_environment(revision: u64, env: HashMap<String, String>) -> Self {
-        let (child_env, resolver) = SecretResolver::from_provider_env_for_revision(env, revision);
+        let (child_env, generation_resolver, current_resolver) =
+            SecretResolver::from_provider_env_for_current_revision(env, revision);
         let snapshot = Arc::new(ProviderCredentialSnapshot {
             revision,
             child_env,
         });
-        let generations: VecDeque<_> = resolver.map(Arc::new).into_iter().collect();
-        let combined_resolver =
-            SecretResolver::merge(generations.iter().map(Arc::as_ref)).map(Arc::new);
+        let generations: VecDeque<_> = generation_resolver.map(Arc::new).into_iter().collect();
+        let current_resolver = current_resolver.map(Arc::new);
+        let combined_resolver = merge_resolvers(&generations, current_resolver.as_ref());
 
         Self {
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
                 current: snapshot,
                 generations,
+                current_resolver,
                 combined_resolver,
             })),
         }
@@ -64,7 +67,8 @@ impl ProviderCredentialState {
     }
 
     pub fn install_environment(&self, revision: u64, env: HashMap<String, String>) -> usize {
-        let (child_env, resolver) = SecretResolver::from_provider_env_for_revision(env, revision);
+        let (child_env, generation_resolver, current_resolver) =
+            SecretResolver::from_provider_env_for_current_revision(env, revision);
         let mut inner = self
             .inner
             .write()
@@ -74,17 +78,31 @@ impl ProviderCredentialState {
             revision,
             child_env,
         });
+        inner.current_resolver = current_resolver.map(Arc::new);
 
-        if let Some(resolver) = resolver {
+        if let Some(resolver) = generation_resolver {
             inner.generations.push_back(Arc::new(resolver));
             while inner.generations.len() > MAX_RETAINED_CREDENTIAL_GENERATIONS {
                 inner.generations.pop_front();
             }
         }
         inner.combined_resolver =
-            SecretResolver::merge(inner.generations.iter().map(Arc::as_ref)).map(Arc::new);
+            merge_resolvers(&inner.generations, inner.current_resolver.as_ref());
         inner.current.child_env.len()
     }
+}
+
+fn merge_resolvers(
+    generations: &VecDeque<Arc<SecretResolver>>,
+    current_resolver: Option<&Arc<SecretResolver>>,
+) -> Option<Arc<SecretResolver>> {
+    SecretResolver::merge(
+        generations
+            .iter()
+            .map(Arc::as_ref)
+            .chain(current_resolver.into_iter().map(Arc::as_ref)),
+    )
+    .map(Arc::new)
 }
 
 #[cfg(test)]
@@ -126,10 +144,14 @@ mod tests {
             resolver.resolve_placeholder("openshell:resolve:env:GITHUB_TOKEN"),
             Some("new")
         );
+        assert_eq!(
+            resolver.resolve_placeholder("provider-OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"),
+            Some("new")
+        );
     }
 
     #[test]
-    fn empty_refresh_removes_env_from_new_snapshots_but_retains_old_resolver() {
+    fn empty_refresh_removes_current_aliases_but_retains_revisioned_resolver() {
         let state = ProviderCredentialState::from_environment(
             10,
             HashMap::from([("GITHUB_TOKEN".to_string(), "old".to_string())]),
@@ -142,6 +164,14 @@ mod tests {
         assert_eq!(
             resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
             Some("old")
+        );
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:GITHUB_TOKEN"),
+            None
+        );
+        assert_eq!(
+            resolver.resolve_placeholder("provider-OPENSHELL-RESOLVE-ENV-GITHUB_TOKEN"),
+            None
         );
     }
 }

@@ -543,7 +543,7 @@ where
     Ok(())
 }
 
-fn upgrade_options<'a>(
+pub(crate) fn upgrade_options<'a>(
     config: &L7EndpointConfig,
     ctx: &'a L7EvalContext,
     websocket_request: bool,
@@ -584,7 +584,7 @@ fn upgrade_options<'a>(
     }
 }
 
-fn websocket_extension_mode(config: &L7EndpointConfig) -> WebSocketExtensionMode {
+pub(crate) fn websocket_extension_mode(config: &L7EndpointConfig) -> WebSocketExtensionMode {
     if config.protocol == L7Protocol::Websocket
         || (config.protocol == L7Protocol::Rest && config.websocket_credential_rewrite)
     {

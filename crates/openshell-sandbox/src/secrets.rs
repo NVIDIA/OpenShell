@@ -99,6 +99,38 @@ impl SecretResolver {
         provider_env: HashMap<String, String>,
         revision: u64,
     ) -> (HashMap<String, String>, Option<Self>) {
+        Self::from_provider_env_for_revision_with_current_aliases(provider_env, revision, false)
+    }
+
+    pub(crate) fn from_provider_env_for_current_revision(
+        provider_env: HashMap<String, String>,
+        revision: u64,
+    ) -> (HashMap<String, String>, Option<Self>, Option<Self>) {
+        if revision == 0 {
+            let (child_env, current_resolver) =
+                Self::from_provider_env_for_revision_with_current_aliases(provider_env, 0, true);
+            return (child_env, None, current_resolver);
+        }
+        let provider_env_for_current = provider_env.clone();
+        let (child_env, revision_resolver) =
+            Self::from_provider_env_for_revision_with_current_aliases(
+                provider_env,
+                revision,
+                false,
+            );
+        let (_, current_resolver) = Self::from_provider_env_for_revision_with_current_aliases(
+            provider_env_for_current,
+            revision,
+            true,
+        );
+        (child_env, revision_resolver, current_resolver)
+    }
+
+    fn from_provider_env_for_revision_with_current_aliases(
+        provider_env: HashMap<String, String>,
+        revision: u64,
+        include_current_aliases: bool,
+    ) -> (HashMap<String, String>, Option<Self>) {
         if provider_env.is_empty() {
             return (HashMap::new(), None);
         }
@@ -108,11 +140,10 @@ impl SecretResolver {
 
         for (key, value) in provider_env {
             let placeholder = placeholder_for_env_key_for_revision(&key, revision);
-            let canonical_placeholder = (revision != 0).then(|| placeholder_for_env_key(&key));
             child_env.insert(key.clone(), placeholder.clone());
             by_placeholder.insert(placeholder, value.clone());
-            if let Some(canonical_placeholder) = canonical_placeholder {
-                by_placeholder.insert(canonical_placeholder, value.clone());
+            if include_current_aliases && revision != 0 {
+                by_placeholder.insert(placeholder_for_env_key(&key), value.clone());
             }
         }
 
