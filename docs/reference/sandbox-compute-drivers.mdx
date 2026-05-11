@@ -98,10 +98,11 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | Gateway option | Environment variable | Helm value | Description |
 |---|---|---|---|
 | `--drivers kubernetes` | `OPENSHELL_DRIVERS=kubernetes` | Not applicable | Select the Kubernetes compute driver. |
-| `--sandbox-namespace <namespace>` | `OPENSHELL_SANDBOX_NAMESPACE` | `server.sandboxNamespace` | Set the namespace for sandbox resources. |
+| `--sandbox-namespace <namespace>` | `OPENSHELL_SANDBOX_NAMESPACE` | `server.sandboxNamespace` | Set the namespace for sandbox resources. The Helm chart defaults to the release namespace when left empty. |
 | `--sandbox-image <image>` | `OPENSHELL_SANDBOX_IMAGE` | `server.sandboxImage` | Set the default sandbox image. |
 | `--sandbox-image-pull-policy <policy>` | `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
 | `--grpc-endpoint <url>` | `OPENSHELL_GRPC_ENDPOINT` | `server.grpcEndpoint` | Set the gateway callback endpoint reachable from sandbox pods. |
 | `--client-tls-secret-name <name>` | `OPENSHELL_CLIENT_TLS_SECRET_NAME` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
+| Not applicable | Not applicable | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy via an init container on older clusters. |
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io/v1alpha1` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. The Agent Sandbox controller turns those resources into sandbox pods and related storage.

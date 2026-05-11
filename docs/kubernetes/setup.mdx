@@ -131,11 +131,12 @@ The most commonly changed values are:
 | Value | Purpose |
 |---|---|
 | `image.repository` / `image.tag` | Gateway container image. Defaults to `ghcr.io/nvidia/openshell/gateway:latest`. |
-| `server.sandboxNamespace` | Namespace where sandbox pods are created. |
+| `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
 | `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |
 | `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
 | `server.sshGatewayHost` / `server.sshGatewayPort` | Public host and port returned to CLI clients for SSH proxy connections. Required when the gateway is exposed externally. |
 | `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
+| `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect based on cluster version: clusters running Kubernetes 1.35 or later use `image-volume` (ImageVolume GA in 1.36); older clusters use `init-container`. Set explicitly to `image-volume` on Kubernetes 1.33 or 1.34 with the ImageVolume feature gate enabled, or to `init-container` to force the legacy path on any version. |
 
 Use a values file for repeatable deployments:
 
