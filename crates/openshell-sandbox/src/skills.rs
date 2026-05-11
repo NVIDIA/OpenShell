@@ -59,5 +59,11 @@ mod tests {
         assert!(content.contains("# OpenShell Policy Advisor"));
         assert!(content.contains("policy.local"));
         assert!(content.contains("addRule"));
+        // The wait-loop teaching is load-bearing for the agent feedback
+        // UX; lock the workflow language in so future skill edits cannot
+        // drop it silently. Both substrings target the directive, not the
+        // field name (which could appear in the API doc block alone).
+        assert!(content.contains("/v1/proposals/{chunk_id}/wait"));
+        assert!(content.contains("read `rejection_reason`"));
     }
 }
