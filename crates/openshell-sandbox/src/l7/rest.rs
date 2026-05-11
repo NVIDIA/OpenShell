@@ -4396,21 +4396,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_request_body_rewrites_slack_header_and_urlencoded_token() {
+    async fn relay_request_body_rewrites_provider_alias_header_and_urlencoded_token() {
         let (_, resolver) = SecretResolver::from_provider_env(
-            [(
-                "SLACK_BOT_TOKEN".to_string(),
-                "xoxb-real-bot-token".to_string(),
-            )]
-            .into_iter()
-            .collect(),
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
         );
         let resolver = resolver.expect("resolver");
-        let alias = "xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN";
+        let alias = "provider.v1-OPENSHELL-RESOLVE-ENV-API_TOKEN";
         let body = format!("token={alias}&channel=C123");
         let raw = format!(
-            "POST /api/chat.postMessage HTTP/1.1\r\n\
-             Host: slack.com\r\n\
+            "POST /api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
              Authorization: Bearer {alias}\r\n\
              Content-Type: application/x-www-form-urlencoded\r\n\
              Content-Length: {}\r\n\r\n{}",
@@ -4427,8 +4424,8 @@ mod tests {
         .await
         .expect("relay should succeed");
 
-        let expected_body = "token=xoxb-real-bot-token&channel=C123";
-        assert!(forwarded.contains("Authorization: Bearer xoxb-real-bot-token\r\n"));
+        let expected_body = "token=provider-real-token&channel=C123";
+        assert!(forwarded.contains("Authorization: Bearer provider-real-token\r\n"));
         assert!(forwarded.contains(&format!("Content-Length: {}\r\n", expected_body.len())));
         assert!(forwarded.ends_with(expected_body));
         assert!(!forwarded.contains("OPENSHELL-RESOLVE-ENV"));
@@ -4437,18 +4434,15 @@ mod tests {
     #[tokio::test]
     async fn relay_request_body_unresolved_alias_fails_before_upstream_write() {
         let (_, resolver) = SecretResolver::from_provider_env(
-            [(
-                "SLACK_BOT_TOKEN".to_string(),
-                "xoxb-real-bot-token".to_string(),
-            )]
-            .into_iter()
-            .collect(),
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
         );
         let resolver = resolver.expect("resolver");
-        let body = "token=xapp-OPENSHELL-RESOLVE-ENV-SLACK_APP_TOKEN";
+        let body = "token=provider-OPENSHELL-RESOLVE-ENV-APP_TOKEN";
         let raw = format!(
-            "POST /api/apps.connections.open HTTP/1.1\r\n\
-             Host: slack.com\r\n\
+            "POST /api/connections.open HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
              Content-Type: application/x-www-form-urlencoded\r\n\
              Content-Length: {}\r\n\r\n{}",
             body.len(),
@@ -4456,7 +4450,7 @@ mod tests {
         );
         let req = L7Request {
             action: "POST".to_string(),
-            target: "/api/apps.connections.open".to_string(),
+            target: "/api/connections.open".to_string(),
             query_params: HashMap::new(),
             raw_header: raw.into_bytes(),
             body_length: BodyLength::ContentLength(body.len() as u64),
@@ -4477,7 +4471,7 @@ mod tests {
         .await
         .expect_err("unknown body alias should fail closed");
 
-        assert!(!err.to_string().contains("xoxb-real-bot-token"));
+        assert!(!err.to_string().contains("provider-real-token"));
         drop(proxy_to_upstream);
         let mut forwarded = Vec::new();
         upstream_side.read_to_end(&mut forwarded).await.unwrap();

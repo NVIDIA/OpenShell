@@ -581,7 +581,10 @@ mod tests {
     #[test]
     fn parse_add_endpoint_enables_request_body_credential_rewrite_on_rest_endpoint() {
         let plan = build_policy_update_plan(
-            &["slack.com:443:read-write:rest:enforce:request-body-credential-rewrite".to_string()],
+            &[
+                "api.example.com:443:read-write:rest:enforce:request-body-credential-rewrite"
+                    .to_string(),
+            ],
             &[],
             &[],
             &[],

@@ -7,8 +7,6 @@ use std::fmt;
 
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 const PROVIDER_ALIAS_MARKER: &str = "OPENSHELL-RESOLVE-ENV-";
-const SLACK_BOT_ALIAS_PREFIX: &str = "xoxb-OPENSHELL-RESOLVE-ENV-";
-const SLACK_APP_ALIAS_PREFIX: &str = "xapp-OPENSHELL-RESOLVE-ENV-";
 
 /// Public access to the placeholder prefix for fail-closed scanning in other modules.
 pub const PLACEHOLDER_PREFIX_PUBLIC: &str = PLACEHOLDER_PREFIX;
@@ -21,7 +19,7 @@ fn is_env_key_char(b: u8) -> bool {
 }
 
 fn is_alias_token_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'~')
 }
 
 fn contains_raw_reserved_marker(value: &str) -> bool {
@@ -51,7 +49,7 @@ impl fmt::Display for UnresolvedPlaceholderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "unresolved credential placeholder in {}: detected openshell:resolve:env:* token that could not be resolved",
+            "unresolved credential placeholder in {}: detected reserved credential token that could not be resolved",
             self.location
         )
     }
@@ -116,8 +114,6 @@ impl SecretResolver {
             if let Some(canonical_placeholder) = canonical_placeholder {
                 by_placeholder.insert(canonical_placeholder, value.clone());
             }
-            by_placeholder.insert(slack_bot_alias_for_env_key(&key), value.clone());
-            by_placeholder.insert(slack_app_alias_for_env_key(&key), value);
         }
 
         (child_env, Some(Self { by_placeholder }))
@@ -140,7 +136,13 @@ impl SecretResolver {
     /// Returns `None` if the placeholder is unknown or the resolved value
     /// contains prohibited control characters (CRLF, null byte).
     pub(crate) fn resolve_placeholder(&self, value: &str) -> Option<&str> {
-        let secret = self.by_placeholder.get(value).map(String::as_str)?;
+        let secret = if let Some(secret) = self.by_placeholder.get(value) {
+            secret.as_str()
+        } else {
+            let key = alias_env_key(value)?;
+            let canonical = placeholder_for_env_key(key);
+            self.by_placeholder.get(&canonical).map(String::as_str)?
+        };
         match validate_resolved_secret(secret) {
             Ok(s) => Some(s),
             Err(reason) => {
@@ -213,7 +215,7 @@ impl SecretResolver {
             let next_canonical = text[pos..].find(PLACEHOLDER_PREFIX).map(|p| pos + p);
             let next_alias = text[pos..].find(PROVIDER_ALIAS_MARKER).map(|marker_pos| {
                 let marker_abs = pos + marker_pos;
-                alias_start_for_marker(text, marker_abs).unwrap_or(marker_abs)
+                alias_start_for_marker(text, marker_abs)
             });
             let Some(abs_start) = [next_canonical, next_alias].into_iter().flatten().min() else {
                 rewritten.push_str(&text[pos..]);
@@ -235,12 +237,7 @@ impl SecretResolver {
                 continue;
             }
 
-            if text[abs_start..].starts_with(SLACK_BOT_ALIAS_PREFIX)
-                || text[abs_start..].starts_with(SLACK_APP_ALIAS_PREFIX)
-            {
-                let Some((token_end, token)) = self.credential_token_at(text, abs_start) else {
-                    return Err(UnresolvedPlaceholderError { location });
-                };
+            if let Some((token_end, token)) = alias_token_at(text, abs_start) {
                 let Some(secret) = self.resolve_placeholder(token) else {
                     return Err(UnresolvedPlaceholderError { location });
                 };
@@ -333,15 +330,13 @@ impl SecretResolver {
     }
 }
 
-fn alias_start_for_marker(text: &str, marker_abs: usize) -> Option<usize> {
-    marker_abs
-        .checked_sub("xoxb-".len())
-        .filter(|start| text[*start..].starts_with(SLACK_BOT_ALIAS_PREFIX))
-        .or_else(|| {
-            marker_abs
-                .checked_sub("xapp-".len())
-                .filter(|start| text[*start..].starts_with(SLACK_APP_ALIAS_PREFIX))
-        })
+fn alias_start_for_marker(text: &str, marker_abs: usize) -> usize {
+    let mut start = marker_abs;
+    let bytes = text.as_bytes();
+    while start > 0 && is_alias_token_char(bytes[start - 1]) {
+        start -= 1;
+    }
+    start
 }
 
 fn canonical_token_at(text: &str, abs_start: usize) -> Option<(usize, &str)> {
@@ -357,14 +352,12 @@ fn canonical_token_at(text: &str, abs_start: usize) -> Option<(usize, &str)> {
 }
 
 fn alias_token_at(text: &str, abs_start: usize) -> Option<(usize, &str)> {
-    let prefix_len = if text[abs_start..].starts_with(SLACK_BOT_ALIAS_PREFIX) {
-        SLACK_BOT_ALIAS_PREFIX.len()
-    } else if text[abs_start..].starts_with(SLACK_APP_ALIAS_PREFIX) {
-        SLACK_APP_ALIAS_PREFIX.len()
-    } else {
+    let suffix = &text[abs_start..];
+    let marker_rel = suffix.find(PROVIDER_ALIAS_MARKER)?;
+    if marker_rel == 0 {
         return None;
-    };
-    let key_start = abs_start + prefix_len;
+    }
+    let key_start = abs_start + marker_rel + PROVIDER_ALIAS_MARKER.len();
     let key_end = text[key_start..]
         .bytes()
         .position(|b| !is_env_key_char(b))
@@ -375,6 +368,22 @@ fn alias_token_at(text: &str, abs_start: usize) -> Option<(usize, &str)> {
     let before_ok = abs_start == 0 || !is_alias_token_char(text.as_bytes()[abs_start - 1]);
     let after_ok = key_end == text.len() || !is_alias_token_char(text.as_bytes()[key_end]);
     (before_ok && after_ok).then_some((key_end, &text[abs_start..key_end]))
+}
+
+fn alias_env_key(token: &str) -> Option<&str> {
+    let marker_start = token.find(PROVIDER_ALIAS_MARKER)?;
+    if marker_start == 0 {
+        return None;
+    }
+    if !token[..marker_start].bytes().all(is_alias_token_char) {
+        return None;
+    }
+    let key_start = marker_start + PROVIDER_ALIAS_MARKER.len();
+    let key_end = token[key_start..]
+        .bytes()
+        .position(|b| !is_env_key_char(b))
+        .map_or(token.len(), |p| key_start + p);
+    (key_end == token.len() && key_end > key_start).then_some(&token[key_start..key_end])
 }
 
 fn token_boundary_ok(text: &str, abs_start: usize, token_end: usize, token: &str) -> bool {
@@ -390,14 +399,6 @@ fn token_boundary_ok(text: &str, abs_start: usize, token_end: usize, token: &str
 
 pub fn placeholder_for_env_key(key: &str) -> String {
     format!("{PLACEHOLDER_PREFIX}{key}")
-}
-
-pub fn slack_bot_alias_for_env_key(key: &str) -> String {
-    format!("{SLACK_BOT_ALIAS_PREFIX}{key}")
-}
-
-pub fn slack_app_alias_for_env_key(key: &str) -> String {
-    format!("{SLACK_APP_ALIAS_PREFIX}{key}")
 }
 
 pub fn placeholder_for_env_key_for_revision(key: &str, revision: u64) -> String {
@@ -699,7 +700,7 @@ fn rewrite_path_segment(
             .find(PROVIDER_ALIAS_MARKER)
             .map(|marker_pos| {
                 let marker_abs = pos + marker_pos;
-                alias_start_for_marker(segment, marker_abs).unwrap_or(marker_abs)
+                alias_start_for_marker(segment, marker_abs)
             });
         if let Some(abs_start) = [next_canonical, next_alias].into_iter().flatten().min() {
             // Copy literal prefix before the placeholder
@@ -994,11 +995,11 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_slack_shaped_alias_header_values() {
+    fn rewrites_provider_shaped_alias_header_values() {
         let (_, resolver) = SecretResolver::from_provider_env(
             [
-                ("SLACK_BOT_TOKEN".to_string(), "xoxb-real-bot".to_string()),
-                ("SLACK_APP_TOKEN".to_string(), "xapp-real-app".to_string()),
+                ("API_TOKEN".to_string(), "provider-real-token".to_string()),
+                ("CHAT_APP_TOKEN".to_string(), "app-real-token".to_string()),
             ]
             .into_iter()
             .collect(),
@@ -1007,29 +1008,29 @@ mod tests {
 
         assert_eq!(
             rewrite_header_line(
-                "Authorization: Bearer xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN",
+                "Authorization: Bearer vendor-OPENSHELL-RESOLVE-ENV-API_TOKEN",
                 &resolver,
             ),
-            "Authorization: Bearer xoxb-real-bot"
+            "Authorization: Bearer provider-real-token"
         );
         assert_eq!(
             rewrite_header_line(
-                "Authorization: Bearer xapp-OPENSHELL-RESOLVE-ENV-SLACK_APP_TOKEN",
+                "x-app-token: token.v1-OPENSHELL-RESOLVE-ENV-CHAT_APP_TOKEN",
                 &resolver,
             ),
-            "Authorization: Bearer xapp-real-app"
+            "x-app-token: app-real-token"
         );
     }
 
     #[test]
-    fn unresolved_slack_shaped_alias_fails_closed() {
+    fn unresolved_provider_shaped_alias_fails_closed() {
         let (_, resolver) = SecretResolver::from_provider_env(
-            [("SLACK_BOT_TOKEN".to_string(), "xoxb-real-bot".to_string())]
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
                 .into_iter()
                 .collect(),
         );
         let resolver = resolver.expect("resolver");
-        let raw = b"GET / HTTP/1.1\r\nAuthorization: Bearer xapp-OPENSHELL-RESOLVE-ENV-SLACK_APP_TOKEN\r\n\r\n";
+        let raw = b"GET / HTTP/1.1\r\nAuthorization: Bearer vendor-OPENSHELL-RESOLVE-ENV-UNKNOWN_TOKEN\r\n\r\n";
 
         let err = rewrite_http_header_block(raw, Some(&resolver))
             .expect_err("unknown alias should fail closed");
@@ -1650,19 +1651,19 @@ mod tests {
     #[test]
     fn percent_encoded_canonical_placeholder_in_query_rewrites() {
         let (_, resolver) = SecretResolver::from_provider_env(
-            [("SLACK_BOT_TOKEN".to_string(), "xoxb-real-bot".to_string())]
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
                 .into_iter()
                 .collect(),
         );
         let resolver = resolver.expect("resolver");
-        let encoded = "openshell%3Aresolve%3Aenv%3ASLACK_BOT_TOKEN";
+        let encoded = "openshell%3Aresolve%3Aenv%3AAPI_TOKEN";
         let raw = format!("GET /api?token={encoded} HTTP/1.1\r\nHost: x\r\n\r\n");
 
         let result =
             rewrite_http_header_block(raw.as_bytes(), Some(&resolver)).expect("should rewrite");
         let rewritten = String::from_utf8(result.rewritten).expect("utf8");
 
-        assert!(rewritten.starts_with("GET /api?token=xoxb-real-bot HTTP/1.1"));
+        assert!(rewritten.starts_with("GET /api?token=provider-real-token HTTP/1.1"));
         assert!(!rewritten.contains("openshell"));
         assert_eq!(
             result.redacted_target.as_deref(),
@@ -1731,21 +1732,21 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_websocket_text_replaces_slack_shaped_alias() {
+    fn rewrite_websocket_text_replaces_provider_shaped_alias() {
         let (_, resolver) = SecretResolver::from_provider_env(
-            [("SLACK_APP_TOKEN".to_string(), "xapp-real-app".to_string())]
+            [("APP_TOKEN".to_string(), "app-real-token".to_string())]
                 .into_iter()
                 .collect(),
         );
         let resolver = resolver.expect("resolver");
-        let mut payload = r#"{"token":"xapp-OPENSHELL-RESOLVE-ENV-SLACK_APP_TOKEN"}"#.to_string();
+        let mut payload = r#"{"token":"provider-OPENSHELL-RESOLVE-ENV-APP_TOKEN"}"#.to_string();
 
         let count = resolver
             .rewrite_websocket_text_placeholders(&mut payload)
             .expect("alias should rewrite");
 
         assert_eq!(count, 1);
-        assert_eq!(payload, r#"{"token":"xapp-real-app"}"#);
+        assert_eq!(payload, r#"{"token":"app-real-token"}"#);
     }
 
     #[test]

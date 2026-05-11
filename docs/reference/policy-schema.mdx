@@ -169,7 +169,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `graphql_persisted_queries` | map | No | Trusted GraphQL persisted-query registry keyed by hash or saved-query ID. Values contain `operation_type`, optional `operation_name`, and optional root `fields`. |
 | `graphql_max_body_bytes` | integer | No | Maximum GraphQL-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
 
-Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token Slack-shaped aliases such as `xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN` and `xapp-OPENSHELL-RESOLVE-ENV-SLACK_APP_TOKEN` when the referenced environment key exists in the configured provider credentials.
+Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token provider-shaped aliases such as `provider-OPENSHELL-RESOLVE-ENV-API_TOKEN` when the referenced environment key exists in the configured provider credentials.
 
 #### Access Levels
 

@@ -234,7 +234,7 @@ Examples:
 |---|---|
 | `pypi.org:443` | Add a plain L4 endpoint. The proxy allows the TCP stream and does not inspect HTTP requests. |
 | `api.github.com:443:read-only:rest:enforce` | Add a REST endpoint with the `read-only` preset expanded by the policy engine into GET, HEAD, and OPTIONS access. |
-| `slack.com:443:read-write:rest:enforce:request-body-credential-rewrite` | Add a REST endpoint that rewrites credential placeholders in supported text request bodies. |
+| `api.example.com:443:read-write:rest:enforce:request-body-credential-rewrite` | Add a REST endpoint that rewrites credential placeholders in supported text request bodies. |
 | `realtime.example.com:443:read-write:websocket:enforce` | Add a WebSocket endpoint with the `read-write` preset expanded by the policy engine into the upgrade `GET` and client `WEBSOCKET_TEXT` access. |
 | `realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite` | Add a WebSocket endpoint that rewrites `openshell:resolve:env:*` placeholders in client text frames after an allowed upgrade. |
 
@@ -244,7 +244,7 @@ Use the `websocket-credential-rewrite` endpoint option with `protocol: websocket
 
 Use the `request-body-credential-rewrite` endpoint option with `protocol: rest` when an API expects OpenShell-managed credentials in UTF-8 JSON, form, or text request bodies. OpenShell buffers up to 256 KiB, rewrites recognized credential placeholders, updates `Content-Length`, and rejects unresolved placeholders instead of forwarding them. The option is rejected for WebSocket, GraphQL, SQL, and plain L4 endpoints.
 
-Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token Slack-shaped aliases such as `xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN` and `xapp-OPENSHELL-RESOLVE-ENV-SLACK_APP_TOKEN` when the referenced environment key exists in the configured provider credentials.
+Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token provider-shaped aliases such as `provider-OPENSHELL-RESOLVE-ENV-API_TOKEN` when the referenced environment key exists in the configured provider credentials.
 
 For example:
 
