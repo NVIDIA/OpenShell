@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    DenialSummary, GetInferenceBundleRequest, GetInferenceBundleResponse, GetSandboxConfigRequest,
-    GetSandboxProviderEnvironmentRequest, PolicySource, PolicyStatus, ReportPolicyStatusRequest,
-    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    UpdateConfigRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
+    DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
+    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, PolicyChunk, PolicySource,
+    PolicyStatus, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
+    inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -339,7 +340,7 @@ impl CachedOpenShellClient {
         &self,
         sandbox_name: &str,
         summaries: Vec<DenialSummary>,
-        proposed_chunks: Vec<openshell_core::proto::PolicyChunk>,
+        proposed_chunks: Vec<PolicyChunk>,
         analysis_mode: &str,
     ) -> Result<SubmitPolicyAnalysisResponse> {
         let response = self
@@ -355,6 +356,27 @@ impl CachedOpenShellClient {
             .into_diagnostic()?;
 
         Ok(response.into_inner())
+    }
+
+    /// Fetch the current draft chunks for a sandbox. `status_filter` may be
+    /// `"pending"`, `"approved"`, `"rejected"`, or empty for all. Used by
+    /// `policy.local`'s `GET /v1/proposals/{id}` and `/wait` routes to
+    /// inspect proposal state.
+    pub async fn get_draft_policy(
+        &self,
+        sandbox_name: &str,
+        status_filter: &str,
+    ) -> Result<Vec<PolicyChunk>> {
+        let response = self
+            .client
+            .clone()
+            .get_draft_policy(GetDraftPolicyRequest {
+                name: sandbox_name.to_string(),
+                status_filter: status_filter.to_string(),
+            })
+            .await
+            .into_diagnostic()?;
+        Ok(response.into_inner().chunks)
     }
 
     /// Report policy load status back to the server.
