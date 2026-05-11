@@ -154,6 +154,19 @@ static NVIDIA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     passthrough_headers: &["x-model-id"],
 };
 
+static MODEL_RUNNER_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
+    provider_type: "model-runner",
+    // Accessible from Docker containers via the Docker-internal hostname on port 80.
+    default_base_url: "http://model-runner.docker.internal/engines/llama.cpp/v1",
+    protocols: OPENAI_PROTOCOLS,
+    // Docker Model Runner requires no authentication by default.
+    credential_key_names: &[],
+    base_url_config_keys: &["MODEL_RUNNER_BASE_URL"],
+    auth: AuthHeader::Bearer,
+    default_headers: &[],
+    passthrough_headers: &["x-model-id"],
+};
+
 /// Canonicalize an inference provider type string to a well-known identifier.
 ///
 /// Returns `Some(canonical_name)` for recognized inference providers,
@@ -169,6 +182,7 @@ pub fn normalize_inference_provider_type(input: &str) -> Option<&'static str> {
         "google-vertex-ai" | "vertex" | "vertex-ai" | "google-vertex" | "gcp-vertex" => {
             Some("google-vertex-ai")
         }
+        "model-runner" | "model_runner" => Some("model-runner"),
         _ => None,
     }
 }
@@ -183,6 +197,7 @@ pub fn profile_for(provider_type: &str) -> Option<&'static InferenceProviderProf
         "anthropic" => Some(&ANTHROPIC_PROFILE),
         "nvidia" => Some(&NVIDIA_PROFILE),
         "google-vertex-ai" => Some(&VERTEX_AI_PROFILE),
+        "model-runner" => Some(&MODEL_RUNNER_PROFILE),
         _ => None,
     }
 }
@@ -358,6 +373,19 @@ mod tests {
             let profile = profile_for(key).expect("vertex profile should be Some");
             assert_eq!(profile.provider_type, "google-vertex-ai");
         }
+    }
+
+    #[test]
+    fn profile_for_model_runner() {
+        let profile = profile_for("model-runner").expect("model-runner profile should be Some");
+        assert_eq!(profile.provider_type, "model-runner");
+        assert!(
+            profile
+                .default_base_url
+                .contains("model-runner.docker.internal"),
+            "default base URL should use Docker-internal hostname"
+        );
+        assert!(profile.credential_key_names.is_empty());
     }
 
     #[test]

@@ -23,6 +23,7 @@ const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/cursor.yaml"),
     include_str!("../../../providers/github.yaml"),
     include_str!("../../../providers/google-vertex-ai.yaml"),
+    include_str!("../../../providers/model-runner.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
     include_str!("../../../providers/pypi.yaml"),
 ];

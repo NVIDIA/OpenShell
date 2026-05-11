@@ -620,7 +620,7 @@ fn resolve_provider_route(
     let profile = openshell_core::inference::profile_for(&provider_type).ok_or_else(|| {
         Status::invalid_argument(format!(
             "provider '{name}' has unsupported type '{raw_provider_type}' for cluster inference \
-                 (supported: openai, anthropic, nvidia, google-vertex-ai)",
+                 (supported: openai, anthropic, nvidia, google-vertex-ai, model-runner)",
             name = provider.object_name()
         ))
     })?;

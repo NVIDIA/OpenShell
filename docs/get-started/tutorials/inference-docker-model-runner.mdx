@@ -1,0 +1,128 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Run Local Inference with Docker Model Runner"
+sidebar-title: "Inference with Docker Model Runner"
+slug: "get-started/tutorials/inference-docker-model-runner"
+description: "Route sandbox inference requests to Docker Model Runner running on your host machine using the built-in model-runner provider type."
+keywords: "Generative AI, Cybersecurity, Tutorial, Inference Routing, Docker Model Runner, Local Inference, Sandbox"
+---
+
+This tutorial shows how to route `inference.local` requests from OpenShell sandboxes to Docker Model Runner on your host machine.
+
+Docker Model Runner is built into Docker Desktop. It runs models locally using the OpenAI-compatible API with no external service or API key required.
+
+After completing this tutorial, you will know how to:
+
+- Pull and run a model with Docker Model Runner.
+- Create a `model-runner` provider in OpenShell.
+- Set Docker Model Runner as the `inference.local` backend.
+- Verify inference from inside a sandbox.
+
+## Prerequisites
+
+- A working OpenShell installation. Complete the [Quickstart](/get-started/quickstart) before proceeding.
+- Docker Desktop with Docker Model Runner enabled (Docker Desktop 4.40 or later).
+
+## Verify Docker Model Runner Is Available
+
+Confirm Docker Model Runner is running on your host:
+
+```shell
+docker model version
+```
+
+If Docker Model Runner is not available, upgrade Docker Desktop or enable the feature in Docker Desktop settings under the **Beta Features** tab.
+
+<Steps toc={true}>
+
+### Pull a Model
+
+Pull a model to use for inference. A small model is a good starting point:
+
+```shell
+docker model pull ai/smollm2
+```
+
+Verify the model is available:
+
+```shell
+docker model list
+```
+
+### Create a Provider
+
+Create a `model-runner` provider. No credentials are needed because Docker Model Runner is accessed over the Docker-internal network:
+
+```shell
+openshell provider create --name model-runner --type model-runner
+```
+
+### Set Inference Routing
+
+Point `inference.local` at the model-runner provider and choose a model:
+
+```shell
+openshell inference set --provider model-runner --model ai/smollm2
+```
+
+OpenShell will verify that the upstream endpoint is reachable before saving. If the model has not fully loaded yet, wait a few seconds and retry.
+
+Confirm:
+
+```shell
+openshell inference get
+```
+
+### Verify from a Sandbox
+
+Run a request through `https://inference.local`:
+
+```shell
+openshell sandbox create -- \
+    curl https://inference.local/v1/chat/completions \
+    --json '{"messages":[{"role":"user","content":"hello"}],"max_tokens":10}'
+```
+
+A JSON response from the model confirms end-to-end connectivity.
+
+</Steps>
+
+## Model Recommendations
+
+| Use case | Model | Notes |
+|---|---|---|
+| Smoke test | `ai/smollm2` | Small, fast, good for verifying setup |
+| Coding and reasoning | `ai/llama3.2` | Strong general-purpose model |
+| Chat | `ai/gemma3` | Lightweight with good instruction following |
+
+Search for additional models with:
+
+```shell
+docker model search <query>
+```
+
+## Troubleshooting
+
+Common issues and fixes:
+
+- **`docker model version` fails** — Docker Desktop is not running or Docker Model Runner is disabled. Enable it in Docker Desktop settings.
+- **`openshell inference set` fails with connection refused** — The model may still be loading. Run `docker model ps` to check. If no model is loaded, run `docker model run --detach ai/smollm2` to pre-load it.
+- **Model not found** — Run `docker model list` to confirm the model is present. Run `docker model pull <model>` if needed.
+- **HTTPS vs HTTP** — Code inside sandboxes must call `https://inference.local`, not `http://`.
+
+Useful commands:
+
+```shell
+openshell status
+openshell inference get
+openshell provider get model-runner
+docker model ps
+docker model list
+```
+
+## Next Steps
+
+- To learn more about managed inference, refer to [Inference Routing](/sandboxes/inference-routing).
+- To configure a different self-hosted backend, refer to [Inference Routing](/sandboxes/inference-routing#configure-inference-routing).
+- To learn how to use Ollama for local inference, refer to [Inference with Ollama](/get-started/tutorials/inference-ollama).

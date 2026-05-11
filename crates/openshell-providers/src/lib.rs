@@ -118,6 +118,7 @@ impl ProviderRegistry {
         registry.register(providers::nvidia::SPEC);
         registry.register(providers::gitlab::SPEC);
         registry.register(providers::github::SPEC);
+        registry.register(providers::model_runner::ModelRunnerProvider);
         registry.register(providers::outlook::OutlookProvider);
         registry
     }
@@ -182,6 +183,7 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
         "generic" => Some("generic"),
         "gitlab" | "glab" => Some("gitlab"),
         "github" | "gh" => Some("github"),
+        "model-runner" | "model_runner" => Some("model-runner"),
         "outlook" => Some("outlook"),
         _ => None,
     }

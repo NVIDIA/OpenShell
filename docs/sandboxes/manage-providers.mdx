@@ -253,6 +253,7 @@ The following provider types are supported.
 | `generic` | User-defined | Any service with custom credentials |
 | `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API and `gh` CLI. Refer to [GitHub Sandbox](/get-started/tutorials/github-sandbox). |
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
+| `model-runner` | (none) | Docker Model Runner local inference. No credentials required. Refer to [Inference with Docker Model Runner](/get-started/tutorials/inference-docker-model-runner). |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
 | `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint. Set `--config OPENAI_BASE_URL` to point to the provider. Refer to [Inference Routing](/sandboxes/inference-routing). |
 | `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | OpenCode |
@@ -280,6 +281,7 @@ The following providers have been tested with `inference.local`. Any provider th
 | Bitdeer AI | `bitdeer` | `openai` | `https://api-inference.bitdeer.ai/v1` | `OPENAI_API_KEY` |
 | Deepinfra | `deepinfra` | `openai` | `https://api.deepinfra.com/v1/openai` | `OPENAI_API_KEY` |
 | Groq | `groq` | `openai` | `https://api.groq.com/openai/v1` | `OPENAI_API_KEY` |
+| Docker Model Runner | `model-runner` | `model-runner` | `http://model-runner.docker.internal/engines/llama.cpp/v1` | (none required) |
 | Ollama (local) | `ollama` | `openai` | `http://host.openshell.internal:11434/v1` | `OPENAI_API_KEY` |
 | LM Studio (local) | `lmstudio` | `openai` | `http://host.openshell.internal:1234/v1` | `OPENAI_API_KEY` |
 

@@ -118,6 +118,18 @@ Use [Google Vertex AI](/providers/google-vertex-ai) for the full auth flows, inc
 
 </Tab>
 
+<Tab title="Docker Model Runner">
+
+Docker Model Runner is built into Docker Desktop and exposes an OpenAI-compatible API over the Docker-internal network. No credentials are required.
+
+```shell
+openshell provider create --name model-runner --type model-runner
+```
+
+The `model-runner` type uses `model-runner.docker.internal` as the default endpoint. No base URL or API key configuration is needed. For a step-by-step setup, refer to [Inference with Docker Model Runner](/get-started/tutorials/inference-docker-model-runner).
+
+</Tab>
+
 <Tab title="Local Endpoint">
 
 ```shell
@@ -287,6 +299,7 @@ A successful response confirms the privacy router can reach the configured backe
 
 Explore related topics:
 
+- To follow a complete Docker Model Runner setup, refer to [Inference with Docker Model Runner](/get-started/tutorials/inference-docker-model-runner).
 - To follow a complete Ollama-based local setup, refer to [Inference Ollama](/get-started/tutorials/inference-ollama).
 - To follow a complete LM Studio-based local setup, refer to [Local Inference LM Studio](/get-started/tutorials/local-inference-lmstudio).
 - To control external endpoints, refer to [Policies](/sandboxes/policies).
