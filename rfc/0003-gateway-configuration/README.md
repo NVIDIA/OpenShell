@@ -37,7 +37,7 @@ Three sources are merged at startup, in descending priority:
 CLI flags  >  OPENSHELL_* environment variables  >  TOML config file  >  built-in defaults
 ```
 
-The TOML file is optional. If neither `--config` nor `OPENSHELL_CONFIG` is set, the gateway behaves exactly as before. Any field present in the file is overridden by a CLI flag or matching environment variable.
+The TOML file is optional. If neither `--config` nor `OPENSHELL_GATEWAY_CONFIG` is set, the gateway behaves exactly as before. Any field present in the file is overridden by a CLI flag or matching environment variable.
 
 ### Loading the file
 
@@ -261,7 +261,7 @@ The chart owners can migrate one section at a time: `OPENSHELL_*` env vars and t
 No part of this RFC has shipped yet. The work breaks down as:
 
 1. **Add a config-file loader to `openshell-server`** — define a `GatewayConfigFile` struct that mirrors the schema above, parse it with `serde` + `toml`, and merge it into `openshell_core::Config` plus the per-driver structs in `compute/`.
-2. **Wire the merge into `cli.rs`** — add `--config` / `OPENSHELL_CONFIG`, gate each existing flag's "apply from file" path on clap `ValueSource::DefaultValue`, and run cross-field validation after the merge.
+2. **Wire the merge into `cli.rs`** — add `--config` / `OPENSHELL_GATEWAY_CONFIG`, gate each existing flag's "apply from file" path on clap `ValueSource::DefaultValue`, and run cross-field validation after the merge.
 3. **Per-driver deserialization** — give each driver crate (`openshell-driver-{kubernetes,docker,podman,vm}`) a `from_toml` (or `serde::Deserialize`) entry point so the gateway can hand each driver its own table.
 4. **Test coverage** — file parsing, env-overrides-file, CLI-overrides-env, partial TLS error, port-collision error, unknown-field rejection, missing driver table fallback.
 5. **Helm chart migration** — add `gateway.config` value tree, render the `ConfigMap`, mount it, switch the gateway container to `--config`. Keep the `OPENSHELL_*` env names available as opt-in overrides for secrets.
