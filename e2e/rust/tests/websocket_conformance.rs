@@ -15,13 +15,16 @@ use std::io::{self, Error, ErrorKind, Write};
 use std::process::Stdio;
 use std::sync::Mutex;
 
+use base64::Engine as _;
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::sandbox::SandboxGuard;
+use sha1::{Digest, Sha1};
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
+const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const PROVIDER_NAME: &str = "e2e-websocket-conformance";
 const TEST_SERVER_HOST: &str = "host.openshell.internal";
 const TEST_SECRET: &str = "sk-e2e-websocket-conformance-secret";
@@ -198,6 +201,24 @@ async fn send_websocket_text(stream: &mut TcpStream, payload: &str) -> io::Resul
     stream.write_all(&frame).await
 }
 
+fn header_value(request: &str, name: &str) -> Option<String> {
+    request.lines().find_map(|line| {
+        let (header, value) = line.split_once(':')?;
+        if header.trim().eq_ignore_ascii_case(name) {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn websocket_accept_for_key(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(WEBSOCKET_GUID.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+}
+
 async fn handle_websocket_probe_connection(mut stream: TcpStream) -> io::Result<()> {
     let request_bytes = recv_until(&mut stream, b"\r\n\r\n").await?;
     let request = String::from_utf8_lossy(&request_bytes);
@@ -208,15 +229,17 @@ async fn handle_websocket_probe_connection(mut stream: TcpStream) -> io::Result<
         return Ok(());
     }
 
-    stream
-        .write_all(
-            b"HTTP/1.1 101 Switching Protocols\r\n\
-              Upgrade: websocket\r\n\
-              Connection: Upgrade\r\n\
-              Sec-WebSocket-Accept: test\r\n\
-              \r\n",
-        )
-        .await?;
+    let accept = header_value(&request, "Sec-WebSocket-Key")
+        .map(|key| websocket_accept_for_key(&key))
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing Sec-WebSocket-Key"))?;
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\
+         \r\n"
+    );
+    stream.write_all(response.as_bytes()).await?;
 
     let text = read_websocket_text(&mut stream).await?;
     let response = format!(
@@ -290,6 +313,7 @@ import json
 import os
 import socket
 import struct
+import time
 
 HOST = {host:?}
 PORT = {port}
@@ -338,11 +362,22 @@ def read_frame(sock):
         payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
     return first, payload
 
+def connect_with_retry(host, port, timeout_seconds=20):
+    deadline = time.monotonic() + timeout_seconds
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            return socket.create_connection((host, port), timeout=5)
+        except OSError as error:
+            last_error = error
+            time.sleep(0.25)
+    raise last_error
+
 token = os.environ[TOKEN_ENV]
 payload = json.dumps({{"authorization": "Bearer " + token}}, sort_keys=True)
 key = base64.b64encode(os.urandom(16)).decode("ascii")
 
-with socket.create_connection((HOST, PORT), timeout=20) as sock:
+with connect_with_retry(HOST, PORT) as sock:
     request = (
         f"GET /ws HTTP/1.1\r\n"
         f"Host: {{HOST}}:{{PORT}}\r\n"
