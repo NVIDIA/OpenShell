@@ -58,6 +58,7 @@ anyhow = { workspace = true }
 
 # File archiving (tar-over-SSH sync)
 tar = "0.4"
+tempfile = "3"
 
 # OIDC/Auth
 oauth2 = "5"

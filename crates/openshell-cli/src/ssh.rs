@@ -605,6 +605,91 @@ fn split_sandbox_path(path: &str) -> (&str, &str) {
     }
 }
 
+/// Writable root inside every sandbox. Used as the boundary for path-traversal
+/// checks on sandbox-side source paths in download flows.
+const SANDBOX_WORKSPACE_ROOT: &str = "/sandbox";
+
+/// Lexically normalise a POSIX-style absolute path by resolving `.` and `..`
+/// components, collapsing repeated separators, and stripping any trailing
+/// slash. Returns `None` if the input is empty or relative — the caller is
+/// expected to reject those before reaching this helper.
+///
+/// This is *lexical* only: it does not consult the filesystem and so cannot
+/// follow symlinks. That trade-off is intentional — the function is used
+/// client-side to refuse obvious path-traversal attempts before issuing the
+/// SSH command. Symlink-based escapes inside the sandbox must be addressed
+/// server-side.
+fn lexical_normalise_absolute_path(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut stack: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    if stack.is_empty() {
+        return Some("/".to_string());
+    }
+    let mut out = String::with_capacity(path.len());
+    for component in stack {
+        out.push('/');
+        out.push_str(component);
+    }
+    Some(out)
+}
+
+/// Validate that a sandbox-side source path passed to `sandbox download`
+/// resolves under the sandbox writable root.
+///
+/// Returns the normalised, traversal-resolved path on success. Refuses any
+/// path that escapes `/sandbox` (e.g. `/etc/passwd`, `/sandbox/../etc/passwd`)
+/// with a user-facing error.
+fn validate_sandbox_source_path(path: &str) -> Result<String> {
+    if path.is_empty() {
+        return Err(miette::miette!("sandbox source path is empty"));
+    }
+    let normalised = lexical_normalise_absolute_path(path)
+        .ok_or_else(|| miette::miette!("sandbox source path must be absolute (got '{path}')"))?;
+    let inside_workspace = normalised == SANDBOX_WORKSPACE_ROOT
+        || normalised.starts_with(&format!("{SANDBOX_WORKSPACE_ROOT}/"));
+    if !inside_workspace {
+        return Err(miette::miette!(
+            "sandbox source path '{path}' is outside the sandbox workspace ({SANDBOX_WORKSPACE_ROOT})"
+        ));
+    }
+    Ok(normalised)
+}
+
+/// Resolve the host-side target path for a downloaded *file*, following
+/// `cp`-style semantics.
+///
+/// - If `dest_str` ends with `/` or already exists as a directory, the file is
+///   placed inside it as `<dest>/<source_basename>`.
+/// - Otherwise `dest_str` is treated as the exact file path to write.
+///
+/// `dest_exists_as_dir` is taken as a parameter (rather than queried inside)
+/// so this function stays pure and unit-testable; the caller performs the
+/// filesystem check.
+fn resolve_file_download_target(
+    dest_str: &str,
+    source_basename: &str,
+    dest_exists_as_dir: bool,
+) -> PathBuf {
+    let trailing_slash = dest_str.ends_with('/');
+    let dest_path = Path::new(dest_str);
+    if trailing_slash || dest_exists_as_dir {
+        dest_path.join(source_basename)
+    } else {
+        dest_path.to_path_buf()
+    }
+}
+
 /// Push a list of files from a local directory into a sandbox using tar-over-SSH.
 ///
 /// Files are streamed as a tar archive to `ssh ... tar xf - -C <dest>` on
@@ -730,41 +815,105 @@ fn file_list_archive_prefix(local_path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Run a small command on the sandbox over SSH and capture its stdout.
+///
+/// Used by the download flow to probe whether the source path is a regular
+/// file or a directory before streaming the tar archive. Stderr is inherited
+/// so the user still sees any diagnostic output from ssh itself.
+async fn ssh_run_capture_stdout(session: &SshSessionConfig, command: &str) -> Result<String> {
+    let mut ssh = ssh_base_command(&session.proxy_command);
+    ssh.arg("-T")
+        .arg("-o")
+        .arg("RequestTTY=no")
+        .arg("sandbox")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let output = tokio::task::spawn_blocking(move || ssh.output())
+        .await
+        .into_diagnostic()?
+        .into_diagnostic()?;
+    if !output.status.success() {
+        return Err(miette::miette!(
+            "ssh probe exited with status {}",
+            output.status
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SandboxSourceKind {
+    File,
+    Directory,
+}
+
+/// Probe the sandbox-side source path. The path is assumed to have already
+/// been validated by `validate_sandbox_source_path`.
+async fn probe_sandbox_source_kind(
+    session: &SshSessionConfig,
+    sandbox_path: &str,
+) -> Result<SandboxSourceKind> {
+    let probe_cmd = format!(
+        "if [ -d {path} ]; then printf dir; elif [ -e {path} ]; then printf file; else printf missing; fi",
+        path = shell_escape(sandbox_path),
+    );
+    let kind = ssh_run_capture_stdout(session, &probe_cmd).await?;
+    match kind.as_str() {
+        "dir" => Ok(SandboxSourceKind::Directory),
+        "file" => Ok(SandboxSourceKind::File),
+        "missing" => Err(miette::miette!(
+            "sandbox source path '{sandbox_path}' does not exist"
+        )),
+        other => Err(miette::miette!(
+            "unexpected probe output for sandbox source path '{sandbox_path}': '{other}'"
+        )),
+    }
+}
+
 /// Pull a path from a sandbox to a local destination using tar-over-SSH.
+///
+/// Follows `cp`-style semantics for the destination:
+///
+/// - If the source is a single file:
+///   - When `dest` ends with `/` or already exists as a directory on the host,
+///     the file lands at `<dest>/<source-basename>`.
+///   - Otherwise `dest` is taken to be the exact file path to write.
+/// - If the source is a directory, its contents are extracted into `dest`
+///   (creating `dest` if it does not yet exist). This preserves prior
+///   behaviour for the directory-source case.
+///
+/// The sandbox source path is also subjected to a workspace-boundary check
+/// before any SSH command is issued; paths that lexically resolve outside
+/// `/sandbox` are refused.
 pub async fn sandbox_sync_down(
     server: &str,
     name: &str,
     sandbox_path: &str,
-    local_path: &Path,
+    dest: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let sandbox_path = validate_sandbox_source_path(sandbox_path)?;
     let session = ssh_session_config(server, name, tls).await?;
+    let kind = probe_sandbox_source_kind(&session, &sandbox_path).await?;
 
-    // Build tar command.  When the sandbox path is a directory we tar its
-    // *contents* (using `-C <path> .`) so the caller gets the files directly
-    // without an extra wrapper directory.  For a single file we split into
-    // the parent directory and the filename.
-    let sandbox_path_clean = sandbox_path.trim_end_matches('/');
+    match kind {
+        SandboxSourceKind::File => sandbox_sync_down_file(&session, &sandbox_path, dest).await,
+        SandboxSourceKind::Directory => {
+            sandbox_sync_down_directory(&session, &sandbox_path, dest).await
+        }
+    }
+}
 
-    let tar_cmd = format!(
-        "if [ -d {path} ]; then tar cf - -C {path} .; else tar cf - -C {parent} {name}; fi",
-        path = shell_escape(sandbox_path_clean),
-        parent = shell_escape(
-            sandbox_path_clean
-                .rfind('/')
-                .map_or(".", |pos| if pos == 0 {
-                    "/"
-                } else {
-                    &sandbox_path_clean[..pos]
-                })
-        ),
-        name = shell_escape(
-            sandbox_path_clean
-                .rfind('/')
-                .map_or(sandbox_path_clean, |pos| &sandbox_path_clean[pos + 1..])
-        ),
-    );
-
+/// Stream a tar archive from the sandbox and extract it into a fresh
+/// destination directory. The source is always wrapped on the sandbox side so
+/// the host can pick a basename when needed.
+async fn stream_sandbox_tar(
+    session: &SshSessionConfig,
+    tar_cmd: String,
+    extract_into: &Path,
+) -> Result<()> {
     let mut ssh = ssh_base_command(&session.proxy_command);
     ssh.arg("-T")
         .arg("-o")
@@ -781,14 +930,11 @@ pub async fn sandbox_sync_down(
         .take()
         .ok_or_else(|| miette::miette!("failed to open stdout for ssh process"))?;
 
-    let local_path = local_path.to_path_buf();
+    let extract_into = extract_into.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        fs::create_dir_all(&local_path)
-            .into_diagnostic()
-            .wrap_err("failed to create local destination directory")?;
         let mut archive = tar::Archive::new(stdout);
         archive
-            .unpack(&local_path)
+            .unpack(&extract_into)
             .into_diagnostic()
             .wrap_err("failed to extract tar archive from sandbox")?;
         Ok(())
@@ -806,8 +952,113 @@ pub async fn sandbox_sync_down(
             "ssh tar create exited with status {status}"
         ));
     }
-
     Ok(())
+}
+
+async fn sandbox_sync_down_file(
+    session: &SshSessionConfig,
+    sandbox_path: &str,
+    dest: &str,
+) -> Result<()> {
+    let (parent, basename) = split_sandbox_path(sandbox_path);
+    let dest_exists_as_dir = fs::symlink_metadata(Path::new(dest)).is_ok_and(|m| m.is_dir());
+    let final_path = resolve_file_download_target(dest, basename, dest_exists_as_dir);
+
+    let staging_parent = final_path
+        .parent()
+        .ok_or_else(|| miette::miette!("destination '{}' has no parent directory", dest))?;
+    fs::create_dir_all(staging_parent)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create local destination directory '{}'",
+                staging_parent.display()
+            )
+        })?;
+
+    let staging = tempfile::TempDir::new_in(staging_parent)
+        .into_diagnostic()
+        .wrap_err("failed to create download staging directory")?;
+
+    let tar_cmd = format!(
+        "tar cf - -C {parent} {name}",
+        parent = shell_escape(parent),
+        name = shell_escape(basename),
+    );
+    stream_sandbox_tar(session, tar_cmd, staging.path()).await?;
+
+    place_downloaded_file(staging.path(), basename, &final_path).wrap_err_with(|| {
+        format!(
+            "failed to place downloaded file at '{}'",
+            final_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Move a single file extracted by `stream_sandbox_tar` into its final
+/// position on the host.
+///
+/// `staging_dir` must contain a single regular-file entry named
+/// `source_basename` (the wrapper produced by `tar cf - -C <parent> <name>`).
+/// The entry is renamed onto `final_path`, atomically when `staging_dir` is
+/// on the same filesystem. Refuses to overwrite an existing directory at
+/// `final_path` to match `cp` behaviour.
+fn place_downloaded_file(
+    staging_dir: &Path,
+    source_basename: &str,
+    final_path: &Path,
+) -> Result<()> {
+    let staged_file = staging_dir.join(source_basename);
+    let staged_meta = fs::symlink_metadata(&staged_file)
+        .into_diagnostic()
+        .wrap_err("downloaded archive did not contain the expected entry")?;
+    if !staged_meta.is_file() {
+        return Err(miette::miette!(
+            "downloaded entry '{source_basename}' is not a regular file"
+        ));
+    }
+
+    if let Ok(existing) = fs::symlink_metadata(final_path)
+        && existing.is_dir()
+    {
+        return Err(miette::miette!(
+            "cannot overwrite directory '{}' with downloaded file",
+            final_path.display()
+        ));
+    }
+
+    fs::rename(&staged_file, final_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to rename into '{}'", final_path.display()))?;
+    Ok(())
+}
+
+async fn sandbox_sync_down_directory(
+    session: &SshSessionConfig,
+    sandbox_path: &str,
+    dest: &str,
+) -> Result<()> {
+    let dest_path = Path::new(dest);
+    if let Ok(existing) = fs::symlink_metadata(dest_path)
+        && !existing.is_dir()
+    {
+        return Err(miette::miette!(
+            "cannot extract directory '{sandbox_path}' over non-directory destination '{}'",
+            dest_path.display()
+        ));
+    }
+    fs::create_dir_all(dest_path)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create local destination directory '{}'",
+                dest_path.display()
+            )
+        })?;
+
+    let tar_cmd = format!("tar cf - -C {path} .", path = shell_escape(sandbox_path));
+    stream_sandbox_tar(session, tar_cmd, dest_path).await
 }
 
 /// Run the SSH proxy, connecting stdin/stdout to the gateway.
@@ -1237,6 +1488,209 @@ mod tests {
             ("/sandbox/sub", "file")
         );
         assert_eq!(split_sandbox_path("/a/b/c/d.txt"), ("/a/b/c", "d.txt"));
+    }
+
+    #[test]
+    fn lexical_normalise_resolves_dot_and_dotdot_segments() {
+        assert_eq!(
+            lexical_normalise_absolute_path("/sandbox/./a"),
+            Some("/sandbox/a".to_string())
+        );
+        assert_eq!(
+            lexical_normalise_absolute_path("/sandbox/sub/../a"),
+            Some("/sandbox/a".to_string())
+        );
+        assert_eq!(
+            lexical_normalise_absolute_path("/sandbox/../etc/passwd"),
+            Some("/etc/passwd".to_string())
+        );
+        assert_eq!(
+            lexical_normalise_absolute_path("//sandbox///foo//"),
+            Some("/sandbox/foo".to_string())
+        );
+        assert_eq!(lexical_normalise_absolute_path("/"), Some("/".to_string()));
+    }
+
+    #[test]
+    fn lexical_normalise_refuses_relative_paths() {
+        assert_eq!(lexical_normalise_absolute_path(""), None);
+        assert_eq!(lexical_normalise_absolute_path("sandbox/a"), None);
+        assert_eq!(lexical_normalise_absolute_path("./a"), None);
+    }
+
+    #[test]
+    fn validate_sandbox_source_path_accepts_workspace_paths() {
+        assert_eq!(
+            validate_sandbox_source_path("/sandbox/file.txt").unwrap(),
+            "/sandbox/file.txt"
+        );
+        assert_eq!(
+            validate_sandbox_source_path("/sandbox/.openclaw/workspace/hello.txt").unwrap(),
+            "/sandbox/.openclaw/workspace/hello.txt"
+        );
+        assert_eq!(
+            validate_sandbox_source_path("/sandbox").unwrap(),
+            "/sandbox"
+        );
+        assert_eq!(
+            validate_sandbox_source_path("/sandbox/").unwrap(),
+            "/sandbox"
+        );
+        assert_eq!(
+            validate_sandbox_source_path("/sandbox/sub/../file").unwrap(),
+            "/sandbox/file"
+        );
+    }
+
+    #[test]
+    fn validate_sandbox_source_path_rejects_traversal_and_escapes() {
+        let traversal = validate_sandbox_source_path("/etc/passwd").unwrap_err();
+        assert!(
+            format!("{traversal}").contains("outside the sandbox workspace"),
+            "unexpected error: {traversal}"
+        );
+
+        let parent_escape = validate_sandbox_source_path("/sandbox/../etc/passwd").unwrap_err();
+        assert!(
+            format!("{parent_escape}").contains("outside the sandbox workspace"),
+            "unexpected error: {parent_escape}"
+        );
+
+        let prefix_only = validate_sandbox_source_path("/sandboxed/secrets").unwrap_err();
+        assert!(
+            format!("{prefix_only}").contains("outside the sandbox workspace"),
+            "unexpected error: {prefix_only}"
+        );
+
+        let empty = validate_sandbox_source_path("").unwrap_err();
+        assert!(format!("{empty}").contains("empty"));
+
+        let relative = validate_sandbox_source_path("sandbox/file").unwrap_err();
+        assert!(format!("{relative}").contains("must be absolute"));
+    }
+
+    #[test]
+    fn resolve_file_download_target_writes_to_dest_when_not_a_directory() {
+        assert_eq!(
+            resolve_file_download_target("/tmp/out.txt", "hello.txt", false),
+            PathBuf::from("/tmp/out.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_file_download_target_places_inside_existing_directory() {
+        assert_eq!(
+            resolve_file_download_target("/tmp", "hello.txt", true),
+            PathBuf::from("/tmp/hello.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_file_download_target_honors_trailing_slash() {
+        assert_eq!(
+            resolve_file_download_target("/tmp/newdir/", "hello.txt", false),
+            PathBuf::from("/tmp/newdir/hello.txt")
+        );
+    }
+
+    fn build_single_file_archive(entry_path: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_path(entry_path).expect("set tar entry path");
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            builder.append(&header, bytes).expect("append tar entry");
+            builder.finish().expect("finish tar archive");
+        }
+        buf
+    }
+
+    fn unpack_into(archive_bytes: &[u8], staging: &Path) {
+        let mut archive = tar::Archive::new(std::io::Cursor::new(archive_bytes));
+        archive.unpack(staging).expect("unpack archive");
+    }
+
+    #[test]
+    fn place_downloaded_file_writes_regular_file_at_dest() {
+        let workdir = tempfile::tempdir().expect("create workdir");
+        let staging = workdir.path().join("staging");
+        fs::create_dir_all(&staging).expect("create staging");
+        let archive = build_single_file_archive("hello.txt", b"trust me");
+        unpack_into(&archive, &staging);
+
+        let dest = workdir.path().join("out.txt");
+        place_downloaded_file(&staging, "hello.txt", &dest).expect("place file");
+
+        let meta = fs::symlink_metadata(&dest).expect("stat dest");
+        assert!(meta.is_file(), "dest must be a regular file, got {meta:?}");
+        assert_eq!(fs::read(&dest).expect("read dest"), b"trust me");
+    }
+
+    #[test]
+    fn place_downloaded_file_refuses_to_clobber_existing_directory() {
+        let workdir = tempfile::tempdir().expect("create workdir");
+        let staging = workdir.path().join("staging");
+        fs::create_dir_all(&staging).expect("create staging");
+        let archive = build_single_file_archive("hello.txt", b"trust me");
+        unpack_into(&archive, &staging);
+
+        let dest = workdir.path().join("conflict-dir");
+        fs::create_dir(&dest).expect("create conflict dir");
+
+        let err = place_downloaded_file(&staging, "hello.txt", &dest)
+            .expect_err("expected directory-clobber refusal");
+        assert!(
+            format!("{err}").contains("cannot overwrite directory"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            fs::symlink_metadata(&dest).expect("stat dest").is_dir(),
+            "dest should remain a directory after refusal"
+        );
+    }
+
+    #[test]
+    fn download_full_pipeline_lands_file_at_exact_dest_path() {
+        let workdir = tempfile::tempdir().expect("create workdir");
+        let staging_parent = workdir.path();
+        let archive = build_single_file_archive("hello.txt", b"trust me");
+
+        let dest_str = staging_parent.join("out.txt");
+        let dest_str = dest_str.to_str().unwrap();
+        let final_path = resolve_file_download_target(dest_str, "hello.txt", false);
+        assert_eq!(final_path, Path::new(dest_str));
+
+        let staging = tempfile::TempDir::new_in(staging_parent).expect("staging dir");
+        unpack_into(&archive, staging.path());
+        place_downloaded_file(staging.path(), "hello.txt", &final_path).expect("place");
+
+        let meta = fs::symlink_metadata(&final_path).expect("stat final");
+        assert!(meta.is_file(), "expected regular file, got {meta:?}");
+        assert_eq!(fs::read(&final_path).expect("read final"), b"trust me");
+    }
+
+    #[test]
+    fn download_full_pipeline_places_inside_existing_directory_destination() {
+        let workdir = tempfile::tempdir().expect("create workdir");
+        let archive = build_single_file_archive("hello.txt", b"trust me");
+
+        let dest_dir = workdir.path().join("out-dir");
+        fs::create_dir(&dest_dir).expect("create dest dir");
+        let dest_str = dest_dir.to_str().unwrap();
+        let final_path = resolve_file_download_target(dest_str, "hello.txt", true);
+        assert_eq!(final_path, dest_dir.join("hello.txt"));
+
+        let staging = tempfile::TempDir::new_in(workdir.path()).expect("staging dir");
+        unpack_into(&archive, staging.path());
+        place_downloaded_file(staging.path(), "hello.txt", &final_path).expect("place");
+
+        let meta = fs::symlink_metadata(&final_path).expect("stat final");
+        assert!(meta.is_file());
+        assert_eq!(fs::read(&final_path).expect("read final"), b"trust me");
     }
 
     #[test]

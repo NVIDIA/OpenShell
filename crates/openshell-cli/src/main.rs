@@ -2374,12 +2374,8 @@ async fn main() -> Result<()> {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name);
-                    let local_dest = std::path::Path::new(dest.as_deref().unwrap_or("."));
-                    eprintln!(
-                        "Downloading sandbox:{} -> {}",
-                        sandbox_path,
-                        local_dest.display()
-                    );
+                    let local_dest = dest.as_deref().unwrap_or(".");
+                    eprintln!("Downloading sandbox:{sandbox_path} -> {local_dest}");
                     run::sandbox_sync_down(&ctx.endpoint, &name, &sandbox_path, local_dest, &tls)
                         .await?;
                     eprintln!("{} Download complete", "✓".green().bold());
