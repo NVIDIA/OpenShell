@@ -24,7 +24,7 @@ pub(super) async fn handle_expose_service(
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
     let req = request.into_inner();
     validate_endpoint_name("sandbox", &req.sandbox, MAX_SANDBOX_NAME_LEN)?;
-    validate_endpoint_name("service", &req.service, MAX_SERVICE_NAME_LEN)?;
+    validate_optional_endpoint_name("service", &req.service, MAX_SERVICE_NAME_LEN)?;
     if req.target_port == 0 || req.target_port > u32::from(u16::MAX) {
         return Err(Status::invalid_argument("target_port must be in 1..=65535"));
     }
@@ -83,6 +83,23 @@ fn validate_endpoint_name(field: &str, value: &str, max_len: usize) -> Result<()
     if value.is_empty() {
         return Err(Status::invalid_argument(format!("{field} is required")));
     }
+    validate_non_empty_endpoint_name(field, value, max_len)
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_optional_endpoint_name(field: &str, value: &str, max_len: usize) -> Result<(), Status> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    validate_non_empty_endpoint_name(field, value, max_len)
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_non_empty_endpoint_name(
+    field: &str,
+    value: &str,
+    max_len: usize,
+) -> Result<(), Status> {
     if value.len() > max_len {
         return Err(Status::invalid_argument(format!(
             "{field} must be at most {max_len} characters for sandbox service routing"
@@ -120,8 +137,18 @@ mod tests {
     }
 
     #[test]
+    fn validates_empty_optional_service_name() {
+        validate_optional_endpoint_name("service", "", 28).unwrap();
+    }
+
+    #[test]
     fn rejects_separator_in_endpoint_name() {
         assert!(validate_endpoint_name("service", "web--api", 28).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_required_endpoint_name() {
+        assert!(validate_endpoint_name("sandbox", "", 28).is_err());
     }
 
     #[test]

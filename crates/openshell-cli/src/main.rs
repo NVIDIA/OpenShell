@@ -1653,12 +1653,12 @@ enum ServiceCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         sandbox: String,
 
-        /// Service name.
-        service: String,
-
         /// Loopback TCP port inside the sandbox.
-        #[arg(long)]
+        #[arg(value_name = "TARGET-PORT")]
         target_port: u16,
+
+        /// Service name.
+        service: Option<String>,
     },
 }
 
@@ -1960,6 +1960,7 @@ async fn main() -> Result<()> {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name);
+            let service = service.unwrap_or_default();
             run::service_expose(&ctx.endpoint, &sandbox, &service, target_port, &tls).await?;
         }
         // -----------------------------------------------------------
@@ -3566,6 +3567,57 @@ mod tests {
             } else {
                 panic!("expected SandboxCommands::Create");
             }
+        }
+    }
+
+    #[test]
+    fn service_expose_accepts_positional_target_port_and_service() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "service",
+            "expose",
+            "my-sandbox",
+            "8080",
+            "api",
+        ])
+        .expect("service expose positional target port should parse");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::Expose {
+                        sandbox,
+                        target_port,
+                        service,
+                    }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(target_port, 8080);
+                assert_eq!(service.as_deref(), Some("api"));
+            }
+            other => panic!("expected service expose command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_expose_allows_omitted_service_name() {
+        let cli = Cli::try_parse_from(["openshell", "service", "expose", "my-sandbox", "8080"])
+            .expect("service expose should allow omitting the service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::Expose {
+                        sandbox,
+                        target_port,
+                        service,
+                    }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(target_port, 8080);
+                assert_eq!(service, None);
+            }
+            other => panic!("expected service expose command, got: {other:?}"),
         }
     }
 }

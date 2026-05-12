@@ -3421,13 +3421,22 @@ pub async fn service_expose(
         .map_err(|status| miette::miette!("expose service failed: {status}"))?
         .into_inner();
 
-    println!(
-        "{} Exposed service {} on sandbox {} -> 127.0.0.1:{}",
-        "✓".green().bold(),
-        service.bold(),
-        sandbox.bold(),
-        target_port,
-    );
+    if service.is_empty() {
+        println!(
+            "{} Exposed sandbox {} -> 127.0.0.1:{}",
+            "✓".green().bold(),
+            sandbox.bold(),
+            target_port,
+        );
+    } else {
+        println!(
+            "{} Exposed service {} on sandbox {} -> 127.0.0.1:{}",
+            "✓".green().bold(),
+            service.bold(),
+            sandbox.bold(),
+            target_port,
+        );
+    }
     if !response.url.is_empty() {
         let url = service_url_for_gateway(&response.url, server);
         println!("  URL: {}", url.cyan());

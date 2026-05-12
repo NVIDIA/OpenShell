@@ -26,7 +26,11 @@ impl ObjectType for ServiceEndpoint {
 }
 
 pub fn endpoint_key(sandbox: &str, service: &str) -> String {
-    format!("{sandbox}--{service}")
+    if service.is_empty() {
+        sandbox.to_string()
+    } else {
+        format!("{sandbox}--{service}")
+    }
 }
 
 pub fn endpoint_url(
@@ -58,7 +62,11 @@ fn endpoint_scheme(config: &openshell_core::Config) -> &'static str {
 
 fn endpoint_host(config: &ServiceRoutingConfig, sandbox: &str, service: &str) -> Option<String> {
     let base_domain = config.service_base_domains.first()?;
-    Some(format!("{sandbox}--{service}.{base_domain}"))
+    Some(if service.is_empty() {
+        format!("{sandbox}.{base_domain}")
+    } else {
+        format!("{sandbox}--{service}.{base_domain}")
+    })
 }
 
 pub fn parse_host(host: &str, config: &ServiceRoutingConfig) -> Option<(String, String)> {
@@ -68,12 +76,15 @@ pub fn parse_host(host: &str, config: &ServiceRoutingConfig) -> Option<(String, 
         let Some(encoded) = host.strip_suffix(&expected_suffix) else {
             continue;
         };
-        let (sandbox, service) = encoded.split_once("--")?;
-        if sandbox.is_empty()
-            || service.is_empty()
-            || sandbox.contains("--")
-            || service.contains("--")
-        {
+        let (sandbox, service) = if let Some((sandbox, service)) = encoded.split_once("--") {
+            if service.is_empty() || service.contains("--") {
+                return None;
+            }
+            (sandbox, service)
+        } else {
+            (encoded, "")
+        };
+        if sandbox.is_empty() || sandbox.contains("--") {
             return None;
         }
         return Some((sandbox.to_string(), service.to_string()));
@@ -393,6 +404,18 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_url_omits_service_label_for_empty_service_name() {
+        let cfg = openshell_core::Config::new(Some(tls_config()))
+            .with_bind_address("127.0.0.1:8080".parse().unwrap())
+            .with_service_base_domains(["dev.openshell.localhost"]);
+
+        assert_eq!(
+            endpoint_url(&cfg, "my-sandbox", "").as_deref(),
+            Some("http://my-sandbox.dev.openshell.localhost:8080/")
+        );
+    }
+
+    #[test]
     fn endpoint_url_keeps_https_for_non_loopback_tls_gateway() {
         let cfg = openshell_core::Config::new(Some(tls_config()))
             .with_bind_address("0.0.0.0:8080".parse().unwrap())
@@ -422,6 +445,22 @@ mod tests {
         assert_eq!(
             parse_host("my-sandbox--web.dev.openshell.localhost", &config()),
             Some(("my-sandbox".to_string(), "web".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_sandbox_host_without_service_label() {
+        assert_eq!(
+            parse_host("my-sandbox.dev.openshell.localhost", &config()),
+            Some(("my-sandbox".to_string(), String::new()))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_service_label_separator() {
+        assert_eq!(
+            parse_host("my-sandbox--.dev.openshell.localhost", &config()),
+            None
         );
     }
 
