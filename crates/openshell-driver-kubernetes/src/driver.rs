@@ -1325,7 +1325,7 @@ fn apply_required_env(
     upsert_env(env, "OPENSHELL_SANDBOX_ID", sandbox_id);
     upsert_env(env, "OPENSHELL_SANDBOX", sandbox_name);
     upsert_env(env, "OPENSHELL_ENDPOINT", grpc_endpoint);
-    upsert_env(env, "OPENSHELL_SANDBOX_COMMAND", "sleep infinity");
+    upsert_env_if_absent(env, "OPENSHELL_SANDBOX_COMMAND", "sleep infinity");
     if !ssh_socket_path.is_empty() {
         upsert_env(env, "OPENSHELL_SSH_SOCKET_PATH", ssh_socket_path);
     }
@@ -1362,6 +1362,15 @@ fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
     }
 
     env.push(serde_json::json!({"name": name, "value": value}));
+}
+
+fn upsert_env_if_absent(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
+    let exists = env
+        .iter()
+        .any(|item| item.get("name").and_then(|v| v.as_str()) == Some(name));
+    if !exists {
+        env.push(serde_json::json!({"name": name, "value": value}));
+    }
 }
 
 /// Extract a string value from the template's `platform_config` Struct.
@@ -2321,5 +2330,51 @@ mod tests {
                 .any(|e| e["name"] == "OPENSHELL_LOG_LEVEL" && e["value"] == "debug")
         );
         assert!(cr["spec"].get("logLevel").is_none());
+    }
+
+    #[test]
+    fn upsert_env_if_absent_does_not_overwrite_existing() {
+        let mut env = vec![serde_json::json!({"name": "OPENSHELL_SANDBOX_COMMAND", "value": "my-entrypoint"})];
+        upsert_env_if_absent(&mut env, "OPENSHELL_SANDBOX_COMMAND", "sleep infinity");
+        assert_eq!(env.len(), 1);
+        assert_eq!(
+            env[0].get("value").and_then(|v| v.as_str()),
+            Some("my-entrypoint")
+        );
+    }
+
+    #[test]
+    fn upsert_env_if_absent_inserts_when_missing() {
+        let mut env = Vec::new();
+        upsert_env_if_absent(&mut env, "OPENSHELL_SANDBOX_COMMAND", "sleep infinity");
+        assert_eq!(env.len(), 1);
+        assert_eq!(
+            env[0].get("value").and_then(|v| v.as_str()),
+            Some("sleep infinity")
+        );
+    }
+
+    #[test]
+    fn apply_required_env_preserves_template_sandbox_command() {
+        let mut env = vec![serde_json::json!({"name": "OPENSHELL_SANDBOX_COMMAND", "value": "/usr/bin/my-app"})];
+        apply_required_env(
+            &mut env,
+            "sandbox-1",
+            "my-sandbox",
+            "https://endpoint:8080",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            false,
+        );
+        let cmd_entry = env
+            .iter()
+            .find(|e| e.get("name").and_then(|v| v.as_str()) == Some("OPENSHELL_SANDBOX_COMMAND"))
+            .expect("OPENSHELL_SANDBOX_COMMAND must be present");
+        assert_eq!(
+            cmd_entry.get("value").and_then(|v| v.as_str()),
+            Some("/usr/bin/my-app"),
+            "template value should be preserved, not overwritten"
+        );
     }
 }
