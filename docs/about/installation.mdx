@@ -36,82 +36,28 @@ For detailed driver behavior, refer to [Sandbox Compute Drivers](/reference/sand
 
 ## Manually running the Gateway
 
-Use a manual gateway when the package-managed installer is not a fit, such as on immutable or image-based Linux systems. This path keeps the binaries and gateway state in your home directory and leaves lifecycle management to your shell, a systemd user unit, or another supervisor.
+You can run the gateway without Homebrew, RPM, Debian packages, or Helm by downloading the release binary and starting `openshell-gateway` yourself. This is useful on immutable or image-based systems where package-manager installation is not the right fit.
 
-Download the CLI and gateway release artifacts. Choose targets that match your host:
+Choose the gateway release artifact that matches your host:
 
-| Host | `CLI_TARGET` | `GATEWAY_TARGET` |
-|---|---|---|
-| Linux x86_64 | `x86_64-unknown-linux-musl` | `x86_64-unknown-linux-gnu` |
-| Linux Arm64 | `aarch64-unknown-linux-musl` | `aarch64-unknown-linux-gnu` |
-| macOS Apple Silicon | `aarch64-apple-darwin` | `aarch64-apple-darwin` |
+| Host | `GATEWAY_TARGET` |
+|---|---|
+| Linux x86_64 | `x86_64-unknown-linux-gnu` |
+| Linux Arm64 | `aarch64-unknown-linux-gnu` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
 
 ```shell
 VERSION="v0.0.0"
-CLI_TARGET=x86_64-unknown-linux-musl
 GATEWAY_TARGET=x86_64-unknown-linux-gnu
 BASE_URL="https://github.com/NVIDIA/OpenShell/releases/download/${VERSION}"
 
 mkdir -p "$HOME/.local/bin"
-curl -LsSf "${BASE_URL}/openshell-${CLI_TARGET}.tar.gz" | tar -xz -C "$HOME/.local/bin" openshell
 curl -LsSf "${BASE_URL}/openshell-gateway-${GATEWAY_TARGET}.tar.gz" | tar -xz -C "$HOME/.local/bin" openshell-gateway
-chmod 755 "$HOME/.local/bin/openshell" "$HOME/.local/bin/openshell-gateway"
+chmod 755 "$HOME/.local/bin/openshell-gateway"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Set `VERSION` to a release tag from [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases). For production installs, download and verify the release checksum files before installing the artifacts.
-
-Generate a local mTLS bundle and start a Docker-backed gateway on loopback:
-
-```shell
-export OPENSHELL_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/openshell"
-export OPENSHELL_TLS_DIR="${OPENSHELL_STATE_DIR}/tls"
-export OPENSHELL_SERVER_PORT=17670
-
-mkdir -p "${OPENSHELL_STATE_DIR}/gateway"
-openshell-gateway generate-certs \
-  --output-dir "${OPENSHELL_TLS_DIR}" \
-  --server-san host.openshell.internal
-
-export OPENSHELL_BIND_ADDRESS=127.0.0.1
-export OPENSHELL_TLS_CERT="${OPENSHELL_TLS_DIR}/server/tls.crt"
-export OPENSHELL_TLS_KEY="${OPENSHELL_TLS_DIR}/server/tls.key"
-export OPENSHELL_TLS_CLIENT_CA="${OPENSHELL_TLS_DIR}/ca.crt"
-export OPENSHELL_DB_URL="sqlite:${OPENSHELL_STATE_DIR}/gateway/openshell.db"
-export OPENSHELL_GRPC_ENDPOINT="https://127.0.0.1:${OPENSHELL_SERVER_PORT}"
-export OPENSHELL_SSH_GATEWAY_HOST=127.0.0.1
-export OPENSHELL_SSH_GATEWAY_PORT="${OPENSHELL_SERVER_PORT}"
-export OPENSHELL_SSH_HANDSHAKE_SECRET="$(openssl rand -hex 32)"
-export OPENSHELL_DRIVERS=docker
-export OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
-export OPENSHELL_DOCKER_TLS_CA="${OPENSHELL_TLS_DIR}/ca.crt"
-export OPENSHELL_DOCKER_TLS_CERT="${OPENSHELL_TLS_DIR}/client/tls.crt"
-export OPENSHELL_DOCKER_TLS_KEY="${OPENSHELL_TLS_DIR}/client/tls.key"
-
-openshell-gateway
-```
-
-If you move this command into a service manager, persist the same environment values so restarts keep the same database, mTLS bundle, and SSH handshake secret.
-
-For Podman, enable the user socket and replace the Docker driver exports:
-
-```shell
-systemctl --user enable --now podman.socket
-
-export OPENSHELL_DRIVERS=podman
-export OPENSHELL_SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:${VERSION#v}"
-export OPENSHELL_PODMAN_TLS_CA="${OPENSHELL_TLS_DIR}/ca.crt"
-export OPENSHELL_PODMAN_TLS_CERT="${OPENSHELL_TLS_DIR}/client/tls.crt"
-export OPENSHELL_PODMAN_TLS_KEY="${OPENSHELL_TLS_DIR}/client/tls.key"
-```
-
-In another terminal, register the manually started gateway:
-
-```shell
-openshell gateway add "https://127.0.0.1:17670" --local --name openshell
-openshell gateway select openshell
-openshell status
-```
+Set `VERSION` to a release tag from [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases). For production installs, download and verify the release checksum files before installing the artifact. To configure the gateway process, refer to [Configuring the Gateway](/sandboxes/manage-gateways#configuring-the-gateway).
 
 ## macOS
 
