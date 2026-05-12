@@ -21,15 +21,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+VALUES_DIR="${REPO_ROOT}/deploy/kube/observability"
 
 MONITORING_NAMESPACE="${MONITORING_NAMESPACE:-monitoring}"
 OBSERVABILITY_NAMESPACE="${OBSERVABILITY_NAMESPACE:-observability}"
 PROMSTACK_RELEASE="${PROMSTACK_RELEASE:-kube-prometheus-stack}"
 PROMSTACK_VERSION="${PROMSTACK_VERSION:-75.0.0}"
-PROMSTACK_VALUES="${PROMSTACK_VALUES:-${SCRIPT_DIR}/observability-prometheus-values.yaml}"
+PROMSTACK_VALUES="${PROMSTACK_VALUES:-${VALUES_DIR}/prometheus-values.yaml}"
 JAEGER_RELEASE="${JAEGER_RELEASE:-jaeger}"
 JAEGER_VERSION="${JAEGER_VERSION:-3.4.0}"
-JAEGER_VALUES="${JAEGER_VALUES:-${SCRIPT_DIR}/observability-jaeger-values.yaml}"
+JAEGER_VALUES="${JAEGER_VALUES:-${VALUES_DIR}/jaeger-values.yaml}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
 
 # ---------------------------------------------------------------------------
