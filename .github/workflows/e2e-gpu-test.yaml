@@ -58,7 +58,7 @@ jobs:
       - name: Check Docker GPU prerequisites
         run: |
           docker info --format '{{json .CDISpecDirs}}'
-          GPU_PROBE_IMAGE="$(awk '$1 == "FROM" && $3 == "AS" && $4 == "gateway" { print $2; exit }' deploy/docker/Dockerfile.images)"
+          GPU_PROBE_IMAGE="$(awk -F= '/^ARG[[:space:]]+GATEWAY_BASE_IMAGE=/ { print $2; exit }' deploy/docker/Dockerfile.gateway)"
           test -n "${GPU_PROBE_IMAGE}"
           docker run --rm --device nvidia.com/gpu=all "${GPU_PROBE_IMAGE}" nvidia-smi -L
 
