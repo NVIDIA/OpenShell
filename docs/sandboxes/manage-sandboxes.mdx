@@ -137,7 +137,7 @@ openshell sandbox list --selector env=dev,team=platform
 
 ## Expose Long Running Services
 
-Sandbox service routing is enabled for gateways by default. Loopback gateways use `openshell.localhost` service URLs. Custom HTTPS service domains use the gateway server SAN configuration: add a wildcard DNS SAN such as `*.apps.example.com` to the gateway certificate and pass the same SAN to the gateway with `--server-san` or `OPENSHELL_SERVER_SAN`.
+Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by OpenShell.
 
 Expose a service that listens on loopback inside the sandbox:
 
@@ -150,8 +150,6 @@ Pass an optional service name to create a named service URL:
 ```shell
 openshell service expose my-sandbox 8080 web
 ```
-
-Use `openshell svc` as shorthand for `openshell service`.
 
 List exposed endpoints:
 
@@ -179,11 +177,8 @@ openshell service get my-sandbox
 openshell service delete my-sandbox
 ```
 
-For loopback gateways, OpenShell prints a URL in the form `http://<sandbox>.openshell.localhost:<port>/` or `http://<sandbox>--<service>.openshell.localhost:<port>/` when a service name is provided. Browser traffic enters the same gateway listener as mTLS-protected gRPC, but plaintext HTTP is accepted only from loopback clients and only for sandbox service hostnames. Gateway APIs, auth routes, health endpoints, and non-service hostnames remain unavailable over plaintext HTTP. Cross-origin and sibling-subdomain browser requests are rejected before reaching the sandbox service. Disable this local browser path with `--enable-loopback-service-http=false` or `OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP=false`.
-
 <Note>
-For remote or non-loopback gateways, browser service URLs remain HTTPS and require normal gateway authentication.
-
+Loopback gateways return local `openshell.localhost` URLs. Remote gateways return HTTPS URLs that require normal gateway authentication. For gateway service-domain configuration, refer to [Manage Gateways](/sandboxes/manage-gateways#configure-service-forwarding).
 </Note>
 
 ## Monitor and Debug

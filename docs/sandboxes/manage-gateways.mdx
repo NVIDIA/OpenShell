@@ -38,6 +38,20 @@ For driver setup, including Docker, Podman, MicroVM, and Kubernetes paths, refer
 
 </Tip>
 
+## Configure Service Forwarding
+
+Sandbox service routing is enabled for gateways by default. Users expose long-running sandbox services with `openshell service expose`, and the gateway routes browser traffic from the printed service URL to the loopback port inside the sandbox.
+
+Loopback gateways use `openshell.localhost` service URLs. OpenShell prints a URL in the form `http://<sandbox>.openshell.localhost:<port>/` or `http://<sandbox>--<service>.openshell.localhost:<port>/` when a service name is provided.
+
+Browser traffic enters the same gateway listener as mTLS-protected gRPC, but plaintext HTTP is accepted only from loopback clients and only for sandbox service hostnames. Gateway APIs, auth routes, health endpoints, and non-service hostnames remain unavailable over plaintext HTTP. Cross-origin and sibling-subdomain browser requests are rejected before reaching the sandbox service.
+
+Disable the local browser path with `--enable-loopback-service-http=false` or `OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP=false`.
+
+Custom HTTPS service domains use the gateway server SAN configuration. Add a wildcard DNS SAN such as `*.apps.example.com` to the gateway certificate and pass the same SAN to the gateway with `--server-san` or `OPENSHELL_SERVER_SAN`.
+
+For remote or non-loopback gateways, browser service URLs remain HTTPS and require normal gateway authentication.
+
 ## Register an Existing Gateway
 
 Use `openshell gateway add` to register any reachable gateway endpoint so the CLI can target it.
