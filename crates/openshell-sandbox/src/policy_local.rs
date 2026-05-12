@@ -680,9 +680,28 @@ async fn proposal_wait_response(
     };
     let timeout_secs = parse_timeout_query(query);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    // Baseline local policy version at /wait start. When a chunk is
+    // approved upstream the gateway merges it immediately, but the local
+    // supervisor reloads policy on its own poll cycle — without this
+    // baseline we can return "approved" before the local rule is active,
+    // and the agent's single retry races the reload.
+    let baseline_policy_version: u32 = ctx
+        .current_policy
+        .read()
+        .await
+        .as_ref()
+        .map_or(0, |p| p.version);
     loop {
         match fetch_chunk(&session, chunk_id).await {
             Ok(Some(chunk)) if is_terminal_status(&chunk.status) => {
+                if chunk.status == "approved" {
+                    // Don't promise the agent its retry will succeed until
+                    // the local supervisor has actually loaded the new
+                    // policy. Bounded by the same deadline so a stuck
+                    // supervisor cannot extend the wait beyond what the
+                    // caller asked for.
+                    wait_for_local_policy_bump(ctx, baseline_policy_version, deadline).await;
+                }
                 // Audit beat: emit at the moment this sandbox observes the
                 // decision so the trace correlates with the proxy events
                 // bracketing the loop. Multiple waiters on the same chunk
@@ -751,6 +770,42 @@ fn chunk_state_payload(chunk: &PolicyChunk, timed_out: bool) -> serde_json::Valu
 
 fn is_terminal_status(status: &str) -> bool {
     matches!(status, "approved" | "rejected")
+}
+
+/// After a chunk is approved upstream, wait until the local supervisor has
+/// loaded a policy version strictly newer than the baseline captured at the
+/// start of `/wait`. Bounded by the caller-supplied deadline; returns early
+/// (best-effort) if the deadline passes without the version bumping.
+///
+/// The polling cadence here is faster than `PROPOSAL_WAIT_POLL_INTERVAL`
+/// (which paces upstream gateway calls). This loop only reads in-memory
+/// state, so 200ms gives a responsive handoff to the agent's retry once
+/// the supervisor's own policy poll catches up.
+async fn wait_for_local_policy_bump(
+    ctx: &PolicyLocalContext,
+    baseline_version: u32,
+    deadline: tokio::time::Instant,
+) {
+    const TICK: std::time::Duration = std::time::Duration::from_millis(200);
+    loop {
+        let current: u32 = ctx
+            .current_policy
+            .read()
+            .await
+            .as_ref()
+            .map_or(0, |p| p.version);
+        if current > baseline_version {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            // Best effort: return approved anyway. The agent's retry may
+            // race the reload, but the alternative (extending past the
+            // caller's deadline) violates the wait contract.
+            return;
+        }
+        tokio::time::sleep(std::cmp::min(remaining, TICK)).await;
+    }
 }
 
 /// Parse `?timeout=<s>` from the query string. Default applies for missing
@@ -1663,6 +1718,64 @@ mod tests {
         assert!(summary.contains("api.github.com:443"));
         assert!(summary.contains("PUT /repos/foo/bar/contents/x.md"));
         assert!(summary.contains("/usr/bin/curl"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_local_policy_bump_returns_when_version_advances() {
+        let ctx = PolicyLocalContext::new(
+            Some(ProtoSandboxPolicy {
+                version: 5,
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let bumped = {
+            let policy = ctx.current_policy.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                *policy.write().await = Some(ProtoSandboxPolicy {
+                    version: 6,
+                    ..Default::default()
+                });
+            })
+        };
+        let start = tokio::time::Instant::now();
+        wait_for_local_policy_bump(&ctx, 5, deadline).await;
+        bumped.await.unwrap();
+        // Returned promptly after the bump, well before the 2s deadline.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "should return shortly after version bumps; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_local_policy_bump_returns_at_deadline_if_no_advance() {
+        let ctx = PolicyLocalContext::new(
+            Some(ProtoSandboxPolicy {
+                version: 5,
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+        let start = tokio::time::Instant::now();
+        wait_for_local_policy_bump(&ctx, 5, deadline).await;
+        let elapsed = start.elapsed();
+        // Best effort: returns at or shortly after the deadline rather
+        // than extending past it.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "should wait until ~deadline; only waited {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "should not extend past deadline by much; took {elapsed:?}"
+        );
     }
 
     #[test]

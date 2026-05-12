@@ -73,8 +73,49 @@ RESET=$'\033[0m'
 
 AGENT_PID=""
 
-step() { printf "\n${BOLD}${CYAN}==> %s${RESET}\n\n" "$1"; }
+# Wall-clock anchor so each step header can carry a "[t+1.2s]" tag and the
+# reader sees where time is going. `date +%s.%N` works on macOS bash where
+# `${EPOCHREALTIME}` may be unavailable in older bashes.
+DEMO_START_EPOCH="$(date +%s.%N)"
+
+elapsed() {
+    awk -v s="$DEMO_START_EPOCH" -v now="$(date +%s.%N)" \
+        'BEGIN { printf "%.1fs", now - s }'
+}
+
+step() {
+    printf "\n${BOLD}${CYAN}==> [t+%s] %s${RESET}\n\n" "$(elapsed)" "$1"
+}
 info() { printf "  %b\n" "$*"; }
+
+# ASCII spinner for the watch-for-pending loop. Renders only on a TTY so
+# piped runs (CI, tee, etc.) stay clean. spin_wait pairs a message with a
+# bounded sleep so the spinner animates smoothly without polling faster
+# than necessary.
+SPINNER_CHARS=( '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏' )
+SPINNER_IDX=0
+
+spin_wait() {
+    local message="$1"
+    local duration_secs="${2:-2}"
+    if [[ ! -t 1 ]]; then
+        sleep "$duration_secs"
+        return
+    fi
+    local end=$(( SECONDS + duration_secs ))
+    while (( SECONDS < end )); do
+        printf "\r  ${DIM}%s${RESET} %s  " \
+            "${SPINNER_CHARS[SPINNER_IDX]}" "$message"
+        SPINNER_IDX=$(( (SPINNER_IDX + 1) % ${#SPINNER_CHARS[@]} ))
+        sleep 0.1
+    done
+}
+
+spin_clear() {
+    if [[ -t 1 ]]; then
+        printf "\r%*s\r" "${COLUMNS:-100}" ''
+    fi
+}
 
 # Redact host-side credentials from the agent log tail before printing on
 # failure. Codex shouldn't echo the token, but a misbehaving tool call (e.g.,
@@ -204,9 +245,19 @@ check_gateway() {
     local raw version
     # `openshell status` colorizes labels with ANSI even when piped, so strip
     # escapes before parsing. Use NO_COLOR as a belt-and-suspenders hint for
-    # libraries that respect it.
-    raw="$(NO_COLOR=1 "$OPENSHELL_BIN" status 2>/dev/null \
-        | sed 's/\x1b\[[0-9;]*m//g')"
+    # libraries that respect it. Capture stderr explicitly so a connection
+    # failure (gateway down, port-forward died after a redeploy) surfaces a
+    # real error message instead of `set -euo pipefail` silently exiting.
+    if ! raw="$(NO_COLOR=1 "$OPENSHELL_BIN" status 2>&1)"; then
+        fail "openshell could not reach the gateway. CLI output:
+${raw}
+
+If you just redeployed, the kubectl port-forward you backgrounded earlier
+probably died with the old pod. Restart it (silenced so its noise doesn't
+bleed into the demo):
+  KUBECONFIG=kubeconfig kubectl -n openshell port-forward svc/openshell 8090:8080 >/dev/null 2>&1 &"
+    fi
+    raw="$(sed 's/\x1b\[[0-9;]*m//g' <<<"$raw")"
     version="$(awk -F': *' '/Version:/ { print $2; exit }' <<<"$raw")"
     [[ -n "$version" ]] \
         || fail "active OpenShell gateway is not reachable; start one with: openshell gateway start"
@@ -357,23 +408,36 @@ EOF
     info "${DIM}Watching for the pending draft on the gateway...${RESET}"
 }
 
-approve_when_pending() {
+approve_pending_until_agent_exits() {
     step "Waiting for the agent to draft a policy proposal"
     narrate_sandbox_workflow
 
-    local start now pending
+    local start now pending approval_count
     start="$(date +%s)"
     pending="${TMP_DIR}/pending.txt"
+    approval_count=0
 
     while true; do
+        # Agent finished? Drain its exit status and we're done.
         if ! kill -0 "$AGENT_PID" >/dev/null 2>&1; then
-            wait "$AGENT_PID" || true
+            spin_clear
+            if ! wait "$AGENT_PID"; then
+                AGENT_PID=""
+                fail "agent run failed"
+            fi
             AGENT_PID=""
-            fail "agent exited before a pending proposal appeared"
+            if (( approval_count == 0 )); then
+                fail "agent exited before any pending proposal appeared"
+            fi
+            info "agent exited after ${approval_count} approval(s)"
+            return
         fi
 
+        # Anything pending? Approve and keep watching — the agent may
+        # redraft if a previous proposal didn't yield the access it needed.
         if "$OPENSHELL_BIN" rule get "$DEMO_SANDBOX_NAME" --status pending >"$pending" 2>/dev/null \
             && grep -q "Chunk:" "$pending" && grep -q "pending" "$pending"; then
+            spin_clear
             info ""
             info "${GREEN}proposal received:${RESET}"
             summarize_pending "$pending"
@@ -381,24 +445,20 @@ approve_when_pending() {
             step "Approving — the agent's /wait will return within ~1s"
             "$OPENSHELL_BIN" rule approve-all "$DEMO_SANDBOX_NAME" \
                 | awk '/approved/ { print "  " $0 }'
-            return
+            approval_count=$((approval_count + 1))
         fi
 
         now="$(date +%s)"
         if (( now - start >= DEMO_APPROVAL_TIMEOUT_SECS )); then
-            fail "timed out waiting for the agent to submit a policy proposal"
+            spin_clear
+            if (( approval_count == 0 )); then
+                fail "timed out waiting for the agent to submit a policy proposal"
+            fi
+            fail "agent did not exit within ${DEMO_APPROVAL_TIMEOUT_SECS}s after ${approval_count} approval(s)"
         fi
-        sleep 2
-    done
-}
 
-wait_for_agent() {
-    if ! wait "$AGENT_PID"; then
-        AGENT_PID=""
-        fail "agent run failed"
-    fi
-    AGENT_PID=""
-    info "agent's /wait returned approved — single PUT retry succeeded"
+        spin_wait "watching for pending proposals (approved ${approval_count} so far)" 2
+    done
 }
 
 verify_github_write() {
@@ -457,8 +517,7 @@ main() {
     show_run_summary
 
     start_agent_sandbox
-    approve_when_pending
-    wait_for_agent
+    approve_pending_until_agent_exits
     verify_github_write
     show_logs
 
