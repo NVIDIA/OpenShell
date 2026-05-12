@@ -2200,12 +2200,8 @@ pub async fn sandbox_sync_command(
             eprintln!("{} Sync complete", "✓".green().bold());
         }
         (None, Some(sandbox_path)) => {
-            let local_dest = Path::new(dest.unwrap_or("."));
-            eprintln!(
-                "Syncing sandbox:{} -> {}",
-                sandbox_path,
-                local_dest.display()
-            );
+            let local_dest = dest.unwrap_or(".");
+            eprintln!("Syncing sandbox:{sandbox_path} -> {local_dest}");
             sandbox_sync_down(server, name, sandbox_path, local_dest, tls).await?;
             eprintln!("{} Sync complete", "✓".green().bold());
         }
