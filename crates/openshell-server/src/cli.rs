@@ -571,12 +571,6 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.sandbox_image = Some(image.clone());
     }
-    if let Some(policy) = &file.image_pull_policy
-        && args.sandbox_image_pull_policy.is_none()
-        && arg_defaulted(matches, "sandbox_image_pull_policy")
-    {
-        args.sandbox_image_pull_policy = Some(policy.clone());
-    }
     if let Some(secret) = &file.client_tls_secret_name
         && args.client_tls_secret_name.is_none()
         && arg_defaulted(matches, "client_tls_secret_name")

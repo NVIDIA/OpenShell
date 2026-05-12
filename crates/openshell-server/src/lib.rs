@@ -604,8 +604,14 @@ async fn build_compute_runtime(
             // file + CLI/env at startup.
             k8s.namespace.clone_from(&config.sandbox_namespace);
             k8s.default_image.clone_from(&config.sandbox_image);
-            k8s.image_pull_policy
-                .clone_from(&config.sandbox_image_pull_policy);
+            // Only let the gateway-wide CLI/env value overwrite the per-driver
+            // file value when it was actually set — otherwise the empty CLI
+            // default would silently clobber `image_pull_policy` configured
+            // under `[openshell.drivers.kubernetes]`.
+            if !config.sandbox_image_pull_policy.is_empty() {
+                k8s.image_pull_policy
+                    .clone_from(&config.sandbox_image_pull_policy);
+            }
             k8s.grpc_endpoint.clone_from(&config.grpc_endpoint);
             k8s.ssh_socket_path
                 .clone_from(&config.sandbox_ssh_socket_path);
@@ -690,7 +696,16 @@ async fn build_compute_runtime(
             // Shared fields are sourced from Config (which already merged
             // file + CLI/env at startup).
             podman.default_image.clone_from(&config.sandbox_image);
-            podman.image_pull_policy = config.sandbox_image_pull_policy.parse().unwrap_or_default();
+            // The CLI/env `image_pull_policy` is K8s-shaped
+            // (e.g. `IfNotPresent`) and won't parse into Podman's lowercase
+            // enum. Only apply it when the operator set a Podman-shaped value
+            // explicitly; otherwise keep whatever `[openshell.drivers.podman]`
+            // (or the struct default) provided.
+            if !config.sandbox_image_pull_policy.is_empty()
+                && let Ok(policy) = config.sandbox_image_pull_policy.parse()
+            {
+                podman.image_pull_policy = policy;
+            }
             podman.grpc_endpoint.clone_from(&config.grpc_endpoint);
             podman.gateway_port = config.bind_address.port();
             podman
