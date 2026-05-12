@@ -55,7 +55,8 @@ missing_prebuilt_paths() {
 	local binary
 	local path
 
-	mapfile -t arches < <(prebuilt_arches)
+	local arches=()
+	while IFS= read -r _a; do arches+=("$_a"); done < <(prebuilt_arches)
 	read -r -a binaries <<< "$(required_prebuilt_binaries "${target}")"
 
 	for arch in "${arches[@]}"; do
@@ -75,7 +76,8 @@ ensure_prebuilt_binaries() {
 
 	if [[ -z "${CI:-}" && "${PREBUILT_AUTO_STAGE:-1}" != "0" ]]; then
 		echo "Staging prebuilt Rust binaries for Docker target '${target}'..."
-		mapfile -t arches < <(prebuilt_arches)
+		local arches=()
+		while IFS= read -r _a; do arches+=("$_a"); done < <(prebuilt_arches)
 		for arch in "${arches[@]}"; do
 			PREBUILT_ARCH="${arch}" "${SCRIPT_DIR}/stage-prebuilt-binaries.sh" "${target}"
 		done

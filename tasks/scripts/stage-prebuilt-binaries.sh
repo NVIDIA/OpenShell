@@ -203,7 +203,8 @@ trap restore_workspace_version EXIT
 
 patch_workspace_version
 
-mapfile -t arches < <(detect_arches)
+arches=()
+while IFS= read -r _a; do arches+=("$_a"); done < <(detect_arches)
 read -r -a components <<< "$(components_for_target "$target")"
 
 for arch in "${arches[@]}"; do
