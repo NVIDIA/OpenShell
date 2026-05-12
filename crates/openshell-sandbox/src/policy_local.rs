@@ -8,6 +8,7 @@ use openshell_core::proto::{
     L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
     SandboxPolicy as ProtoSandboxPolicy,
 };
+use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -480,6 +481,12 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
         }
     };
 
+    // Pre-compute the audit summaries before handing `chunks` to the
+    // gateway client (which consumes the vec). The summaries pair up with
+    // the gateway's `accepted_chunk_ids` by index for the propose events
+    // emitted after submit returns.
+    let audit_summaries: Vec<String> = chunks.iter().map(summarize_chunk_for_audit).collect();
+
     let response = match client
         .submit_policy_analysis(sandbox_name, vec![], chunks, "agent_authored")
         .await
@@ -496,6 +503,27 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
         }
     };
 
+    // One OCSF event per accepted chunk so the audit trace in
+    // `openshell logs <sandbox>` carries the propose beat alongside the
+    // proxy deny and policy reload that bracket it.
+    //
+    // The gateway compresses its `accepted_chunk_ids` by skipping rejected
+    // chunks (`grpc/policy.rs:1357-1436`); the proto does not promise 1:1
+    // ordering against the request. Today client-side validation catches
+    // both rejection causes (missing rule_name, missing proposed_rule)
+    // before submit, so the lengths match in practice. If they don't, we
+    // can't safely pair audit_summaries by index — fall back to a generic
+    // event per accepted chunk_id rather than mis-attribute a summary.
+    let pairing_is_safe = response.accepted_chunk_ids.len() == audit_summaries.len();
+    for (idx, chunk_id) in response.accepted_chunk_ids.iter().enumerate() {
+        let summary = if pairing_is_safe {
+            audit_summaries[idx].as_str()
+        } else {
+            "(summary unavailable: gateway partially accepted)"
+        };
+        emit_policy_propose_event(chunk_id, summary);
+    }
+
     (
         202,
         serde_json::json!({
@@ -506,6 +534,122 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
             "accepted_chunk_ids": response.accepted_chunk_ids,
         }),
     )
+}
+
+/// Emit one CONFIG:PROPOSED audit event for an agent-authored proposal that
+/// the gateway just accepted. The message names the `chunk_id`, the binary,
+/// and the endpoint the agent is asking to reach — what a developer needs
+/// to see in the audit trace to correlate against the inbox card.
+fn emit_policy_propose_event(chunk_id: &str, summary: &str) {
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Other, "PROPOSED")
+            .unmapped("chunk_id", serde_json::json!(chunk_id))
+            .message(format!(
+                "agent_authored proposal chunk:{chunk_id} {summary}"
+            ))
+            .build()
+    );
+}
+
+/// Emit one CONFIG:APPROVED or CONFIG:REJECTED audit event observed by the
+/// `/wait` poll loop. The reviewer's free-form `rejection_reason` (if any)
+/// is included verbatim so the audit trace shows what guidance the agent
+/// received.
+fn emit_policy_decision_event(chunk: &PolicyChunk) {
+    let summary = summarize_chunk_for_audit(chunk);
+    match chunk.status.as_str() {
+        "approved" => ocsf_emit!(
+            ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "APPROVED")
+                .unmapped("chunk_id", serde_json::json!(chunk.id))
+                .message(format!("chunk:{} approved {summary}", chunk.id))
+                .build()
+        ),
+        "rejected" => {
+            // The reviewer's free-form rejection_reason is opaque user
+            // input. The agent reads the raw text via `GET /v1/proposals/
+            // {id}` to redraft; the OCSF surface (which can be shipped to
+            // external SIEMs per AGENTS.md) gets a sanitized copy — caps
+            // length and strips control characters so a stray credential
+            // or escape sequence cannot leak into the audit log.
+            let sanitized = sanitize_reason_for_audit(&chunk.rejection_reason);
+            let reason_display = if sanitized.is_empty() {
+                "(no guidance)".to_string()
+            } else {
+                format!("\"{sanitized}\"")
+            };
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(SeverityId::Low)
+                    .status(StatusId::Success)
+                    .state(StateId::Disabled, "REJECTED")
+                    .unmapped("chunk_id", serde_json::json!(chunk.id))
+                    .unmapped("rejection_reason", serde_json::json!(sanitized))
+                    .message(format!(
+                        "chunk:{} rejected {summary} reason:{reason_display}",
+                        chunk.id
+                    ))
+                    .build()
+            );
+        }
+        // Caller is gated on `is_terminal_status`, so a non-terminal status
+        // here is a code change that broke the invariant. Warn loudly so
+        // the audit gap doesn't go silent.
+        other => tracing::warn!(
+            chunk_id = %chunk.id,
+            status = %other,
+            "emit_policy_decision_event called on non-terminal status; no audit event emitted"
+        ),
+    }
+}
+
+/// Sanitize a free-form reviewer-typed string before it lands in the OCSF
+/// audit surface. The agent still reads the raw text via the API — this is
+/// audit-side defense only.
+fn sanitize_reason_for_audit(raw: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .take(MAX_CHARS)
+        .collect();
+    if raw.chars().count() > MAX_CHARS {
+        format!("{cleaned}…")
+    } else {
+        cleaned
+    }
+}
+
+/// One-line audit description of a chunk's target: binary, host, port, and
+/// L7 method/path if present. Used by both the propose and approve/reject
+/// audit events so the trace can be grepped by endpoint without parsing
+/// JSON.
+fn summarize_chunk_for_audit(chunk: &PolicyChunk) -> String {
+    let Some(rule) = chunk.proposed_rule.as_ref() else {
+        return format!("rule_name:{}", chunk.rule_name);
+    };
+    let endpoint = rule.endpoints.first().map_or_else(
+        || "unknown".to_string(),
+        |ep| format!("{}:{}", ep.host, ep.port),
+    );
+    let l7 = rule
+        .endpoints
+        .first()
+        .and_then(|ep| ep.rules.first())
+        .and_then(|r| r.allow.as_ref())
+        .map(|a| format!(" {} {}", a.method, a.path))
+        .unwrap_or_default();
+    let binary = if chunk.binary.is_empty() {
+        String::new()
+    } else {
+        format!(" by {}", chunk.binary)
+    };
+    format!("on {endpoint}{l7}{binary}")
 }
 
 /// `GET /v1/proposals/{chunk_id}` — immediate state. One gateway call, no loop.
@@ -539,6 +683,11 @@ async fn proposal_wait_response(
     loop {
         match fetch_chunk(&session, chunk_id).await {
             Ok(Some(chunk)) if is_terminal_status(&chunk.status) => {
+                // Audit beat: emit at the moment this sandbox observes the
+                // decision so the trace correlates with the proxy events
+                // bracketing the loop. Multiple waiters on the same chunk
+                // each fire one event — acceptable for a wakeup audit.
+                emit_policy_decision_event(&chunk);
                 return (200, chunk_state_payload(&chunk, false));
             }
             Ok(Some(chunk)) => {
@@ -1481,5 +1630,71 @@ mod tests {
 
         let (status, _) = route_request(&ctx, "GET", "/v1/proposals/abc/wait", &[]).await;
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn summarize_chunk_for_audit_includes_endpoint_l7_path_and_binary() {
+        let chunk = PolicyChunk {
+            id: "ignored".to_string(),
+            rule_name: "github_write".to_string(),
+            binary: "/usr/bin/curl".to_string(),
+            proposed_rule: Some(NetworkPolicyRule {
+                name: "github_write".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.github.com".to_string(),
+                    port: 443,
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "PUT".to_string(),
+                            path: "/repos/foo/bar/contents/x.md".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        let summary = summarize_chunk_for_audit(&chunk);
+        assert!(summary.contains("api.github.com:443"));
+        assert!(summary.contains("PUT /repos/foo/bar/contents/x.md"));
+        assert!(summary.contains("/usr/bin/curl"));
+    }
+
+    #[test]
+    fn sanitize_reason_for_audit_strips_control_chars_and_caps_length() {
+        // Tabs and newlines are stripped; ordinary printable chars survive;
+        // multi-byte characters count as one char in the cap.
+        let raw = "line one\nline\ttwo\u{0001}\u{0007}";
+        let cleaned = sanitize_reason_for_audit(raw);
+        assert!(!cleaned.contains('\n'));
+        assert!(!cleaned.contains('\t'));
+        assert!(!cleaned.contains('\u{0001}'));
+        assert!(cleaned.contains("line one"));
+        assert!(cleaned.contains("linetwo"));
+
+        // Length cap with ellipsis marker so a downstream reader can tell
+        // the audit string is truncated.
+        let long: String = "x".repeat(500);
+        let capped = sanitize_reason_for_audit(&long);
+        assert!(capped.chars().count() <= 201);
+        assert!(capped.ends_with('…'));
+
+        // Empty input maps to empty output (caller renders "(no guidance)").
+        assert_eq!(sanitize_reason_for_audit(""), "");
+    }
+
+    #[test]
+    fn summarize_chunk_for_audit_falls_back_to_rule_name_without_rule() {
+        let chunk = PolicyChunk {
+            rule_name: "fallback".to_string(),
+            proposed_rule: None,
+            ..Default::default()
+        };
+        assert_eq!(summarize_chunk_for_audit(&chunk), "rule_name:fallback");
     }
 }

@@ -417,8 +417,15 @@ verify_github_write() {
 # OpenShell's logging — keep it as-is rather than re-formatting.
 show_logs() {
     step "Policy decision trace (OCSF)"
+    # Filter to the events that tell the loop's story end-to-end, ordered by
+    # the trace's own timestamps:
+    #   HTTP:PUT DENIED          — initial proxy enforcement
+    #   CONFIG:PROPOSED          — agent submitted a chunk to the gateway
+    #   CONFIG:APPROVED/REJECTED — developer decided; agent's /wait woke up
+    #   CONFIG:LOADED            — supervisor hot-reloaded the merged policy
+    #   HTTP:PUT ALLOWED         — agent's retry succeeded
     "$OPENSHELL_BIN" logs "$DEMO_SANDBOX_NAME" --since 10m -n 200 2>&1 \
-        | grep -E 'HTTP:PUT.*(DENIED|ALLOWED)|CONFIG:LOADED.*Policy reloaded' \
+        | grep -E 'HTTP:PUT.*(DENIED|ALLOWED)|CONFIG:(PROPOSED|APPROVED|REJECTED|LOADED)' \
         | sed 's/^/  /' || true
 }
 

@@ -31,8 +31,11 @@
 # Prereqs:
 #   - A running gateway and the openshell CLI built from this branch.
 #     The simplest local path is `mise run helm:skaffold:run`, then
-#     `kubectl -n openshell port-forward svc/openshell 8090:8080 &` and
-#     `cargo build -p openshell-cli`.
+#     `cargo build -p openshell-cli` and start the port-forward with its
+#     output redirected so kubectl's "Handling connection for 8090" lines
+#     don't bleed into your terminal:
+#       KUBECONFIG=kubeconfig kubectl -n openshell \
+#           port-forward svc/openshell 8090:8080 >/dev/null 2>&1 &
 #   - The agent-proposals feature flag enabled. Run once:
 #       openshell settings set --global \
 #           --key agent_policy_proposals_enabled --value true --yes
