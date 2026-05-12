@@ -23,8 +23,12 @@ FROM scratch AS supervisor
 
 ARG TARGETARCH
 
-# --chmod=755 preserves the executable bit through actions/upload-artifact +
-# download-artifact, which strip exec perms during the roundtrip.
-COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
+# --chmod=0550 preserves the executable bit through actions/upload-artifact +
+# download-artifact (which strip exec perms during the roundtrip) without
+# granting world-execute. --chown uses numeric 65534:65534 (nobody:nobody)
+# because scratch has no /etc/passwd to resolve a named user against. This
+# scratch image is only consumed by the init-container copy-self path, so
+# the destination pod's USER governs what can execute the binary.
+COPY --chown=65534:65534 --chmod=0550 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
 
 ENTRYPOINT ["/openshell-sandbox"]
