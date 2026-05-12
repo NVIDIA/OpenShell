@@ -680,17 +680,17 @@ async fn proposal_wait_response(
     };
     let timeout_secs = parse_timeout_query(query);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    // Baseline local policy version at /wait start. When a chunk is
+    // Baseline local policy fingerprint at /wait start. When a chunk is
     // approved upstream the gateway merges it immediately, but the local
     // supervisor reloads policy on its own poll cycle — without this
     // baseline we can return "approved" before the local rule is active,
     // and the agent's single retry races the reload.
-    let baseline_policy_version: u32 = ctx
-        .current_policy
-        .read()
-        .await
-        .as_ref()
-        .map_or(0, |p| p.version);
+    //
+    // We compare encoded policy bytes rather than `SandboxPolicy.version`,
+    // which is a schema-version constant (always 1) and never bumps on a
+    // revision change. A naive version compare loops forever; a byte
+    // compare picks up any rule mutation, which is what reload means.
+    let baseline_fingerprint = local_policy_fingerprint(ctx).await;
     loop {
         match fetch_chunk(&session, chunk_id).await {
             Ok(Some(chunk)) if is_terminal_status(&chunk.status) => {
@@ -700,7 +700,7 @@ async fn proposal_wait_response(
                     // policy. Bounded by the same deadline so a stuck
                     // supervisor cannot extend the wait beyond what the
                     // caller asked for.
-                    wait_for_local_policy_bump(ctx, baseline_policy_version, deadline).await;
+                    wait_for_local_policy_bump(ctx, &baseline_fingerprint, deadline).await;
                 }
                 // Audit beat: emit at the moment this sandbox observes the
                 // decision so the trace correlates with the proxy events
@@ -772,10 +772,25 @@ fn is_terminal_status(status: &str) -> bool {
     matches!(status, "approved" | "rejected")
 }
 
+/// Snapshot of the local policy at a moment in time, used as a revision
+/// fingerprint by `wait_for_local_policy_bump`. Compares with `==` against
+/// a later snapshot to detect a reload — prost-generated types derive
+/// `PartialEq`, so any field change (including the `network_policies` map)
+/// flips equality.
+async fn local_policy_fingerprint(ctx: &PolicyLocalContext) -> Option<ProtoSandboxPolicy> {
+    ctx.current_policy.read().await.clone()
+}
+
 /// After a chunk is approved upstream, wait until the local supervisor has
-/// loaded a policy version strictly newer than the baseline captured at the
-/// start of `/wait`. Bounded by the caller-supplied deadline; returns early
-/// (best-effort) if the deadline passes without the version bumping.
+/// loaded a policy that differs from the baseline captured at the start of
+/// `/wait`. Bounded by the caller-supplied deadline; returns early
+/// (best-effort) if the deadline passes without a change.
+///
+/// We compare the whole policy proto rather than any single field because
+/// `SandboxPolicy.version` is a schema-version constant (always 1) and does
+/// not track revisions — only the policy *content* changes when a reload
+/// lands. Equality is via prost's derived `PartialEq`; a clone-per-tick on
+/// a few-KB struct is cheap for the bounded wait window this lives in.
 ///
 /// The polling cadence here is faster than `PROPOSAL_WAIT_POLL_INTERVAL`
 /// (which paces upstream gateway calls). This loop only reads in-memory
@@ -783,18 +798,13 @@ fn is_terminal_status(status: &str) -> bool {
 /// the supervisor's own policy poll catches up.
 async fn wait_for_local_policy_bump(
     ctx: &PolicyLocalContext,
-    baseline_version: u32,
+    baseline: &Option<ProtoSandboxPolicy>,
     deadline: tokio::time::Instant,
 ) {
     const TICK: std::time::Duration = std::time::Duration::from_millis(200);
     loop {
-        let current: u32 = ctx
-            .current_policy
-            .read()
-            .await
-            .as_ref()
-            .map_or(0, |p| p.version);
-        if current > baseline_version {
+        let current = local_policy_fingerprint(ctx).await;
+        if current.as_ref() != baseline.as_ref() {
             return;
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1721,50 +1731,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_local_policy_bump_returns_when_version_advances() {
-        let ctx = PolicyLocalContext::new(
-            Some(ProtoSandboxPolicy {
-                version: 5,
-                ..Default::default()
-            }),
-            None,
-            None,
-        );
+    async fn wait_for_local_policy_bump_returns_when_policy_content_changes() {
+        // Baseline: a policy with one network policy keyed "initial".
+        // SandboxPolicy.version stays 1 across reloads (it's a schema
+        // marker, not a revision id) — this test deliberately changes
+        // *content* without bumping the version field, which is the
+        // failure mode that surfaced in the demo (supervisor reloaded
+        // the policy but kept version=1, so the prior version-compare
+        // implementation hung until deadline).
+        let initial = ProtoSandboxPolicy {
+            version: 1,
+            network_policies: HashMap::from([(
+                "initial".to_string(),
+                NetworkPolicyRule {
+                    name: "initial".to_string(),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let ctx = PolicyLocalContext::new(Some(initial), None, None);
+        let baseline = local_policy_fingerprint(&ctx).await;
+
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        let bumped = {
+        let changed = {
             let policy = ctx.current_policy.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                // Same schema version (1), different content — exactly
+                // what the supervisor does on a real reload.
                 *policy.write().await = Some(ProtoSandboxPolicy {
-                    version: 6,
+                    version: 1,
+                    network_policies: HashMap::from([(
+                        "reloaded".to_string(),
+                        NetworkPolicyRule {
+                            name: "reloaded".to_string(),
+                            ..Default::default()
+                        },
+                    )]),
                     ..Default::default()
                 });
             })
         };
         let start = tokio::time::Instant::now();
-        wait_for_local_policy_bump(&ctx, 5, deadline).await;
-        bumped.await.unwrap();
-        // Returned promptly after the bump, well before the 2s deadline.
+        wait_for_local_policy_bump(&ctx, &baseline, deadline).await;
+        changed.await.unwrap();
         let elapsed = start.elapsed();
         assert!(
             elapsed < std::time::Duration::from_millis(800),
-            "should return shortly after version bumps; took {elapsed:?}"
+            "should return shortly after content changes; took {elapsed:?}"
         );
     }
 
     #[tokio::test]
-    async fn wait_for_local_policy_bump_returns_at_deadline_if_no_advance() {
+    async fn wait_for_local_policy_bump_returns_at_deadline_if_no_change() {
         let ctx = PolicyLocalContext::new(
             Some(ProtoSandboxPolicy {
-                version: 5,
+                version: 1,
                 ..Default::default()
             }),
             None,
             None,
         );
+        let baseline = local_policy_fingerprint(&ctx).await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
         let start = tokio::time::Instant::now();
-        wait_for_local_policy_bump(&ctx, 5, deadline).await;
+        wait_for_local_policy_bump(&ctx, &baseline, deadline).await;
         let elapsed = start.elapsed();
         // Best effort: returns at or shortly after the deadline rather
         // than extending past it.
