@@ -28,18 +28,19 @@ use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
     ClearDraftChunksRequest, CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest,
     DeleteProviderProfileRequest, DeleteProviderRequest, DeleteSandboxRequest,
-    DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
+    DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
     GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetProviderProfileRequest, GetProviderRequest,
     GetSandboxConfigRequest, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
-    GetSandboxRequest, HealthRequest, ImportProviderProfilesRequest, LintProviderProfilesRequest,
-    ListProviderProfilesRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
-    ListSandboxProvidersRequest, ListSandboxesRequest, PolicySource, PolicyStatus, Provider,
-    ProviderProfile, ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    GetSandboxRequest, GetServiceRequest, HealthRequest, ImportProviderProfilesRequest,
+    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
+    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
+    ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderProfile,
+    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
     RevokeSshSessionRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    SetClusterInferenceRequest, SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit,
-    TcpRelayTarget, UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest,
-    exec_sandbox_event, setting_value, tcp_forward_init,
+    ServiceEndpointResponse, SetClusterInferenceRequest, SettingScope, SettingValue,
+    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, UpdateProviderRequest,
+    WatchSandboxRequest, exec_sandbox_event, setting_value, tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -3445,20 +3446,173 @@ pub async fn service_expose(
 }
 
 fn service_expose_status_error(status: Status) -> miette::Report {
+    service_status_error("expose service", "sandbox:write", status)
+}
+
+pub async fn service_list(
+    server: &str,
+    sandbox: Option<&str>,
+    limit: u32,
+    offset: u32,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .list_services(ListServicesRequest {
+            sandbox: sandbox.unwrap_or_default().to_string(),
+            limit,
+            offset,
+        })
+        .await
+        .map_err(|status| service_status_error("list services", "sandbox:read", status))?
+        .into_inner();
+
+    if response.services.is_empty() {
+        if let Some(sandbox) = sandbox {
+            println!("No services exposed for sandbox {sandbox}.");
+        } else {
+            println!("No services exposed.");
+        }
+        return Ok(());
+    }
+
+    print_service_endpoint_table(&response.services, server);
+    Ok(())
+}
+
+pub async fn service_get(
+    server: &str,
+    sandbox: &str,
+    service: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_service(GetServiceRequest {
+            sandbox: sandbox.to_string(),
+            service: service.to_string(),
+        })
+        .await
+        .map_err(|status| service_status_error("get service", "sandbox:read", status))?
+        .into_inner();
+
+    print_service_endpoint_table(&[response], server);
+    Ok(())
+}
+
+pub async fn service_delete(
+    server: &str,
+    sandbox: &str,
+    service: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .delete_service(DeleteServiceRequest {
+            sandbox: sandbox.to_string(),
+            service: service.to_string(),
+        })
+        .await
+        .map_err(|status| service_status_error("delete service", "sandbox:write", status))?
+        .into_inner();
+
+    if !response.deleted {
+        return Err(miette!("delete service failed: service endpoint not found"));
+    }
+
+    if service.is_empty() {
+        println!(
+            "{} Deleted exposed sandbox {}",
+            "✓".green().bold(),
+            sandbox.bold(),
+        );
+    } else {
+        println!(
+            "{} Deleted service {} on sandbox {}",
+            "✓".green().bold(),
+            service.bold(),
+            sandbox.bold(),
+        );
+    }
+    Ok(())
+}
+
+fn service_status_error(action: &str, required_scope: &str, status: Status) -> miette::Report {
     let message = status.message();
     match status.code() {
         Code::PermissionDenied => {
-            miette!("expose service failed: permission denied (requires sandbox:write)")
+            miette!("{action} failed: permission denied (requires {required_scope})")
         }
-        Code::Unauthenticated => miette!("expose service failed: authentication required"),
+        Code::Unauthenticated => miette!("{action} failed: authentication required"),
         Code::NotFound if message == "sandbox not found" => {
-            miette!("expose service failed: sandbox not found")
+            miette!("{action} failed: sandbox not found")
+        }
+        Code::NotFound if message == "service endpoint not found" => {
+            miette!("{action} failed: service endpoint not found")
         }
         Code::InvalidArgument if !message.is_empty() => {
-            miette!("expose service failed: invalid request: {message}")
+            miette!("{action} failed: invalid request: {message}")
         }
-        _ => miette!("expose service failed: {status}"),
+        _ => miette!("{action} failed: {status}"),
     }
+}
+
+fn print_service_endpoint_table(services: &[ServiceEndpointResponse], gateway_endpoint: &str) {
+    let rows = services
+        .iter()
+        .filter_map(|response| {
+            let endpoint = response.endpoint.as_ref()?;
+            let service = service_display_name(&endpoint.service_name).to_string();
+            let target = format!("127.0.0.1:{}", endpoint.target_port);
+            let url = if response.url.is_empty() {
+                String::new()
+            } else {
+                service_url_for_gateway(&response.url, gateway_endpoint)
+            };
+            Some((endpoint.sandbox_name.clone(), service, target, url))
+        })
+        .collect::<Vec<_>>();
+
+    if rows.is_empty() {
+        return;
+    }
+
+    let sandbox_width = rows
+        .iter()
+        .map(|(sandbox, _, _, _)| sandbox.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let service_width = rows
+        .iter()
+        .map(|(_, service, _, _)| service.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let target_width = rows
+        .iter()
+        .map(|(_, _, target, _)| target.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+
+    println!(
+        "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {}",
+        "SANDBOX".bold(),
+        "SERVICE".bold(),
+        "TARGET".bold(),
+        "URL".bold(),
+    );
+
+    for (sandbox, service, target, url) in rows {
+        println!(
+            "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {url}"
+        );
+    }
+}
+
+fn service_display_name(service: &str) -> &str {
+    if service.is_empty() { "-" } else { service }
 }
 
 fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String {

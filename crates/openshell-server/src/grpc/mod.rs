@@ -15,23 +15,25 @@ use openshell_core::proto::{
     ClearDraftChunksRequest, ClearDraftChunksResponse, CreateProviderRequest, CreateSandboxRequest,
     CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderProfileRequest,
     DeleteProviderProfileResponse, DeleteProviderRequest, DeleteProviderResponse,
-    DeleteSandboxRequest, DeleteSandboxResponse, DetachSandboxProviderRequest,
-    DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent,
-    ExecSandboxRequest, ExposeServiceRequest, GatewayMessage, GetDraftHistoryRequest,
-    GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
-    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderProfileRequest,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
-    GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    DeleteSandboxRequest, DeleteSandboxResponse, DeleteServiceRequest, DeleteServiceResponse,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
+    EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxRequest, ExposeServiceRequest,
+    GatewayMessage, GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest,
+    GetDraftPolicyResponse, GetGatewayConfigRequest, GetGatewayConfigResponse,
+    GetProviderProfileRequest, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
+    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ImportProviderProfilesRequest, ImportProviderProfilesResponse,
-    LintProviderProfilesRequest, LintProviderProfilesResponse, ListProviderProfilesRequest,
-    ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxProvidersRequest,
-    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
-    ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
-    RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame, ReportPolicyStatusRequest,
-    ReportPolicyStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
-    SandboxStreamEvent, ServiceEndpointResponse, ServiceStatus, SubmitPolicyAnalysisRequest,
+    GetServiceRequest, HealthRequest, HealthResponse, ImportProviderProfilesRequest,
+    ImportProviderProfilesResponse, LintProviderProfilesRequest, LintProviderProfilesResponse,
+    ListProviderProfilesRequest, ListProviderProfilesResponse, ListProvidersRequest,
+    ListProvidersResponse, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
+    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
+    ListSandboxesResponse, ListServicesRequest, ListServicesResponse, ProviderProfileResponse,
+    ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
+    RejectDraftChunkResponse, RelayFrame, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent,
+    ServiceEndpointResponse, ServiceStatus, SubmitPolicyAnalysisRequest,
     SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
     UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse, UpdateProviderRequest,
     WatchSandboxRequest, open_shell_server::OpenShell,
@@ -266,6 +268,27 @@ impl OpenShell for OpenShellService {
         request: Request<ExposeServiceRequest>,
     ) -> Result<Response<ServiceEndpointResponse>, Status> {
         service::handle_expose_service(&self.state, request).await
+    }
+
+    async fn get_service(
+        &self,
+        request: Request<GetServiceRequest>,
+    ) -> Result<Response<ServiceEndpointResponse>, Status> {
+        service::handle_get_service(&self.state, request).await
+    }
+
+    async fn list_services(
+        &self,
+        request: Request<ListServicesRequest>,
+    ) -> Result<Response<ListServicesResponse>, Status> {
+        service::handle_list_services(&self.state, request).await
+    }
+
+    async fn delete_service(
+        &self,
+        request: Request<DeleteServiceRequest>,
+    ) -> Result<Response<DeleteServiceResponse>, Status> {
+        service::handle_delete_service(&self.state, request).await
     }
 
     async fn revoke_ssh_session(

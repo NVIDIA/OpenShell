@@ -48,8 +48,17 @@ service OpenShell {
   // Create a short-lived SSH session for a sandbox.
   rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse);
 
-  // Create or update a sandbox HTTP service endpoint for local-domain routing.
+  // Create or update a sandbox HTTP service endpoint for local routing.
   rpc ExposeService(ExposeServiceRequest) returns (ServiceEndpointResponse);
+
+  // Fetch one sandbox HTTP service endpoint.
+  rpc GetService(GetServiceRequest) returns (ServiceEndpointResponse);
+
+  // List sandbox HTTP service endpoints.
+  rpc ListServices(ListServicesRequest) returns (ListServicesResponse);
+
+  // Delete one sandbox HTTP service endpoint.
+  rpc DeleteService(DeleteServiceRequest) returns (DeleteServiceResponse);
 
   // Revoke a previously issued SSH session.
   rpc RevokeSshSession(RevokeSshSessionRequest) returns (RevokeSshSessionResponse);
@@ -470,6 +479,43 @@ message ExposeServiceRequest {
   uint32 target_port = 3;
   // Whether to print/use the local-domain URL.
   bool domain = 4;
+}
+
+// Request to fetch an exposed sandbox service endpoint.
+message GetServiceRequest {
+  // Sandbox name.
+  string sandbox = 1;
+  // Service name within the sandbox. Empty selects the unnamed endpoint.
+  string service = 2;
+}
+
+// Request to list exposed sandbox service endpoints.
+message ListServicesRequest {
+  // Optional sandbox name. Empty lists endpoints for all sandboxes.
+  string sandbox = 1;
+  // Page size. Zero uses the server default.
+  uint32 limit = 2;
+  // Page offset.
+  uint32 offset = 3;
+}
+
+// Response containing exposed sandbox service endpoints.
+message ListServicesResponse {
+  repeated ServiceEndpointResponse services = 1;
+}
+
+// Request to delete an exposed sandbox service endpoint.
+message DeleteServiceRequest {
+  // Sandbox name.
+  string sandbox = 1;
+  // Service name within the sandbox. Empty selects the unnamed endpoint.
+  string service = 2;
+}
+
+// Response for deleting an exposed sandbox service endpoint.
+message DeleteServiceResponse {
+  // True when an endpoint existed and was deleted.
+  bool deleted = 1;
 }
 
 // Persisted sandbox service endpoint.

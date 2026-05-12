@@ -279,6 +279,10 @@ const SERVICE_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell service expose my-sandbox 8080
   $ openshell service expose my-sandbox 8080 web
+  $ openshell service list
+  $ openshell service list my-sandbox
+  $ openshell service get my-sandbox web
+  $ openshell service delete my-sandbox web
 ";
 
 const LOGS_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
@@ -418,7 +422,7 @@ enum Commands {
         command: Option<ForwardCommands>,
     },
 
-    /// Expose sandbox services.
+    /// Manage sandbox services.
     #[command(alias = "svc", after_help = SERVICE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Service {
         #[command(subcommand)]
@@ -1668,6 +1672,44 @@ enum ServiceCommands {
         /// Service name.
         service: Option<String>,
     },
+
+    /// List exposed sandbox service endpoints.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: Option<String>,
+
+        /// Maximum number of endpoints to return.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+
+        /// Number of endpoints to skip.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+    },
+
+    /// Show one exposed sandbox service endpoint.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: String,
+
+        /// Service name. Omit for the unnamed endpoint.
+        service: Option<String>,
+    },
+
+    /// Delete one exposed sandbox service endpoint.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: String,
+
+        /// Service name. Omit for the unnamed endpoint.
+        service: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -1958,18 +2000,38 @@ async fn main() -> Result<()> {
         // Service exposure
         // -----------------------------------------------------------
         Some(Commands::Service {
-            command:
-                Some(ServiceCommands::Expose {
-                    sandbox,
-                    service,
-                    target_port,
-                }),
+            command: Some(command),
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name);
-            let service = service.unwrap_or_default();
-            run::service_expose(&ctx.endpoint, &sandbox, &service, target_port, &tls).await?;
+            match command {
+                ServiceCommands::Expose {
+                    sandbox,
+                    service,
+                    target_port,
+                } => {
+                    let service = service.unwrap_or_default();
+                    run::service_expose(&ctx.endpoint, &sandbox, &service, target_port, &tls)
+                        .await?;
+                }
+                ServiceCommands::List {
+                    sandbox,
+                    limit,
+                    offset,
+                } => {
+                    run::service_list(&ctx.endpoint, sandbox.as_deref(), limit, offset, &tls)
+                        .await?;
+                }
+                ServiceCommands::Get { sandbox, service } => {
+                    let service = service.unwrap_or_default();
+                    run::service_get(&ctx.endpoint, &sandbox, &service, &tls).await?;
+                }
+                ServiceCommands::Delete { sandbox, service } => {
+                    let service = service.unwrap_or_default();
+                    run::service_delete(&ctx.endpoint, &sandbox, &service, &tls).await?;
+                }
+            }
         }
         // -----------------------------------------------------------
         // Top-level logs (was `sandbox logs`)
@@ -3648,6 +3710,114 @@ mod tests {
                 assert_eq!(service, None);
             }
             other => panic!("expected service expose command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_list_accepts_optional_sandbox_and_paging() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "service",
+            "list",
+            "my-sandbox",
+            "--limit",
+            "10",
+            "--offset",
+            "2",
+        ])
+        .expect("service list should parse optional sandbox and paging");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::List {
+                        sandbox,
+                        limit,
+                        offset,
+                    }),
+            }) => {
+                assert_eq!(sandbox.as_deref(), Some("my-sandbox"));
+                assert_eq!(limit, 10);
+                assert_eq!(offset, 2);
+            }
+            other => panic!("expected service list command, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["openshell", "service", "list"])
+            .expect("service list should allow omitting sandbox");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::List {
+                        sandbox,
+                        limit,
+                        offset,
+                    }),
+            }) => {
+                assert_eq!(sandbox, None);
+                assert_eq!(limit, 100);
+                assert_eq!(offset, 0);
+            }
+            other => panic!("expected service list command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_get_accepts_optional_service_name() {
+        let cli = Cli::try_parse_from(["openshell", "service", "get", "my-sandbox", "api"])
+            .expect("service get should parse service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command: Some(ServiceCommands::Get { sandbox, service }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(service.as_deref(), Some("api"));
+            }
+            other => panic!("expected service get command, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["openshell", "service", "get", "my-sandbox"])
+            .expect("service get should allow omitting service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command: Some(ServiceCommands::Get { sandbox, service }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(service, None);
+            }
+            other => panic!("expected service get command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_delete_accepts_optional_service_name() {
+        let cli = Cli::try_parse_from(["openshell", "service", "delete", "my-sandbox", "api"])
+            .expect("service delete should parse service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command: Some(ServiceCommands::Delete { sandbox, service }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(service.as_deref(), Some("api"));
+            }
+            other => panic!("expected service delete command, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["openshell", "service", "delete", "my-sandbox"])
+            .expect("service delete should allow omitting service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command: Some(ServiceCommands::Delete { sandbox, service }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(service, None);
+            }
+            other => panic!("expected service delete command, got: {other:?}"),
         }
     }
 }

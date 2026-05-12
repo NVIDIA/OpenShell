@@ -563,6 +563,11 @@ pub fn emit_service_endpoint_config_event(endpoint: &ServiceEndpoint, url: &str,
     emit_gateway_ocsf_event(&endpoint.sandbox_id, event);
 }
 
+pub fn emit_service_endpoint_delete_event(endpoint: &ServiceEndpoint) {
+    let event = build_service_endpoint_delete_event(endpoint);
+    emit_gateway_ocsf_event(&endpoint.sandbox_id, event);
+}
+
 pub fn emit_cross_origin_service_http_rejection(state: &ServerState, req: &Request<Body>) {
     let Some(host) = request_host(req) else {
         return;
@@ -632,6 +637,22 @@ fn build_service_endpoint_config_event(
     }
 
     builder.build()
+}
+
+fn build_service_endpoint_delete_event(endpoint: &ServiceEndpoint) -> OcsfEvent {
+    let service_label = service_display_name(&endpoint.sandbox_name, &endpoint.service_name);
+    ConfigStateChangeBuilder::new(&gateway_ocsf_ctx(
+        &endpoint.sandbox_id,
+        &endpoint.sandbox_name,
+    ))
+    .state(StateId::Disabled, "service_endpoint_deleted")
+    .severity(SeverityId::Informational)
+    .status(StatusId::Success)
+    .message(format!("Service endpoint deleted {service_label}"))
+    .unmapped("endpoint_name", endpoint_name(endpoint))
+    .unmapped("service_name", endpoint.service_name.clone())
+    .unmapped("target_port", u64::from(endpoint.target_port))
+    .build()
 }
 
 fn build_service_http_failure_event(
@@ -961,6 +982,22 @@ mod tests {
             event
                 .format_shorthand()
                 .contains("Service endpoint exposed my-sandbox/web")
+        );
+    }
+
+    #[test]
+    fn service_endpoint_delete_event_includes_endpoint_metadata() {
+        let event = build_service_endpoint_delete_event(&endpoint());
+        let json = event.to_json().unwrap();
+
+        assert_eq!(json["class_uid"], 5019);
+        assert_eq!(json["unmapped"]["endpoint_name"], "my-sandbox--web");
+        assert_eq!(json["unmapped"]["service_name"], "web");
+        assert_eq!(json["unmapped"]["target_port"], 8080);
+        assert!(
+            event
+                .format_shorthand()
+                .contains("Service endpoint deleted my-sandbox/web")
         );
     }
 

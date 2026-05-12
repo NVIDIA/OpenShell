@@ -47,6 +47,8 @@ const SCOPED_METHODS: &[(&str, &str)] = &[
     ),
     ("/openshell.v1.OpenShell/WatchSandbox", "sandbox:read"),
     ("/openshell.v1.OpenShell/GetSandboxLogs", "sandbox:read"),
+    ("/openshell.v1.OpenShell/GetService", "sandbox:read"),
+    ("/openshell.v1.OpenShell/ListServices", "sandbox:read"),
     (
         "/openshell.v1.OpenShell/GetSandboxPolicyStatus",
         "sandbox:read",
@@ -63,6 +65,7 @@ const SCOPED_METHODS: &[(&str, &str)] = &[
     ("/openshell.v1.OpenShell/CreateSshSession", "sandbox:write"),
     ("/openshell.v1.OpenShell/RevokeSshSession", "sandbox:write"),
     ("/openshell.v1.OpenShell/ExposeService", "sandbox:write"),
+    ("/openshell.v1.OpenShell/DeleteService", "sandbox:write"),
     (
         "/openshell.v1.OpenShell/AttachSandboxProvider",
         "sandbox:write",
@@ -419,6 +422,16 @@ mod tests {
         );
         assert!(
             policy
+                .check(&id, "/openshell.v1.OpenShell/ListServices")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/GetService")
+                .is_ok()
+        );
+        assert!(
+            policy
                 .check(&id, "/openshell.v1.OpenShell/CreateSandbox")
                 .is_ok()
         );
@@ -430,6 +443,11 @@ mod tests {
         assert!(
             policy
                 .check(&id, "/openshell.v1.OpenShell/ExposeService")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/DeleteService")
                 .is_ok()
         );
         assert!(
@@ -453,6 +471,16 @@ mod tests {
                 .check(&id, "/openshell.v1.OpenShell/ListSandboxes")
                 .is_ok()
         );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/ListServices")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/GetService")
+                .is_ok()
+        );
         let err = policy
             .check(&id, "/openshell.v1.OpenShell/AttachSandboxProvider")
             .unwrap_err();
@@ -461,6 +489,12 @@ mod tests {
 
         let err = policy
             .check(&id, "/openshell.v1.OpenShell/ExposeService")
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("sandbox:write"));
+
+        let err = policy
+            .check(&id, "/openshell.v1.OpenShell/DeleteService")
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(err.message().contains("sandbox:write"));
