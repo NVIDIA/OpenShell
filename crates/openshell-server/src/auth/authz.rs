@@ -59,6 +59,7 @@ const SCOPED_METHODS: &[(&str, &str)] = &[
     ("/openshell.v1.OpenShell/CreateSandbox", "sandbox:write"),
     ("/openshell.v1.OpenShell/DeleteSandbox", "sandbox:write"),
     ("/openshell.v1.OpenShell/ExecSandbox", "sandbox:write"),
+    ("/openshell.v1.OpenShell/ForwardTcp", "sandbox:write"),
     ("/openshell.v1.OpenShell/CreateSshSession", "sandbox:write"),
     ("/openshell.v1.OpenShell/RevokeSshSession", "sandbox:write"),
     (
@@ -418,6 +419,11 @@ mod tests {
         assert!(
             policy
                 .check(&id, "/openshell.v1.OpenShell/CreateSandbox")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/ForwardTcp")
                 .is_ok()
         );
         assert!(

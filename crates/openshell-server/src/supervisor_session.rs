@@ -246,7 +246,7 @@ impl SupervisorSessionRegistry {
         self.open_relay_with_target(
             sandbox_id,
             relay_open::Target::Ssh(SshRelayTarget {}),
-            "".to_string(),
+            String::new(),
             session_wait_timeout,
         )
         .await
@@ -331,7 +331,7 @@ impl SupervisorSessionRegistry {
         }
     }
 
-    /// Claim a pending relay channel. Called by the /relay/{channel_id} HTTP handler
+    /// Claim a pending relay channel. Called by the `/relay/{channel_id}` HTTP handler
     /// when the supervisor's reverse CONNECT arrives.
     ///
     /// Returns the `DuplexStream` half that the supervisor side should read/write.
@@ -1285,7 +1285,9 @@ mod tests {
             pending_relay(
                 "sbx-test",
                 relay_tx,
-                Instant::now() - Duration::from_secs(60),
+                Instant::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .expect("test duration should be before now"),
             ),
         );
 
@@ -1358,7 +1360,9 @@ mod tests {
             pending_relay(
                 "sbx-test",
                 relay_tx,
-                Instant::now() - Duration::from_secs(60),
+                Instant::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .expect("test duration should be before now"),
             ),
         );
 

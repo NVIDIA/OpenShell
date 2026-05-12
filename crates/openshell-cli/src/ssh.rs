@@ -846,10 +846,7 @@ pub async fn sandbox_ssh_proxy(
     let to_remote = tokio::spawn(async move {
         let mut stdin = stdin;
         let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let Ok(n) = stdin.read(&mut buf).await else {
-                break;
-            };
+        while let Ok(n) = stdin.read(&mut buf).await {
             if n == 0 {
                 break;
             }
@@ -869,9 +866,8 @@ pub async fn sandbox_ssh_proxy(
     let from_remote = tokio::spawn(async move {
         let mut stdout = stdout;
         loop {
-            let frame = match response.message().await {
-                Ok(Some(frame)) => frame,
-                Ok(None) | Err(_) => break,
+            let Ok(Some(frame)) = response.message().await else {
+                break;
             };
             let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
             else {

@@ -20,8 +20,8 @@ use openshell_core::proto::{
     ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
     ListSandboxesResponse, Provider, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    SandboxResponse, SandboxStreamEvent, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    WatchSandboxRequest, relay_open, tcp_forward_init,
+    SandboxResponse, SandboxStreamEvent, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
+    TcpRelayTarget, WatchSandboxRequest, relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use prost::Message;
@@ -730,13 +730,10 @@ pub(super) async fn handle_forward_tcp(
         .message()
         .await?
         .ok_or_else(|| Status::invalid_argument("empty ForwardTcp stream"))?;
-    let init = match first.payload {
-        Some(openshell_core::proto::tcp_forward_frame::Payload::Init(init)) => init,
-        _ => {
-            return Err(Status::invalid_argument(
-                "first TcpForwardFrame must be init",
-            ));
-        }
+    let Some(openshell_core::proto::tcp_forward_frame::Payload::Init(init)) = first.payload else {
+        return Err(Status::invalid_argument(
+            "first TcpForwardFrame must be init",
+        ));
     };
 
     let target = validate_tcp_forward_init(&init)?;
@@ -930,7 +927,9 @@ fn validate_tcp_forward_init(init: &TcpForwardInit) -> Result<relay_open::Target
 
     if let Some(target) = init.target.as_ref() {
         return match target {
-            tcp_forward_init::Target::Ssh(_) => Ok(relay_open::Target::Ssh(Default::default())),
+            tcp_forward_init::Target::Ssh(_) => {
+                Ok(relay_open::Target::Ssh(SshRelayTarget::default()))
+            }
             tcp_forward_init::Target::Tcp(target) => Ok(relay_open::Target::Tcp(
                 validate_tcp_forward_target(target)?,
             )),
@@ -1570,12 +1569,12 @@ mod tests {
     fn tcp_forward_init_allows_ssh_target() {
         let init = TcpForwardInit {
             sandbox_id: "sbx".to_string(),
-            target: Some(tcp_forward_init::Target::Ssh(Default::default())),
+            target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget::default())),
             ..Default::default()
         };
         match validate_tcp_forward_init(&init).expect("ssh target should pass") {
             relay_open::Target::Ssh(_) => {}
-            other => panic!("expected SSH target, got {other:?}"),
+            other @ relay_open::Target::Tcp(_) => panic!("expected SSH target, got {other:?}"),
         }
     }
 

@@ -1630,7 +1630,7 @@ enum ForwardCommands {
         #[arg(long, default_value = "127.0.0.1")]
         target_host: String,
 
-        /// Local bind address and port: [bind_address:]port. Defaults to the target port. Use port 0 for dynamic assignment.
+        /// Local bind address and port: `[bind_address:]port`. Defaults to the target port. Use port 0 for dynamic assignment.
         #[arg(long)]
         local: Option<String>,
     },

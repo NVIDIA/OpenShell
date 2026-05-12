@@ -2718,13 +2718,10 @@ async fn drain_and_shutdown_local_socket(mut socket: tokio::net::TcpStream) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut buf = [0u8; 4096];
-    loop {
-        match tokio::time::timeout(Duration::from_millis(25), socket.read(&mut buf)).await {
-            Ok(Ok(0)) | Err(_) => break,
-            Ok(Ok(_)) => continue,
-            Ok(Err(_)) => break,
-        }
-    }
+    while matches!(
+        tokio::time::timeout(Duration::from_millis(25), socket.read(&mut buf)).await,
+        Ok(Ok(n)) if n != 0
+    ) {}
     let _ = socket.shutdown().await;
 }
 

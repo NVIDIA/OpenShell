@@ -2308,10 +2308,18 @@ mod tests {
 
     #[test]
     fn log_level_propagates_as_env_var_to_sandbox_pod() {
-        let spec = SandboxSpec { log_level: "debug".to_string(), ..SandboxSpec::default() };
+        let spec = SandboxSpec {
+            log_level: "debug".to_string(),
+            ..SandboxSpec::default()
+        };
         let cr = sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default());
-        let env = cr["spec"]["podTemplate"]["spec"]["containers"][0]["env"].as_array().unwrap();
-        assert!(env.iter().any(|e| e["name"] == "OPENSHELL_LOG_LEVEL" && e["value"] == "debug"));
+        let env = cr["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap();
+        assert!(
+            env.iter()
+                .any(|e| e["name"] == "OPENSHELL_LOG_LEVEL" && e["value"] == "debug")
+        );
         assert!(cr["spec"].get("logLevel").is_none());
     }
 }
