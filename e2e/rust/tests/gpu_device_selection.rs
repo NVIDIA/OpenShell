@@ -7,7 +7,6 @@
 //!
 //! Requires a GPU-backed gateway and a sandbox image containing `nvidia-smi`.
 
-use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -19,9 +18,9 @@ use serde_json::{Map, Value};
 use tokio::time::timeout;
 
 const SANDBOX_CREATE_TIMEOUT: Duration = Duration::from_secs(600);
-const GPU_PROBE_DOCKERFILE_STAGE: &str = "gateway";
 const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 const CDI_GPU_DEVICE_PREFIX: &str = "nvidia.com/gpu=";
+const GPU_PROBE_IMAGE_ENV: &str = "OPENSHELL_E2E_GPU_PROBE_IMAGE";
 
 fn gpu_lines(output: &str) -> Vec<String> {
     strip_ansi(output)
@@ -32,53 +31,18 @@ fn gpu_lines(output: &str) -> Vec<String> {
         .collect()
 }
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("failed to resolve workspace root from CARGO_MANIFEST_DIR")
-        .to_path_buf()
-}
-
-fn dockerfile_images_gpu_probe_image() -> String {
-    let dockerfile = workspace_root().join("deploy/docker/Dockerfile.images");
-    let contents = std::fs::read_to_string(&dockerfile)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", dockerfile.display()));
-
-    contents
-        .lines()
-        .map(str::trim)
-        .find_map(|line| {
-            let mut parts = line.split_whitespace();
-            let instruction = parts.next()?;
-            let image = parts.next()?;
-            let as_keyword = parts.next()?;
-            let stage = parts.next()?;
-
-            if instruction.eq_ignore_ascii_case("FROM")
-                && as_keyword.eq_ignore_ascii_case("AS")
-                && stage == GPU_PROBE_DOCKERFILE_STAGE
-            {
-                Some(image)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "failed to find a FROM <image> AS {GPU_PROBE_DOCKERFILE_STAGE} stage in {}",
-                dockerfile.display()
-            )
-        })
-        .to_string()
-}
-
 fn gpu_probe_image() -> String {
-    std::env::var("OPENSHELL_E2E_GPU_PROBE_IMAGE")
+    std::env::var(GPU_PROBE_IMAGE_ENV)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(dockerfile_images_gpu_probe_image)
+        .unwrap_or_else(|| {
+            panic!(
+                "{GPU_PROBE_IMAGE_ENV} must be set to a container image that supports \
+                 NVIDIA Container Toolkit CDI injection (set by \
+                 .github/workflows/e2e-gpu-test.yaml in CI)"
+            )
+        })
 }
 
 fn object_string<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> {

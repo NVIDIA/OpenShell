@@ -49,6 +49,11 @@ jobs:
       OPENSHELL_REGISTRY_USERNAME: ${{ github.actor }}
       OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
       OPENSHELL_E2E_DOCKER_GPU: "1"
+      # NVIDIA-managed Ubuntu base used as the GPU probe target: it has the
+      # filesystem layout CDI injection expects (ldconfig, populated /usr/bin)
+      # which the distroless gateway runtime lacks. Consumed by the prereq
+      # probe below and by the e2e tests in e2e/rust/tests/gpu_device_selection.rs.
+      OPENSHELL_E2E_GPU_PROBE_IMAGE: "nvcr.io/nvidia/base/ubuntu:noble-20251013"
     steps:
       - uses: actions/checkout@v6
 
@@ -58,11 +63,7 @@ jobs:
       - name: Check Docker GPU prerequisites
         run: |
           docker info --format '{{json .CDISpecDirs}}'
-          # NVIDIA-managed Ubuntu base — has the layout CDI injection expects
-          # (ldconfig, populated /usr/bin, etc.). The gateway runtime is now
-          # distroless and lacks those, so it is not a viable probe target.
-          GPU_PROBE_IMAGE="nvcr.io/nvidia/base/ubuntu:noble-20251013"
-          docker run --rm --device nvidia.com/gpu=all "${GPU_PROBE_IMAGE}" nvidia-smi -L
+          docker run --rm --device nvidia.com/gpu=all "${OPENSHELL_E2E_GPU_PROBE_IMAGE}" nvidia-smi -L
 
       - name: Run tests
         run: mise run --no-deps --skip-deps e2e:docker:gpu
