@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Docker-driver example. Sandboxes run as containers on a local bridge
+# network. The supervisor binary is bind-mounted from the host (no in-cluster
+# image pull required); guest mTLS material is supplied as host paths.
+#
+# `database_url` is env-only — set OPENSHELL_DB_URL / --db-url.
+
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address    = "127.0.0.1:8080"
+log_level       = "info"
+compute_drivers = ["docker"]
+
+# Shared defaults inherited into [openshell.drivers.docker].
+supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
+guest_tls_ca     = "/etc/openshell/certs/ca.pem"
+guest_tls_cert   = "/etc/openshell/certs/client.pem"
+guest_tls_key    = "/etc/openshell/certs/client-key.pem"
+
+[openshell.drivers.docker]
+network_name   = "openshell-docker"
+# Skip the image-pull-and-extract step by pointing at a locally built binary.
+supervisor_bin = "/usr/local/libexec/openshell/openshell-sandbox"

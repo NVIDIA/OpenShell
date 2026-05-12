@@ -480,4 +480,25 @@ version = 2
             .expect_err("missing file must be io error");
         assert!(matches!(err, ConfigFileError::Io { .. }));
     }
+
+    /// Lock in that every checked-in example under `examples/gateway/`
+    /// round-trips through the loader. Catches schema drift the moment a
+    /// field is renamed or a doc snippet falls out of date.
+    #[test]
+    fn checked_in_examples_parse() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crate manifest has grandparent");
+        for name in [
+            "gateway.example.toml",
+            "kubernetes.example.toml",
+            "docker.example.toml",
+            "podman.example.toml",
+            "microvm.example.toml",
+        ] {
+            let path = repo_root.join("examples/gateway").join(name);
+            load(&path).unwrap_or_else(|e| panic!("{name} failed to parse: {e}"));
+        }
+    }
 }

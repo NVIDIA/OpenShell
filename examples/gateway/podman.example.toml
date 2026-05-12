@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Podman-driver example. Sandboxes run as Podman containers on a user-mode
+# bridge network. The supervisor image is mounted read-only via Podman's
+# `type=image` mount; guest mTLS material is supplied as host paths.
+#
+# `database_url` is env-only — set OPENSHELL_DB_URL / --db-url.
+
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address    = "127.0.0.1:8080"
+log_level       = "info"
+compute_drivers = ["podman"]
+
+# Shared defaults inherited into [openshell.drivers.podman].
+default_image     = "ghcr.io/nvidia/openshell/sandbox:latest"
+supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
+image_pull_policy = "missing"   # Podman pull policy: always | missing | never | newer
+guest_tls_ca      = "/etc/openshell/certs/ca.pem"
+guest_tls_cert    = "/etc/openshell/certs/client.pem"
+guest_tls_key     = "/etc/openshell/certs/client-key.pem"
+
+[openshell.drivers.podman]
+# Rootless socket path. For root Podman use /run/podman/podman.sock.
+socket_path       = "/run/user/1000/podman/podman.sock"
+network_name      = "openshell"
+stop_timeout_secs = 10
