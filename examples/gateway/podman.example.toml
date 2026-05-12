@@ -18,7 +18,6 @@ compute_drivers = ["podman"]
 # Shared defaults inherited into [openshell.drivers.podman].
 default_image     = "ghcr.io/nvidia/openshell/sandbox:latest"
 supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
-image_pull_policy = "missing"   # Podman pull policy: always | missing | never | newer
 guest_tls_ca      = "/etc/openshell/certs/ca.pem"
 guest_tls_cert    = "/etc/openshell/certs/client.pem"
 guest_tls_key     = "/etc/openshell/certs/client-key.pem"
@@ -28,3 +27,4 @@ guest_tls_key     = "/etc/openshell/certs/client-key.pem"
 socket_path       = "/run/user/1000/podman/podman.sock"
 network_name      = "openshell"
 stop_timeout_secs = 10
+image_pull_policy = "missing"   # Podman vocabulary: always | missing | never | newer

@@ -140,7 +140,7 @@ guest_tls_key     = "/etc/openshell/certs/client-key.pem"
 [openshell.drivers.podman]
 socket_path       = "/run/podman/podman.sock"
 default_image     = "ghcr.io/nvidia/openshell/sandbox:latest"
-image_pull_policy = "IfNotPresent"
+image_pull_policy = "missing"   # Podman vocabulary: always | missing | never | newer
 supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
 network_name      = "openshell"
 stop_timeout_secs = 10

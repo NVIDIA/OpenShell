@@ -114,8 +114,6 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub supervisor_image: Option<String>,
     #[serde(default)]
-    pub image_pull_policy: Option<String>,
-    #[serde(default)]
     pub client_tls_secret_name: Option<String>,
     #[serde(default)]
     pub host_gateway_ip: Option<String>,
@@ -243,7 +241,6 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
         ComputeDriverKind::Kubernetes => &[
             "default_image",
             "supervisor_image",
-            "image_pull_policy",
             "client_tls_secret_name",
             "host_gateway_ip",
             "enable_user_namespaces",
@@ -257,7 +254,6 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
         ComputeDriverKind::Podman => &[
             "default_image",
             "supervisor_image",
-            "image_pull_policy",
             "guest_tls_ca",
             "guest_tls_cert",
             "guest_tls_key",
@@ -275,7 +271,6 @@ fn gateway_inherited_value(g: &GatewayFileSection, key: &str) -> Option<toml::Va
     match key {
         "default_image" => g.default_image.as_deref().map(string_value),
         "supervisor_image" => g.supervisor_image.as_deref().map(string_value),
-        "image_pull_policy" => g.image_pull_policy.as_deref().map(string_value),
         "client_tls_secret_name" => g.client_tls_secret_name.as_deref().map(string_value),
         "host_gateway_ip" => g.host_gateway_ip.as_deref().map(string_value),
         "enable_user_namespaces" => g.enable_user_namespaces.map(toml::Value::Boolean),
@@ -331,7 +326,6 @@ compute_drivers = ["kubernetes"]
 sandbox_namespace = "agents"
 default_image = "ghcr.io/nvidia/openshell/sandbox:latest"
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
-image_pull_policy = "IfNotPresent"
 client_tls_secret_name = "openshell-sandbox-tls"
 
 [openshell.gateway.tls]
@@ -407,7 +401,6 @@ version = 2
         let gateway = GatewayFileSection {
             default_image: Some("ghcr.io/nvidia/openshell/sandbox:0.9".to_string()),
             supervisor_image: Some("ghcr.io/nvidia/openshell/supervisor:0.9".to_string()),
-            image_pull_policy: Some("IfNotPresent".to_string()),
             ..Default::default()
         };
         let raw = toml::toml! {
