@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Kubernetes-driver example. The gateway runs as a Pod and creates sandbox
+# Pods in another namespace. mTLS material for sandboxes is delivered via a
+# Kubernetes Secret rather than host-side file paths.
+#
+# `database_url` is env-only — set OPENSHELL_DB_URL / --db-url.
+
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address          = "0.0.0.0:8080"
+health_bind_address   = "0.0.0.0:8081"
+metrics_bind_address  = "0.0.0.0:9090"
+log_level             = "info"
+compute_drivers       = ["kubernetes"]
+
+# Shared defaults inherited into [openshell.drivers.kubernetes].
+default_image          = "ghcr.io/nvidia/openshell/sandbox:latest"
+supervisor_image       = "ghcr.io/nvidia/openshell/supervisor:latest"
+image_pull_policy      = "IfNotPresent"
+client_tls_secret_name = "openshell-client-tls"
+
+[openshell.gateway.tls]
+cert_path      = "/etc/openshell-tls/server/tls.crt"
+key_path       = "/etc/openshell-tls/server/tls.key"
+client_ca_path = "/etc/openshell-tls/client-ca/ca.crt"
+
+[openshell.drivers.kubernetes]
+namespace                  = "agents"
+grpc_endpoint              = "https://openshell-gateway.agents.svc:8080"
+# Use the image volume on K8s >= 1.35 (GA in 1.36); switch to "init-container"
+# on older clusters or where the ImageVolume feature gate is off.
+supervisor_sideload_method = "image-volume"
