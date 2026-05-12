@@ -134,7 +134,7 @@ server:
   # TLS-enabled gateways.
   enableLoopbackServiceHttp: true
   serviceBaseDomains:
-    - "openshell.openshell.localhost"
+    - "openshell.localhost"
   tls:
     # K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server
     certSecretName: openshell-server-tls
@@ -186,9 +186,10 @@ sshHandshake:
 #
 # The server certificate already includes the built-in cluster SANs
 # (`openshell`, `openshell.openshell.svc`, the cluster.local FQDN, `localhost`,
-# `host.docker.internal`, and `127.0.0.1`) baked into the gateway binary. The
-# lists below are *additional* SANs appended on top — typically a public
-# hostname or load-balancer IP for remote deployments.
+# `openshell.localhost`, `*.openshell.localhost`, `host.docker.internal`, and
+# `127.0.0.1`) baked into the gateway binary. The lists below are *additional*
+# SANs appended on top — typically a public hostname or load-balancer IP for
+# remote deployments.
 pkiInitJob:
   enabled: true
   # Extra DNS SANs to append to the server certificate.
@@ -213,6 +214,8 @@ certManager:
     - openshell.openshell.svc
     - openshell.openshell.svc.cluster.local
     - localhost
+    - openshell.localhost
+    - "*.openshell.localhost"
     - host.docker.internal
   serverIpAddresses:
     - 127.0.0.1

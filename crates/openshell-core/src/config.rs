@@ -36,11 +36,8 @@ pub const DEFAULT_NETWORK_NAME: &str = "openshell";
 /// Default Docker bridge network name for local sandboxes.
 pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 
-/// Default root used to derive browser-facing sandbox service domains.
-pub const DEFAULT_SERVICE_BASE_DOMAIN_ROOT: &str = "openshell.localhost";
-
-/// Default gateway name used when no gateway-specific service base domain exists.
-pub const DEFAULT_GATEWAY_NAME: &str = "openshell";
+/// Default base domain used for browser-facing sandbox service URLs.
+pub const DEFAULT_SERVICE_BASE_DOMAIN: &str = "openshell.localhost";
 
 /// Default OCI image for the openshell-sandbox supervisor binary.
 pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
@@ -631,17 +628,11 @@ fn default_bind_address() -> SocketAddr {
 }
 
 fn default_service_base_domains() -> Vec<String> {
-    vec![default_service_base_domain_for_gateway(
-        DEFAULT_GATEWAY_NAME,
-    )]
+    vec![DEFAULT_SERVICE_BASE_DOMAIN.to_string()]
 }
 
 const fn default_enable_loopback_service_http() -> bool {
     true
-}
-
-pub fn default_service_base_domain_for_gateway(name: &str) -> String {
-    format!("{name}.{DEFAULT_SERVICE_BASE_DOMAIN_ROOT}")
 }
 
 fn normalize_service_base_domain(domain: String) -> Option<String> {
@@ -688,7 +679,8 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeDriverKind, Config, detect_driver, docker_host_unix_socket_path, is_unix_socket,
+        ComputeDriverKind, Config, DEFAULT_SERVICE_BASE_DOMAIN, detect_driver,
+        docker_host_unix_socket_path, is_unix_socket,
     };
     use std::net::SocketAddr;
     #[cfg(unix)]
@@ -736,6 +728,10 @@ mod tests {
     #[test]
     fn service_routing_allows_loopback_plaintext_http_by_default() {
         let cfg = Config::new(None);
+        assert_eq!(
+            cfg.service_routing.service_base_domains,
+            vec![DEFAULT_SERVICE_BASE_DOMAIN.to_string()]
+        );
         assert!(cfg.service_routing.enable_loopback_service_http);
     }
 
