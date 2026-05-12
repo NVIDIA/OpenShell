@@ -55,7 +55,7 @@ After the Gateway is provisioned, Envoy Gateway creates a LoadBalancer service i
 kubectl -n openshell get svc -l gateway.envoyproxy.io/owning-gateway-name=openshell
 ```
 
-Once the `EXTERNAL-IP` is assigned, register the gateway with the CLI:
+After the `EXTERNAL-IP` is assigned, register the gateway with the CLI:
 
 ```shell
 openshell gateway add http://<external-ip> --name production

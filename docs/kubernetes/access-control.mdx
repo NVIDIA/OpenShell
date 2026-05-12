@@ -64,7 +64,7 @@ helm upgrade openshell \
   --set server.oidc.userRole=openshell-user
 ```
 
-`adminRole` and `userRole` must both be set or both be empty — setting only one is not supported.
+Both `adminRole` and `userRole` must be set, or both must be empty. Setting only one is not supported.
 
 ### Provider-specific rolesClaim paths
 
@@ -76,7 +76,7 @@ helm upgrade openshell \
 
 ## Reverse-Proxy Auth Termination
 
-When an access proxy — such as Cloudflare Access, ngrok, or a corporate SSO gateway — handles authentication in front of the OpenShell gateway, you can disable the gateway's own client certificate verification:
+When an access proxy, such as Cloudflare Access, ngrok, or a corporate SSO gateway, handles authentication in front of the OpenShell gateway, you can disable the gateway's own client certificate verification:
 
 ```shell
 helm upgrade openshell \
@@ -99,7 +99,7 @@ To also disable TLS entirely (when the proxy terminates TLS before the request r
 Only disable TLS and gateway auth when the gateway is not reachable from outside the cluster and the proxy path is fully trusted. Never expose a plaintext, auth-disabled gateway to a public network.
 </Warning>
 
-Register the gateway with the CLI using the proxy's public URL — the browser-based login flow runs automatically on first use:
+Register the gateway with the CLI using the proxy's public URL. The browser-based login flow runs automatically on first use:
 
 ```shell
 openshell gateway add https://gateway.example.com --name production

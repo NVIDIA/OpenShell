@@ -1,7 +1,7 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "OpenShell Security Best Practices — Controls, Risks, and Configuration Guidance"
+title: "OpenShell Security Best Practices for Controls, Risks, and Configuration Guidance"
 sidebar-title: "Security Best Practices"
 slug: "security/best-practices"
 description: "A guide to every configurable security control in OpenShell: defaults, what you can change, and the risks of each choice."
@@ -66,13 +66,13 @@ Even if a process ignores proxy environment variables, it can only reach the pro
 ### User Namespace Isolation
 
 Kubernetes user namespaces (`hostUsers: false`) map container UID 0 to an unprivileged host UID.
-Capabilities like `CAP_SYS_ADMIN` become namespaced — they grant power over container-local resources only, not the host.
+Capabilities like `CAP_SYS_ADMIN` become namespaced. They grant power over container-local resources only, not the host.
 This provides defense-in-depth: even if a container escape vulnerability exists, the attacker lands as an unprivileged host user.
 
 | Aspect | Detail |
 |---|---|
 | Default | Disabled. Set `server.enableUserNamespaces: true` in the Helm values or `OPENSHELL_ENABLE_USER_NAMESPACES=true` as an environment variable to enable cluster-wide. |
-| What you can change | Enable cluster-wide via Helm or environment variable. Override per-sandbox via the `user_namespaces` field on `SandboxTemplate` in the API. |
+| What you can change | Enable cluster-wide through Helm or environment variable. Override per-sandbox through the `user_namespaces` field on `SandboxTemplate` in the API. |
 | Prerequisites | Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), a container runtime that supports user namespaces (containerd 2.0+, CRI-O 1.25+), and Linux 5.12+ for ID-mapped mounts. |
 | Risk if enabled with GPU | NVIDIA device plugin compatibility with user namespaces is unverified. OpenShell logs a warning when both GPU and user namespaces are active on the same sandbox. |
 | Recommendation | Enable on non-GPU clusters running Kubernetes with user namespace support available (1.33+ beta, 1.36+ GA) for stronger host isolation. Test GPU workloads separately before enabling on GPU clusters. |
@@ -110,7 +110,7 @@ When L7 inspection is active, the `enforcement` field controls whether the proxy
 | Default | `audit`. The proxy logs violations but forwards traffic. |
 | What you can change | Set `enforcement: enforce` to block requests that do not match any `rules` entry. Denied requests receive a `403 Forbidden` response with a JSON body describing the violation. |
 | Risk if relaxed | `audit` mode provides visibility but does not prevent unauthorized actions. An agent can still perform write or delete operations on an API even if the rules would deny them. |
-| Recommendation | Start with `audit` to understand traffic patterns and verify that rules are correct. Switch to `enforce` once you have validated that the rules match the intended access pattern. |
+| Recommendation | Start with `audit` to understand traffic patterns and verify that rules are correct. Switch to `enforce` after you validate that the rules match the intended access pattern. |
 
 ### TLS Handling
 
@@ -268,7 +268,7 @@ For Helm deployments, provide a CA and certificate bundle through the Kubernetes
 
 ### SSH Tunnel Authentication
 
-SSH connections to sandboxes travel through the gateway over the sandbox's existing mTLS session. On top of the gateway's transport authentication (mTLS by default), each SSH connect call also carries a short-lived session token scoped to a specific sandbox. The sandbox never exposes an SSH port on the network — its SSH daemon listens on a local Unix socket that only the sandbox's own supervisor process can reach.
+SSH connections to sandboxes travel through the gateway over the sandbox's existing mTLS session. On top of the gateway's transport authentication (mTLS by default), each SSH connect call also carries a short-lived session token scoped to a specific sandbox. The sandbox never exposes an SSH port on the network. Its SSH daemon listens on a local Unix socket that only the sandbox's own supervisor process can reach.
 
 | Aspect | Detail |
 |---|---|
@@ -288,7 +288,7 @@ The following patterns weaken security without providing meaningful benefit.
 | Adding endpoints permanently when operator approval would suffice | Adding endpoints to the policy YAML makes them permanently reachable across all instances. | Use operator approval. Approved endpoints persist within the sandbox instance but reset on re-creation. |
 | Using broad binary globs | A glob like `/**` allows any binary to reach the endpoint, defeating binary-scoped enforcement. | Scope globs to specific directories (for example, `/sandbox/.vscode-server/**`). |
 | Skipping TLS termination on HTTPS APIs | Setting `tls: skip` disables credential injection and L7 inspection. | Use the default auto-detect behavior unless the upstream requires client-certificate mTLS. |
-| Setting `enforcement: enforce` before auditing | Jumping to `enforce` without first running in `audit` mode risks breaking the agent's workflow. | Start with `audit`, review the logs, and switch to `enforce` once you have validated the rules. |
+| Setting `enforcement: enforce` before auditing | Jumping to `enforce` without first running in `audit` mode risks breaking the agent's workflow. | Start with `audit`, review the logs, and switch to `enforce` after you validate the rules. |
 
 ## Related Topics
 

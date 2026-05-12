@@ -87,7 +87,7 @@ Configures [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforc
 
 | Field | Type | Required | Values | Description |
 |---|---|---|---|---|
-| `compatibility` | string | No | `best_effort`, `hard_requirement` | How OpenShell handles Landlock failures. See behavior table below. |
+| `compatibility` | string | No | `best_effort`, `hard_requirement` | How OpenShell handles Landlock failures. Refer to the behavior table below. |
 
 **Compatibility modes:**
 
@@ -96,7 +96,7 @@ Configures [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforc
 | `best_effort` | Warns and continues without Landlock. | Skips the path, applies remaining rules. | Warns and continues without Landlock (refuses to apply an empty ruleset). |
 | `hard_requirement` | Aborts sandbox startup. | Aborts sandbox startup. | Aborts sandbox startup. |
 
-`best_effort` (the default) is appropriate for most deployments. It handles missing paths gracefully -- for example, `/app` may not exist in every container image but is included in the baseline path set for containers that do have it. Individual missing paths are skipped while the remaining filesystem rules are still enforced.
+`best_effort` (the default) is appropriate for most deployments. It handles missing paths gracefully. For example, `/app` might not exist in every container image but is included in the baseline path set for containers that do have it. Individual missing paths are skipped while the remaining filesystem rules are still enforced.
 
 `hard_requirement` is for environments where any gap in filesystem isolation is unacceptable. If a listed path cannot be opened for any reason (missing, permission denied, symlink loop), sandbox startup fails immediately rather than running with reduced protection.
 
@@ -120,7 +120,7 @@ Sets the OS-level identity for the agent process inside the sandbox.
 | `run_as_user` | string | No | The user name or UID the agent process runs as. Default: `sandbox`. |
 | `run_as_group` | string | No | The group name or GID the agent process runs as. Default: `sandbox`. |
 
-**Validation constraint:** Neither `run_as_user` nor `run_as_group` may be set to `root` or `0`. Policies that request root process identity are rejected at creation or update time.
+**Validation constraint:** Neither `run_as_user` nor `run_as_group` can be set to `root` or `0`. Policies that request root process identity are rejected at creation or update time.
 
 Example:
 
