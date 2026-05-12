@@ -25,6 +25,13 @@ identity.
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
 The default deployment mode is mTLS: clients and sandbox workloads present a
 certificate signed by the deployment CA before reaching application handlers.
+When that service port is bound to loopback, the listener can also accept
+plaintext HTTP on the same port for sandbox service subdomains only. That local
+browser path is enabled by default and disabled with
+`--enable-loopback-service-http=false`; it never serves gateway APIs, auth,
+health, metrics, or tunnel routes. The plaintext service router also rejects
+browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
+cross-origin or sibling-subdomain request.
 
 Supported auth modes:
 
@@ -140,6 +147,12 @@ authorization token from `CreateSshSession`, and an explicit target:
 inside the sandbox. The gateway validates the token and sandbox readiness,
 sends a targeted `RelayOpen` to the supervisor, then bridges
 `TcpForwardFrame::Data` to `RelayFrame::Data` until either side closes.
+
+Browser service URLs use the same supervisor relay path after host-based
+routing resolves `sandbox--service.<base-domain>` to a stored service endpoint.
+TLS-enabled loopback gateways print `http://` URLs when loopback plaintext
+service HTTP is enabled; non-loopback TLS gateways continue to print `https://`
+URLs.
 
 For `target.tcp`, the gateway only accepts loopback destinations such as
 `localhost`, `127.0.0.0/8`, or `::1`. The gateway never needs to know or dial a

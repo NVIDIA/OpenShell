@@ -261,9 +261,9 @@ For Helm deployments, provide a CA and certificate bundle through the Kubernetes
 
 | Aspect | Detail |
 |---|---|
-| Default | mTLS required. Both client and server present certificates that the deployment CA signed. |
-| What you can change | Enable dual-auth mode (`allow_unauthenticated=true`) for Cloudflare Tunnel deployments, or disable TLS entirely for trusted reverse-proxy setups. |
-| Risk if relaxed | Dual-auth mode accepts clients without certificates and defers authentication to the HTTP layer (Cloudflare JWT). Disabling TLS removes transport-level authentication entirely. |
+| Default | mTLS required for gateway APIs and sandbox callbacks. TLS-enabled loopback gateways also accept plaintext HTTP for sandbox service hostnames by default. |
+| What you can change | Enable dual-auth mode (`allow_unauthenticated=true`) for Cloudflare Tunnel deployments, disable TLS entirely for trusted reverse-proxy setups, or disable loopback service HTTP with `--enable-loopback-service-http=false`. |
+| Risk if relaxed | Dual-auth mode accepts clients without certificates and defers authentication to the HTTP layer (Cloudflare JWT). Disabling TLS removes transport-level authentication entirely. Loopback service HTTP is local-only and rejects cross-origin browser requests, but any local process can still reach exposed service URLs directly. |
 | Recommendation | Use mTLS (the default) unless deploying behind Cloudflare or a trusted reverse proxy. |
 
 ### SSH Tunnel Authentication

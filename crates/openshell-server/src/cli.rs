@@ -3,7 +3,7 @@
 
 //! Shared CLI entrypoint for the gateway binaries.
 
-use clap::{Command, CommandFactory, FromArgMatches, Parser};
+use clap::{ArgAction, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::ComputeDriverKind;
 use openshell_core::config::{
@@ -42,6 +42,7 @@ enum Commands {
 }
 
 #[derive(clap::Args, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct RunArgs {
     /// IP address to bind the server, health, and metrics listeners to.
     #[arg(long, default_value = "127.0.0.1", env = "OPENSHELL_BIND_ADDRESS")]
@@ -305,6 +306,15 @@ struct RunArgs {
         value_delimiter = ','
     )]
     service_base_domains: Vec<String>,
+
+    /// Enable plaintext HTTP routing for loopback sandbox service URLs.
+    #[arg(
+        long,
+        env = "OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    enable_loopback_service_http: bool,
 }
 
 pub fn command() -> Command {
@@ -402,7 +412,8 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
         .with_ssh_gateway_port(args.ssh_gateway_port)
         .with_sandbox_ssh_port(args.sandbox_ssh_port)
         .with_ssh_handshake_skew_secs(args.ssh_handshake_skew_secs)
-        .with_service_base_domains(args.service_base_domains);
+        .with_service_base_domains(args.service_base_domains)
+        .with_loopback_service_http(args.enable_loopback_service_http);
 
     if let Some(image) = args.sandbox_image {
         config = config.with_sandbox_image(image);
@@ -578,6 +589,50 @@ mod tests {
             .expect("env should provide bind address");
 
         assert_eq!(cli.run.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn command_enables_loopback_service_http_by_default() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP");
+
+        let cli =
+            Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+
+        assert!(cli.run.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn command_disables_loopback_service_http_with_false_value() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP");
+
+        let cli = Cli::try_parse_from([
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--enable-loopback-service-http=false",
+        ])
+        .unwrap();
+
+        assert!(!cli.run.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn command_reads_loopback_service_http_from_env() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::set("OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP", "false");
+
+        let cli =
+            Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+
+        assert!(!cli.run.enable_loopback_service_http);
     }
 
     #[test]

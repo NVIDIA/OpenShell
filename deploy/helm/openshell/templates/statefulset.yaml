@@ -98,6 +98,8 @@ spec:
             {{- end }}
             - name: OPENSHELL_SERVICE_BASE_DOMAINS
               value: {{ join "," .Values.server.serviceBaseDomains | quote }}
+            - name: OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP
+              value: {{ .Values.server.enableLoopbackServiceHttp | quote }}
             - name: OPENSHELL_SSH_HANDSHAKE_SECRET
               valueFrom:
                 secretKeyRef:

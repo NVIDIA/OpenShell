@@ -320,6 +320,11 @@ pub struct ServiceRoutingConfig {
     /// The first domain is used when the gateway prints endpoint URLs.
     #[serde(default = "default_service_base_domains")]
     pub service_base_domains: Vec<String>,
+
+    /// Enable TLS-enabled loopback gateway listeners to also accept plaintext
+    /// HTTP for sandbox service hostnames.
+    #[serde(default = "default_enable_loopback_service_http")]
+    pub enable_loopback_service_http: bool,
 }
 
 /// TLS configuration.
@@ -595,13 +600,19 @@ impl Config {
             .into_iter()
             .filter_map(|domain| normalize_service_base_domain(domain.into()))
             .collect();
-        self.service_routing = ServiceRoutingConfig {
-            service_base_domains: if domains.is_empty() {
-                default_service_base_domains()
-            } else {
-                domains
-            },
+        self.service_routing.service_base_domains = if domains.is_empty() {
+            default_service_base_domains()
+        } else {
+            domains
         };
+        self
+    }
+
+    /// Enable or disable plaintext HTTP routing for loopback sandbox service
+    /// hostnames on TLS-enabled gateway listeners.
+    #[must_use]
+    pub const fn with_loopback_service_http(mut self, enabled: bool) -> Self {
+        self.service_routing.enable_loopback_service_http = enabled;
         self
     }
 }
@@ -610,6 +621,7 @@ impl Default for ServiceRoutingConfig {
     fn default() -> Self {
         Self {
             service_base_domains: default_service_base_domains(),
+            enable_loopback_service_http: default_enable_loopback_service_http(),
         }
     }
 }
@@ -622,6 +634,10 @@ fn default_service_base_domains() -> Vec<String> {
     vec![default_service_base_domain_for_gateway(
         DEFAULT_GATEWAY_NAME,
     )]
+}
+
+const fn default_enable_loopback_service_http() -> bool {
+    true
 }
 
 pub fn default_service_base_domain_for_gateway(name: &str) -> String {
@@ -715,6 +731,25 @@ mod tests {
     fn config_new_disables_health_bind_by_default() {
         let cfg = Config::new(None);
         assert!(cfg.health_bind_address.is_none());
+    }
+
+    #[test]
+    fn service_routing_allows_loopback_plaintext_http_by_default() {
+        let cfg = Config::new(None);
+        assert!(cfg.service_routing.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn service_base_domain_update_preserves_loopback_plaintext_http_flag() {
+        let cfg = Config::new(None)
+            .with_loopback_service_http(false)
+            .with_service_base_domains(["dev.openshell.localhost"]);
+
+        assert_eq!(
+            cfg.service_routing.service_base_domains,
+            vec!["dev.openshell.localhost"]
+        );
+        assert!(!cfg.service_routing.enable_loopback_service_http);
     }
 
     #[test]

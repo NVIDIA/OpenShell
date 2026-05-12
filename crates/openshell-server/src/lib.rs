@@ -51,7 +51,7 @@ use tracing::{debug, error, info, warn};
 
 use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
 pub use grpc::OpenShellService;
-pub use http::{health_router, http_router, metrics_router};
+pub use http::{health_router, http_router, metrics_router, service_http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
 use openshell_driver_kubernetes::KubernetesComputeConfig;
 use persistence::Store;
@@ -299,12 +299,14 @@ pub async fn run_server(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut listener_tasks = Vec::with_capacity(gateway_listeners.len());
+    let enable_loopback_service_http = config.service_routing.enable_loopback_service_http;
     for (listener, listen_addr) in gateway_listeners {
         listener_tasks.push(tokio::spawn(serve_gateway_listener(
             listener,
             listen_addr,
             service.clone(),
             tls_acceptor.clone(),
+            enable_loopback_service_http,
             shutdown_rx.clone(),
         )));
     }
@@ -364,6 +366,7 @@ async fn serve_gateway_listener(
     listen_addr: SocketAddr,
     service: MultiplexService,
     tls_acceptor: Option<TlsAcceptor>,
+    enable_loopback_service_http: bool,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -385,30 +388,117 @@ async fn serve_gateway_listener(
             }
         };
 
-        spawn_gateway_connection(stream, addr, service.clone(), tls_acceptor.clone());
+        spawn_gateway_connection(
+            stream,
+            addr,
+            listen_addr,
+            service.clone(),
+            tls_acceptor.clone(),
+            enable_loopback_service_http,
+        );
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionProtocol {
+    Tls,
+    PlainHttp,
+    Unknown,
+}
+
+async fn classify_connection_protocol(stream: &TcpStream) -> std::io::Result<ConnectionProtocol> {
+    let mut prefix = [0_u8; 8];
+    let read = stream.peek(&mut prefix).await?;
+    Ok(classify_initial_bytes(&prefix[..read]))
+}
+
+fn classify_initial_bytes(prefix: &[u8]) -> ConnectionProtocol {
+    if looks_like_tls(prefix) {
+        ConnectionProtocol::Tls
+    } else if looks_like_http(prefix) {
+        ConnectionProtocol::PlainHttp
+    } else {
+        ConnectionProtocol::Unknown
+    }
+}
+
+fn looks_like_tls(prefix: &[u8]) -> bool {
+    prefix.len() >= 3 && prefix[0] == 0x16 && prefix[1] == 0x03
+}
+
+fn looks_like_http(prefix: &[u8]) -> bool {
+    const METHODS: [&[u8]; 10] = [
+        b"GET ",
+        b"POST ",
+        b"PUT ",
+        b"PATCH ",
+        b"DELETE ",
+        b"HEAD ",
+        b"OPTIONS ",
+        b"TRACE ",
+        b"CONNECT ",
+        b"PRI ",
+    ];
+
+    if prefix.is_empty() {
+        return false;
+    }
+    METHODS
+        .iter()
+        .any(|method| method.starts_with(prefix) || prefix.starts_with(method))
+}
+
+fn allow_plaintext_service_http(
+    enabled: bool,
+    listen_addr: SocketAddr,
+    peer_addr: SocketAddr,
+) -> bool {
+    enabled && listen_addr.ip().is_loopback() && peer_addr.ip().is_loopback()
 }
 
 fn spawn_gateway_connection(
     stream: TcpStream,
     addr: SocketAddr,
+    listen_addr: SocketAddr,
     service: MultiplexService,
     tls_acceptor: Option<TlsAcceptor>,
+    enable_loopback_service_http: bool,
 ) {
     if let Some(acceptor) = tls_acceptor {
         tokio::spawn(async move {
-            match acceptor.inner().accept(stream).await {
-                Ok(tls_stream) => {
-                    if let Err(e) = service.serve(tls_stream).await {
-                        error!(error = %e, client = %addr, "Connection error");
+            match classify_connection_protocol(&stream).await {
+                Ok(ConnectionProtocol::PlainHttp)
+                    if allow_plaintext_service_http(
+                        enable_loopback_service_http,
+                        listen_addr,
+                        addr,
+                    ) =>
+                {
+                    if let Err(e) = service.serve_service_http(stream).await {
+                        error!(error = %e, client = %addr, listen = %listen_addr, "Plaintext service HTTP connection error");
+                    }
+                }
+                Ok(ConnectionProtocol::PlainHttp) => {
+                    warn!(client = %addr, listen = %listen_addr, "Rejected plaintext HTTP on non-loopback gateway listener");
+                }
+                Ok(ConnectionProtocol::Tls | ConnectionProtocol::Unknown) => {
+                    match acceptor.inner().accept(stream).await {
+                        Ok(tls_stream) => {
+                            if let Err(e) = service.serve(tls_stream).await {
+                                error!(error = %e, client = %addr, "Connection error");
+                            }
+                        }
+                        Err(e) => {
+                            if is_benign_tls_handshake_failure(&e) {
+                                debug!(error = %e, client = %addr, "TLS handshake closed early");
+                            } else {
+                                error!(error = %e, client = %addr, "TLS handshake failed");
+                            }
+                        }
                     }
                 }
                 Err(e) => {
-                    if is_benign_tls_handshake_failure(&e) {
-                        debug!(error = %e, client = %addr, "TLS handshake closed early");
-                    } else {
-                        error!(error = %e, client = %addr, "TLS handshake failed");
-                    }
+                    debug!(error = %e, client = %addr, "Failed to inspect connection preface");
                 }
             }
         });
@@ -635,6 +725,7 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
 #[cfg(test)]
 mod tests {
     use super::{
+        ConnectionProtocol, allow_plaintext_service_http, classify_initial_bytes,
         configured_compute_driver, gateway_listener_addresses, is_benign_tls_handshake_failure,
     };
     use openshell_core::{ComputeDriverKind, Config};
@@ -659,6 +750,36 @@ mod tests {
             let error = Error::new(kind, "real tls failure");
             assert!(!is_benign_tls_handshake_failure(&error));
         }
+    }
+
+    #[test]
+    fn classifies_tls_and_plain_http_prefaces() {
+        assert_eq!(
+            classify_initial_bytes(&[0x16, 0x03, 0x01, 0x00]),
+            ConnectionProtocol::Tls
+        );
+        assert_eq!(
+            classify_initial_bytes(b"GET / HTTP/1.1\r\n"),
+            ConnectionProtocol::PlainHttp
+        );
+        assert_eq!(classify_initial_bytes(b"G"), ConnectionProtocol::PlainHttp);
+        assert_eq!(
+            classify_initial_bytes(b"\x00\x01\x02"),
+            ConnectionProtocol::Unknown
+        );
+    }
+
+    #[test]
+    fn plaintext_service_http_requires_loopback_listener_and_peer() {
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:54000".parse().unwrap();
+        let wildcard: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let remote_peer: SocketAddr = "192.0.2.10:54000".parse().unwrap();
+
+        assert!(allow_plaintext_service_http(true, loopback, peer));
+        assert!(!allow_plaintext_service_http(false, loopback, peer));
+        assert!(!allow_plaintext_service_http(true, wildcard, peer));
+        assert!(!allow_plaintext_service_http(true, loopback, remote_peer));
     }
 
     #[test]

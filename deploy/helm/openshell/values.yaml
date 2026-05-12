@@ -130,6 +130,9 @@ server:
   # Disable TLS entirely — the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
   disableTls: false
+  # Enable plaintext HTTP routing for loopback sandbox service URLs on
+  # TLS-enabled gateways.
+  enableLoopbackServiceHttp: true
   serviceBaseDomains:
     - "openshell.openshell.localhost"
   tls:

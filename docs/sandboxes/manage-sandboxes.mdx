@@ -141,7 +141,7 @@ openshell sandbox list --selector env=dev,team=platform
 
 ## Expose HTTP Services
 
-Sandbox service routing is enabled for gateways by default. Recreate gateways created before this routing mode so their generated TLS certificate includes the service base domain SANs:
+Sandbox service routing is enabled for gateways by default. HTTPS service URLs need the service base domain in the gateway certificate SANs, so recreate older gateways before using remote or non-loopback service URLs:
 
 ```shell
 openshell gateway start --recreate
@@ -153,10 +153,10 @@ Expose a service that listens on loopback inside the sandbox:
 openshell service expose my-sandbox web --target-port 8080
 ```
 
-OpenShell prints a URL in the form `https://<sandbox>--<service>.<gateway>.openshell.localhost:<port>/`. HTTP traffic enters the same gateway listener as gRPC and routes by the `Host` header before gateway routes such as `/auth`, so application paths are preserved for the sandbox service.
+For loopback gateways, OpenShell prints a URL in the form `http://<sandbox>--<service>.<gateway>.openshell.localhost:<port>/`. Browser traffic enters the same gateway listener as mTLS-protected gRPC, but plaintext HTTP is accepted only from loopback clients and only for sandbox service hostnames. Gateway APIs, auth routes, health endpoints, and non-service hostnames remain unavailable over plaintext HTTP. Cross-origin and sibling-subdomain browser requests are rejected before reaching the sandbox service. Disable this local browser path with `--enable-loopback-service-http=false` or `OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP=false`.
 
 <Note>
-Import the gateway CA and client certificate before using mTLS-protected browser access; see [Browser Certificates](/reference/browser-certificates). Endpoint deletion, renewal, and remote/public domains are follow-up work.
+For remote or non-loopback gateways, browser service URLs remain HTTPS and require normal gateway authentication. Endpoint deletion, renewal, and remote/public domains are follow-up work.
 
 </Note>
 
