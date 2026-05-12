@@ -51,7 +51,15 @@ DEMO_FILE_PATH="${DEMO_FILE_DIR}/${DEMO_RUN_ID}.md"
 DEMO_SANDBOX_NAME="${DEMO_SANDBOX_NAME:-policy-demo-${DEMO_RUN_ID}}"
 DEMO_CODEX_PROVIDER_NAME="${DEMO_CODEX_PROVIDER_NAME:-codex-policy-demo-${DEMO_RUN_ID}}"
 DEMO_GITHUB_PROVIDER_NAME="${DEMO_GITHUB_PROVIDER_NAME:-github-policy-demo-${DEMO_RUN_ID}}"
-DEMO_APPROVAL_TIMEOUT_SECS="${DEMO_APPROVAL_TIMEOUT_SECS:-240}"
+DEMO_MANUAL_APPROVE="${DEMO_MANUAL_APPROVE:-0}"
+# Manual approvals need more headroom than the auto-approve loop — a human
+# reads the proposal, thinks, and decides. Bump the default to 30 min when
+# the developer is in the loop. Explicit overrides still win.
+if [[ "$DEMO_MANUAL_APPROVE" == "1" ]]; then
+    DEMO_APPROVAL_TIMEOUT_SECS="${DEMO_APPROVAL_TIMEOUT_SECS:-1800}"
+else
+    DEMO_APPROVAL_TIMEOUT_SECS="${DEMO_APPROVAL_TIMEOUT_SECS:-240}"
+fi
 DEMO_KEEP_SANDBOX="${DEMO_KEEP_SANDBOX:-0}"
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-policy-demo.XXXXXX")"
@@ -420,6 +428,43 @@ EOF
     info "${DIM}Watching for the pending draft on the gateway...${RESET}"
 }
 
+# In DEMO_MANUAL_APPROVE mode, swap auto-approve for a human-in-the-loop pause.
+# The agent's /wait is already parked on a socket — we just stop driving the
+# decision from this script and tell the user the exact commands to run from
+# their other terminal. We poll `rule get --status pending` because that's the
+# durable signal: a chunk leaving the pending bucket means a decision landed,
+# whether approve or reject. The outer loop handles whichever path comes next
+# (agent exits cleanly after approve; agent redrafts and we see a fresh
+# pending chunk after reject --reason).
+approve_manually() {
+    local pending="$1"
+    local chunk_id
+    chunk_id="$(sed 's/\x1b\[[0-9;]*m//g' "$pending" \
+        | awk '/^[[:space:]]*Chunk:/ { print $2; exit }')"
+    [[ -n "$chunk_id" ]] || fail "could not extract chunk_id from pending output"
+    local short_id="${chunk_id:0:8}"
+
+    step "Decide from your other terminal — the agent's /wait is parked"
+    info "Run ONE on the host:"
+    info ""
+    info "  ${BOLD}${GREEN}approve:${RESET} ${DIM}${OPENSHELL_BIN} rule approve ${DEMO_SANDBOX_NAME} --chunk-id ${chunk_id}${RESET}"
+    info "  ${BOLD}reject:${RESET}  ${DIM}${OPENSHELL_BIN} rule reject ${DEMO_SANDBOX_NAME} --chunk-id ${chunk_id} --reason \"scope this to ...\"${RESET}"
+    info ""
+    info "  ${DIM}reject --reason sends free-form guidance back to the agent; it will${RESET}"
+    info "  ${DIM}read rejection_reason, draft a revised proposal, and we'll pause again.${RESET}"
+    info ""
+
+    while true; do
+        if ! "$OPENSHELL_BIN" rule get "$DEMO_SANDBOX_NAME" --status pending 2>/dev/null \
+            | grep -q "$chunk_id"; then
+            spin_clear
+            info "  ${GREEN}✓${RESET} decision recorded for chunk ${short_id}"
+            return
+        fi
+        spin_wait "awaiting your decision on chunk ${short_id}" 2
+    done
+}
+
 approve_pending_until_agent_exits() {
     step "Waiting for the agent to draft a policy proposal"
     narrate_sandbox_workflow
@@ -454,9 +499,13 @@ approve_pending_until_agent_exits() {
             info "${GREEN}proposal received:${RESET}"
             summarize_pending "$pending"
 
-            step "Approving — the agent's /wait will return within ~1s"
-            "$OPENSHELL_BIN" rule approve-all "$DEMO_SANDBOX_NAME" \
-                | awk '/approved/ { print "  " $0 }'
+            if [[ "$DEMO_MANUAL_APPROVE" == "1" ]]; then
+                approve_manually "$pending"
+            else
+                step "Approving — the agent's /wait will return within ~1s"
+                "$OPENSHELL_BIN" rule approve-all "$DEMO_SANDBOX_NAME" \
+                    | awk '/approved/ { print "  " $0 }'
+            fi
             approval_count=$((approval_count + 1))
         fi
 

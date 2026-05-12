@@ -50,6 +50,22 @@ That's the whole thing. The demo resolves your GitHub handle from `gh`, picks
 `openshell-policy-demo` as the repo, and writes one timestamped markdown file
 under `openshell-policy-advisor-demo/` per run.
 
+## Driving it manually (real-session UX)
+
+```shell
+DEMO_MANUAL_APPROVE=1 bash examples/agent-driven-policy-management/demo.sh
+```
+
+Same flow, but the script no longer auto-approves. When the agent submits a
+proposal, the demo prints the exact `approve` and `reject --reason` commands
+and pauses until you run one from another terminal. This is how you'd review
+a coding agent's privilege ask in a real session — read the structured grant,
+decide, type one command, watch the agent's `/wait` unblock within ~1s.
+
+Try a rejection-with-guidance to see the full revise-and-resubmit loop:
+reject with `--reason "scope to docs/ paths only"` and the agent reads
+`rejection_reason`, drafts a tighter proposal, and pauses again.
+
 ## Overrides (all optional)
 
 | Env var | Default |
@@ -60,7 +76,8 @@ under `openshell-policy-advisor-demo/` per run.
 | `DEMO_RUN_ID` | timestamp |
 | `DEMO_GITHUB_TOKEN` | falls back to `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token` |
 | `DEMO_KEEP_SANDBOX` | `0` (set `1` to inspect the sandbox after the demo) |
-| `DEMO_APPROVAL_TIMEOUT_SECS` | `240` |
+| `DEMO_MANUAL_APPROVE` | `0` (set `1` to pause for host-side `rule approve` / `rule reject --reason`) |
+| `DEMO_APPROVAL_TIMEOUT_SECS` | `240` (auto), `1800` (manual mode) |
 | `OPENSHELL_BIN` | `target/debug/openshell` if present, else `openshell` on `PATH` |
 
 ## What the agent sees

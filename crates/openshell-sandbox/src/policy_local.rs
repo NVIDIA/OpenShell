@@ -45,6 +45,12 @@ const PROPOSAL_WAIT_DEFAULT_SECS: u64 = 60;
 const PROPOSAL_WAIT_MIN_SECS: u64 = 1;
 const PROPOSAL_WAIT_MAX_SECS: u64 = 300;
 const PROPOSAL_WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Minimum window the reload-readiness phase gets after a chunk
+/// terminalizes, even if the caller's deadline is shorter. Without this,
+/// approvals that arrive at T-50ms always return `policy_reloaded=false`
+/// and force a re-issue. 500ms is well below typical supervisor poll
+/// latency but enough to cover the in-memory coverage check.
+const RELOAD_WAIT_MIN_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
 
 const MAX_POLICY_LOCAL_BODY_BYTES: usize = 64 * 1024;
 /// Hard ceiling on how long a single request body read can stall. Bounds a
@@ -680,39 +686,49 @@ async fn proposal_wait_response(
     };
     let timeout_secs = parse_timeout_query(query);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    // Baseline local policy fingerprint at /wait start. When a chunk is
-    // approved upstream the gateway merges it immediately, but the local
-    // supervisor reloads policy on its own poll cycle — without this
-    // baseline we can return "approved" before the local rule is active,
-    // and the agent's single retry races the reload.
-    //
-    // We compare encoded policy bytes rather than `SandboxPolicy.version`,
-    // which is a schema-version constant (always 1) and never bumps on a
-    // revision change. A naive version compare loops forever; a byte
-    // compare picks up any rule mutation, which is what reload means.
-    let baseline_fingerprint = local_policy_fingerprint(ctx).await;
     loop {
         match fetch_chunk(&session, chunk_id).await {
             Ok(Some(chunk)) if is_terminal_status(&chunk.status) => {
-                if chunk.status == "approved" {
-                    // Don't promise the agent its retry will succeed until
-                    // the local supervisor has actually loaded the new
-                    // policy. Bounded by the same deadline so a stuck
-                    // supervisor cannot extend the wait beyond what the
-                    // caller asked for.
-                    wait_for_local_policy_bump(ctx, &baseline_fingerprint, deadline).await;
-                }
                 // Audit beat: emit at the moment this sandbox observes the
                 // decision so the trace correlates with the proxy events
                 // bracketing the loop. Multiple waiters on the same chunk
                 // each fire one event — acceptable for a wakeup audit.
                 emit_policy_decision_event(&chunk);
-                return (200, chunk_state_payload(&chunk, false));
+                let policy_reloaded = if chunk.status == "approved" {
+                    // Hold the wait until the local supervisor has loaded a
+                    // policy that semantically contains this chunk's
+                    // proposed rule. Reloads triggered by *other* chunks or
+                    // settings changes do not wake us; a missing
+                    // proposed_rule (defensive) skips the check and
+                    // returns reloaded=false so the agent can decide.
+                    //
+                    // Floor the reload-wait window to RELOAD_WAIT_MIN_FLOOR
+                    // so an approval that arrives at T-50ms still gets a
+                    // realistic shot at seeing the reload. Worst case we
+                    // overshoot the caller's deadline by this floor —
+                    // preferable to returning reloaded=false on every
+                    // short-budget call and forcing the agent to re-issue.
+                    let reload_deadline = std::cmp::max(
+                        deadline,
+                        tokio::time::Instant::now() + RELOAD_WAIT_MIN_FLOOR,
+                    );
+                    match chunk.proposed_rule.as_ref() {
+                        Some(rule) => {
+                            wait_for_local_policy_to_cover(ctx, rule, reload_deadline).await
+                        }
+                        None => false,
+                    }
+                } else {
+                    // Rejected: no reload semantics — the agent reads
+                    // rejection_reason and redrafts.
+                    false
+                };
+                return (200, chunk_state_payload(&chunk, false, policy_reloaded));
             }
             Ok(Some(chunk)) => {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    return (200, chunk_state_payload(&chunk, true));
+                    return (200, chunk_state_payload(&chunk, true, false));
                 }
                 let sleep_for = std::cmp::min(remaining, PROPOSAL_WAIT_POLL_INTERVAL);
                 tokio::time::sleep(sleep_for).await;
@@ -739,7 +755,7 @@ async fn fetch_chunk_or_404(
     timed_out: bool,
 ) -> (u16, serde_json::Value) {
     match fetch_chunk(session, chunk_id).await {
-        Ok(Some(chunk)) => (200, chunk_state_payload(&chunk, timed_out)),
+        Ok(Some(chunk)) => (200, chunk_state_payload(&chunk, timed_out, false)),
         Ok(None) => chunk_not_found_payload(chunk_id),
         Err(err) => err,
     }
@@ -749,11 +765,18 @@ async fn fetch_chunk_or_404(
 ///
 /// Selection rule: include the fields the agent needs to decide what to do
 /// next on the redraft loop — identity (`chunk_id`, `status`), the proposal
-/// it submitted (`rule_name`, `binary`), and the two feedback signals
+/// it submitted (`rule_name`, `binary`), the two feedback signals
 /// (`rejection_reason` from the reviewer, `validation_result` from the
-/// gateway prover). Display-only proto fields (`hit_count`, `confidence`,
-/// `stage`, timing) are left off until a concrete agent need surfaces them.
-fn chunk_state_payload(chunk: &PolicyChunk, timed_out: bool) -> serde_json::Value {
+/// gateway prover), and (on /wait) `policy_reloaded` so the agent can tell
+/// "approved AND the new rule is loaded — safe to retry" from "approved
+/// but the supervisor hasn't reloaded yet — re-issue /wait or surface to
+/// user". Display-only proto fields (`hit_count`, `confidence`, `stage`,
+/// timing) are left off until a concrete agent need surfaces them.
+fn chunk_state_payload(
+    chunk: &PolicyChunk,
+    timed_out: bool,
+    policy_reloaded: bool,
+) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "chunk_id": chunk.id,
         "status": chunk.status,
@@ -765,6 +788,9 @@ fn chunk_state_payload(chunk: &PolicyChunk, timed_out: bool) -> serde_json::Valu
     if timed_out {
         payload["timed_out"] = serde_json::json!(true);
     }
+    if chunk.status == "approved" {
+        payload["policy_reloaded"] = serde_json::json!(policy_reloaded);
+    }
     payload
 }
 
@@ -772,47 +798,52 @@ fn is_terminal_status(status: &str) -> bool {
     matches!(status, "approved" | "rejected")
 }
 
-/// Snapshot of the local policy at a moment in time, used as a revision
-/// fingerprint by `wait_for_local_policy_bump`. Compares with `==` against
-/// a later snapshot to detect a reload — prost-generated types derive
-/// `PartialEq`, so any field change (including the `network_policies` map)
-/// flips equality.
-async fn local_policy_fingerprint(ctx: &PolicyLocalContext) -> Option<ProtoSandboxPolicy> {
-    ctx.current_policy.read().await.clone()
-}
-
 /// After a chunk is approved upstream, wait until the local supervisor has
-/// loaded a policy that differs from the baseline captured at the start of
-/// `/wait`. Bounded by the caller-supplied deadline; returns early
-/// (best-effort) if the deadline passes without a change.
+/// loaded a policy that semantically contains the chunk's proposed rule.
+/// Returns `true` if coverage was observed before the deadline, `false`
+/// otherwise — the caller reports that bool back to the agent as
+/// `policy_reloaded` so it can decide whether to retry immediately or
+/// re-issue `/wait`.
 ///
-/// We compare the whole policy proto rather than any single field because
-/// `SandboxPolicy.version` is a schema-version constant (always 1) and does
-/// not track revisions — only the policy *content* changes when a reload
-/// lands. Equality is via prost's derived `PartialEq`; a clone-per-tick on
-/// a few-KB struct is cheap for the bounded wait window this lives in.
+/// Why rule-coverage instead of whole-policy diff (as we used to do):
+///
+/// 1. **False sleep.** If the agent re-issues `/wait` after a `timed_out`
+///    response, the chunk may have approved AND the supervisor may have
+///    reloaded between the two `/wait` calls. A diff-based check snapshots
+///    the already-updated policy as baseline and then waits forever for
+///    another change. The skill tells the agent to re-issue on
+///    `timed_out`, so the diff approach is broken on the happy path.
+/// 2. **False wakeup.** Any unrelated reload (another agent's approval,
+///    settings change) flips a whole-policy diff, but the chunk's actual
+///    rule may not be loaded yet. The agent retries, hits another
+///    `policy_denied`, and the revise-loop fires with no real signal to
+///    revise on.
 ///
 /// The polling cadence here is faster than `PROPOSAL_WAIT_POLL_INTERVAL`
 /// (which paces upstream gateway calls). This loop only reads in-memory
 /// state, so 200ms gives a responsive handoff to the agent's retry once
 /// the supervisor's own policy poll catches up.
-async fn wait_for_local_policy_bump(
+async fn wait_for_local_policy_to_cover(
     ctx: &PolicyLocalContext,
-    baseline: &Option<ProtoSandboxPolicy>,
+    proposed_rule: &NetworkPolicyRule,
     deadline: tokio::time::Instant,
-) {
+) -> bool {
     const TICK: std::time::Duration = std::time::Duration::from_millis(200);
     loop {
-        let current = local_policy_fingerprint(ctx).await;
-        if current.as_ref() != baseline.as_ref() {
-            return;
+        // Clone the snapshot out of the RwLock before running coverage —
+        // otherwise the read guard is held across `policy_covers_rule`'s
+        // iteration of `network_policies`, serializing a writer (supervisor
+        // reload) on the very thing we're waiting for. Clone-per-tick on
+        // a few-KB struct is cheap for the bounded wait window here.
+        let snapshot = ctx.current_policy.read().await.clone();
+        if let Some(policy) = snapshot.as_ref()
+            && openshell_policy::policy_covers_rule(policy, proposed_rule)
+        {
+            return true;
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            // Best effort: return approved anyway. The agent's retry may
-            // race the reload, but the alternative (extending past the
-            // caller's deadline) violates the wait contract.
-            return;
+            return false;
         }
         tokio::time::sleep(std::cmp::min(remaining, TICK)).await;
     }
@@ -1630,16 +1661,37 @@ mod tests {
             validation_result: "no exfil paths".to_string(),
             ..Default::default()
         };
-        let pending = chunk_state_payload(&chunk, false);
+        let pending = chunk_state_payload(&chunk, false, false);
         assert_eq!(pending["chunk_id"], "chunk-x");
         assert_eq!(pending["status"], "rejected");
         assert_eq!(pending["rejection_reason"], "scope too broad");
         assert_eq!(pending["validation_result"], "no exfil paths");
-        // timed_out only appears when set.
+        // timed_out and policy_reloaded only appear when relevant.
         assert!(pending.get("timed_out").is_none());
+        assert!(
+            pending.get("policy_reloaded").is_none(),
+            "policy_reloaded is only meaningful for approved chunks"
+        );
 
-        let timed = chunk_state_payload(&chunk, true);
+        let timed = chunk_state_payload(&chunk, true, false);
         assert_eq!(timed["timed_out"], true);
+    }
+
+    #[test]
+    fn chunk_state_payload_includes_policy_reloaded_when_approved() {
+        let chunk = PolicyChunk {
+            id: "chunk-y".to_string(),
+            status: "approved".to_string(),
+            rule_name: "allow_github".to_string(),
+            binary: "/usr/bin/curl".to_string(),
+            ..Default::default()
+        };
+        let reloaded = chunk_state_payload(&chunk, false, true);
+        assert_eq!(reloaded["status"], "approved");
+        assert_eq!(reloaded["policy_reloaded"], true);
+
+        let not_reloaded = chunk_state_payload(&chunk, false, false);
+        assert_eq!(not_reloaded["policy_reloaded"], false);
     }
 
     #[tokio::test]
@@ -1730,61 +1782,109 @@ mod tests {
         assert!(summary.contains("/usr/bin/curl"));
     }
 
-    #[tokio::test]
-    async fn wait_for_local_policy_bump_returns_when_policy_content_changes() {
-        // Baseline: a policy with one network policy keyed "initial".
-        // SandboxPolicy.version stays 1 across reloads (it's a schema
-        // marker, not a revision id) — this test deliberately changes
-        // *content* without bumping the version field, which is the
-        // failure mode that surfaced in the demo (supervisor reloaded
-        // the policy but kept version=1, so the prior version-compare
-        // implementation hung until deadline).
-        let initial = ProtoSandboxPolicy {
-            version: 1,
-            network_policies: HashMap::from([(
-                "initial".to_string(),
-                NetworkPolicyRule {
-                    name: "initial".to_string(),
-                    ..Default::default()
-                },
-            )]),
-            ..Default::default()
-        };
-        let ctx = PolicyLocalContext::new(Some(initial), None, None);
-        let baseline = local_policy_fingerprint(&ctx).await;
+    // Helpers — synthetic proposed rule + policy with that rule already
+    // merged. Both reused across reload-readiness tests.
+    fn proposed_curl_rule_for_github() -> NetworkPolicyRule {
+        NetworkPolicyRule {
+            name: "agent_proposed".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                ports: vec![443],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        }
+    }
 
+    fn policy_with_rule(rule: NetworkPolicyRule) -> ProtoSandboxPolicy {
+        ProtoSandboxPolicy {
+            version: 1,
+            network_policies: HashMap::from([(rule.name.clone(), rule)]),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_returns_reloaded_true_when_rule_already_loaded() {
+        // John's false-sleep case: the supervisor has already reloaded a
+        // policy containing the proposed rule before /wait starts. A
+        // whole-policy diff would never see another change and burn the
+        // full timeout. Rule-coverage must return immediately.
+        let proposed = proposed_curl_rule_for_github();
+        let ctx = PolicyLocalContext::new(Some(policy_with_rule(proposed.clone())), None, None);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        let changed = {
-            let policy = ctx.current_policy.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                // Same schema version (1), different content — exactly
-                // what the supervisor does on a real reload.
-                *policy.write().await = Some(ProtoSandboxPolicy {
-                    version: 1,
-                    network_policies: HashMap::from([(
-                        "reloaded".to_string(),
-                        NetworkPolicyRule {
-                            name: "reloaded".to_string(),
-                            ..Default::default()
-                        },
-                    )]),
-                    ..Default::default()
-                });
-            })
-        };
+
         let start = tokio::time::Instant::now();
-        wait_for_local_policy_bump(&ctx, &baseline, deadline).await;
-        changed.await.unwrap();
+        let reloaded = wait_for_local_policy_to_cover(&ctx, &proposed, deadline).await;
         let elapsed = start.elapsed();
+
+        assert!(reloaded, "should report reloaded=true on coverage");
         assert!(
-            elapsed < std::time::Duration::from_millis(800),
-            "should return shortly after content changes; took {elapsed:?}"
+            elapsed < std::time::Duration::from_millis(200),
+            "should return immediately, not poll-and-wait; took {elapsed:?}"
         );
     }
 
     #[tokio::test]
-    async fn wait_for_local_policy_bump_returns_at_deadline_if_no_change() {
+    async fn wait_does_not_wake_on_unrelated_policy_change() {
+        // John's false-wakeup case: a *different* rule gets added to the
+        // local policy (other agent's approval, settings change, etc.).
+        // The agent's specific rule is still not loaded. A diff-based
+        // check would wake here; coverage must not.
+        let proposed = proposed_curl_rule_for_github();
+        // Start with a policy that does NOT contain the proposed rule.
+        let initial = ProtoSandboxPolicy {
+            version: 1,
+            ..Default::default()
+        };
+        let ctx = PolicyLocalContext::new(Some(initial), None, None);
+
+        // Concurrently, an unrelated rule lands. We must not return.
+        let unrelated_load = {
+            let policy = ctx.current_policy.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                *policy.write().await = Some(policy_with_rule(NetworkPolicyRule {
+                    name: "unrelated".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        ports: vec![443],
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/curl".to_string(),
+                        ..Default::default()
+                    }],
+                }));
+            })
+        };
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(400);
+        let start = tokio::time::Instant::now();
+        let reloaded = wait_for_local_policy_to_cover(&ctx, &proposed, deadline).await;
+        unrelated_load.await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            !reloaded,
+            "must not wake on an unrelated reload; coverage was never satisfied"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(350),
+            "should have held until the deadline; only waited {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_wakes_when_matching_rule_arrives_mid_flight() {
+        // Sandbox starts without the rule, then a reload lands containing
+        // it. /wait should observe coverage and return reloaded=true.
+        let proposed = proposed_curl_rule_for_github();
         let ctx = PolicyLocalContext::new(
             Some(ProtoSandboxPolicy {
                 version: 1,
@@ -1793,13 +1893,49 @@ mod tests {
             None,
             None,
         );
-        let baseline = local_policy_fingerprint(&ctx).await;
+
+        let matching_load = {
+            let policy = ctx.current_policy.clone();
+            let target = proposed.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                *policy.write().await = Some(policy_with_rule(target));
+            })
+        };
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let start = tokio::time::Instant::now();
+        let reloaded = wait_for_local_policy_to_cover(&ctx, &proposed, deadline).await;
+        matching_load.await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(reloaded, "should report reloaded=true after coverage lands");
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "should return shortly after coverage; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_returns_reloaded_false_at_deadline_when_no_coverage() {
+        // Deadline budget exhausted, the proposed rule never showed up.
+        // Coverage check returns false — the agent gets policy_reloaded=
+        // false and decides whether to retry blind or re-issue /wait.
+        let proposed = proposed_curl_rule_for_github();
+        let ctx = PolicyLocalContext::new(
+            Some(ProtoSandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
         let start = tokio::time::Instant::now();
-        wait_for_local_policy_bump(&ctx, &baseline, deadline).await;
+        let reloaded = wait_for_local_policy_to_cover(&ctx, &proposed, deadline).await;
         let elapsed = start.elapsed();
-        // Best effort: returns at or shortly after the deadline rather
-        // than extending past it.
+
+        assert!(!reloaded);
         assert!(
             elapsed >= std::time::Duration::from_millis(250),
             "should wait until ~deadline; only waited {elapsed:?}"

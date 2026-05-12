@@ -192,8 +192,15 @@ run_flow_a_approve() {
         || { printf '%s\n' "$body" >&2; fail "Flow A: /wait did not return approved"; }
     [[ "$(printf '%s\n' "$body" | jq -r '.rejection_reason')" == "" ]] \
         || fail "Flow A: rejection_reason should be empty on approve"
+    # policy_reloaded must be present on every approved response and must
+    # be true once the supervisor has loaded the merged policy. A false
+    # here would mean the agent is being told "go ahead and retry" when
+    # the rule isn't actually in effect — exactly the regression John's
+    # review caught.
+    [[ "$(printf '%s\n' "$body" | jq -r '.policy_reloaded')" == "true" ]] \
+        || { printf '%s\n' "$body" >&2; fail "Flow A: policy_reloaded should be true on approve"; }
 
-    ok "/wait returned status=approved in ${elapsed}s"
+    ok "/wait returned status=approved, policy_reloaded=true in ${elapsed}s"
 }
 
 run_flow_b_reject() {

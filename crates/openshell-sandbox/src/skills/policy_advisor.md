@@ -32,7 +32,10 @@ The sandbox-local policy API is reachable at `http://policy.local`:
 - `GET /v1/proposals/{chunk_id}/wait?timeout=<seconds>` — block on this
   proposal until the developer decides or the timeout expires. Default
   60s, clamped [1, 300]. On timeout you get `status: "pending"` plus
-  `timed_out: true`. Use this instead of polling `/v1/proposals/{chunk_id}`.
+  `timed_out: true`. On approval the response also carries
+  `policy_reloaded: true|false` indicating whether the local sandbox has
+  already loaded a policy containing the approved rule. Use this endpoint
+  instead of polling `/v1/proposals/{chunk_id}`.
 
 The proposal body takes an `intent_summary` and one or more `addRule`
 operations. Each `addRule` carries a complete narrow `NetworkPolicyRule`.
@@ -54,11 +57,17 @@ operations. Each `addRule` carries a complete narrow `NetworkPolicyRule`.
    waiting on the rest.
 7. For each accepted chunk_id, call
    `GET /v1/proposals/{chunk_id}/wait?timeout=300` and act on the result:
-   - `status: "approved"` — retry the original denied action. Policy
-     hot-reloads after approval, so the request should succeed. If it
-     still fails with `policy_denied`, re-read the denial — your rule
-     may not match. If it fails for any other reason, surface to the
-     user.
+   - `status: "approved"` with `policy_reloaded: true` — retry the
+     original denied action. The merged policy is already loaded; the
+     request should succeed. If it still fails with `policy_denied`,
+     re-read the denial — your rule may not match. If it fails for any
+     other reason, surface to the user.
+   - `status: "approved"` with `policy_reloaded: false` — approval
+     landed but the local sandbox hasn't observed the reload within the
+     `/wait` window. Re-issue the same `/wait` call once with
+     `timeout=30`. If the second response is still
+     `policy_reloaded: false`, surface to the user rather than retrying
+     blind; do not loop tightly.
    - `status: "rejected"` — read `rejection_reason` and
      `validation_result`. `rejection_reason` is what the reviewer typed;
      `validation_result` is the prover's verdict, which often explains

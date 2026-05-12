@@ -61,9 +61,15 @@ mod tests {
         assert!(content.contains("addRule"));
         // The wait-loop teaching is load-bearing for the agent feedback
         // UX; lock the workflow language in so future skill edits cannot
-        // drop it silently. Both substrings target the directive, not the
+        // drop it silently. Each substring targets a directive, not the
         // field name (which could appear in the API doc block alone).
         assert!(content.contains("/v1/proposals/{chunk_id}/wait"));
         assert!(content.contains("read `rejection_reason`"));
+        // policy_reloaded distinguishes "safe to retry" from "approval
+        // landed but supervisor hasn't reloaded yet"; without both
+        // branches taught the agent retries blind on approve+not-yet
+        // and re-runs into policy_denied.
+        assert!(content.contains("`policy_reloaded: true`"));
+        assert!(content.contains("`policy_reloaded: false`"));
     }
 }
