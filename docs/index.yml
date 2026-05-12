@@ -16,7 +16,7 @@ navigation:
   - folder: get-started/tutorials
     skip-slug: true
 - folder: sandboxes
-  title: "How It Works"
+  title: "Manage OpenShell"
 - folder: observability
   title: "Observability"
 - folder: kubernetes
