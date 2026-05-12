@@ -11,17 +11,19 @@
 //! whether any placeholder survived; it never echoes payload bytes, placeholder
 //! text, or secret material back into test output.
 
-use std::io::Write;
+use std::io::{self, Error, ErrorKind, Write};
 use std::process::Stdio;
 use std::sync::Mutex;
 
 use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::container::ContainerHttpServer;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 
 const PROVIDER_NAME: &str = "e2e-websocket-conformance";
-const TEST_SERVER_ALIAS: &str = "websocket-conformance.openshell.test";
+const TEST_SERVER_HOST: &str = "host.openshell.internal";
 const TEST_SECRET: &str = "sk-e2e-websocket-conformance-secret";
 const TOKEN_ENV: &str = "WS_E2E_TOKEN";
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
@@ -76,107 +78,153 @@ async fn create_generic_provider(name: &str) -> Result<String, String> {
     .await
 }
 
-async fn start_websocket_probe_server() -> Result<ContainerHttpServer, String> {
-    let script = format!(
-        r#"
-import base64
-import hashlib
-import json
-import socketserver
-import struct
+struct WebSocketProbeServer {
+    port: u16,
+    task: JoinHandle<()>,
+}
 
-GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-SECRET = {secret:?}
-PLACEHOLDER_PREFIX = {placeholder_prefix:?}
+impl WebSocketProbeServer {
+    async fn start() -> Result<Self, String> {
+        let listener = TcpListener::bind(("0.0.0.0", 0))
+            .await
+            .map_err(|e| format!("bind websocket probe server: {e}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| format!("read websocket probe server address: {e}"))?
+            .port();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let _ = handle_websocket_probe_connection(stream).await;
+                });
+            }
+        });
 
-def recv_until(sock, marker):
-    data = b""
-    while marker not in data:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        data += chunk
-    return data
+        Ok(Self { port, task })
+    }
+}
 
-def read_exact(sock, size):
-    data = b""
-    while len(data) < size:
-        chunk = sock.recv(size - len(data))
-        if not chunk:
-            raise EOFError("unexpected end of websocket frame")
-        data += chunk
-    return data
+impl Drop for WebSocketProbeServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 
-def read_frame(sock):
-    header = read_exact(sock, 2)
-    first, second = header[0], header[1]
-    length = second & 0x7F
-    if length == 126:
-        length = struct.unpack("!H", read_exact(sock, 2))[0]
-    elif length == 127:
-        length = struct.unpack("!Q", read_exact(sock, 8))[0]
-    mask = read_exact(sock, 4) if second & 0x80 else b""
-    payload = read_exact(sock, length)
-    if mask:
-        payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
-    return first, payload
+async fn recv_until(stream: &mut TcpStream, marker: &[u8]) -> io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    let mut buf = [0_u8; 1024];
+    loop {
+        let read = stream.read(&mut buf).await?;
+        if read == 0 {
+            return Ok(data);
+        }
+        data.extend_from_slice(&buf[..read]);
+        if data.windows(marker.len()).any(|window| window == marker) {
+            return Ok(data);
+        }
+    }
+}
 
-def send_text(sock, payload):
-    data = payload.encode("utf-8")
-    if len(data) < 126:
-        header = bytes([0x81, len(data)])
-    elif len(data) <= 0xFFFF:
-        header = bytes([0x81, 126]) + struct.pack("!H", len(data))
-    else:
-        header = bytes([0x81, 127]) + struct.pack("!Q", len(data))
-    sock.sendall(header + data)
+async fn read_websocket_text(stream: &mut TcpStream) -> io::Result<String> {
+    let mut header = [0_u8; 2];
+    stream.read_exact(&mut header).await?;
+    let length = match header[1] & 0x7F {
+        len @ 0..=125 => usize::from(len),
+        126 => {
+            let mut bytes = [0_u8; 2];
+            stream.read_exact(&mut bytes).await?;
+            usize::from(u16::from_be_bytes(bytes))
+        }
+        127 => {
+            let mut bytes = [0_u8; 8];
+            stream.read_exact(&mut bytes).await?;
+            usize::try_from(u64::from_be_bytes(bytes))
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "websocket frame too large"))?
+        }
+        _ => unreachable!(),
+    };
 
-def header_value(request, name):
-    prefix = name.lower() + ":"
-    for line in request.split("\r\n"):
-        if line.lower().startswith(prefix):
-            return line.split(":", 1)[1].strip()
-    return ""
+    let mut mask = [0_u8; 4];
+    if header[1] & 0x80 != 0 {
+        stream.read_exact(&mut mask).await?;
+    } else {
+        mask = [0, 0, 0, 0];
+    }
 
-class Handler(socketserver.BaseRequestHandler):
-    def handle(self):
-        request_bytes = recv_until(self.request, b"\r\n\r\n")
-        request = request_bytes.decode("iso-8859-1", "replace")
-        if "upgrade: websocket" not in request.lower():
-            self.request.sendall(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
-            )
-            return
+    let mut payload = vec![0_u8; length];
+    stream.read_exact(&mut payload).await?;
+    if header[1] & 0x80 != 0 {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % mask.len()];
+        }
+    }
 
-        key = header_value(request, "Sec-WebSocket-Key")
-        accept = base64.b64encode(hashlib.sha1((key + GUID).encode("ascii")).digest()).decode("ascii")
-        response = (
-            "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Accept: {{accept}}\r\n"
-            "\r\n"
+    String::from_utf8(payload).map_err(|e| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid websocket text: {e}"),
         )
-        self.request.sendall(response.encode("ascii"))
+    })
+}
 
-        _, payload = read_frame(self.request)
-        text = payload.decode("utf-8", "replace")
-        result = {{
-            "saw_placeholder": PLACEHOLDER_PREFIX in text,
-            "saw_secret": SECRET in text,
-        }}
-        send_text(self.request, json.dumps(result, sort_keys=True))
+async fn send_websocket_text(stream: &mut TcpStream, payload: &str) -> io::Result<()> {
+    let data = payload.as_bytes();
+    let mut frame = Vec::with_capacity(data.len() + 10);
+    frame.push(0x81);
+    if data.len() < 126 {
+        frame.push(
+            u8::try_from(data.len())
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "websocket frame too large"))?,
+        );
+    } else if data.len() <= usize::from(u16::MAX) {
+        frame.push(126);
+        frame.extend_from_slice(
+            &u16::try_from(data.len())
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "websocket frame too large"))?
+                .to_be_bytes(),
+        );
+    } else {
+        frame.push(127);
+        frame.extend_from_slice(
+            &u64::try_from(data.len())
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "websocket frame too large"))?
+                .to_be_bytes(),
+        );
+    }
+    frame.extend_from_slice(data);
+    stream.write_all(&frame).await
+}
 
-class Server(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
+async fn handle_websocket_probe_connection(mut stream: TcpStream) -> io::Result<()> {
+    let request_bytes = recv_until(&mut stream, b"\r\n\r\n").await?;
+    let request = String::from_utf8_lossy(&request_bytes);
+    if !request.to_ascii_lowercase().contains("upgrade: websocket") {
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await?;
+        return Ok(());
+    }
 
-Server(("0.0.0.0", 8000), Handler).serve_forever()
-"#,
-        secret = TEST_SECRET,
-        placeholder_prefix = PLACEHOLDER_PREFIX,
+    stream
+        .write_all(
+            b"HTTP/1.1 101 Switching Protocols\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Accept: test\r\n\
+              \r\n",
+        )
+        .await?;
+
+    let text = read_websocket_text(&mut stream).await?;
+    let response = format!(
+        r#"{{"saw_placeholder": {}, "saw_secret": {}}}"#,
+        text.contains(PLACEHOLDER_PREFIX),
+        text.contains(TEST_SECRET)
     );
-
-    ContainerHttpServer::start_python(TEST_SERVER_ALIAS, &script).await
+    send_websocket_text(&mut stream, &response).await
 }
 
 fn write_websocket_policy(host: &str, port: u16) -> Result<NamedTempFile, String> {
@@ -330,14 +378,14 @@ async fn websocket_text_placeholder_is_rewritten_in_docker_sandbox() {
         .expect("create generic provider");
 
     let result = async {
-        let server = start_websocket_probe_server().await?;
-        let policy = write_websocket_policy(&server.host, server.port)?;
+        let server = WebSocketProbeServer::start().await?;
+        let policy = write_websocket_policy(TEST_SERVER_HOST, server.port)?;
         let policy_path = policy
             .path()
             .to_str()
             .ok_or_else(|| "temp policy path should be utf-8".to_string())?
             .to_string();
-        let script = websocket_client_script(&server.host, server.port);
+        let script = websocket_client_script(TEST_SERVER_HOST, server.port);
 
         SandboxGuard::create(&[
             "--policy",
