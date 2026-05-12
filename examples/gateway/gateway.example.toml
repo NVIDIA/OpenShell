@@ -7,9 +7,8 @@
 # Source precedence (highest first):
 #   CLI flag  >  OPENSHELL_* env var  >  this file  >  built-in default
 #
-# Two values are deliberately env-only and MUST NOT appear in this file:
-#   - database_url             (OPENSHELL_DB_URL              / --db-url)
-#   - ssh_handshake_secret     (OPENSHELL_SSH_HANDSHAKE_SECRET / --ssh-handshake-secret)
+# `database_url` is deliberately env-only and MUST NOT appear in this file
+# (set OPENSHELL_DB_URL / --db-url instead).
 
 [openshell]
 version = 1
@@ -29,7 +28,6 @@ sandbox_namespace     = "openshell"
 sandbox_ssh_port      = 2222
 ssh_gateway_host      = "127.0.0.1"
 ssh_gateway_port      = 8080
-ssh_handshake_skew_secs = 300
 
 # Subject Alternative Names baked into the gateway server certificate.
 # Wildcard DNS SANs (e.g. "*.dev.openshell.localhost") also enable sandbox

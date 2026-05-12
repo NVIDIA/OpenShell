@@ -207,23 +207,18 @@ When unset, the gateway behaves exactly as before — CLI flags and env vars
 drive every setting. See `examples/gateway/gateway.example.toml` for a
 worked example and RFC 0003 for the full schema.
 
-Two secrets are env-only and rejected when present in the file:
-
-| Field                  | Source                                           |
-|------------------------|--------------------------------------------------|
-| `database_url`         | `OPENSHELL_DB_URL` / `--db-url`                  |
-| `ssh_handshake_secret` | `OPENSHELL_SSH_HANDSHAKE_SECRET` / `--ssh-handshake-secret` |
+`database_url` is env-only and rejected when present in the file
+(`OPENSHELL_DB_URL` / `--db-url`).
 
 ### Driver inheritance
 
 `[openshell.gateway]` carries a small set of values (`default_image`,
 `supervisor_image`, `image_pull_policy`, `guest_tls_ca/cert/key`,
-`client_tls_secret_name`, `host_gateway_ip`, `ssh_handshake_skew_secs`,
-`enable_user_namespaces`) that are inherited into each driver's
-`[openshell.drivers.<name>]` table when the driver-specific table does not
-override them. The allowlist is per-driver so a gateway-wide default cannot
-land in a driver that does not understand it (e.g.
-`client_tls_secret_name` is K8s-only).
+`client_tls_secret_name`, `host_gateway_ip`, `enable_user_namespaces`) that
+are inherited into each driver's `[openshell.drivers.<name>]` table when
+the driver-specific table does not override them. The allowlist is
+per-driver so a gateway-wide default cannot land in a driver that does not
+understand it (e.g. `client_tls_secret_name` is K8s-only).
 
 Driver-specific values that are not part of the inheritance allowlist
 (e.g. K8s `namespace`, Podman `socket_path`, VM `vcpus`) only come from
