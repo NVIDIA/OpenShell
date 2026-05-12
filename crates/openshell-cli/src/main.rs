@@ -1959,7 +1959,7 @@ async fn main() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_edge_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name);
             run::service_expose(&ctx.endpoint, &sandbox, &service, target_port, &tls).await?;
         }
         // -----------------------------------------------------------
