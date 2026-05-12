@@ -406,9 +406,12 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
                     .ca
                     .as_ref()
                     .and_then(|ca_path| std::fs::read(ca_path).ok())
-                    .map_or_else(ClientTlsConfig::new, |ca_pem| {
-                        ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem))
-                    })
+                    .map_or_else(
+                        || ClientTlsConfig::new().with_enabled_roots(),
+                        |ca_pem| {
+                            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem))
+                        },
+                    )
             },
             |materials| build_tonic_tls_config(&materials),
         )
