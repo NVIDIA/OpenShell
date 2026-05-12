@@ -5,60 +5,26 @@
 
 # Supervisor image build.
 #
-# The final image intentionally stays `scratch`: it only carries the static
-# openshell-sandbox binary used by Docker extraction, Podman image volumes, and
-# the Kubernetes init container copy-self path.
+# The final image is `scratch`: it only carries the static `openshell-sandbox`
+# binary used by Docker extraction, Podman image volumes, and the Kubernetes
+# init container copy-self path. A static musl binary lets the image stay
+# `scratch` while still being executable as an init container.
 #
-# Rust binaries are normally built natively before the image build and staged at:
+# The Rust binary is built natively before this image build runs and staged at:
 #   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-sandbox
 #
-# Local dev callers such as Skaffold can pass BUILD_FROM_SOURCE=1 to compile the
-# supervisor inside Docker instead.
-
-ARG BUILD_FROM_SOURCE=0
-
-FROM rust:1.95.0-slim-bookworm AS rust-builder
-ARG TARGETARCH
-ARG BUILDARCH
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    ca-certificates \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY deploy/docker/cross-build.sh /usr/local/bin/cross-build.sh
-RUN . /usr/local/bin/cross-build.sh \
-    && install_musl_toolchain \
-    && add_musl_target
-
-WORKDIR /build
-
-COPY Cargo.toml Cargo.lock ./
-COPY crates/ crates/
-COPY proto/ proto/
-COPY providers/ providers/
-
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    . /usr/local/bin/cross-build.sh \
-    && cargo_musl_build --release \
-        --features "openshell-core/dev-settings" \
-        -p openshell-sandbox \
-        --bin openshell-sandbox \
-    && mkdir -p /build/out \
-    && install -m 0755 "$(musl_output_dir release)/openshell-sandbox" /build/out/openshell-sandbox
-
-FROM scratch AS supervisor-binary-0
-ARG TARGETARCH
-COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /build/out/openshell-sandbox
-
-FROM rust-builder AS supervisor-binary-1
-
-FROM supervisor-binary-${BUILD_FROM_SOURCE} AS supervisor-binary
+# Use tasks/scripts/docker-build-image.sh supervisor (or `mise run build:docker:supervisor`)
+# to stage the binary and build the image in one step. CI builds the binary
+# per-architecture via the `rust-native-build.yml` workflow (with the musl
+# target) and uploads it as an artifact, which is downloaded into the same
+# staging directory before the image build job runs.
 
 FROM scratch AS supervisor
 
-COPY --from=supervisor-binary /build/out/openshell-sandbox /openshell-sandbox
+ARG TARGETARCH
+
+# --chmod=755 preserves the executable bit through actions/upload-artifact +
+# download-artifact, which strip exec perms during the roundtrip.
+COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
 
 ENTRYPOINT ["/openshell-sandbox"]

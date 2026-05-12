@@ -5,54 +5,30 @@
 
 # Gateway image build.
 #
-# Rust binaries are normally built natively before the image build and staged at:
+# The Rust binary is built natively before this image build runs and staged at:
 #   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-gateway
 #
-# Local dev callers such as Skaffold can pass BUILD_FROM_SOURCE=1 to compile the
-# gateway inside Docker instead.
+# Use tasks/scripts/docker-build-image.sh gateway (or `mise run build:docker:gateway`)
+# to stage the binary and build the image in one step. CI builds the binary
+# per-architecture via the `rust-native-build.yml` workflow and uploads it as
+# an artifact, which is downloaded into the same staging directory before the
+# image build job runs.
+#
+# The runtime is `nvcr.io/nvidia/distroless/cc:4.0.0`, which provides glibc and
+# the dynamic loader needed by the GNU-linked gateway binary while keeping the
+# attack surface small.
 
-ARG BUILD_FROM_SOURCE=0
-ARG GATEWAY_BASE_IMAGE=nvcr.io/nvidia/distroless/cc:4.0.0
-
-FROM rust:1.95.0-slim-bookworm AS rust-builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    ca-certificates \
-    cmake \
-    libssl-dev \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-
-COPY Cargo.toml Cargo.lock ./
-COPY crates/ crates/
-COPY proto/ proto/
-COPY providers/ providers/
-
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo build --release \
-        --features "openshell-core/dev-settings" \
-        -p openshell-server \
-        --bin openshell-gateway \
-    && mkdir -p /build/out \
-    && install -m 0755 target/release/openshell-gateway /build/out/openshell-gateway
-
-FROM scratch AS gateway-binary-0
-ARG TARGETARCH
-COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /build/out/openshell-gateway
-
-FROM rust-builder AS gateway-binary-1
-
-FROM gateway-binary-${BUILD_FROM_SOURCE} AS gateway-binary
+ARG GATEWAY_BASE_IMAGE=nvcr.io/nvidia/distroless/cc:v4.0.4
 
 FROM ${GATEWAY_BASE_IMAGE} AS gateway
 
+ARG TARGETARCH
+
 WORKDIR /app
 
-COPY --from=gateway-binary /build/out/openshell-gateway /usr/local/bin/openshell-gateway
+# --chmod=755 preserves the executable bit through actions/upload-artifact +
+# download-artifact, which strip exec perms during the roundtrip.
+COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
 
 USER 65532:65532
 EXPOSE 8080
