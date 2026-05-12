@@ -79,4 +79,36 @@ The chart can opt into two independent observability surfaces:
 - `monitoring.serviceMonitor.enabled` — creates a Prometheus-Operator `ServiceMonitor` scraping the gateway's `/metrics` endpoint. Requires the `monitoring.coreos.com/v1` CRD (ships with `kube-prometheus-stack`).
 - `monitoring.tracing.enabled` — projects standard `OTEL_*` env vars onto the gateway container so it exports OTLP/gRPC traces to the configured `monitoring.tracing.endpoint`.
 
-Both are off by default. See [Monitoring the Gateway](../../../docs/kubernetes/monitoring.mdx) for the operator guide and `mise run observability:k8s:setup` for the local-dev `kube-prometheus-stack` + Jaeger bundle.
+Both are off by default. See [Monitoring the Gateway](../../../docs/kubernetes/monitoring.mdx) for the operator guide.
+
+### Local development
+
+The repo ships a one-shot mise task that installs `kube-prometheus-stack` (slimmed-down: no Alertmanager, node-exporter, or kube-state) and a Jaeger all-in-one Pod into the local k3s cluster.
+
+```bash
+# 1. Bring up the cluster (skip if already running):
+mise run helm:k3s:create
+
+# 2. Install Prometheus + Grafana + Jaeger:
+mise run observability:k8s:setup
+
+# 3. Uncomment `- ci/values-monitoring.yaml` in deploy/helm/openshell/skaffold.yaml
+
+# 4. Deploy / restart the openshell release:
+mise run helm:skaffold:dev
+
+# 5. Forward UIs to localhost:
+mise run observability:port-forward
+```
+
+Then visit:
+
+- Grafana — http://localhost:3000 (admin / admin)
+- Prometheus — http://localhost:9090
+- Jaeger UI — http://localhost:16686
+
+Tear down with:
+
+```bash
+mise run observability:k8s:teardown
+```

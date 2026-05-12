@@ -13,7 +13,7 @@ The OpenShell gateway exposes two telemetry surfaces operators usually plug dire
 - **Prometheus metrics** at `/metrics` on a dedicated port — scraped over HTTP.
 - **OpenTelemetry traces** exported over OTLP/gRPC — pushed to a collector or backend.
 
-Both are off by default in the chart. This page enables them on a real cluster, and shows the local-dev path that bundles `kube-prometheus-stack` and Jaeger.
+Both are off by default in the chart. This page enables them on a real cluster.
 
 <Note>
 For sandbox-internal logs (OCSF), see [Observability → Sandbox Logging](/observability/logging). That surface is independent of the gateway control-plane telemetry described here.
@@ -93,39 +93,6 @@ openshell sandbox create --name trace-probe
 ```
 
 In Jaeger UI: select **Service: openshell-gateway** and **Find Traces**. In Grafana Tempo / OTLP backends: query `service.name="openshell-gateway"`.
-
-## Local development
-
-The repo ships a one-shot mise task that installs `kube-prometheus-stack` (slimmed-down: no Alertmanager, node-exporter, or kube-state) and a Jaeger all-in-one Pod into the local k3s cluster.
-
-```shell
-# 1. Bring up the cluster (skip if already running):
-mise run helm:k3s:create
-
-# 2. Install Prometheus + Grafana + Jaeger:
-mise run observability:k8s:setup
-
-# 3. Open ci/values-monitoring.yaml on the openshell release:
-#    Uncomment `- ci/values-monitoring.yaml` in deploy/helm/openshell/skaffold.yaml
-
-# 4. Deploy / restart the openshell release:
-mise run helm:skaffold:dev
-
-# 5. Forward UIs to localhost:
-mise run observability:port-forward
-```
-
-Then visit:
-
-- Grafana — http://localhost:3000 (admin / admin)
-- Prometheus — http://localhost:9090
-- Jaeger UI — http://localhost:16686
-
-Tear it all down with:
-
-```shell
-mise run observability:k8s:teardown
-```
 
 ## Production guidance
 
