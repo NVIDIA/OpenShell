@@ -74,7 +74,7 @@ fn endpoint_scheme(config: &openshell_core::Config) -> &'static str {
 }
 
 fn endpoint_host(config: &ServiceRoutingConfig, sandbox: &str, service: &str) -> Option<String> {
-    let base_domain = config.service_base_domains.first()?;
+    let base_domain = config.base_domains.first()?;
     Some(if service.is_empty() {
         format!("{sandbox}.{base_domain}")
     } else {
@@ -84,7 +84,7 @@ fn endpoint_host(config: &ServiceRoutingConfig, sandbox: &str, service: &str) ->
 
 pub fn parse_host(host: &str, config: &ServiceRoutingConfig) -> Option<(String, String)> {
     let host = host.split_once(':').map_or(host, |(name, _)| name);
-    for base_domain in &config.service_base_domains {
+    for base_domain in &config.base_domains {
         let expected_suffix = format!(".{base_domain}");
         let Some(encoded) = host.strip_suffix(&expected_suffix) else {
             continue;
@@ -814,7 +814,7 @@ mod tests {
 
     fn config() -> ServiceRoutingConfig {
         ServiceRoutingConfig {
-            service_base_domains: vec![
+            base_domains: vec![
                 "dev.openshell.localhost".to_string(),
                 "svc.gateway.localhost".to_string(),
             ],
@@ -835,7 +835,7 @@ mod tests {
     fn endpoint_url_uses_plain_http_for_loopback_tls_gateway() {
         let cfg = openshell_core::Config::new(Some(tls_config()))
             .with_bind_address("127.0.0.1:8080".parse().unwrap())
-            .with_service_base_domains(["dev.openshell.localhost"]);
+            .with_server_sans(["*.dev.openshell.localhost"]);
 
         assert_eq!(
             endpoint_url(&cfg, "my-sandbox", "web").as_deref(),
@@ -847,7 +847,7 @@ mod tests {
     fn endpoint_url_omits_service_label_for_empty_service_name() {
         let cfg = openshell_core::Config::new(Some(tls_config()))
             .with_bind_address("127.0.0.1:8080".parse().unwrap())
-            .with_service_base_domains(["dev.openshell.localhost"]);
+            .with_server_sans(["*.dev.openshell.localhost"]);
 
         assert_eq!(
             endpoint_url(&cfg, "my-sandbox", "").as_deref(),
@@ -859,7 +859,7 @@ mod tests {
     fn endpoint_url_keeps_https_for_non_loopback_tls_gateway() {
         let cfg = openshell_core::Config::new(Some(tls_config()))
             .with_bind_address("0.0.0.0:8080".parse().unwrap())
-            .with_service_base_domains(["dev.openshell.localhost"]);
+            .with_server_sans(["*.dev.openshell.localhost"]);
 
         assert_eq!(
             endpoint_url(&cfg, "my-sandbox", "web").as_deref(),
@@ -871,7 +871,7 @@ mod tests {
     fn endpoint_url_keeps_https_when_loopback_plaintext_http_is_disabled() {
         let cfg = openshell_core::Config::new(Some(tls_config()))
             .with_bind_address("127.0.0.1:8080".parse().unwrap())
-            .with_service_base_domains(["dev.openshell.localhost"])
+            .with_server_sans(["*.dev.openshell.localhost"])
             .with_loopback_service_http(false);
 
         assert_eq!(
@@ -913,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_alternate_service_base_domain() {
+    fn parses_alternate_service_routing_domain() {
         assert_eq!(
             parse_host("my-sandbox--web.svc.gateway.localhost", &config()),
             Some(("my-sandbox".to_string(), "web".to_string()))

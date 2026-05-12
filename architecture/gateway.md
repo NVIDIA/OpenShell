@@ -149,10 +149,12 @@ sends a targeted `RelayOpen` to the supervisor, then bridges
 `TcpForwardFrame::Data` to `RelayFrame::Data` until either side closes.
 
 Browser service URLs use the same supervisor relay path after host-based
-routing resolves `sandbox--service.<base-domain>` to a stored service endpoint.
-TLS-enabled loopback gateways print `http://` URLs when loopback plaintext
-service HTTP is enabled; non-loopback TLS gateways continue to print `https://`
-URLs.
+routing resolves `sandbox--service.<service-routing-domain>` to a stored
+service endpoint. Accepted service routing domains are derived from wildcard
+DNS SANs configured on the gateway server certificate, with
+`openshell.localhost` available by default for loopback gateways. TLS-enabled
+loopback gateways print `http://` URLs when loopback plaintext service HTTP is
+enabled; non-loopback TLS gateways continue to print `https://` URLs.
 
 For `target.tcp`, the gateway only accepts loopback destinations such as
 `localhost`, `127.0.0.0/8`, or `::1`. The gateway never needs to know or dial a

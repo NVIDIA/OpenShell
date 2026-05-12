@@ -46,7 +46,6 @@ spec:
         adminRole: "__OIDC_ADMIN_ROLE__"
         userRole: "__OIDC_USER_ROLE__"
         scopesClaim: "__OIDC_SCOPES_CLAIM__"
-      serviceBaseDomains: __SERVICE_BASE_DOMAINS__
       tls:
         certSecretName: openshell-server-tls
         clientCaSecretName: openshell-server-client-ca

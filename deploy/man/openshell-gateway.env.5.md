@@ -96,6 +96,11 @@ the SSH handshake secret).
     **OPENSHELL_BIND_ADDRESS** to **127.0.0.1** or place the gateway
     behind a TLS-terminating reverse proxy.
 
+**OPENSHELL_SERVER_SAN** (default: unset)
+:   Comma-separated SANs configured on the gateway server certificate.
+    Wildcard DNS SANs also enable sandbox service URLs under that
+    domain.
+
 **OPENSHELL_PODMAN_TLS_CA** (default: auto-generated path)
 :   CA certificate bind-mounted into sandbox containers.
 

@@ -96,8 +96,13 @@ spec:
             - name: OPENSHELL_ENABLE_USER_NAMESPACES
               value: "true"
             {{- end }}
-            - name: OPENSHELL_SERVICE_BASE_DOMAIN
-              value: {{ join "," .Values.server.serviceBaseDomains | quote }}
+            {{- if and .Values.certManager.enabled .Values.certManager.serverDnsNames }}
+            - name: OPENSHELL_SERVER_SAN
+              value: {{ join "," .Values.certManager.serverDnsNames | quote }}
+            {{- else if and .Values.pkiInitJob.enabled .Values.pkiInitJob.serverDnsNames }}
+            - name: OPENSHELL_SERVER_SAN
+              value: {{ join "," .Values.pkiInitJob.serverDnsNames | quote }}
+            {{- end }}
             - name: OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP
               value: {{ .Values.server.enableLoopbackServiceHttp | quote }}
             - name: OPENSHELL_SSH_HANDSHAKE_SECRET

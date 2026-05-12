@@ -299,13 +299,14 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_OIDC_SCOPES_CLAIM", default_value = "")]
     oidc_scopes_claim: String,
 
-    /// Base domains accepted for sandbox service routing.
+    /// Subject Alternative Names configured on the gateway server certificate.
+    /// Wildcard DNS SANs also enable sandbox service URLs under that domain.
     #[arg(
-        long = "service-base-domain",
-        env = "OPENSHELL_SERVICE_BASE_DOMAIN",
+        long = "server-san",
+        env = "OPENSHELL_SERVER_SAN",
         value_delimiter = ','
     )]
-    service_base_domains: Vec<String>,
+    server_sans: Vec<String>,
 
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[arg(
@@ -412,7 +413,7 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
         .with_ssh_gateway_port(args.ssh_gateway_port)
         .with_sandbox_ssh_port(args.sandbox_ssh_port)
         .with_ssh_handshake_skew_secs(args.ssh_handshake_skew_secs)
-        .with_service_base_domains(args.service_base_domains)
+        .with_server_sans(args.server_sans)
         .with_loopback_service_http(args.enable_loopback_service_http);
 
     if let Some(image) = args.sandbox_image {
@@ -636,19 +637,16 @@ mod tests {
     }
 
     #[test]
-    fn command_reads_service_base_domain_from_env() {
+    fn command_reads_server_san_from_env() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _guard = EnvVarGuard::set("OPENSHELL_SERVICE_BASE_DOMAIN", "openshell.localhost");
+        let _guard = EnvVarGuard::set("OPENSHELL_SERVER_SAN", "*.apps.example.com");
 
         let cli =
             Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
 
-        assert_eq!(
-            cli.run.service_base_domains,
-            vec!["openshell.localhost".to_string()]
-        );
+        assert_eq!(cli.run.server_sans, vec!["*.apps.example.com".to_string()]);
     }
 
     #[test]

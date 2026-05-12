@@ -89,6 +89,13 @@ gRPC and HTTP, secured by mutual TLS (mTLS) by default.
     **--disable-tls** is set.
     Environment: **OPENSHELL_DISABLE_GATEWAY_AUTH**.
 
+**--server-san** *SAN*
+:   Subject Alternative Name configured on the gateway server
+    certificate. Repeat or pass a comma-separated value through
+    **OPENSHELL_SERVER_SAN**. Wildcard DNS SANs also enable sandbox
+    service URLs under that domain.
+    Environment: **OPENSHELL_SERVER_SAN**.
+
 **--sandbox-image** *IMAGE*
 :   Default container image for sandboxes.
     Environment: **OPENSHELL_SANDBOX_IMAGE**.

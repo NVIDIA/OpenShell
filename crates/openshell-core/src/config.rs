@@ -36,8 +36,8 @@ pub const DEFAULT_NETWORK_NAME: &str = "openshell";
 /// Default Docker bridge network name for local sandboxes.
 pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 
-/// Default base domain used for browser-facing sandbox service URLs.
-pub const DEFAULT_SERVICE_BASE_DOMAIN: &str = "openshell.localhost";
+/// Default domain used for browser-facing sandbox service URLs.
+pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
 /// Default OCI image for the openshell-sandbox supervisor binary.
 pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
@@ -313,10 +313,10 @@ pub struct Config {
 /// Browser-facing sandbox service routing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceRoutingConfig {
-    /// Base domains accepted for `sandbox--service.<base-domain>` routes.
+    /// Base domains accepted for `sandbox--service.<domain>` routes.
     /// The first domain is used when the gateway prints endpoint URLs.
-    #[serde(default = "default_service_base_domains")]
-    pub service_base_domains: Vec<String>,
+    #[serde(default = "default_service_routing_domains")]
+    pub base_domains: Vec<String>,
 
     /// Enable TLS-enabled loopback gateway listeners to also accept plaintext
     /// HTTP for sandbox service hostnames.
@@ -586,22 +586,18 @@ impl Config {
         self
     }
 
-    /// Configure browser-facing sandbox service base domains.
+    /// Derive browser-facing sandbox service domains from gateway server SANs.
+    ///
+    /// Wildcard DNS SANs such as `*.apps.example.com` enable service URLs
+    /// under `apps.example.com`. Non-wildcard DNS names and IP SANs do not
+    /// enable service subdomains.
     #[must_use]
-    pub fn with_service_base_domains<I, S>(mut self, domains: I) -> Self
+    pub fn with_server_sans<I, S>(mut self, sans: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let domains: Vec<String> = domains
-            .into_iter()
-            .filter_map(|domain| normalize_service_base_domain(domain.into()))
-            .collect();
-        self.service_routing.service_base_domains = if domains.is_empty() {
-            default_service_base_domains()
-        } else {
-            domains
-        };
+        self.service_routing.base_domains = service_routing_domains_from_server_sans(sans);
         self
     }
 
@@ -617,7 +613,7 @@ impl Config {
 impl Default for ServiceRoutingConfig {
     fn default() -> Self {
         Self {
-            service_base_domains: default_service_base_domains(),
+            base_domains: default_service_routing_domains(),
             enable_loopback_service_http: default_enable_loopback_service_http(),
         }
     }
@@ -627,17 +623,60 @@ fn default_bind_address() -> SocketAddr {
     "127.0.0.1:8080".parse().expect("valid default address")
 }
 
-fn default_service_base_domains() -> Vec<String> {
-    vec![DEFAULT_SERVICE_BASE_DOMAIN.to_string()]
+fn default_service_routing_domains() -> Vec<String> {
+    vec![DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()]
 }
 
 const fn default_enable_loopback_service_http() -> bool {
     true
 }
 
-fn normalize_service_base_domain(domain: String) -> Option<String> {
+fn service_routing_domains_from_server_sans<I, S>(sans: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut domains = Vec::new();
+    for san in sans {
+        if let Some(domain) = service_routing_domain_from_server_san(&san.into())
+            && !domains.contains(&domain)
+        {
+            domains.push(domain);
+        }
+    }
+    for domain in default_service_routing_domains() {
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+    domains
+}
+
+fn service_routing_domain_from_server_san(san: &str) -> Option<String> {
+    let san = san.trim().trim_matches('.').to_ascii_lowercase();
+    let domain = san.strip_prefix("*.")?;
+    normalize_service_routing_domain(domain)
+}
+
+fn normalize_service_routing_domain(domain: &str) -> Option<String> {
     let domain = domain.trim().trim_matches('.');
-    (!domain.is_empty()).then(|| domain.to_string())
+    if domain.is_empty() || domain.len() > 253 {
+        return None;
+    }
+    let labels = domain.split('.');
+    if labels.clone().any(|label| !is_dns_label(label)) {
+        return None;
+    }
+    Some(domain.to_string())
+}
+
+fn is_dns_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-') {
+        return false;
+    }
+    label
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn default_log_level() -> String {
@@ -679,7 +718,7 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_BASE_DOMAIN, detect_driver,
+        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, detect_driver,
         docker_host_unix_socket_path, is_unix_socket,
     };
     use std::net::SocketAddr;
@@ -729,23 +768,46 @@ mod tests {
     fn service_routing_allows_loopback_plaintext_http_by_default() {
         let cfg = Config::new(None);
         assert_eq!(
-            cfg.service_routing.service_base_domains,
-            vec![DEFAULT_SERVICE_BASE_DOMAIN.to_string()]
+            cfg.service_routing.base_domains,
+            vec![DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()]
         );
         assert!(cfg.service_routing.enable_loopback_service_http);
     }
 
     #[test]
-    fn service_base_domain_update_preserves_loopback_plaintext_http_flag() {
+    fn server_sans_update_preserves_loopback_plaintext_http_flag() {
         let cfg = Config::new(None)
             .with_loopback_service_http(false)
-            .with_service_base_domains(["dev.openshell.localhost"]);
+            .with_server_sans(["*.dev.openshell.localhost"]);
 
         assert_eq!(
-            cfg.service_routing.service_base_domains,
-            vec!["dev.openshell.localhost"]
+            cfg.service_routing.base_domains,
+            vec![
+                "dev.openshell.localhost".to_string(),
+                DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()
+            ]
         );
         assert!(!cfg.service_routing.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn service_routing_domains_are_derived_from_wildcard_server_sans() {
+        let cfg = Config::new(None).with_server_sans([
+            "gateway.example.com",
+            "*.apps.example.com",
+            "127.0.0.1",
+            "*.apps.example.com",
+            "*.dev.example.com.",
+        ]);
+
+        assert_eq!(
+            cfg.service_routing.base_domains,
+            vec![
+                "apps.example.com".to_string(),
+                "dev.example.com".to_string(),
+                DEFAULT_SERVICE_ROUTING_DOMAIN.to_string(),
+            ]
+        );
     }
 
     #[test]
