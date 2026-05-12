@@ -302,7 +302,7 @@ struct RunArgs {
     /// Base domains accepted for sandbox service routing.
     #[arg(
         long = "service-base-domain",
-        env = "OPENSHELL_SERVICE_BASE_DOMAINS",
+        env = "OPENSHELL_SERVICE_BASE_DOMAIN",
         value_delimiter = ','
     )]
     service_base_domains: Vec<String>,
@@ -633,6 +633,22 @@ mod tests {
             Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
 
         assert!(!cli.run.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn command_reads_service_base_domain_from_env() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::set("OPENSHELL_SERVICE_BASE_DOMAIN", "openshell.localhost");
+
+        let cli =
+            Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+
+        assert_eq!(
+            cli.run.service_base_domains,
+            vec!["openshell.localhost".to_string()]
+        );
     }
 
     #[test]

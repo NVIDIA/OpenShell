@@ -96,7 +96,7 @@ spec:
             - name: OPENSHELL_ENABLE_USER_NAMESPACES
               value: "true"
             {{- end }}
-            - name: OPENSHELL_SERVICE_BASE_DOMAINS
+            - name: OPENSHELL_SERVICE_BASE_DOMAIN
               value: {{ join "," .Values.server.serviceBaseDomains | quote }}
             - name: OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP
               value: {{ .Values.server.enableLoopbackServiceHttp | quote }}
