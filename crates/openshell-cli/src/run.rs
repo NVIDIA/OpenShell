@@ -3443,10 +3443,10 @@ fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String 
         return service_url.to_string();
     };
 
-    if service_url.set_scheme(gateway_endpoint.scheme()).is_err() {
-        return service_url.to_string();
-    }
-    if service_url.set_port(gateway_endpoint.port()).is_err() {
+    if service_url
+        .set_port(gateway_endpoint.port_or_known_default())
+        .is_err()
+    {
         return service_url.to_string();
     }
 
@@ -6227,10 +6227,32 @@ mod tests {
     fn service_url_for_gateway_omits_default_external_port() {
         assert_eq!(
             service_url_for_gateway(
-                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
                 "https://gateway.example.com"
             ),
             "https://quiet-flamingo--openclaw.navigator.openshell.localhost/"
+        );
+    }
+
+    #[test]
+    fn service_url_for_gateway_preserves_service_scheme() {
+        assert_eq!(
+            service_url_for_gateway(
+                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://127.0.0.1:31886"
+            ),
+            "http://quiet-flamingo--openclaw.navigator.openshell.localhost:31886/"
+        );
+    }
+
+    #[test]
+    fn service_url_for_gateway_uses_gateway_default_port() {
+        assert_eq!(
+            service_url_for_gateway(
+                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://gateway.example.com"
+            ),
+            "http://quiet-flamingo--openclaw.navigator.openshell.localhost:443/"
         );
     }
 
