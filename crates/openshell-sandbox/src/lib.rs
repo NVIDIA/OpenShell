@@ -2259,7 +2259,7 @@ async fn flush_proposals_to_gateway(
     // Run the mechanistic mapper sandbox-side to generate proposals.
     // The gateway is a thin persistence + validation layer — it never
     // generates proposals itself.
-    let proposals = mechanistic_mapper::generate_proposals(&proto_summaries).await;
+    let proposals = mechanistic_mapper::generate_proposals(&proto_summaries);
 
     info!(
         sandbox_name = %sandbox_name,

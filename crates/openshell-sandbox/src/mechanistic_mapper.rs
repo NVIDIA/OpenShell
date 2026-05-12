@@ -12,7 +12,7 @@
 //! The LLM-powered `PolicyAdvisor` (issue #205) wraps and enriches these
 //! mechanistic proposals with context-aware rationale and smarter grouping.
 
-use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
+use openshell_core::net::is_always_blocked_ip;
 use openshell_core::proto::{
     DenialSummary, L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
 };
@@ -48,12 +48,15 @@ const WELL_KNOWN_PORTS: &[(u16, &str)] = &[
 /// single binary. This produces one proposal per binary so each
 /// `(sandbox_id, host, port, binary)` maps to exactly one DB row.
 ///
-/// When a host resolves to a private IP (RFC 1918, loopback, link-local),
-/// the proposed endpoint includes `allowed_ips` so the proxy's SSRF override
-/// accepts the connection. Public IPs do not need `allowed_ips`.
+/// Proposals never include `allowed_ips`. If the user applies a proposed rule
+/// and the host resolves to a private IP, the proxy's SSRF defense will deny
+/// the connection. That SSRF denial flows back through the aggregator, and the
+/// user can then explicitly add `allowed_ips` to their policy. This two-step
+/// flow avoids DNS resolution in the mapper, which would leak the denied
+/// hostname via DNS even though the connection was blocked. See #1169.
 ///
 /// Returns an empty vec if there are no actionable denials.
-pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
+pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
     // Group denials by (host, port, binary).
     let mut groups: HashMap<(String, u32, String), Vec<&DenialSummary>> = HashMap::new();
 
@@ -116,11 +119,6 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
             continue;
         }
 
-        // Resolve the host and check if any IP is private. When a host
-        // resolves to private IP space, the proxy requires `allowed_ips` as an
-        // explicit SSRF override. Public IPs don't need this.
-        let allowed_ips = resolve_allowed_ips_if_private(host, *port).await;
-
         // Build proposed NetworkPolicyRule.
         let l7_rules = build_l7_rules(&l7_methods);
         let endpoint = if has_l7 && !l7_rules.is_empty() {
@@ -131,7 +129,6 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
                 protocol: "rest".to_string(),
                 enforcement: "enforce".to_string(),
                 rules: l7_rules,
-                allowed_ips: allowed_ips.clone(),
                 ..Default::default()
             }
         } else {
@@ -139,7 +136,6 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
                 host: host.clone(),
                 port: *port,
                 ports: vec![*port],
-                allowed_ips: allowed_ips.clone(),
                 ..Default::default()
             }
         };
@@ -178,15 +174,6 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
             .map(|(_, name)| format!(" ({name})"))
             .unwrap_or_default();
 
-        let private_ip_note = if allowed_ips.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " Host resolves to private IP ({}); allowed_ips included for SSRF override.",
-                allowed_ips.join(", ")
-            )
-        };
-
         // Note: hit_count in the DB accumulates across flush cycles, so we
         // don't bake a denial count into the rationale text (it would go stale).
         let rationale = if has_l7 && !l7_methods.is_empty() {
@@ -194,13 +181,13 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
             format!(
                 "Allow {binary_list} to connect to {host}:{port}{port_name} \
                  with L7 inspection. \
-                 Allowed paths: {}.{private_ip_note}",
+                 Allowed paths: {}.",
                 paths.join(", ")
             )
         } else {
             format!(
                 "Allow {binary_list} to connect to \
-                 {host}:{port}{port_name}.{private_ip_note}"
+                 {host}:{port}{port_name}."
             )
         };
 
@@ -438,82 +425,6 @@ fn is_always_blocked_destination(host: &str) -> bool {
     host_lc == "localhost" || host_lc == "localhost."
 }
 
-/// Resolve a hostname and return the IPs as `allowed_ips` strings only if any
-/// resolved address is in private IP space.
-///
-/// When a host resolves entirely to public IPs, the proxy doesn't need
-/// `allowed_ips` — it passes public traffic through after the OPA check.
-/// When any resolved IP is private/internal, the proxy requires `allowed_ips`
-/// as an explicit SSRF override, so the mapper includes them.
-///
-/// Returns an empty vec for public hosts or on DNS resolution failure.
-async fn resolve_allowed_ips_if_private(host: &str, port: u32) -> Vec<String> {
-    let addr = format!("{host}:{port}");
-    let addrs = match tokio::net::lookup_host(&addr).await {
-        Ok(addrs) => addrs.collect::<Vec<_>>(),
-        Err(e) => {
-            let port_u16 = u16::try_from(port).unwrap_or(u16::MAX);
-            let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
-                .activity(openshell_ocsf::ActivityId::Fail)
-                .severity(openshell_ocsf::SeverityId::Low)
-                .dst_endpoint(openshell_ocsf::Endpoint::from_domain(host, port_u16))
-                .message(format!("DNS resolution failed for allowed_ips check: {e}"))
-                .build();
-            openshell_ocsf::ocsf_emit!(event);
-            return Vec::new();
-        }
-    };
-
-    if addrs.is_empty() {
-        let port_u16 = u16::try_from(port).unwrap_or(u16::MAX);
-        let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
-            .activity(openshell_ocsf::ActivityId::Fail)
-            .severity(openshell_ocsf::SeverityId::Low)
-            .dst_endpoint(openshell_ocsf::Endpoint::from_domain(host, port_u16))
-            .message(format!(
-                "DNS resolution returned no addresses for {host}:{port}"
-            ))
-            .build();
-        openshell_ocsf::ocsf_emit!(event);
-        return Vec::new();
-    }
-
-    let has_private = addrs.iter().any(|a| is_internal_ip(a.ip()));
-    if !has_private {
-        return Vec::new();
-    }
-
-    // Host has private IPs — include non-always-blocked resolved IPs in
-    // allowed_ips.  Always-blocked addresses (loopback, link-local,
-    // unspecified) are filtered out since the proxy will reject them
-    // regardless of policy.
-    let mut ips: Vec<String> = addrs
-        .iter()
-        .filter(|a| !is_always_blocked_ip(a.ip()))
-        .map(|a| a.ip().to_string())
-        .collect();
-    ips.sort();
-    ips.dedup();
-
-    if ips.is_empty() {
-        // All resolved IPs were always-blocked — no viable allowed_ips.
-        tracing::debug!(
-            host,
-            port,
-            "All resolved IPs are always-blocked; skipping allowed_ips"
-        );
-        return Vec::new();
-    }
-
-    tracing::debug!(
-        host,
-        port,
-        ?ips,
-        "Host resolves to private IP; adding allowed_ips"
-    );
-    ips
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,14 +458,14 @@ mod tests {
         assert!(notes.contains("SSRF"));
     }
 
-    #[tokio::test]
-    async fn test_generate_proposals_empty() {
-        let proposals = generate_proposals(&[]).await;
+    #[test]
+    fn test_generate_proposals_empty() {
+        let proposals = generate_proposals(&[]);
         assert!(proposals.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_generate_proposals_basic() {
+    #[test]
+    fn test_generate_proposals_basic() {
         let summaries = vec![DenialSummary {
             sandbox_id: "test".to_string(),
             host: "api.example.com".to_string(),
@@ -575,7 +486,7 @@ mod tests {
             l7_inspection_active: false,
         }];
 
-        let proposals = generate_proposals(&summaries).await;
+        let proposals = generate_proposals(&summaries);
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0].rule_name, "allow_api_example_com_443");
         assert!(proposals[0].proposed_rule.is_some());
@@ -591,15 +502,12 @@ mod tests {
         assert!(rule.endpoints[0].protocol.is_empty());
         assert!(rule.endpoints[0].rules.is_empty());
 
-        // Public host should NOT have allowed_ips.
-        assert!(
-            rule.endpoints[0].allowed_ips.is_empty(),
-            "Public host should not get allowed_ips"
-        );
+        // Proposals never include allowed_ips (two-step approval flow).
+        assert!(rule.endpoints[0].allowed_ips.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_generate_proposals_with_l7_samples() {
+    #[test]
+    fn test_generate_proposals_with_l7_samples() {
         use openshell_core::proto::L7RequestSample;
 
         let summaries = vec![DenialSummary {
@@ -635,7 +543,7 @@ mod tests {
             l7_inspection_active: true,
         }];
 
-        let proposals = generate_proposals(&summaries).await;
+        let proposals = generate_proposals(&summaries);
         assert_eq!(proposals.len(), 1);
 
         let rule = proposals[0].proposed_rule.as_ref().unwrap();
@@ -662,76 +570,6 @@ mod tests {
 
         // Rationale should mention L7.
         assert!(proposals[0].rationale.contains("L7"));
-    }
-
-    // -- is_internal_ip tests -------------------------------------------------
-
-    #[test]
-    fn test_is_internal_ip_private_v4() {
-        use std::net::Ipv4Addr;
-        // RFC 1918 ranges
-        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
-        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(10, 110, 50, 3))));
-        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
-        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(172, 31, 255, 255))));
-        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
-    }
-
-    #[test]
-    fn test_is_internal_ip_loopback_and_link_local() {
-        use std::net::Ipv4Addr;
-        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(
-            169, 254, 169, 254
-        ))));
-    }
-
-    #[test]
-    fn test_is_internal_ip_public_v4() {
-        use std::net::Ipv4Addr;
-        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
-        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(208, 95, 112, 1))));
-        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
-    }
-
-    #[test]
-    fn test_is_internal_ip_cgnat() {
-        use std::net::Ipv4Addr;
-        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
-        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 100, 50, 3))));
-        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(
-            100, 127, 255, 255
-        ))));
-        // Just outside the /10 boundary
-        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1))));
-    }
-
-    #[test]
-    fn test_is_internal_ip_special_use() {
-        use std::net::Ipv4Addr;
-        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 1))));
-        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
-        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))));
-        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
-    }
-
-    #[test]
-    fn test_is_internal_ip_v6() {
-        use std::net::Ipv6Addr;
-        // Loopback
-        assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        // Link-local fe80::1
-        assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::new(
-            0xfe80, 0, 0, 0, 0, 0, 0, 1
-        ))));
-        // ULA fd00::1
-        assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::new(
-            0xfd00, 0, 0, 0, 0, 0, 0, 1
-        ))));
-        // Public 2001:db8::1
-        assert!(!is_internal_ip(IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
-        ))));
     }
 
     // -- is_always_blocked_destination tests ------------------------------------
@@ -770,8 +608,8 @@ mod tests {
 
     // -- generate_proposals: always-blocked filtering tests --------------------
 
-    #[tokio::test]
-    async fn test_generate_proposals_skips_loopback_destination() {
+    #[test]
+    fn test_generate_proposals_skips_loopback_destination() {
         let summaries = vec![DenialSummary {
             host: "127.0.0.1".to_string(),
             port: 80,
@@ -783,15 +621,15 @@ mod tests {
             ..Default::default()
         }];
 
-        let proposals = generate_proposals(&summaries).await;
+        let proposals = generate_proposals(&summaries);
         assert!(
             proposals.is_empty(),
             "should skip proposals for loopback: {proposals:?}"
         );
     }
 
-    #[tokio::test]
-    async fn test_generate_proposals_skips_link_local_destination() {
+    #[test]
+    fn test_generate_proposals_skips_link_local_destination() {
         let summaries = vec![DenialSummary {
             host: "169.254.169.254".to_string(),
             port: 80,
@@ -803,15 +641,15 @@ mod tests {
             ..Default::default()
         }];
 
-        let proposals = generate_proposals(&summaries).await;
+        let proposals = generate_proposals(&summaries);
         assert!(
             proposals.is_empty(),
             "should skip proposals for link-local: {proposals:?}"
         );
     }
 
-    #[tokio::test]
-    async fn test_generate_proposals_skips_localhost_hostname() {
+    #[test]
+    fn test_generate_proposals_skips_localhost_hostname() {
         let summaries = vec![DenialSummary {
             host: "localhost".to_string(),
             port: 8080,
@@ -823,15 +661,15 @@ mod tests {
             ..Default::default()
         }];
 
-        let proposals = generate_proposals(&summaries).await;
+        let proposals = generate_proposals(&summaries);
         assert!(
             proposals.is_empty(),
             "should skip proposals for localhost: {proposals:?}"
         );
     }
 
-    #[tokio::test]
-    async fn test_generate_proposals_keeps_public_destination() {
+    #[test]
+    fn test_generate_proposals_keeps_public_destination() {
         let summaries = vec![DenialSummary {
             host: "api.github.com".to_string(),
             port: 443,
@@ -843,7 +681,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let proposals = generate_proposals(&summaries).await;
+        let proposals = generate_proposals(&summaries);
         assert_eq!(proposals.len(), 1, "should keep proposals for public host");
     }
 
