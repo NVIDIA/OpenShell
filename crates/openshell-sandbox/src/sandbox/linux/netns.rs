@@ -242,6 +242,20 @@ impl NetworkNamespace {
         self.ns_fd
     }
 
+    /// Kernel-level identity of this network namespace.
+    ///
+    /// Returns the `nsfs` inode of `/var/run/netns/<name>`. The value matches
+    /// what `stat` on `/proc/<pid>/ns/net` reports for any process residing
+    /// in this namespace, so the proxy can use it to identify processes
+    /// running inside the sandbox even when the cached `entrypoint_pid` is
+    /// stale or has been recycled.
+    pub fn ns_inode(&self) -> Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        let path = format!("/var/run/netns/{}", self.name);
+        let meta = std::fs::metadata(&path).into_diagnostic()?;
+        Ok(meta.ino())
+    }
+
     /// Install iptables rules for bypass detection inside the namespace.
     ///
     /// Sets up OUTPUT chain rules that:

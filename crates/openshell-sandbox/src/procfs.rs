@@ -119,8 +119,14 @@ pub fn binary_path(pid: i32) -> Result<PathBuf> {
 /// ephemeral port, then scans the entrypoint process tree to find which PID owns
 /// that socket, and finally reads `/proc/<pid>/exe` to get the binary path.
 #[cfg(target_os = "linux")]
-pub fn resolve_tcp_peer_binary(entrypoint_pid: u32, peer_port: u16) -> Result<PathBuf> {
-    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_port)?;
+pub fn resolve_tcp_peer_binary(
+    entrypoint_pid: u32,
+    peer_port: u16,
+    remote_port: u16,
+    sandbox_netns_inode: u64,
+) -> Result<PathBuf> {
+    let owner =
+        resolve_single_tcp_peer_owner(entrypoint_pid, peer_port, remote_port, sandbox_netns_inode)?;
     binary_path(owner.pid.cast_signed())
 }
 
@@ -129,20 +135,40 @@ pub fn resolve_tcp_peer_binary(entrypoint_pid: u32, peer_port: u16) -> Result<Pa
 /// Multiple processes can legitimately hold the same socket inode after `fork()`
 /// or fd passing. Callers that make security decisions must evaluate the full
 /// owner set instead of selecting the first PID returned by `/proc` traversal.
+///
+/// `sandbox_netns_inode` is the `nsfs` inode of the sandbox network namespace
+/// (zero means unknown / not configured). When non-zero, the cross-netns
+/// fallback only considers PIDs whose `/proc/<pid>/ns/net` resolves to the
+/// same inode, so the proxy never attributes a connection to a process
+/// living in some other sandbox or the host. Without it, no fallback is
+/// attempted — better to fail closed than to attribute the connection to
+/// the wrong tenant.
 #[cfg(target_os = "linux")]
 pub fn resolve_tcp_peer_socket_owners(
     entrypoint_pid: u32,
     peer_port: u16,
+    remote_port: u16,
+    sandbox_netns_inode: u64,
 ) -> Result<TcpPeerSocketOwners> {
-    let inode = parse_proc_net_tcp(entrypoint_pid, peer_port)?;
+    let inode = parse_proc_net_tcp(entrypoint_pid, peer_port, remote_port, sandbox_netns_inode)?;
     let owners = find_socket_inode_owners(inode, entrypoint_pid)?;
     Ok(TcpPeerSocketOwners { inode, owners })
 }
 
 /// Resolve exactly one owner for the TCP peer, failing closed on ambiguity.
 #[cfg(target_os = "linux")]
-fn resolve_single_tcp_peer_owner(entrypoint_pid: u32, peer_port: u16) -> Result<SocketOwner> {
-    let socket_owners = resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)?;
+fn resolve_single_tcp_peer_owner(
+    entrypoint_pid: u32,
+    peer_port: u16,
+    remote_port: u16,
+    sandbox_netns_inode: u64,
+) -> Result<SocketOwner> {
+    let socket_owners = resolve_tcp_peer_socket_owners(
+        entrypoint_pid,
+        peer_port,
+        remote_port,
+        sandbox_netns_inode,
+    )?;
     match socket_owners.owners.as_slice() {
         [owner] => Ok(owner.clone()),
         owners => {
@@ -164,8 +190,14 @@ fn resolve_single_tcp_peer_owner(entrypoint_pid: u32, peer_port: u16) -> Result<
 ///
 /// Needed for the ancestor walk: we must know the PID to walk `/proc/<pid>/status` `PPid` chain.
 #[cfg(target_os = "linux")]
-pub fn resolve_tcp_peer_identity(entrypoint_pid: u32, peer_port: u16) -> Result<(PathBuf, u32)> {
-    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_port)?;
+pub fn resolve_tcp_peer_identity(
+    entrypoint_pid: u32,
+    peer_port: u16,
+    remote_port: u16,
+    sandbox_netns_inode: u64,
+) -> Result<(PathBuf, u32)> {
+    let owner =
+        resolve_single_tcp_peer_owner(entrypoint_pid, peer_port, remote_port, sandbox_netns_inode)?;
     let path = binary_path(owner.pid.cast_signed())?;
     Ok((path, owner.pid))
 }
@@ -274,7 +306,7 @@ pub fn collect_cmdline_paths(pid: u32, stop_pid: u32, exclude: &[PathBuf]) -> Ve
 }
 
 /// Parse `/proc/<pid>/net/tcp` (and `/proc/<pid>/net/tcp6`) to find the socket
-/// inode for a given local port.
+/// inode for a given local port and known proxy remote port.
 ///
 /// Checks both IPv4 and IPv6 tables because some clients (notably gRPC C-core)
 /// use `AF_INET6` sockets with IPv4-mapped addresses even for IPv4 connections.
@@ -287,14 +319,154 @@ pub fn collect_cmdline_paths(pid: u32, stop_pid: u32, exclude: &[PathBuf]) -> Ve
 /// - Addresses: hex IP (host byte order) `:` hex port
 /// - State `01` = ESTABLISHED
 /// - Inode is field index 9 (0-indexed)
+///
+/// Matches the socket whose **local port** equals `peer_port` *and* whose
+/// **remote port** equals `remote_port`. The remote-port filter is a sanity
+/// check, not a tenancy boundary — different sandbox netns can legitimately
+/// have identical `(local_port, remote_port)` pairs because each sandbox
+/// uses the same `10.200.0.0/24` veth subnet and the proxy listens on the
+/// same port in every supervisor instance.
+///
+/// To stay tenant-correct, the cross-netns fallback is gated by
+/// `sandbox_netns_inode`: only `/proc/<pid>` entries whose `ns/net` resolves
+/// to that exact `nsfs` inode are considered. When `sandbox_netns_inode`
+/// is zero (caller has no netns identity to compare against), the fallback
+/// is skipped entirely and the function fails closed.
+///
+/// Socket inodes are kernel-global, so the inode returned from a confirmed
+/// sandbox-netns scan is the same one that `find_socket_inode_owners` will
+/// resolve to FD-holding processes downstream.
 #[cfg(target_os = "linux")]
-fn parse_proc_net_tcp(pid: u32, peer_port: u16) -> Result<u64> {
-    // Check IPv4 first (most common), then IPv6.
+fn parse_proc_net_tcp(
+    pid: u32,
+    peer_port: u16,
+    remote_port: u16,
+    sandbox_netns_inode: u64,
+) -> Result<u64> {
+    // Try the cached entrypoint PID first, but only if it actually lives
+    // inside the expected sandbox netns. Without this gate a recycled PID
+    // — now owned by an unrelated process in a different netns — could
+    // expose a `(local_port, remote_port)` collision and let us
+    // misattribute the connection.
+    let primary_in_sandbox =
+        sandbox_netns_inode == 0 || pid_lives_in_netns(pid, sandbox_netns_inode);
+    if primary_in_sandbox {
+        match scan_pid_net_tcp(pid, peer_port, remote_port) {
+            ScanOutcome::Found(inode) => return Ok(inode),
+            ScanOutcome::Empty => {
+                // We got the full netns view through `pid` and the
+                // connection wasn't there. No further PID in the same
+                // namespace can help — fail closed.
+                if sandbox_netns_inode != 0 {
+                    return Err(miette::miette!(
+                        "No ESTABLISHED TCP connection found for local port {peer_port} \
+                         and remote port {remote_port} in /proc/{pid}/net/tcp{{,6}} \
+                         (sandbox netns inode {sandbox_netns_inode}, view confirmed empty)"
+                    ));
+                }
+            }
+            ScanOutcome::Unreadable => {
+                // Couldn't read the entrypoint's procfs view at all —
+                // fall through to the walk so another live PID in the
+                // same netns can supply the view.
+            }
+        }
+    }
+
+    // Without a sandbox-netns reference there is no safe way to confirm
+    // that a candidate process actually belongs to this sandbox, so refuse
+    // to walk into other tenants' procfs entries.
+    if sandbox_netns_inode == 0 {
+        return Err(miette::miette!(
+            "No ESTABLISHED TCP connection found for local port {peer_port} \
+             and remote port {remote_port} in /proc/{pid}/net/tcp{{,6}}; \
+             cross-netns fallback disabled (no sandbox netns inode configured)"
+        ));
+    }
+
+    // Fallback: the entrypoint PID is either in a different netns from
+    // the one we expect, or its procfs view couldn't be read. Walk
+    // `/proc` for another live PID in the sandbox netns and scan that
+    // PID's `/proc/<pid>/net/tcp`. The first PID that produces a
+    // readable view defines the answer — every process in the same
+    // netns sees the same kernel TCP table.
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Err(miette::miette!(
+            "No ESTABLISHED TCP connection found for local port {peer_port} \
+             and remote port {remote_port} in /proc/{pid}/net/tcp{{,6}}; \
+             also failed to enumerate /proc for netns fallback"
+        ));
+    };
+
+    for entry in entries.flatten() {
+        let Ok(other_pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if other_pid == pid {
+            continue;
+        }
+        if !pid_lives_in_netns(other_pid, sandbox_netns_inode) {
+            continue;
+        }
+        match scan_pid_net_tcp(other_pid, peer_port, remote_port) {
+            ScanOutcome::Found(inode) => return Ok(inode),
+            ScanOutcome::Empty => {
+                // Confirmed netns view via `other_pid` — no need to
+                // probe more PIDs in the same namespace.
+                return Err(miette::miette!(
+                    "No ESTABLISHED TCP connection found for local port {peer_port} \
+                     and remote port {remote_port} in sandbox netns \
+                     (inode {sandbox_netns_inode}, view confirmed via /proc/{other_pid})"
+                ));
+            }
+            ScanOutcome::Unreadable => {
+                // `other_pid` exited between the netns stat and the
+                // tcp/tcp6 read. Try the next PID in the same netns
+                // rather than concluding the namespace is empty.
+            }
+        }
+    }
+
+    Err(miette::miette!(
+        "No ESTABLISHED TCP connection found for local port {peer_port} \
+         and remote port {remote_port}: no live PID in sandbox netns \
+         (inode {sandbox_netns_inode}) had a readable /proc/<pid>/net/tcp"
+    ))
+}
+
+/// Result of a single PID's `/proc/<pid>/net/tcp{,6}` scan.
+///
+/// Distinguishing `Empty` from `Unreadable` is what lets the walk in
+/// [`parse_proc_net_tcp`] avoid the race where a PID exits between
+/// stat'ing `ns/net` and reading the TCP table — a transient read
+/// failure must not be treated as "no match in this namespace".
+#[cfg(target_os = "linux")]
+enum ScanOutcome {
+    /// The TCP table contained an ESTABLISHED row matching the requested
+    /// `(local_port, remote_port)`; carries the kernel socket inode.
+    Found(u64),
+    /// At least one of `tcp` / `tcp6` was successfully read and no row
+    /// matched. The caller has a confirmed netns view.
+    Empty,
+    /// Neither `tcp` nor `tcp6` was readable (PID exited mid-scan or the
+    /// procfs entry is otherwise inaccessible).
+    Unreadable,
+}
+
+/// Scan a single PID's `/proc/<pid>/net/tcp` (and `tcp6`) for an ESTABLISHED
+/// connection matching `(local_port, remote_port)`. Returns the kernel socket
+/// inode on first match. The tri-state return lets the caller tell a
+/// confirmed "no match in this namespace" apart from a transient
+/// "could not read the procfs entry".
+#[cfg(target_os = "linux")]
+fn scan_pid_net_tcp(pid: u32, peer_port: u16, remote_port: u16) -> ScanOutcome {
+    let mut any_readable = false;
     for suffix in &["tcp", "tcp6"] {
         let path = format!("/proc/{pid}/net/{suffix}");
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
+        any_readable = true;
 
         for line in content.lines().skip(1) {
             let fields: Vec<&str> = line.split_whitespace().collect();
@@ -302,38 +474,57 @@ fn parse_proc_net_tcp(pid: u32, peer_port: u16) -> Result<u64> {
                 continue;
             }
 
-            // Parse local_address to extract port.
-            // IPv4 format: AABBCCDD:PORT
-            // IPv6 format: 00000000000000000000000000000000:PORT
-            let local_addr = fields[1];
-            let local_port = match local_addr.rsplit_once(':') {
-                Some((_, port_hex)) => u16::from_str_radix(port_hex, 16).unwrap_or(0),
-                None => continue,
-            };
-
-            // Check state is ESTABLISHED (01)
-            let state = fields[3];
-            if state != "01" {
+            // Check state is ESTABLISHED (01) before parsing ports.
+            if fields[3] != "01" {
                 continue;
             }
 
-            if local_port == peer_port {
-                let inode: u64 = fields[9]
-                    .parse()
-                    .map_err(|_| miette::miette!("Failed to parse inode from {}", fields[9]))?;
+            // Parse local_address to extract port.
+            // IPv4 format: AABBCCDD:PORT
+            // IPv6 format: 00000000000000000000000000000000:PORT
+            let Some(local_port) = parse_hex_port(fields[1]) else {
+                continue;
+            };
+            let Some(rem_port) = parse_hex_port(fields[2]) else {
+                continue;
+            };
+
+            if local_port == peer_port && rem_port == remote_port {
+                let Ok(inode) = fields[9].parse::<u64>() else {
+                    // Malformed inode column — skip the row rather than
+                    // abandoning the whole scan.
+                    continue;
+                };
                 if inode == 0 {
                     continue;
                 }
-                return Ok(inode);
+                return ScanOutcome::Found(inode);
             }
         }
     }
+    if any_readable {
+        ScanOutcome::Empty
+    } else {
+        ScanOutcome::Unreadable
+    }
+}
 
-    Err(miette::miette!(
-        "No ESTABLISHED TCP connection found for port {} in /proc/{}/net/tcp{{,6}}",
-        peer_port,
-        pid
-    ))
+/// Check whether `/proc/<pid>/ns/net` resolves to the given `nsfs` inode.
+/// Returns `false` if the procfs entry cannot be stat'd (PID exited, or
+/// permissions prevent the lookup) — fail closed instead of optimistically
+/// admitting the PID into the sandbox-netns-gated scan.
+#[cfg(target_os = "linux")]
+fn pid_lives_in_netns(pid: u32, netns_inode: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(format!("/proc/{pid}/ns/net")).is_ok_and(|m| m.ino() == netns_inode)
+}
+
+/// Parse the hex port suffix of a `/proc/net/tcp` address field
+/// (`<hex_ip>:<hex_port>`).
+#[cfg(target_os = "linux")]
+fn parse_hex_port(addr: &str) -> Option<u16> {
+    let (_, port_hex) = addr.rsplit_once(':')?;
+    u16::from_str_radix(port_hex, 16).ok()
 }
 
 /// Scan `/proc` to find every PID that owns a given socket inode.
@@ -756,6 +947,17 @@ mod tests {
         assert_eq!(pids.len(), unique.len());
     }
 
+    /// `/proc/self/ns/net` inode for the test process — used as the
+    /// sandbox-netns identity in tests where the listener and the test
+    /// process share a namespace.
+    #[cfg(target_os = "linux")]
+    fn self_netns_inode() -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self/ns/net")
+            .expect("stat /proc/self/ns/net")
+            .ino()
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_tcp_peer_socket_owners_returns_all_forked_socket_holders() {
@@ -783,10 +985,12 @@ mod tests {
 
         let child_pid_u32 = child_pid.cast_unsigned();
         let entrypoint_pid = std::process::id();
+        let netns_ino = self_netns_inode();
         let deadline = Instant::now() + Duration::from_secs(2);
         let owners = loop {
-            let owners = resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)
-                .expect("resolve socket owners");
+            let owners =
+                resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port, listener_port, netns_ino)
+                    .expect("resolve socket owners");
             let owner_pids = owners
                 .owners
                 .iter()
@@ -816,6 +1020,172 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(owner_pids.contains(&entrypoint_pid));
         assert!(owner_pids.contains(&child_pid_u32));
+    }
+
+    /// When the given `entrypoint_pid` does not exist (or its `/proc/<pid>/`
+    /// directory is missing) but a sandbox netns inode is supplied, the
+    /// fallback walks `/proc` and only considers PIDs whose `ns/net`
+    /// resolves to that inode. Here the listener and the test process
+    /// share a namespace, so the test process's procfs view is the one
+    /// the fallback should pick up.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_tcp_peer_socket_owners_falls_back_to_proc_walk_when_entrypoint_pid_is_dead() {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let listener_port = listener.local_addr().unwrap().port();
+        let stream = TcpStream::connect(("127.0.0.1", listener_port)).expect("connect");
+        let peer_port = stream.local_addr().unwrap().port();
+        let (_accepted, _) = listener.accept().expect("accept");
+
+        // PID 999_999_999 is virtually guaranteed not to exist on Linux
+        // (PID_MAX_LIMIT is typically 4 194 304). The first scan attempt
+        // misses immediately; the fallback walk picks up the connection
+        // from this process's own /proc/<self>/net/tcp because we're
+        // gating on this test process's netns inode.
+        let dead_pid = 999_999_999;
+        let owners =
+            resolve_tcp_peer_socket_owners(dead_pid, peer_port, listener_port, self_netns_inode())
+                .expect("fallback walk should locate the live connection");
+
+        let owner_pids: HashSet<u32> = owners.owners.iter().map(|owner| owner.pid).collect();
+        assert!(
+            owner_pids.contains(&std::process::id()),
+            "fallback walk should attribute the socket to this test process; got {owner_pids:?}"
+        );
+    }
+
+    /// When the entrypoint PID is dead and `sandbox_netns_inode` is zero
+    /// (caller has no netns identity), `parse_proc_net_tcp` must fail
+    /// closed instead of attributing the connection to whichever PID it
+    /// happens to find in another namespace.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_net_tcp_fails_closed_without_sandbox_netns_inode() {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let listener_port = listener.local_addr().unwrap().port();
+        let stream = TcpStream::connect(("127.0.0.1", listener_port)).expect("connect");
+        let peer_port = stream.local_addr().unwrap().port();
+        let (_accepted, _) = listener.accept().expect("accept");
+
+        // Connection exists and would be found by the fallback if it were
+        // permitted to run — but without a sandbox netns reference the
+        // scan must refuse to cross into other procfs entries.
+        let dead_pid = 999_999_999;
+        let result = parse_proc_net_tcp(dead_pid, peer_port, listener_port, 0);
+        assert!(
+            result.is_err(),
+            "fallback must be disabled when sandbox_netns_inode == 0"
+        );
+    }
+
+    /// The primary `pid` scan must be gated by `sandbox_netns_inode` too.
+    /// If the cached entrypoint PID has been recycled to a process living
+    /// in a different namespace, the proxy must not trust its TCP table
+    /// even when a `(local_port, remote_port)` collision happens to match.
+    /// Simulated by passing the test process's PID — which does live in
+    /// some real netns — together with a `sandbox_netns_inode` that
+    /// belongs to a different namespace (here, `u64::MAX`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_net_tcp_refuses_recycled_primary_pid_in_wrong_netns() {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let listener_port = listener.local_addr().unwrap().port();
+        let stream = TcpStream::connect(("127.0.0.1", listener_port)).expect("connect");
+        let peer_port = stream.local_addr().unwrap().port();
+        let (_accepted, _) = listener.accept().expect("accept");
+
+        let pid = std::process::id();
+        let actual_netns = self_netns_inode();
+        // Sanity: under our own netns the scan succeeds.
+        parse_proc_net_tcp(pid, peer_port, listener_port, actual_netns)
+            .expect("scan should succeed when sandbox netns matches the primary PID");
+
+        // Passing a different (here: nonexistent) sandbox netns inode
+        // must reject the primary PID before reading its TCP table.
+        let result = parse_proc_net_tcp(pid, peer_port, listener_port, u64::MAX);
+        assert!(
+            result.is_err(),
+            "primary PID scan must be gated when sandbox netns inode disagrees"
+        );
+    }
+
+    /// When the supplied `sandbox_netns_inode` does not match any PID's
+    /// `ns/net` inode (simulating a sandbox whose every process has died),
+    /// the fallback walk must come up empty rather than reattributing the
+    /// connection to a co-tenant.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_net_tcp_refuses_to_cross_into_other_netns() {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let listener_port = listener.local_addr().unwrap().port();
+        let stream = TcpStream::connect(("127.0.0.1", listener_port)).expect("connect");
+        let peer_port = stream.local_addr().unwrap().port();
+        let (_accepted, _) = listener.accept().expect("accept");
+
+        // u64::MAX is not a real nsfs inode, so no /proc/<pid>/ns/net will
+        // match. With the connection clearly visible in the test process's
+        // own netns, the fallback must still refuse to attribute it.
+        let dead_pid = 999_999_999;
+        let bogus_netns = u64::MAX;
+        let result = parse_proc_net_tcp(dead_pid, peer_port, listener_port, bogus_netns);
+        assert!(
+            result.is_err(),
+            "fallback must not attribute connection when no PID lives in the expected netns"
+        );
+    }
+
+    /// `(peer_port, remote_port)` matching prevents a port-only collision in
+    /// the same netns from being treated as the target connection. Two
+    /// independent ESTABLISHED connections share `peer_port` only if the
+    /// remote ports differ; the scan must select the one whose `rem_port`
+    /// matches the requested `remote_port`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_net_tcp_filters_by_remote_port() {
+        use std::net::{TcpListener, TcpStream};
+
+        // Two listeners on different ports — connections to each will share
+        // the same client-side peer port only by accident, but each socket
+        // has a distinct (local_port, rem_port) pair so the filter works.
+        let listener_a = TcpListener::bind("127.0.0.1:0").expect("bind A");
+        let listener_b = TcpListener::bind("127.0.0.1:0").expect("bind B");
+        let port_a = listener_a.local_addr().unwrap().port();
+        let port_b = listener_b.local_addr().unwrap().port();
+
+        let stream_a = TcpStream::connect(("127.0.0.1", port_a)).expect("connect A");
+        let stream_b = TcpStream::connect(("127.0.0.1", port_b)).expect("connect B");
+        let _accepted_a = listener_a.accept().expect("accept A");
+        let _accepted_b = listener_b.accept().expect("accept B");
+
+        let peer_a = stream_a.local_addr().unwrap().port();
+        let peer_b = stream_b.local_addr().unwrap().port();
+        assert_ne!(peer_a, peer_b, "client-side ephemeral ports collided");
+
+        let pid = std::process::id();
+        let netns_ino = self_netns_inode();
+
+        // Asking for (peer_a, port_a) must match connection A's inode.
+        let inode_a = parse_proc_net_tcp(pid, peer_a, port_a, netns_ino)
+            .expect("connection A must be resolvable");
+        // Asking for (peer_a, port_b) must fail — that pair does not exist.
+        let mismatch = parse_proc_net_tcp(pid, peer_a, port_b, netns_ino);
+        assert!(
+            mismatch.is_err(),
+            "remote-port mismatch must not resolve to a stale inode"
+        );
+
+        // Sanity: connection B has its own distinct inode.
+        let inode_b = parse_proc_net_tcp(pid, peer_b, port_b, netns_ino)
+            .expect("connection B must be resolvable");
+        assert_ne!(inode_a, inode_b);
     }
 
     #[cfg(target_os = "linux")]

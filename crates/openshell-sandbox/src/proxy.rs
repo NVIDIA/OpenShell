@@ -20,7 +20,7 @@ use openshell_ocsf::{
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tokio::io::{
     AsyncRead as TokioAsyncRead, AsyncReadExt, AsyncWrite as TokioAsyncWrite, AsyncWriteExt,
 };
@@ -155,6 +155,7 @@ impl ProxyHandle {
         opa_engine: Arc<OpaEngine>,
         identity_cache: Arc<BinaryIdentityCache>,
         entrypoint_pid: Arc<AtomicU32>,
+        sandbox_netns_inode: Arc<AtomicU64>,
         tls_state: Option<Arc<ProxyTlsState>>,
         inference_ctx: Option<Arc<InferenceContext>>,
         provider_credentials: Option<ProviderCredentialState>,
@@ -195,6 +196,7 @@ impl ProxyHandle {
                         let opa = opa_engine.clone();
                         let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
+                        let netns = sandbox_netns_inode.clone();
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
                         let policy_local = policy_local_ctx.clone();
@@ -208,6 +210,7 @@ impl ProxyHandle {
                                 opa,
                                 cache,
                                 spid,
+                                netns,
                                 tls,
                                 inf,
                                 policy_local,
@@ -325,6 +328,7 @@ async fn handle_tcp_connection(
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
+    sandbox_netns_inode: Arc<AtomicU64>,
     tls_state: Option<Arc<ProxyTlsState>>,
     inference_ctx: Option<Arc<InferenceContext>>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
@@ -372,6 +376,7 @@ async fn handle_tcp_connection(
             opa_engine,
             identity_cache,
             entrypoint_pid,
+            sandbox_netns_inode,
             policy_local_ctx,
             secret_resolver,
             denial_tx.as_ref(),
@@ -409,7 +414,7 @@ async fn handle_tcp_connection(
     }
 
     let peer_addr = client.peer_addr().into_diagnostic()?;
-    let _local_addr = client.local_addr().into_diagnostic()?;
+    let local_addr = client.local_addr().into_diagnostic()?;
 
     // Evaluate OPA policy with process-identity binding.
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
@@ -417,13 +422,16 @@ async fn handle_tcp_connection(
     let opa_clone = opa_engine.clone();
     let cache_clone = identity_cache.clone();
     let pid_clone = entrypoint_pid.clone();
+    let netns_clone = sandbox_netns_inode.clone();
     let host_clone = host_lc.clone();
     let decision = tokio::task::spawn_blocking(move || {
         evaluate_opa_tcp(
             peer_addr,
+            local_addr,
             &opa_clone,
             &cache_clone,
             &pid_clone,
+            &netns_clone,
             &host_clone,
             port,
         )
@@ -1084,15 +1092,22 @@ fn resolve_owner_identity(
 fn resolve_process_identity(
     entrypoint_pid: u32,
     peer_port: u16,
+    remote_port: u16,
+    sandbox_netns_inode: u64,
     identity_cache: &BinaryIdentityCache,
 ) -> std::result::Result<ResolvedIdentity, IdentityError> {
-    let socket_owners = crate::procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)
-        .map_err(|e| IdentityError {
-            reason: format!("failed to resolve peer binary: {e}"),
-            binary: None,
-            binary_pid: None,
-            ancestors: vec![],
-        })?;
+    let socket_owners = crate::procfs::resolve_tcp_peer_socket_owners(
+        entrypoint_pid,
+        peer_port,
+        remote_port,
+        sandbox_netns_inode,
+    )
+    .map_err(|e| IdentityError {
+        reason: format!("failed to resolve peer binary: {e}"),
+        binary: None,
+        binary_pid: None,
+        ancestors: vec![],
+    })?;
 
     let mut identities = Vec::with_capacity(socket_owners.owners.len());
     for owner in &socket_owners.owners {
@@ -1150,11 +1165,14 @@ fn resolve_process_identity(
 
 /// Evaluate OPA policy for a TCP connection with identity binding via /proc/net/tcp.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn evaluate_opa_tcp(
     peer_addr: SocketAddr,
+    local_addr: SocketAddr,
     engine: &OpaEngine,
     identity_cache: &BinaryIdentityCache,
     entrypoint_pid: &AtomicU32,
+    sandbox_netns_inode: &AtomicU64,
     host: &str,
     port: u16,
 ) -> ConnectDecision {
@@ -1190,19 +1208,22 @@ fn evaluate_opa_tcp(
 
     let total_start = std::time::Instant::now();
     let peer_port = peer_addr.port();
+    let remote_port = local_addr.port();
+    let netns_inode = sandbox_netns_inode.load(Ordering::Acquire);
 
-    let identity = match resolve_process_identity(pid, peer_port, identity_cache) {
-        Ok(id) => id,
-        Err(err) => {
-            return deny(
-                err.reason,
-                err.binary,
-                err.binary_pid,
-                err.ancestors,
-                vec![],
-            );
-        }
-    };
+    let identity =
+        match resolve_process_identity(pid, peer_port, remote_port, netns_inode, identity_cache) {
+            Ok(id) => id,
+            Err(err) => {
+                return deny(
+                    err.reason,
+                    err.binary,
+                    err.binary_pid,
+                    err.ancestors,
+                    vec![],
+                );
+            }
+        };
 
     let ResolvedIdentity {
         bin_path,
@@ -1247,11 +1268,14 @@ fn evaluate_opa_tcp(
 
 /// Non-Linux stub: OPA identity binding requires /proc.
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
 fn evaluate_opa_tcp(
     _peer_addr: SocketAddr,
+    _local_addr: SocketAddr,
     engine: &OpaEngine,
     _identity_cache: &BinaryIdentityCache,
     _entrypoint_pid: &AtomicU32,
+    _sandbox_netns_inode: &AtomicU64,
     _host: &str,
     _port: u16,
 ) -> ConnectDecision {
@@ -2454,6 +2478,7 @@ async fn handle_forward_proxy(
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
+    sandbox_netns_inode: Arc<AtomicU64>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
@@ -2536,18 +2561,21 @@ async fn handle_forward_proxy(
 
     // 3. Evaluate OPA policy (same identity binding as CONNECT)
     let peer_addr = client.peer_addr().into_diagnostic()?;
-    let _local_addr = client.local_addr().into_diagnostic()?;
+    let local_addr = client.local_addr().into_diagnostic()?;
 
     let opa_clone = opa_engine.clone();
     let cache_clone = identity_cache.clone();
     let pid_clone = entrypoint_pid.clone();
+    let netns_clone = sandbox_netns_inode.clone();
     let host_clone = host_lc.clone();
     let decision = tokio::task::spawn_blocking(move || {
         evaluate_opa_tcp(
             peer_addr,
+            local_addr,
             &opa_clone,
             &cache_clone,
             &pid_clone,
+            &netns_clone,
             &host_clone,
             port,
         )
@@ -5550,7 +5578,14 @@ network_policies:
         //    contract: we want "Binary integrity violation", not
         //    "Failed to stat ... (deleted)".
         let test_pid = std::process::id();
-        let result = resolve_process_identity(test_pid, peer_port, &cache);
+        let test_netns_ino = std::fs::metadata("/proc/self/ns/net")
+            .map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                m.ino()
+            })
+            .expect("stat /proc/self/ns/net");
+        let result =
+            resolve_process_identity(test_pid, peer_port, listener_port, test_netns_ino, &cache);
 
         // Always clean up the child before asserting so a failure doesn't
         // leak a sleeping process across test runs.
@@ -5664,12 +5699,24 @@ network_policies:
         }
 
         let cache = BinaryIdentityCache::new();
+        let test_netns_ino = std::fs::metadata("/proc/self/ns/net")
+            .map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                m.ino()
+            })
+            .expect("stat /proc/self/ns/net");
 
         // Resolve with a brief retry loop — under heavy CI load the child's
         // procfs entry can momentarily fail to resolve even though the loop
         // above just verified `/proc/<pid>/exe` pointed at `sleep`.  Retry a
         // few times before declaring failure so the test is not flaky.
-        let mut result = resolve_process_identity(std::process::id(), peer_port, &cache);
+        let mut result = resolve_process_identity(
+            std::process::id(),
+            peer_port,
+            listener_port,
+            test_netns_ino,
+            &cache,
+        );
         for _ in 0..5 {
             match &result {
                 Err(err)
@@ -5677,7 +5724,13 @@ network_policies:
                         || err.reason.contains("os error 2") =>
                 {
                     std::thread::sleep(Duration::from_millis(50));
-                    result = resolve_process_identity(std::process::id(), peer_port, &cache);
+                    result = resolve_process_identity(
+                        std::process::id(),
+                        peer_port,
+                        listener_port,
+                        test_netns_ino,
+                        &cache,
+                    );
                 }
                 _ => break,
             }

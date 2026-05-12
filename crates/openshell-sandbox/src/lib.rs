@@ -36,7 +36,7 @@ use std::sync::LazyLock;
 #[cfg(any(target_os = "linux", test))]
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
@@ -560,6 +560,25 @@ pub async fn run_sandbox(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
+    // Kernel-level nsfs inode of the sandbox network namespace, used by
+    // the proxy to confirm that processes resolved during peer-binary
+    // attribution actually live inside this sandbox. Zero means "no netns
+    // gate available" — the proxy then keeps the legacy entrypoint-PID-only
+    // behaviour and refuses to cross into other namespaces during fallback.
+    let sandbox_netns_inode = Arc::new(AtomicU64::new(0));
+    #[cfg(target_os = "linux")]
+    if let Some(ns) = netns.as_ref() {
+        match ns.ns_inode() {
+            Ok(inode) => sandbox_netns_inode.store(inode, Ordering::Release),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to stat sandbox netns inode; peer-binary fallback will be disabled",
+                );
+            }
+        }
+    }
+
     let (_proxy, denial_rx, bypass_denial_tx) = if matches!(policy.network.mode, NetworkMode::Proxy)
     {
         let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
@@ -609,6 +628,7 @@ pub async fn run_sandbox(
             engine,
             cache,
             entrypoint_pid.clone(),
+            sandbox_netns_inode.clone(),
             tls_state,
             inference_ctx,
             Some(provider_credentials.clone()),
@@ -629,6 +649,7 @@ pub async fn run_sandbox(
         bypass_monitor::spawn(
             ns.name().to_string(),
             entrypoint_pid.clone(),
+            sandbox_netns_inode.clone(),
             bypass_denial_tx,
         )
     });
