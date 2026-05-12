@@ -105,7 +105,11 @@ async fn sandbox_service_routing_only(
         return StatusCode::NOT_FOUND.into_response();
     }
     if !browser_context_allows_plaintext_service_request(&req) {
-        return StatusCode::FORBIDDEN.into_response();
+        crate::service_routing::emit_cross_origin_service_http_rejection(&state, &req);
+        return crate::service_routing::service_error_response(
+            StatusCode::FORBIDDEN,
+            "Cross-origin service request rejected",
+        );
     }
     crate::service_routing::proxy_sandbox_service_request(state, req)
         .await

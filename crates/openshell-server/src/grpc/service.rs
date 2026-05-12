@@ -39,13 +39,20 @@ pub(super) async fn handle_expose_service(
     let now =
         super::current_time_ms().map_err(|e| Status::internal(format!("clock error: {e}")))?;
     let key = service_routing::endpoint_key(&req.sandbox, &req.service);
-    let id = match state
+    let (id, created_at_ms, created) = match state
         .store
         .get_message_by_name::<ServiceEndpoint>(&key)
         .await
     {
-        Ok(Some(existing)) => existing.object_id().to_string(),
-        Ok(None) => Uuid::new_v4().to_string(),
+        Ok(Some(existing)) => (
+            existing.object_id().to_string(),
+            existing
+                .metadata
+                .as_ref()
+                .map_or(now, |metadata| metadata.created_at_ms),
+            false,
+        ),
+        Ok(None) => (Uuid::new_v4().to_string(), now, true),
         Err(e) => return Err(Status::internal(format!("fetch endpoint failed: {e}"))),
     };
 
@@ -53,7 +60,7 @@ pub(super) async fn handle_expose_service(
         metadata: Some(ObjectMeta {
             id,
             name: key,
-            created_at_ms: now,
+            created_at_ms,
             labels: HashMap::from([("sandbox".to_string(), req.sandbox.clone())]),
         }),
         sandbox_id: sandbox.object_id().to_string(),
@@ -71,6 +78,7 @@ pub(super) async fn handle_expose_service(
 
     let url = service_routing::endpoint_url(&state.config, &req.sandbox, &req.service)
         .unwrap_or_default();
+    service_routing::emit_service_endpoint_config_event(&endpoint, &url, created);
 
     Ok(Response::new(ServiceEndpointResponse {
         endpoint: Some(endpoint),

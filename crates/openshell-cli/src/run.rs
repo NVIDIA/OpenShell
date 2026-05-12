@@ -3418,7 +3418,7 @@ pub async fn service_expose(
             domain: true,
         })
         .await
-        .map_err(|status| miette::miette!("expose service failed: {status}"))?
+        .map_err(service_expose_status_error)?
         .into_inner();
 
     if service.is_empty() {
@@ -3442,6 +3442,23 @@ pub async fn service_expose(
         println!("  URL: {}", url.cyan());
     }
     Ok(())
+}
+
+fn service_expose_status_error(status: Status) -> miette::Report {
+    let message = status.message();
+    match status.code() {
+        Code::PermissionDenied => {
+            miette!("expose service failed: permission denied (requires sandbox:write)")
+        }
+        Code::Unauthenticated => miette!("expose service failed: authentication required"),
+        Code::NotFound if message == "sandbox not found" => {
+            miette!("expose service failed: sandbox not found")
+        }
+        Code::InvalidArgument if !message.is_empty() => {
+            miette!("expose service failed: invalid request: {message}")
+        }
+        _ => miette!("expose service failed: {status}"),
+    }
 }
 
 fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String {
@@ -5848,7 +5865,7 @@ mod tests {
         inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
         parse_credential_pairs, plaintext_gateway_is_remote, provisioning_timeout_message,
         ready_false_condition_message, resolve_from, sandbox_should_persist,
-        service_url_for_gateway,
+        service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -5859,6 +5876,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::thread;
+    use tonic::Status;
 
     use openshell_bootstrap::GatewayMetadata;
     use openshell_core::proto::{
@@ -6262,6 +6280,18 @@ mod tests {
                 "https://gateway.example.com"
             ),
             "http://quiet-flamingo--openclaw.navigator.openshell.localhost:443/"
+        );
+    }
+
+    #[test]
+    fn service_expose_status_error_mentions_required_scope() {
+        let report = service_expose_status_error(Status::permission_denied(
+            "scope 'sandbox:write' required",
+        ));
+
+        assert_eq!(
+            report.to_string(),
+            "expose service failed: permission denied (requires sandbox:write)"
         );
     }
 
