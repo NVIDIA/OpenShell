@@ -60,7 +60,8 @@ impl FromStr for ImagePullPolicy {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PodmanComputeConfig {
     /// Path to the Podman API Unix socket.
     /// Default: `$XDG_RUNTIME_DIR/podman/podman.sock` (Linux),

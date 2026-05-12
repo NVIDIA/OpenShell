@@ -23,6 +23,7 @@ mod auth;
 pub mod certgen;
 pub mod cli;
 mod compute;
+pub mod config_file;
 mod grpc;
 mod http;
 mod inference;
@@ -161,6 +162,7 @@ pub async fn run_server(
     config: Config,
     vm_config: VmComputeConfig,
     docker_config: DockerComputeConfig,
+    config_file: Option<config_file::ConfigFile>,
     tracing_log_bus: TracingLogBus,
 ) -> Result<()> {
     let database_url = config.database_url.trim();
@@ -194,6 +196,7 @@ pub async fn run_server(
         &config,
         &vm_config,
         &docker_config,
+        config_file.as_ref(),
         store.clone(),
         sandbox_index.clone(),
         sandbox_watch_bus.clone(),
@@ -567,6 +570,7 @@ async fn build_compute_runtime(
     config: &Config,
     vm_config: &VmComputeConfig,
     docker_config: &DockerComputeConfig,
+    file: Option<&config_file::ConfigFile>,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -578,35 +582,39 @@ async fn build_compute_runtime(
 
     match driver {
         ComputeDriverKind::Kubernetes => {
-            let supervisor_image = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string());
-            let supervisor_image_pull_policy =
-                std::env::var("OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_default();
+            let mut k8s = kubernetes_config_from_file(file)?;
+            // Env overrides file for fields not represented in Config.
+            if let Ok(v) = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
+                && !v.is_empty()
+            {
+                k8s.supervisor_image = v;
+            }
+            if let Ok(v) = std::env::var("OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")
+                && !v.is_empty()
+            {
+                k8s.supervisor_image_pull_policy = v;
+            }
+            if let Ok(v) = std::env::var("OPENSHELL_SUPERVISOR_SIDELOAD_METHOD")
+                && !v.is_empty()
+                && let Ok(parsed) = v.parse()
+            {
+                k8s.supervisor_sideload_method = parsed;
+            }
+            // Shared fields are sourced from Config, which already merged
+            // file + CLI/env at startup.
+            k8s.namespace.clone_from(&config.sandbox_namespace);
+            k8s.default_image.clone_from(&config.sandbox_image);
+            k8s.image_pull_policy
+                .clone_from(&config.sandbox_image_pull_policy);
+            k8s.grpc_endpoint.clone_from(&config.grpc_endpoint);
+            k8s.ssh_socket_path
+                .clone_from(&config.sandbox_ssh_socket_path);
+            k8s.client_tls_secret_name
+                .clone_from(&config.client_tls_secret_name);
+            k8s.host_gateway_ip.clone_from(&config.host_gateway_ip);
+            k8s.enable_user_namespaces = config.enable_user_namespaces;
             ComputeRuntime::new_kubernetes(
-                KubernetesComputeConfig {
-                    namespace: config.sandbox_namespace.clone(),
-                    default_image: config.sandbox_image.clone(),
-                    image_pull_policy: config.sandbox_image_pull_policy.clone(),
-                    supervisor_image,
-                    supervisor_image_pull_policy,
-                    supervisor_sideload_method: std::env::var(
-                        "OPENSHELL_SUPERVISOR_SIDELOAD_METHOD",
-                    )
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or_default(),
-                    grpc_endpoint: config.grpc_endpoint.clone(),
-                    ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
-                    client_tls_secret_name: config.client_tls_secret_name.clone(),
-                    host_gateway_ip: config.host_gateway_ip.clone(),
-                    enable_user_namespaces: config.enable_user_namespaces,
-                },
+                k8s,
                 store,
                 sandbox_index,
                 sandbox_watch_bus,
@@ -642,61 +650,56 @@ async fn build_compute_runtime(
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
         ComputeDriverKind::Podman => {
-            let socket_path = std::env::var("OPENSHELL_PODMAN_SOCKET")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map_or_else(
-                    openshell_driver_podman::PodmanComputeConfig::default_socket_path,
-                    std::path::PathBuf::from,
-                );
-
-            let network_name = std::env::var("OPENSHELL_NETWORK_NAME")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| openshell_core::config::DEFAULT_NETWORK_NAME.to_string());
-
-            let stop_timeout_secs: u32 = std::env::var("OPENSHELL_STOP_TIMEOUT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS);
-
-            let supervisor_image = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string());
-
-            // TLS client cert paths for sandbox mTLS. When all three are
-            // set, the Podman driver bind-mounts them into sandbox
-            // containers and switches the endpoint to https://.
-            let podman_tls_ca = std::env::var("OPENSHELL_PODMAN_TLS_CA")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from);
-            let podman_tls_cert = std::env::var("OPENSHELL_PODMAN_TLS_CERT")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from);
-            let podman_tls_key = std::env::var("OPENSHELL_PODMAN_TLS_KEY")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from);
+            let mut podman = podman_config_from_file(file)?;
+            // Env overrides file for fields not represented in Config.
+            if let Ok(v) = std::env::var("OPENSHELL_PODMAN_SOCKET")
+                && !v.is_empty()
+            {
+                podman.socket_path = std::path::PathBuf::from(v);
+            }
+            if let Ok(v) = std::env::var("OPENSHELL_NETWORK_NAME")
+                && !v.is_empty()
+            {
+                podman.network_name = v;
+            }
+            if let Ok(v) = std::env::var("OPENSHELL_STOP_TIMEOUT")
+                && let Ok(parsed) = v.parse()
+            {
+                podman.stop_timeout_secs = parsed;
+            }
+            if let Ok(v) = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
+                && !v.is_empty()
+            {
+                podman.supervisor_image = v;
+            }
+            if let Ok(v) = std::env::var("OPENSHELL_PODMAN_TLS_CA")
+                && !v.is_empty()
+            {
+                podman.guest_tls_ca = Some(std::path::PathBuf::from(v));
+            }
+            if let Ok(v) = std::env::var("OPENSHELL_PODMAN_TLS_CERT")
+                && !v.is_empty()
+            {
+                podman.guest_tls_cert = Some(std::path::PathBuf::from(v));
+            }
+            if let Ok(v) = std::env::var("OPENSHELL_PODMAN_TLS_KEY")
+                && !v.is_empty()
+            {
+                podman.guest_tls_key = Some(std::path::PathBuf::from(v));
+            }
+            // Shared fields are sourced from Config (which already merged
+            // file + CLI/env at startup).
+            podman.default_image.clone_from(&config.sandbox_image);
+            podman.image_pull_policy = config.sandbox_image_pull_policy.parse().unwrap_or_default();
+            podman.grpc_endpoint.clone_from(&config.grpc_endpoint);
+            podman.gateway_port = config.bind_address.port();
+            podman
+                .sandbox_ssh_socket_path
+                .clone_from(&config.sandbox_ssh_socket_path);
+            podman.ssh_port = config.sandbox_ssh_port;
 
             ComputeRuntime::new_podman(
-                openshell_driver_podman::PodmanComputeConfig {
-                    socket_path,
-                    default_image: config.sandbox_image.clone(),
-                    image_pull_policy: config.sandbox_image_pull_policy.parse().unwrap_or_default(),
-                    grpc_endpoint: config.grpc_endpoint.clone(),
-                    gateway_port: config.bind_address.port(),
-                    sandbox_ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
-                    network_name,
-                    ssh_port: config.sandbox_ssh_port,
-                    stop_timeout_secs,
-                    supervisor_image,
-                    guest_tls_ca: podman_tls_ca,
-                    guest_tls_cert: podman_tls_cert,
-                    guest_tls_key: podman_tls_key,
-                },
+                podman,
                 store,
                 sandbox_index,
                 sandbox_watch_bus,
@@ -707,6 +710,43 @@ async fn build_compute_runtime(
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
     }
+}
+
+/// Build a [`KubernetesComputeConfig`] from the file's
+/// `[openshell.drivers.kubernetes]` table merged with inheritable
+/// `[openshell.gateway]` defaults. Falls back to the driver's `Default`
+/// when no file is present.
+fn kubernetes_config_from_file(
+    file: Option<&config_file::ConfigFile>,
+) -> Result<KubernetesComputeConfig> {
+    let Some(file) = file else {
+        return Ok(KubernetesComputeConfig::default());
+    };
+    let merged = config_file::driver_table(
+        ComputeDriverKind::Kubernetes,
+        &file.openshell.gateway,
+        file.openshell.drivers.get("kubernetes"),
+    );
+    merged
+        .try_into()
+        .map_err(|e| Error::config(format!("invalid [openshell.drivers.kubernetes] table: {e}")))
+}
+
+/// Same pattern as [`kubernetes_config_from_file`] but for Podman.
+fn podman_config_from_file(
+    file: Option<&config_file::ConfigFile>,
+) -> Result<openshell_driver_podman::PodmanComputeConfig> {
+    let Some(file) = file else {
+        return Ok(openshell_driver_podman::PodmanComputeConfig::default());
+    };
+    let merged = config_file::driver_table(
+        ComputeDriverKind::Podman,
+        &file.openshell.gateway,
+        file.openshell.drivers.get("podman"),
+    );
+    merged
+        .try_into()
+        .map_err(|e| Error::config(format!("invalid [openshell.drivers.podman] table: {e}")))
 }
 
 fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {

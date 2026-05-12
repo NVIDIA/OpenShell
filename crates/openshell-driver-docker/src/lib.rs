@@ -127,7 +127,8 @@ pub trait SupervisorReadiness: Send + Sync + 'static {
 }
 
 /// Gateway-local configuration for the Docker compute driver.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct DockerComputeConfig {
     /// Optional override for the Linux `openshell-sandbox` binary mounted into containers.
     pub supervisor_bin: Option<PathBuf>,
@@ -149,6 +150,19 @@ pub struct DockerComputeConfig {
 
     /// Docker bridge network that sandbox containers join.
     pub network_name: String,
+}
+
+impl Default for DockerComputeConfig {
+    fn default() -> Self {
+        Self {
+            supervisor_bin: None,
+            supervisor_image: None,
+            guest_tls_ca: None,
+            guest_tls_cert: None,
+            guest_tls_key: None,
+            network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

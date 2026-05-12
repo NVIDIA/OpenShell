@@ -1,0 +1,101 @@
+{{/*
+ConfigMap holding the gateway TOML config file (RFC 0003).
+
+The gateway reads `/etc/openshell/gateway.toml` (mounted from this ConfigMap)
+at startup. CLI flags and OPENSHELL_* env vars on the StatefulSet container
+still override anything in this file.
+
+Two values are intentionally NOT rendered here:
+  - server.dbUrl              → passed via --db-url in the StatefulSet args
+  - sshHandshake secret       → injected as OPENSHELL_SSH_HANDSHAKE_SECRET env var
+                                from a Kubernetes Secret reference.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "openshell.fullname" . }}-config
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+data:
+  gateway.toml: |
+    [openshell]
+    version = 1
+
+    [openshell.gateway]
+    bind_address          = "0.0.0.0:{{ .Values.service.port }}"
+    {{- if .Values.service.healthPort }}
+    health_bind_address   = "0.0.0.0:{{ .Values.service.healthPort }}"
+    {{- end }}
+    {{- if .Values.service.metricsPort }}
+    metrics_bind_address  = "0.0.0.0:{{ .Values.service.metricsPort }}"
+    {{- end }}
+    log_level             = {{ .Values.server.logLevel | quote }}
+    sandbox_namespace     = {{ include "openshell.sandboxNamespace" . | quote }}
+    default_image         = {{ .Values.server.sandboxImage | quote }}
+    supervisor_image      = {{ include "openshell.supervisorImage" . | quote }}
+    {{- if .Values.server.sandboxImagePullPolicy }}
+    image_pull_policy     = {{ .Values.server.sandboxImagePullPolicy | quote }}
+    {{- end }}
+    {{- if .Values.supervisor.image.pullPolicy }}
+    supervisor_image_pull_policy = {{ .Values.supervisor.image.pullPolicy | quote }}
+    {{- end }}
+    grpc_endpoint         = {{ include "openshell.grpcEndpoint" . | quote }}
+    {{- if .Values.server.sshGatewayHost }}
+    ssh_gateway_host      = {{ .Values.server.sshGatewayHost | quote }}
+    {{- end }}
+    {{- if .Values.server.sshGatewayPort }}
+    ssh_gateway_port      = {{ .Values.server.sshGatewayPort }}
+    {{- end }}
+    {{- if .Values.server.hostGatewayIP }}
+    host_gateway_ip       = {{ .Values.server.hostGatewayIP | quote }}
+    {{- end }}
+    {{- if .Values.server.enableUserNamespaces }}
+    enable_user_namespaces = true
+    {{- end }}
+    {{- if not .Values.server.disableTls }}
+    client_tls_secret_name = {{ .Values.server.tls.clientTlsSecretName | quote }}
+    {{- end }}
+    enable_loopback_service_http = {{ .Values.server.enableLoopbackServiceHttp }}
+    {{- $sans := list -}}
+    {{- if and .Values.certManager.enabled .Values.certManager.serverDnsNames }}
+    {{- $sans = .Values.certManager.serverDnsNames }}
+    {{- else if and .Values.pkiInitJob.enabled .Values.pkiInitJob.serverDnsNames }}
+    {{- $sans = .Values.pkiInitJob.serverDnsNames }}
+    {{- end }}
+    {{- if $sans }}
+    server_sans = [{{- range $i, $san := $sans }}{{ if $i }}, {{ end }}{{ $san | quote }}{{- end }}]
+    {{- end }}
+
+    {{- if not .Values.server.disableTls }}
+
+    [openshell.gateway.tls]
+    cert_path             = "/etc/openshell-tls/server/tls.crt"
+    key_path              = "/etc/openshell-tls/server/tls.key"
+    client_ca_path        = "/etc/openshell-tls/client-ca/ca.crt"
+    {{- if .Values.server.disableGatewayAuth }}
+    allow_unauthenticated = true
+    {{- end }}
+    {{- end }}
+
+    {{- if .Values.server.oidc.issuer }}
+
+    [openshell.gateway.oidc]
+    issuer        = {{ .Values.server.oidc.issuer | quote }}
+    audience      = {{ .Values.server.oidc.audience | quote }}
+    jwks_ttl_secs = {{ .Values.server.oidc.jwksTtl }}
+    {{- if .Values.server.oidc.rolesClaim }}
+    roles_claim   = {{ .Values.server.oidc.rolesClaim | quote }}
+    {{- end }}
+    {{- if .Values.server.oidc.adminRole }}
+    admin_role    = {{ .Values.server.oidc.adminRole | quote }}
+    {{- end }}
+    {{- if .Values.server.oidc.userRole }}
+    user_role     = {{ .Values.server.oidc.userRole | quote }}
+    {{- end }}
+    {{- if .Values.server.oidc.scopesClaim }}
+    scopes_claim  = {{ .Values.server.oidc.scopesClaim | quote }}
+    {{- end }}
+    {{- end }}
+
+    [openshell.drivers.kubernetes]
+    supervisor_sideload_method = {{ include "openshell.supervisorSideloadMethod" . | quote }}
