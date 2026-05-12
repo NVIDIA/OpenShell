@@ -82,9 +82,24 @@ pub struct RewriteTargetResult {
 // SecretResolver
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct SecretResolver {
     by_placeholder: HashMap<String, String>,
+}
+
+// Manual `Debug` impl: the auto-derived `Debug` would format the
+// `by_placeholder` map, exposing both placeholder keys (which reveal which
+// provider env var names are configured) and the resolved secret values
+// themselves. Any accidental `{:?}` in a tracing call, or a
+// derived `Debug` on a containing struct, would write secrets to logs.
+//
+// We expose only the count of registered placeholders without leaking anything.
+impl fmt::Debug for SecretResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretResolver")
+            .field("placeholders", &self.by_placeholder.len())
+            .finish_non_exhaustive() // Use to show that the struct is not empty
+    }
 }
 
 impl SecretResolver {
@@ -1912,6 +1927,66 @@ mod tests {
 
         assert_eq!(result.resolved, "/v1/chat/completions?format=json");
         assert_eq!(result.redacted, "/v1/chat/completions?format=json");
+    }
+
+    #[test]
+    fn debug_format_does_not_leak_secret_values() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [
+                (
+                    "ANTHROPIC_API_KEY".to_string(),
+                    "sk-very-secret-value-12345".to_string(),
+                ),
+                ("DB_PASSWORD".to_string(), "very-secret-value".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        let plain = format!("{resolver:?}");
+        let pretty = format!("{resolver:#?}");
+
+        for output in [&plain, &pretty] {
+            assert!(
+                !output.contains("sk-very-secret-value-12345"),
+                "secret value leaked via Debug: {output}"
+            );
+            assert!(
+                !output.contains("very-secret-value"),
+                "secret value leaked via Debug: {output}"
+            );
+            assert!(
+                !output.contains("ANTHROPIC_API_KEY"),
+                "placeholder key (env var name) leaked via Debug: {output}"
+            );
+            assert!(
+                !output.contains("DB_PASSWORD"),
+                "placeholder key (env var name) leaked via Debug: {output}"
+            );
+            assert!(
+                !output.contains(PLACEHOLDER_PREFIX),
+                "placeholder prefix leaked via Debug: {output}"
+            );
+            assert!(
+                output.contains("SecretResolver"),
+                "Debug output should still identify the type: {output}"
+            );
+        }
+
+        assert!(
+            plain.contains('2'),
+            "Debug output should expose the placeholder count: {plain}"
+        );
+    }
+
+    #[test]
+    fn debug_format_of_empty_resolver_is_safe() {
+        let resolver = SecretResolver::default();
+        let output = format!("{resolver:?}");
+        assert!(output.contains("SecretResolver"));
+        assert!(output.contains('0'));
+        assert!(!output.contains(PLACEHOLDER_PREFIX));
     }
 
     #[test]
